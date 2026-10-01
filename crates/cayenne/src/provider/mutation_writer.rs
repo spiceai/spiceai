@@ -767,12 +767,13 @@ impl<'a> AppendMutationWriter<'a> {
         // `post_validation` with the on-conflict deletions.
         let schema = prepared_stream.schema();
         let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut incoming_bytes: u64 = 0;
+        let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
         let mut incoming_rows: u64 = 0;
         let drain_start = Instant::now();
         while let Some(batch) = StreamExt::next(&mut prepared_stream).await {
             let batch = batch?;
-            incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+            incoming.add(&batch);
+            let incoming_bytes = incoming.total();
             incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
             // Memory mode never spills, so enforce the per-table RAM bound AS the
             // burst is buffered: an oversized burst fails fast with the structured
@@ -791,6 +792,7 @@ impl<'a> AppendMutationWriter<'a> {
             batches.push(batch);
         }
         drop(prepared_stream);
+        let incoming_bytes = incoming.total();
         // Decompose `cdc_path_inmemory`: draining the prepared stream RUNS the
         // deferred PK-conflict validation and decodes the upstream CDC batches,
         // so this is the "produce + validate the batch" slice — separating
@@ -946,16 +948,17 @@ impl<'a> AppendMutationWriter<'a> {
         // deferred to the per-shard step below).
         let schema = stream.schema();
         let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut incoming_bytes: u64 = 0;
+        let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
         let mut incoming_rows: u64 = 0;
         let drain_start = Instant::now();
         while let Some(batch) = StreamExt::next(&mut stream).await {
             let batch = batch?;
-            incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+            incoming.add(&batch);
             incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
             batches.push(batch);
         }
         drop(stream);
+        let incoming_bytes = incoming.total();
         record_cayenne_write_phase(
             self.table.table_name(),
             "inmemory_stream_drain",

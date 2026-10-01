@@ -176,7 +176,7 @@ impl DataSink for CayenneDataSink {
         if self.table.is_memory_resident_mode() {
             let overwrite = self.overwrite == InsertOp::Overwrite;
             let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
-            let mut incoming_bytes: u64 = 0;
+            let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
             // Acquire the write lock BEFORE draining so memory-mode writes are
             // serialized during buffering: two concurrent writes must not each buffer
             // a large payload while both pass `enforce_memory_limit` against the same
@@ -214,8 +214,8 @@ impl DataSink for CayenneDataSink {
 
             while let Some(batch) = data.next().await {
                 let batch = batch?;
-                incoming_bytes =
-                    incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+                incoming.add(&batch);
+                let incoming_bytes = incoming.total();
                 // Enforce the hard RAM bound while buffering so an oversized refresh
                 // fails fast with a structured error instead of OOMing during
                 // collection (memory mode never spills). Always count resident +
@@ -241,7 +241,7 @@ impl DataSink for CayenneDataSink {
 
             let rows = self
                 .table
-                .write_batches_memory_mode(batches, incoming_bytes, overwrite, &deletions)
+                .write_batches_memory_mode(batches, incoming.total(), overwrite, &deletions)
                 .await
                 .map_err(datafusion_common::DataFusionError::from)?;
 

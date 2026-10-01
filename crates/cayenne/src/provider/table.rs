@@ -9607,10 +9607,12 @@ impl CayenneTableProvider {
             let snapshot_id = snapshot_id.to_string();
             let schema = Arc::clone(schema);
             handles.push(tokio::spawn(async move {
-                let unit_bytes = unit
-                    .iter()
-                    .map(|b| b.get_array_memory_size() as u64)
-                    .fold(0u64, u64::saturating_add);
+                // The shard is fully materialized, so its size is the resident
+                // memory of its batches with each Arrow allocation counted once —
+                // the same figure `MemSegment::bytes` charged the tier for them. A
+                // per-reference sum would bill one allocation once per buffer and
+                // fan a Flight-fed shard out into ~its buffer count in files.
+                let unit_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&unit);
                 let estimated_bytes = Some(unit_bytes);
                 let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                     &[unit],
@@ -9658,13 +9660,14 @@ impl CayenneTableProvider {
     }
 
     /// The per-shard encode fan-out for the concurrent checkpoint encode: how many
-    /// files a shard of `unit_bytes` (uncompressed Arrow) must split into so no
-    /// output file exceeds the target Vortex file size — `ceil(unit_bytes / target)`,
-    /// min 1. A shard no larger than one target file stays a single file; a larger
-    /// shard rolls into just enough files to honor the target. Arrow over-counts vs
-    /// the compressed on-disk size, the safe direction (files land under the target
-    /// with margin). `write_to_snapshot` further clamps the result to the write
-    /// budget. `target_size_bytes == 0` means size rolling is DISABLED (one file per
+    /// files a shard of `unit_bytes` (resident Arrow bytes, each allocation counted
+    /// once) must split into so no output file exceeds the target Vortex file size
+    /// — `ceil(unit_bytes / target)`, min 1. A shard no larger than one target file
+    /// stays a single file; a larger shard rolls into just enough files to honor the
+    /// target. Resident Arrow still over-counts vs the compressed on-disk size, the
+    /// safe direction (files land under the target with margin).
+    /// `write_to_snapshot` further clamps the result to the write budget.
+    /// `target_size_bytes == 0` means size rolling is DISABLED (one file per
     /// write is intended — see the config warning), so the shard stays a single
     /// file, matching the pre-roll behavior.
     fn shard_encode_target_partitions(unit_bytes: u64, target_size_bytes: usize) -> usize {
@@ -9704,15 +9707,20 @@ impl CayenneTableProvider {
     ///   lower bound on it) supply a real estimate; only genuinely-unsized
     ///   streams fall back here.
     ///
-    /// **Units (deliberately asymmetric).** `estimated_bytes` is *uncompressed
-    /// in-memory Arrow* size (`RecordBatch::get_array_memory_size`), while
-    /// `target_size_bytes` is the target *on-disk Vortex* file size. Vortex
-    /// compresses, so `arrow_bytes / vortex_target` over-counts the files a write
-    /// will actually produce — i.e. it biases toward *more* shards. That is the
-    /// intended, safe direction: the surplus is bounded by `write_concurrency`,
-    /// extra encode parallelism is free on a multi-core host, and the transient
-    /// sub-target files it emits are merged by compaction (which is pinned to a
-    /// single output shard). The opposite error — discounting for compression and
+    /// **Units (deliberately asymmetric).** `estimated_bytes` is the *uncompressed
+    /// resident Arrow* size — what the batches hold in memory, each physical
+    /// allocation counted once
+    /// ([`RetainedBytes`](arrow_tools::batch_bytes::RetainedBytes)) rather than
+    /// once per buffer referencing it — while `target_size_bytes` is the target
+    /// *on-disk Vortex* file size. Vortex compresses, so `arrow_bytes /
+    /// vortex_target` over-counts the files a write will actually produce — i.e. it
+    /// biases toward *more* shards. That is the intended, safe direction: the
+    /// surplus is bounded by `write_concurrency`, extra encode parallelism is free
+    /// on a multi-core host, and the transient sub-target files it emits are merged
+    /// by compaction (which is pinned to a single output shard). Counting one
+    /// allocation once per buffer referencing it would be a different error
+    /// entirely — not a bias but a multiple, so a sub-target write fans out to the
+    /// concurrency ceiling. The opposite error — discounting for compression and
     /// then *under*-sharding a genuinely large, incompressible write into one
     /// oversized, serially-encoded file — is the costly one, so we do not apply a
     /// compression factor here. A faithful on-disk count would require an
@@ -14483,18 +14491,19 @@ impl CayenneTableProvider {
         //    `per_shard_batches[s]` accumulates shard s's sub-batches in apply
         //    order. Empty sub-batches are dropped (an empty append is a no-op).
         let mut per_shard_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
-        let mut per_shard_bytes: Vec<u64> = vec![0; n];
         for batch in &batches {
             let shards = Self::split_batch_by_pk_shard(batch, pk_indices, converter, n)?;
             for (s, sub) in shards.into_iter().enumerate() {
                 if sub.num_rows() == 0 {
                     continue;
                 }
-                per_shard_bytes[s] =
-                    per_shard_bytes[s].saturating_add(sub.get_array_memory_size() as u64);
                 per_shard_batches[s].push(sub);
             }
         }
+        let mut per_shard_bytes: Vec<u64> = per_shard_batches
+            .iter()
+            .map(|shard| arrow_tools::batch_bytes::RetainedBytes::of(shard))
+            .collect();
         // Guard against rounding loss: ensure the byte reservation accounting sums
         // back to the whole-apply figure the caller reserved (assign any remainder
         // to shard 0). At N=1 `per_shard_bytes[0]` is the whole apply.
@@ -30376,10 +30385,12 @@ impl CayenneTableProvider {
         }
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let estimated_flushed_bytes = batches
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .fold(0u64, u64::saturating_add);
+        // Resident memory of the captured corpus, each Arrow allocation counted
+        // once: the tier retains the batches an apply handed it, and one fed over
+        // Arrow IPC (Flight, Flight SQL) points every buffer at one message body,
+        // which a per-reference sum bills once per buffer. It sizes the encode
+        // fan-out, so that over-count is files on disk, not just a number.
+        let estimated_flushed_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
         let estimated_bytes = Some(estimated_flushed_bytes);
         tracing::debug!(
             table = %self.table_metadata.table_name,
@@ -31759,16 +31770,14 @@ impl CayenneTableProvider {
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         // The inline memtable is fully materialized here, so we can size the
-        // checkpoint write exactly (sum of in-memory Arrow bytes). This lets the
-        // write shard count scale with the actual flush size instead of always
+        // checkpoint write exactly: the resident memory of the batches, each Arrow
+        // allocation counted once. The corpus is decoded from the metastore's IPC
+        // blobs, so every buffer of an entry points into that entry's one body
+        // allocation and a per-reference sum bills it once per buffer. This lets
+        // the write shard count scale with the actual flush size instead of always
         // fanning out — a small inline flush stays a single file. Computed before
         // `batches` is moved into the MemorySource below.
-        let estimated_bytes = Some(
-            batches
-                .iter()
-                .map(|b| b.get_array_memory_size() as u64)
-                .fold(0u64, u64::saturating_add),
-        );
+        let estimated_bytes = Some(arrow_tools::batch_bytes::RetainedBytes::of(&batches));
 
         // Extract Int64 PKs from the batches before they're moved into the
         // `MemorySource` below. After the flush, these PKs live in the new
