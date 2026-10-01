@@ -44,6 +44,7 @@ use crate::dataconnector::snapshot_source::{
     projected_publisher_message, publisher_column_projection,
 };
 use crate::datafusion::{DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL, engine_to_acceleration_engine};
+use crate::init::dataset_loads::DatasetLoad;
 use crate::{LogErrors, Runtime, UnableToBuildDatasetSnafu, status};
 
 impl Runtime {
@@ -54,35 +55,56 @@ impl Runtime {
     /// snapshot restored — as startup initializes every other accelerated dataset.
     ///
     /// The dataset is rebuilt from the app `pending` was built from. A hot reload spawns
-    /// this load before it installs its app, and a reload that changes or removes the
-    /// dataset supersedes this resolution instead (see
-    /// [`SnapshotSourceRegistry::begin_resolution`]).
+    /// this load before it installs its app.
+    ///
+    /// Runs as attempts of `load`, the way `Runtime::load_dataset` retries a dataset: a
+    /// reload that replaces or removes the dataset supersedes `load`, and each read of the
+    /// snapshots' metadata, with what it reports, holds the load's attempt guard, so once
+    /// that reload's `DatasetLoads::supersede` returns, this configuration reports nothing
+    /// more and restores nothing. A restore already under way is waited for rather than
+    /// dropped (see `dataset_loads`). A resolution of the same dataset that starts later
+    /// supersedes this one too (see [`SnapshotSourceRegistry::begin_resolution`]).
     ///
     /// Retries on the dataset's refresh interval until a snapshot is described, because
     /// a dataset may start before the snapshots it reads are first published. Returns
     /// `None`, having reported why, when the dataset cannot load its snapshots at all;
-    /// and returns `None` silently when the runtime shuts down or a reload supersedes the
-    /// resolution, since that reload loads the dataset as it now is.
+    /// and returns `None` silently when the runtime shuts down or the resolution is
+    /// superseded, since what superseded it loads the dataset as it now is.
     ///
     /// [`SnapshotSourceRegistry::begin_resolution`]: crate::component::dataset::snapshot_source::SnapshotSourceRegistry::begin_resolution
     pub(super) async fn resolve_snapshot_source(
         self: &Arc<Self>,
         pending: &Arc<Dataset>,
         load_semaphore: &Arc<Semaphore>,
+        load: &DatasetLoad,
     ) -> Option<(Arc<Dataset>, BootstrapStatus)> {
         let name = pending.name.clone();
         let resolution = self.snapshot_sources().begin_resolution(&name);
-        let stopped = || self.status.is_shutdown() || resolution.is_superseded();
+        let stopped =
+            || self.status.is_shutdown() || load.is_superseded() || resolution.is_superseded();
 
-        let resolved = retry(Self::snapshot_source_backoff(pending), || async {
+        let wait_for_snapshot = retry(Self::snapshot_source_backoff(pending), || async {
+            let Some(_attempt) = load.start_attempt().await else {
+                return Err(RetryError::permanent(()));
+            };
             if stopped() {
                 return Err(RetryError::permanent(()));
             }
             self.resolve_snapshot_source_once(pending, &stopped).await
-        })
-        .await
-        .ok()?;
+        });
+        // A superseded load stops waiting at once, dropping the read it is running, rather
+        // than at its next attempt.
+        let resolved = tokio::select! {
+            resolved = wait_for_snapshot => resolved.ok()?,
+            () = load.superseded() => return None,
+        };
 
+        // Held until the snapshot is restored, so a reload that supersedes the load
+        // meanwhile waits for the restore.
+        let _attempt = load.start_attempt().await?;
+        if stopped() {
+            return None;
+        }
         if let Err(message) = self.check_snapshot_source_conflicts(&resolved).await {
             self.refuse_snapshot_source(&name, &message);
             return None;
@@ -100,9 +122,15 @@ impl Runtime {
 
         // Restore the current snapshot before the table is created. Bounded by the
         // shared load budget like every other accelerator initialization, and released
-        // before the load, which takes its own permit.
+        // before the load, which takes its own permit. A superseded load stops waiting
+        // for a permit; a restore that has started is not dropped part-way (see
+        // `dataset_loads`).
         let bootstrap_status = {
-            let Ok(_permit) = load_semaphore.acquire().await else {
+            let permit = tokio::select! {
+                permit = load_semaphore.acquire() => permit,
+                () = load.superseded() => return None,
+            };
+            let Ok(_permit) = permit else {
                 return None;
             };
             self.initialize_datasets_accelerators(std::slice::from_ref(&resolved))
