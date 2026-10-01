@@ -323,31 +323,46 @@ fn argmax(values: &[f64]) -> usize {
 ///
 /// A reply holding a second JSON object is ambiguous — a draft and its revision, say —
 /// so it is rejected rather than read as either. A `{` that does not begin an object,
-/// such as `{braces}` in trailing prose, is not a second object. An object that repeats
-/// a key is also rejected: parsing it into a `Value` would keep only the last of two
-/// answers to one question.
+/// such as `{braces}` in leading or trailing prose, is skipped so a later object can
+/// still be read. An unclosed `{` is not skipped: finishing it would be a guess. An
+/// object that repeats a key is also rejected: parsing it into a `Value` would keep
+/// only the last of two answers to one question.
 fn json_object(reply: &str) -> Result<&str, String> {
-    let Some(start) = reply.find('{') else {
-        return Err("the reply contains no JSON object".to_string());
-    };
-    let from_object = reply.get(start..).unwrap_or_default();
-    let mut values = serde_json::Deserializer::from_str(from_object).into_iter::<NoRepeatedKeys>();
-    match values.next() {
-        Some(Ok(NoRepeatedKeys)) => {
-            let (object, rest) = from_object.split_at(values.byte_offset());
-            if contains_json_object(rest) {
-                return Err(
-                    "the reply contains more than one JSON object; return exactly one".to_string(),
-                );
+    let mut remaining = reply;
+    let mut last_syntax_error: Option<String> = None;
+    while let Some(start) = remaining.find('{') {
+        let from_object = remaining.get(start..).unwrap_or_default();
+        let mut values =
+            serde_json::Deserializer::from_str(from_object).into_iter::<NoRepeatedKeys>();
+        match values.next() {
+            Some(Ok(NoRepeatedKeys)) => {
+                let (object, rest) = from_object.split_at(values.byte_offset());
+                if contains_json_object(rest) {
+                    return Err(
+                        "the reply contains more than one JSON object; return exactly one"
+                            .to_string(),
+                    );
+                }
+                return Ok(object);
             }
-            Ok(object)
+            // A repeated key is well-formed JSON with a meaning problem, which the
+            // error describes itself.
+            Some(Err(e)) if e.is_data() => return Err(e.to_string()),
+            // An object that starts and never closes is that object, unfinished —
+            // not a reason to look for another `{`.
+            Some(Err(e)) if e.is_eof() => {
+                return Err(format!("the reply is not a JSON object ({e})"));
+            }
+            Some(Err(e)) => {
+                last_syntax_error = Some(format!("the reply is not a JSON object ({e})"));
+                remaining = from_object.get(1..).unwrap_or_default();
+            }
+            None => {
+                remaining = from_object.get(1..).unwrap_or_default();
+            }
         }
-        // A repeated key is well-formed JSON with a meaning problem, which the error
-        // describes itself.
-        Some(Err(e)) if e.is_data() => Err(e.to_string()),
-        Some(Err(e)) => Err(format!("the reply is not a JSON object ({e})")),
-        None => Err("the reply contains no JSON object".to_string()),
     }
+    Err(last_syntax_error.unwrap_or_else(|| "the reply contains no JSON object".to_string()))
 }
 
 /// True when `text` holds a `{` that begins a JSON object.
@@ -766,16 +781,22 @@ mod tests {
         );
     }
 
-    /// A `{` in trailing prose is not a second object unless it begins one.
+    /// A `{` in prose is not an object unless it begins one, before or after the
+    /// answer.
     #[test]
     fn a_brace_in_trailing_prose_is_not_a_second_object() {
         let questions: BTreeMap<String, Question> = serde_json::from_value(json!({
             "q": {"type": "noul", "instructions": "yes or no"}
         }))
         .expect("question");
-        let reply = r#"{"answers":{"q":0.5}} Explanation: use {braces} literally."#;
-        let answers = parse_reply(reply, &questions, AnswerMode::Probabilities)
+        let trailing = r#"{"answers":{"q":0.5}} Explanation: use {braces} literally."#;
+        let answers = parse_reply(trailing, &questions, AnswerMode::Probabilities)
             .expect("a brace in the explanation is not a second object");
+        assert_eq!(answers.get("q"), Some(&Answer::Noul { noul: 0.5 }));
+
+        let leading = r#"Note: use {braces} literally. Final: {"answers":{"q":0.5}}"#;
+        let answers = parse_reply(leading, &questions, AnswerMode::Probabilities)
+            .expect("a brace in the leading prose is not the answer object");
         assert_eq!(answers.get("q"), Some(&Answer::Noul { noul: 0.5 }));
     }
 
