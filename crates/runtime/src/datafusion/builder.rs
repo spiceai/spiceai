@@ -410,6 +410,70 @@ pub struct DataFusionBuilder {
 pub use runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder;
 pub use runtime_datafusion::session_config::{DEFAULT_DATAFUSION_CONFIG, get_df_default_config};
 
+/// The `datafusion-spark` scalar functions Spice does not register.
+///
+/// Registering a Spark function replaces a built-in of the same name, so each
+/// one here either answers differently from the built-in it would shadow or
+/// is a name no release has shipped:
+///
+/// - `trunc` is date truncation in Spark and shadows numeric
+///   `trunc(<float>, <int>)` (spiceai/spiceai#11415).
+/// - `date_trunc` accepts only a string as the value to truncate, where the
+///   built-in also accepts a date. Registered over the built-in,
+///   `date_trunc(<unit>, <date>)` stops planning, and a federated filter
+///   comparing a timestamp against one loses the type its comparison needs and
+///   is pushed down as a pair `BigQuery` refuses.
+/// - `date_part` counts `dow` from Sunday = 1, where the built-in — and
+///   `EXTRACT(DOW FROM …)`, which the planner binds straight to the built-in —
+///   counts from Sunday = 0, so the two spellings of one weekday answered a day
+///   apart (spiceai/spiceai#13920); it also takes only a timestamp or a date.
+/// - `power` (Spark's `pow`, of which `power` is an alias) answers infinity
+///   for zero to a negative power, where the built-in reports the result
+///   undefined.
+/// - `atan2` widens `Float32` arguments to a `Float64` result, where the
+///   built-in keeps `Float32`.
+/// - `concat_ws` flattens an array argument into its elements, where the
+///   built-in renders the array as one value.
+/// - `hypot`, `monthname`, `quote` and `weekday` have no built-in to shadow,
+///   but `datafusion-spark` added them with `DataFusion` 55 and no release has
+///   shipped them: a new SQL function is new surface, not a side effect of a
+///   dependency upgrade.
+///
+/// `the_built_session_registers_exactly_the_shipped_spark_functions` pins what
+/// is registered, so a function a later `datafusion-spark` adds has to be
+/// decided on here rather than arriving silently.
+const UNREGISTERED_SPARK_SCALAR_FUNCTIONS: &[&str] = &[
+    "trunc",
+    "date_trunc",
+    "date_part",
+    "power",
+    "atan2",
+    "concat_ws",
+    "hypot",
+    "monthname",
+    "quote",
+    "weekday",
+];
+
+/// The `datafusion-spark` scalar functions the session registers: every one
+/// but [`UNREGISTERED_SPARK_SCALAR_FUNCTIONS`]. The NSQL context lists these
+/// as the Spark-compatible functions, so what it describes is what runs.
+///
+/// A function is withheld when its name *or any alias* is listed, because
+/// registering it registers every alias: Spark's power function is named
+/// `pow` with `power` as its alias, so matching the name alone would let
+/// `power` through.
+pub(crate) fn registered_spark_scalar_functions()
+-> impl Iterator<Item = Arc<datafusion::logical_expr::ScalarUDF>> {
+    datafusion_spark::all_default_scalar_functions()
+        .into_iter()
+        .filter(|udf| {
+            !std::iter::once(udf.name())
+                .chain(udf.aliases().iter().map(String::as_str))
+                .any(|name| UNREGISTERED_SPARK_SCALAR_FUNCTIONS.contains(&name))
+        })
+}
+
 impl DataFusionBuilder {
     /// Creates a new `DataFusionBuilder` with the runtime defaults.
     ///
@@ -1123,34 +1187,15 @@ impl DataFusionBuilder {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        // Register Spark-compatible functions, but skip Spark's `trunc`,
-        // `date_trunc` and `date_part` (scalar) and `avg` (aggregate): `register_all` would register
-        // them *over* the built-ins of the same name. Spark `trunc` is date-truncation and shadows numeric
-        // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
-        // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
-        // (`[count:UInt64, sum]`); harmless single-node, but it corrupts DISTRIBUTED
-        // plans — the scheduler bakes the shuffle/stage schema from Spark `avg`'s
-        // `state_fields` while executors run the built-in `avg`, so the coalescing
-        // shuffle reader downcasts the wrong primitive type and panics ("primitive
-        // array"). Keep the built-ins; register every other Spark function (mirrors
-        // `datafusion_spark::register_all`).
-        for udf in datafusion_spark::all_default_scalar_functions() {
-            // Spark `date_trunc` accepts only a string as the value to truncate,
-            // where the built-in also accepts a date. Registering it over the
-            // built-in makes `date_trunc(<unit>, <date>)` unplannable, and a
-            // federated filter comparing a timestamp against one loses the type
-            // its comparison needs and is pushed down as a pair BigQuery refuses.
-            //
-            // Spark `date_part` counts `dow` from Sunday = 1, where the built-in
-            // counts from Sunday = 0 as the SQL reference documents — and so does
-            // `EXTRACT(DOW FROM …)`, which the planner binds straight to the
-            // built-in, never through the registry. Registered over the built-in,
-            // the two spellings of one weekday answered a day apart
-            // (spiceai/spiceai#13920). Spark's also takes only a timestamp or a
-            // date, so `date_part('hour', <time>)` stopped planning.
-            if matches!(udf.name(), "trunc" | "date_trunc" | "date_part") {
-                continue;
-            }
+        // Register Spark-compatible functions, except the scalars
+        // `registered_spark_scalar_functions` withholds and Spark's `avg`
+        // (aggregate). Spark `avg` uses a different partial-aggregate state
+        // layout (`[sum, count:Int64]`) than the built-in (`[count:UInt64, sum]`);
+        // harmless single-node, but it corrupts DISTRIBUTED plans — the scheduler
+        // bakes the shuffle/stage schema from Spark `avg`'s `state_fields` while
+        // executors run the built-in `avg`, so the coalescing shuffle reader
+        // downcasts the wrong primitive type and panics ("primitive array").
+        for udf in registered_spark_scalar_functions() {
             let name = udf.name().to_string();
             if let Err(e) = state.register_udf(udf) {
                 panic!("Unable to register Spark scalar function `{name}`: {e}");
@@ -2665,14 +2710,14 @@ mod tests {
         );
 
         // Spark's *other* functions must still be there — the skip is meant to
-        // be three names, not a disabled registration.
+        // be a short list of names, not a disabled registration.
         assert!(
             df.ctx
                 .state()
                 .scalar_functions()
                 .contains_key("array_append"),
-            "only `trunc`, `date_trunc` and `date_part` are skipped; the rest of \
-             the Spark functions must still register"
+            "only the functions in `UNREGISTERED_SPARK_SCALAR_FUNCTIONS` are \
+             skipped; the rest of the Spark functions must still register"
         );
     }
 
@@ -2750,6 +2795,261 @@ mod tests {
             ],
             &other_shapes
         );
+    }
+
+    /// Every name the built session answers with a `datafusion-spark`
+    /// implementation, pinned.
+    ///
+    /// A `datafusion-spark` release adds functions, and some of them share a
+    /// name with a built-in: registered, each replaces the built-in's
+    /// semantics, and each new name is new SQL surface. Neither may arrive as
+    /// a side effect of a version bump, so the set the session resolves to
+    /// Spark's implementation is pinned here, aliases included. A name joining
+    /// it fails this test and has to be decided on: added to the registration
+    /// loop's skip, or listed here once it is meant to ship.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_registers_exactly_the_shipped_spark_functions() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+        let state = df.ctx.state();
+
+        let mut resolved_to_spark = std::collections::BTreeSet::new();
+        for udf in datafusion_spark::all_default_scalar_functions() {
+            for name in std::iter::once(udf.name()).chain(udf.aliases().iter().map(String::as_str))
+            {
+                if state
+                    .scalar_functions()
+                    .get(name)
+                    .is_some_and(|registered| **registered == *udf)
+                {
+                    resolved_to_spark.insert(format!("scalar {name}"));
+                }
+            }
+        }
+        for udaf in datafusion_spark::all_default_aggregate_functions() {
+            for name in
+                std::iter::once(udaf.name()).chain(udaf.aliases().iter().map(String::as_str))
+            {
+                if state
+                    .aggregate_functions()
+                    .get(name)
+                    .is_some_and(|registered| **registered == *udaf)
+                {
+                    resolved_to_spark.insert(format!("aggregate {name}"));
+                }
+            }
+        }
+        for udwf in datafusion_spark::all_default_window_functions() {
+            for name in
+                std::iter::once(udwf.name()).chain(udwf.aliases().iter().map(String::as_str))
+            {
+                if state
+                    .window_functions()
+                    .get(name)
+                    .is_some_and(|registered| **registered == *udwf)
+                {
+                    resolved_to_spark.insert(format!("window {name}"));
+                }
+            }
+        }
+
+        let shipped: std::collections::BTreeSet<String> = SHIPPED_SPARK_FUNCTIONS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let unexpected: Vec<_> = resolved_to_spark.difference(&shipped).collect();
+        let missing: Vec<_> = shipped.difference(&resolved_to_spark).collect();
+        assert!(
+            unexpected.is_empty() && missing.is_empty(),
+            "the Spark functions the session registers changed; newly registered: \
+             {unexpected:?}, no longer registered: {missing:?}"
+        );
+    }
+
+    /// The names `the_built_session_registers_exactly_the_shipped_spark_functions`
+    /// pins: what the session resolved to `datafusion-spark` with `DataFusion` 54.
+    const SHIPPED_SPARK_FUNCTIONS: &[&str] = &[
+        "aggregate collect_list",
+        "aggregate collect_set",
+        "aggregate try_sum",
+        "scalar abs",
+        "scalar add_months",
+        "scalar array",
+        "scalar array_contains",
+        "scalar array_repeat",
+        "scalar ascii",
+        "scalar base64",
+        "scalar bin",
+        "scalar bit_count",
+        "scalar bit_get",
+        "scalar bitmap_bit_position",
+        "scalar bitmap_bucket_number",
+        "scalar bitmap_count",
+        "scalar bitwise_not",
+        "scalar ceil",
+        "scalar ceiling",
+        "scalar char",
+        "scalar char_length",
+        "scalar character_length",
+        "scalar concat",
+        "scalar crc32",
+        "scalar csc",
+        "scalar date_add",
+        "scalar date_diff",
+        "scalar date_sub",
+        "scalar dateadd",
+        "scalar datediff",
+        "scalar elt",
+        "scalar expm1",
+        "scalar factorial",
+        "scalar floor",
+        "scalar format_string",
+        "scalar from_utc_timestamp",
+        "scalar getbit",
+        "scalar hex",
+        "scalar hour",
+        "scalar if",
+        "scalar ilike",
+        "scalar is_valid_utf8",
+        "scalar json_tuple",
+        "scalar last_day",
+        "scalar len",
+        "scalar length",
+        "scalar like",
+        "scalar luhn_check",
+        "scalar make_dt_interval",
+        "scalar make_interval",
+        "scalar make_valid_utf8",
+        "scalar map_from_arrays",
+        "scalar map_from_entries",
+        "scalar minute",
+        "scalar mod",
+        "scalar negative",
+        "scalar next_day",
+        "scalar parse_url",
+        "scalar pmod",
+        "scalar printf",
+        "scalar rint",
+        "scalar round",
+        "scalar sec",
+        "scalar second",
+        "scalar sha",
+        "scalar sha1",
+        "scalar sha2",
+        "scalar shiftleft",
+        "scalar shiftright",
+        "scalar shiftrightunsigned",
+        "scalar shuffle",
+        "scalar size",
+        "scalar slice",
+        "scalar soundex",
+        "scalar space",
+        "scalar spark_cast",
+        "scalar str_to_map",
+        "scalar substr",
+        "scalar substring",
+        "scalar time_trunc",
+        "scalar to_utc_timestamp",
+        "scalar try_parse_url",
+        "scalar try_url_decode",
+        "scalar unbase64",
+        "scalar unhex",
+        "scalar unix_date",
+        "scalar unix_micros",
+        "scalar unix_millis",
+        "scalar unix_seconds",
+        "scalar url_decode",
+        "scalar url_encode",
+        "scalar width_bucket",
+        "scalar xxhash64",
+    ];
+
+    /// The built-ins a `datafusion-spark` function of the same name would
+    /// replace keep their own answers.
+    ///
+    /// Each statement here answered differently with Spark's implementation
+    /// registered over the built-in: `power` answered infinity for zero to a
+    /// negative power where the built-in reports the result undefined, `atan2`
+    /// widened `Float32` to `Float64`, and `concat_ws` flattened an array
+    /// argument instead of rendering it. Through `DataFusionBuilder::build`,
+    /// because what can regress is the registration loop's skip.
+    ///
+    /// The decimal rows pin the built-in's own answer, which `DataFusion` 55
+    /// changed: `power` now always returns `Float64`
+    /// (apache/datafusion#22482, #22651), because the decimal result it kept
+    /// the base's type for truncated silently — `2.5⁴` in `DECIMAL(2,1)`
+    /// answered `3.9`.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_math_and_string_functions() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        let answers = df
+            .ctx
+            .sql(
+                "SELECT \
+                 power(CAST(2.5 AS DECIMAL(2,1)), 4.0) AS power_decimal, \
+                 arrow_typeof(power(CAST(2.5 AS DECIMAL(2,1)), 4.0)) AS power_decimal_type, \
+                 arrow_typeof(pow(CAST(2.5 AS DECIMAL(2,1)), 4.0)) AS pow_decimal_type, \
+                 power(2, 3) AS power_integer, \
+                 arrow_typeof(atan2(CAST(1.0 AS FLOAT), CAST(3.0 AS FLOAT))) AS atan2_float_type, \
+                 atan2(1.0, 3.0) AS atan2_double, \
+                 concat_ws(',', make_array('a', 'b'), 'c') AS concat_ws_array, \
+                 concat_ws(',', 'a', NULL, 'b') AS concat_ws_null",
+            )
+            .await
+            .expect("plan the built-in calls")
+            .collect()
+            .await
+            .expect("run the built-in calls");
+        datafusion::assert_batches_eq!(
+            [
+                "+---------------+--------------------+-------------------+---------------+------------------+--------------------+-----------------+----------------+",
+                "| power_decimal | power_decimal_type | pow_decimal_type  | power_integer | atan2_float_type | atan2_double       | concat_ws_array | concat_ws_null |",
+                "+---------------+--------------------+-------------------+---------------+------------------+--------------------+-----------------+----------------+",
+                "| 39.0625       | Float64            | Float64           | 8.0           | Float32          | 0.3217505543966422 | [a, b],c        | a,b            |",
+                "+---------------+--------------------+-------------------+---------------+------------------+--------------------+-----------------+----------------+",
+            ],
+            &answers
+        );
+
+        // Zero to a negative power is undefined: the built-in says so, where
+        // Spark's answers infinity.
+        let undefined = match df.ctx.sql("SELECT power(0.0, -1.0) AS v").await {
+            Ok(frame) => frame.collect().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        let error = undefined.expect_err("zero to a negative power must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("zero raised to a negative power is undefined"),
+            "zero to a negative power must fail as undefined: {error}"
+        );
+
+        // A function no release has shipped stays unknown.
+        for unshipped in [
+            "SELECT hypot(3.0, 4.0)",
+            "SELECT monthname(DATE '2024-03-17')",
+            "SELECT quote('a')",
+            "SELECT weekday(DATE '2024-03-17')",
+        ] {
+            let planned = df.ctx.sql(unshipped).await;
+            assert!(
+                planned.is_err(),
+                "`{unshipped}` must stay an unknown function"
+            );
+        }
     }
 
     #[tokio::test]
