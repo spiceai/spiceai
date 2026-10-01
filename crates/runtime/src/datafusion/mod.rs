@@ -2992,7 +2992,6 @@ impl DataFusion {
         // acceleration was built with stands in, so writes after the source returns
         // match the existing keyed table.
         let source_constraints = source_table_provider.constraints();
-        let source_constraints = source_constraints.as_ref();
 
         // PK/unique/index column names feed the schema-evolution classifier's
         // constraint guard: constraint columns must never be widened in place.

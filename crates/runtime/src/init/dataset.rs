@@ -28,7 +28,8 @@ use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::reconnecting::{
-    ConnectorBuilder, ReconnectingConnector, SourceUnavailable,
+    ConnectorBuilder, ReconnectingConnector, SOURCE_WAIT_BEFORE_SERVING_ACCELERATION,
+    SourceUnavailable,
 };
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
@@ -92,13 +93,6 @@ use util::{error_spaced, warn_spaced};
 /// datasets sequentially, so an apply changing several of them can spend this
 /// bound once per dataset.
 const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
-
-/// How long loading a dataset waits for its source's schema before serving an
-/// existing acceleration instead. A responsive source answers well within this, and
-/// keeps the dataset on the path that registers with the live source provider; a
-/// slow or unresponsive one no longer holds a dataset that already has its data
-/// locally unregistered. See `Runtime::defer_to_existing_acceleration`.
-const SOURCE_WAIT_BEFORE_SERVING_ACCELERATION: Duration = Duration::from_secs(2);
 
 /// Warn an operator about what their dataset's or view's acceleration block asks for and
 /// the runtime will not do as written: settings that `enabled: false` discards (#13514), and
@@ -659,7 +653,7 @@ impl Runtime {
         }
 
         let connector_start = Instant::now();
-        let connector = if Self::serves_existing_acceleration(&ds).await {
+        let connector = if Self::may_serve_existing_acceleration(&ds) {
             self.connector_or_reconnecting(Arc::clone(&ds)).await?
         } else {
             // `load_dataset_connector` owns reporting for this failure -- the
@@ -852,26 +846,40 @@ impl Runtime {
     }
 
     /// Builds `ds`'s connector, or — when the source is unreachable or slower than
-    /// [`SOURCE_WAIT_BEFORE_SERVING_ACCELERATION`] — a [`ReconnectingConnector`] that
-    /// builds it later, so the dataset registers against its existing acceleration
-    /// now. Only called for datasets [`Self::serves_existing_acceleration`] admits.
+    /// [`SOURCE_WAIT_BEFORE_SERVING_ACCELERATION`] and `ds` has an existing
+    /// acceleration — a [`ReconnectingConnector`] that builds it later, so the
+    /// dataset registers against that acceleration now. Only called for datasets
+    /// that [may be served from their acceleration](Self::may_serve_existing_acceleration);
+    /// the acceleration is only looked up once the source has not answered, so a
+    /// responsive source costs nothing extra.
     ///
-    /// A permanent failure (a configuration error no retry clears) is reported and
-    /// returned exactly as [`Self::load_dataset_connector`] does.
+    /// Otherwise — a permanent failure (a configuration error no retry clears), or no
+    /// acceleration to serve — the failure is reported and returned exactly as
+    /// [`Self::load_dataset_connector`] does.
     async fn connector_or_reconnecting(&self, ds: Arc<Dataset>) -> Result<Arc<dyn DataConnector>> {
-        let unavailable = match tokio::time::timeout(
-            SOURCE_WAIT_BEFORE_SERVING_ACCELERATION,
-            self.build_dataset_connector(Arc::clone(&ds)),
-        )
-        .await
-        {
-            Ok(Ok(data_connector)) => return Ok(data_connector),
-            Ok(Err(err)) if is_permanent_dataset_failure(&err) => {
-                return Err(self.report_connector_failure(&ds, err));
-            }
-            Ok(Err(err)) => SourceUnavailable::Failed(err.to_string()),
-            Err(_elapsed) => SourceUnavailable::Slow(SOURCE_WAIT_BEFORE_SERVING_ACCELERATION),
-        };
+        let build = self.build_dataset_connector(Arc::clone(&ds));
+        tokio::pin!(build);
+        let unavailable =
+            match tokio::time::timeout(SOURCE_WAIT_BEFORE_SERVING_ACCELERATION, &mut build).await {
+                Ok(Ok(data_connector)) => return Ok(data_connector),
+                Ok(Err(err)) => {
+                    if is_permanent_dataset_failure(&err)
+                        || !Self::has_existing_acceleration(&ds).await
+                    {
+                        return Err(self.report_connector_failure(&ds, err));
+                    }
+                    SourceUnavailable::Failed(err.to_string())
+                }
+                Err(_elapsed) => {
+                    if !Self::has_existing_acceleration(&ds).await {
+                        // Nothing to serve: keep waiting for the same build.
+                        return build
+                            .await
+                            .map_err(|err| self.report_connector_failure(&ds, err));
+                    }
+                    SourceUnavailable::Slow
+                }
+            };
 
         Ok(Self::reconnecting_connector(&ds, unavailable))
     }
@@ -895,10 +903,14 @@ impl Runtime {
     /// it [may be](Self::may_serve_existing_acceleration), and its acceleration has a
     /// checkpointed schema to serve.
     pub(crate) async fn serves_existing_acceleration(ds: &Dataset) -> bool {
-        Self::may_serve_existing_acceleration(ds)
-            && crate::dataconnector::sink::accelerated_checkpoint_schema(ds)
-                .await
-                .is_some()
+        Self::may_serve_existing_acceleration(ds) && Self::has_existing_acceleration(ds).await
+    }
+
+    /// Whether `ds`'s acceleration has a checkpointed schema to serve from.
+    async fn has_existing_acceleration(ds: &Dataset) -> bool {
+        crate::dataconnector::sink::recorded_checkpoint_schema(ds)
+            .await
+            .is_some()
     }
 
     /// Whether `ds`'s configuration allows serving it from an existing acceleration
@@ -979,7 +991,7 @@ impl Runtime {
             &checkpoint_schema,
             resolved_refresh_mode,
         );
-        let federated_table = FederatedTable::new_deferred_with_checkpoint_schema(
+        let federated_table = FederatedTable::new_deferred(
             Arc::new(ds.spec.clone()),
             ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
             checkpoint_schema,
@@ -1003,17 +1015,12 @@ impl Runtime {
     ) -> Result<(Arc<Dataset>, FederatedTable)> {
         // The connector could not be built when the dataset loaded (see
         // `try_load_dataset_once`); there is no source to wait for yet.
-        if let Some(reconnecting) = data_connector
+        if let Some(reason) = data_connector
             .as_any()
             .downcast_ref::<ReconnectingConnector>()
-            && !reconnecting.is_connected()
+            .and_then(ReconnectingConnector::pending_reason)
             && let Some(deferred) = self
-                .defer_to_existing_acceleration(
-                    &ds,
-                    data_connector,
-                    resolved_refresh_mode,
-                    reconnecting.unavailable(),
-                )
+                .defer_to_existing_acceleration(&ds, data_connector, resolved_refresh_mode, reason)
                 .await
         {
             return Ok(deferred);
@@ -1023,31 +1030,28 @@ impl Runtime {
             let context = RuntimeConnectorContext::for_dataset(&ds);
             let read_provider = data_connector.read_provider(&context, &ds);
             tokio::pin!(read_provider);
-            if Self::may_serve_existing_acceleration(&ds) {
-                match tokio::time::timeout(
-                    SOURCE_WAIT_BEFORE_SERVING_ACCELERATION,
-                    &mut read_provider,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_elapsed) => {
-                        if let Some(deferred) = self
-                            .defer_to_existing_acceleration(
-                                &ds,
-                                data_connector,
-                                resolved_refresh_mode,
-                                &SourceUnavailable::Slow(SOURCE_WAIT_BEFORE_SERVING_ACCELERATION),
-                            )
-                            .await
-                        {
-                            return Ok(deferred);
-                        }
-                        // Nothing to serve: keep waiting for the same read.
-                        read_provider.await
-                    }
-                }
+            let answered = if Self::may_serve_existing_acceleration(&ds) {
+                tokio::time::timeout(SOURCE_WAIT_BEFORE_SERVING_ACCELERATION, &mut read_provider)
+                    .await
+                    .ok()
             } else {
+                Some((&mut read_provider).await)
+            };
+            if let Some(result) = answered {
+                result
+            } else {
+                if let Some(deferred) = self
+                    .defer_to_existing_acceleration(
+                        &ds,
+                        data_connector,
+                        resolved_refresh_mode,
+                        &SourceUnavailable::Slow,
+                    )
+                    .await
+                {
+                    return Ok(deferred);
+                }
+                // Nothing to serve: keep waiting for the same read.
                 read_provider.await
             }
         };

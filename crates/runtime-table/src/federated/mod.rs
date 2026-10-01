@@ -38,7 +38,7 @@ use arrow_tools::schema::schema_difference;
 use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use datafusion::catalog::TableProvider;
 use datafusion::common::{Constraints, DataFusionError};
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
@@ -115,14 +115,9 @@ pub enum FederatedTable {
 }
 
 #[derive(Debug)]
-enum DeferredState {
-    Waiting(oneshot::Receiver<Arc<dyn TableProvider>>),
-    Done,
-}
-
-#[derive(Debug)]
 pub struct DeferredTableProvider {
-    state: RwLock<DeferredState>,
+    /// The deferred task's result. Waiters await it in turn, under the lock.
+    receiver: Mutex<oneshot::Receiver<Arc<dyn TableProvider>>>,
     table: OnceLock<Arc<dyn TableProvider>>,
     /// True when the deferred task failed to produce a real provider (e.g. was
     /// cancelled during shutdown or panicked) and [`FederatedTable::table_provider`]
@@ -423,30 +418,11 @@ impl FederatedTable {
         }
     }
 
-    /// If the table provider is not available immediately and this is an accelerated table with a previous acceleration checkpoint,
-    /// we can create a deferred task to keep trying to connect to the table provider until it is available.
-    ///
-    /// Returns `None` if the dataset isn't a valid file-accelerated dataset.
-    pub async fn new_deferred(
-        dataset: Arc<DatasetSpec>,
-        source: Arc<dyn RefreshSource>,
-        shutdown_token: CancellationToken,
-    ) -> Option<Self> {
-        let checkpoint = source.checkpointer().await?;
-        let accelerated_schema = checkpoint.get_schema().await.ok()??;
-
-        Some(Self::new_deferred_with_checkpoint_schema(
-            dataset,
-            source,
-            accelerated_schema,
-            shutdown_token,
-        ))
-    }
-
-    /// [`Self::new_deferred`] for a caller that has already read the acceleration
-    /// checkpoint's schema.
+    /// A table served from an existing acceleration — registered with its
+    /// checkpoint's schema — while a background task keeps trying to connect to the
+    /// source until its provider is available.
     #[must_use]
-    pub fn new_deferred_with_checkpoint_schema(
+    pub fn new_deferred(
         dataset: Arc<DatasetSpec>,
         source: Arc<dyn RefreshSource>,
         checkpoint_schema: SchemaRef,
@@ -465,27 +441,23 @@ impl FederatedTable {
     /// checkpoint records it, so the acceleration registers with the key its
     /// existing table has.
     #[must_use]
-    pub fn constraints(&self) -> Option<Constraints> {
+    pub fn constraints(&self) -> Option<&Constraints> {
         match self {
-            Self::Immediate(table_provider) => table_provider.constraints().cloned(),
-            Self::Deferred(deferred_table_provider) => deferred_table_provider.constraints.clone(),
+            Self::Immediate(table_provider) => table_provider.constraints(),
+            Self::Deferred(deferred_table_provider) => deferred_table_provider.constraints.as_ref(),
         }
     }
 
-    /// Attempts to return the [`TableProvider`] without waiting for a deferred [`TableProvider`] that is not done (i.e. not in `DeferredState::Done`).
+    /// Attempts to return the [`TableProvider`] without waiting for a deferred [`TableProvider`] that has not resolved yet.
     ///
-    /// Returns None if
-    ///   1. Active write on the [`DeferredTableProvider`]'s state.
-    ///   2. The [`DeferredTableProvider`] is not Ready.
+    /// Returns `None` until the [`DeferredTableProvider`] has resolved.
     pub fn try_table_provider_sync(&self) -> Option<Arc<dyn TableProvider>> {
         Some(Arc::clone(self.try_table_provider_sync_ref()?))
     }
 
-    /// Attempts to return the [`TableProvider`] without waiting for a deferred [`TableProvider`] that is not done (i.e. not in `DeferredState::Done`).
+    /// Attempts to return the [`TableProvider`] without waiting for a deferred [`TableProvider`] that has not resolved yet.
     ///
-    /// Returns None if
-    ///   1. Active write on the [`DeferredTableProvider`]'s state.
-    ///   2. The [`DeferredTableProvider`] is not Ready.
+    /// Returns `None` until the [`DeferredTableProvider`] has resolved.
     pub fn try_table_provider_sync_ref(&self) -> Option<&Arc<dyn TableProvider>> {
         let deferred_table_provider = match self {
             Self::Immediate(table_provider) => return Some(table_provider),
@@ -533,19 +505,20 @@ impl FederatedTable {
         // Not resolved yet: wait on the deferred task. Several callers can get here at
         // once (the refresh and `ready_state: on_schema_resolved`'s readiness wait, for
         // one), so whoever takes the lock second must re-check what the first resolved.
-        let mut deferred_state_guard = deferred_table_provider.state.write().await;
+        let mut pending = deferred_table_provider.receiver.lock().await;
         if let Some(resolved) = deferred_table_provider.resolved() {
             return resolved;
         }
 
-        // The table is set before the state becomes `Done`, so it is still `Waiting`
-        // here. Await the receiver in place rather than moving it out, so a caller
-        // dropped mid-wait (shutdown, or a cancelled query) leaves it for the next one.
-        let received = match &mut *deferred_state_guard {
-            DeferredState::Waiting(rx) => rx.await.ok(),
-            DeferredState::Done => None,
+        // Whoever receives sets the table before releasing the lock, so the receiver
+        // has not completed here. Await it in place rather than moving it out, so a
+        // caller dropped mid-wait (shutdown, or a cancelled query) leaves it for the
+        // next one.
+        let received = if pending.is_terminated() {
+            None
+        } else {
+            (&mut *pending).await.ok()
         };
-        *deferred_state_guard = DeferredState::Done;
 
         if let Some(table_provider) = received {
             let _ = deferred_table_provider
@@ -657,7 +630,7 @@ impl FederatedTable {
         });
 
         DeferredTableProvider {
-            state: RwLock::new(DeferredState::Waiting(rx)),
+            receiver: Mutex::new(rx),
             schema,
             table: OnceLock::new(),
             resolved_unavailable: AtomicBool::new(false),
@@ -686,9 +659,9 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::datasource::{TableProvider, empty::EmptyTable};
-    use tokio::sync::{RwLock, oneshot};
+    use tokio::sync::{Mutex, oneshot};
 
-    use super::{DeferredState, DeferredTableProvider, FederatedTable};
+    use super::{DeferredTableProvider, FederatedTable};
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]))
@@ -698,7 +671,7 @@ mod tests {
     fn deferred() -> (FederatedTable, oneshot::Sender<Arc<dyn TableProvider>>) {
         let (tx, rx) = oneshot::channel();
         let table = FederatedTable::Deferred(DeferredTableProvider {
-            state: RwLock::new(DeferredState::Waiting(rx)),
+            receiver: Mutex::new(rx),
             table: OnceLock::new(),
             resolved_unavailable: AtomicBool::new(false),
             schema: schema(),
@@ -714,8 +687,8 @@ mod tests {
     }
 
     /// The refresh and `ready_state: on_schema_resolved`'s readiness wait both wait on
-    /// the same deferred table; the one that takes the lock second used to find the
-    /// state already `Done` and panic.
+    /// the same deferred table; the one that takes the lock second must get the
+    /// provider the first one received.
     #[tokio::test]
     async fn concurrent_waiters_both_resolve() {
         let (table, tx) = deferred();

@@ -48,13 +48,20 @@ use crate::component::dataset::acceleration::RefreshMode;
 pub type ConnectorBuilder =
     Arc<dyn Fn() -> BoxFuture<'static, crate::Result<Arc<dyn DataConnector>>> + Send + Sync>;
 
+/// How long loading a dataset waits for its source before serving an existing
+/// acceleration instead. A responsive source answers well within this, and keeps
+/// the dataset on the path that registers with the live source provider; a slow or
+/// unresponsive one no longer holds a dataset that already has its data locally
+/// unregistered.
+pub const SOURCE_WAIT_BEFORE_SERVING_ACCELERATION: Duration = Duration::from_secs(2);
+
 /// Why a dataset is registered before its real connector exists.
 #[derive(Debug, Clone)]
 pub enum SourceUnavailable {
     /// Building the connector failed with a retriable error.
     Failed(String),
-    /// Building the connector did not finish within the given wait.
-    Slow(Duration),
+    /// The source did not respond within [`SOURCE_WAIT_BEFORE_SERVING_ACCELERATION`].
+    Slow,
     /// The source was not contacted: a deferred dataset (`ready_state:
     /// on_registration` with typed `columns:`) serves its first query from its
     /// existing acceleration and connects in the background.
@@ -70,7 +77,7 @@ impl SourceUnavailable {
             Self::Failed(cause) => {
                 tracing::warn!("{}", unreachable_source_warning(dataset, cause));
             }
-            Self::Slow(wait) => tracing::info!("{}", slow_source_message(dataset, *wait)),
+            Self::Slow => tracing::info!("{}", slow_source_message(dataset)),
             Self::NotContacted => tracing::info!("{}", not_contacted_message(dataset)),
         }
     }
@@ -85,13 +92,14 @@ fn unreachable_source_warning(dataset: &TableReference, cause: &str) -> String {
     )
 }
 
-/// The message logged when a dataset's source did not respond within `wait`, so
-/// queries are served from its existing acceleration until it does.
+/// The message logged when a dataset's source did not respond within
+/// [`SOURCE_WAIT_BEFORE_SERVING_ACCELERATION`], so queries are served from its
+/// existing acceleration until it does.
 #[must_use]
-fn slow_source_message(dataset: &TableReference, wait: Duration) -> String {
+fn slow_source_message(dataset: &TableReference) -> String {
     format!(
         "The source for dataset '{dataset}' did not respond within {}s, so queries are served from the existing acceleration for '{dataset}' until the source responds and the next refresh completes.",
-        wait.as_secs()
+        SOURCE_WAIT_BEFORE_SERVING_ACCELERATION.as_secs()
     )
 }
 
@@ -131,16 +139,11 @@ impl ReconnectingConnector {
         }
     }
 
-    /// Whether the real connector has been built.
+    /// Why the real connector was not built when the dataset loaded, until it has
+    /// been built.
     #[must_use]
-    pub fn is_connected(&self) -> bool {
-        self.inner.initialized()
-    }
-
-    /// Why the real connector was not built when the dataset loaded.
-    #[must_use]
-    pub fn unavailable(&self) -> &SourceUnavailable {
-        &self.unavailable
+    pub fn pending_reason(&self) -> Option<&SourceUnavailable> {
+        (!self.inner.initialized()).then_some(&self.unavailable)
     }
 
     /// The real connector, once it has been built.
@@ -363,8 +366,6 @@ impl DataConnector for ReconnectingConnector {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use datafusion::sql::TableReference;
 
     use super::{not_contacted_message, slow_source_message, unreachable_source_warning};
@@ -383,7 +384,7 @@ mod tests {
 
     #[test]
     fn slow_source_message_names_the_dataset_the_wait_and_what_is_served() {
-        let message = slow_source_message(&TableReference::bare("orders"), Duration::from_secs(2));
+        let message = slow_source_message(&TableReference::bare("orders"));
         assert_eq!(
             message,
             "The source for dataset 'orders' did not respond within 2s, so queries are served from the existing acceleration for 'orders' until the source responds and the next refresh completes."

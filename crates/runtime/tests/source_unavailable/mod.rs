@@ -394,6 +394,32 @@ mod served_from_acceleration {
         dataset
     }
 
+    /// A registered test source (three rows, `v = 1`) and the directory its
+    /// acceleration lives in.
+    struct Fixture {
+        source: Arc<UnreachableSource>,
+        dir: TempDir,
+    }
+
+    impl Fixture {
+        async fn new(prefix: &'static str) -> Result<Self, anyhow::Error> {
+            let source = UnreachableSource::new(prefix, 1);
+            source.register().await;
+            Ok(Self {
+                source,
+                dir: TempDir::new()?,
+            })
+        }
+
+        fn dataset(&self, ready_state: ReadyState) -> SpicepodDataset {
+            dataset(
+                self.source.prefix,
+                &self.dir.path().join("orders.duckdb"),
+                ready_state,
+            )
+        }
+    }
+
     async fn start(dataset: SpicepodDataset) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
         let app = AppBuilder::new("source_unavailable")
             .with_dataset(dataset)
@@ -487,19 +513,12 @@ mod served_from_acceleration {
     async fn an_acceleration_is_served_and_ready_while_its_source_is_down()
     -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));
-        let source = UnreachableSource::new("served-while-down", 1);
-        source.register().await;
-        let dir = TempDir::new()?;
-        let spec = || {
-            dataset(
-                source.prefix,
-                &dir.path().join("orders.duckdb"),
-                ReadyState::OnLoad,
-            )
-        };
-        seed(&source, spec()).await?;
+        let fixture = Fixture::new("served-while-down").await?;
+        let source = &fixture.source;
+        let spec = || fixture.dataset(ReadyState::OnLoad);
+        seed(source, spec()).await?;
 
-        let (rt, loader) = restart_with_source_down(&source, spec()).await;
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
 
         assert!(
             served_from_acceleration(&rt, Duration::from_secs(10)).await,
@@ -530,19 +549,12 @@ mod served_from_acceleration {
     async fn on_schema_resolved_serves_the_acceleration_but_waits_for_the_source_to_be_ready()
     -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));
-        let source = UnreachableSource::new("schema-resolved-while-down", 1);
-        source.register().await;
-        let dir = TempDir::new()?;
-        let spec = || {
-            dataset(
-                source.prefix,
-                &dir.path().join("orders.duckdb"),
-                ReadyState::OnSchemaResolved,
-            )
-        };
-        seed(&source, spec()).await?;
+        let fixture = Fixture::new("schema-resolved-while-down").await?;
+        let source = &fixture.source;
+        let spec = || fixture.dataset(ReadyState::OnSchemaResolved);
+        seed(source, spec()).await?;
 
-        let (rt, loader) = restart_with_source_down(&source, spec()).await;
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
 
         assert!(
             served_from_acceleration(&rt, Duration::from_secs(10)).await,
@@ -575,28 +587,16 @@ mod served_from_acceleration {
     async fn a_deferred_dataset_does_not_contact_its_source_at_startup_and_serves_its_acceleration()
     -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));
-        let source = UnreachableSource::new("deferred-while-down", 1);
-        source.register().await;
-        let dir = TempDir::new()?;
-        let duckdb_file = dir.path().join("orders.duckdb");
-        let spec = || {
-            with_declared_columns(dataset(
-                source.prefix,
-                &duckdb_file,
-                ReadyState::OnRegistration,
-            ))
-        };
+        let fixture = Fixture::new("deferred-while-down").await?;
+        let source = &fixture.source;
+        let spec = || with_declared_columns(fixture.dataset(ReadyState::OnRegistration));
         // Build the acceleration the way a previous run would have. Seeding with the
         // deferred spec itself would not do: under `on_registration` a query is answered
         // by the source before the acceleration has loaded.
-        seed(
-            &source,
-            dataset(source.prefix, &duckdb_file, ReadyState::OnLoad),
-        )
-        .await?;
+        seed(source, fixture.dataset(ReadyState::OnLoad)).await?;
         let attempts_before_restart = source.connect_attempts();
 
-        let (rt, loader) = restart_with_source_down(&source, spec()).await;
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
         let registered = wait_until_true(Duration::from_secs(10), || async {
             dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
         })
@@ -630,17 +630,10 @@ mod served_from_acceleration {
     #[tokio::test]
     async fn a_slow_source_does_not_hold_back_an_acceleration() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));
-        let source = UnreachableSource::new("slow-source", 1);
-        source.register().await;
-        let dir = TempDir::new()?;
-        let spec = || {
-            dataset(
-                source.prefix,
-                &dir.path().join("orders.duckdb"),
-                ReadyState::OnLoad,
-            )
-        };
-        seed(&source, spec()).await?;
+        let fixture = Fixture::new("slow-source").await?;
+        let source = &fixture.source;
+        let spec = || fixture.dataset(ReadyState::OnLoad);
+        seed(source, spec()).await?;
 
         source.set_value(2);
         source.set_read_delay(Duration::from_secs(6));
@@ -662,28 +655,20 @@ mod served_from_acceleration {
     }
 
     /// A source that reports a primary key creates the acceleration's table with
-    /// it. Registering while the source is down used to build the accelerator
-    /// without the key, so every refresh after the source returned failed with
-    /// "Primary keys do not match" and the data stayed stale. The key is now
-    /// recovered from the checkpoint.
+    /// it. Registering while the source is down must recover that key from the
+    /// checkpoint: an accelerator built without it fails every refresh after the
+    /// source returns with "Primary keys do not match", and the data stays stale.
     #[tokio::test]
     async fn a_keyed_acceleration_refreshes_after_its_source_returns() -> Result<(), anyhow::Error>
     {
         let _tracing = init_tracing(Some("integration=debug,info"));
-        let source = UnreachableSource::new("keyed-while-down", 1);
-        source.report_primary_key();
-        source.register().await;
-        let dir = TempDir::new()?;
-        let spec = || {
-            dataset(
-                source.prefix,
-                &dir.path().join("orders.duckdb"),
-                ReadyState::OnLoad,
-            )
-        };
-        seed(&source, spec()).await?;
+        let fixture = Fixture::new("keyed-while-down").await?;
+        fixture.source.report_primary_key();
+        let source = &fixture.source;
+        let spec = || fixture.dataset(ReadyState::OnLoad);
+        seed(source, spec()).await?;
 
-        let (rt, loader) = restart_with_source_down(&source, spec()).await;
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
         assert!(served_from_acceleration(&rt, Duration::from_secs(10)).await);
 
         source.bring_up();
@@ -693,7 +678,17 @@ mod served_from_acceleration {
             sum_and_count(&rt).await,
             dataset_status(&rt, "orders")
         );
-        assert_eq!(dataset_status(&rt, "orders"), Some(ComponentStatus::Ready));
+        // A refresh is due every second, so the status alternates with `Refreshing`;
+        // a key mismatch would leave it in `Error` instead.
+        let ready = wait_until_true(Duration::from_secs(10), || async {
+            dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        assert!(
+            ready,
+            "a keyed acceleration stays ready after refreshing ({:?})",
+            dataset_status(&rt, "orders")
+        );
         stop(rt, loader).await;
         Ok(())
     }

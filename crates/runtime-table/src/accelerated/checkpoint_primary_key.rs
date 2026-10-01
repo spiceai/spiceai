@@ -31,6 +31,7 @@ use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
 
 use arrow_tools::metadata_keys::ACCELERATION_PRIMARY_KEY_METADATA_KEY;
+use search::generation::util::get_primary_keys;
 
 /// `schema` with the primary key `accelerator` was built with recorded in its
 /// metadata, or `schema` unchanged when the accelerator has none.
@@ -39,10 +40,9 @@ pub fn with_acceleration_primary_key(
     schema: SchemaRef,
     accelerator: &Arc<dyn TableProvider>,
 ) -> SchemaRef {
-    let accelerator_schema = accelerator.schema();
-    let Some(columns) = accelerator
-        .constraints()
-        .and_then(|constraints| primary_key_columns(constraints, &accelerator_schema))
+    let Some(columns) = get_primary_keys(accelerator)
+        .ok()
+        .filter(|columns| !columns.is_empty())
     else {
         return schema;
     };
@@ -91,18 +91,6 @@ pub fn without_acceleration_primary_key(schema: SchemaRef) -> SchemaRef {
     let mut metadata = schema.metadata().clone();
     metadata.remove(ACCELERATION_PRIMARY_KEY_METADATA_KEY);
     Arc::new(schema.as_ref().clone().with_metadata(metadata))
-}
-
-fn primary_key_columns(constraints: &Constraints, schema: &Schema) -> Option<Vec<String>> {
-    constraints.iter().find_map(|constraint| match constraint {
-        Constraint::PrimaryKey(indices) if !indices.is_empty() => indices
-            .iter()
-            .map(|&index| {
-                (index < schema.fields().len()).then(|| schema.field(index).name().clone())
-            })
-            .collect(),
-        _ => None,
-    })
 }
 
 #[cfg(test)]
