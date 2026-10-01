@@ -471,7 +471,7 @@ async fn test_megascience_permutations(
             let mut rng = rand::rng();
             rng.random_range(19200_u16..19300_u16)
         };
-        let container = elasticsearch::start_elasticsearch_docker_container(port)
+        let container = elasticsearch::start_elasticsearch_docker_container()
             .await
             .expect("failed to start Elasticsearch Docker container");
         es_endpoint = elasticsearch::elasticsearch_endpoint(port);
@@ -642,6 +642,7 @@ async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
 
     let response_str = http_post(&format!("{base_url}/v1/sql").to_string(), sql, headers).await?;
+    let port = container.host_port(9200)?;
     serde_json::from_str(&response_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse 'v1/sql' HTTP response: {e}"))
 }

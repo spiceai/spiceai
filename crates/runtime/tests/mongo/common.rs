@@ -156,14 +156,10 @@ pub fn make_mongodb_change_stream_dataset_inferred(path: &str, name: &str, port:
 }
 
 #[instrument]
-pub async fn start_mongodb_docker_container(
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    let container_name = format!("{MONGODB_DOCKER_CONTAINER}-{port}");
-    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let running_container = ContainerRunnerBuilder::new(container_name)
+pub async fn start_mongodb_docker_container() -> Result<RunningContainer, anyhow::Error> {
+    let running_container = ContainerRunnerBuilder::new(MONGODB_DOCKER_CONTAINER)
         .image(MONGODB_IMAGE.to_string())
-        .add_port_binding(27017, port)
+        .publish_port(27017)
         .add_env_var("MONGO_INITDB_ROOT_USERNAME", "root")
         .add_env_var("MONGO_INITDB_ROOT_PASSWORD", MONGODB_ROOT_PASSWORD)
         .add_env_var("MONGO_INITDB_DATABASE", "testdb")
@@ -185,20 +181,17 @@ pub async fn start_mongodb_docker_container(
         .run(Some(MONGODB_CONTAINER_START_TIMEOUT))
         .await?;
 
-    wait_for_mongodb_host_port(port).await?;
+    wait_for_mongodb_host_port(running_container.host_port(27017)?).await?;
     Ok(running_container)
 }
 
 #[cfg(feature = "duckdb")]
 #[instrument]
-pub async fn start_mongodb_replica_set_docker_container(
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    let container_name = format!("{MONGODB_DOCKER_CONTAINER}-rs-{port}");
-    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let running_container = ContainerRunnerBuilder::new(container_name)
+pub async fn start_mongodb_replica_set_docker_container() -> Result<RunningContainer, anyhow::Error>
+{
+    let running_container = ContainerRunnerBuilder::new(&format!("{MONGODB_DOCKER_CONTAINER}-rs"))
         .image(MONGODB_IMAGE.to_string())
-        .add_port_binding(27017, port)
+        .publish_port(27017)
         .command(["mongod", "--replSet", "rs0", "--bind_ip_all"])
         .healthcheck(HealthConfig {
             test: Some(vec![
@@ -218,19 +211,23 @@ pub async fn start_mongodb_replica_set_docker_container(
         .run(Some(MONGODB_CONTAINER_START_TIMEOUT))
         .await?;
 
-    wait_for_mongodb_rs_node_port(port).await?;
+    wait_for_mongodb_rs_node_port(running_container.host_port(27017)?).await?;
     initiate_mongodb_replica_set(&running_container).await?;
     Ok(running_container)
 }
 
 #[cfg(feature = "duckdb")]
 async fn initiate_mongodb_replica_set(
-    running_container: &RunningContainer<'_>,
+    running_container: &RunningContainer,
 ) -> Result<(), anyhow::Error> {
-    let initiate =
-        "mongosh --quiet --eval \"rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]})\""
-            .to_string();
-    let _ = running_container.exec_cmd(&initiate).await?;
+    running_container
+        .exec([
+            "mongosh",
+            "--quiet",
+            "--eval",
+            "rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]})",
+        ])
+        .await?;
 
     let start_time = std::time::Instant::now();
     let mut last_output = None;
