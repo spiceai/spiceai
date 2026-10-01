@@ -634,7 +634,7 @@ mod tests {
             ScalarValue::FixedSizeBinary(1, Some(byte.clone())),
             ScalarValue::Dictionary(
                 Box::new(DataType::Int32),
-                Box::new(ScalarValue::Binary(Some(byte.clone()))),
+                Box::new(ScalarValue::Binary(Some(byte))),
             ),
         ] {
             let literal = lit(value.clone());
