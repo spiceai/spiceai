@@ -75,38 +75,36 @@ const ADAPTIVE_WEIGHT_RESOLUTION: u32 = 100;
 
 type GovernorRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
 
-/// The cluster adaptive decay half-life, in whole windows.
+/// The cluster adaptive decay half-life, as a count of windows.
 ///
 /// The shared state records request outcomes per window, so one window is the
 /// shortest half-life it can express. An unset `rate_control_window` therefore
 /// takes the window itself — the `refresh_interval` — rather than the
-/// single-node [`DEFAULT_ADAPTIVE_WINDOW`], and an explicit value is quantised
-/// to the nearest whole number of windows, floored at one.
+/// single-node [`DEFAULT_ADAPTIVE_WINDOW`]. An explicit value keeps its exact
+/// ratio to the window, fractions included, and is floored at one window.
 ///
 /// A half-life of exactly one window is the least robust setting against
 /// failures grouped at one end of a window; the worst case is a factor of
 /// `2 ^ (window / half_life)`, which is 2 here and 1.15 at five windows. That
 /// matters only while an origin is failing or recovering, so it is the right
-/// default and the wrong thing to be stuck with — hence the rounding is logged
+/// default and the wrong thing to be stuck with — hence the floor is logged
 /// rather than silent.
-fn half_life_windows(origin: &str, configured: Option<Duration>, window: Duration) -> u64 {
+fn half_life_windows(origin: &str, configured: Option<Duration>, window: Duration) -> f64 {
     let Some(configured) = configured else {
-        return 1;
+        return 1.0;
     };
     let window_ms = duration_millis_u64(window).max(1);
     let configured_ms = duration_millis_u64(configured);
     #[expect(
         clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
         reason = "both are millisecond durations; the quotient is a small window count"
     )]
-    let windows = (((configured_ms as f64) / (window_ms as f64)).round() as u64).max(1);
-    let effective_ms = windows.saturating_mul(window_ms);
-    if effective_ms != configured_ms {
+    let windows = (configured_ms as f64) / (window_ms as f64);
+    if windows < 1.0 {
         tracing::info!(
-            "Cluster rate control for origin '{origin}' rounded `rate_control_window` from {configured_ms}ms to {effective_ms}ms, which is {windows} x the {window_ms}ms `refresh_interval`. The shared state records request outcomes one window at a time, so the reaction and recovery half-life is a whole number of windows."
+            "Cluster rate control for origin '{origin}' raised `rate_control_window` from {configured_ms}ms to the {window_ms}ms `refresh_interval`. The shared state records request outcomes one window at a time, so the reaction and recovery half-life cannot be shorter than one window."
         );
+        return 1.0;
     }
     windows
 }
@@ -1263,6 +1261,49 @@ mod tests {
             _ = controller.acquire() => panic!("should have blocked, lease was {granted}"),
             () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
+    }
+
+    const TEST_ORIGIN: &str = "https://origin.example.com";
+
+    /// The half-life is the plain ratio of `rate_control_window` to the window:
+    /// a value that is not a whole number of windows keeps its fraction.
+    #[test]
+    fn half_life_windows_keeps_the_configured_ratio() {
+        let window = Duration::from_secs(30);
+
+        let exact = half_life_windows(TEST_ORIGIN, Some(Duration::from_mins(1)), window);
+        assert!(
+            (exact - 2.0).abs() < 1e-9,
+            "expected 2 windows, got {exact}"
+        );
+
+        let fractional = half_life_windows(TEST_ORIGIN, Some(Duration::from_secs(45)), window);
+        assert!(
+            (fractional - 1.5).abs() < 1e-9,
+            "expected 1.5 windows, got {fractional}"
+        );
+    }
+
+    /// The shared state records outcomes one window at a time, so a half-life
+    /// shorter than a window cannot be expressed and clamps to one.
+    #[test]
+    fn half_life_windows_is_floored_at_one_window() {
+        let floored = half_life_windows(
+            TEST_ORIGIN,
+            Some(Duration::from_secs(10)),
+            Duration::from_secs(30),
+        );
+        assert!(
+            (floored - 1.0).abs() < 1e-9,
+            "expected 1 window, got {floored}"
+        );
+    }
+
+    /// Unset, the half-life is the window itself — not the single-node default.
+    #[test]
+    fn half_life_windows_defaults_to_one_window() {
+        let unset = half_life_windows(TEST_ORIGIN, None, Duration::from_secs(30));
+        assert!((unset - 1.0).abs() < 1e-9, "expected 1 window, got {unset}");
     }
 
     /// Drive the adaptive window to a target admission coefficient, then read the

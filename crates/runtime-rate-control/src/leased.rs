@@ -306,19 +306,16 @@ impl PersistedLimiter {
     /// A source window `s` covers `[s·W, (s+1)·W)` and the target window starts
     /// at `t·W`, so the gap between them is `(t − s − 1)·W` — `age` below is
     /// that gap in whole windows, and the weight halves every
-    /// `half_life_windows` of it.
+    /// `half_life_windows` of it. The half-life itself need not be a whole
+    /// number of windows.
     fn ewma_outcomes(
         &self,
         target_window: u64,
         lookback_windows: u64,
-        half_life_windows: u64,
+        half_life_windows: f64,
     ) -> OutcomeSample {
         let mut outcomes = OutcomeSample::default();
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "half-life is a small window count; f64 represents it exactly"
-        )]
-        let half_life = half_life_windows.max(1) as f64;
+        let half_life = half_life_windows.max(1.0);
         for age in 0..lookback_windows {
             let Some(source_window) = target_window.checked_sub(age + 1) else {
                 break; // Before the epoch's first window: nothing older exists.
@@ -645,11 +642,11 @@ pub(crate) struct LeasedAdaptiveConfig {
     pub k: f64,
     /// The configured failure threshold, quoted in the throttling log line.
     pub failure_threshold: f64,
-    /// Decay half-life, in whole windows. One window is the smallest unit of
-    /// time the shared file records, so a shorter half-life cannot be expressed;
-    /// the caller quantises `rate_control_window` against `refresh_interval` and
-    /// logs the rounded value.
-    pub half_life_windows: u64,
+    /// Decay half-life, as a count of windows. One window is the smallest unit
+    /// of time the shared file records, so a shorter half-life cannot be
+    /// expressed; the caller divides `rate_control_window` by `refresh_interval`
+    /// and floors the ratio at one window.
+    pub half_life_windows: f64,
 }
 
 /// Configuration for a single leased rate limiter (one quota on one origin).
@@ -1055,14 +1052,12 @@ impl LeasedBucket {
         let window_id = window_id_for(SystemTime::now(), config.window_duration);
         // Hold a boundary reading for one half-life before reporting it, the
         // same rule the single-node controller uses.
-        let hold = config.window_duration.saturating_mul(
-            u32::try_from(
-                config
-                    .adaptive
-                    .map_or(1, |adaptive| adaptive.half_life_windows.max(1)),
-            )
-            .unwrap_or(u32::MAX),
-        );
+        let half_life_windows = config
+            .adaptive
+            .map_or(1.0, |adaptive| adaptive.half_life_windows.max(1.0));
+        let hold =
+            Duration::try_from_secs_f64(config.window_duration.as_secs_f64() * half_life_windows)
+                .unwrap_or(Duration::MAX);
         Arc::new(Self {
             object_state,
             inner: Mutex::new(LeasedBucketInner::new(window_id)),
@@ -1893,7 +1888,7 @@ mod tests {
     const HALF_THRESHOLD: f64 = 0.5;
     const K_AT_HALF_THRESHOLD: f64 = 2.0;
 
-    fn adaptive_config(half_life_windows: u64) -> LeasedAdaptiveConfig {
+    fn adaptive_config(half_life_windows: f64) -> LeasedAdaptiveConfig {
         LeasedAdaptiveConfig {
             k: K_AT_HALF_THRESHOLD,
             failure_threshold: HALF_THRESHOLD,
@@ -2034,7 +2029,7 @@ mod tests {
                 .collect(),
         );
 
-        let sample = limiter.ewma_outcomes(10, 5, 1);
+        let sample = limiter.ewma_outcomes(10, 5, 1.0);
         let expected = 1.0 + 0.5 + 0.25 + 0.125 + 0.0625;
         assert!(
             (sample.requests - expected).abs() < 1e-9,
@@ -2044,8 +2039,38 @@ mod tests {
         assert!((sample.accepts - expected).abs() < 1e-9);
 
         // A five-window half-life flattens the weights toward 1.
-        let flat = limiter.ewma_outcomes(10, 5, 5);
+        let flat = limiter.ewma_outcomes(10, 5, 5.0);
         assert!(flat.requests > sample.requests);
+    }
+
+    /// The half-life is a real number of windows, not a whole one: at 1.5
+    /// windows the weight at age `a` is `0.5 ^ (a / 1.5)`, which sits between
+    /// the one-window and two-window curves.
+    #[test]
+    fn ewma_outcomes_accepts_a_fractional_half_life() {
+        let limiter = outcome_limiter(
+            (5..=9)
+                .map(|id| {
+                    (
+                        id,
+                        outcome_window(vec![("a", reported_lease(id, 1_000, 1, 0))]),
+                    )
+                })
+                .collect(),
+        );
+
+        let sample = limiter.ewma_outcomes(10, 5, 1.5);
+        let expected: f64 = (0..5).map(|age| 0.5_f64.powf(f64::from(age) / 1.5)).sum();
+        assert!(
+            (sample.requests - expected).abs() < 1e-9,
+            "expected {expected}, got {}",
+            sample.requests
+        );
+
+        let one_window = limiter.ewma_outcomes(10, 5, 1.0);
+        let two_windows = limiter.ewma_outcomes(10, 5, 2.0);
+        assert!(sample.requests > one_window.requests);
+        assert!(sample.requests < two_windows.requests);
     }
 
     /// The decay is anchored on the window being leased, not on a clock read.
@@ -2065,9 +2090,9 @@ mod tests {
         ]);
 
         // Target 10: window 9 at weight 1, window 8 at weight 1/2.
-        assert!((limiter.ewma_outcomes(10, 5, 1).requests - (4.0 + 0.5)).abs() < 1e-9);
+        assert!((limiter.ewma_outcomes(10, 5, 1.0).requests - (4.0 + 0.5)).abs() < 1e-9);
         // Target 11, same file and no clock involved: both windows age by one.
-        assert!((limiter.ewma_outcomes(11, 5, 1).requests - (2.0 + 0.25)).abs() < 1e-9);
+        assert!((limiter.ewma_outcomes(11, 5, 1.0).requests - (2.0 + 0.25)).abs() < 1e-9);
     }
 
     /// A replica that did not report is dropped from the estimate. Reading it as
@@ -2083,7 +2108,7 @@ mod tests {
             outcome_window(vec![("a", reported_lease(9, 1_000, 1, 1)), ("b", silent)]),
         )]);
 
-        let sample = limiter.ewma_outcomes(10, 5, 1);
+        let sample = limiter.ewma_outcomes(10, 5, 1.0);
         assert!(
             (sample.requests - 2.0).abs() < 1e-9,
             "only replica a counts"
@@ -2108,7 +2133,7 @@ mod tests {
             ]),
         )]);
 
-        let sample = limiter.ewma_outcomes(10, 5, 1);
+        let sample = limiter.ewma_outcomes(10, 5, 1.0);
         assert!(
             (sample.requests - 1.0).abs() < 1e-9,
             "only the final lease counts"
@@ -2121,7 +2146,7 @@ mod tests {
     fn coefficient_of_an_empty_sample_is_full_admission() {
         let limiter = outcome_limiter(vec![]);
         let coefficient = limiter
-            .ewma_outcomes(10, 5, 1)
+            .ewma_outcomes(10, 5, 1.0)
             .coefficient(K_AT_HALF_THRESHOLD);
         assert!((coefficient - FULL_ADMISSION_COEFFICIENT).abs() < f64::EPSILON);
     }
@@ -2184,7 +2209,7 @@ mod tests {
         let window = Duration::from_millis(200);
         let mut cfg_a = config_for(10, "a", window);
         cfg_a.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
-        cfg_a.adaptive = Some(adaptive_config(1));
+        cfg_a.adaptive = Some(adaptive_config(1.0));
         let mut cfg_b = cfg_a.clone();
         cfg_b.instance_id = "b".to_string();
 
@@ -2235,7 +2260,7 @@ mod tests {
         let window = Duration::from_millis(150);
         let mut cfg_a = config_for(20, "a", window);
         cfg_a.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
-        cfg_a.adaptive = Some(adaptive_config(1));
+        cfg_a.adaptive = Some(adaptive_config(1.0));
         let mut cfg_b = cfg_a.clone();
         cfg_b.instance_id = "b".to_string();
 
