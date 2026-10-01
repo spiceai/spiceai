@@ -170,7 +170,10 @@ impl CayenneTableProvider {
         let index = self.index_mem_tier_segment(&batches).await;
         // Memory-resident tables have no checkpoint/seal writer. The write
         // guard therefore orders this reservation with every tier mutation.
-        let sequence = self.reserve_sequences_local(1).await?;
+        let sequence = self
+            .reserve_sequences_local(1)
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let next = tokio::task::spawn_blocking(move || {
             retained.append_segment_with_source_position(
                 batches,
