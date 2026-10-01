@@ -22,14 +22,18 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, OrderingRequirements, PhysicalSortExpr};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, InvariantLevel, check_default_invariants,
 };
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
@@ -78,7 +82,139 @@ pub fn sort_stream(
     }
 
     let schema = stream.schema();
+    let input: Arc<dyn ExecutionPlan> = Arc::new(StreamingExec::new(&schema, stream));
+    execute_stream(
+        sort_plan(input, sort_columns, context)?,
+        Arc::clone(context),
+    )
+}
 
+/// Wrap `stream` as a one-partition, bounded `ExecutionPlan` that yields it, so
+/// plan operators (repartitioning, projection, [`sort_plan`]) can be layered on
+/// top. The plan executes once.
+#[must_use]
+pub fn stream_plan(stream: SendableRecordBatchStream) -> Arc<dyn ExecutionPlan> {
+    let schema = stream.schema();
+    Arc::new(StreamingExec::new(&schema, stream))
+}
+
+/// Order `input` by `sort_columns` as a plan with one output partition.
+///
+/// When `context`'s memory pool can give every partition of `input` a sort of
+/// its own (see [`max_sort_partitions`]), each partition is sorted by its own
+/// spilling `SortExec` and a `SortPreservingMergeExec` combines them. The merge
+/// polls each input partition from its own task, so everything below it — each
+/// sort, and whatever `input` computes per partition — runs concurrently, not
+/// on the one task that drains the result. Otherwise the partitions are
+/// coalesced into one spilling `SortExec`, the plan a single sort always used.
+///
+/// It is all partitions or one, never a subset: sorts sharing a pool too small
+/// for them fail ("Not enough memory to continue external sort") where one
+/// sort spills and finishes, and re-partitioning the input down to fewer sorts
+/// with a round-robin `RepartitionExec` can deadlock a spilling sort under
+/// memory pressure.
+///
+/// Partitions `input` already delivers in this order (its advertised ordering
+/// satisfies the sort) are merged without being sorted again. The order equals
+/// a single sort of all of `input`'s rows; only the relative order of rows with
+/// equal keys may differ.
+///
+/// `sort_columns` follows [`sort_stream`]: an empty list, or one that does not
+/// resolve against `input`'s schema (logged), returns `input` unchanged, with
+/// its partitions still apart.
+///
+/// # Errors
+///
+/// Returns an error if the ordering or the repartitioning cannot be built.
+pub fn sort_plan(
+    input: Arc<dyn ExecutionPlan>,
+    sort_columns: &[String],
+    context: &TaskContext,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let Some(ordering) = build_lex_ordering(&input.schema(), sort_columns) else {
+        return Ok(input);
+    };
+    let already_ordered = input
+        .properties()
+        .equivalence_properties()
+        .ordering_satisfy(ordering.clone())?;
+    let partitions = input.properties().output_partitioning().partition_count();
+    if partitions == 0 {
+        // No partitions, no rows: nothing to order, and a sort would execute a
+        // partition the input does not have.
+        return Ok(input);
+    }
+    let sorted: Arc<dyn ExecutionPlan> = if already_ordered {
+        input
+    } else if partitions > 1 && partitions <= max_sort_partitions(context) {
+        tracing::debug!(
+            partitions,
+            "Sorting data by columns {:?} using a DataFusion SortExec per partition and SortPreservingMergeExec",
+            sort_columns
+        );
+        Arc::new(SortExec::new(ordering.clone(), input).with_preserve_partitioning(true))
+    } else {
+        tracing::debug!(
+            partitions,
+            "Sorting data by columns {:?} using one DataFusion SortExec",
+            sort_columns
+        );
+        let input: Arc<dyn ExecutionPlan> = if partitions > 1 {
+            Arc::new(CoalescePartitionsExec::new(input))
+        } else {
+            input
+        };
+        Arc::new(SortExec::new(ordering.clone(), input))
+    };
+    if sorted.properties().output_partitioning().partition_count() <= 1 {
+        return Ok(sorted);
+    }
+    Ok(Arc::new(SortPreservingMergeExec::new(ordering, sorted)))
+}
+
+/// Working memory [`sort_plan`] budgets for each partition it sorts, on top
+/// of that partition's `sort_spill_reservation_bytes`.
+///
+/// A spilling `SortExec` must buffer at least one batch before it can spill,
+/// and it fails ("Not enough memory to continue external sort") rather than
+/// spilling when its pool refuses it while it holds nothing. Sorts sharing one
+/// greedy pool with the scan feeding them can each be left holding nothing, so
+/// each is budgeted room for several wide batches (a batch of wide rows runs
+/// past 10 MiB).
+pub const SORT_PARTITION_WORKING_BYTES: usize = 128 * 1024 * 1024;
+
+/// The most partitions [`sort_plan`] sorts separately under `context`: as many
+/// as half of what a bounded memory pool has free gives each its
+/// `sort_spill_reservation_bytes` plus [`SORT_PARTITION_WORKING_BYTES`], and at
+/// least one. The other half is left to the scan and the merge. An unbounded
+/// pool imposes no cap. An input with more partitions than this is sorted as
+/// one.
+///
+/// Free, not total: another consumer already holding the pool — a concurrent
+/// rewrite of another table sharing a carved compaction pool, say — leaves
+/// less for these sorts, and planning a full set of them anyway is how they
+/// would run each other out of memory. Consumers that start after planning are
+/// not seen; a sort they starve fails with `DataFusion`'s external-sort error,
+/// as a lone sort starved by them would.
+#[must_use]
+pub fn max_sort_partitions(context: &TaskContext) -> usize {
+    let per_sort = context
+        .session_config()
+        .options()
+        .execution
+        .sort_spill_reservation_bytes
+        .saturating_add(SORT_PARTITION_WORKING_BYTES);
+    let pool = context.memory_pool();
+    match pool.memory_limit() {
+        MemoryLimit::Finite(limit) => (limit.saturating_sub(pool.reserved()) / 2 / per_sort).max(1),
+        MemoryLimit::Infinite | MemoryLimit::Unknown => usize::MAX,
+    }
+}
+
+/// The `LexOrdering` for `sort_columns` over `schema`, or `None` when the list
+/// is empty or — after a warning — an entry is malformed or names a column
+/// `schema` lacks.
+fn build_lex_ordering(schema: &SchemaRef, sort_columns: &[String]) -> Option<LexOrdering> {
     // Build sort expressions from configured sort_columns
     let mut sort_exprs = Vec::with_capacity(sort_columns.len());
     for entry in sort_columns {
@@ -100,7 +236,7 @@ pub fn sort_stream(
                 "Invalid sort column specification '{}', expected 'column [ASC|DESC] [NULLS FIRST|LAST]'. Skipping sort.",
                 entry
             );
-            return Ok(stream);
+            return None;
         };
 
         // Validate column exists in schema and get its index
@@ -109,7 +245,7 @@ pub fn sort_stream(
                 "Sort column '{}' not found in schema. Skipping sort.",
                 col_name
             );
-            return Ok(stream);
+            return None;
         };
 
         sort_exprs.push(PhysicalSortExpr {
@@ -118,27 +254,8 @@ pub fn sort_stream(
         });
     }
 
-    let lex_ordering = LexOrdering::new(sort_exprs).ok_or_else(|| {
-        DataFusionError::Execution(
-            "Failed to create lex ordering: sort expressions cannot be empty".to_string(),
-        )
-    })?;
-
-    tracing::debug!(
-        "Sorting data stream by columns {:?} using DataFusion SortExec",
-        sort_columns
-    );
-
-    // Create a streaming execution plan that yields the input stream
-    let stream_exec = Arc::new(StreamingExec::new(&schema, stream));
-
-    // Wrap with SortExec for external sorting with disk spilling
-    let sort_exec = Arc::new(SortExec::new(lex_ordering, stream_exec));
-
-    // Execute the sort
-    let sorted_stream = sort_exec.execute(0, Arc::clone(context))?;
-
-    Ok(sorted_stream)
+    // Empty only for an empty list, which means "do not sort".
+    LexOrdering::new(sort_exprs)
 }
 
 /// Parse one sort specification of the form
