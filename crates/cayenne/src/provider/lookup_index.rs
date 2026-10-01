@@ -133,11 +133,14 @@ const READ_BACK_POSITION_COLUMN: &str = "__cayenne_lookup_row_idx";
 /// `cayenne_lookup_index_probe_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProbeOutcome {
-    /// A row selection was attached to the scan.
+    /// A row selection was attached to the scan. Files no run covers yet are
+    /// read in full beside it.
     Selected,
-    /// The key has no posting, so the scan reads no file.
+    /// Every file the scan reads is covered and none holds the key, so the
+    /// scan reads no file.
     Empty,
-    /// No index covers the rows the lookup reads, so it read them in full.
+    /// None of the files the lookup reads is indexed yet, so it read them all
+    /// in full.
     Unbuilt,
 }
 
@@ -196,6 +199,10 @@ pub(crate) struct LookupIndexExplain {
     pub(crate) shape: Option<String>,
     pub(crate) outcome: LookupIndexExplainOutcome,
     pub(crate) candidate_files: Option<usize>,
+    /// Files the scan reads in full because no run covers them yet. On
+    /// `selected` they are part of `candidate_files`; on `unbuilt` they are
+    /// every file the scan reads.
+    pub(crate) uncovered_files: Option<usize>,
     pub(crate) candidate_rows: Option<u64>,
     /// Why the lookup scanned, when an indexed table's lookup did.
     pub(crate) reason: Option<LookupIndexScanReason>,
@@ -203,9 +210,9 @@ pub(crate) struct LookupIndexExplain {
 
 impl LookupIndexExplain {
     /// One decision for a scan that read several snapshots: selected when any
-    /// snapshot's files held a candidate, with their candidate files summed;
-    /// else
-    /// unbuilt when any snapshot's files were read in full; else empty.
+    /// snapshot's files held a candidate; else unbuilt when any snapshot's
+    /// files were read in full; else empty. A selected scan's candidate files
+    /// include the files of any snapshot read in full, which are uncovered.
     #[must_use]
     pub(crate) fn merge(self, other: Self) -> Self {
         use LookupIndexExplainOutcome::{Empty, NotApplicable, Selected, Unbuilt};
@@ -220,16 +227,25 @@ impl LookupIndexExplain {
         } else {
             (self.outcome, self.reason.or(other.reason))
         };
-        let sum_files = match (self.candidate_files, other.candidate_files) {
+        let sum = |a: Option<usize>, b: Option<usize>| match (a, b) {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
         };
+        let read_in_full = |explain: &Self| {
+            (explain.outcome == Unbuilt).then_some(explain.uncovered_files.unwrap_or(0))
+        };
+        let mut sum_files = sum(self.candidate_files, other.candidate_files);
+        if outcome == Selected {
+            sum_files = sum(sum_files, sum(read_in_full(&self), read_in_full(&other)));
+        }
+        let sum_uncovered = sum(self.uncovered_files, other.uncovered_files);
         // Every snapshot reports the selection's candidate rows, not its own.
         let sum_rows = self.candidate_rows.max(other.candidate_rows);
         Self {
             shape: self.shape.or(other.shape),
             outcome,
             candidate_files: sum_files,
+            uncovered_files: sum_uncovered,
             candidate_rows: sum_rows,
             reason: (outcome == NotApplicable).then_some(reason).flatten(),
         }
@@ -240,6 +256,7 @@ impl LookupIndexExplain {
             shape,
             outcome: LookupIndexExplainOutcome::NotApplicable,
             candidate_files: None,
+            uncovered_files: None,
             candidate_rows: None,
             reason: None,
         }
@@ -258,8 +275,18 @@ impl LookupIndexExplain {
             shape: Some(shape),
             outcome,
             candidate_files: None,
+            uncovered_files: None,
             candidate_rows: None,
             reason: None,
+        }
+    }
+
+    /// A lookup that read all `files` of its scan in full because none is
+    /// covered.
+    fn unbuilt(shape: String, files: usize) -> Self {
+        Self {
+            uncovered_files: Some(files),
+            ..Self::fallback(shape, LookupIndexExplainOutcome::Unbuilt)
         }
     }
 
@@ -273,6 +300,7 @@ impl LookupIndexExplain {
             shape: Some(shape),
             outcome,
             candidate_files,
+            uncovered_files: None,
             candidate_rows: Some(candidate_rows),
             reason: None,
         }
@@ -735,7 +763,7 @@ impl LookupSelection {
             return (
                 file_groups,
                 None,
-                LookupIndexExplain::fallback(self.shape, LookupIndexExplainOutcome::Unbuilt),
+                LookupIndexExplain::unbuilt(self.shape, uncovered),
                 true,
             );
         }
@@ -769,12 +797,15 @@ impl LookupSelection {
         (
             file_groups,
             Some(Arc::new(provider)),
-            LookupIndexExplain::selection(
-                self.shape,
-                LookupIndexExplainOutcome::Selected,
-                Some(candidate_files),
-                u64::try_from(self.rows).unwrap_or(u64::MAX),
-            ),
+            LookupIndexExplain {
+                uncovered_files: Some(uncovered),
+                ..LookupIndexExplain::selection(
+                    self.shape,
+                    LookupIndexExplainOutcome::Selected,
+                    Some(candidate_files),
+                    u64::try_from(self.rows).unwrap_or(u64::MAX),
+                )
+            },
             uncovered > 0,
         )
     }
@@ -1937,14 +1968,21 @@ impl LookupIndexState {
             self.record_runtime_fallback();
             return RuntimeProbe::Declined;
         };
-        if hit.rows == 0 {
+        // An uncovered file is read in full whatever the covered ones hold, so
+        // the probe is `empty` only when every file the scan reads is covered.
+        let uncovered = scan_files.len() - covered;
+        if hit.rows == 0 && uncovered == 0 {
             self.record_probe(&hit.shape, ProbeOutcome::Empty);
         } else {
-            self.record_selection(&hit.shape, hit.per_file.len() as u64, hit.rows as u64);
+            self.record_selection(
+                &hit.shape,
+                (hit.per_file.len() + uncovered) as u64,
+                hit.rows as u64,
+            );
         }
         RuntimeProbe::Selection {
             selection: RuntimeLookupSelection::new(Arc::clone(index), hit.per_file),
-            uncovered: covered < scan_files.len(),
+            uncovered: uncovered > 0,
         }
     }
 
@@ -3480,6 +3518,11 @@ mod tests {
                 .restrict(group(&["a.vortex", "b.vortex"]), no_table_plans());
         assert!(uncovered);
         assert_eq!(explain.outcome, LookupIndexExplainOutcome::Selected);
+        assert_eq!(
+            (explain.candidate_files, explain.uncovered_files),
+            (Some(2), Some(1)),
+            "the uncovered file is a candidate, and reported as read in full"
+        );
         let files: Vec<&PartitionedFile> = groups.iter().flat_map(FileGroup::iter).collect();
         assert_eq!(files.len(), 2);
         let provider = provider.expect("a selection");
@@ -3496,10 +3539,17 @@ mod tests {
             "an uncovered file is read as the table reads it"
         );
 
-        // A key in no covered file drops `a` but still reads `b`.
-        let (groups, _, _, uncovered) = selection(state.probe(Some(&view), &tenant_values(&[7])))
-            .restrict(group(&["a.vortex", "b.vortex"]), no_table_plans());
+        // A key in no covered file drops `a` but still reads `b`, so it is not
+        // `empty`.
+        let (groups, _, explain, uncovered) =
+            selection(state.probe(Some(&view), &tenant_values(&[7])))
+                .restrict(group(&["a.vortex", "b.vortex"]), no_table_plans());
         assert!(uncovered);
+        assert_eq!(explain.outcome, LookupIndexExplainOutcome::Selected);
+        assert_eq!(
+            (explain.candidate_files, explain.uncovered_files),
+            (Some(1), Some(1))
+        );
         let names: Vec<String> = groups
             .iter()
             .flat_map(FileGroup::iter)
@@ -3520,6 +3570,39 @@ mod tests {
                 .restrict(group(&["b.vortex"]), no_table_plans());
         assert!(uncovered && provider.is_none());
         assert_eq!(explain.outcome, LookupIndexExplainOutcome::Unbuilt);
+        assert_eq!(explain.uncovered_files, Some(1));
+    }
+
+    /// A scan over several snapshots, one of them read in full, is still one
+    /// selection, and the snapshot read in full counts among its candidate and
+    /// uncovered files.
+    #[test]
+    fn a_selection_merged_with_an_unbuilt_snapshot_counts_its_files() {
+        let selected = LookupIndexExplain {
+            uncovered_files: Some(1),
+            ..LookupIndexExplain::selection(
+                "TenantId".to_string(),
+                LookupIndexExplainOutcome::Selected,
+                Some(2),
+                4,
+            )
+        };
+        let unbuilt = LookupIndexExplain::unbuilt("TenantId".to_string(), 3);
+        for merged in [
+            selected.clone().merge(unbuilt.clone()),
+            unbuilt.merge(selected),
+        ] {
+            assert_eq!(merged.outcome, LookupIndexExplainOutcome::Selected);
+            assert_eq!(
+                (
+                    merged.candidate_files,
+                    merged.uncovered_files,
+                    merged.candidate_rows
+                ),
+                (Some(5), Some(4), Some(4)),
+                "{merged:?}"
+            );
+        }
     }
 
     #[tokio::test]

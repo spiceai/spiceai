@@ -3182,10 +3182,11 @@ pub mod cayenne {
 
     /// Counts secondary index probes by outcome, so an indexed run can be told
     /// apart from one that silently fell back to the ordinary scan. Outcomes (the
-    /// `outcome` dimension): `selected` (row selection attached), `empty`
-    /// (the covered files hold no candidate for the key), `unbuilt` (no index
-    /// run covers the files read). `dimensions` carries `table`, `shape` (the indexed columns,
-    /// as the `indexes` entry names them) and `outcome`.
+    /// `outcome` dimension): `selected` (row selection attached; files not
+    /// indexed yet are read in full beside it), `empty` (every file read is
+    /// indexed and none holds the key, so no file is read), `unbuilt` (none of
+    /// the files read is indexed yet). `dimensions` carries `table`, `shape`
+    /// (the indexed columns, as the `indexes` entry names them) and `outcome`.
     pub fn track_lookup_index_probe(dimensions: &[KeyValue]) {
         LOOKUP_INDEX_PROBE
             .get_or_init(|| {
