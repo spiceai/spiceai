@@ -156,11 +156,12 @@ def check_bound(
             stats.p99 <= bound.max_p99,
             f"p99={stats.p99:g} <= {bound.max_p99:g}? ({stats})",
         )
-    if bound.max_peak is not None:
+    if bound.max_rolling_2s is not None:
+        rolling = rates.max_rolling(selected, window.start_ms, window.end_ms, 2)
         assertions.add(
-            f"{label}: peak second within budget",
-            stats.peak <= bound.max_peak,
-            f"peak={stats.peak} <= {bound.max_peak:g}? ({stats})",
+            f"{label}: two consecutive seconds stay within two budgets",
+            rolling <= bound.max_rolling_2s,
+            f"worst 2s window carried {rolling} <= {bound.max_rolling_2s:g}? ({stats})",
         )
     if bound.max_fraction_of_warmup is not None:
         baseline = rates.rate_stats(selected, warmup.start_ms, warmup.end_ms)

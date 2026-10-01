@@ -272,11 +272,15 @@ straddle two windows and report a peak that was never spent. The statistic is
 Empty seconds inside the range are counted, so a throttled phase is not
 flattered by dropping its idle seconds.
 
-A whole second may legitimately carry **one request more** than the budget: a
-permit is spent when its window grants it and the request lands milliseconds
-later. The exact check is per rate-control window, in
-`loadgen/ratecontrol/state.py`, which reads the leased budget out of the shared
-state object rather than trusting wall-clock arrivals.
+**A single wall-clock second is not the limiter's window**, and a budget claim
+cannot be made on one. A permit is spent when its window grants it and the
+request lands milliseconds later, so a second can carry its own budget plus
+whatever crossed into it — and with N requests in flight, up to N can cross. The
+budget bound is therefore on any **two consecutive seconds** (`max_rolling_2s`,
+`2 x budget + 1`), which absorbs the crossing: a budget really being exceeded
+survives the sum, a boundary artefact does not. For cluster scenarios there is
+an exact check as well, in `loadgen/ratecontrol/state.py`, which reads the
+leased budget per window out of the shared state object.
 
 ### A single node and a cluster move at completely different speeds
 

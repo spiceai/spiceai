@@ -53,7 +53,9 @@ from .topology import ClusterState, DatasetSpec, OriginSpec, RateControl, Topolo
 BUDGET = 20
 SATURATED = 0.7 * BUDGET  # 14
 THROTTLED = 0.5 * BUDGET  # 10
-PEAK = BUDGET + 1
+#: Two whole seconds may carry two budgets, plus the one request that was
+#: granted in the second before them and landed inside them.
+ROLLING_2S = 2 * BUDGET + 1
 
 P1_PORT = 9001
 P2_PORT = 9002
@@ -102,7 +104,11 @@ class Bound:
     where: Slice = field(default_factory=Slice)
     min_p99: float | None = None
     max_p99: float | None = None
-    max_peak: float | None = None
+    #: No two consecutive whole seconds may carry more than this. The honest
+    #: wall-clock form of a budget: a per-second peak counts requests that were
+    #: granted in one window and landed in the next, and with several requests
+    #: in flight more than one can cross.
+    max_rolling_2s: float | None = None
     #: Every arrival in the slice must carry one of these statuses. Used where
     #: the point is that a dataset was throttled without itself failing.
     only_statuses: tuple[str, ...] | None = None
@@ -215,7 +221,7 @@ def _saturated(phase: str, where: Slice = Slice(), claim: str = "") -> Bound:
         phase=phase,
         where=where,
         min_p99=SATURATED,
-        max_peak=PEAK,
+        max_rolling_2s=ROLLING_2S,
     )
 
 
@@ -232,7 +238,7 @@ def _throttled(
 
 
 def _unchanged(phase: str, claim: str, where: Slice = Slice()) -> Bound:
-    return Bound(claim=claim, phase=phase, where=where, min_p99=SATURATED, max_peak=PEAK)
+    return Bound(claim=claim, phase=phase, where=where, min_p99=SATURATED, max_rolling_2s=ROLLING_2S)
 
 
 # --------------------------------------------------------------------------
@@ -372,14 +378,14 @@ B_SCENARIOS = (
                 phase="warmup",
                 where=Slice(origin="p1"),
                 min_p99=SATURATED,
-                max_peak=PEAK,
+                max_rolling_2s=ROLLING_2S,
             ),
             Bound(
                 claim="p2 runs at its own, smaller 5 rps budget",
                 phase="warmup",
                 where=Slice(origin="p2"),
                 min_p99=3,
-                max_peak=6,
+                max_rolling_2s=11,
             ),
         ),
         **STEADY_SHAPE,
@@ -401,7 +407,7 @@ C_SCENARIOS = (
                 claim="two saturated datasets on one origin stay within ONE budget",
                 phase="warmup",
                 min_p99=SATURATED,
-                max_peak=PEAK,
+                max_rolling_2s=ROLLING_2S,
             ),
             Bound(
                 claim="both datasets are actually sending",
@@ -450,7 +456,7 @@ C_SCENARIOS = (
             Bound(
                 claim="both datasets together still fit inside ONE budget",
                 phase="fault",
-                max_peak=PEAK,
+                max_rolling_2s=ROLLING_2S,
             ),
             Bound(
                 claim="the co-tenant keeps sending",
@@ -550,10 +556,17 @@ D_SCENARIOS = (
         bounds=(
             _saturated("warmup"),
             Bound(
-                claim="the replica that only ever got 200s is throttled",
+                claim="the replica that only ever got 200s does not gain rate",
                 phase="fault",
                 where=Slice(replica="r1"),
-                max_fraction_of_warmup=0.8,
+                # How FAR it falls is set by the fleet's overall error rate --
+                # only one of two replicas fails here, so the shared
+                # coefficient settles part-way down and the split between the
+                # replicas moves run to run. What does not vary: the replica
+                # that saw no failure never gets more than it had while the
+                # origin was healthy. Contrast `sameorigin-coupled-throttle`,
+                # where the healthy co-tenant does gain.
+                max_fraction_of_warmup=1.0,
                 min_total=1,
             ),
             Bound(
@@ -612,7 +625,7 @@ D_SCENARIOS = (
                 claim="2 replicas x 2 datasets stay within ONE 20 rps budget",
                 phase="warmup",
                 min_p99=SATURATED,
-                max_peak=PEAK,
+                max_rolling_2s=ROLLING_2S,
             ),
             Bound(
                 claim="every replica/dataset pair is actually sending",

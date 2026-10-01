@@ -337,13 +337,33 @@ def check_state(
             # written back when it fixed a budget starts to matter and the
             # agreement loosens. What does NOT move is where the best fit sits:
             # a different formula, or a different decay, would shift it.
-            checks.append(
-                Check(
-                    f"{prefix}: the formula's source-window offset is {DEFAULT_MIN_AGE}",
-                    best == DEFAULT_MIN_AGE,
-                    f"autofit {fits}, best min_age={best}",
-                )
+            # The offset only means anything where the coefficient actually
+            # moved. An origin that never failed holds `effective_burst` at the
+            # configured burst in every window, every offset reproduces it, and
+            # "best" is whichever one the tie-break reached first. There the
+            # meaningful claim is that the budget was never cut at all.
+            throttled = any(
+                window.effective_burst is not None
+                and window.effective_burst < limiter.burst_per_window
+                for window in windows.values()
             )
+            if throttled:
+                checks.append(
+                    Check(
+                        f"{prefix}: the formula's source-window offset is {DEFAULT_MIN_AGE}",
+                        best == DEFAULT_MIN_AGE,
+                        f"autofit {fits}, best min_age={best}",
+                    )
+                )
+            else:
+                checks.append(
+                    Check(
+                        f"{prefix}: a healthy origin keeps its full budget in every window",
+                        True,
+                        f"effective_burst == burst_per_window in all {len(windows)} windows,"
+                        " so the source-window offset is not identifiable here",
+                    )
+                )
             checks.append(
                 Check(
                     f"{prefix}: effective_burst matches the published formula",

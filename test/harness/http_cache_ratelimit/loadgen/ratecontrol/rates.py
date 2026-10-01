@@ -194,6 +194,25 @@ def read_arrivals(log_path: str, origin: str, path_to_dataset: dict[str, str]) -
     return out
 
 
+def max_rolling(arrivals: Iterable[Arrival], start_ms: int, end_ms: int, seconds: int = 2) -> int:
+    """The most arrivals any `seconds` consecutive whole seconds carried.
+
+    A single wall-clock second is not the limiter's window and cannot be: a
+    permit is spent when its window grants it and the request lands
+    milliseconds later, so a second can carry its own budget plus whatever
+    crossed into it, and with N requests in flight that is up to N. Summing
+    adjacent seconds absorbs the crossing — a budget really being exceeded
+    survives it, a boundary artefact does not.
+    """
+    counts = per_second(arrivals)
+    first = -(-start_ms // 1000)
+    last = end_ms // 1000
+    best = 0
+    for second in range(first, max(first, last - seconds + 1)):
+        best = max(best, sum(counts.get(second + offset, 0) for offset in range(seconds)))
+    return best
+
+
 def per_second(arrivals: Iterable[Arrival]) -> dict[int, int]:
     """Arrivals per whole unix second, for the seconds that had any."""
     counts: Counter[int] = Counter()
