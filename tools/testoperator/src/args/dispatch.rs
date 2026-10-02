@@ -735,7 +735,7 @@ schedule: weeky
 tests: {}
 ";
 
-        assert!(yaml::from_str::<DispatchTestFile>(yaml).is_err());
+        yaml::from_str::<DispatchTestFile>(yaml).expect_err("an unknown schedule must not parse");
     }
 
     #[test]
