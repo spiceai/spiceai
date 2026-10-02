@@ -1857,8 +1857,9 @@ pub struct CayenneTableProvider {
     /// ([`util::session_state::UserStatementWrite`]), which keeps its own
     /// semantics.
     resolves_repeated_keys: bool,
-    /// Bytes of input a streaming upsert write collapses in memory before it
-    /// splits the rest into layers; see [`super::overwrite_layers::CollapseWindow`].
+    /// Bytes of input a streaming write that resolves repeated keys collapses in
+    /// memory at a time, before it splits them into layers or, for a partition's
+    /// append, writes them; see [`super::overwrite_layers::CollapseWindow`].
     pub(crate) collapse_window_bytes: usize,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
@@ -5532,12 +5533,13 @@ impl CayenneTableProvider {
         self.clone_for_write()
     }
 
-    /// This provider, writing a user's statement: its writes keep statement
-    /// semantics instead of resolving the keys their data repeats per
-    /// `on_conflict` ([`util::session_state::UserStatementWrite`]).
+    /// This provider, writing a user's statement when `user_statement` is set:
+    /// its writes then keep statement semantics instead of resolving the keys
+    /// their data repeats per `on_conflict`
+    /// ([`util::session_state::UserStatementWrite`]).
     #[must_use]
-    pub fn for_user_statement(mut self) -> Self {
-        self.resolves_repeated_keys = false;
+    pub fn for_user_statement(mut self, user_statement: bool) -> Self {
+        self.resolves_repeated_keys &= !user_statement;
         self
     }
 

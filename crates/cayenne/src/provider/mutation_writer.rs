@@ -86,7 +86,7 @@ use super::mem_tier_budget;
 use super::on_conflict::PreparedOnConflictDeletionPublish;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
 use super::overwrite_layers::{
-    CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter, MAX_LAYER_ROWS,
+    CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter, MAX_LAYER_ROWS, Survivor,
 };
 use super::pk_index::PkDigestSet;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
@@ -1186,6 +1186,7 @@ impl<'a> AppendMutationWriter<'a> {
                     splitter,
                     Some(CollapseWindow::new(
                         self.table.collapse_window_bytes,
+                        Survivor::Latest,
                         window_reservation,
                     )),
                 ))

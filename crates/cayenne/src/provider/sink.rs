@@ -651,7 +651,7 @@ mod tests {
                     (
                         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
                         UpsertDedup::None,
-                        None,
+                        Some(vec![(1, 40), (2, 20)]),
                     ),
                     (
                         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),

@@ -1326,18 +1326,11 @@ impl CayenneTableProvider {
                     self.table_name()
                 ))
                 .register(&self.runtime_env().memory_pool);
-                let window = super::overwrite_layers::CollapseWindow::new(
+                Box::pin(super::overwrite_layers::CollapseStream::new(
+                    data,
+                    resolver,
                     self.collapse_window_bytes,
                     reservation,
-                );
-                let window = if resolver.policy() == super::key_conflicts::ConflictPolicy::KeepFirst
-                {
-                    window.keeping_first()
-                } else {
-                    window
-                };
-                Box::pin(super::overwrite_layers::CollapseStream::new(
-                    data, resolver, window,
                 ))
             }
         };

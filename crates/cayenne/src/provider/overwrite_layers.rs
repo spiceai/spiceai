@@ -37,8 +37,15 @@ limitations under the License.
 //! supersedes the copies below it the way any later write does; it uses the map
 //! only for the current layer, and cuts a layer at [`MAX_LAYER_ROWS`] to bound it.
 //!
-//! Under `drop` the first copy of a key wins, so a later copy must be dropped
-//! outright, which [`FirstCopyFilter`] does.
+//! Under `drop` the first copy of a key wins: an overwrite drops a later copy
+//! as the splitter admits it ([`Survivor::Earliest`]), and a streaming append,
+//! whose layers supersede by snapshot, drops it with [`FirstCopyFilter`].
+//!
+//! When the memory pool refuses to grow an overwrite's map, the next batch opens
+//! a new layer, and between layers — every admitted key located by then — the
+//! map is written to the spill directory as a run sorted by digest. Once every
+//! layer is written, the runs are merged with what the map still holds to find
+//! the superseded copies.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -55,7 +62,7 @@ use futures::Stream;
 use hash_index::PrehashedBuildHasher;
 use parking_lot::Mutex;
 
-use super::key_conflicts::{KeyResolver, ResolvedBatch};
+use super::key_conflicts::{ConflictPolicy, KeyResolver, ResolvedBatch};
 
 /// Rows one layer of a streaming append holds at most, which bounds the map of
 /// the layer it is writing.
@@ -68,12 +75,24 @@ pub(crate) const COLLAPSE_WINDOW_BYTES: usize = 128 * 1024 * 1024;
 /// A key's file before the write observer has seen its row land.
 const UNWRITTEN: u32 = u32::MAX;
 
-/// Which copy of a key a layered overwrite keeps: the last (the upsert
-/// policies) or the first (`drop`).
+/// Buffer size for writing and reading a spill run of 28-byte records.
+const SPILL_IO_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Which copy of a repeated key a write keeps: the last (the upsert policies)
+/// or the first (`drop`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Survivor {
     Latest,
     Earliest,
+}
+
+impl Survivor {
+    pub(crate) fn for_policy(policy: ConflictPolicy) -> Self {
+        match policy {
+            ConflictPolicy::KeepFirst => Self::Earliest,
+            ConflictPolicy::UpsertDropIdentical | ConflictPolicy::UpsertKeepLast => Self::Latest,
+        }
+    }
 }
 
 /// The copy of one admitted key the map tracks — the latest admitted under
@@ -104,8 +123,6 @@ pub(crate) struct KeyLayers {
     /// File-local positions of superseded copies, by file id.
     superseded: HashMap<u32, Vec<u32>>,
     superseded_rows: usize,
-    /// The layer the latest admitted batch belongs to.
-    admitted_layer: u32,
     /// Set when the memory pool refused the map's growth: the next batch opens a
     /// new layer, and the map is spilled before that layer starts.
     spill_pending: bool,
@@ -144,10 +161,11 @@ impl KeyLayers {
 }
 
 /// Whether a split write locates its keys and records the copies they
-/// supersede (an overwrite), or only keeps a layer free of repeats (an append).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// supersede (an overwrite, which spills its map to the given directory when the
+/// memory pool refuses it), or only keeps a layer free of repeats (an append).
+#[derive(Debug, Clone)]
 enum SplitMode {
-    Overwrite,
+    Overwrite(Arc<DiskManager>),
     Append,
 }
 
@@ -168,9 +186,6 @@ pub(crate) struct LayerSplitter {
     keys: Arc<Mutex<KeyLayers>>,
     mode: SplitMode,
     survivor: Survivor,
-    /// Where an overwrite spills its map when the memory pool refuses to grow it;
-    /// `None` fails the write instead.
-    spill: Option<Arc<DiskManager>>,
     layer: u32,
     layer_rows: usize,
     max_layer_rows: usize,
@@ -178,24 +193,26 @@ pub(crate) struct LayerSplitter {
 }
 
 impl LayerSplitter {
-    /// Split an overwrite, every layer of which joins one snapshot, keeping
-    /// `survivor` of each repeated key and spilling to `spill` when the memory
-    /// pool refuses the map.
+    /// Split an overwrite, every layer of which joins one snapshot, keeping the
+    /// copy of each repeated key the resolver's policy keeps, and spilling to
+    /// `spill` when the memory pool refuses the map.
     pub(crate) fn new(
         resolver: Arc<KeyResolver>,
         reservation: MemoryReservation,
-        survivor: Survivor,
-        spill: Option<Arc<DiskManager>>,
+        spill: Arc<DiskManager>,
     ) -> Self {
-        let mut splitter = Self::with_mode(resolver, usize::MAX, reservation, SplitMode::Overwrite);
-        splitter.survivor = survivor;
-        splitter.spill = spill;
-        splitter
+        Self::with_mode(
+            resolver,
+            usize::MAX,
+            reservation,
+            SplitMode::Overwrite(spill),
+        )
     }
 
-    /// Split an append, whose layers supersede by snapshot. When the memory
-    /// pool refuses the map of the layer being written, the next batch opens a
-    /// new layer, which starts a new map.
+    /// Split an append, whose layers supersede by snapshot, so a later copy of a
+    /// key always wins; `drop` appends filter with [`FirstCopyFilter`] instead.
+    /// When the memory pool refuses the map of the layer being written, the next
+    /// batch opens a new layer, which starts a new map.
     pub(crate) fn for_append(
         resolver: Arc<KeyResolver>,
         max_layer_rows: usize,
@@ -210,12 +227,12 @@ impl LayerSplitter {
         reservation: MemoryReservation,
         mode: SplitMode,
     ) -> Self {
+        let survivor = Survivor::for_policy(resolver.policy());
         Self {
             resolver,
             keys: Arc::new(Mutex::new(KeyLayers::default())),
             mode,
-            survivor: Survivor::Latest,
-            spill: None,
+            survivor,
             layer: 0,
             layer_rows: 0,
             max_layer_rows: max_layer_rows.max(1),
@@ -235,10 +252,6 @@ impl LayerSplitter {
         }
         drop(map);
         self
-    }
-
-    fn resolve(&self, batch: &RecordBatch) -> super::Result<ResolvedBatch> {
-        self.resolver.resolve_batch(batch)
     }
 
     /// Decide the batch's layer. The batch is admitted, and the copies it
@@ -282,18 +295,20 @@ impl LayerSplitter {
     /// spilled is kept, and resolved when the runs are merged.
     fn admit(&mut self, routed: Routed) -> super::Result<RecordBatch> {
         let Routed {
-            resolved, layer, ..
+            resolved,
+            layer,
+            starts_layer,
         } = routed;
+        let overwrite = matches!(self.mode, SplitMode::Overwrite(_));
         let mut keep: Option<Vec<bool>> = None;
         let bytes = {
             let mut keys = self.keys.lock();
-            if self.mode == SplitMode::Append && keys.admitted_layer != layer {
+            if !overwrite && starts_layer {
                 // An append's layers supersede by snapshot; the map only keeps
                 // the current one free of repeats.
                 keys.entries.clear();
                 keys.spill_pending = false;
             }
-            keys.admitted_layer = layer;
             for (row, &digest) in resolved.digests.iter().enumerate() {
                 let latest = KeyEntry {
                     layer,
@@ -314,7 +329,7 @@ impl LayerSplitter {
                 }
                 match keys.entries.insert(digest, latest) {
                     None => {}
-                    Some(earlier) if earlier.layer < layer && self.mode == SplitMode::Overwrite => {
+                    Some(earlier) if earlier.layer < layer && overwrite => {
                         if earlier.file == UNWRITTEN {
                             keys.fail(|| {
                                 "a key's earlier copy was not written before a later layer admitted it"
@@ -333,12 +348,9 @@ impl LayerSplitter {
             }
             keys.memory_bytes()
         };
-        if let Err(error) = self.reservation.try_resize(bytes) {
+        if self.reservation.try_resize(bytes).is_err() {
             // Cut the layer at the next batch rather than fail: an append's next
             // layer starts a new map, and an overwrite spills this one first.
-            if self.mode == SplitMode::Overwrite && self.spill.is_none() {
-                return Err(error.into());
-            }
             self.keys.lock().spill_pending = true;
         }
         match keep {
@@ -351,17 +363,42 @@ impl LayerSplitter {
     }
 }
 
+/// An internal error naming `table`, for a layered write whose bookkeeping
+/// went wrong.
+fn inconsistency(table: &str, message: &str) -> super::Error {
+    super::Error::Internal {
+        table: table.to_string(),
+        message: format!("Overwrite: {message}"),
+    }
+}
+
+/// `entries` sorted by digest, once every one of them is located.
+fn located_by_digest(
+    table: &str,
+    entries: HashMap<u128, KeyEntry, PrehashedBuildHasher>,
+) -> super::Result<Vec<(u128, KeyEntry)>> {
+    let mut entries: Vec<(u128, KeyEntry)> = entries.into_iter().collect();
+    if entries.iter().any(|(_, entry)| entry.file == UNWRITTEN) {
+        return Err(inconsistency(
+            table,
+            "a key was not written before its layer ended",
+        ));
+    }
+    entries.sort_unstable_by_key(|(digest, _)| *digest);
+    Ok(entries)
+}
+
 /// Write `entries`, sorted by digest, to a new spill file.
 fn write_run(
     disk: &Arc<DiskManager>,
-    mut entries: Vec<(u128, KeyEntry)>,
+    entries: &[(u128, KeyEntry)],
 ) -> super::Result<RefCountedTempFile> {
     use std::io::Write as _;
-    entries.sort_unstable_by_key(|(digest, _)| *digest);
     let mut file = disk.create_tmp_file("Cayenne layered refresh key spill")?;
     {
-        let mut out = std::io::BufWriter::new(file.inner().as_file());
-        for (digest, entry) in &entries {
+        let mut out =
+            std::io::BufWriter::with_capacity(SPILL_IO_BUFFER_BYTES, file.inner().as_file());
+        for (digest, entry) in entries {
             out.write_all(&digest.to_le_bytes())?;
             out.write_all(&entry.layer.to_le_bytes())?;
             out.write_all(&entry.file.to_le_bytes())?;
@@ -381,17 +418,24 @@ struct RunReader {
 impl RunReader {
     fn open(run: &RefCountedTempFile) -> super::Result<Self> {
         Ok(Self {
-            reader: std::io::BufReader::new(std::fs::File::open(run.path())?),
+            reader: std::io::BufReader::with_capacity(
+                SPILL_IO_BUFFER_BYTES,
+                std::fs::File::open(run.path())?,
+            ),
         })
     }
+}
 
-    fn next_entry(&mut self) -> super::Result<Option<(u128, KeyEntry)>> {
+impl Iterator for RunReader {
+    type Item = super::Result<(u128, KeyEntry)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
         use std::io::Read as _;
         let mut record = [0_u8; SPILLED_ENTRY_BYTES];
         match self.reader.read_exact(&mut record) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+            Err(error) => return Some(Err(error.into())),
         }
         let word = |at: usize| {
             let mut bytes = [0_u8; 4];
@@ -400,7 +444,7 @@ impl RunReader {
         };
         let mut digest = [0_u8; 16];
         digest.copy_from_slice(&record[..16]);
-        Ok(Some((
+        Some(Ok((
             u128::from_le_bytes(digest),
             KeyEntry {
                 layer: word(16),
@@ -411,45 +455,44 @@ impl RunReader {
     }
 }
 
+/// One sorted source of a merge: a spilled run, or what the map still holds.
+type MergeSource = Box<dyn Iterator<Item = super::Result<(u128, KeyEntry)>> + Send>;
+
+/// The next entry of each merge source, ordered by digest.
+type MergeHeap = std::collections::BinaryHeap<std::cmp::Reverse<(u128, usize, u32, u32, u32)>>;
+
+/// Push `source`'s next entry, if it has one.
+fn advance(heap: &mut MergeHeap, sources: &mut [MergeSource], source: usize) -> super::Result<()> {
+    if let Some(next) = sources[source].next() {
+        let (digest, entry) = next?;
+        heap.push(std::cmp::Reverse((
+            digest,
+            source,
+            entry.layer,
+            entry.file,
+            entry.position,
+        )));
+    }
+    Ok(())
+}
+
 /// Merge `runs` and the map's remaining `entries` (all sorted by digest) and
 /// return the position of every copy of a key other than its `survivor`: the
 /// highest layer's under [`Survivor::Latest`], the lowest's under
 /// [`Survivor::Earliest`]. Each run and the map hold at most one copy per key.
 fn merge_runs(
     runs: &[RefCountedTempFile],
-    mut entries: Vec<(u128, KeyEntry)>,
+    entries: Vec<(u128, KeyEntry)>,
     survivor: Survivor,
 ) -> super::Result<Vec<(u32, u32)>> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-    entries.sort_unstable_by_key(|(digest, _)| *digest);
-    let mut readers = runs
+    let mut sources = runs
         .iter()
-        .map(RunReader::open)
+        .map(|run| RunReader::open(run).map(|reader| Box::new(reader) as MergeSource))
         .collect::<super::Result<Vec<_>>>()?;
-    let mut in_memory = entries.into_iter();
-    // The next entry of each source: the runs, then the map at `readers.len()`.
-    let mut heap = BinaryHeap::new();
-    for (source, reader) in readers.iter_mut().enumerate() {
-        if let Some((digest, entry)) = reader.next_entry()? {
-            heap.push(Reverse((
-                digest,
-                source,
-                entry.layer,
-                entry.file,
-                entry.position,
-            )));
-        }
-    }
-    let map_source = readers.len();
-    if let Some((digest, entry)) = in_memory.next() {
-        heap.push(Reverse((
-            digest,
-            map_source,
-            entry.layer,
-            entry.file,
-            entry.position,
-        )));
+    sources.push(Box::new(entries.into_iter().map(Ok)));
+    let mut heap = MergeHeap::new();
+    for source in 0..sources.len() {
+        advance(&mut heap, &mut sources, source)?;
     }
     let mut superseded = Vec::new();
     let mut group: Vec<(u32, u32, u32)> = Vec::new();
@@ -469,26 +512,13 @@ fn merge_runs(
         }
         group.clear();
     };
-    while let Some(Reverse((digest, source, layer, file, position))) = heap.pop() {
+    while let Some(std::cmp::Reverse((digest, source, layer, file, position))) = heap.pop() {
         if group_digest != Some(digest) {
             flush(&mut group, &mut superseded);
             group_digest = Some(digest);
         }
         group.push((layer, file, position));
-        let next = if source == map_source {
-            in_memory.next()
-        } else {
-            readers[source].next_entry()?
-        };
-        if let Some((digest, entry)) = next {
-            heap.push(Reverse((
-                digest,
-                source,
-                entry.layer,
-                entry.file,
-                entry.position,
-            )));
-        }
+        advance(&mut heap, &mut sources, source)?;
     }
     flush(&mut group, &mut superseded);
     Ok(superseded)
@@ -553,21 +583,21 @@ impl vortex_datafusion::VortexWriteObserver for KeyLocator {
     }
 }
 
-/// Collapses the batches of a bounded window of the input — the last copy of a
-/// key within the window wins — before the splitter sees them, so a key the
-/// window repeats never opens a layer or leaves a tombstone. Each batch is
-/// resolved on arrival, so the work done per poll stays one batch's worth.
+/// Collapses the batches of a bounded window of the input — keeping the last
+/// copy of a key within the window, or the first under `drop` — before they are
+/// routed or written, so a key the window repeats never opens a layer or leaves
+/// a tombstone. Each batch is resolved on arrival, so the work done per poll
+/// stays one batch's worth.
 pub(crate) struct CollapseWindow {
     max_bytes: usize,
     batches: Vec<ResolvedBatch>,
     bytes: usize,
-    /// The window position of each key's last copy.
+    /// The window position of each key's surviving copy.
     survivor: HashMap<u128, (usize, usize), PrehashedBuildHasher>,
     /// Whether the window holds a key more than once; when it does not, every
     /// row survives and the drain filters nothing.
     repeats: bool,
-    /// Keep a key's first copy in the window (`drop`) rather than its last.
-    keep_first: bool,
+    keeps: Survivor,
     /// Set when the memory pool refused the window's growth: the window drains
     /// at once, smaller than its bound, rather than failing the write.
     refused: bool,
@@ -575,29 +605,23 @@ pub(crate) struct CollapseWindow {
 }
 
 impl CollapseWindow {
-    pub(crate) fn new(max_bytes: usize, reservation: MemoryReservation) -> Self {
+    pub(crate) fn new(max_bytes: usize, keeps: Survivor, reservation: MemoryReservation) -> Self {
         Self {
             max_bytes: max_bytes.max(1),
             batches: Vec::new(),
             bytes: 0,
             survivor: HashMap::with_hasher(PrehashedBuildHasher),
             repeats: false,
-            keep_first: false,
+            keeps,
             refused: false,
             reservation,
         }
     }
 
-    /// Keep the first copy of a key the window repeats, as `drop` does.
-    pub(crate) fn keeping_first(mut self) -> Self {
-        self.keep_first = true;
-        self
-    }
-
     fn push(&mut self, resolved: ResolvedBatch) {
         let index = self.batches.len();
         for (row, &digest) in resolved.digests.iter().enumerate() {
-            if self.keep_first {
+            if self.keeps == Survivor::Earliest {
                 match self.survivor.entry(digest) {
                     std::collections::hash_map::Entry::Occupied(_) => self.repeats = true,
                     std::collections::hash_map::Entry::Vacant(slot) => {
@@ -673,15 +697,93 @@ impl CollapseWindow {
     }
 }
 
-struct LayerSourceState {
+/// Resolves each input batch's own repeats and, with a window, the repeats a
+/// window holds, yielding the resolved batches one at a time.
+struct Collapser {
     input: SendableRecordBatchStream,
-    splitter: LayerSplitter,
+    resolver: Arc<KeyResolver>,
     window: Option<CollapseWindow>,
-    /// Resolved batches waiting to be routed.
+    /// Resolved batches waiting to be yielded.
     ready: VecDeque<ResolvedBatch>,
+    exhausted: bool,
+}
+
+impl Collapser {
+    fn new(
+        input: SendableRecordBatchStream,
+        resolver: Arc<KeyResolver>,
+        window: Option<CollapseWindow>,
+    ) -> Self {
+        Self {
+            input,
+            resolver,
+            window,
+            ready: VecDeque::new(),
+            exhausted: false,
+        }
+    }
+
+    /// The next non-empty resolved batch. After an error the collapser yields
+    /// nothing more.
+    fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<datafusion_common::Result<ResolvedBatch>>> {
+        loop {
+            if let Some(resolved) = self.ready.pop_front() {
+                if resolved.batch.num_rows() == 0 {
+                    continue;
+                }
+                return Poll::Ready(Some(Ok(resolved)));
+            }
+            if self.exhausted {
+                return Poll::Ready(None);
+            }
+            let step: super::Result<()> = match self.input.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(batch))) => {
+                    self.resolver.resolve_batch(&batch).and_then(|resolved| {
+                        match self.window.as_mut() {
+                            None => {
+                                self.ready.push_back(resolved);
+                                Ok(())
+                            }
+                            Some(window) => {
+                                window.push(resolved);
+                                if window.is_full() {
+                                    self.ready = window.drain()?;
+                                }
+                                Ok(())
+                            }
+                        }
+                    })
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.exhausted = true;
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(None) => {
+                    self.exhausted = true;
+                    match self.window.as_mut() {
+                        Some(window) => window.drain().map(|ready| self.ready = ready),
+                        None => Ok(()),
+                    }
+                }
+                Poll::Pending => return Poll::Pending,
+            };
+            if let Err(error) = step {
+                self.exhausted = true;
+                self.ready.clear();
+                return Poll::Ready(Some(Err(error.into())));
+            }
+        }
+    }
+}
+
+struct LayerSourceState {
+    collapser: Collapser,
+    splitter: LayerSplitter,
     /// The batch that opened the next layer, held until that layer's stream starts.
     carry: Option<Routed>,
-    exhausted: bool,
 }
 
 /// Splits an overwrite's input into one stream per layer: [`Self::next_layer`]
@@ -693,22 +795,21 @@ pub(crate) struct LayerSource {
 }
 
 impl LayerSource {
-    /// `window` collapses bounded windows of the input before they are routed;
-    /// only for policies under which the last copy of a key wins.
+    /// `window` collapses bounded windows of the input before they are routed,
+    /// so a key repeated within one opens no layer. A write that drops later
+    /// copies on admission (`drop`) needs none.
     pub(crate) fn new(
         input: SendableRecordBatchStream,
         splitter: LayerSplitter,
         window: Option<CollapseWindow>,
     ) -> Self {
         let schema = input.schema();
+        let collapser = Collapser::new(input, Arc::clone(&splitter.resolver), window);
         Self {
             state: Arc::new(Mutex::new(LayerSourceState {
-                input,
+                collapser,
                 splitter,
-                window,
-                ready: VecDeque::new(),
                 carry: None,
-                exhausted: false,
             })),
             schema,
             next_layer: 0,
@@ -751,28 +852,32 @@ impl LayerSource {
 
     /// Spill the map to disk if the memory pool refused its growth. Call only
     /// between layers: every admitted key has been written and located then.
+    /// Only the map's swap happens under the lock; sorting and writing it run on
+    /// the blocking pool.
     pub(crate) async fn spill_if_pending(&self) -> super::Result<()> {
-        let (entries, disk) = {
+        let (entries, disk, table) = {
             let state = self.state.lock();
             let splitter = &state.splitter;
-            let mut keys = splitter.keys.lock();
-            if !keys.spill_pending || splitter.mode != SplitMode::Overwrite {
-                return Ok(());
-            }
-            let Some(disk) = splitter.spill.as_ref().map(Arc::clone) else {
+            let SplitMode::Overwrite(disk) = &splitter.mode else {
                 return Ok(());
             };
+            let mut keys = splitter.keys.lock();
+            if !keys.spill_pending {
+                return Ok(());
+            }
             keys.spill_pending = false;
-            let entries: Vec<(u128, KeyEntry)> =
-                std::mem::take(&mut keys.entries).into_iter().collect();
-            (entries, disk)
+            (
+                std::mem::take(&mut keys.entries),
+                Arc::clone(disk),
+                splitter.resolver.table_name().to_string(),
+            )
         };
-        if entries.iter().any(|(_, entry)| entry.file == UNWRITTEN) {
-            return Err(self.inconsistent("a spilled key was not written before its layer ended"));
-        }
-        let run = tokio::task::spawn_blocking(move || write_run(&disk, entries))
-            .await
-            .map_err(|error| self.inconsistent(&format!("key spill task failed: {error}")))??;
+        let run = tokio::task::spawn_blocking(move || {
+            let entries = located_by_digest(&table, entries)?;
+            write_run(&disk, &entries)
+        })
+        .await
+        .map_err(|error| self.inconsistent(&format!("key spill task failed: {error}")))??;
         let state = self.state.lock();
         let bytes = {
             let mut keys = state.splitter.keys.lock();
@@ -786,72 +891,60 @@ impl LayerSource {
     }
 
     fn inconsistent(&self, message: &str) -> super::Error {
-        super::Error::Internal {
-            table: self.state.lock().splitter.resolver.table_name().to_string(),
-            message: format!("Overwrite: {message}"),
-        }
+        inconsistency(self.state.lock().splitter.resolver.table_name(), message)
     }
 
     /// The file-local positions of the copies later layers superseded, by data
     /// file location, sorted; taken once every layer is written. Merges the
-    /// spilled runs, if any, with the map.
+    /// spilled runs, if any, with the map, on the blocking pool.
     ///
     /// # Errors
     ///
     /// Returns an error if a written row could not be located, which leaves
     /// which copies to hide unknown, or a spilled run cannot be read back.
-    pub(crate) async fn take_superseded(
-        &self,
-        table: &str,
-    ) -> super::Result<HashMap<String, Vec<u32>>> {
-        let (runs, entries, survivor) = {
+    pub(crate) async fn take_superseded(&self) -> super::Result<HashMap<String, Vec<u32>>> {
+        let (table, runs, entries, mut superseded, files, survivor) = {
             let state = self.state.lock();
+            let table = state.splitter.resolver.table_name().to_string();
             let mut keys = state.splitter.keys.lock();
             if let Some(message) = keys.failure.take() {
-                return Err(super::Error::Internal {
-                    table: table.to_string(),
-                    message: format!("Overwrite: {message}"),
-                });
+                return Err(inconsistency(&table, &message));
             }
             let runs = std::mem::take(&mut keys.runs);
-            let entries: Vec<(u128, KeyEntry)> = if runs.is_empty() {
-                Vec::new()
+            // Without runs the map holds no key twice, so it supersedes nothing.
+            let entries = if runs.is_empty() {
+                HashMap::with_hasher(PrehashedBuildHasher)
             } else {
-                std::mem::take(&mut keys.entries).into_iter().collect()
+                std::mem::take(&mut keys.entries)
             };
-            (runs, entries, state.splitter.survivor)
+            keys.superseded_rows = 0;
+            (
+                table,
+                runs,
+                entries,
+                std::mem::take(&mut keys.superseded),
+                std::mem::take(&mut keys.files),
+                state.splitter.survivor,
+            )
         };
-        if !runs.is_empty() {
-            if entries.iter().any(|(_, entry)| entry.file == UNWRITTEN) {
-                return Err(super::Error::Internal {
-                    table: table.to_string(),
-                    message: "Overwrite: a written row was not located".to_string(),
-                });
+        tokio::task::spawn_blocking(move || {
+            if !runs.is_empty() {
+                let entries = located_by_digest(&table, entries)?;
+                for (file, position) in merge_runs(&runs, entries, survivor)? {
+                    superseded.entry(file).or_default().push(position);
+                }
             }
-            let merged = tokio::task::spawn_blocking(move || merge_runs(&runs, entries, survivor))
-                .await
-                .map_err(|error| super::Error::Internal {
-                    table: table.to_string(),
-                    message: format!("Overwrite: key merge task failed: {error}"),
-                })??;
-            let state = self.state.lock();
-            let mut keys = state.splitter.keys.lock();
-            for (file, position) in merged {
-                keys.superseded.entry(file).or_default().push(position);
-                keys.superseded_rows += 1;
-            }
-        }
-        let state = self.state.lock();
-        let mut keys = state.splitter.keys.lock();
-        let superseded = std::mem::take(&mut keys.superseded);
-        Ok(superseded
-            .into_iter()
-            .map(|(file, mut positions)| {
-                positions.sort_unstable();
-                positions.dedup();
-                (keys.files[file as usize].to_string(), positions)
-            })
-            .collect())
+            Ok(superseded
+                .into_iter()
+                .map(|(file, mut positions)| {
+                    positions.sort_unstable();
+                    positions.dedup();
+                    (files[file as usize].to_string(), positions)
+                })
+                .collect())
+        })
+        .await
+        .map_err(|error| self.inconsistent(&format!("key merge task failed: {error}")))?
     }
 }
 
@@ -891,52 +984,27 @@ impl Stream for LayerStream {
             }
         }
         loop {
-            if let Some(resolved) = state.ready.pop_front() {
-                let Some(routed) = state.splitter.route(resolved) else {
-                    continue;
-                };
-                if routed.starts_layer {
-                    state.carry = Some(routed);
+            match state.collapser.poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
                     this.done = true;
                     return Poll::Ready(None);
-                }
-                return Poll::Ready(Some(Self::accept(state, routed)));
-            }
-            if state.exhausted {
-                this.done = true;
-                return Poll::Ready(None);
-            }
-            let step: super::Result<()> = match state.input.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(batch))) => {
-                    state.splitter.resolve(&batch).and_then(|resolved| {
-                        match state.window.as_mut() {
-                            None => state.ready.push_back(resolved),
-                            Some(window) => {
-                                window.push(resolved);
-                                if window.is_full() {
-                                    state.ready = window.drain()?;
-                                }
-                            }
-                        }
-                        Ok(())
-                    })
                 }
                 Poll::Ready(Some(Err(error))) => {
                     this.done = true;
                     return Poll::Ready(Some(Err(error)));
                 }
-                Poll::Ready(None) => {
-                    state.exhausted = true;
-                    match state.window.as_mut() {
-                        Some(window) => window.drain().map(|ready| state.ready = ready),
-                        None => Ok(()),
+                Poll::Ready(Some(Ok(resolved))) => {
+                    let Some(routed) = state.splitter.route(resolved) else {
+                        continue;
+                    };
+                    if routed.starts_layer {
+                        state.carry = Some(routed);
+                        this.done = true;
+                        return Poll::Ready(None);
                     }
+                    return Poll::Ready(Some(Self::accept(state, routed)));
                 }
-                Poll::Pending => return Poll::Pending,
-            };
-            if let Err(error) = step {
-                this.done = true;
-                return Poll::Ready(Some(Err(error.into())));
             }
         }
     }
@@ -953,25 +1021,26 @@ impl RecordBatchStream for LayerStream {
 /// resolves repeats this close together, and leaves a key repeated across
 /// windows for its conflict validation to reject, as it would without it.
 pub(crate) struct CollapseStream {
-    input: SendableRecordBatchStream,
-    resolver: KeyResolver,
-    window: CollapseWindow,
-    ready: VecDeque<ResolvedBatch>,
-    exhausted: bool,
+    collapser: Collapser,
+    schema: SchemaRef,
 }
 
 impl CollapseStream {
     pub(crate) fn new(
         input: SendableRecordBatchStream,
         resolver: KeyResolver,
-        window: CollapseWindow,
+        window_bytes: usize,
+        reservation: MemoryReservation,
     ) -> Self {
+        let schema = input.schema();
+        let window = CollapseWindow::new(
+            window_bytes,
+            Survivor::for_policy(resolver.policy()),
+            reservation,
+        );
         Self {
-            input,
-            resolver,
-            window,
-            ready: VecDeque::new(),
-            exhausted: false,
+            collapser: Collapser::new(input, Arc::new(resolver), Some(window)),
+            schema,
         }
     }
 }
@@ -980,46 +1049,16 @@ impl Stream for CollapseStream {
     type Item = datafusion_common::Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(resolved) = this.ready.pop_front() {
-                if resolved.batch.num_rows() == 0 {
-                    continue;
-                }
-                return Poll::Ready(Some(Ok(resolved.batch)));
-            }
-            if this.exhausted {
-                return Poll::Ready(None);
-            }
-            let step: super::Result<()> = match this.input.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(batch))) => {
-                    this.resolver.resolve_batch(&batch).and_then(|resolved| {
-                        this.window.push(resolved);
-                        if this.window.is_full() {
-                            this.ready = this.window.drain()?;
-                        }
-                        Ok(())
-                    })
-                }
-                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
-                Poll::Ready(None) => {
-                    this.exhausted = true;
-                    this.window.drain().map(|ready| this.ready = ready)
-                }
-                Poll::Pending => return Poll::Pending,
-            };
-            if let Err(error) = step {
-                this.exhausted = true;
-                this.ready.clear();
-                return Poll::Ready(Some(Err(error.into())));
-            }
-        }
+        self.get_mut()
+            .collapser
+            .poll_next(cx)
+            .map(|next| next.map(|resolved| resolved.map(|resolved| resolved.batch)))
     }
 }
 
 impl RecordBatchStream for CollapseStream {
     fn schema(&self) -> SchemaRef {
-        self.input.schema()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -1176,13 +1215,12 @@ mod tests {
         let splitter = LayerSplitter::new(
             Arc::new(resolver(policy)),
             MemoryConsumer::new("keys").register(&pool),
-            survivor,
-            Some(Arc::clone(&env.disk_manager)),
+            Arc::clone(&env.disk_manager),
         );
         let mut source = LayerSource::new(input(batches), splitter, window);
         let layers = drain(&mut source, true).await;
         let mut superseded: Vec<_> = source
-            .take_superseded("t")
+            .take_superseded()
             .await
             .expect("superseded")
             .into_iter()
@@ -1284,7 +1322,11 @@ mod tests {
         ];
         let (layers, superseded) = overwrite_layers(
             batches,
-            Some(CollapseWindow::new(COLLAPSE_WINDOW_BYTES, reservation())),
+            Some(CollapseWindow::new(
+                COLLAPSE_WINDOW_BYTES,
+                Survivor::Latest,
+                reservation(),
+            )),
         )
         .await;
         assert_eq!(layers, vec![owned(&[(1, "c"), (3, "d"), (2, "e")])]);
@@ -1295,7 +1337,11 @@ mod tests {
     async fn a_window_without_repeats_passes_every_row_through() {
         let (layers, superseded) = overwrite_layers(
             vec![batch(&[(1, "a"), (2, "b")]), batch(&[(3, "c")])],
-            Some(CollapseWindow::new(COLLAPSE_WINDOW_BYTES, reservation())),
+            Some(CollapseWindow::new(
+                COLLAPSE_WINDOW_BYTES,
+                Survivor::Latest,
+                reservation(),
+            )),
         )
         .await;
         assert_eq!(layers, vec![owned(&[(1, "a"), (2, "b"), (3, "c")])]);
@@ -1309,7 +1355,7 @@ mod tests {
         const BOUND: usize = 8 * 1024 * 1024;
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let reservation = MemoryConsumer::new("window").register(&pool);
-        let mut window = CollapseWindow::new(BOUND, reservation);
+        let mut window = CollapseWindow::new(BOUND, Survivor::Latest, reservation);
         let resolver = resolver(ConflictPolicy::UpsertKeepLast);
         let mut peak = 0;
         let mut next_id = 0_i64;
@@ -1343,7 +1389,7 @@ mod tests {
         // A one-byte window flushes after every batch.
         let (layers, superseded) = overwrite_layers(
             vec![batch(&[(1, "a"), (2, "b")]), batch(&[(1, "c")])],
-            Some(CollapseWindow::new(1, reservation())),
+            Some(CollapseWindow::new(1, Survivor::Latest, reservation())),
         )
         .await;
         assert_eq!(
@@ -1357,11 +1403,13 @@ mod tests {
     async fn an_unlocated_earlier_copy_fails_the_write() {
         // Without the observer, layer 0's rows are never located, so layer 1
         // cannot tell where the copy it supersedes is.
+        let env = datafusion_execution::runtime_env::RuntimeEnvBuilder::new()
+            .build_arc()
+            .expect("runtime env");
         let splitter = LayerSplitter::new(
             Arc::new(resolver(ConflictPolicy::UpsertKeepLast)),
             reservation(),
-            Survivor::Latest,
-            None,
+            Arc::clone(&env.disk_manager),
         );
         let mut source = LayerSource::new(
             input(vec![batch(&[(1, "a")]), batch(&[(1, "b")])]),
@@ -1370,7 +1418,7 @@ mod tests {
         );
         drain(&mut source, false).await;
         let error = source
-            .take_superseded("t")
+            .take_superseded()
             .await
             .expect_err("an unlocated earlier copy must fail the write");
         assert!(error.to_string().contains("not written before"), "{error}");

@@ -75,7 +75,6 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
-use super::key_conflicts::ConflictPolicy;
 use super::mutation_writer::InlineBatchBuffer;
 use super::overwrite_layers::{CollapseWindow, LayerSource, LayerSplitter, Survivor};
 use super::table::{
@@ -684,19 +683,17 @@ impl CayenneTableProvider {
         let data: SendableRecordBatchStream = match self.key_resolver()? {
             None => data,
             Some(resolver) => {
-                let window_reservation = reservation.new_empty();
-                let (survivor, window) = if resolver.policy() == ConflictPolicy::KeepFirst {
-                    (
-                        Survivor::Earliest,
-                        CollapseWindow::new(self.collapse_window_bytes, window_reservation)
-                            .keeping_first(),
+                // Under `drop` the splitter drops a later copy as it admits it, so
+                // only the upsert policies need a window to keep a repeat from
+                // opening a layer.
+                let survivor = Survivor::for_policy(resolver.policy());
+                let window = (survivor == Survivor::Latest).then(|| {
+                    CollapseWindow::new(
+                        self.collapse_window_bytes,
+                        survivor,
+                        reservation.new_empty(),
                     )
-                } else {
-                    (
-                        Survivor::Latest,
-                        CollapseWindow::new(self.collapse_window_bytes, window_reservation),
-                    )
-                };
+                });
                 // A refresh usually holds about the keys of the table it replaces;
                 // the pool caps the size.
                 let expected_keys = self
@@ -706,11 +703,10 @@ impl CayenneTableProvider {
                 let splitter = LayerSplitter::new(
                     Arc::new(resolver),
                     reservation,
-                    survivor,
-                    Some(Arc::clone(&self.runtime_env().disk_manager)),
+                    Arc::clone(&self.runtime_env().disk_manager),
                 )
                 .with_expected_keys(expected_keys);
-                let mut source = LayerSource::new(data, splitter, Some(window));
+                let mut source = LayerSource::new(data, splitter, window);
                 let main = self.first_layer(&mut source)?;
                 layer_source = Some(source);
                 main
@@ -1116,7 +1112,7 @@ impl CayenneTableProvider {
         self.sync_local_snapshot_dir(snapshot_id)
             .await
             .map_err(|source| super::Error::Catalog { source })?;
-        let superseded = source.take_superseded(self.table_name()).await?;
+        let superseded = source.take_superseded().await?;
         Ok((rows, superseded))
     }
 
