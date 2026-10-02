@@ -13,7 +13,7 @@ expression: response
   ],
   "sql": {
     "engine": "Apache DataFusion",
-    "version": "54.1.0",
+    "version": "55.1.0",
     "dialect": "PostgreSQL",
     "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
     "notes": [
@@ -368,9 +368,7 @@ expression: response
         "csc",
         "date_add",
         "date_diff",
-        "date_part",
         "date_sub",
-        "date_trunc",
         "elt",
         "expm1",
         "factorial",
@@ -417,7 +415,6 @@ expression: response
         "substring",
         "time_trunc",
         "to_utc_timestamp",
-        "trunc",
         "try_parse_url",
         "try_url_decode",
         "unbase64",

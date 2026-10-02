@@ -38,7 +38,7 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
-use datafusion::sql::{ResolvedTableReference, TableReference};
+use datafusion::common::{ResolvedTableReference, TableReference};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 

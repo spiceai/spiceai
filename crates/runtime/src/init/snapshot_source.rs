@@ -20,7 +20,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_acceleration::Engine;
 use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotManager};
 use runtime_metrics as metrics;

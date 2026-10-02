@@ -1465,7 +1465,14 @@ impl<'a> AppendMutationWriter<'a> {
                 // distinct-count for free when the inline memtable later spills to
                 // a Vortex file at checkpoint (`write_to_snapshot` folds NDV
                 // there). Min/max/null-count stats are maintained regardless.
-                let stats_acc = ColumnStatsAccumulator::new_with_ndv(&schema, false);
+                let stats_acc =
+                    ColumnStatsAccumulator::new_with_ndv(&schema, false).map_err(|e| {
+                        super::Error::Vortex {
+                            operation: "derive the column statistics types from the table schema",
+                            table: self.table.table_name().to_string(),
+                            source: Box::new(e),
+                        }
+                    })?;
                 for batch in buffer.batches() {
                     stats_acc.update(batch);
                 }

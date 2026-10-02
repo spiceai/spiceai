@@ -34,7 +34,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::util::pretty::pretty_format_batches;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use chrono::Utc;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 #[cfg(feature = "duckdb")]
 use duckdb::Connection;
 use futures::{StreamExt, future::try_join_all};

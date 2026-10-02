@@ -18,8 +18,7 @@ use crate::odbcconn::ODBCDbConnectionPool;
 use async_trait::async_trait;
 use data_components::function_support::FunctionSupport;
 use datafusion::{
-    datasource::TableProvider,
-    sql::{TableReference, unparser::dialect::Dialect},
+    common::TableReference, datasource::TableProvider, sql::unparser::dialect::Dialect,
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
 use snafu::prelude::*;

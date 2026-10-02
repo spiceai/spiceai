@@ -42,6 +42,7 @@ use arrow::util::display::array_value_to_string;
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 use common::TestFixture;
+use datafusion::common::config::ConfigNonZeroUsize;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use runtime_datafusion::session_config::get_df_default_config;
@@ -192,7 +193,10 @@ async fn an_aggregate_dynamic_filter_keeps_rows_an_expression_aggregate_needs_im
     // Each file's first row group fixes MIN(a), MAX(a) and MAX(b); its second
     // holds the minimum c and cannot improve the other three. Two rows per batch
     // let the filter tighten between the two, whichever file is read first.
-    let parquet = spice_session(|config| config.options_mut().execution.batch_size = 2);
+    let parquet = spice_session(|config| {
+        config.options_mut().execution.batch_size =
+            ConfigNonZeroUsize::try_new(2).expect("non-zero batch size");
+    });
     let dir = fixture.data_path.join("agg_dyn_mixed");
     std::fs::create_dir_all(&dir)?;
     for file in ["file_0.parquet", "file_1.parquet"] {
@@ -309,7 +313,8 @@ async fn a_topk_dynamic_filter_maps_same_named_columns_by_position_impl(
     // tightens its filter before the later orders are read.
     let ctx = spice_session(|config| {
         config.options_mut().execution.target_partitions = 1;
-        config.options_mut().execution.batch_size = 1;
+        config.options_mut().execution.batch_size =
+            ConfigNonZeroUsize::try_new(1).expect("non-zero batch size");
     });
     let orders = fixture.data_path.join("issue_25296_orders.parquet");
     let payments = fixture.data_path.join("issue_25296_payments.parquet");

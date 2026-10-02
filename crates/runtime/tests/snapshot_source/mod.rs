@@ -517,7 +517,7 @@ async fn first_snapshot_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     // The load cannot finish until a snapshot exists, so it runs alongside the writer.
     let reader_load = tokio::spawn(Arc::clone(&reader).load_components());
 
-    let table = datafusion::sql::TableReference::bare(modules);
+    let table = datafusion::common::TableReference::bare(modules);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut status = None;
     while Instant::now() < deadline {
@@ -810,7 +810,7 @@ async fn projected_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     );
     let load = tokio::spawn(Arc::clone(&reader).load_components());
 
-    let table = datafusion::sql::TableReference::bare(modules);
+    let table = datafusion::common::TableReference::bare(modules);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut status = None;
     while Instant::now() < deadline {

@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use super::*;
 use app::AppBuilder;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };

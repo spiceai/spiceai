@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
