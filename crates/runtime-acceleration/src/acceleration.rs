@@ -343,7 +343,12 @@ impl From<spicepod_acceleration::OnConflictBehavior> for OnConflictBehavior {
     fn from(index_type: spicepod_acceleration::OnConflictBehavior) -> Self {
         match index_type {
             spicepod_acceleration::OnConflictBehavior::Drop => OnConflictBehavior::Drop,
-            spicepod_acceleration::OnConflictBehavior::Upsert => {
+            // `upsert_dedup_by_time_column` reaches the engines as a plain upsert: the
+            // refresh hands them only rows newer than the version already kept, so the
+            // time-based selection happens before the write (see
+            // `Acceleration::upsert_dedup_by_time_column`).
+            spicepod_acceleration::OnConflictBehavior::Upsert
+            | spicepod_acceleration::OnConflictBehavior::UpsertDedupByTimeColumn => {
                 OnConflictBehavior::Upsert(UpsertOptions::default())
             }
             spicepod_acceleration::OnConflictBehavior::UpsertDedup => {
@@ -540,6 +545,11 @@ pub struct Acceleration {
     pub primary_key: Option<ColumnReference>,
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
+
+    /// `on_conflict: upsert_dedup_by_time_column`: the refresh keeps, per primary key, only
+    /// rows newer (by the dataset `time_column`) than the version already kept, and the
+    /// engine upserts what remains. `on_conflict` itself records a plain upsert.
+    pub upsert_dedup_by_time_column: bool,
 
     pub maintained_aggregates: spicepod_acceleration::MaintainedAggregates,
 
@@ -946,6 +956,12 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         let mut on_conflict = HashMap::new();
+        let upsert_dedup_by_time_column = acceleration.on_conflict.values().any(|behavior| {
+            matches!(
+                behavior,
+                spicepod_acceleration::OnConflictBehavior::UpsertDedupByTimeColumn
+            )
+        });
         for (k, v) in acceleration.on_conflict {
             on_conflict.insert(
                 try_parse_column_reference(k.as_str())?,
@@ -1061,6 +1077,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             indexes,
             primary_key,
             on_conflict,
+            upsert_dedup_by_time_column,
             maintained_aggregates: acceleration.maintained_aggregates,
             write_mode: acceleration.write_mode,
             storage_profile: StorageProfile::from(acceleration.storage_profile),
@@ -1108,6 +1125,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
+            upsert_dedup_by_time_column: false,
             maintained_aggregates: spicepod_acceleration::MaintainedAggregates::default(),
             write_mode: spicepod_acceleration::WriteMode::default(),
             storage_profile: StorageProfile::default(),

@@ -196,6 +196,25 @@ pub static REFRESH_ROWS_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Rows a refresh read from the source but did not write under
+/// `on_conflict: upsert_dedup_by_time_column`, because a version of the same key with an
+/// equal or greater `time_column` was already kept. Labelled by `reason`: `older` or
+/// `equal_time`. Rows read = `refresh_rows_written` + `refresh_rows_superseded`.
+///
+/// Counted per read, not per distinct version: an append re-reads its overlap window on
+/// every refresh and counts each re-read row again (a stored row as `equal_time`, a late
+/// row that lost as `older`). The selector keeps only each key's newest time, so it cannot
+/// tell a re-read from a different row with the same or an older time.
+pub static REFRESH_ROWS_SUPERSEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_rows_superseded")
+        .with_description(
+            "Cumulative number of rows read from the federated source and not written because the accelerated table already kept a version of the same key with an equal or greater time.",
+        )
+        .with_unit("rows")
+        .build()
+});
+
 pub static REFRESH_BYTES_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("dataset_acceleration_refresh_bytes_written")

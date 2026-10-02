@@ -83,6 +83,8 @@ mod single_instance_duckdb;
 mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
 mod snapshot_mutex;
+#[cfg(not(target_os = "windows"))]
+mod upsert_dedup_by_time_column;
 #[cfg(feature = "sqlite")]
 mod user_function_pushdown;
 

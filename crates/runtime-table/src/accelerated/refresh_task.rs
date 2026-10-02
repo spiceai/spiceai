@@ -107,6 +107,7 @@ use util::{RetryError, retry};
 
 pub mod changes;
 mod deletion;
+mod latest_by_time;
 
 // Reuse the single shared schema-evolution instrument rather than registering a
 // same-named counter under a second meter.
@@ -790,8 +791,15 @@ impl RefreshTask {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
             }
             RefreshMode::Full => {
-                self.get_full_or_incremental_append_update(refresh, None)
+                match self
+                    .get_full_or_incremental_append_update(refresh, None)
                     .await
+                {
+                    Ok(update) if refresh.upsert_dedup_by_time_column => {
+                        self.select_latest_by_time(refresh, update, None).await
+                    }
+                    other => other,
+                }
             }
             RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
@@ -1220,6 +1228,11 @@ impl RefreshTask {
                     .get_full_or_incremental_append_update(refresh, timestamp)
                     .await
                 {
+                    // `upsert_dedup_by_time_column` replaces the exact-row dedupe: it is
+                    // seeded with the stored keys and times from the same window start.
+                    Ok(data) if refresh.upsert_dedup_by_time_column => {
+                        self.select_latest_by_time(refresh, data, timestamp).await
+                    }
                     // Reuse `timestamp`: the dedupe must compare against the same mark the
                     // source filter just used, not a freshly read one (#12492).
                     Ok(data) => match self
@@ -1239,6 +1252,90 @@ impl RefreshTask {
                 Err(e)
             }
         }
+    }
+
+    /// `on_conflict: upsert_dedup_by_time_column`: pass on only rows newer than the version
+    /// of their key already kept. When `window_start` is set (an append), the selector is
+    /// first seeded with the keys and times the acceleration stores from that same window
+    /// start the source fetch used: any stored row newer than an incoming row is at or after
+    /// it, so nothing earlier needs reading.
+    async fn select_latest_by_time(
+        &self,
+        refresh: &Refresh,
+        update: StreamingDataUpdate,
+        window_start: Option<u128>,
+    ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
+        let dataset = self.dataset_name.to_string();
+        let permanent = |message: String| {
+            RetryError::permanent(super::Error::FailedToRefreshDataset {
+                source: DataFusionError::Plan(message),
+            })
+        };
+        let Some(time_column) = refresh.time_column.clone() else {
+            return Err(permanent(format!(
+                "Failed to refresh dataset '{dataset}': 'acceleration.on_conflict: upsert_dedup_by_time_column' requires a 'time_column'. Set 'time_column' to the column that records when each row occurred. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+            )));
+        };
+        let accelerator_schema = self.accelerator.schema();
+        let key_columns = self
+            .accelerator
+            .constraints()
+            .map_or_else(Vec::new, |constraints| {
+                data_accelerator_api::get_primary_keys_from_constraints(
+                    constraints,
+                    &accelerator_schema,
+                )
+            });
+        if key_columns.is_empty() {
+            return Err(permanent(format!(
+                "Failed to refresh dataset '{dataset}': 'acceleration.on_conflict: upsert_dedup_by_time_column' requires 'acceleration.primary_key', the key it keeps the latest row for. Set 'acceleration.primary_key' to the column(s) that identify a row. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+            )));
+        }
+        let mut selector = latest_by_time::LatestByTime::try_new(
+            &dataset,
+            &update.data.schema(),
+            key_columns.clone(),
+            time_column.clone(),
+            refresh.time_format,
+        )
+        .map_err(|e| permanent(e.to_string()))?;
+        selector.publish_zero();
+
+        if let Some(value) = window_start
+            && let Some(filter_converter) = self.get_accelerator_filter_converter(refresh)
+        {
+            let federated_provider = self.federated.table_provider().await;
+            let ctx = Self::create_refresh_df_context(
+                federated_provider,
+                &self.dataset_name,
+                &self.accelerator,
+                self.disable_federation,
+                self.io_runtime.clone(),
+            )
+            .await;
+            let mut columns: Vec<&str> = key_columns.iter().map(String::as_str).collect();
+            columns.push(&time_column);
+            let mut stored = accelerator_df(&Arc::clone(&self.accelerator), &ctx)
+                .and_then(|df| df.filter(filter_converter.convert_high_water_mark(value)))
+                .and_then(|df| df.select_columns(&columns))
+                .map_err(find_datafusion_root)
+                .context(super::UnableToScanTableProviderSnafu)?
+                .execute_stream()
+                .await
+                .map_err(find_datafusion_root)
+                .context(super::UnableToScanTableProviderSnafu)?;
+            while let Some(batch) = stored.next().await {
+                let batch = batch
+                    .map_err(find_datafusion_root)
+                    .context(super::UnableToScanTableProviderSnafu)?;
+                selector
+                    .seed(&batch)
+                    .map_err(find_datafusion_root)
+                    .context(super::UnableToScanTableProviderSnafu)?;
+            }
+        }
+
+        Ok(latest_by_time::select_latest(selector, update))
     }
 
     async fn refresh_stale_cached_rows(

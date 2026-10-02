@@ -93,6 +93,9 @@ pub struct Refresh {
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
     pub(crate) append_overlap: Option<Duration>,
+    /// `on_conflict: upsert_dedup_by_time_column`: keep only rows newer than the version
+    /// of their key already kept (see `refresh_task::latest_by_time`).
+    pub(crate) upsert_dedup_by_time_column: bool,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
     /// TTL for cache entries. Data older than this is considered stale.
@@ -210,6 +213,12 @@ impl Refresh {
     #[must_use]
     pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
+        self
+    }
+
+    #[must_use]
+    pub fn upsert_dedup_by_time_column(mut self, enabled: bool) -> Self {
+        self.upsert_dedup_by_time_column = enabled;
         self
     }
 
@@ -514,6 +523,7 @@ impl Default for Refresh {
             mode: RefreshMode::Full,
             period: None,
             append_overlap: None,
+            upsert_dedup_by_time_column: false,
             retry_enabled: false,
             retry_max_attempts: None,
             caching_ttl: None,

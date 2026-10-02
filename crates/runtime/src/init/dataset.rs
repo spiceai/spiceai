@@ -41,10 +41,11 @@ use crate::{
     Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
     UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    UpsertDedupByTimeColumnUnsupportedSnafu,
     accelerated::AcceleratedTable,
     component::dataset::{
         Dataset,
-        acceleration::{Acceleration, DurableWriteBackKey, Mode, RefreshMode},
+        acceleration::{Acceleration, DurableWriteBackKey, Engine, Mode, RefreshMode},
         builder::DatasetBuilder,
     },
     component::{
@@ -949,6 +950,34 @@ impl Runtime {
             .build();
             warn_spaced!(spaced_tracer, "{}{err}", "");
             return Err(err);
+        }
+
+        if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled)
+            && acceleration.upsert_dedup_by_time_column
+        {
+            let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
+            if let Some(reason) = upsert_dedup_by_time_column_refusal(
+                ds.time_column.as_deref(),
+                acceleration.primary_key.as_ref(),
+                refresh_mode,
+                acceleration.engine,
+            ) {
+                let err = UpsertDedupByTimeColumnUnsupportedSnafu {
+                    dataset_name: ds.name.to_string(),
+                    connector: source.clone(),
+                    reason,
+                }
+                .build();
+                warn_spaced!(spaced_tracer, "{}{err}", "");
+                return Err(err);
+            }
+            if refresh_mode == RefreshMode::Append && acceleration.refresh_append_overlap.is_none()
+            {
+                tracing::warn!(
+                    "{}",
+                    upsert_dedup_by_time_column_no_overlap_warning(&ds.name.to_string())
+                );
+            }
         }
 
         // A `drasi` block only takes effect through the change stream, so a
@@ -2328,6 +2357,70 @@ async fn await_hot_reload_initial_refresh(
     .fail()
 }
 
+const UPSERT_DEDUP_BY_TIME_COLUMN_DOCS: &str =
+    "https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column";
+
+/// Why a dataset using `on_conflict: upsert_dedup_by_time_column` cannot load, worded as
+/// the cause clause of [`Error::UpsertDedupByTimeColumnUnsupported`], or `None` when it
+/// can.
+///
+/// The primary key is the one the Spicepod declares: the mode keeps the latest row per
+/// key, so the key has to be knowable before any data is read.
+fn upsert_dedup_by_time_column_refusal(
+    time_column: Option<&str>,
+    primary_key: Option<&datafusion_table_providers::util::column_reference::ColumnReference>,
+    refresh_mode: RefreshMode,
+    engine: Engine,
+) -> Option<String> {
+    const MODE: &str = "'acceleration.on_conflict: upsert_dedup_by_time_column'";
+    let Some(time_column) = time_column else {
+        return Some(format!(
+            "{MODE} requires a 'time_column'. Set 'time_column' to the column that records when each row occurred."
+        ));
+    };
+    let Some(primary_key) = primary_key.filter(|key| !key.is_empty()) else {
+        return Some(format!(
+            "{MODE} requires 'acceleration.primary_key', the key it keeps the latest row for. Set 'acceleration.primary_key' to the column(s) that identify a row."
+        ));
+    };
+    if primary_key.iter().any(|column| column == time_column) {
+        return Some(format!(
+            "'time_column' '{time_column}' is part of 'acceleration.primary_key', so each version of a row has its own key and there is nothing to choose between. Set 'time_column' to a column outside the primary key, or use 'acceleration.on_conflict: upsert'."
+        ));
+    }
+    match refresh_mode {
+        RefreshMode::Full | RefreshMode::Append => {}
+        RefreshMode::Changes => {
+            return Some(format!(
+                "{MODE} supports 'acceleration.refresh_mode: full' and 'append', not 'changes'. Use 'acceleration.on_conflict: upsert' for a change-data-capture dataset."
+            ));
+        }
+        other => {
+            return Some(format!(
+                "{MODE} supports 'acceleration.refresh_mode: full' and 'append', not '{}'.",
+                format!("{other:?}").to_lowercase()
+            ));
+        }
+    }
+    // A refresh writes a key's versions in increasing time order, and only Cayenne and
+    // SQLite apply a key repeated across one write's batches in that order. DuckDB applies
+    // the whole write as one statement and keeps an unspecified copy of a repeated key.
+    if !matches!(engine, Engine::Cayenne | Engine::Sqlite) {
+        return Some(format!(
+            "{MODE} is not supported by 'acceleration.engine: {engine}'. Use 'acceleration.engine: cayenne' or 'sqlite'."
+        ));
+    }
+    None
+}
+
+/// Warning for an append refresh under `on_conflict: upsert_dedup_by_time_column` with no
+/// `refresh_append_overlap`.
+fn upsert_dedup_by_time_column_no_overlap_warning(dataset_name: &str) -> String {
+    format!(
+        "Dataset '{dataset_name}' uses 'acceleration.on_conflict: upsert_dedup_by_time_column' with 'acceleration.refresh_mode: append' and no 'acceleration.refresh_append_overlap', so a row older than the newest row already loaded is never fetched, even when it is the newest version of its key, and that key keeps showing its previous version. Set 'acceleration.refresh_append_overlap' to the most a row can arrive late. See: {UPSERT_DEDUP_BY_TIME_COLUMN_DOCS}"
+    )
+}
+
 /// Returns `true` when a dataset load failure cannot be cleared by retrying it.
 ///
 /// `load_dataset` retries with unbounded backoff and only short-circuits on
@@ -2356,7 +2449,9 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
         | Error::DurableWriteBackCompositePrimaryKey { .. }
         | Error::DurableWriteBackUndeclaredPrimaryKey { .. }
         | Error::DurableWriteBackPrerequisitesUnmet { .. }
-        | Error::DurableWriteBackUnsupportedBySource { .. } => true,
+        | Error::DurableWriteBackUnsupportedBySource { .. }
+        // `on_conflict: upsert_dedup_by_time_column` without what it needs.
+        | Error::UpsertDedupByTimeColumnUnsupported { .. } => true,
         // Connector creation boxes its error, so recover the type the way the
         // catalog load path does before asking it to classify itself.
         Error::UnableToInitializeDataConnector { source } => {
@@ -2731,6 +2826,111 @@ fn with_localpod_dependents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod upsert_dedup_by_time_column {
+        use super::*;
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+
+        fn key(columns: &[&str]) -> ColumnReference {
+            ColumnReference::new(columns.iter().map(ToString::to_string).collect())
+        }
+
+        fn refusal(
+            time_column: Option<&str>,
+            primary_key: Option<&ColumnReference>,
+            refresh_mode: RefreshMode,
+            engine: Engine,
+        ) -> Option<String> {
+            upsert_dedup_by_time_column_refusal(time_column, primary_key, refresh_mode, engine)
+        }
+
+        #[test]
+        fn accepts_full_and_append_on_every_supported_engine() {
+            let id = key(&["id"]);
+            for engine in [Engine::Cayenne, Engine::Sqlite] {
+                for mode in [RefreshMode::Full, RefreshMode::Append] {
+                    assert_eq!(refusal(Some("occurred_at"), Some(&id), mode, engine), None);
+                }
+            }
+        }
+
+        #[test]
+        fn refuses_each_missing_prerequisite_with_its_fix() {
+            let id = key(&["id"]);
+            let full = RefreshMode::Full;
+            let cases = [
+                (
+                    refusal(None, Some(&id), full, Engine::Cayenne),
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' requires a 'time_column'. Set 'time_column' to the column that records when each row occurred.",
+                ),
+                (
+                    refusal(Some("occurred_at"), None, full, Engine::Cayenne),
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' requires 'acceleration.primary_key', the key it keeps the latest row for. Set 'acceleration.primary_key' to the column(s) that identify a row.",
+                ),
+                (
+                    refusal(
+                        Some("occurred_at"),
+                        Some(&key(&["id", "occurred_at"])),
+                        full,
+                        Engine::Cayenne,
+                    ),
+                    "'time_column' 'occurred_at' is part of 'acceleration.primary_key', so each version of a row has its own key and there is nothing to choose between. Set 'time_column' to a column outside the primary key, or use 'acceleration.on_conflict: upsert'.",
+                ),
+                (
+                    refusal(
+                        Some("occurred_at"),
+                        Some(&id),
+                        RefreshMode::Changes,
+                        Engine::Cayenne,
+                    ),
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' supports 'acceleration.refresh_mode: full' and 'append', not 'changes'. Use 'acceleration.on_conflict: upsert' for a change-data-capture dataset.",
+                ),
+                (
+                    refusal(
+                        Some("occurred_at"),
+                        Some(&id),
+                        RefreshMode::Caching,
+                        Engine::Cayenne,
+                    ),
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' supports 'acceleration.refresh_mode: full' and 'append', not 'caching'.",
+                ),
+                (
+                    refusal(Some("occurred_at"), Some(&id), full, Engine::Arrow),
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' is not supported by 'acceleration.engine: arrow'. Use 'acceleration.engine: cayenne' or 'sqlite'.",
+                ),
+                (
+                    refusal(Some("occurred_at"), Some(&id), full, Engine::DuckDB),
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' is not supported by 'acceleration.engine: duckdb'. Use 'acceleration.engine: cayenne' or 'sqlite'.",
+                ),
+            ];
+            for (actual, expected) in cases {
+                assert_eq!(actual.as_deref(), Some(expected));
+            }
+        }
+
+        #[test]
+        fn the_refusal_names_the_dataset_connector_and_docs() {
+            let err = UpsertDedupByTimeColumnUnsupportedSnafu {
+                dataset_name: "events",
+                connector: "iceberg",
+                reason: "REASON",
+            }
+            .build();
+            assert_eq!(
+                err.to_string(),
+                "Failed to register dataset 'events' (iceberg): REASON See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+            );
+            assert!(is_permanent_dataset_failure(&err));
+        }
+
+        #[test]
+        fn the_no_overlap_warning_explains_what_is_never_fetched() {
+            assert_eq!(
+                upsert_dedup_by_time_column_no_overlap_warning("events"),
+                "Dataset 'events' uses 'acceleration.on_conflict: upsert_dedup_by_time_column' with 'acceleration.refresh_mode: append' and no 'acceleration.refresh_append_overlap', so a row older than the newest row already loaded is never fetched, even when it is the newest version of its key, and that key keeps showing its previous version. Set 'acceleration.refresh_append_overlap' to the most a row can arrive late. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+            );
+        }
+    }
 
     /// Every retention setting has to be recognised, whichever one the dataset
     /// carries: a prune can remove a row that was acknowledged to the writer and
