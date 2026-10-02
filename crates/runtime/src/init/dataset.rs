@@ -1036,7 +1036,12 @@ impl Runtime {
         );
         let federated_table = FederatedTable::new_deferred(
             Arc::new(ds.spec.clone()),
-            ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
+            crate::dataconnector::refresh_source::ReportingRefreshSource::new_arc(
+                ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
+                Arc::clone(&ds),
+                Arc::clone(&self.status),
+                matches!(reason, SourceUnavailable::Failed(_)),
+            ),
             checkpoint_schema,
             self.status.shutdown_token(),
             first_attempt,

@@ -88,7 +88,7 @@ impl SourceUnavailable {
 /// The warning logged when a dataset's source could not be reached, so queries are
 /// served from its existing acceleration while the connection is retried.
 #[must_use]
-fn unreachable_source_warning(dataset: &TableReference, cause: &str) -> String {
+pub(crate) fn unreachable_source_warning(dataset: &TableReference, cause: &str) -> String {
     format!(
         "Failed to connect to the source for dataset {dataset}. Serving data from the existing acceleration for {dataset} while retrying the connection. {cause}"
     )

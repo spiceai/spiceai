@@ -69,6 +69,7 @@ struct UnreachableSource {
     reads: AtomicUsize,
     primary_key: AtomicBool,
     extra_column: AtomicBool,
+    reject_credentials: AtomicBool,
 }
 
 impl UnreachableSource {
@@ -85,6 +86,7 @@ impl UnreachableSource {
             reads: AtomicUsize::new(0),
             primary_key: AtomicBool::new(false),
             extra_column: AtomicBool::new(false),
+            reject_credentials: AtomicBool::new(false),
         })
     }
 
@@ -92,9 +94,18 @@ impl UnreachableSource {
         self.refuse_reads.store(true, Ordering::SeqCst);
     }
 
-    /// Counts an attempt to reach the source, and fails it while the source is down.
+    /// Counts an attempt to reach the source, and fails it while the source is down,
+    /// or with rejected credentials while it rejects them.
     fn attempt(&self, connector_component: ConnectorComponent) -> Result<(), DataConnectorError> {
         self.connect_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.reject_credentials.load(Ordering::SeqCst) {
+            return Err(
+                DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                    dataconnector: self.prefix.to_string(),
+                    connector_component,
+                },
+            );
+        }
         if self.up.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -140,6 +151,11 @@ impl UnreachableSource {
     /// How many times the source was read (counted as each read starts).
     fn reads(&self) -> usize {
         self.reads.load(Ordering::SeqCst)
+    }
+
+    /// Rejects every connection with invalid credentials, a configuration error.
+    fn reject_credentials(&self) {
+        self.reject_credentials.store(true, Ordering::SeqCst);
     }
 
     /// Adds a column `w` to the source's schema, as a source-side schema change.
@@ -815,6 +831,48 @@ mod served_from_acceleration {
             served_from_acceleration(&rt, Duration::from_secs(10)).await,
             "the acceleration keeps serving its schema, got {:?}",
             sum_and_count(&rt).await
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A source that rejects the dataset's credentials while the dataset is served from
+    /// its acceleration is a configuration error no retry clears: the dataset reports
+    /// `Error`, rather than staying silently served, while queries are still served
+    /// and the runtime stays ready.
+    #[tokio::test]
+    async fn rejected_credentials_while_served_set_the_dataset_status_to_error()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("rejected-credentials").await?;
+        let source = &fixture.source;
+        seed(source, fixture.dataset(ReadyState::OnLoad)).await?;
+
+        source.reject_credentials();
+        let (rt, loader) = start(with_declared_columns(
+            fixture.dataset(ReadyState::OnRegistration),
+        ))
+        .await;
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(10)).await,
+            "the acceleration is served despite the rejected credentials, got {:?}",
+            sum_and_count(&rt).await
+        );
+        let reported = wait_until_true(Duration::from_secs(10), || async {
+            matches!(
+                dataset_status(&rt, "orders"),
+                Some(ComponentStatus::Error(_))
+            )
+        })
+        .await;
+        assert!(
+            reported,
+            "rejected credentials must set the dataset's status to Error ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            rt.status().is_ready(),
+            "a served dataset in Error is still ready"
         );
         stop(rt, loader).await;
         Ok(())
