@@ -4182,6 +4182,55 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         );
     }
 
+    /// Regression test for #14609: a source that is down when the dataset loads
+    /// reports `UnableToConnectInvalidHostOrPort`, which must not be a permanent
+    /// failure, so the dataset keeps retrying and recovers once the source is
+    /// reachable. Rejected credentials and TLS failures are configuration errors and
+    /// stay permanent.
+    #[test]
+    fn an_unreachable_source_stays_retriable_but_rejected_credentials_do_not() {
+        let component = crate::dataconnector::ConnectorComponent::Dataset(Arc::new(
+            crate::component::dataset::DatasetSpec::new(
+                "postgres:public.orders",
+                TableReference::bare("orders"),
+            ),
+        ));
+        let boxed =
+            |source: dataconnector::DataConnectorError| Error::UnableToInitializeDataConnector {
+                source: Box::new(source),
+            };
+
+        let unreachable = boxed(
+            dataconnector::DataConnectorError::UnableToConnectInvalidHostOrPort {
+                dataconnector: "postgres".to_string(),
+                connector_component: component.clone(),
+                host: "db".to_string(),
+                port: "5432".to_string(),
+            },
+        );
+        assert!(
+            !is_permanent_dataset_failure(&unreachable),
+            "a source that cannot be reached right now must be retried: {unreachable}"
+        );
+
+        for configuration_error in [
+            dataconnector::DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                dataconnector: "postgres".to_string(),
+                connector_component: component.clone(),
+            },
+            dataconnector::DataConnectorError::UnableToConnectTlsError {
+                dataconnector: "postgres".to_string(),
+                connector_component: component,
+            },
+        ] {
+            let err = boxed(configuration_error);
+            assert!(
+                is_permanent_dataset_failure(&err),
+                "a credential or TLS misconfiguration must not be retried: {err}"
+            );
+        }
+    }
+
     /// An error type neither downcast recognises must not be assumed permanent —
     /// failing open here would strand a dataset that would have recovered.
     #[test]

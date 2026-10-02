@@ -1173,6 +1173,7 @@ impl Query {
             runtime_handle,
             runtime_request_context,
             Span::current(),
+            managed_runtime::StreamStart::Immediately,
             async move {
                 // Started once the driver is running on the query runtime, so
                 // neither the query's spans nor its clock count a wait for one
