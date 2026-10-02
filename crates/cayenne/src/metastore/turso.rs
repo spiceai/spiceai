@@ -343,7 +343,7 @@ impl TursoMetastore {
     /// dropped (see `init_schema` for the legacy-schema migration).
     ///
     /// `table_id` stores the 16 raw bytes of the UUID (`BLOB`), not the 36-char
-    /// text — a pure re-encoding (via `cayenne_catalog::insert_record_table_id_value`
+    /// text — a pure re-encoding (via `cayenne_catalog::blob_keyed_table_id_value`
     /// / `metastore::table_id_to_key_bytes`) that cuts the WAL/journal volume of
     /// hot upsert bursts; see the `SQLite` `INSERT_RECORD_TABLE_DDL` doc for the
     /// full rationale and correctness contract. The catalog builders bind the
