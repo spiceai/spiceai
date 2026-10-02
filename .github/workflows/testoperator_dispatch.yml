@@ -163,7 +163,10 @@ jobs:
       # `scheduled-bench-retried-<branch>-<commit>` artifact so no later run repeats it. Only runs whose
       # first attempt failed are re-run; a cancelled run is left alone, because a cancel may be
       # deliberate. The dispatch's runs are the release-branch `workflow_dispatch` runs of the child
-      # workflows created between the start of the run that recorded the build and the record itself.
+      # workflows that a workflow started (`github-actions[bot]`) between the start of the run that
+      # recorded the build and the record itself, so a run someone dispatched by hand is never re-run.
+      # A manual `testoperator dispatch` of the release branch starts its runs the same way, so one
+      # that overlaps that window has its failed runs re-run once as well.
       # A failed lookup or re-run request, or a first attempt that has not finished yet, leaves the
       # build unrecorded, so the next scheduled run tries again; it selects only first attempts, so a
       # run already re-run is never re-run twice.
@@ -229,11 +232,14 @@ jobs:
               count=$(jq '.workflow_runs | length' <<< "$runs")
               listed=$((listed + count))
               mapfile -t ids < <(jq -r '.workflow_runs[]
-                | select(.status == "completed" and .run_attempt == 1 and (.conclusion == "failure" or .conclusion == "timed_out"))
+                | select(.triggering_actor.login == "github-actions[bot]" and .run_attempt == 1)
+                | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out"))
                 | .id' <<< "$runs")
               failed+=("${ids[@]}")
               picked=$((picked + ${#ids[@]}))
-              pending=$((pending + $(jq '[.workflow_runs[] | select(.status != "completed" and .run_attempt == 1)] | length' <<< "$runs")))
+              pending=$((pending + $(jq '[.workflow_runs[]
+                | select(.triggering_actor.login == "github-actions[bot]" and .run_attempt == 1 and .status != "completed")]
+                | length' <<< "$runs")))
               if [ "$count" -lt 100 ]; then
                 break
               fi
