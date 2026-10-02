@@ -695,7 +695,8 @@ pub enum SnapshotUploadError {
     #[snafu(display("Failed to write snapshot metadata to {path}: {source}"))]
     UploadWriteMetadata {
         path: String,
-        source: ConditionalWriteError,
+        #[snafu(source(from(ConditionalWriteError, Box::new)))]
+        source: Box<ConditionalWriteError>,
     },
     #[snafu(display(
         "Failed to publish a snapshot of dataset '{dataset}': the object store returned neither an ETag nor a version for '{path}', so the snapshot metadata cannot be updated without risking a concurrent writer's changes. Use a snapshot location that supports conditional writes. See: {SNAPSHOTS_DOCS}"
@@ -3192,7 +3193,7 @@ impl SnapshotManager {
             },
             MetadataUpdateError::Write(source) => SnapshotUploadError::UploadWriteMetadata {
                 path: metadata_path,
-                source,
+                source: Box::new(source),
             },
             MetadataUpdateError::Contention { attempts } => {
                 SnapshotUploadError::MetadataContention {
