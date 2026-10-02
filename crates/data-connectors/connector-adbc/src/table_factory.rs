@@ -63,15 +63,13 @@ pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + 
 /// and the cast has to stay local on this route as on the engine's own
 /// connector (issue #14482).
 fn function_support_for_driver(driver_name: &str) -> FunctionSupport {
-    match driver_name {
-        BIGQUERY_DRIVER => deny_spice_functions_for_bigquery_table_providers(),
-        _ => {
-            let support = deny_spice_functions_for_table_providers();
-            match expression_support_for_engine(driver_name) {
-                Some(gate) => support.with_expression_support(gate),
-                None => support,
-            }
-        }
+    if driver_name == BIGQUERY_DRIVER {
+        return deny_spice_functions_for_bigquery_table_providers();
+    }
+    let support = deny_spice_functions_for_table_providers();
+    match expression_support_for_engine(driver_name) {
+        Some(gate) => support.with_expression_support(gate),
+        None => support,
     }
 }
 
