@@ -700,11 +700,11 @@ mod tests {
         };
         let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
         let micros = DataType::Timestamp(TimeUnit::Microsecond, None);
-        let instant_ns = lit(ScalarValue::TimestampNanosecond(
+        let nanosecond_instant = lit(ScalarValue::TimestampNanosecond(
             Some(1_768_473_000_390_436_170),
             None,
         ));
-        let instant_us = lit(ScalarValue::TimestampMicrosecond(
+        let microsecond_instant = lit(ScalarValue::TimestampMicrosecond(
             Some(1_768_473_000_390_436),
             None,
         ));
@@ -712,7 +712,7 @@ mod tests {
             plan_projecting(cast(col("s"), nanos.clone())),
             plan_over(
                 text_and_id(),
-                Some(cast(col("s"), nanos.clone()).gt(instant_ns)),
+                Some(cast(col("s"), nanos).gt(nanosecond_instant)),
                 col("id"),
             ),
         ] {
@@ -726,7 +726,7 @@ mod tests {
             plan_projecting(cast(col("s"), micros.clone())),
             plan_over(
                 text_and_id(),
-                Some(cast(col("s"), micros).gt(instant_us)),
+                Some(cast(col("s"), micros).gt(microsecond_instant)),
                 col("id"),
             ),
         ] {
