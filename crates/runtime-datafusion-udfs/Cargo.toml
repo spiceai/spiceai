@@ -29,6 +29,7 @@ reqwest = { workspace = true, optional = true }
 runtime-auth = { path = "../runtime-auth", optional = true }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
+runtime-status = { path = "../runtime-status", optional = true }
 opentelemetry.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -64,7 +65,7 @@ harness = false
 [features]
 default = []
 http-functions = ["dep:reqwest", "dep:runtime-auth", "dep:url"]
-models = ["dep:llms"]
+models = ["dep:llms", "dep:runtime-status"]
 wasm-functions = ["dep:arrow-ipc", "dep:arrow_tools", "dep:wasmtime"]
 wasm-functions-compile = ["wasm-functions", "dep:blake3"]
 

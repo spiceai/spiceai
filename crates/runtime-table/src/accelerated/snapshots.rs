@@ -24,9 +24,12 @@ use datafusion::datasource::TableProvider;
 use runtime_acceleration::acceleration_source::AccelerationSource;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::notifications::Subscription;
-use runtime_acceleration::snapshot::{ForceCreate, SnapshotManager, metrics as snapshot_metrics};
+use runtime_acceleration::snapshot::{
+    ForceCreate, SnapshotManager, SnapshotUploadError, metrics as snapshot_metrics,
+};
 use runtime_async::is_shutdown_cancellation;
 use runtime_status::{RuntimeStatus, WaitOutcome};
+use snafu::{ResultExt, Snafu};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -34,6 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
+use util::{RetryError, retry, retry_strategy::RetryBackoffBuilder};
 
 /// Per-dataset state required to drive `refresh_mode: snapshot`.
 ///
@@ -519,6 +523,35 @@ pub fn create_periodic_snapshot_callback(
     }
 }
 
+/// Retries after a failed attempt; each one re-takes the write lock.
+const SNAPSHOT_MAX_RETRIES: usize = 3;
+
+/// One attempt of [`create_checkpoint_and_snapshot`], by the step that failed.
+#[derive(Debug, Snafu)]
+enum SnapshotAttemptError {
+    /// Step 1: writing the dataset checkpoint (schema, refresh SQL) to the local store.
+    #[snafu(display("Failed to checkpoint dataset {dataset}: {source}"))]
+    Checkpoint {
+        dataset: TableReference,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// Step 2: archiving the acceleration and uploading it to the snapshot store.
+    #[snafu(display("{source}"))]
+    Upload { source: SnapshotUploadError },
+}
+
+impl SnapshotAttemptError {
+    fn is_retriable(&self) -> bool {
+        match self {
+            Self::Checkpoint { .. } => true,
+            Self::Upload { source } => source.is_retriable(),
+        }
+    }
+}
+
+/// Checkpoints the dataset and creates a snapshot, retrying a failed attempt with
+/// backoff. The lock is released between attempts, so a retry re-derives everything
+/// (checkpoint, row count, metastore slice, archive) from the table as of its own lock.
 #[expect(clippy::too_many_arguments)]
 pub async fn create_checkpoint_and_snapshot(
     checkpointer: &Arc<dyn DatasetCheckpointer>,
@@ -532,6 +565,60 @@ pub async fn create_checkpoint_and_snapshot(
     federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
 ) {
+    let backoff = RetryBackoffBuilder::new()
+        .max_retries(Some(SNAPSHOT_MAX_RETRIES))
+        .build();
+    let result = retry(backoff, || async {
+        create_checkpoint_and_snapshot_once(
+            checkpointer,
+            snapshot_manager,
+            checkpoint_schema,
+            accelerator_write_mutex,
+            dataset_name,
+            last_updated_at,
+            force_create,
+            accelerator,
+            federated_schema,
+            refresh_sql,
+        )
+        .await
+        .map_err(|e| {
+            if !e.is_retriable() || is_shutdown_cancellation(&e) {
+                return RetryError::permanent(e);
+            }
+            tracing::debug!(dataset = %dataset_name, error = %e, "Snapshot attempt failed, retrying");
+            RetryError::transient(e)
+        })
+    })
+    .await;
+
+    match result {
+        Ok(()) => {}
+        // Expected under shutdown; reporting it at `warn` makes a clean stop look like a failure.
+        Err(e) if is_shutdown_cancellation(&e) => {
+            tracing::debug!(dataset = %dataset_name, error = %e, "Did not create snapshot: the runtime is shutting down");
+        }
+        Err(e @ SnapshotAttemptError::Checkpoint { .. }) => tracing::warn!("{e}"),
+        Err(e) => {
+            snapshot_metrics::record_snapshot_failure(&dataset_name.to_string());
+            tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
+        }
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn create_checkpoint_and_snapshot_once(
+    checkpointer: &Arc<dyn DatasetCheckpointer>,
+    snapshot_manager: Option<&Arc<SnapshotManager>>,
+    checkpoint_schema: &Arc<Schema>,
+    accelerator_write_mutex: &Arc<Mutex<()>>,
+    dataset_name: &TableReference,
+    last_updated_at: &Arc<AtomicI64>,
+    force_create: ForceCreate,
+    accelerator: Option<&Arc<dyn TableProvider>>,
+    federated_schema: Option<&Arc<Schema>>,
+    refresh_sql: Option<&str>,
+) -> Result<(), SnapshotAttemptError> {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
     // the accelerator and the federated (source) schema are available, so an
@@ -547,60 +634,37 @@ pub async fn create_checkpoint_and_snapshot(
     } else {
         checkpoint_schema
     };
-    if let Err(e) = checkpointer
+    checkpointer
         .checkpoint(checkpoint_schema, refresh_sql)
         .await
-    {
-        if is_shutdown_cancellation(e.as_ref()) {
-            // Expected under shutdown — reporting it at `warn` makes a clean stop
-            // look like a failure. See `is_shutdown_cancellation`.
-            tracing::debug!(
-                "Did not checkpoint dataset {dataset_name}: the runtime is shutting down ({e})"
-            );
-        } else {
-            tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
-        }
-        return;
-    }
+        .context(CheckpointSnafu {
+            dataset: dataset_name.clone(),
+        })?;
 
-    if let Some(snapshot_manager) = snapshot_manager {
-        let updated_at = match last_updated_at.load(Ordering::Acquire) {
-            0 => None,
-            i => Some(i),
-        };
-
-        // Get the current row count from the accelerator using the `DataFrame` API.
-        // This must be done after checkpoint while holding the write lock to ensure atomicity.
-        let row_count = if let Some(accelerator) = accelerator {
-            get_row_count(accelerator, dataset_name).await
-        } else {
-            None
-        };
-
-        match snapshot_manager
-            .create_snapshot(
-                checkpoint_schema,
-                lock_guard,
-                updated_at,
-                row_count,
-                force_create,
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(e) if is_shutdown_cancellation(&e) => {
-                // The snapshot engines carry a cancelled `JoinError` up this path
-                // too, in the same shutdown window as the checkpoint above. Not a
-                // snapshot failure, so it is not counted as one either.
-                tracing::debug!(dataset = %dataset_name, error = %e, "Did not create snapshot: the runtime is shutting down");
-            }
-            Err(e) => {
-                let dataset_label = dataset_name.to_string();
-                snapshot_metrics::record_snapshot_failure(&dataset_label);
-                tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
-            }
-        }
-    }
+    let Some(snapshot_manager) = snapshot_manager else {
+        return Ok(());
+    };
+    let updated_at = match last_updated_at.load(Ordering::Acquire) {
+        0 => None,
+        i => Some(i),
+    };
+    // Counted under the write lock so it describes the archived data.
+    let row_count = if let Some(accelerator) = accelerator {
+        get_row_count(accelerator, dataset_name).await
+    } else {
+        None
+    };
+    snapshot_manager
+        .create_snapshot(
+            checkpoint_schema,
+            lock_guard,
+            updated_at,
+            row_count,
+            force_create,
+        )
+        .await
+        .map(|_| ())
+        .context(UploadSnafu)
 }
 
 /// Gets the row count from the accelerator using the `DataFrame` API.
@@ -652,6 +716,9 @@ mod tests {
     use runtime_acceleration::snapshot::notifications::TestAnnouncer;
     use std::sync::atomic::AtomicUsize;
     use tokio::task::JoinHandle;
+    use async_trait::async_trait;
+    use runtime_acceleration::dataset_checkpoint::Result as CheckpointResult;
+    use std::time::SystemTime;
 
     /// Stands in for a table's refresh loop. Each request is a reload of the
     /// snapshot published when it was requested; it completes at once unless
@@ -825,6 +892,85 @@ mod tests {
             .await
             .expect("the loop must end once the table is gone")
             .expect("the loop must not panic");
+    }
+
+    /// Fails the first `failures` checkpoints, then succeeds.
+    struct FlakyCheckpointer {
+        failures: usize,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DatasetCheckpointer for FlakyCheckpointer {
+        async fn exists(&self) -> bool {
+            true
+        }
+        async fn checkpoint(&self, _: &SchemaRef, _: Option<&str>) -> CheckpointResult<()> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.failures {
+                return Err("database is locked".into());
+            }
+            Ok(())
+        }
+        async fn get_schema(&self) -> CheckpointResult<Option<SchemaRef>> {
+            Ok(None)
+        }
+        async fn last_checkpoint_time(&self) -> CheckpointResult<Option<SystemTime>> {
+            Ok(None)
+        }
+        async fn get_refresh_sql(&self) -> CheckpointResult<Option<String>> {
+            Ok(None)
+        }
+        async fn set_schema(&self, _: &SchemaRef) -> CheckpointResult<()> {
+            Ok(())
+        }
+        async fn delete(&self) -> CheckpointResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_attempt_is_retried_with_the_lock_released() {
+        let flaky = Arc::new(FlakyCheckpointer {
+            failures: 2,
+            calls: AtomicUsize::new(0),
+        });
+        let checkpointer: Arc<dyn DatasetCheckpointer> = Arc::clone(&flaky) as _;
+        let mutex = Arc::new(Mutex::new(()));
+        let task = tokio::spawn({
+            let mutex = Arc::clone(&mutex);
+            async move {
+                create_checkpoint_and_snapshot(
+                    &checkpointer,
+                    None,
+                    &Arc::new(Schema::empty()),
+                    &mutex,
+                    &TableReference::bare("t"),
+                    &Arc::new(AtomicI64::new(0)),
+                    ForceCreate(false),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
+        });
+
+        // Runs once the task parks in the backoff after its first failure.
+        while flaky.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "the retry is still pending");
+        assert!(
+            mutex.try_lock().is_ok(),
+            "the write lock is free during the backoff"
+        );
+
+        task.await.expect("snapshot task completes");
+        assert_eq!(
+            flaky.calls.load(Ordering::SeqCst),
+            3,
+            "two failures, then the attempt that succeeded"
+        );
     }
 
     /// A live (in-place) widening evolution moves the accelerator ahead of the
