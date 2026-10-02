@@ -1061,8 +1061,8 @@ impl QueryResultsCacheProvider {
             != EntryValidity::Invalidated
     }
 
-    /// Stores `result`, ruled the way a hit is, and returns whether it was
-    /// stored.
+    /// Stores `result`, ruled the way a hit is. Returns `false` only when no
+    /// lookup could serve it; keeping an entry that read later counts as stored.
     ///
     /// A result whose tables changed while it ran is stored only inside a
     /// `stale_while_revalidate_ttl` window, to be served stale, and never over
@@ -1118,7 +1118,7 @@ impl QueryResultsCacheProvider {
                     tracing::debug!(
                         "A result from a query that began later is already cached under this key, keeping it"
                     );
-                    return Ok(false);
+                    return Ok(true);
                 }
                 // A concurrent store landing before this write is overwritten.
                 // Every hit re-rules the entry left behind, so this costs
@@ -2994,7 +2994,7 @@ mod tests {
                 .expect("cache access should succeed")
         );
         assert!(
-            !provider
+            provider
                 .store_raw_key(&key, cached_result_for("customer", older_read).await, None)
                 .await
                 .expect("cache access should succeed")
