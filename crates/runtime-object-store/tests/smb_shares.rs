@@ -48,10 +48,14 @@ fn live_server() -> Option<LiveServer> {
     let user = std::env::var("SPICE_SMB_TEST_USER").ok()?;
     let pass = std::env::var("SPICE_SMB_TEST_PASS").ok()?;
     let port = host.rsplit_once(':').map_or("445", |(_, port)| port);
-    Some(LiveServer {
-        fragment: format!("port={port}&user={user}&pass={pass}"),
-        host,
-    })
+    // Encoded the way the connector encodes it, so a password holding `&`,
+    // `%`, `=` or `#` survives the fragment.
+    let fragment = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("port", port)
+        .append_pair("user", &user)
+        .append_pair("pass", &pass)
+        .finish();
+    Some(LiveServer { host, fragment })
 }
 
 #[tokio::test]

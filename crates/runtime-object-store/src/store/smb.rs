@@ -262,8 +262,16 @@ impl SMBObjectStore {
     /// The session for `share`, connecting on first use.
     async fn get_share(&self, share: &str) -> object_store::Result<Arc<ShareSession>> {
         // Take the cell out of the map before awaiting: a `DashMap` guard held
-        // across the connect would block every other share on this store.
-        let cell = Arc::clone(&self.inner.shares.entry(share.to_string()).or_default());
+        // across the connect would block every other share on this store. The
+        // lookup comes first so a known share costs no key allocation.
+        let existing = self
+            .inner
+            .shares
+            .get(share)
+            .map(|cell| Arc::clone(cell.value()));
+        let cell = existing.unwrap_or_else(|| {
+            Arc::clone(&self.inner.shares.entry(share.to_string()).or_default())
+        });
         let session = cell.get_or_try_init(|| self.connect_share(share)).await?;
         Ok(Arc::clone(session))
     }
