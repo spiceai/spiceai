@@ -53,6 +53,21 @@ pub const SPICE_SQLITE_ACCEL: &str = "spice-sqlite-accel";
 
 // --- DuckDB (feature `result-correctness-duckdb`) ---
 
+/// Open a DuckDB database to serve as an oracle.
+///
+/// `integer_division` makes `/` on two integers truncate, as it does in
+/// DataFusion (and so Cayenne), PostgreSQL and SQLite; DuckDB otherwise returns a
+/// double. Without it the two engines answer different questions whenever a
+/// query divides integers — TPC-DS Q21, Q34, Q73, Q78 and Q83 all do — and the
+/// disagreement says nothing about either engine's correctness.
+#[cfg(feature = "result-correctness-duckdb")]
+pub fn open_duckdb_oracle(db_path: &Path) -> duckdb::Connection {
+    let conn = duckdb::Connection::open(db_path).expect("duckdb open");
+    conn.execute_batch("SET integer_division = true;")
+        .expect("set DuckDB integer division");
+    conn
+}
+
 /// Load named parquet tables into an in-process DuckDB database (not Spice).
 #[cfg(feature = "result-correctness-duckdb")]
 pub fn load_duckdb_from_parquet(
@@ -61,7 +76,7 @@ pub fn load_duckdb_from_parquet(
 ) -> (tempfile::TempDir, duckdb::Connection) {
     let temp = tempfile::tempdir().expect("duckdb temp");
     let db_path = temp.path().join("parity.duckdb");
-    let conn = duckdb::Connection::open(&db_path).expect("duckdb open");
+    let conn = open_duckdb_oracle(&db_path);
     for table in tables {
         let path = parquet_dir.join(format!("{table}.parquet"));
         conn.execute_batch(&format!(

@@ -120,7 +120,8 @@ impl Default for App {
 pub enum Error {
     #[snafu(display("Unable to load spicepod {}: {source}", path.display()))]
     UnableToLoadSpicepod {
-        source: spicepod::Error,
+        #[snafu(source(from(spicepod::Error, Box::new)))]
+        source: Box<spicepod::Error>,
         path: PathBuf,
     },
 

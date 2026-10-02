@@ -31,7 +31,7 @@ use arrow::{
     error::ArrowError,
 };
 use arrow_schema::SchemaRef;
-use arrow_tools::record_batch::try_cast_to;
+use arrow_tools::record_batch::{slice_memory_size, try_cast_to};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use arrow_tools::type_rewrite::rewrite_data_type;
 use async_stream::stream;
@@ -214,6 +214,16 @@ pub(crate) fn collect_all_indexes(
         .chain(indexes_from_federated(federated))
         .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
         .collect()
+}
+
+/// Whether a successful refresh changed the accelerator's contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The refresh may have written to or reloaded the accelerator.
+    Refreshed,
+    /// The accelerator already matched the source, so nothing was written:
+    /// the source reported unchanged data, or no newer snapshot was available.
+    UpToDate,
 }
 
 pub struct RefreshTaskBuilder {
@@ -602,11 +612,15 @@ impl RefreshTask {
 
     /// Runs one refresh to completion.
     ///
+    /// Reports whether the refresh changed the accelerator, so callers can skip
+    /// work (such as results-cache invalidation) after a refresh that found
+    /// nothing new.
+    ///
     /// # Errors
     ///
     /// Returns an error if the source cannot be queried, the refresh SQL fails to
     /// plan or execute, or the resulting data cannot be written to the accelerator.
-    pub async fn run(&self, refresh: Refresh) -> super::Result<()> {
+    pub async fn run(&self, refresh: Refresh) -> super::Result<RefreshOutcome> {
         // Limit parallel refreshes via a semaphore
         let _permit = self.semaphore.acquire().await;
 
@@ -633,7 +647,7 @@ impl RefreshTask {
             .unwrap_or_else(|| unreachable!("There is always at least one span"));
         let result = retry(retry_strategy, || async {
             match self.run_once(&refresh).await {
-                Ok(()) => Ok(()),
+                Ok(outcome) => Ok(outcome),
                 Err(retry_err) => {
                     if !self.runtime_status.is_shutdown()
                         && let Some(error) = attempt_refresh_error(&retry_err)
@@ -667,7 +681,10 @@ impl RefreshTask {
         result
     }
 
-    async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
+    async fn run_once(
+        &self,
+        refresh: &Refresh,
+    ) -> Result<RefreshOutcome, RetryError<super::Error>> {
         self.set_refresh_status(
             refresh.display_sql().as_deref(),
             status::ComponentStatus::Refreshing,
@@ -735,7 +752,7 @@ impl RefreshTask {
                             status::ComponentStatus::Ready,
                         )
                         .await;
-                        return Ok(());
+                        return Ok(RefreshOutcome::UpToDate);
                     }
                     Ok(_) => {
                         // Data may have changed or provider does not support skipping; continue with refresh.
@@ -780,7 +797,10 @@ impl RefreshTask {
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
             RefreshMode::Caching => {
                 // For caching mode, identify and refresh stale rows based on _fetched_at and TTL
-                return self.refresh_stale_cached_rows(refresh).await;
+                return self
+                    .refresh_stale_cached_rows(refresh)
+                    .await
+                    .map(|()| RefreshOutcome::Refreshed);
             }
             RefreshMode::Snapshot => {
                 // For snapshot mode, poll the snapshot store for a newer snapshot
@@ -795,8 +815,9 @@ impl RefreshTask {
             Err(e) => {
                 // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
                 // This is expected and should not be logged as an error.
+                // Report `Refreshed` so a canceled refresh never keeps cached results.
                 if self.runtime_status.is_shutdown() {
-                    return Ok(());
+                    return Ok(RefreshOutcome::Refreshed);
                 }
                 self.log_refresh_error(
                     inner_err_from_retry_ref(&e),
@@ -840,8 +861,9 @@ impl RefreshTask {
         {
             // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
             // This is expected and should not be logged as an error.
+            // Report `Refreshed` so a canceled refresh never keeps cached results.
             if self.runtime_status.is_shutdown() {
-                return Ok(());
+                return Ok(RefreshOutcome::Refreshed);
             }
             tracing::warn!(
                 "Failed to load data for {} {}: {}",
@@ -860,7 +882,7 @@ impl RefreshTask {
         )
         .await;
 
-        Ok(())
+        Ok(RefreshOutcome::Refreshed)
     }
 
     fn is_metric_enabled(&self, metric_name: &str) -> bool {
@@ -990,16 +1012,21 @@ impl RefreshTask {
                         match batch {
                             Ok(batch) => {
                                 tracing.on_new_batch_received(&batch);
+                                // Size the batch by the rows it holds, not by the
+                                // buffers it shares. A read path that slices one
+                                // decoded chunk hands out batches that all point at
+                                // the same buffers, so a whole-buffer measurement
+                                // counts those buffers once per batch.
+                                let batch_bytes = slice_memory_size(&batch);
                                 stat.num_rows += batch.num_rows();
-                                stat.memory_size += batch.get_array_memory_size();
+                                stat.memory_size += batch_bytes;
 
                                 // Record incremental ingestion counters per batch.
                                 // Reuse the prebuilt dataset label (no per-batch
                                 // `dataset` string copy) — see `DatasetMetricLabels`.
                                 let labels = metric_labels.dataset();
                                 metrics::REFRESH_ROWS_WRITTEN.add(batch.num_rows() as u64, labels);
-                                metrics::REFRESH_BYTES_WRITTEN
-                                    .add(batch.get_array_memory_size() as u64, labels);
+                                metrics::REFRESH_BYTES_WRITTEN.add(batch_bytes as u64, labels);
 
                                 // Check memory usage after processing each batch
                                 if let Some(ref monitor) = resource_monitor {
@@ -1263,7 +1290,7 @@ impl RefreshTask {
     async fn refresh_from_snapshot(
         &self,
         refresh: &Refresh,
-    ) -> Result<(), RetryError<super::Error>> {
+    ) -> Result<RefreshOutcome, RetryError<super::Error>> {
         let _ = refresh; // refresh sql / window are intentionally unused for snapshot mode
 
         let Some(state) = self.snapshot_refresh_state.clone() else {
@@ -1390,7 +1417,7 @@ impl RefreshTask {
                 }
                 self.set_refresh_status(None, status::ComponentStatus::Ready)
                     .await;
-                return Ok(());
+                return Ok(RefreshOutcome::UpToDate);
             }
             Err(e) => {
                 let schema_mismatch = mismatch_detail
@@ -1587,7 +1614,7 @@ impl RefreshTask {
 
         self.set_refresh_status(None, status::ComponentStatus::Ready)
             .await;
-        Ok(())
+        Ok(RefreshOutcome::Refreshed)
     }
 
     async fn trace_load_completed(
@@ -1698,6 +1725,9 @@ impl RefreshTask {
                 cpu_runtime_handle,
                 request_context,
                 span,
+                // The scan computes the dataset's indexes as it reads, so it must not start
+                // before the sink has opened their write window (#14619).
+                managed_runtime::StreamStart::OnFirstPoll,
                 async move {
                     // Create ctx inside the managed runtime to avoid creating it twice
                     let mut ctx = Self::create_refresh_df_context(
@@ -2656,7 +2686,10 @@ impl DataLoadTracing {
 
     fn on_new_batch_received(&mut self, batch: &RecordBatch) {
         let num_rows = batch.num_rows();
-        let batch_size = batch.get_array_memory_size();
+        // See the note at the refresh accumulator: measure the rows this batch
+        // holds, so a sequence of slices of one parent does not report the
+        // parent's buffers once per slice.
+        let batch_size = slice_memory_size(batch);
 
         tracing::trace!("Dataset {} received {num_rows} records", self.dataset,);
         self.num_records_received += num_rows;
@@ -2806,7 +2839,7 @@ pub async fn probe_acceleration_contents(
     // the source-federation wiring a refresh needs applies. `accelerator_df`
     // still normalizes the provider chain, and a `FederatedTableProviderAdaptor`
     // left un-federated scans its inner provider directly.
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
     let batches = async {
         accelerator_df(accelerator, &ctx)
             .and_then(|df| df.limit(0, Some(1)))?
@@ -3090,7 +3123,7 @@ fn install_test_meter_provider() {
 /// Used for the user-facing error log. Metric increments use
 /// [`attempt_refresh_error`] and [`terminal_generation_change_refresh_error`].
 #[must_use]
-fn terminal_refresh_error(result: &super::Result<()>, shutdown: bool) -> Option<&super::Error> {
+fn terminal_refresh_error<T>(result: &super::Result<T>, shutdown: bool) -> Option<&super::Error> {
     if shutdown {
         return None;
     }
@@ -3112,8 +3145,8 @@ fn attempt_refresh_error(error: &RetryError<super::Error>) -> Option<&super::Err
 /// An exhausted generation-change after the retry loop. A recovered 412 is
 /// `Ok` and is not counted; a non-generation terminal was already counted
 /// per attempt.
-fn terminal_generation_change_refresh_error(
-    result: &super::Result<()>,
+fn terminal_generation_change_refresh_error<T>(
+    result: &super::Result<T>,
     shutdown: bool,
 ) -> Option<&super::Error> {
     let error = terminal_refresh_error(result, shutdown)?;
@@ -3420,7 +3453,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("Failed to create batch");
 
-        let batch_size = batch.get_array_memory_size();
+        let batch_size = slice_memory_size(&batch);
         let num_rows = batch.num_rows();
 
         // Process the batch
@@ -3430,6 +3463,46 @@ mod tests {
         assert_eq!(tracing.num_records_received, num_rows);
         assert_eq!(tracing.bytes_received, batch_size);
         assert!(tracing.bytes_received > 0);
+    }
+
+    /// Byte accounting must scale with the rows in each batch.
+    ///
+    /// Read paths that decode a large chunk and then emit zero-copy slices of
+    /// it give the refresh a sequence of batches that all share one set of
+    /// buffers. A whole-buffer measurement counts the parent buffers once per
+    /// slice, so the reported bytes grow with the slice count while the rows
+    /// stay correct.
+    #[test]
+    fn test_data_load_tracing_does_not_inflate_sliced_batches() {
+        let rows = 4096;
+        let slice_rows = 32;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col1",
+            DataType::Int32,
+            false,
+        )]));
+        let array = Int32Array::from(
+            (0..rows)
+                .map(|i| i32::try_from(i).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>(),
+        );
+        let parent = RecordBatch::try_new(schema, vec![Arc::new(array)])
+            .expect("Failed to create parent batch");
+        let parent_bytes = slice_memory_size(&parent);
+
+        let dataset = TableReference::bare("test_dataset");
+        let mut tracing = DataLoadTracing::new(&dataset);
+        for i in 0..rows / slice_rows {
+            tracing.on_new_batch_received(&parent.slice(i * slice_rows, slice_rows));
+        }
+
+        assert_eq!(tracing.num_records_received, rows);
+        assert!(
+            tracing.bytes_received <= parent_bytes * 2,
+            "reported {} bytes for the {parent_bytes} bytes the slices cover",
+            tracing.bytes_received
+        );
     }
 
     #[test]
@@ -3940,6 +4013,35 @@ mod tests {
             ),
             "RefreshTaskBuilder::build must hand out the shared state, not build its own"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_session_uses_cpu_budget_partitions() {
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "accelerated::refresh_task::tests::refresh_session_uses_cpu_budget_partitions",
+        )
+        .expect("isolated CPU budget run should pass") else {
+            return;
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let refresh = RefreshTask::create_refresh_df_context(
+            source,
+            &TableReference::bare("cpu_budget_refresh"),
+            &accelerator,
+            false,
+            Handle::current(),
+        )
+        .await;
+        assert_eq!(refresh.state().config().target_partitions(), cores);
     }
 
     #[derive(Debug)]
