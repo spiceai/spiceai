@@ -3155,12 +3155,18 @@ impl DataFusion {
                 // `ready_state: on_schema_resolved` also promises the source was reached,
                 // so while the source is still unresolved the accelerated table's builder
                 // marks the dataset ready once it resolves instead.
+                // Until then it reports `Initializing` rather than the `Refreshing` set
+                // before registration: no refresh may be due, and one that is reports
+                // `Refreshing` itself when it starts.
                 let awaits_source = effective_ready_state == ReadyState::OnSchemaResolved
                     && matches!(&*source_table_provider, FederatedTable::Deferred(_));
-                if !awaits_source {
-                    self.runtime_status
-                        .update_dataset(&dataset.name, status::ComponentStatus::Ready);
-                }
+                let initial_status = if awaits_source {
+                    status::ComponentStatus::Initializing
+                } else {
+                    status::ComponentStatus::Ready
+                };
+                self.runtime_status
+                    .update_dataset(&dataset.name, initial_status);
                 initial_load_complete = true;
             }
         }

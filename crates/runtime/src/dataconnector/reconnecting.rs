@@ -45,8 +45,10 @@ use crate::component::dataset::DatasetSpec;
 use crate::component::dataset::acceleration::RefreshMode;
 
 /// Builds the real connector. Called again after each failure, until one succeeds.
-pub type ConnectorBuilder =
-    Arc<dyn Fn() -> BoxFuture<'static, crate::Result<Arc<dyn DataConnector>>> + Send + Sync>;
+pub type ConnectorBuilder = Arc<dyn Fn() -> ConnectorAttempt + Send + Sync>;
+
+/// One attempt to build the real connector.
+pub type ConnectorAttempt = BoxFuture<'static, crate::Result<Arc<dyn DataConnector>>>;
 
 /// How long loading a dataset waits for its source before serving an existing
 /// acceleration instead. A responsive source answers well within this, and keeps
@@ -116,6 +118,9 @@ pub struct ReconnectingConnector {
     /// The connector name from the dataset's `from:`, for errors.
     source_name: String,
     build: ConnectorBuilder,
+    /// A build already in progress when the dataset loaded, awaited before `build`
+    /// is called, so a slow source is not connected to twice.
+    first_attempt: parking_lot::Mutex<Option<ConnectorAttempt>>,
     unavailable: SourceUnavailable,
     inner: OnceCell<Arc<dyn DataConnector>>,
     /// Object stores the runtime asked to register before the real connector existed,
@@ -128,11 +133,13 @@ impl ReconnectingConnector {
     pub fn new(
         source_name: impl Into<String>,
         build: ConnectorBuilder,
+        first_attempt: Option<ConnectorAttempt>,
         unavailable: SourceUnavailable,
     ) -> Self {
         Self {
             source_name: source_name.into(),
             build,
+            first_attempt: parking_lot::Mutex::new(first_attempt),
             unavailable,
             inner: OnceCell::new(),
             pending_object_stores: parking_lot::Mutex::new(Vec::new()),
@@ -158,7 +165,12 @@ impl ReconnectingConnector {
     ) -> Result<&Arc<dyn DataConnector>, DataConnectorError> {
         let connector = self
             .inner
-            .get_or_try_init(|| (self.build)())
+            .get_or_try_init(|| {
+                // Taken by whichever initialization runs first; if that one fails or
+                // is dropped, the next builds afresh.
+                let first_attempt = self.first_attempt.lock().take();
+                first_attempt.unwrap_or_else(|| (self.build)())
+            })
             .await
             .map_err(|err| self.build_error(dataset, err))?;
 

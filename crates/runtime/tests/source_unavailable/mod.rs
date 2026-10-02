@@ -53,8 +53,10 @@ use crate::{
 /// (`create()` fails); with [`Self::refuse_reads_instead_of_connecting`] it builds,
 /// and `read_provider` fails instead.
 ///
-/// It can also be slow (every `read_provider` waits `read_delay_ms` first) and can
-/// report a primary key on `id`, the way `DynamoDB` reports its key schema.
+/// It can also be slow (building its connector waits `build_delay_ms` first, and every
+/// `read_provider` waits `read_delay_ms`), counts every build and read it is asked
+/// for, and can report a primary key on `id`, the way `DynamoDB` reports its key
+/// schema.
 struct UnreachableSource {
     prefix: &'static str,
     up: AtomicBool,
@@ -62,6 +64,9 @@ struct UnreachableSource {
     connect_attempts: AtomicUsize,
     value: AtomicUsize,
     read_delay_ms: AtomicU64,
+    build_delay_ms: AtomicU64,
+    builds: AtomicUsize,
+    reads: AtomicUsize,
     primary_key: AtomicBool,
 }
 
@@ -74,6 +79,9 @@ impl UnreachableSource {
             connect_attempts: AtomicUsize::new(0),
             value: AtomicUsize::new(value),
             read_delay_ms: AtomicU64::new(0),
+            build_delay_ms: AtomicU64::new(0),
+            builds: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
             primary_key: AtomicBool::new(false),
         })
     }
@@ -113,6 +121,23 @@ impl UnreachableSource {
             u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             Ordering::SeqCst,
         );
+    }
+
+    fn set_build_delay(&self, delay: Duration) {
+        self.build_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// How many times a connector was built (counted as each build starts).
+    fn builds(&self) -> usize {
+        self.builds.load(Ordering::SeqCst)
+    }
+
+    /// How many times the source was read (counted as each read starts).
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
     }
 
     fn report_primary_key(&self) {
@@ -177,6 +202,7 @@ impl DataConnector for UnreachableSourceConnector {
         _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
+        self.source.reads.fetch_add(1, Ordering::SeqCst);
         let delay = self.source.read_delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -220,6 +246,11 @@ impl DataConnectorFactory for UnreachableSourceFactory {
         _context: &'a dyn ConnectorContext,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
+            self.source.builds.fetch_add(1, Ordering::SeqCst);
+            let delay = self.source.build_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             if !self.source.refuse_reads.load(Ordering::SeqCst) {
                 self.source.attempt(params.component.clone())?;
             }
@@ -377,6 +408,17 @@ mod served_from_acceleration {
             )]))),
             ..Default::default()
         });
+        dataset
+    }
+
+    /// `dataset` checking for a due refresh only every `interval`.
+    fn with_refresh_check_interval(
+        mut dataset: SpicepodDataset,
+        interval: &str,
+    ) -> SpicepodDataset {
+        if let Some(acceleration) = dataset.acceleration.as_mut() {
+            acceleration.refresh_check_interval = Some(interval.to_string());
+        }
         dataset
     }
 
@@ -637,6 +679,7 @@ mod served_from_acceleration {
 
         source.set_value(2);
         source.set_read_delay(Duration::from_secs(6));
+        let reads_before_restart = source.reads();
         let (rt, loader) = start(spec()).await;
 
         assert!(
@@ -649,6 +692,87 @@ mod served_from_acceleration {
             refreshed_from_source(&rt).await,
             "the data catches up once the slow source answers, got {:?}",
             sum_and_count(&rt).await
+        );
+        assert_eq!(
+            source.reads() - reads_before_restart,
+            1,
+            "the read in progress when the acceleration starts serving is the one the source answers, not repeated"
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A source that is slow to connect to does not hold the dataset unregistered, and
+    /// the connection already in progress is the one used once it completes, rather
+    /// than a second one started after the wait.
+    #[tokio::test]
+    async fn a_slow_connection_is_used_rather_than_opened_again() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("slow-connection").await?;
+        let source = &fixture.source;
+        let spec = || fixture.dataset(ReadyState::OnLoad);
+        seed(source, spec()).await?;
+
+        source.set_value(2);
+        source.set_build_delay(Duration::from_secs(6));
+        let builds_before_restart = source.builds();
+        let (rt, loader) = start(spec()).await;
+
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(5)).await,
+            "a slow connection must not keep the acceleration from serving, got {:?} ({:?})",
+            sum_and_count(&rt).await,
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            refreshed_from_source(&rt).await,
+            "the data catches up once the connection completes, got {:?}",
+            sum_and_count(&rt).await
+        );
+        assert_eq!(
+            source.builds() - builds_before_restart,
+            1,
+            "the connection in progress when the acceleration starts serving is used, not opened again"
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// Under `ready_state: on_schema_resolved` with no refresh due, the dataset
+    /// reports `Initializing` while its source is down, not `Refreshing`: it is
+    /// served from its acceleration, and nothing is refreshing.
+    #[tokio::test]
+    async fn on_schema_resolved_reports_initializing_until_the_source_is_reached()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("initializing-while-down").await?;
+        let source = &fixture.source;
+        // A refresh is checked for only hourly, so none is due after the restart.
+        let spec = |ready_state| with_refresh_check_interval(fixture.dataset(ready_state), "1h");
+        seed(source, spec(ReadyState::OnLoad)).await?;
+
+        let (rt, loader) =
+            restart_with_source_down(source, spec(ReadyState::OnSchemaResolved)).await;
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(10)).await,
+            "queries must be answered from the existing acceleration, got {:?}",
+            sum_and_count(&rt).await
+        );
+        assert_eq!(
+            dataset_status(&rt, "orders"),
+            Some(ComponentStatus::Initializing),
+            "with no refresh due, the dataset is initializing until its source is reached"
+        );
+
+        source.bring_up();
+        let ready = wait_until_true(Duration::from_secs(30), || async {
+            dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        assert!(
+            ready,
+            "the dataset is ready once its source is reached ({:?})",
+            dataset_status(&rt, "orders")
         );
         stop(rt, loader).await;
         Ok(())

@@ -42,7 +42,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
-use crate::refresh_source::RefreshSource;
+use crate::refresh_source::{RefreshSource, RefreshSourceError};
 use async_trait::async_trait;
 use data_connector_api::DataConnectorError;
 use data_connector_api::federated::FederatedTableProvider;
@@ -137,6 +137,11 @@ pub struct DeferredTableProvider {
     schema_change_failure: Option<String>,
 }
 
+/// A read of the source already in progress when the provider is deferred; the
+/// deferred task awaits it as its first attempt instead of starting another.
+pub type ProviderAttempt =
+    futures::future::BoxFuture<'static, Result<Arc<dyn TableProvider>, RefreshSourceError>>;
+
 /// A resolved federated provider, or the fallback that errors on scan when the
 /// deferred task finished without producing one; see
 /// [`FederatedTable::try_wait_table_provider`].
@@ -223,6 +228,7 @@ impl FederatedTable {
                 source,
                 accelerated_schema,
                 shutdown_token,
+                None,
             ));
         }
 
@@ -299,6 +305,7 @@ impl FederatedTable {
                         source,
                         accelerated_schema,
                         shutdown_token,
+                        None,
                     ));
                 }
                 if refresh_mode == RefreshMode::Caching {
@@ -317,6 +324,7 @@ impl FederatedTable {
                         source,
                         accelerated_schema,
                         shutdown_token,
+                        None,
                     ));
                 }
                 if !engine.is_some_and(engine_supports_in_place_evolution) {
@@ -336,6 +344,7 @@ impl FederatedTable {
                         source,
                         accelerated_schema,
                         shutdown_token,
+                        None,
                     ));
                 }
                 // Detection + applied metrics for this path are emitted by
@@ -375,6 +384,7 @@ impl FederatedTable {
                     source,
                     accelerated_schema,
                     shutdown_token,
+                    None,
                 ))
             }
         }
@@ -401,8 +411,13 @@ impl FederatedTable {
             "A schema change was detected for {dataset_name} ({change}), and `on_schema_change: fail` is set. The existing acceleration continues to serve the previous schema. Revert the source schema change to recover, or set `on_schema_change` to `append_new_columns` or `sync_all_columns` to evolve the schema."
         );
         tracing::error!(dataset = %dataset.name, "{message}");
-        let mut deferred =
-            Self::new_deferred_with_schema(dataset, source, accelerated_schema, shutdown_token);
+        let mut deferred = Self::new_deferred_with_schema(
+            dataset,
+            source,
+            accelerated_schema,
+            shutdown_token,
+            None,
+        );
         deferred.schema_change_failure = Some(message);
         Self::Deferred(deferred)
     }
@@ -420,19 +435,22 @@ impl FederatedTable {
 
     /// A table served from an existing acceleration — registered with its
     /// checkpoint's schema — while a background task keeps trying to connect to the
-    /// source until its provider is available.
+    /// source until its provider is available. `first_attempt` is a read of the
+    /// source already in progress, which that task awaits before trying again.
     #[must_use]
     pub fn new_deferred(
         dataset: Arc<DatasetSpec>,
         source: Arc<dyn RefreshSource>,
         checkpoint_schema: SchemaRef,
         shutdown_token: CancellationToken,
+        first_attempt: Option<ProviderAttempt>,
     ) -> Self {
         Self::Deferred(Self::new_deferred_with_schema(
             dataset,
             source,
             checkpoint_schema,
             shutdown_token,
+            first_attempt,
         ))
     }
 
@@ -556,6 +574,7 @@ impl FederatedTable {
         source: Arc<dyn RefreshSource>,
         schema: SchemaRef,
         shutdown_token: CancellationToken,
+        first_attempt: Option<ProviderAttempt>,
     ) -> DeferredTableProvider {
         let constraints =
             crate::accelerated::checkpoint_primary_key::acceleration_primary_key(&schema);
@@ -570,28 +589,37 @@ impl FederatedTable {
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
             let tracer = OnceTracer::new();
-            let source = Arc::clone(&source);
-            let retry_fut = retry(retry_strategy, || async {
-                match source.read_provider().await {
-                    Ok(table_provider) => {
-                        let federated_schema = table_provider.schema();
+            let (source, accelerated_schema, dataset_name, tracer) =
+                (&source, &accelerated_schema, &dataset_name, &tracer);
+            let mut first_attempt = first_attempt;
+            let retry_fut = retry(retry_strategy, move || {
+                let first_attempt = first_attempt.take();
+                async move {
+                    let read = match first_attempt {
+                        Some(attempt) => attempt.await,
+                        None => source.read_provider().await,
+                    };
+                    match read {
+                        Ok(table_provider) => {
+                            let federated_schema = table_provider.schema();
 
-                        if let Some(differences) =
-                            schema_difference(&accelerated_schema, &federated_schema)
-                        {
-                            let error = DataConnectorError::SchemaMismatch {
-                                dataset_name: dataset_name.to_string(),
-                                differences,
-                            };
-                            warn_once!(tracer, "{}", error);
-                            return Err(RetryError::transient(
-                                Box::new(error) as crate::refresh_source::RefreshSourceError
-                            ));
+                            if let Some(differences) =
+                                schema_difference(&accelerated_schema, &federated_schema)
+                            {
+                                let error = DataConnectorError::SchemaMismatch {
+                                    dataset_name: dataset_name.to_string(),
+                                    differences,
+                                };
+                                warn_once!(tracer, "{}", error);
+                                return Err(RetryError::transient(
+                                    Box::new(error) as crate::refresh_source::RefreshSourceError
+                                ));
+                            }
+
+                            Ok(table_provider)
                         }
-
-                        Ok(table_provider)
+                        Err(e) => Err(RetryError::transient(e)),
                     }
-                    Err(e) => Err(RetryError::transient(e)),
                 }
             });
 

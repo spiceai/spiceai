@@ -222,7 +222,7 @@ impl DatasetInitialization {
                 // its first query from that acceleration rather than connecting to the
                 // source first; the source is connected in the background.
                 let connector = if Runtime::serves_existing_acceleration(&dataset).await {
-                    Runtime::reconnecting_connector(&dataset, SourceUnavailable::NotContacted)
+                    Runtime::reconnecting_connector(&dataset, None, SourceUnavailable::NotContacted)
                 } else {
                     match builder().await {
                         Ok(connector) => connector,
