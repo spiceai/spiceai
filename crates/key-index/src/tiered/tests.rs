@@ -23,7 +23,7 @@ use rand::{RngExt, SeedableRng};
 
 use super::*;
 use crate::KeyField;
-use crate::test_support::{column, encoded, encoder, word};
+use crate::test_support::{column, encoded, encoder, run_of, word};
 
 /// Model: key -> set of (file, position) rows in live files.
 #[derive(Default)]
@@ -160,12 +160,6 @@ fn a_lone_posting_too_wide_for_its_slot_is_found() {
 }
 
 /// A run over `keys`, all in `file`.
-fn run_of(file: &str, keys: &[i64]) -> IndexRun {
-    let mut builder = RunBuilder::new(encoder());
-    builder.add_batch(file, 0, &column(keys)).expect("add");
-    builder.finish().expect("finish")
-}
-
 /// The filter counts distinct keys, not inserts: runs over keys it holds
 /// already (a rewrite's run over the rows it compacted, a batch of
 /// updates) never make it due for a rebuild, while new keys past twice
@@ -325,14 +319,7 @@ fn explicit_positions_and_coverage() {
         index.publish(vec![read_back.finish().expect("run")], &[]);
         index
     });
-    written.publish(
-        vec![{
-            let mut b = RunBuilder::new(encoder());
-            b.add_batch("a", 0, &column(&keys)).expect("add");
-            b.finish().expect("run")
-        }],
-        &[],
-    );
+    written.publish(vec![run_of("a", &keys)], &[]);
     for k in 0..20 {
         let collect = |index: &TieredIndex| {
             let mut rows = Vec::new();
@@ -501,12 +488,7 @@ fn a_run_is_retired_only_when_all_its_files_are() {
 #[test]
 fn reconcile_retires_files_seen_live_and_then_gone() {
     let index = TieredIndex::new(encoder());
-    let run = |file: &str, key: i64| {
-        let mut builder = RunBuilder::new(encoder());
-        builder.add_batch(file, 0, &column(&[key])).expect("batch");
-        builder.finish().expect("run")
-    };
-    index.publish(vec![run("a", 1), run("b", 2)], &[]);
+    index.publish(vec![run_of("a", &[1]), run_of("b", &[2])], &[]);
     let live = |names: &[&'static str]| {
         names
             .iter()
@@ -518,7 +500,7 @@ fn reconcile_retires_files_seen_live_and_then_gone() {
     assert_eq!(index.view().runs(), 2);
     // Both visible, then a refresh replaces them with `c`.
     assert_eq!(index.reconcile(&live(&["a", "b"])), 0);
-    index.publish(vec![run("c", 3)], &[]);
+    index.publish(vec![run_of("c", &[3])], &[]);
     assert_eq!(index.reconcile(&live(&["c"])), 2);
     let view = index.view();
     assert_eq!(view.runs(), 1);
@@ -550,9 +532,7 @@ fn publish_visible_retires_files_already_gone() {
     assert_eq!(index.reconcile(&live(&["c"])), 1);
     assert_eq!(index.view().runs(), 0);
     // A run with no live file is not published at all.
-    let mut gone = RunBuilder::new(encoder());
-    gone.add_batch("d", 0, &column(&[4])).expect("batch");
-    index.publish_visible(vec![gone.finish().expect("run")], &live(&["c"]));
+    index.publish_visible(vec![run_of("d", &[4])], &live(&["c"]));
     assert_eq!(index.view().runs(), 0);
 }
 
@@ -850,18 +830,36 @@ mod persist {
         );
     }
 
-    /// A run whose only word has `postings` as its posting stream, sealed
-    /// with a valid checksum, as a writer bug or a crafted file could leave.
-    fn sealed_with_postings(postings: Vec<u8>, rows: usize) -> Vec<u8> {
+    /// The bytes of a run over `files` built from these parts, sealed with a
+    /// valid checksum, as a writer bug or a crafted file could leave them.
+    fn sealed(
+        files: &[&str],
+        words: Vec<u64>,
+        slots: Vec<u32>,
+        postings: Vec<u8>,
+        rows: usize,
+    ) -> Vec<u8> {
+        let files: Vec<Arc<str>> = files.iter().map(|&file| Arc::from(file)).collect();
         IndexRun::from_parts(
             0,
-            vec![Arc::from("a")].into(),
-            vec![7].into(),
-            vec![word_proof::offset_slot(0)].into(),
+            files.into(),
+            words.into(),
+            slots.into(),
             postings.into(),
             rows,
         )
         .to_bytes()
+    }
+
+    /// A run of file `a` whose only word has `postings` as its posting stream.
+    fn sealed_with_postings(postings: Vec<u8>, rows: usize) -> Vec<u8> {
+        sealed(
+            &["a"],
+            vec![7],
+            vec![word_proof::offset_slot(0)],
+            postings,
+            rows,
+        )
     }
 
     fn varints(values: &[u64]) -> Vec<u8> {
@@ -909,27 +907,11 @@ mod persist {
             } else {
                 varints(&[1, 0])
             };
-            let bytes = IndexRun::from_parts(
-                0,
-                Vec::new().into(),
-                vec![7].into(),
-                vec![slot].into(),
-                postings.into(),
-                1,
-            )
-            .to_bytes();
+            let bytes = sealed(&[], vec![7], vec![slot], postings, 1);
             assert_eq!(IndexRun::from_bytes(&bytes).err(), Some(Error::Corrupt));
         }
-        let empty = IndexRun::from_parts(
-            0,
-            Vec::new().into(),
-            Vec::new().into(),
-            Vec::new().into(),
-            Vec::new().into(),
-            0,
-        );
         assert!(
-            IndexRun::from_bytes(&empty.to_bytes()).is_ok(),
+            IndexRun::from_bytes(&sealed(&[], Vec::new(), Vec::new(), Vec::new(), 0)).is_ok(),
             "a run of no rows and no files loads"
         );
     }
@@ -944,15 +926,7 @@ mod persist {
         let second = u32::try_from(postings.len()).expect("small");
         postings.extend(varints(&[2, 1, 2]));
         let sealed = |slots: Vec<u32>, rows: usize| {
-            IndexRun::from_parts(
-                0,
-                vec![Arc::from("a")].into(),
-                vec![7, 9].into(),
-                slots.into(),
-                postings.clone().into(),
-                rows,
-            )
-            .to_bytes()
+            sealed(&["a"], vec![7, 9], slots, postings.clone(), rows)
         };
         let intact = IndexRun::from_bytes(&sealed(
             vec![word_proof::offset_slot(0), word_proof::offset_slot(second)],

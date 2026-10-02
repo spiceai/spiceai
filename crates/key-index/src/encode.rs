@@ -25,7 +25,8 @@ limitations under the License.
 //! |---|---|
 //! | nullable, NULL | `00` |
 //! | nullable, valid | `01` then the value's encoding |
-//! | signed integers, dates, times, timestamps, durations, `Decimal128` | big-endian, sign bit flipped |
+//! | signed integers, dates, times, timestamps, durations, `Decimal128`, `Decimal256`, `Interval(YearMonth)` | big-endian, sign bit flipped |
+//! | `Interval(DayTime)`, `Interval(MonthDayNano)` | each field in order (`i32` days and milliseconds; `i32` months and days and `i64` nanoseconds), big-endian, sign bit flipped |
 //! | unsigned integers | big-endian |
 //! | floating point | canonical bits big-endian, all bits flipped when negative, else the sign bit |
 //! | `Boolean` | `00` or `01` |
@@ -44,15 +45,15 @@ limitations under the License.
 //! on the value. The declared [`KeyField`] type still has to match the bound
 //! array exactly, so a mismatch is an error rather than a silent miss.
 //!
-//! A floating-point value is encoded by its bits after two values with several
-//! bit patterns are given one: `-0.0` encodes as `0.0`, and every NaN as the
-//! one quiet NaN of its width. SQL may hold those equal (`-0.0 = 0.0`, and a
-//! NaN equal to every NaN under total ordering), so a key holding one of them
-//! must encode as every value equal to it does, or a lookup for one would miss
-//! rows holding the other. Merging them can only give values SQL tells apart a
-//! shared encoding, which costs a lookup candidate rows that its filter
-//! drops, never a row it should return. Every other value keeps its own bits,
-//! and the sign transform orders them as the numbers they are.
+//! A floating-point value is encoded by its bits, except that `-0.0` encodes
+//! as `0.0` and every NaN as the positive quiet NaN of its width. Engines
+//! disagree on which of those are equal: IEEE comparison holds `-0.0 = 0.0`,
+//! and some engines hold every NaN equal, while a total order (`DataFusion`'s)
+//! tells them all apart. Giving each group one encoding is correct either
+//! way: values an engine holds equal always share an encoding, and values it
+//! tells apart that share one only add candidate rows the query's filter
+//! drops. Every other value keeps its own bits, and the sign transform orders
+//! them as the numbers they are.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
@@ -70,7 +71,7 @@ use arrow_array::{
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
-use snafu::ensure;
+use snafu::{OptionExt, ensure};
 
 use crate::escape_proof::escape_value_into;
 use crate::{
@@ -78,16 +79,13 @@ use crate::{
     UnsupportedTypeSnafu,
 };
 
-/// The encoded bits of a float of `width` bits (16, 32 or 64) whose bits are
-/// `bits`: `-0.0` as `0.0` and every NaN as the quiet NaN with no payload (see
-/// the module docs), then ordered as the number is, all bits flipped for a
-/// negative value and the sign bit set for a positive one.
-fn float_key(bits: u64, width: u32) -> u64 {
-    let (exponent_bits, mask) = match width {
-        16 => (5, u64::from(u16::MAX)),
-        32 => (8, u64::from(u32::MAX)),
-        _ => (11, u64::MAX),
-    };
+/// Appends the encoding of a float of `width` bits (16, 32 or 64) with
+/// `exponent_bits` exponent bits whose bits are `bits`: `-0.0` as `0.0` and
+/// every NaN as the quiet NaN with no payload (see the module docs), then
+/// ordered as the number is, all bits flipped for a negative value and the
+/// sign bit set for a positive one, big-endian.
+fn put_float(out: &mut Vec<u8>, bits: u64, width: u32, exponent_bits: u32) {
+    let mask = u64::MAX >> (64 - width);
     let sign = 1_u64 << (width - 1);
     let fraction_bits = width - 1 - exponent_bits;
     let exponent = ((1_u64 << exponent_bits) - 1) << fraction_bits;
@@ -105,7 +103,7 @@ fn float_key(bits: u64, width: u32) -> u64 {
     } else {
         !canonical
     };
-    ordered & mask
+    out.extend_from_slice(&(ordered & mask).to_be_bytes()[(64 - width) as usize / 8..]);
 }
 
 const NULL_MARK: u8 = 0x00;
@@ -136,6 +134,8 @@ impl KeyField {
 #[derive(Debug, Clone)]
 pub struct KeyEncoder {
     fields: Vec<KeyField>,
+    /// Each field's [`Kind`], resolved once when the key is declared.
+    kinds: Vec<Kind>,
     /// How a key becomes its 64-bit word; see [`KeyEncoder::key_word`].
     words: WordRule,
 }
@@ -259,14 +259,11 @@ impl Kind {
 }
 
 impl WordRule {
-    fn of(fields: &[KeyField]) -> Self {
+    fn of(fields: &[KeyField], kinds: &[Kind]) -> Self {
         let layout: Option<Vec<(bool, usize)>> = fields
             .iter()
-            .map(|field| {
-                kind(&field.data_type)
-                    .and_then(Kind::fixed_width)
-                    .map(|width| (field.nullable, width))
-            })
+            .zip(kinds)
+            .map(|(field, kind)| kind.fixed_width().map(|width| (field.nullable, width)))
             .collect();
         match layout {
             Some(layout) if layout.iter().map(|&(_, width)| width).sum::<usize>() <= 8 => {
@@ -285,16 +282,20 @@ impl KeyEncoder {
     /// [`crate::Error::UnsupportedType`] when a field's type has no
     /// order-preserving encoding here.
     pub fn new(fields: Vec<KeyField>) -> Result<Self> {
-        for field in &fields {
-            ensure!(
-                kind(&field.data_type).is_some(),
-                UnsupportedTypeSnafu {
+        let kinds = fields
+            .iter()
+            .map(|field| {
+                kind(&field.data_type).context(UnsupportedTypeSnafu {
                     data_type: field.data_type.to_string(),
-                }
-            );
-        }
-        let words = WordRule::of(&fields);
-        Ok(Self { fields, words })
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let words = WordRule::of(&fields, &kinds);
+        Ok(Self {
+            fields,
+            kinds,
+            words,
+        })
     }
 
     /// The key fields.
@@ -403,7 +404,12 @@ impl KeyEncoder {
             .first()
             .map_or(0, |column| Array::len(column.as_ref()));
         let mut bound = Vec::with_capacity(columns.len());
-        for (index, (column, field)) in columns.iter().zip(&self.fields).enumerate() {
+        for (index, ((column, field), &kind)) in columns
+            .iter()
+            .zip(&self.fields)
+            .zip(&self.kinds)
+            .enumerate()
+        {
             ensure!(
                 column.data_type() == &field.data_type,
                 ColumnTypeSnafu {
@@ -425,7 +431,7 @@ impl KeyEncoder {
                 UnexpectedNullSnafu { index }
             );
             bound.push(BoundColumn {
-                data: ColumnData::new(column.as_ref())?,
+                data: ColumnData::new(column.as_ref(), kind),
                 nulls: if field.nullable { column.nulls() } else { None },
                 nullable: field.nullable,
             });
@@ -466,14 +472,10 @@ enum ColumnData<'a> {
 }
 
 impl<'a> ColumnData<'a> {
-    fn new(array: &'a dyn Array) -> Result<Self> {
-        let Some(kind) = kind(array.data_type()) else {
-            return UnsupportedTypeSnafu {
-                data_type: array.data_type().to_string(),
-            }
-            .fail();
-        };
-        Ok(match kind {
+    /// The values of `array`, whose type `bind` checked is the field's, so
+    /// `kind` is its type's kind.
+    fn new(array: &'a dyn Array, kind: Kind) -> Self {
+        match kind {
             Kind::Int8 => Self::I8(array.as_primitive::<Int8Type>().values()),
             Kind::Int16 => Self::I16(array.as_primitive::<Int16Type>().values()),
             Kind::Int32 => Self::I32(array.as_primitive::<Int32Type>().values()),
@@ -538,7 +540,7 @@ impl<'a> ColumnData<'a> {
             Kind::LargeBinary => Self::LargeBinary(array.as_binary::<i64>()),
             Kind::BinaryView => Self::BinaryView(array.as_binary_view()),
             Kind::FixedSizeBinary(_) => Self::FixedBinary(array.as_fixed_size_binary()),
-        })
+        }
     }
 }
 
@@ -644,17 +646,9 @@ impl BoundColumn<'_> {
             ColumnData::U16(v) => out.extend_from_slice(&v[row].to_be_bytes()),
             ColumnData::U32(v) => out.extend_from_slice(&v[row].to_be_bytes()),
             ColumnData::U64(v) => out.extend_from_slice(&v[row].to_be_bytes()),
-            ColumnData::F16(v) => {
-                let bits = float_key(u64::from(v[row].to_bits()), 16);
-                out.extend_from_slice(&bits.to_be_bytes()[6..]);
-            }
-            ColumnData::F32(v) => {
-                let bits = float_key(u64::from(v[row].to_bits()), 32);
-                out.extend_from_slice(&bits.to_be_bytes()[4..]);
-            }
-            ColumnData::F64(v) => {
-                out.extend_from_slice(&float_key(v[row].to_bits(), 64).to_be_bytes());
-            }
+            ColumnData::F16(v) => put_float(out, u64::from(v[row].to_bits()), 16, 5),
+            ColumnData::F32(v) => put_float(out, u64::from(v[row].to_bits()), 32, 8),
+            ColumnData::F64(v) => put_float(out, v[row].to_bits(), 64, 11),
             ColumnData::Bool(v) => out.push(u8::from(v.value(row))),
             ColumnData::FixedBinary(v) => out.extend_from_slice(v.value(row)),
             ColumnData::Binary(v) => escape_value_into(v.value(row), out),
