@@ -2739,14 +2739,15 @@ impl MetadataCatalog for CayenneCatalog {
             )
             .await;
             if let Err(e) = swapped {
-                if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
-                    roll_back_and_back_off(
+                if is_retryable_write_conflict(&e)
+                    && end_conflicted_attempt(
                         tx,
                         attempt,
                         max_attempts,
                         "swap the current snapshot pointer",
                     )
-                    .await;
+                    .await
+                {
                     continue;
                 }
                 return Err(e);
@@ -3493,8 +3494,11 @@ impl MetadataCatalog for CayenneCatalog {
                         });
                     }
                 },
-                Err(e) if should_retry_metastore_write_conflict(&e, attempt, max_attempts) => {
-                    roll_back_and_back_off(tx, attempt, max_attempts, "commit compaction").await;
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(tx, attempt, max_attempts, "commit compaction").await
+                    {
+                        return Err(e);
+                    }
                 }
                 Err(e) => {
                     // Transaction auto-rolls-back on drop.
@@ -3563,9 +3567,17 @@ impl MetadataCatalog for CayenneCatalog {
                         });
                     }
                 },
-                Err(e) if should_retry_metastore_write_conflict(&e, attempt, max_attempts) => {
-                    roll_back_and_back_off(tx, attempt, max_attempts, "commit fenced compaction")
-                        .await;
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(
+                        tx,
+                        attempt,
+                        max_attempts,
+                        "commit fenced compaction",
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -3630,9 +3642,17 @@ impl MetadataCatalog for CayenneCatalog {
                         });
                     }
                 },
-                Err(e) if should_retry_metastore_write_conflict(&e, attempt, max_attempts) => {
-                    roll_back_and_back_off(tx, attempt, max_attempts, "swap protected snapshots")
-                        .await;
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(
+                        tx,
+                        attempt,
+                        max_attempts,
+                        "swap protected snapshots",
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
                 }
                 Err(e) => {
                     // Transaction auto-rolls-back on drop.
@@ -3696,8 +3716,11 @@ impl MetadataCatalog for CayenneCatalog {
                         });
                     }
                 },
-                Err(e) if should_retry_metastore_write_conflict(&e, attempt, max_attempts) => {
-                    roll_back_and_back_off(tx, attempt, max_attempts, "commit overwrite").await;
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(tx, attempt, max_attempts, "commit overwrite").await
+                    {
+                        return Err(e);
+                    }
                 }
                 Err(e) => {
                     return Err(e);
@@ -4259,9 +4282,17 @@ impl MetadataCatalog for CayenneCatalog {
                         });
                     }
                 },
-                Err(e) if should_retry_metastore_write_conflict(&e, attempt, max_attempts) => {
-                    roll_back_and_back_off(tx, attempt, max_attempts, "commit datalake data move")
-                        .await;
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(
+                        tx,
+                        attempt,
+                        max_attempts,
+                        "commit datalake data move",
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
                 }
                 // Drop `tx` → automatic rollback; leaves the catalog unchanged.
                 Err(e) => return Err(e),
@@ -4829,9 +4860,10 @@ impl MetadataCatalog for CayenneCatalog {
             )
             .await;
             if let Err(e) = applied {
-                if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
-                    roll_back_and_back_off(tx, attempt, max_attempts, "commit inline mutation")
-                        .await;
+                if is_retryable_write_conflict(&e)
+                    && end_conflicted_attempt(tx, attempt, max_attempts, "commit inline mutation")
+                        .await
+                {
                     continue;
                 }
                 return Err(e);
@@ -5463,20 +5495,21 @@ async fn sleep_before_metastore_write_retry(
 }
 
 /// End a transaction attempt that a statement's retryable write conflict
-/// failed, then back off before the next attempt.
+/// failed and, when attempts remain, back off before the next one. Returns
+/// whether to retry; on `false` the caller returns the conflict.
 ///
 /// Turso rolls the transaction back itself when a statement raises a write-write
 /// conflict, so this `ROLLBACK` can report that no transaction is open. That is
 /// harmless: the connection returns to the pool in autocommit either way, which
-/// is what the next attempt needs. Rolling back explicitly, rather than dropping
-/// the transaction, keeps that expected failure out of the error log the
-/// dropped transaction's rollback would write.
-async fn roll_back_and_back_off(
+/// is what the next attempt needs. The attempt is rolled back explicitly even
+/// when it was the last one, rather than dropped, because a dropped
+/// transaction's rollback writes that expected failure to the error log.
+async fn end_conflicted_attempt(
     tx: Box<dyn MetastoreTransaction>,
     attempt: u32,
     max_attempts: u32,
     operation: &'static str,
-) {
+) -> bool {
     if let Err(error) = tx.rollback().await {
         tracing::debug!(
             operation,
@@ -5484,7 +5517,11 @@ async fn roll_back_and_back_off(
             "Rolling back a metastore transaction attempt after a write conflict reported an error"
         );
     }
+    if attempt >= max_attempts {
+        return false;
+    }
     sleep_before_metastore_write_retry(attempt, max_attempts, operation).await;
+    true
 }
 
 fn validate_existing_delete_file_record(
