@@ -1,6 +1,9 @@
 [workspace]
 default-members = ["bin/spiced"]
-exclude = ["crates/data-connectors/connector-nfs"]
+exclude = [
+    "crates/data-connectors/connector-nfs",
+    "tools/turso-072-fixture-gen",
+]
 members = [
     "bin/spice/",
     "bin/spiced/",
