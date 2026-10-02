@@ -20,8 +20,8 @@ use tokio::sync::Semaphore;
 use {crate::graphql::InvalidPaginationRegexSnafu, data_components::rate_limit::RateLimiter};
 
 use super::{
-    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
-    is_gateway_error, is_retriable_error,
+    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, RefusalKind,
+    ReqwestInternalSnafu, Result, is_gateway_error, is_retriable_error, should_shrink_page_size,
 };
 use arrow::{
     array::RecordBatch,
@@ -1254,9 +1254,9 @@ impl GraphQLClient {
         // Try to parse as JSON
         let response: serde_json::Value = serde_json::from_str(&response_text)
             .map_err(|e| {
-                let preview = response_text.chars().take(1000).collect::<String>();
+                let preview = json_error_preview(&response_text, &e);
                 tracing::error!(
-                    "Failed to decode response body as JSON.\nHTTP Status: {}\nJSON Parse Error: {}\nResponse body preview (first 1000 chars):\n{}",
+                    "Failed to decode response body as JSON.\nHTTP Status: {}\nJSON Parse Error: {}\nResponse body preview (head and parse-failure context):\n{}",
                     status,
                     e,
                     preview
@@ -1761,12 +1761,15 @@ impl GraphQLClient {
     /// Note: Rate limit handling (waiting until reset time) is done proactively by the
     /// `RateLimiter` trait via `check_rate_limit()` before each request.
     ///
-    /// On gateway errors (HTTP 502/504) the next retry is sent with a smaller
+    /// On an upstream backend error the next retry is sent with a smaller
     /// per-page size, shrinking along a reverse-Fibonacci sequence. A 502 from
     /// an upstream proxy commonly means the GitHub GraphQL backend timed out
     /// while resolving an oversized query; requesting a smaller page gives the
     /// backend a chance to complete within its per-request deadline instead of
-    /// replaying the exact same failing query.
+    /// replaying the exact same failing query. GitHub reports the same timeout
+    /// as HTTP 200 with an "internal error" message, which reaches this path as
+    /// an inferred `InvalidCredentialsOrPermissions`; see
+    /// `should_shrink_page_size`.
     async fn execute_with_retry(
         client: &Arc<Self>,
         query: &GraphQLQuery,
@@ -1829,6 +1832,8 @@ impl GraphQLClient {
                             }
                             if is_gateway_error(&e) {
                                 close_conn.store(true, Ordering::Relaxed);
+                            }
+                            if should_shrink_page_size(&e) {
                                 // Shrink the per-page size for the next retry.
                                 // Seed from the query's declared page size on
                                 // the first gateway error, then reverse-Fib.
@@ -1845,7 +1850,7 @@ impl GraphQLClient {
                                 });
                                 let next = reverse_fibonacci_shrink(current);
                                 tracing::warn!(
-                                    "Gateway error; shrinking GraphQL page size for retry: {current} -> {next}"
+                                    "Upstream backend error; shrinking GraphQL page size for retry: {current} -> {next}"
                                 );
                                 *guard = Some(next);
                             }
@@ -1971,11 +1976,13 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                 message: format!(
                     "The API failed with status code {status}. Verify the provided credentials are correct."
                 ),
+                kind: RefusalKind::Explicit,
             }),
             StatusCode::FORBIDDEN => Err(Error::InvalidCredentialsOrPermissions {
                 message: format!(
                     "The API failed with status code {status}. Verify the provided credentials have the necessary permissions."
                 ),
+                kind: RefusalKind::Explicit,
             }),
             StatusCode::GATEWAY_TIMEOUT | StatusCode::REQUEST_TIMEOUT => {
                 Err(Error::InvalidReqwestStatus {
@@ -2013,21 +2020,24 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                 return Ok(());
             }
 
-            // GitHub bug: When the app doesn't have access to Projects v2, GitHub sometimes
-            // returns "Something went wrong while executing your query" instead of a proper
-            // permission error. This appears to be a GitHub API bug where lack of permissions
-            // triggers an internal error rather than returning a proper authorization error.
-            // Check for this before processing other GraphQL errors.
+            // GitHub sends "Something went wrong while executing your query" for
+            // two different causes, and the message alone cannot tell them apart:
+            // a backend timeout on a query that is too expensive, and a GitHub
+            // defect where missing Projects v2 access gives an internal error
+            // instead of an authorization error. The timeout is the common case,
+            // so the error is not an explicit deny: the caller retries it with a
+            // smaller page. Check for this before processing other GraphQL errors.
             for error in errors_array {
                 if let Some(message) = error.get("message").and_then(|m| m.as_str())
                     && message.contains("Something went wrong while executing your query")
                 {
                     tracing::debug!(
-                        "Detected GitHub 'Something went wrong' error, likely a permissions issue: {}",
+                        "Detected GitHub 'Something went wrong' error, treating it as a transient backend failure: {}",
                         message
                     );
                     return Err(Error::InvalidCredentialsOrPermissions {
-                        message: "GitHub returned an internal error. This may indicate the GitHub App does not have permission to access the requested resource. Verify the app has the required permissions.".to_string(),
+                        message: "GitHub returned an internal error. The query is usually too expensive for the GitHub backend to complete in time; the request will be retried with a smaller page. If the error persists, verify the GitHub App has permission to access the requested resource.".to_string(),
+                        kind: RefusalKind::Inferred,
                     });
                 }
             }
@@ -2084,6 +2094,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                     message: format!(
                         "The API returned a 'FORBIDDEN' error. Verify the credentials have the necessary permissions. {message}"
                     ),
+                    kind: RefusalKind::Explicit,
                 });
             }
             if error_type.to_lowercase() == "not_found" {
@@ -2119,6 +2130,65 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     Ok(())
 }
 
+/// Characters kept from the start of a body, and on each side of the parse
+/// failure, in a JSON decode preview.
+const JSON_PREVIEW_HEAD: usize = 512;
+const JSON_PREVIEW_CONTEXT: usize = 512;
+
+/// Largest byte index `<= idx` that starts a character.
+fn floor_char_boundary(text: &str, idx: usize) -> usize {
+    let mut idx = idx.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Byte offset in `text` of the 1-based `line`/`column` a `serde_json` error
+/// reports.
+fn json_error_offset(text: &str, line: usize, column: usize) -> usize {
+    let line_start = if line <= 1 {
+        0
+    } else {
+        text.match_indices('\n')
+            .nth(line - 2)
+            .map_or(text.len(), |(idx, _)| idx + 1)
+    };
+    let rest = &text[line_start..];
+    let column_offset = rest
+        .char_indices()
+        .nth(column.saturating_sub(1))
+        .map_or(rest.len(), |(idx, _)| idx);
+    line_start + column_offset
+}
+
+/// Preview of a body that failed to parse as JSON: the head, plus the bytes
+/// around the parse failure. A paginated GraphQL page can fail hundreds of
+/// kilobytes in, where a head-only preview never shows the offending bytes.
+fn json_error_preview(text: &str, err: &serde_json::Error) -> String {
+    let head_end = floor_char_boundary(text, JSON_PREVIEW_HEAD);
+    let offset = json_error_offset(text, err.line(), err.column());
+    let context_start = floor_char_boundary(text, offset.saturating_sub(JSON_PREVIEW_CONTEXT));
+    let context_end = floor_char_boundary(text, offset.saturating_add(JSON_PREVIEW_CONTEXT));
+
+    if context_start <= head_end {
+        // The failure is at or near the head: one contiguous slice shows both.
+        return format!(
+            "[{} bytes total, parse failure at byte {offset}]\n{}",
+            text.len(),
+            &text[..context_end.max(head_end)]
+        );
+    }
+
+    format!(
+        "[{} bytes total, parse failure at byte {offset}]\n{}\n...[{} bytes omitted]...\n{}",
+        text.len(),
+        &text[..head_end],
+        context_start - head_end,
+        &text[context_start..context_end]
+    )
+}
+
 fn format_query_with_context(query: &str, line: usize, column: usize) -> String {
     if line == 0 || column == 0 {
         return query.to_string();
@@ -2152,6 +2222,60 @@ mod tests {
     use crate::graphql::client::GraphQLQuery;
 
     use super::{DuplicateBehavior, PaginationParameters, UnnestBehavior, handle_http_error};
+
+    mod json_error_preview {
+        use crate::graphql::client::{JSON_PREVIEW_HEAD, json_error_preview};
+
+        fn parse_error(text: &str) -> serde_json::Error {
+            serde_json::from_str::<serde_json::Value>(text)
+                .expect_err("the body is expected to be invalid JSON")
+        }
+
+        /// A truncated page fails far past the head, so the preview has to carry
+        /// the bytes where parsing stopped.
+        #[test]
+        fn shows_the_bytes_at_a_far_parse_failure() {
+            let body = format!(
+                "{{\"data\":{{\"filler\":\"{}\",\"tail\":\"cut here",
+                "x".repeat(4096)
+            );
+            let preview = json_error_preview(&body, &parse_error(&body));
+
+            assert!(preview.contains("cut here"), "preview: {preview}");
+            assert!(preview.contains("{\"data\":"), "preview: {preview}");
+            assert!(preview.contains("bytes omitted"), "preview: {preview}");
+            assert!(preview.len() < body.len(), "preview: {preview}");
+        }
+
+        /// A short body is shown whole, with no omission marker.
+        #[test]
+        fn shows_a_short_body_whole() {
+            let body = "{\"data\": oops}";
+            let preview = json_error_preview(body, &parse_error(body));
+
+            assert!(preview.contains(body), "preview: {preview}");
+            assert!(!preview.contains("bytes omitted"), "preview: {preview}");
+        }
+
+        /// A failure inside the head window keeps one contiguous slice.
+        #[test]
+        fn keeps_one_slice_when_the_failure_is_in_the_head() {
+            let body = format!("{{\"a\":\"{}\", oops}}", "y".repeat(JSON_PREVIEW_HEAD / 2));
+            let preview = json_error_preview(&body, &parse_error(&body));
+
+            assert!(!preview.contains("bytes omitted"), "preview: {preview}");
+            assert!(preview.contains("oops"), "preview: {preview}");
+        }
+
+        /// Multi-byte characters must not panic the slicing.
+        #[test]
+        fn handles_multi_byte_characters() {
+            let body = format!("{{\"a\":\"{}\", oops}}", "\u{00e9}".repeat(2048));
+            let preview = json_error_preview(&body, &parse_error(&body));
+
+            assert!(preview.contains("bytes total"), "preview: {preview}");
+        }
+    }
 
     mod health_check_payload {
         use serde_json::json;

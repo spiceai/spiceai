@@ -110,7 +110,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// can supply its body and metadata after the retry budget is exhausted.
 enum RequestAttemptError {
     Response {
-        response: reqwest::Response,
+        // `reqwest::Response` alone is over clippy's `result_large_err` limit.
+        response: Box<reqwest::Response>,
         attempt_started: Instant,
         permit: Option<Permit>,
     },
@@ -1559,7 +1560,7 @@ impl HttpTableProvider {
             }) => {
                 let status_code = response.status().as_u16();
                 Self::extract_response(
-                    response,
+                    *response,
                     status_code,
                     path_label,
                     attempt_started,
@@ -1648,7 +1649,7 @@ impl HttpTableProvider {
         if Self::is_retryable_status(status_code) {
             tracing::debug!("HTTP retryable status ({status_code}), will retry");
             return Err(RetryError::transient(RequestAttemptError::Response {
-                response,
+                response: Box::new(response),
                 attempt_started,
                 permit: rate_control_permit,
             }));
