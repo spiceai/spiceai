@@ -546,6 +546,98 @@ async fn test_sort_rewrite_then_insert_impl(
     Ok(())
 }
 
+test_with_backends!(test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl);
+
+/// Sort-rewrite sorts each scan partition on its own and merges them. With a
+/// nullable, heavily duplicated key spread over several input files and a small
+/// target size (so the output spans many files), the written order must still
+/// be one ascending, NULLs-last sequence holding every input row exactly once.
+async fn test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("k", DataType::Int64, true),
+    ]));
+    let setup_ctx = SessionContext::new();
+    let table = create_sorted_table(
+        &fixture,
+        "sort_nulls_files",
+        Arc::clone(&schema),
+        vec!["k".to_string()],
+        setup_ctx.runtime_env(),
+    )
+    .await;
+
+    // 6 inserts (6 files) of 2,000 rows; every insert spans the whole key range.
+    let key = |id: i64| (id % 37 != 0).then(|| (id * 7_919) % 500);
+    let mut expected: Vec<(Option<i64>, i64)> = Vec::new();
+    for file in 0..6_i64 {
+        let values: Vec<String> = (0..2_000_i64)
+            .map(|i| {
+                let id = i * 6 + file;
+                expected.push((key(id), id));
+                match key(id) {
+                    Some(k) => format!("({id}, {k})"),
+                    None => format!("({id}, NULL)"),
+                }
+            })
+            .collect();
+        sql_insert(&table, "sort_nulls_files", &values.join(", ")).await;
+    }
+
+    // The second pass reads the snapshot the first attested as sorted; it must
+    // write the same single order again.
+    table.sort_and_rewrite_data(64 * 1024).await?;
+    table.sort_and_rewrite_data(64 * 1024).await?;
+
+    // One partition reads the snapshot's files in order as a single stream, so
+    // this is the physical order the rewrite wrote.
+    let ctx = SessionContext::new_with_config(
+        datafusion::prelude::SessionConfig::new().with_target_partitions(1),
+    );
+    ctx.register_table(
+        "sort_nulls_files",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+    let batches = ctx
+        .sql("SELECT k, id FROM sort_nulls_files")
+        .await?
+        .collect()
+        .await?;
+    let mut got: Vec<(Option<i64>, i64)> = Vec::new();
+    for batch in &batches {
+        let k = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("k is Int64");
+        let id = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64");
+        for i in 0..batch.num_rows() {
+            got.push((k.is_valid(i).then(|| k.value(i)), id.value(i)));
+        }
+    }
+
+    let rank = |k: &Option<i64>| (k.is_none(), k.unwrap_or(0));
+    for w in got.windows(2) {
+        assert!(
+            rank(&w[0].0) <= rank(&w[1].0),
+            "not ascending NULLs-last: {:?} then {:?}",
+            w[0].0,
+            w[1].0
+        );
+    }
+    expected.sort_unstable();
+    got.sort_unstable();
+    assert_eq!(got.len(), expected.len(), "row count changed");
+    assert_eq!(got, expected, "rows changed");
+    Ok(())
+}
+
 test_with_backends!(test_sort_rewrite_large_dataset_impl);
 
 /// Sort a larger dataset to exercise chunking behavior.
