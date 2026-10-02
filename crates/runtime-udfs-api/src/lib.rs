@@ -17,8 +17,7 @@ limitations under the License.
 //! Which functions a remote backend must not be asked to evaluate.
 //!
 //! Federating a filter to a data source is only safe if that source can evaluate
-//! every function in it. Two independent sets of names are unsafe to push down,
-//! and they have opposite defaults:
+//! every function in it. Three sets of names are unsafe to push down:
 //!
 //! 1. **Spice functions** — the UDFs Spice defines (`bucket`, `cosine_distance`,
 //!    `rerank`, …) plus any the user registers. No remote source knows them, so
@@ -29,6 +28,10 @@ limitations under the License.
 //!    nested array/list/map functions relative to `PostgreSQL`. These are
 //!    allowed by default; only the backend knows which subset it lacks, so it
 //!    supplies them via [`FunctionSupportBuilder::deny_also`].
+//! 3. **The `DataFusion` cast built-ins** — [`DATAFUSION_CAST_BUILTINS`]
+//!    (`arrow_cast`, `cast_to_type`, …). The exception to set 2's default: they
+//!    are denied for every backend, because no source answers them as
+//!    `DataFusion` does.
 //!
 //! Set 1 lives here because Spice owns it: every Spice function registers its
 //! name at its definition site with [`register_spice_function!`], collected into
@@ -357,22 +360,23 @@ impl<'a> FunctionSupportBuilder<'a> {
 }
 
 /// The [`FunctionSupport`] for a backend that evaluates no Spice function and
-/// every `DataFusion` built-in — the conservative default.
+/// every `DataFusion` built-in except the [`DATAFUSION_CAST_BUILTINS`] — the
+/// conservative default.
 #[must_use]
 pub fn function_support() -> FunctionSupport {
     FunctionSupportBuilder::new().build()
 }
 
 /// The functions no remote source may be asked to evaluate: every Spice
-/// function plus every user-registered one. Safe to call from per-query filter
-/// pushdown paths.
+/// function, every user-registered one, and the [`DATAFUSION_CAST_BUILTINS`].
+/// Safe to call from per-query filter pushdown paths.
 #[must_use]
 pub fn deny_spice_specific_functions() -> std::sync::Arc<FunctionSupport> {
     std::sync::Arc::new(FunctionSupportBuilder::new().build())
 }
 
 /// As [`deny_spice_specific_functions`], but allowing the functions the target
-/// backend evaluates itself.
+/// backend evaluates itself. The [`DATAFUSION_CAST_BUILTINS`] stay denied.
 ///
 /// `native` is normally that backend's unparser dialect's native-function names,
 /// which is how the deny-list becomes backend-aware: a Spice function the
@@ -384,8 +388,9 @@ pub fn deny_spice_specific_functions_excluding(native: &[&str]) -> std::sync::Ar
     std::sync::Arc::new(FunctionSupportBuilder::new().native(native).build())
 }
 
-/// Full deny-list as a value, for any SQL connector whose unparser dialect has
-/// no Spice-function carve-out. See issue #10703.
+/// Full deny-list as a value — every Spice function, every user-registered one,
+/// and the [`DATAFUSION_CAST_BUILTINS`] — for any SQL connector whose unparser
+/// dialect has no Spice-function carve-out. See issue #10703.
 #[must_use]
 pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new().build()
