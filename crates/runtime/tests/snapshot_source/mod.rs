@@ -840,3 +840,95 @@ async fn projected_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     reader.shutdown().await;
     Ok(())
 }
+
+const CUSTOM_PATHS: Rustfs = Rustfs {
+    name: "spice_test_rustfs_snapshot_source_custom_paths",
+    port: 19129,
+};
+
+/// A Cayenne snapshot dataset that sets `cayenne_file_path` and `cayenne_metadata_dir`
+/// restores its copy there, not under `.spice/data`.
+#[tokio::test]
+async fn restores_cayenne_snapshots_to_the_paths_the_dataset_sets() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let container = start_rustfs(CUSTOM_PATHS).await?;
+            let result = custom_paths_scenario(CUSTOM_PATHS, &modules).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+async fn custom_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let modules_csv = dir.path().join("modules.csv");
+    std::fs::write(&modules_csv, INITIAL_CSV)?;
+    let writer = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_custom_paths_writer")
+                    .with_snapshots(writer_snapshots(rustfs, &prefix))
+                    .with_dataset(writer_dataset(modules, &modules_csv, "cayenne", dir.path()))
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&writer).await?;
+    wait_for_writer_snapshot(rustfs, &prefix, modules, 0).await?;
+    replicate_snapshots(rustfs, &prefix).await?;
+
+    let data_dir = dir.path().join("reader").join(modules);
+    let metadata_dir = dir.path().join("reader").join("metadata");
+    let mut dataset = reader_dataset(rustfs, modules, &prefix);
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        acceleration.params = Some(Params::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".to_string(),
+                data_dir.display().to_string(),
+            ),
+            (
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
+            ),
+        ])));
+    }
+    let reader = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_custom_paths_reader")
+                    .with_dataset(dataset)
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&reader).await?;
+
+    wait_for_rows(&reader, modules, 3).await?;
+    assert_eq!(rows(&reader, modules).await?, rows(&writer, modules).await?);
+    assert!(
+        std::fs::read_dir(&data_dir)?.next().is_some(),
+        "the copy is restored under `cayenne_file_path` ({})",
+        data_dir.display()
+    );
+    assert!(
+        metadata_dir.join("cayenne.db").is_file(),
+        "the metastore is restored under `cayenne_metadata_dir` ({})",
+        metadata_dir.display()
+    );
+    assert_eq!(
+        local_copies(modules),
+        Vec::<PathBuf>::new(),
+        "nothing is restored under `.spice/data`"
+    );
+
+    reader.shutdown().await;
+    writer.shutdown().await;
+    Ok(())
+}
