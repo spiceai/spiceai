@@ -253,6 +253,20 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
         value: V,
         should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
     ) -> bool;
+    /// Insert `value`, or replace the resident, only when `admit` accepts the
+    /// current value (`None` when the key is empty).
+    ///
+    /// Deliberately has no default. A default that always inserted would let a
+    /// slower read overwrite a later one on any wrapper that forgot to forward
+    /// the method. `weight` is what [`Sizeable::get_memory_size`] returns for
+    /// `value`; a cache that bounds entries by count ignores it.
+    async fn put_if(
+        &self,
+        key: &u64,
+        value: V,
+        weight: usize,
+        admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
+    ) -> bool;
     async fn invalidate_all(&self);
     async fn size_bytes(&self) -> u64;
     async fn item_count(&self) -> u64;
@@ -806,6 +820,20 @@ impl EntryValidity {
     }
 }
 
+/// Whether a completed SQL-result read may be written into the cache.
+///
+/// Produced by [`QueryResultsCacheProvider::result_admission`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultAdmission {
+    /// The read is still fresh. Store it, replacing whatever occupies the key.
+    Store,
+    /// The read is servable only as stale. Store it unless a resident began
+    /// reading later — that resident is at least as current.
+    StoreUnlessOlderRead,
+    /// The read cannot be served. Do not store it.
+    Skip,
+}
+
 // TODO: sunset ``QueryResultsCacheProvider`` in favor of ``CacheProvider``?
 pub struct QueryResultsCacheProvider {
     cache: Arc<dyn TabledCacheProvider<CachedQueryResult> + Send + Sync>,
@@ -1255,10 +1283,11 @@ impl QueryResultsCacheProvider {
     /// meaning a result read at that point may predate the change and so cannot
     /// be stored as a fresh cache entry.
     ///
-    /// This is the coarse form of [`Self::entry_validity`], for the write side:
-    /// a result already known not to be storable as fresh is not worth encoding
-    /// and storing. The read side wants `entry_validity`, which additionally
-    /// says whether the entry can still be served stale.
+    /// This is the coarse form of [`Self::entry_validity`], for a caller that
+    /// refuses to store anything it cannot serve fresh. A caller that has a
+    /// stale window wants [`Self::result_admission`]: a
+    /// [`EntryValidity::StaleWhileRevalidate`] result is worth storing, because
+    /// the hit path will serve it stale and never as fresh.
     ///
     /// Note this concerns *reusing* a result, never producing one: a query that
     /// read the committed state and returns it to its own caller is correct
@@ -1289,6 +1318,53 @@ impl QueryResultsCacheProvider {
         read_started_at: std::time::Instant,
     ) -> bool {
         self.table_changes.changed_since(tables, read_started_at)
+    }
+
+    /// Whether a completed read of `tables` that began at `read_started_at`
+    /// may be written into the cache, as of now.
+    ///
+    /// [`ResultAdmission::Store`] is a fresh result: it replaces whatever
+    /// occupies the key. [`ResultAdmission::StoreUnlessOlderRead`] is servable
+    /// only as stale, so it must not overwrite a resident whose read began
+    /// later. [`ResultAdmission::Skip`] cannot be served at all — no stale
+    /// window, or the window has already closed — and is not worth encoding.
+    #[must_use]
+    pub fn result_admission<S: std::hash::BuildHasher>(
+        &self,
+        tables: &HashSet<TableReference, S>,
+        read_started_at: std::time::Instant,
+    ) -> ResultAdmission {
+        match self.entry_validity(tables, read_started_at, std::time::Instant::now()) {
+            EntryValidity::Valid => ResultAdmission::Store,
+            EntryValidity::StaleWhileRevalidate => ResultAdmission::StoreUnlessOlderRead,
+            EntryValidity::Invalidated => ResultAdmission::Skip,
+        }
+    }
+
+    /// Store `result` unless a resident of `raw_key` began reading at least as
+    /// late as `result`.
+    ///
+    /// The comparison and the write share the shard lock. A result stored this
+    /// way is expected to be servable only as stale: [`Self::entry_validity`]
+    /// still refuses to return it as a fresh hit.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if the cache write fails.
+    pub async fn put_raw_key_unless_older_read(
+        &self,
+        raw_key: &RawCacheKey,
+        result: CachedQueryResult,
+        weight: usize,
+    ) -> Result<bool> {
+        let read_started_at = result.read_started_at;
+        let stored = self
+            .cache
+            .put_if(&raw_key.as_u64(), result, weight, &|current| {
+                current.is_none_or(|existing| existing.read_started_at < read_started_at)
+            })
+            .await;
+        Ok(stored)
     }
 
     #[must_use]

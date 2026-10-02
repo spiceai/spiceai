@@ -19,7 +19,7 @@ use super::{
 };
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
-    EntryValidity, QueryResultsCacheProvider, RevalidationOutcome,
+    EntryValidity, QueryResultsCacheProvider, RevalidationOutcome, Sizeable,
     key::{CacheKey, RawCacheKey},
     result::CacheStatus,
     result::query::CachedQueryResult,
@@ -1216,14 +1216,17 @@ impl Query {
         if let Some(cache_provider) = df.results_cache_provider() {
             // A revalidation runs asynchronously, so an accelerated refresh or
             // DML may have invalidated one of its tables while it was
-            // executing. Storing the result anyway would recreate the entry
-            // the invalidation just removed, holding data the query may have
-            // read from the pre-invalidation snapshot.
+            // executing. Without a stale window that result cannot be served,
+            // and storing it would recreate the entry the invalidation just
+            // removed. With `stale_while_revalidate_ttl` the hit path serves
+            // it stale and never as fresh, so it is stored below unless a
+            // later read is already cached.
             //
             // This is only an early exit that avoids encoding a result already
             // known to be unservable; correctness comes from the check every
             // cache hit performs against the entry's `read_started_at`.
-            if cache_provider.tables_changed_since(&input_tables, revalidation_started_at) {
+            let admission = cache_provider.result_admission(&input_tables, revalidation_started_at);
+            if admission == cache::ResultAdmission::Skip {
                 tracing::debug!(
                     cache_key = cache_key_u64,
                     "An input table was invalidated during background revalidation, discarding the result rather than repopulating the cache"
@@ -1307,19 +1310,43 @@ impl Query {
             .await
             {
                 Ok(cached_result) => {
-                    if let Err(e) = cache_provider.put_raw_key(cache_key, cached_result).await {
-                        tracing::debug!(
-                            cache_key = cache_key_u64,
-                            "Background revalidation failed to cache results: {}",
-                            e
-                        );
-                        record_revalidation_outcome(RevalidationOutcome::PutFailed);
+                    let put_result = if admission == cache::ResultAdmission::StoreUnlessOlderRead {
+                        let weight = cached_result.get_memory_size();
+                        cache_provider
+                            .put_raw_key_unless_older_read(cache_key, cached_result, weight)
+                            .await
+                            .map(|stored| {
+                                if !stored {
+                                    tracing::debug!(
+                                        cache_key = cache_key_u64,
+                                        "A later read of this query is already cached, leaving it"
+                                    );
+                                }
+                                stored
+                            })
                     } else {
-                        tracing::debug!(
-                            cache_key = cache_key_u64,
-                            "Background revalidation completed successfully and cached"
-                        );
-                        record_revalidation_outcome(RevalidationOutcome::Stored);
+                        cache_provider
+                            .put_raw_key(cache_key, cached_result)
+                            .await
+                            .map(|()| true)
+                    };
+                    match put_result {
+                        Err(e) => {
+                            tracing::debug!(
+                                cache_key = cache_key_u64,
+                                "Background revalidation failed to cache results: {}",
+                                e
+                            );
+                            record_revalidation_outcome(RevalidationOutcome::PutFailed);
+                        }
+                        Ok(false) => {}
+                        Ok(true) => {
+                            tracing::debug!(
+                                cache_key = cache_key_u64,
+                                "Background revalidation completed successfully and cached"
+                            );
+                            record_revalidation_outcome(RevalidationOutcome::Stored);
+                        }
                     }
                 }
                 Err(e) => {
@@ -2494,6 +2521,127 @@ mod tests {
                 .is_some(),
             "an unaffected revalidation must still populate the cache"
         );
+    }
+
+    /// Regression test for #14686. The same mid-flight invalidation is servable
+    /// once `stale_while_revalidate_ttl` is set: the hit path classifies the
+    /// entry stale, so discarding the revalidation leaves nothing to serve
+    /// under a CDC feed that commits while the query runs.
+    #[tokio::test]
+    async fn test_swr_revalidation_stores_stale_result_invalidated_mid_flight() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            stale_while_revalidate_ttl: Some("5m".to_string()),
+            ..Default::default()
+        }))
+        .await;
+        let cache_provider = df
+            .results_cache_provider()
+            .expect("results cache should be configured");
+
+        let schema: arrow::datatypes::SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("valid record batch");
+
+        let revalidation_started_at = std::time::Instant::now();
+        df.caching()
+            .invalidate_for_table(TableReference::bare("revalidated_table"))
+            .await
+            .expect("invalidation should succeed");
+
+        let key = RawCacheKey::new(31);
+        Query::cache_revalidation_result(
+            &df,
+            &key,
+            vec![batch],
+            Arc::clone(&schema),
+            Arc::new(HashSet::from([TableReference::bare("revalidated_table")])),
+            revalidation_started_at,
+            None,
+        )
+        .await;
+        cache_provider.run_pending_tasks().await;
+
+        let found = cache_provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed");
+        let Some((_, validity)) = found else {
+            panic!(
+                "a revalidation invalidated mid-flight must still be stored when stale_while_revalidate_ttl is set"
+            );
+        };
+        assert_eq!(validity, EntryValidity::StaleWhileRevalidate);
+        assert!(
+            cache_provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "the stored revalidation must not be served as a fresh hit"
+        );
+    }
+
+    /// A revalidation that began before the invalidation must not replace a
+    /// result whose read began after it.
+    #[tokio::test]
+    async fn test_swr_revalidation_keeps_a_later_read() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            stale_while_revalidate_ttl: Some("5m".to_string()),
+            ..Default::default()
+        }))
+        .await;
+        let cache_provider = df
+            .results_cache_provider()
+            .expect("results cache should be configured");
+
+        let schema: arrow::datatypes::SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("valid record batch");
+
+        let earlier = std::time::Instant::now();
+        df.caching()
+            .invalidate_for_table(TableReference::bare("revalidated_table"))
+            .await
+            .expect("invalidation should succeed");
+        let later = std::time::Instant::now();
+
+        let key = RawCacheKey::new(32);
+        let tables = Arc::new(HashSet::from([TableReference::bare("revalidated_table")]));
+        Query::cache_revalidation_result(
+            &df,
+            &key,
+            vec![batch.clone()],
+            Arc::clone(&schema),
+            Arc::clone(&tables),
+            later,
+            None,
+        )
+        .await;
+        Query::cache_revalidation_result(&df, &key, vec![batch], schema, tables, earlier, None)
+            .await;
+        cache_provider.run_pending_tasks().await;
+
+        let found = cache_provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("the later read must still be cached");
+        assert_eq!(found.0.read_started_at, later);
+        assert_eq!(found.1, EntryValidity::Valid);
     }
 
     /// Reports a fixed [`MetricsSet`], standing in for an `HttpExec` whose

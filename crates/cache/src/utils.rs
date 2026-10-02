@@ -336,16 +336,19 @@ pub fn to_cached_record_batch_stream(
             // result set — skip the write to avoid caching a partial result.
             // `batches_boundable` is the separate question of whether the entry
             // could be billed for what it would hold.
+            let admission =
+                cache_provider.result_admission(&input_tables, read_started_at);
             if stream_failed {
                 tracing::debug!(
                     "The query stream yielded an error, skipping cache storage"
                 );
-            } else if cache_provider.tables_changed_since(&input_tables, read_started_at) {
+            } else if admission == crate::ResultAdmission::Skip {
                 // Not the guard — correctness comes from the check every cache
                 // hit performs. This only avoids encoding and storing a result
-                // already known to be unservable.
+                // already known to be unservable. A stale-while-revalidate
+                // result is servable, so it is stored below.
                 tracing::debug!(
-                    "A table read by this query changed while it ran, skipping cache storage"
+                    "A table read by this query changed while it ran, and the result cannot be served stale, skipping cache storage"
                 );
             } else if !batches_cacheable(&records) {
                 tracing::debug!(
@@ -394,11 +397,36 @@ pub fn to_cached_record_batch_stream(
                                 cache_max_size,
                                 "Encoded query result still exceeds cache max size, skipping"
                             );
-                        } else if let Err(e) = cache_provider
-                            .put_raw_key_with_weight(&raw_cache_key, cached_result, actual_size)
-                            .await
-                        {
-                            tracing::error!("Failed to cache query results: {e}");
+                        } else {
+                            let put_result = if admission
+                                == crate::ResultAdmission::StoreUnlessOlderRead
+                            {
+                                cache_provider
+                                    .put_raw_key_unless_older_read(
+                                        &raw_cache_key,
+                                        cached_result,
+                                        actual_size,
+                                    )
+                                    .await
+                                    .map(|stored| {
+                                        if !stored {
+                                            tracing::debug!(
+                                                "A later read of this query is already cached, leaving it"
+                                            );
+                                        }
+                                    })
+                            } else {
+                                cache_provider
+                                    .put_raw_key_with_weight(
+                                        &raw_cache_key,
+                                        cached_result,
+                                        actual_size,
+                                    )
+                                    .await
+                            };
+                            if let Err(e) = put_result {
+                                tracing::error!("Failed to cache query results: {e}");
+                            }
                         }
                     }
                     Err(e) => {
@@ -923,6 +951,132 @@ pub(crate) mod tests {
             .await,
             "a result whose table was invalidated mid-read must not be cached"
         );
+    }
+
+    /// Regression test for #14686. With `stale_while_revalidate_ttl` set, a
+    /// result whose table changed while it was read is still servable as stale,
+    /// so discarding it at store time leaves the cache empty whenever commits
+    /// land faster than the query runs.
+    #[tokio::test]
+    async fn to_cached_record_batch_stream_stores_stale_result_when_swr_is_configured() {
+        let provider = Arc::new(
+            QueryResultsCacheProvider::try_new(
+                &spicepod::component::caching::SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    stale_while_revalidate_ttl: Some("5m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+        let read_started_at = std::time::Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+
+        let key = RawCacheKey::new(11);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let source = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok(batch)]),
+        );
+        let mut wrapped = to_cached_record_batch_stream(
+            Arc::clone(&provider),
+            Box::pin(source),
+            key,
+            Arc::new(HashSet::from([TableReference::bare("customer")])),
+            read_started_at,
+            None,
+        );
+        while wrapped.next().await.is_some() {}
+        provider.run_pending_tasks().await;
+
+        let found = provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed");
+        let Some((entry, validity)) = found else {
+            panic!(
+                "a mid-read invalidation must still be stored when stale_while_revalidate_ttl is set"
+            );
+        };
+        assert_eq!(
+            validity,
+            crate::EntryValidity::StaleWhileRevalidate,
+            "the stored result must be classified stale, not fresh"
+        );
+        assert_eq!(entry.read_started_at, read_started_at);
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "the stored result must not be served as a fresh hit"
+        );
+    }
+
+    /// A read that began before the invalidation must not replace one that
+    /// began after it. The later read saw the change; overwriting it with the
+    /// earlier snapshot would move the cache backwards for the whole stale
+    /// window.
+    #[tokio::test]
+    async fn to_cached_record_batch_stream_keeps_a_later_read_over_an_earlier_stale_one() {
+        let provider = Arc::new(
+            QueryResultsCacheProvider::try_new(
+                &spicepod::component::caching::SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    stale_while_revalidate_ttl: Some("5m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+        let earlier = std::time::Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        let later = std::time::Instant::now();
+
+        let key = RawCacheKey::new(12);
+        let tables = HashSet::from([TableReference::bare("customer")]);
+        assert!(
+            stored_after_drain(&provider, key, tables.clone(), later).await,
+            "a read that began after the invalidation is fresh and must be stored"
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let source = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok(batch)]),
+        );
+        let mut wrapped = to_cached_record_batch_stream(
+            Arc::clone(&provider),
+            Box::pin(source),
+            key,
+            Arc::new(tables),
+            earlier,
+            None,
+        );
+        while wrapped.next().await.is_some() {}
+        provider.run_pending_tasks().await;
+
+        let found = provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("the later read must still be cached");
+        assert_eq!(
+            found.0.read_started_at, later,
+            "an earlier stale result must not replace a read that began after the change"
+        );
+        assert_eq!(found.1, crate::EntryValidity::Valid);
     }
 
     /// The qualification of the invalidated reference must not matter: `customer`
