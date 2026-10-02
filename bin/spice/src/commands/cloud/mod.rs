@@ -2980,20 +2980,34 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
         resolve_project_target(Some(project), flag_org).await?
     } else {
         let (requested_org, requested_source) = resolve_org_with_source(flag_org)?;
-        let token =
-            user_token_for_cloud_connect(&endpoint, requested_org.as_deref(), "Linking", "link")
-                .await?;
+        let credential = user_credential_for_cloud_connect(
+            &endpoint,
+            requested_org.as_deref(),
+            "Linking",
+            "link",
+        )
+        .await?;
         let attach_client = crate::commands::connect::project::ProjectClient::new(&endpoint)
             .map_err(|error| Error::CloudConnectIo {
                 message: error.to_string(),
             })?;
+        // The listing carries only the bearer token, so Spice Cloud answers it for the
+        // organization the credential acts on, not for the organization selected here.
         let projects = attach_client
-            .list_attachable(&runtime_cloud_connect::enroll::SessionToken::new(token))
+            .list_attachable(&runtime_cloud_connect::enroll::SessionToken::new(
+                credential.token,
+            ))
             .await
             .map_err(|error| Error::CloudConnectIo {
                 message: error.to_string(),
             })?;
-        let selected = choose_attachable_project(projects).await?;
+        let selected = choose_attachable_project(
+            projects,
+            credential.org.as_deref(),
+            requested_org.as_deref(),
+            requested_source,
+        )
+        .await?;
         if let Some(selected_org) = selected.org.as_deref() {
             ensure_orgs_agree(
                 selected_org,
@@ -3011,7 +3025,9 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
             "Pass an explicit <org>/<project> target.",
         )
     })?;
-    let token = user_token_for_cloud_connect(&endpoint, Some(org), "Linking", "link").await?;
+    let token = user_credential_for_cloud_connect(&endpoint, Some(org), "Linking", "link")
+        .await?
+        .token;
     let management_client = CloudClient::with_token_for_org_at(token, Some(org), &endpoint)?;
     let project = management_client.get_project(&target).await?;
 
@@ -3052,15 +3068,15 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
     Ok(())
 }
 
-async fn user_token_for_cloud_connect(
+async fn user_credential_for_cloud_connect(
     endpoint: &str,
     requested_org: Option<&str>,
     action: &str,
     command: &str,
-) -> Result<String> {
+) -> Result<client::UserCredential> {
     let candidates = client::user_credential_candidates(requested_org);
     match client::first_user_credential(&candidates, endpoint, requested_org).await? {
-        client::UserCredentialSearch::Found(token) => Ok(token),
+        client::UserCredentialSearch::Found(credential) => Ok(credential),
         client::UserCredentialSearch::NoneStored => Err(no_user_login_error(action, command)),
         client::UserCredentialSearch::AllRejected => {
             Err(rejected_user_credential_error(Some(command), requested_org))
@@ -3127,6 +3143,52 @@ fn rejected_process_credential_vars(requested_org: Option<&str>) -> Vec<String> 
         .collect()
 }
 
+/// The error for an attachable-project listing that came back empty.
+///
+/// The listing is answered for the organization the credential acts on
+/// (`searched_org`), so an empty list says nothing about any other organization
+/// the user can reach. The message names the organization that was searched, and
+/// when the command selected a different one (`requested_org`, via
+/// `requested_source`) it says that organization was not searched and how to
+/// search it: store a credential for it.
+fn no_attachable_projects_error(
+    searched_org: Option<&str>,
+    requested_org: Option<&str>,
+    requested_source: OrgSource,
+) -> Error {
+    const DOCS: &str = "See: https://spiceai.org/docs/spice-cloud";
+    let Some(searched_org) = searched_org else {
+        return Error::cloud_with_hint(
+            CloudErrorCode::ProjectNotFound,
+            "Spice Cloud returned no projects that can be attached for this credential, and did not say which organization it acts on.",
+            format!(
+                "Create a project in that organization in Spice Cloud, then retry `spice cloud link`. To link in another organization, store a credential for it with `spice cloud login token --org <org>` and retry. {DOCS}"
+            ),
+        );
+    };
+    match requested_org.filter(|requested| !requested.eq_ignore_ascii_case(searched_org)) {
+        Some(requested) => Error::cloud_with_hint(
+            CloudErrorCode::ProjectNotFound,
+            format!(
+                "No attachable projects in organization '{searched_org}', the organization this credential acts on; organization '{requested}' ({}) was not searched.",
+                requested_source.label()
+            ),
+            format!(
+                "`spice cloud link` searches the organization of the credential it uses, so linking in '{requested}' takes a credential for it: run `spice cloud login token --org {requested}`, then retry `spice cloud link`. {DOCS}"
+            ),
+        ),
+        None => Error::cloud_with_hint(
+            CloudErrorCode::ProjectNotFound,
+            format!(
+                "No attachable projects in organization '{searched_org}', the organization this credential acts on."
+            ),
+            format!(
+                "Create a project in organization '{searched_org}' in Spice Cloud, then retry `spice cloud link`. To link in another organization, store a credential for it with `spice cloud login token --org <org>` and retry. {DOCS}"
+            ),
+        ),
+    }
+}
+
 fn ensure_link_chooser_tty(is_terminal: bool) -> Result<()> {
     if is_terminal {
         return Ok(());
@@ -3140,12 +3202,15 @@ fn ensure_link_chooser_tty(is_terminal: bool) -> Result<()> {
 
 async fn choose_attachable_project(
     projects: Vec<crate::commands::connect::project::AttachableProject>,
+    searched_org: Option<&str>,
+    requested_org: Option<&str>,
+    requested_source: OrgSource,
 ) -> Result<ProjectTarget> {
     if projects.is_empty() {
-        return Err(Error::cloud_with_hint(
-            CloudErrorCode::ProjectNotFound,
-            "Spice Cloud returned no projects that can be attached.",
-            "Create a project in Spice Cloud, then retry `spice cloud link`.",
+        return Err(no_attachable_projects_error(
+            searched_org,
+            requested_org,
+            requested_source,
         ));
     }
     let items: Vec<String> = projects
@@ -3375,8 +3440,9 @@ async fn execute_unlink() -> Result<()> {
         &configured_endpoint,
     );
     let requested_org = identity.org_name.as_deref().filter(|org| !org.is_empty());
-    let token =
-        user_token_for_cloud_connect(endpoint, requested_org, "Unlinking", "unlink").await?;
+    let token = user_credential_for_cloud_connect(endpoint, requested_org, "Unlinking", "unlink")
+        .await?
+        .token;
     match runtime_cloud_connect::release::release(endpoint, &identity, &token, None).await {
         Ok(_) => {}
         Err(error) if error.is_not_found() => {}
@@ -6854,5 +6920,58 @@ mod tests {
                 .contains("spice cloud logout --scope all")
         );
         assert_ne!(missing.to_string(), rejected.to_string());
+    }
+
+    /// Regression test for #13379: an empty attachable-project listing names the
+    /// organization it was answered for, so "no projects" cannot be read as "no
+    /// projects anywhere this credential can reach".
+    #[test]
+    fn an_empty_project_listing_names_the_organization_it_searched() {
+        let searched = no_attachable_projects_error(Some("acme"), None, OrgSource::ActiveOrg);
+        assert_eq!(searched.cloud_code(), Some(CloudErrorCode::ProjectNotFound));
+        let text = searched.to_string();
+        assert!(text.contains("No attachable projects in organization 'acme'"));
+        assert!(text.contains("the organization this credential acts on"));
+        assert!(text.contains("Create a project in organization 'acme'"));
+        assert!(text.contains("spice cloud login token --org <org>"));
+        assert!(text.contains("https://spiceai.org/docs/spice-cloud"));
+        assert!(!text.contains("was not searched"));
+
+        // The selected organization matching the credential's is not a second organization.
+        let same = no_attachable_projects_error(Some("acme"), Some("ACME"), OrgSource::Flag);
+        assert_eq!(same.to_string(), searched.to_string());
+    }
+
+    /// Regression test for #13379: selecting another organization with `--org`
+    /// or `spice cloud org use` does not change which organization the listing
+    /// is answered for, and the message says so and names the credential it takes.
+    #[test]
+    fn an_empty_project_listing_says_the_selected_organization_was_not_searched() {
+        let flagged = no_attachable_projects_error(Some("acme"), Some("globex"), OrgSource::Flag);
+        let text = flagged.to_string();
+        assert!(text.contains("No attachable projects in organization 'acme'"));
+        assert!(text.contains("organization 'globex' (--org flag) was not searched"));
+        assert!(text.contains("spice cloud login token --org globex"));
+        assert!(text.contains("https://spiceai.org/docs/spice-cloud"));
+
+        let active =
+            no_attachable_projects_error(Some("acme"), Some("globex"), OrgSource::ActiveOrg);
+        assert!(
+            active
+                .to_string()
+                .contains("organization 'globex' (active org) was not searched")
+        );
+    }
+
+    /// A credential Spice Cloud did not describe has no organization to name; the
+    /// message says that rather than inventing one.
+    #[test]
+    fn an_empty_project_listing_for_an_undescribed_credential_says_the_organization_is_unknown() {
+        let unknown = no_attachable_projects_error(None, Some("globex"), OrgSource::Flag);
+        assert_eq!(unknown.cloud_code(), Some(CloudErrorCode::ProjectNotFound));
+        let text = unknown.to_string();
+        assert!(text.contains("did not say which organization it acts on"));
+        assert!(text.contains("spice cloud login token --org <org>"));
+        assert!(!text.contains("'globex'"));
     }
 }

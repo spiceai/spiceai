@@ -984,9 +984,9 @@ async fn stored_user_login(
     match crate::commands::cloud::client::first_user_credential(&candidates, endpoint, org_hint)
         .await?
     {
-        crate::commands::cloud::client::UserCredentialSearch::Found(token) => {
+        crate::commands::cloud::client::UserCredentialSearch::Found(credential) => {
             Ok(Some(LoginCredential {
-                token: SessionToken::new(token),
+                token: SessionToken::new(credential.token),
             }))
         }
         crate::commands::cloud::client::UserCredentialSearch::NoneStored => Ok(None),

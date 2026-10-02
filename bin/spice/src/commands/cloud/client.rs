@@ -1228,11 +1228,22 @@ pub async fn confirm_org_access(client: &CloudClient, org: &str) -> Result<()> {
     }
 }
 
+/// A stored credential Spice Cloud accepts as a user, and the organization it acts on.
+#[derive(PartialEq, Eq)]
+pub struct UserCredential {
+    pub token: String,
+    /// The organization Spice Cloud described for this credential, when it described one.
+    ///
+    /// A Cloud Connect request that carries only the bearer token is answered for this
+    /// organization, whatever organization the command selected.
+    pub org: Option<String>,
+}
+
 /// What searching the stored credentials for a user credential found.
 #[derive(PartialEq, Eq)]
 pub enum UserCredentialSearch {
     /// A credential Spice Cloud accepts as a user.
-    Found(String),
+    Found(UserCredential),
     /// Credentials were stored, and Spice Cloud rejected every one.
     AllRejected,
     /// No credential was stored to try.
@@ -1243,7 +1254,11 @@ pub enum UserCredentialSearch {
 impl std::fmt::Debug for UserCredentialSearch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Found(_) => f.write_str("Found(<redacted>)"),
+            Self::Found(credential) => f
+                .debug_struct("Found")
+                .field("token", &"<redacted>")
+                .field("org", &credential.org)
+                .finish(),
             Self::AllRejected => f.write_str("AllRejected"),
             Self::NoneStored => f.write_str("NoneStored"),
         }
@@ -1291,8 +1306,11 @@ async fn first_user_credential_with_probe(
     for token in candidates {
         let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
 
+        // `Some(acts_on)` when Spice Cloud described the credential; the identity probe
+        // sends no organization, so the organization it answers with is the one the
+        // credential acts on by itself.
         let described = match probe(&client).await {
-            Ok(_) => true,
+            Ok(context) => Some(Some(context.org_name).filter(|org| !org.is_empty())),
             Err(err) => match classify_identity_failure(&err) {
                 IdentityFailure::Rejected => {
                     rejected += 1;
@@ -1303,7 +1321,7 @@ async fn first_user_credential_with_probe(
                     tracing::debug!(
                         "Spice Cloud did not describe the identity behind a stored credential ({err}); considering it a fallback"
                     );
-                    false
+                    None
                 }
             },
         };
@@ -1321,14 +1339,20 @@ async fn first_user_credential_with_probe(
             continue;
         }
 
-        if described {
-            return Ok(UserCredentialSearch::Found(token.clone()));
+        if let Some(acts_on) = described {
+            return Ok(UserCredentialSearch::Found(UserCredential {
+                token: token.clone(),
+                org: acts_on,
+            }));
         }
         fallback.get_or_insert(token);
     }
 
     if let Some(token) = fallback {
-        return Ok(UserCredentialSearch::Found(token.clone()));
+        return Ok(UserCredentialSearch::Found(UserCredential {
+            token: token.clone(),
+            org: None,
+        }));
     }
 
     // Nothing was usable. A refusal explains that far better than the caller's
@@ -1914,5 +1938,76 @@ mod tests {
         .expect("a rejected credential is a terminal search outcome");
 
         assert_eq!(outcome, UserCredentialSearch::AllRejected);
+    }
+
+    /// Regression test for #13379: the organization the identity probe describes
+    /// travels with the credential, so `spice cloud link` can say which
+    /// organization its project listing was answered for.
+    #[tokio::test]
+    async fn a_described_credential_carries_the_organization_it_acts_on() {
+        fn described_identity_probe(_: &CloudClient) -> IdentityProbeFuture<'_> {
+            Box::pin(async {
+                Ok(spice_cloud_client::types::AuthContext {
+                    username: "ada".to_string(),
+                    email: "ada@example.com".to_string(),
+                    org_name: "acme".to_string(),
+                    app_name: None,
+                    app_api_key: None,
+                })
+            })
+        }
+
+        let outcome = first_user_credential_with_probe(
+            &["described-token".to_string()],
+            "https://cloud.invalid",
+            None,
+            described_identity_probe,
+        )
+        .await
+        .expect("a described credential is found");
+
+        assert_eq!(
+            outcome,
+            UserCredentialSearch::Found(UserCredential {
+                token: "described-token".to_string(),
+                org: Some("acme".to_string()),
+            })
+        );
+        assert_eq!(
+            format!("{outcome:?}"),
+            r#"Found { token: "<redacted>", org: Some("acme") }"#
+        );
+    }
+
+    /// A credential Spice Cloud could not describe is still usable, but the
+    /// organization it acts on is unknown rather than guessed.
+    #[tokio::test]
+    async fn an_undescribed_fallback_credential_carries_no_organization() {
+        fn undescribed_identity_probe(_: &CloudClient) -> IdentityProbeFuture<'_> {
+            Box::pin(async {
+                Err(map_cloud_error(None)(
+                    spice_cloud_client::error::Error::NotFound {
+                        message: "{}".to_string(),
+                    },
+                ))
+            })
+        }
+
+        let outcome = first_user_credential_with_probe(
+            &["undescribed-token".to_string()],
+            "https://cloud.invalid",
+            None,
+            undescribed_identity_probe,
+        )
+        .await
+        .expect("an undescribed credential is kept as the fallback");
+
+        assert_eq!(
+            outcome,
+            UserCredentialSearch::Found(UserCredential {
+                token: "undescribed-token".to_string(),
+                org: None,
+            })
+        );
     }
 }
