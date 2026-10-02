@@ -8246,6 +8246,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "evaluate-chat"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-trait",
+ "chat-api",
+ "evaluate-api",
+ "insta",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "event-listener"
 version = "2.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17237,6 +17251,7 @@ dependencies = [
  "duration-parse",
  "elasticsearch",
  "evaluate-api",
+ "evaluate-chat",
  "event_stream",
  "flight_client",
  "fundu",
