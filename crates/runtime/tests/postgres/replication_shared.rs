@@ -1227,6 +1227,24 @@ fn lsn_text(lsn: u64) -> String {
     format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)
 }
 
+/// Whether the slot's acknowledgement is strictly beyond `lsn`: the state
+/// `RebuildCause::AcknowledgedPast` is chosen for (`slot_acknowledged_lsn >
+/// watermark.lsn`), which [`slot_acked_past`]'s `>=` does not distinguish from
+/// equality.
+async fn slot_acked_strictly_past(
+    client: &tokio_postgres::Client,
+    lsn: &str,
+) -> Result<bool, anyhow::Error> {
+    let row = client
+        .query_one(
+            "SELECT confirmed_flush_lsn > $1::text::pg_lsn \
+             FROM pg_replication_slots WHERE slot_name = $2",
+            &[&lsn, &SLOT],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
 /// Whether the slot has acknowledged everything up to `lsn` — the point past
 /// which Postgres is free to recycle that WAL. Returns the verdict and the
 /// slot's current `confirmed_flush_lsn` for the assertion message.
@@ -2260,8 +2278,9 @@ async fn a_graceful_shutdown_records_the_acknowledged_position_so_a_restart_resu
         if let Ok(envelope) = next_envelope(&mut quiet, "quiet heartbeat").await {
             envelope.commit().await?;
         }
-        let (past, _) = slot_acked_past(&source, &lsn_text(recorded)).await?;
-        if past {
+        // Strictly past: an acknowledgement equal to the recorded position is
+        // not the `AcknowledgedPast` state this test exists to construct.
+        if slot_acked_strictly_past(&source, &lsn_text(recorded)).await? {
             drifted = true;
             break;
         }
@@ -2290,14 +2309,8 @@ async fn a_graceful_shutdown_records_the_acknowledged_position_so_a_restart_resu
         .recorded_lsn()
         .ok_or_else(|| anyhow::anyhow!("the position must still be recorded after shutdown"))?;
     let (_, acknowledged) = slot_acked_past(&source, &lsn_text(recorded)).await?;
-    let acknowledged_past_recorded: bool = source
-        .query_one(
-            "SELECT confirmed_flush_lsn > $1::text::pg_lsn \
-             FROM pg_replication_slots WHERE slot_name = $2",
-            &[&lsn_text(recorded_after), &SLOT],
-        )
-        .await?
-        .get(0);
+    let acknowledged_past_recorded =
+        slot_acked_strictly_past(&source, &lsn_text(recorded_after)).await?;
     anyhow::ensure!(
         !acknowledged_past_recorded,
         "the slot is acknowledged to {acknowledged}, past the recorded {}: the shutdown flush \
