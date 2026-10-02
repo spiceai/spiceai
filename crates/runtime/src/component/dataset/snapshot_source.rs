@@ -404,9 +404,8 @@ const LOCAL_COPY_PARAMS: &[&str] = &[
 ///
 /// Cayenne keeps its own layout: one catalog per process, in the shared metadata
 /// directory, and a data directory per dataset, both under `.spice/data` unless the
-/// dataset sets them. A snapshot dataset never serves a copy
-/// it did not restore in this process, whatever the engine; see
-/// `DataFusion::create_accelerated_table`.
+/// dataset sets them. A snapshot dataset never serves a copy it did not restore in this
+/// process, whatever the engine; see `DataFusion::create_accelerated_table`.
 fn local_copy_params(
     dataset: &TableReference,
     location: &str,
