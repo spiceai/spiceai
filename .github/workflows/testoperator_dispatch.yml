@@ -157,6 +157,113 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # A release build is dispatched once, so a run that failed on something transient would stand
+      # until the next build. The first scheduled run that finds the build recorded re-runs the failed
+      # jobs of every run that build's dispatch created, once, and records a
+      # `scheduled-bench-retried-<branch>-<commit>` artifact so no later run repeats it. Only runs whose
+      # first attempt failed are re-run; a cancelled run is left alone, because a cancel may be
+      # deliberate. The dispatch's runs are the release-branch `workflow_dispatch` runs of the child
+      # workflows created between the start of the run that recorded the build and the record itself.
+      # A failed lookup re-runs nothing and records nothing, so the next scheduled run tries again.
+      - name: Re-run this release build's failed runs once
+        id: retry
+        if: ${{ matrix.schedule == '' && steps.benchmarked.outputs.skip == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ matrix.branch }}
+          MARKER: ${{ steps.benchmarked.outputs.marker }}
+        run: |
+          set -uo pipefail
+          api() {
+            curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$@"
+          }
+          # The unexpired artifacts named $1, oldest first.
+          records() {
+            api -G "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts" --data-urlencode "name=$1" \
+              | jq -c '[.artifacts[] | select(.expired | not)] | sort_by(.created_at)'
+          }
+          retried="scheduled-bench-retried-${MARKER#scheduled-bench-}"
+          echo "marker=${retried}" >> "$GITHUB_OUTPUT"
+          if ! done_before=$(records "$retried"); then
+            echo "Could not look up ${retried}; re-running nothing."
+            exit 0
+          fi
+          if [ "$(jq length <<< "$done_before")" -gt 0 ]; then
+            echo "The failed runs of this build were already re-run once."
+            exit 0
+          fi
+          if ! record=$(records "$MARKER" | jq -ec 'last // empty | {run: .workflow_run.id, recorded: .created_at}'); then
+            echo "Could not read ${MARKER}; re-running nothing."
+            exit 0
+          fi
+          run_id=$(jq -r .run <<< "$record")
+          recorded=$(jq -r .recorded <<< "$record")
+          if ! started=$(api "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" | jq -er .run_started_at); then
+            echo "Could not read when run ${run_id} started; re-running nothing."
+            exit 0
+          fi
+          echo "Run ${run_id} dispatched this build between ${started} and ${recorded}."
+          # A listing that comes back short would record the build as re-run without re-running it, so
+          # each one must add up to the API's own total, and the bench listing, which every release
+          # dispatch fills, must not be empty.
+          failed=()
+          for workflow in testoperator_run_bench.yml testoperator_run_append.yml testoperator_run_schema.yml; do
+            page=1
+            listed=0
+            picked=0
+            while :; do
+              if ! runs=$(api -G "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs" \
+                  --data-urlencode "branch=${BRANCH}" --data-urlencode "event=workflow_dispatch" \
+                  --data-urlencode "created=${started}..${recorded}" \
+                  --data-urlencode "per_page=100" --data-urlencode "page=${page}"); then
+                echo "Could not list the ${workflow} runs; re-running nothing."
+                exit 0
+              fi
+              if [ "$page" -eq 1 ]; then
+                total=$(jq .total_count <<< "$runs")
+              fi
+              count=$(jq '.workflow_runs | length' <<< "$runs")
+              listed=$((listed + count))
+              mapfile -t ids < <(jq -r '.workflow_runs[]
+                | select(.status == "completed" and .run_attempt == 1 and (.conclusion == "failure" or .conclusion == "timed_out"))
+                | .id' <<< "$runs")
+              failed+=("${ids[@]}")
+              picked=$((picked + ${#ids[@]}))
+              if [ "$count" -lt 100 ]; then
+                break
+              fi
+              page=$((page + 1))
+            done
+            if [ "$listed" -ne "$total" ] || { [ "$workflow" = testoperator_run_bench.yml ] && [ "$listed" -eq 0 ]; }; then
+              echo "The ${workflow} listing came back incomplete (${listed} of ${total} runs); re-running nothing, so the next scheduled run tries again."
+              exit 0
+            fi
+            echo "${workflow}: ${listed} run(s), ${picked} failed on the first attempt."
+          done
+          echo "Re-running the failed jobs of ${#failed[@]} run(s) once."
+          for id in "${failed[@]}"; do
+            if api -X POST "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${id}/rerun-failed-jobs" > /dev/null; then
+              echo "  ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${id}"
+            else
+              echo "  could not re-run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${id}"
+            fi
+          done
+          echo "record=true" >> "$GITHUB_OUTPUT"
+
+      - name: Record that this release build's failed runs were re-run
+        if: ${{ steps.retry.outputs.record == 'true' }}
+        env:
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: echo "$SPICED_COMMIT" > retried-commit.txt
+
+      - name: Upload the record of the re-run
+        if: ${{ steps.retry.outputs.record == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.retry.outputs.marker }}
+          path: retried-commit.txt
+          retention-days: 60
+
       - name: Build Testoperator
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         uses: ./.github/actions/build-testoperator
