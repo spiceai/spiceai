@@ -318,6 +318,30 @@ async fn lookups_until(
     }
 }
 
+/// Runs lookups until a rebuild covers every file of `name` again, failing
+/// with the last verification after 30 seconds; returns that verification.
+async fn healed(
+    provider: &Arc<CayenneTableProvider>,
+    name: &str,
+) -> cayenne::lookup_index::LookupIndexVerification {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        lookup(provider, name, 7).await;
+        let verification = provider
+            .verify_lookup_index_against_read_back()
+            .await
+            .expect("verify");
+        if verification.uncovered_files == 0 {
+            return verification;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "'{name}' was not rebuilt to cover every file: {verification:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The index follows the `indexes` each registration passes, not whatever the
 /// table was first created with: adding an entry to an existing table indexes
 /// it, and removing it stops indexing.
@@ -1124,13 +1148,25 @@ async fn a_key_column_relaxed_to_nullable_does_not_reuse_its_persisted_runs() {
         "the runs built before the column became nullable must be deleted: {kept:?}"
     );
     lookup(&reopened, name, 7).await;
+    // The index heals: a lookup over the uncovered files rebuilds it, after
+    // which every file is covered again and lookups use it.
+    let healed = healed(&reopened, name).await;
+    println!("after the rebuild: {healed:?}");
+    assert!(healed.agrees(), "{healed:?}");
+    let before = counters(&reopened);
+    lookup(&reopened, name, 7).await;
+    assert_eq!(
+        counters(&reopened).selected - before.selected,
+        1,
+        "a lookup after the rebuild must use the index"
+    );
 }
 
 /// A key column relaxed to nullable on an open table: rows written after it,
 /// including one whose key column is NULL, are found by their keys, and the
-/// rows written before it still are. The open index keeps the encoding it was
-/// built with, so it does not cover the files written after the change; they
-/// are read in full until the table is reopened.
+/// rows written before it still are. The change alters the key's encoding, so
+/// the index built before it is dropped and rebuilt from the table's files by
+/// the next lookups, and then covers the files written before and after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_column_relaxed_to_nullable_on_an_open_table_keeps_lookups_exact() {
     use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
@@ -1224,4 +1260,16 @@ async fn a_key_column_relaxed_to_nullable_on_an_open_table_keeps_lookups_exact()
         .expect("verify");
     println!("after relaxing on an open table: {verification:?}");
     assert!(verification.agrees(), "{verification:?}");
+    // The index heals: a lookup over the uncovered files rebuilds it, after
+    // which every file is covered again and lookups use it.
+    let healed = healed(&table, name).await;
+    println!("after the rebuild: {healed:?}");
+    assert!(healed.agrees(), "{healed:?}");
+    let before = counters(&table);
+    lookup(&table, name, 7).await;
+    assert_eq!(
+        counters(&table).selected - before.selected,
+        1,
+        "a lookup after the rebuild must use the index"
+    );
 }

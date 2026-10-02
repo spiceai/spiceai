@@ -5332,6 +5332,19 @@ impl CayenneTableProvider {
             }
         }
 
+        // The secondary index's keys under the evolved schema, before anything
+        // is committed: a key column widened to a type the index cannot hold
+        // refuses the change, as opening the table with that schema would.
+        let index_shapes = self
+            .lookup_index
+            .as_ref()
+            .map(|state| state.shapes_for(&plan.evolved_schema))
+            .transpose()
+            .map_err(|message| Error::InvalidConfiguration {
+                table: self.table_metadata.table_name.clone(),
+                message,
+            })?;
+
         let started = Instant::now();
         let _write_guard = self.write_lock.lock().await;
 
@@ -5389,6 +5402,9 @@ impl CayenneTableProvider {
                     .map_err(|source| Error::Catalog { source })?;
             }
             self.table_schema.store(Arc::clone(&plan.evolved_schema));
+            if let (Some(state), Some(shapes)) = (&self.lookup_index, index_shapes) {
+                state.adopt_shapes(shapes);
+            }
             {
                 // Cached optimizer statistics are column-indexed against the
                 // old schema width (DataFusion expects column_statistics.len()
