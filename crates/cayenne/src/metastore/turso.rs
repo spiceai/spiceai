@@ -1627,15 +1627,22 @@ mod tests {
         );
     }
 
-    /// A statement that writes a row another open transaction has written fails with
-    /// a write-write conflict, and Turso ends the conflicted transaction on the spot.
-    /// Rolling it back afterwards must still succeed: the commit envelopes roll a
-    /// conflicted attempt back before they retry it, and an error there would report an
-    /// expected retry as a failure. The connection it held must go back to the pool in
-    /// autocommit, so the next borrower is not refused.
-    #[tokio::test]
-    async fn rolling_back_a_transaction_a_write_conflict_ended_succeeds() {
-        let (_dir, metastore) = temp_metastore();
+    /// A metastore whose table `t` holds the row `(1, 0)`. With
+    /// `checkpoint_every_commit`, the database checkpoints after every commit, so the
+    /// row lives in the B-tree rather than the MVCC store.
+    async fn metastore_with_one_row(
+        checkpoint_every_commit: bool,
+    ) -> (tempfile::TempDir, TursoMetastore) {
+        let (dir, metastore) = temp_metastore();
+        if checkpoint_every_commit {
+            metastore
+                .execute(ExecuteParams {
+                    sql: "PRAGMA mvcc_checkpoint_threshold = 0",
+                    params: vec![],
+                })
+                .await
+                .expect("checkpoint after every commit");
+        }
         metastore
             .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
             .await
@@ -1647,6 +1654,84 @@ mod tests {
             })
             .await
             .expect("seed the row");
+        (dir, metastore)
+    }
+
+    /// The engine behavior the commit envelopes' retry and
+    /// `TursoTransaction::rollback` account for. A statement that writes a row
+    /// another open transaction has written fails at once with a write-write conflict,
+    /// and Turso ends the conflicted transaction itself: the connection is back in
+    /// autocommit, and a further `ROLLBACK` on it fails because no transaction is open.
+    async fn assert_a_write_conflict_fails_the_statement_and_ends_the_transaction(
+        checkpoint_every_commit: bool,
+    ) {
+        let (_dir, metastore) = metastore_with_one_row(checkpoint_every_commit).await;
+        let pool = Arc::clone(metastore.pool().await.expect("pool"));
+        let holder = pool
+            .acquire()
+            .await
+            .expect("acquire the connection that holds the row");
+        let conflicted = pool
+            .acquire()
+            .await
+            .expect("acquire the connection that conflicts");
+
+        holder
+            .execute("BEGIN CONCURRENT", ())
+            .await
+            .expect("begin the transaction that holds the row");
+        holder
+            .execute("UPDATE t SET n = n + 1 WHERE id = 1", ())
+            .await
+            .expect("write the row");
+        conflicted
+            .execute("BEGIN CONCURRENT", ())
+            .await
+            .expect("begin the transaction that conflicts");
+        let error = conflicted
+            .execute("UPDATE t SET n = n + 2 WHERE id = 1", ())
+            .await
+            .expect_err("writing a row another open transaction has written fails the statement");
+        assert!(
+            turso_shared::is_retryable_write_conflict_message(&error.to_string()),
+            "the statement should fail with a write-write conflict, got: {error}"
+        );
+        assert!(
+            conflicted.is_autocommit().expect("read autocommit state"),
+            "the conflict should have ended the conflicted transaction"
+        );
+        conflicted
+            .execute("ROLLBACK", ())
+            .await
+            .expect_err("a ROLLBACK after the conflict finds no transaction to roll back");
+        holder
+            .execute("ROLLBACK", ())
+            .await
+            .expect("end the transaction that holds the row");
+    }
+
+    /// Turso fails the conflicting statement for a row still in the MVCC store.
+    #[tokio::test]
+    async fn a_write_conflict_on_an_mvcc_row_fails_the_statement_and_ends_the_transaction() {
+        assert_a_write_conflict_fails_the_statement_and_ends_the_transaction(false).await;
+    }
+
+    /// Turso 0.8 also fails the conflicting statement for a row checkpointed into the
+    /// B-tree, a conflict 0.7 left to `COMMIT` (tursodatabase/turso#8961).
+    #[tokio::test]
+    async fn a_write_conflict_on_a_checkpointed_row_fails_the_statement_and_ends_the_transaction() {
+        assert_a_write_conflict_fails_the_statement_and_ends_the_transaction(true).await;
+    }
+
+    /// A transaction that a statement's write-write conflict has ended (see
+    /// [`assert_a_write_conflict_fails_the_statement_and_ends_the_transaction`])
+    /// still rolls back successfully: the commit envelopes roll a conflicted attempt
+    /// back before they retry it, and an error there would report an expected retry
+    /// as a failure. The connection it held must go back to the pool in autocommit,
+    /// so the next borrower is not refused.
+    #[tokio::test]
+    async fn rolling_back_a_transaction_a_write_conflict_ended_succeeds() {
+        let (_dir, metastore) = metastore_with_one_row(true).await;
 
         let holder = metastore
             .begin_transaction()
