@@ -213,6 +213,30 @@ mod tests {
         );
     }
 
+    /// Regression test for #14472: a `from` URL can carry credentials in its
+    /// userinfo and query, and the registration line is logged at `INFO`.
+    #[tokio::test]
+    async fn test_dataset_registered_trace_redacts_credentials_in_from() {
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let ds = DatasetBuilder::try_new(
+            "http://user:hunter2@127.0.0.1:18997/api/data?api_key=SECRET123".to_string(),
+            "leaky",
+        )
+        .expect("Failed to create builder")
+        .with_app(Arc::new(app))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .expect("Failed to build dataset");
+
+        let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
+        let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, true);
+        assert_eq!(
+            info,
+            "Dataset leaky registered (http://127.0.0.1:18997/api/data), results cache enabled."
+        );
+    }
+
     #[tokio::test]
     async fn test_dataset_registered_trace_default_acceleration_cache() {
         let acceleration = Acceleration {

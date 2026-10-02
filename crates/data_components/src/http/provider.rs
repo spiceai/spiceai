@@ -5232,6 +5232,76 @@ mod tests {
         )
     }
 
+    /// Renders `exec` the way `EXPLAIN` prints a physical plan node.
+    fn explain_line(exec: &HttpExec) -> String {
+        struct Line<'a>(&'a HttpExec);
+        impl std::fmt::Display for Line<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt_as(DisplayFormatType::Default, f)
+            }
+        }
+        Line(exec).to_string()
+    }
+
+    fn provider_at(base_url: &str) -> Arc<HttpTableProvider> {
+        Arc::new(HttpTableProvider::new(
+            Url::parse(base_url).expect("valid URL"),
+            Client::new(),
+            "auto".to_string(),
+            false,
+        ))
+    }
+
+    /// Regression test for #14472: the configured URL's userinfo and query
+    /// can carry credentials, and `EXPLAIN` is readable by anyone who can
+    /// query the dataset.
+    #[test]
+    fn explain_omits_the_base_urls_userinfo_and_query() {
+        let provider =
+            provider_at("http://user:hunter2@127.0.0.1:18997/api/data?api_key=SECRET123");
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+
+        let line = explain_line(&exec);
+        assert!(
+            line.starts_with("HttpExec: base_url=http://127.0.0.1:18997/api/data, format=auto, "),
+            "{line}"
+        );
+        assert!(!line.contains("hunter2"), "{line}");
+        assert!(!line.contains("SECRET123"), "{line}");
+        assert!(!line.contains("user"), "{line}");
+    }
+
+    /// The explain snapshots pin this exact rendering for a credential-free
+    /// URL, so redaction must leave it byte-for-byte alone.
+    #[test]
+    fn explain_renders_a_credential_free_base_url_unchanged() {
+        let provider = provider_at("https://httpbin.org/json");
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+
+        assert_eq!(
+            explain_line(&exec),
+            "HttpExec: base_url=https://httpbin.org/json, format=auto, partitions=[(path=\"\", query=\"\", body=\"\", request_headers_present=false)]"
+        );
+    }
+
+    /// Regression test for #14472: the provider's `Debug` form reaches logs
+    /// through `{:?}`, so it carries no more of the URL than `EXPLAIN` does.
+    #[test]
+    fn debug_omits_the_base_urls_userinfo_and_query() {
+        let provider =
+            provider_at("http://user:hunter2@127.0.0.1:18997/api/data?api_key=SECRET123");
+
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("base_url: \"http://127.0.0.1:18997/api/data\""),
+            "{debug}"
+        );
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(!debug.contains("SECRET123"), "{debug}");
+    }
+
     async fn retry_test_server(
         replies: Vec<(u16, String)>,
         delay: Duration,
