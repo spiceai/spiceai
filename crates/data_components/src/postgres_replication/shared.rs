@@ -3288,6 +3288,10 @@ async fn run_pump(source: Arc<SharedSource>) {
     // Runtime began shutting down); a pump started by a later Runtime in the
     // same process captures the newer epoch and is unaffected.
     let shutdown_epoch = crate::cdc::shutdown_epoch();
+    // Held until this returns — on a runtime shutdown, after the final position
+    // write below. The runtime waits for it before closing the accelerations that
+    // write goes into.
+    let _shutdown_drain = crate::cdc::ShutdownDrainGuard::hold();
     let params = source.params.clone();
     let slot_name = source.key.slot_name.clone();
     let publication_name = params.publication_name.clone();
@@ -3450,7 +3454,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     &e.to_string(),
                     backoff.current().as_millis(),
                 );
-                backoff.wait().await;
+                crate::cdc::until_shutdown(shutdown_epoch, backoff.wait()).await;
                 continue 'reconnect;
             }
             Err(e) => {
@@ -3575,18 +3579,27 @@ async fn run_pump(source: Arc<SharedSource>) {
                     let wait_for = eager_hold
                         .next_flush_in()
                         .map_or(RECV_POLL_INTERVAL, |eager| eager.min(RECV_POLL_INTERVAL));
-                    let polled = tokio::time::timeout(wait_for, client.recv()).await;
+                    let polled = tokio::select! {
+                        polled = tokio::time::timeout(wait_for, client.recv()) => Some(polled),
+                        // Wake for a shutdown as it is signalled, so the position
+                        // flush at the head of the loop runs now rather than at the
+                        // next poll — the runtime is waiting for it. `recv` is
+                        // cancel-safe (see above).
+                        () = crate::cdc::shutdown_signalled(shutdown_epoch) => None,
+                    };
                     input_us_acc = input_us_acc.saturating_add(
                         u64::try_from(recv_start.elapsed().as_micros()).unwrap_or(u64::MAX),
                     );
                     match polled {
-                        Err(_elapsed) => Acquired::Idle,
-                        Ok(Ok(Some(e))) => Acquired::Event(e),
+                        // The poll elapsed, or shutdown was signalled: either way
+                        // re-enter the loop, whose head checks the epoch.
+                        None | Some(Err(_)) => Acquired::Idle,
+                        Some(Ok(Ok(Some(e)))) => Acquired::Event(e),
                         // Server closed cleanly (e.g. orderly Postgres shutdown):
                         // treat like a transient drop and reconnect — the shared
                         // stream is meant to run for the process lifetime.
-                        Ok(Ok(None)) => Acquired::CleanClose,
-                        Ok(Err(e)) => Acquired::RecvError(e),
+                        Some(Ok(Ok(None))) => Acquired::CleanClose,
+                        Some(Ok(Err(e))) => Acquired::RecvError(e),
                     }
                 }
             };
@@ -3944,7 +3957,7 @@ async fn run_pump(source: Arc<SharedSource>) {
         // Mark the drop so the next successful connect can attribute the
         // disconnected duration (this wait + reconnect handshake).
         disconnect_at = Some(std::time::Instant::now());
-        backoff.wait().await;
+        crate::cdc::until_shutdown(shutdown_epoch, backoff.wait()).await;
     } // end 'reconnect
 
     // Fatal exit. Take the setup lock so no subscriber is mid-registration,

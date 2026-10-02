@@ -1444,6 +1444,10 @@ async fn detect_source_gtid(params: &ReplicationParams) -> bool {
 )]
 async fn run_pump(source: Arc<SharedSource>) {
     let shutdown_epoch = crate::cdc::shutdown_epoch();
+    // Held until this returns — on a runtime shutdown, after the final
+    // `persist_all` below. The runtime waits for it before closing the
+    // accelerations those positions are written into.
+    let _shutdown_drain = crate::cdc::ShutdownDrainGuard::hold();
     let params = source.params.clone();
     let connection = source.key.label();
     let mut backoff = super::resilience::StreamBackoff::default_for_stream();
@@ -1546,7 +1550,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     &e.to_string(),
                     backoff.next_delay().as_millis(),
                 );
-                backoff.wait().await;
+                crate::cdc::until_shutdown(shutdown_epoch, backoff.wait()).await;
                 continue 'reconnect;
             }
             Err(e) => {
@@ -1590,7 +1594,14 @@ async fn run_pump(source: Arc<SharedSource>) {
                 return;
             }
 
-            let next_event = match tokio::time::timeout(idle_tick, stream.next()).await {
+            let polled = tokio::select! {
+                polled = tokio::time::timeout(idle_tick, stream.next()) => polled,
+                // Wake for a shutdown as it is signalled: the check at the head of
+                // the loop persists the positions, and the runtime is waiting for
+                // that before it closes the accelerations they go into.
+                () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
+            };
+            let next_event = match polled {
                 Ok(item) => item,
                 Err(_idle) => {
                     if last_persist_at.elapsed() >= params.checkpoint_interval {
@@ -1918,7 +1929,7 @@ async fn run_pump(source: Arc<SharedSource>) {
         } // 'recv
 
         persist_all(&source, &mut last_persisted).await;
-        backoff.wait().await;
+        crate::cdc::until_shutdown(shutdown_epoch, backoff.wait()).await;
     } // 'reconnect
 
     // Fatal exit: error any member still attached and finalize.
