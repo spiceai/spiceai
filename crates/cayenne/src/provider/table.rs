@@ -9800,6 +9800,36 @@ impl CayenneTableProvider {
         range: Option<RangePartitioning<'_>>,
         write_observer: Option<Arc<dyn VortexWriteObserver>>,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+        self.write_to_snapshot_with_schema(
+            stream,
+            target_size_bytes,
+            snapshot_id,
+            target_partitions,
+            estimated_bytes,
+            policy,
+            range,
+            write_observer,
+            self.table_schema(),
+        )
+        .await
+    }
+
+    /// [`Self::write_to_snapshot_range_partitioned`], writing `write_schema`:
+    /// the table schema, optionally followed by trailing columns the scan never
+    /// reads, which every reader of the table projects away by name.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn write_to_snapshot_with_schema(
+        &self,
+        stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        snapshot_id: &str,
+        target_partitions: usize,
+        estimated_bytes: Option<u64>,
+        policy: super::delta_encoding::WritePolicy,
+        range: Option<RangePartitioning<'_>>,
+        write_observer: Option<Arc<dyn VortexWriteObserver>>,
+        write_schema: SchemaRef,
+    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
 
@@ -9943,7 +9973,7 @@ impl CayenneTableProvider {
         // Create a new ListingTable pointing to the snapshot directory
         let snapshot_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
-            self.table_schema(),
+            Arc::clone(&write_schema),
             &write_format,
             &self.pk_deletion_strategy,
         )?;
@@ -10003,7 +10033,7 @@ impl CayenneTableProvider {
             );
         }
 
-        let tracked_schema = self.table_schema();
+        let tracked_schema = write_schema;
         let tracked_stream = {
             let target_schema = Arc::clone(&tracked_schema);
             let total_bytes_written = Arc::clone(&total_bytes_written);
@@ -12985,7 +13015,7 @@ impl CayenneTableProvider {
     }
 
     /// Returns the column indices for the configured primary key, if any.
-    fn primary_key_indices(&self) -> Result<Option<Vec<usize>>> {
+    pub(crate) fn primary_key_indices(&self) -> Result<Option<Vec<usize>>> {
         if self.table_metadata.primary_key.is_empty() {
             return Ok(None);
         }
@@ -25661,7 +25691,7 @@ impl CayenneTableProvider {
     /// capped at this ceiling); object-store upload concurrency, which *can*
     /// usefully exceed the core count, is governed separately by
     /// `cayenne_upload_concurrency`.
-    fn create_session_context(&self) -> SessionContext {
+    pub(crate) fn create_session_context(&self) -> SessionContext {
         SessionContext::new_with_config_rt(
             util::session_state::session_config(),
             Arc::clone(self.context.runtime_env()),
@@ -36083,7 +36113,7 @@ impl CayenneTableProvider {
     /// are deliberately not applied: a file pruned away for one query still
     /// holds rows another query's key maps to, and an index built from a pruned
     /// subset would answer a later lookup with a false empty.
-    async fn lookup_index_snapshot_files(
+    pub(crate) async fn lookup_index_snapshot_files(
         &self,
         state: &dyn Session,
         snapshot_id: &str,

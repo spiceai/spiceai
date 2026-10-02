@@ -680,8 +680,21 @@ impl CayenneTableProvider {
             MemoryConsumer::new(format!("CayenneOverwriteKeys[{}]", self.table_name()))
                 .register(&self.runtime_env().memory_pool);
         let mut layer_source = None;
+        // Resolved after the write instead (`overwrite_postpass`): the survivor
+        // the policy keeps, and the key columns the query groups by.
+        let mut postpass: Option<(Survivor, Vec<String>)> = None;
         let data: SendableRecordBatchStream = match self.key_resolver()? {
             None => data,
+            Some(resolver) if super::overwrite_postpass::enabled() => {
+                let indices = self.primary_key_indices()?.unwrap_or_default();
+                postpass = Some((
+                    Survivor::for_policy(resolver.policy()),
+                    super::overwrite_postpass::key_column_names(&self.table_schema(), &indices),
+                ));
+                Box::pin(super::overwrite_postpass::ArrivalStream::new(
+                    data, resolver,
+                ))
+            }
             Some(resolver) => {
                 // Under `drop` the splitter drops a later copy as it admits it, so
                 // only the upsert policies need a window to keep a repeat from
@@ -739,7 +752,9 @@ impl CayenneTableProvider {
         // out of the snapshot before publishing it, which rewrites the files that
         // hold them; recording each file's statistics as it is written is what
         // keeps the table's statistics exact over the files that survive.
-        let file_stats = (layer_source.is_some() && !self.should_capture_positions()).then(|| {
+        let file_stats = ((layer_source.is_some() || postpass.is_some())
+            && !self.should_capture_positions())
+        .then(|| {
             Arc::new(FileStatsObserver::new(
                 self.table_schema(),
                 lookup_index_observer.as_ref().map(Arc::clone),
@@ -771,9 +786,14 @@ impl CayenneTableProvider {
         // single serial writer. Without split points the shards hash the key and
         // each still sorts its rows by it, so an equality on the key reads about
         // one zone of every file instead of all of them.
+        let write_schema = if postpass.is_some() {
+            super::overwrite_postpass::with_arrival(&self.table_schema())
+        } else {
+            self.table_schema()
+        };
         let written: Result<_> = async {
             let written = self
-                .write_to_snapshot_range_partitioned(
+                .write_to_snapshot_with_schema(
                     data,
                     target_size_bytes,
                     &new_snapshot_id,
@@ -785,6 +805,7 @@ impl CayenneTableProvider {
                         OverwriteRangePlan::partitioning,
                     )),
                     write_observer.as_ref().map(Arc::clone),
+                    write_schema,
                 )
                 .await?;
             self.sync_local_snapshot_dir(&new_snapshot_id)
@@ -811,6 +832,42 @@ impl CayenneTableProvider {
         // holding them without them, so it publishes no deletes at all. Both are
         // done before the manifest below, which must list the final files.
         let (later_rows, position_deletions, write_stats_acc) = match layer_source.take() {
+            None if let Some((survivor, key_columns)) = postpass.take() => {
+                let resolved: Result<_> = async {
+                    let superseded = self
+                        .find_superseded_by_arrival(&new_snapshot_id, survivor, &key_columns)
+                        .await?;
+                    match file_stats.as_deref() {
+                        Some(file_stats) if !superseded.is_empty() => {
+                            let stats = self
+                                .fold_superseded_copies(
+                                    &new_snapshot_id,
+                                    &superseded,
+                                    LayerWrite {
+                                        target_size_bytes,
+                                        target_partitions,
+                                        write_policy,
+                                    },
+                                    file_stats,
+                                    &write_stats_acc,
+                                )
+                                .await?;
+                            // The index build observed the files the fold removed.
+                            self.discard_lookup_index_build();
+                            Ok((HashMap::new(), stats))
+                        }
+                        _ => Ok((superseded, Arc::clone(&write_stats_acc))),
+                    }
+                }
+                .await;
+                match resolved {
+                    Ok((position_deletions, stats)) => (0, position_deletions, stats),
+                    Err(error) => {
+                        self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                        return Err(error);
+                    }
+                }
+            }
             None => (0, HashMap::new(), write_stats_acc),
             Some(mut source) => match self
                 .write_later_layers(
