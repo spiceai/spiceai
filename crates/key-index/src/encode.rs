@@ -258,6 +258,32 @@ impl KeyEncoder {
         &self.fields
     }
 
+    /// Identifies the words this encoder gives keys: two encoders with the same
+    /// identity give every key the same word. It covers each field's type,
+    /// whether the field is nullable (a nullable field encodes each value
+    /// behind a validity byte), and how keys become words. A run records the
+    /// identity of the encoder that built it and an index publishes only runs
+    /// of its own, so a run built under another encoding, whose words match
+    /// none of the index's keys, never answers a lookup.
+    #[must_use]
+    pub fn word_identity(&self) -> u64 {
+        let mut descriptor = Vec::new();
+        for field in &self.fields {
+            descriptor.extend_from_slice(field.data_type.to_string().as_bytes());
+            // A type's name never contains a control byte, so the separator
+            // and the nullability after it keep each field's part distinct.
+            descriptor.extend_from_slice(&[0, u8::from(field.nullable)]);
+        }
+        match &self.words {
+            WordRule::Exact(_) => descriptor.push(0),
+            WordRule::Hashed { bits } => {
+                descriptor.push(1);
+                descriptor.extend_from_slice(&bits.to_le_bytes());
+            }
+        }
+        hash_index::hash_key_bytes_oneshot(&descriptor)
+    }
+
     /// The 64-bit word an index stores for the encoded `key` of a row with no
     /// NULL key column (rows with one are never indexed). When every field is
     /// fixed-width and their values fit 8 bytes, the word is those values'

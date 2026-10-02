@@ -189,6 +189,9 @@ fn postings_intact(files: usize, slots: &[u32], postings: &[u8], rows: usize) ->
 /// with its rows' postings.
 #[derive(Debug)]
 pub struct IndexRun {
+    /// [`KeyEncoder::word_identity`] of the encoder whose words the run
+    /// holds; an index publishes the run only if it is its own.
+    encoding: u64,
     files: Box<[Arc<str>]>,
     words: Box<[u64]>,
     /// Per word: its only posting, when it has one below [`MULTI`] (a unique
@@ -209,6 +212,7 @@ pub struct IndexRun {
 
 impl IndexRun {
     fn from_parts(
+        encoding: u64,
         files: Box<[Arc<str>]>,
         words: Box<[u64]>,
         slots: Box<[u32]>,
@@ -221,6 +225,7 @@ impl IndexRun {
         let mut filter = SplitBlockBloomFilter::new(words.len());
         filter.extend(words.iter().map(|&word| word_hash(word)));
         Self {
+            encoding,
             files,
             words,
             slots,
@@ -235,6 +240,12 @@ impl IndexRun {
     fn decode(&self, posting: u64) -> (usize, u64) {
         let (file, position) = word_proof::decode_posting(posting, self.files.len().max(1) as u64);
         (usize::try_from(file).unwrap_or(usize::MAX), position)
+    }
+
+    /// [`KeyEncoder::word_identity`] of the encoder that built the run.
+    #[must_use]
+    pub fn encoding(&self) -> u64 {
+        self.encoding
     }
 
     /// The files this run covers, in the order their ids were assigned.
@@ -350,6 +361,7 @@ impl IndexRun {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.heap_bytes() + 64);
         crate::persist::header(&mut out, crate::persist::KIND_RUN);
+        out.extend_from_slice(&self.encoding.to_le_bytes());
         out.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
         for file in &self.files {
             out.extend_from_slice(&(file.len() as u32).to_le_bytes());
@@ -376,6 +388,7 @@ impl IndexRun {
     pub fn from_bytes(bytes: &[u8]) -> crate::persist::Result<Self> {
         use crate::persist::Error;
         let mut reader = crate::persist::open(bytes, crate::persist::KIND_RUN)?;
+        let encoding = reader.u64()?;
         let count = reader.u32()? as usize;
         let mut files = Vec::with_capacity(count.min(1 << 20));
         for _ in 0..count {
@@ -395,6 +408,7 @@ impl IndexRun {
             return Err(Error::Corrupt);
         }
         Ok(Self::from_parts(
+            encoding,
             files.into(),
             words.into(),
             slots.into(),
@@ -406,6 +420,7 @@ impl IndexRun {
 
 /// Appends words, in ascending order, with their postings, into a run.
 struct RunWriter {
+    encoding: u64,
     words: Vec<u64>,
     slots: Vec<u32>,
     postings: Vec<u8>,
@@ -413,9 +428,10 @@ struct RunWriter {
 }
 
 impl RunWriter {
-    /// A writer with room for `words` words.
-    fn with_capacity(words: usize) -> Self {
+    /// A writer of a run of `encoding`'s words, with room for `words` of them.
+    fn with_capacity(encoding: u64, words: usize) -> Self {
         Self {
+            encoding,
             words: Vec::with_capacity(words),
             slots: Vec::with_capacity(words),
             postings: Vec::new(),
@@ -445,6 +461,7 @@ impl RunWriter {
 
     fn finish(self, files: Box<[Arc<str>]>) -> IndexRun {
         IndexRun::from_parts(
+            self.encoding,
             files,
             self.words.into(),
             self.slots.into(),
@@ -675,7 +692,10 @@ impl RunBuilder {
             .windows(2)
             .filter(|pair| pair[0].0 != pair[1].0)
             .count();
-        let mut writer = RunWriter::with_capacity(if entries.is_empty() { 0 } else { words });
+        let mut writer = RunWriter::with_capacity(
+            self.encoder.word_identity(),
+            if entries.is_empty() { 0 } else { words },
+        );
         let mut group: Vec<u64> = Vec::new();
         let mut i = 0;
         while i < entries.len() {
@@ -968,9 +988,9 @@ fn pick_merge(runs: &[RunEntry]) -> Option<Vec<usize>> {
         })
 }
 
-/// One run over all of `sources`' files, dropping the rows of files already
-/// retired, by a k-way merge of their words.
-fn merge_runs(sources: &[&RunEntry]) -> Result<IndexRun> {
+/// One run of `encoding`'s words over all of `sources`' files, dropping the
+/// rows of files already retired, by a k-way merge of their words.
+fn merge_runs(encoding: u64, sources: &[&RunEntry]) -> Result<IndexRun> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     let mut files: Vec<Arc<str>> = Vec::new();
@@ -996,6 +1016,7 @@ fn merge_runs(sources: &[&RunEntry]) -> Result<IndexRun> {
     // The merged run holds every word of its largest source, unless a retired
     // file held a word's only rows.
     let mut writer = RunWriter::with_capacity(
+        encoding,
         sources
             .iter()
             .map(|source| source.run.keys())
@@ -1268,7 +1289,9 @@ impl TieredIndex {
     /// Publishes `add` in one swap: each published file's state becomes
     /// `retire(file, state)`, dropping a published run none of whose files
     /// stays live, and each new file starts in `initial(file)`. A new run is
-    /// added when `admit` accepts its files' states.
+    /// added when `admit` accepts its files' states and it holds this index's
+    /// words ([`IndexRun::encoding`]): a run of another encoding is dropped and
+    /// its files stay uncovered, so they are read in full.
     fn publish_runs(
         &self,
         add: Vec<IndexRun>,
@@ -1279,8 +1302,9 @@ impl TieredIndex {
         let _swap = self.swap.lock();
         let current = self.layers.load_full();
         let (mut runs, _) = transition_runs(&current.runs, retire);
+        let encoding = self.encoder.word_identity();
         let mut admitted: Vec<(IndexRun, Arc<[FileState]>)> = Vec::with_capacity(add.len());
-        for run in add {
+        for run in add.into_iter().filter(|run| run.encoding == encoding) {
             let states: Arc<[FileState]> = run.files.iter().map(|file| initial(file)).collect();
             if admit(&states) {
                 admitted.push((run, states));
@@ -1382,7 +1406,7 @@ impl TieredIndex {
     /// holds `merging`.
     fn merge_picked(&self, current: &Layers, picked: &[usize]) -> Result<bool> {
         let sources: Vec<&RunEntry> = picked.iter().map(|&i| &current.runs[i]).collect();
-        let merged = merge_runs(&sources)?;
+        let merged = merge_runs(self.encoder.word_identity(), &sources)?;
 
         let _swap = self.swap.lock();
         let now = self.layers.load_full();
