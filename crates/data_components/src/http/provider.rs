@@ -666,7 +666,10 @@ pub struct HttpTableProvider {
 impl std::fmt::Debug for HttpTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpTableProvider")
-            .field("base_url", &self.base_url)
+            .field(
+                "base_url",
+                &util::redact::url_without_secrets(&self.base_url).as_str(),
+            )
             .field("file_format", &self.file_format)
             .field("acceleration_enabled", &self.acceleration_enabled)
             .field("pagination", &self.pagination)
@@ -2706,7 +2709,8 @@ impl DisplayAs for HttpExec {
         write!(
             f,
             "HttpExec: base_url={}, format={}, ",
-            self.provider.base_url, self.provider.file_format
+            util::redact::url_without_secrets(&self.provider.base_url),
+            self.provider.file_format
         )?;
 
         if self.deferred_partitions {

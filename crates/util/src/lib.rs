@@ -26,6 +26,7 @@ pub mod column_reference;
 pub mod fibonacci_backoff;
 pub mod home_dir;
 pub mod levenshtein;
+pub mod redact;
 pub mod retry_strategy;
 #[cfg(feature = "datafusion")]
 pub mod security;

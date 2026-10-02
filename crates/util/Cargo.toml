@@ -25,6 +25,7 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber.workspace = true
+url.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 datafusion = { workspace = true, optional = true }

@@ -32,7 +32,11 @@ pub fn dataset_registered_trace(
     ds: &Dataset,
     results_cache_enabled: bool,
 ) -> String {
-    let mut info = format!("Dataset {} registered ({})", ds.name, ds.from);
+    let mut info = format!(
+        "Dataset {} registered ({})",
+        ds.name,
+        util::redact::redact_url_str(&ds.from)
+    );
     if let Some(acceleration) = &ds.acceleration
         && acceleration.enabled
     {
