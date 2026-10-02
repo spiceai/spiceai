@@ -64,51 +64,17 @@ pub mod swappable;
 pub mod types;
 pub mod upsert_dedup;
 
-/// Environment variable that sets [`spice_data_base_path`].
-const SPICE_DATA_DIR_ENV: &str = "SPICE_DATA_DIR";
-
-/// Base directory Spice stores accelerator data under: `$SPICE_DATA_DIR` when set and
-/// non-empty (a relative value resolves against the working directory), otherwise
-/// `<cwd>/.spice/data`.
+/// Base directory Spice stores accelerator data under (`<cwd>/.spice/data`).
 ///
 /// Lives here so an engine below `runtime` can resolve it without an upward
 /// dependency; `runtime` re-exports it.
 #[must_use]
 pub fn spice_data_base_path() -> String {
-    resolve_data_base_path(std::env::var_os(SPICE_DATA_DIR_ENV))
-}
-
-/// Rejects a `SPICE_DATA_DIR` that resolves to a path that is not valid UTF-8, which
-/// [`spice_data_base_path`] cannot represent, so `spiced` refuses to start instead of
-/// writing elsewhere.
-///
-/// # Errors
-///
-/// Returns the message to print when the resolved path is not valid UTF-8.
-pub fn validate_spice_data_dir() -> Result<(), String> {
-    let Some(data_dir) = std::env::var_os(SPICE_DATA_DIR_ENV).filter(|dir| !dir.is_empty()) else {
-        return Ok(());
-    };
-    let resolved = std::env::current_dir()
-        .map_or_else(|_| PathBuf::from(&data_dir), |cwd| cwd.join(&data_dir));
-    if resolved.to_str().is_some() {
-        return Ok(());
-    }
-    Err(format!(
-        "`SPICE_DATA_DIR` resolves to '{}', which is not valid UTF-8. Set it to an absolute UTF-8 path. See: https://spiceai.org/docs",
-        resolved.display()
-    ))
-}
-
-fn resolve_data_base_path(data_dir: Option<std::ffi::OsString>) -> String {
-    let data_dir = data_dir
-        .filter(|dir| !dir.is_empty())
-        .map_or_else(|| PathBuf::from(".spice/data"), PathBuf::from);
     let Ok(working_dir) = std::env::current_dir() else {
-        return data_dir.to_str().unwrap_or(".").to_string();
+        return ".".to_string();
     };
 
-    let base_folder = working_dir.join(data_dir);
+    let base_folder = working_dir.join(".spice/data");
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
@@ -1357,7 +1323,7 @@ mod tests {
     use super::{
         AcceleratorExternalTableBuilder, AcceleratorRuntimeConfig,
         cayenne_pk_conflict_detection_none, format_engine_list, get_primary_keys_from_constraints,
-        resolve_data_base_path, upsert_dedup::extract_upsert_options,
+        upsert_dedup::extract_upsert_options,
     };
     use ::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::{Constraint, Constraints, TableReference};
@@ -1621,21 +1587,5 @@ mod tests {
                 "default_for({engine}) must produce the {engine} variant"
             );
         }
-    }
-
-    #[test]
-    fn data_base_path_honours_spice_data_dir() {
-        let cwd = std::env::current_dir().expect("working directory");
-        let resolve = |dir: Option<&str>| resolve_data_base_path(dir.map(Into::into));
-
-        let default = cwd.join(".spice/data").to_string_lossy().into_owned();
-        assert_eq!(resolve(None), default);
-        assert_eq!(resolve(Some("")), default, "empty is the same as unset");
-        assert_eq!(resolve(Some("/data")), "/data");
-        assert_eq!(
-            resolve(Some("data")),
-            cwd.join("data").to_string_lossy().into_owned(),
-            "a relative value resolves against the working directory"
-        );
     }
 }

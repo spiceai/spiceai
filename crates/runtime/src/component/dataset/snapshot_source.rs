@@ -371,13 +371,8 @@ impl SnapshotSource {
         }) {
             return conflict(
                 "params",
-                &format!(
-                    "so Spice keeps its local copy of the snapshot in the Spice data directory '{}'",
-                    data_accelerator_api::spice_data_base_path()
-                ),
-                format!(
-                    "Remove `acceleration.params.{param}`, or set `SPICE_DATA_DIR` to move the data directory"
-                ),
+                "so Spice chooses where it keeps its local copy of the snapshot, under `.spice/data`",
+                format!("Remove `acceleration.params.{param}`"),
             );
         }
 
@@ -387,19 +382,19 @@ impl SnapshotSource {
 
 /// The accelerator params that choose where a dataset's data lives on disk. Where a
 /// snapshot dataset keeps its local copy is Spice's choice; see [`local_copy_params`].
+/// Cayenne's `cayenne_file_path` and `cayenne_metadata_dir` are allowed: its copy is
+/// per dataset, not per location, wherever it lives.
 const LOCAL_COPY_PARAMS: &[&str] = &[
     "duckdb_file",
     "duckdb_data_dir",
     "sqlite_file",
     "turso_file",
-    "cayenne_file_path",
-    "cayenne_metadata_dir",
     "cayenne_s3_zone_ids",
 ];
 
 /// Where a snapshot dataset keeps its local copy, for the engines that keep one file
-/// per dataset: under the Spice data directory, in a file named for the dataset and the
-/// location it reads.
+/// per dataset: under `.spice/data`, in a file named for the dataset and the location it
+/// reads.
 ///
 /// Scoping the file to the location keeps a dataset pointed at another location from
 /// reopening the previous location's copy, which `DuckDB` would otherwise serve from the
@@ -408,7 +403,8 @@ const LOCAL_COPY_PARAMS: &[&str] = &[
 /// one dataset's snapshot would replace the others'.
 ///
 /// Cayenne keeps its own layout: one catalog per process, in the shared metadata
-/// directory, and a data directory per dataset. A snapshot dataset never serves a copy
+/// directory, and a data directory per dataset, both under `.spice/data` unless the
+/// dataset sets them. A snapshot dataset never serves a copy
 /// it did not restore in this process, whatever the engine; see
 /// `DataFusion::create_accelerated_table`.
 fn local_copy_params(
@@ -887,6 +883,30 @@ mod tests {
                 .as_deref(),
             Some("2GB")
         );
+    }
+
+    #[test]
+    fn cayenne_paths_for_the_local_copy_can_be_set() {
+        let mut declared = snapshot_dataset();
+        declared.acceleration = Some(spicepod_acceleration::Acceleration {
+            params: Some(Params::from_string_map(HashMap::from([
+                ("cayenne_file_path".to_string(), "/data/modules/".to_string()),
+                ("cayenne_metadata_dir".to_string(), "/data/metadata/".to_string()),
+            ]))),
+            ..Default::default()
+        });
+        let acceleration = source(&declared)
+            .acceleration(&TableReference::bare("modules"), Engine::Cayenne)
+            .expect("Cayenne paths are accepted");
+        let param = |name: &str| {
+            acceleration
+                .params
+                .as_ref()
+                .and_then(|params| params.data.get(name))
+                .map(ParamValue::as_string)
+        };
+        assert_eq!(param("cayenne_file_path").as_deref(), Some("/data/modules/"));
+        assert_eq!(param("cayenne_metadata_dir").as_deref(), Some("/data/metadata/"));
     }
 
     #[test]

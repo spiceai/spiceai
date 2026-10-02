@@ -195,10 +195,6 @@ fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>
     // degradation, and the global subscriber does not exist until `spiced::run`
     // installs one — so a warning emitted outside this context would be
     // dropped on the floor.
-    if let Err(message) = runtime::validate_spice_data_dir() {
-        in_tracing_context(|| tracing::error!("{message}"));
-        std::process::exit(1);
-    }
     let _instance = match in_tracing_context(spiced::claim_instance_directory) {
         Ok(claim) => claim,
         Err(message) => {

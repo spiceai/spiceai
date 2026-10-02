@@ -88,7 +88,7 @@ impl Extension for TpcExtension {
         }
 
         let path = self.manifest.params.get("path").map_or(
-            format!("{}/{benchmark}.db", runtime::spice_data_base_path()),
+            format!(".spice/data/{benchmark}.db"),
             std::string::ToString::to_string,
         );
 

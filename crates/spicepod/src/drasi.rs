@@ -127,10 +127,9 @@ pub enum DrasiDelivery {
     /// immediately; delivery is retried in the background.
     ///
     /// Replication never waits for Drasi. A change Drasi will not accept is
-    /// written to a durable dead-letter store under the Spice data directory
-    /// (`.spice/data/drasi` by default) and retried until it lands, surviving a
-    /// restart — so the replication log is no longer what replays a failure,
-    /// this is.
+    /// written to a durable dead-letter store under `.spice/data/drasi` and
+    /// retried until it lands, surviving a restart — so the replication log is
+    /// no longer what replays a failure, this is.
     ///
     /// Because an insert or update is a full-state replace keyed by element id,
     /// redelivery must not be overtaken: once anything is pending, later changes

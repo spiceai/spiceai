@@ -205,7 +205,7 @@ The **cold object-store tier** at the bottom (user-facing name: the **datalake t
 The left-hand bracket above groups the generations by *where they physically live*. Here is that same split as an actual on-disk tree for the default local-filesystem backend; an S3-backed table mirrors the per-table portion under an `s3://…/<table_id>/<snapshot_id>/` prefix. Paths and names come from `provider/constants.rs`, `snapshot_dir_path`, the accelerator's `resolve_default_data_path` / `resolve_metadata_dir`, and the Vortex sink's `output_file_path`.
 
 ```text
-<spice_data_base_path>/                   # .spice/data, or SPICE_DATA_DIR
+<spice_data_base_path>/                   # .spice/data by default
 ├─ metadata/
 │  └─ cayenne.db                          # SQLite metastore (all metadata; see below)
 └─ <dataset_name>/                        # the table_path root (one per dataset)
