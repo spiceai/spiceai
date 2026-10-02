@@ -18,6 +18,7 @@ use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{TreeNode as _, TreeNodeRecursion};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::ExprSchemable as _;
+use datafusion::logical_expr::{Cast, TryCast};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::sqlparser;
@@ -406,14 +407,44 @@ pub(crate) fn concat_to_string_concat(
 /// pushdown on a rare shape and cannot return a wrong row, which is the
 /// direction this check is required to err in.
 pub(crate) fn concat_arguments_are_renderable(args: &[Expr], scope: Option<&DFSchema>) -> bool {
-    let empty = DFSchema::empty();
-    let scope = scope.unwrap_or(&empty);
     !args.iter().any(|arg| operand_reaches_binary(arg, scope))
+}
+
+/// Whether `DuckDB` evaluates this cast the way `DataFusion` does.
+///
+/// A cast into text is where the two engines part on binary input.
+/// `DataFusion` validates the bytes: `CAST` raises `Encountered non UTF-8
+/// data` and `TRY_CAST` answers NULL. `DuckDB`'s `CAST(BLOB AS VARCHAR)`
+/// validates nothing and renders unprintable bytes as their escaped form
+/// (`\xFF\xFE`), so both spellings return a row — in a projection, and in a
+/// filter that then selects it (issue #14355). As with
+/// [`concat_arguments_are_renderable`], no rendering closes that, so the cast
+/// stays local.
+///
+/// Only text targets are refused: casting binary into a number, a date or a
+/// boolean is unsupported on both engines, so both refuse the query.
+pub(crate) fn cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let (Expr::Cast(Cast {
+        expr: operand,
+        field,
+    })
+    | Expr::TryCast(TryCast {
+        expr: operand,
+        field,
+    })) = expr
+    else {
+        return true;
+    };
+    !field.data_type().is_string() || !operand_reaches_binary(operand, scope)
 }
 
 /// Whether any node of this operand's expression tree is, or carries, a binary
 /// value — including one a cast has since retyped as text.
-fn operand_reaches_binary(expr: &Expr, scope: &DFSchema) -> bool {
+///
+/// With no `scope`, a column's type cannot be read, so it counts as binary.
+fn operand_reaches_binary(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let empty = DFSchema::empty();
+    let scope = scope.unwrap_or(&empty);
     let mut reaches = false;
     // `Expr::apply` is infallible for a closure that never errors, so the
     // result carries no information and the flag is the answer.

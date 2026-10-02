@@ -129,7 +129,10 @@ limitations under the License.
 //!   the configured unclaimed-reservation grace (a table left in the publication by a
 //!   removed dataset) would pin WAL forever, so the table is dropped from the
 //!   publication — which is what makes releasing its floor safe — and logged at
-//!   ERROR.
+//!   ERROR. A publication that cannot drop it (`FOR ALL TABLES`, `FOR TABLES IN
+//!   SCHEMA`) has its hold released anyway, logged at WARN: a dataset that joins
+//!   the table later is rebuilt from the source, since the slot has acknowledged
+//!   past anything it recorded.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -1977,17 +1980,24 @@ impl SharedSource {
             let (schema_name, table_name) = key.clone();
             let slot_name = self.key.slot_name.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    slot::remove_table_from_publication(&params, &schema_name, &table_name).await
-                {
-                    tracing::warn!(
-                        table = %format!("{schema_name}.{table_name}"),
-                        slot = %slot_name,
-                        "failed to remove mid-snapshot table from the shared publication; \
-                         re-adding the dataset will resume WITHOUT a fresh snapshot — drop \
-                         the table from the publication manually before re-adding: {e}"
-                    );
-                }
+                let removal =
+                    slot::remove_table_from_publication(&params, &schema_name, &table_name).await;
+                let cause = match removal {
+                    Ok(slot::PublicationRemoval::Removed) => return,
+                    Ok(slot::PublicationRemoval::StillPublished) => {
+                        "the publication includes it through FOR ALL TABLES or FOR TABLES IN \
+                         SCHEMA, which cannot drop a single table"
+                            .to_string()
+                    }
+                    Err(e) => e.to_string(),
+                };
+                tracing::warn!(
+                    table = %format!("{schema_name}.{table_name}"),
+                    slot = %slot_name,
+                    "failed to remove mid-snapshot table from the shared publication; \
+                     re-adding the dataset will resume WITHOUT a fresh snapshot — drop \
+                     the table from the publication manually before re-adding: {cause}"
+                );
             });
         }
     }
@@ -2081,6 +2091,14 @@ impl SharedSource {
     /// second silent-loss path: an unpublished table produces no more changes,
     /// and if the dataset ever comes back, `table_added` sends it through the
     /// initial-snapshot path instead of a resume.
+    ///
+    /// A publication that includes the table without naming it (`FOR ALL
+    /// TABLES`, `FOR TABLES IN SCHEMA`) cannot drop it, and a hold kept until it
+    /// does would pin WAL for the life of the slot (#13032). There the floor is
+    /// released with the table still published, which is safe for a different
+    /// reason: the slot then acknowledges past anything a returning dataset
+    /// recorded, and `super::rebuild_cause` rebuilds it from the source rather
+    /// than resuming across the changes nobody consumed.
     fn release_unclaimed_reservations(self: &Arc<Self>, grace: std::time::Duration) {
         for key in self.take_expired_reservations(grace) {
             let params = self.params.clone();
@@ -2100,17 +2118,6 @@ impl SharedSource {
                 if source.member(&key).is_some() {
                     return;
                 }
-                tracing::error!(
-                    table = %format_member(&key),
-                    slot = %slot_name,
-                    publication = %publication,
-                    grace_secs,
-                    "no dataset subscribed to a published table on this shared slot within the \
-                     grace period; it was pinning WAL retention for every dataset on the slot, \
-                     so it is being dropped from the publication and the slot's acknowledgement \
-                     released. Re-adding a dataset for this table will take a fresh initial \
-                     snapshot"
-                );
                 let (schema_name, table_name) = key.clone();
                 match slot::remove_table_from_publication(&params, &schema_name, &table_name).await
                 {
@@ -2119,7 +2126,46 @@ impl SharedSource {
                     // keep arriving with no member to route them to, and acking
                     // past them would be the very loss this hold exists to
                     // prevent.
-                    Ok(()) => source.ack.release(&key),
+                    Ok(slot::PublicationRemoval::Removed) => {
+                        tracing::error!(
+                            table = %format_member(&key),
+                            slot = %slot_name,
+                            publication = %publication,
+                            grace_secs,
+                            "no dataset subscribed to a published table on this shared slot \
+                             within the grace period; it was pinning WAL retention for every \
+                             dataset on the slot, so it is being dropped from the publication \
+                             and the slot's acknowledgement released. Re-adding a dataset for \
+                             this table will take a fresh initial snapshot"
+                        );
+                        source.ack.release(&key);
+                    }
+                    // The publication includes the table without naming it
+                    // (`FOR ALL TABLES`, `FOR TABLES IN SCHEMA`), so no drop can
+                    // ever succeed and holding on would pin WAL for the life of
+                    // the slot. Release it anyway: a dataset that joins this
+                    // table later finds the slot acknowledged past its recorded
+                    // position and is rebuilt from the source
+                    // (`RebuildCause::AcknowledgedPast`), and one with no record
+                    // is loaded from the source — neither resumes over the
+                    // changes acknowledged here.
+                    Ok(slot::PublicationRemoval::StillPublished) => {
+                        let table = format_member(&key);
+                        tracing::warn!(
+                            table = %table,
+                            slot = %slot_name,
+                            publication = %publication,
+                            grace_secs,
+                            "{}",
+                            implicitly_published_release_message(
+                                &table,
+                                &slot_name,
+                                &publication,
+                                grace_secs,
+                            )
+                        );
+                        source.ack.release(&key);
+                    }
                     Err(e) => {
                         // Keep the hold and re-arm the grace period so the next
                         // sweep tries again, rather than leaving a table pinning
@@ -2157,6 +2203,24 @@ impl SharedSource {
 
 fn format_member(key: &MemberKey) -> String {
     format!("{}.{}", key.0, key.1)
+}
+
+/// Logged when an unclaimed hold is released on a table its publication cannot
+/// drop (see [`SharedSource::release_unclaimed_reservations`]).
+fn implicitly_published_release_message(
+    table: &str,
+    slot: &str,
+    publication: &str,
+    grace_secs: u64,
+) -> String {
+    format!(
+        "No dataset subscribed to table '{table}' on shared replication slot '{slot}' within \
+         {grace_secs}s, and publication '{publication}' includes it through `FOR ALL TABLES` or \
+         `FOR TABLES IN SCHEMA`, so it cannot be dropped from the publication; the slot stops \
+         holding WAL for it so retention does not grow without bound. A dataset added for this \
+         table later is reloaded from the source if the changes since it last ran are no longer \
+         retained. See: https://spiceai.org/docs/components/data-connectors/postgres"
+    )
 }
 
 /// Entry point: subscribe one dataset to its shared replication source.
@@ -6437,6 +6501,31 @@ mod tests {
             source.slot_generation.load(Ordering::Acquire),
             refused_generation + 1,
             "one replacement happened, so the generation moved exactly once"
+        );
+    }
+
+    /// The only explanation an operator gets for a hold released on a table the
+    /// publication cannot drop, so it must name the table, slot and publication,
+    /// say why the drop was impossible and what a later dataset will do, and link
+    /// the docs.
+    #[test]
+    fn implicitly_published_release_message_names_the_resources_and_the_consequence() {
+        let message = implicitly_published_release_message("public.b", "spice_slot", "allpub", 300);
+        for needle in [
+            "table 'public.b'",
+            "slot 'spice_slot'",
+            "publication 'allpub'",
+            "within 300s",
+            "`FOR ALL TABLES`",
+            "`FOR TABLES IN SCHEMA`",
+            "reloaded from the source if the changes since it last ran are no longer retained",
+            "https://spiceai.org/docs/components/data-connectors/postgres",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+        assert!(
+            !message.contains('\n'),
+            "log messages stay on one line: {message}"
         );
     }
 
