@@ -401,7 +401,7 @@ fn assert_names_the_rejected_control(message: &str) {
         "the model that refused the control must be named: {message}"
     );
     assert!(
-        message.contains("Remove `temperature` from the request and from the model's `params`"),
+        message.contains("Remove `temperature` from the request and `anthropic_temperature` (or its `openai_temperature` alias) from the model's `params`"),
         "the control and where to remove it must be named: {message}"
     );
     assert!(

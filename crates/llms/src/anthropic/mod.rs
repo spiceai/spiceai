@@ -218,8 +218,9 @@ fn explain_rejected_sampling_control(
     api_error.message = format!(
         "Failed to run a chat completion with Anthropic model '{model}': the model does not \
          accept the `{control}` parameter{default_note}. Remove `{control}` from the request and \
-         from the model's `params`, or set `from: anthropic:<model_id>` to a model that accepts \
-         it. Cause: {cause} See: {ANTHROPIC_DOCS}",
+         `anthropic_{control}` (or its `openai_{control}` alias) from the model's `params`, or \
+         set `from: anthropic:<model_id>` to a model that accepts it. Cause: {cause} \
+         See: {ANTHROPIC_DOCS}",
         cause = api_error.message,
     );
     // The model refused what the caller asked for, so it is the caller's request that is invalid:
@@ -551,7 +552,7 @@ mod tests {
             "the message must name the model that refused the control: {message}"
         );
         assert!(
-            message.contains("Remove `temperature` from the request and from the model's `params`"),
+            message.contains("Remove `temperature` from the request and `anthropic_temperature` (or its `openai_temperature` alias) from the model's `params`"),
             "the message must name the control and both places it can come from: {message}"
         );
         assert!(
