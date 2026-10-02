@@ -257,7 +257,8 @@ const MAX_ENCODING_COMPRESSION_RATIO: usize = 16;
 /// [`QueryResultsCacheProvider::tables_changed_since`], which documents why
 /// the comparison is deliberately conservative. It must be the start of the
 /// read, not the moment the result is stored: a change landing in between has
-/// to disqualify the entry too.
+/// to disqualify the entry *as fresh* too. Whether such a result is stored at
+/// all is [`QueryResultsCacheProvider::store_raw_key`]'s decision.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
@@ -340,12 +341,12 @@ pub fn to_cached_record_batch_stream(
                 tracing::debug!(
                     "The query stream yielded an error, skipping cache storage"
                 );
-            } else if cache_provider.tables_changed_since(&input_tables, read_started_at) {
+            } else if !cache_provider.is_servable(&input_tables, read_started_at) {
                 // Not the guard — correctness comes from the check every cache
-                // hit performs. This only avoids encoding and storing a result
-                // already known to be unservable.
+                // hit performs. This only skips encoding a result no lookup
+                // could serve; see `QueryResultsCacheProvider::store_raw_key`.
                 tracing::debug!(
-                    "A table read by this query changed while it ran, skipping cache storage"
+                    "A table read by this query changed while it ran and no stale-while-revalidate window could serve the result, skipping cache storage"
                 );
             } else if !batches_cacheable(&records) {
                 tracing::debug!(
@@ -395,7 +396,7 @@ pub fn to_cached_record_batch_stream(
                                 "Encoded query result still exceeds cache max size, skipping"
                             );
                         } else if let Err(e) = cache_provider
-                            .put_raw_key_with_weight(&raw_cache_key, cached_result, actual_size)
+                            .store_raw_key(&raw_cache_key, cached_result, Some(actual_size))
                             .await
                         {
                             tracing::error!("Failed to cache query results: {e}");
@@ -854,13 +855,28 @@ pub(crate) mod tests {
     }
 
     /// Drains `sql`-less canned batches through the caching wrapper and reports
-    /// whether the result was stored.
+    /// whether the result was stored and is served fresh.
     async fn stored_after_drain(
         provider: &Arc<QueryResultsCacheProvider>,
         key: RawCacheKey,
         input_tables: HashSet<TableReference>,
         read_started_at: std::time::Instant,
     ) -> bool {
+        drain_through_cache(provider, key, input_tables, read_started_at).await;
+        provider
+            .get_raw_key(&key)
+            .await
+            .expect("cache access should succeed")
+            .is_some()
+    }
+
+    /// Drains `sql`-less canned batches through the caching wrapper.
+    async fn drain_through_cache(
+        provider: &Arc<QueryResultsCacheProvider>,
+        key: RawCacheKey,
+        input_tables: HashSet<TableReference>,
+        read_started_at: std::time::Instant,
+    ) {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::new_empty(Arc::clone(&schema));
         let source = RecordBatchStreamAdapter::new(
@@ -879,11 +895,18 @@ pub(crate) mod tests {
         while wrapped.next().await.is_some() {}
 
         provider.run_pending_tasks().await;
-        provider
-            .get_raw_key(&key)
-            .await
-            .expect("cache access should succeed")
-            .is_some()
+    }
+
+    fn test_cache_provider_with_stale_window(
+        stale_while_revalidate_ttl: &str,
+    ) -> Arc<QueryResultsCacheProvider> {
+        Arc::new(
+            QueryResultsCacheProvider::try_new(
+                &crate::tests::config_with_stale_window(stale_while_revalidate_ttl),
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        )
     }
 
     fn test_cache_provider() -> Arc<QueryResultsCacheProvider> {
@@ -923,6 +946,74 @@ pub(crate) mod tests {
             .await,
             "a result whose table was invalidated mid-read must not be cached"
         );
+    }
+
+    /// Regression test for #14686: with a stale window, a result whose table
+    /// changed during its read is stored, to be served stale and revalidated.
+    /// Dropping it left a table that changes more often than the query runs
+    /// with nothing cached once its previous entry expired.
+    #[tokio::test]
+    async fn to_cached_record_batch_stream_keeps_result_invalidated_during_read_inside_a_stale_window()
+     {
+        let provider = test_cache_provider_with_stale_window("5m");
+        let key = RawCacheKey::new(5);
+        let read_started_at = std::time::Instant::now();
+
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+
+        drain_through_cache(
+            &provider,
+            key,
+            HashSet::from([TableReference::bare("customer")]),
+            read_started_at,
+        )
+        .await;
+
+        let (entry, validity) = provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("the result must be stored inside the stale window");
+        assert_eq!(validity, crate::EntryValidity::StaleWhileRevalidate);
+        assert_eq!(entry.read_started_at, read_started_at);
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "a result overtaken by a change must never be served as fresh"
+        );
+    }
+
+    /// A query that began before a change and drains after a later query must
+    /// not replace that later query's result.
+    #[tokio::test]
+    async fn to_cached_record_batch_stream_does_not_replace_a_newer_result_with_an_older_one() {
+        let provider = test_cache_provider_with_stale_window("5m");
+        let key = RawCacheKey::new(6);
+        let customer = HashSet::from([TableReference::bare("customer")]);
+
+        let older_read = std::time::Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        crate::tests::tick().await;
+        let newer_read = std::time::Instant::now();
+
+        drain_through_cache(&provider, key, customer.clone(), newer_read).await;
+        drain_through_cache(&provider, key, customer, older_read).await;
+
+        let entry = provider
+            .get_raw_key(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("the newer result must still be served fresh");
+        assert_eq!(entry.read_started_at, newer_read);
     }
 
     /// The qualification of the invalidated reference must not matter: `customer`

@@ -89,6 +89,11 @@ pub trait CacheBackend<V: Sizeable>: Send + Sync {
     ///
     /// Implementations must not restart the entry's remaining TTL when the new
     /// value asks to keep it ([`crate::Sizeable::keep_remaining_ttl`]).
+    ///
+    /// `should_replace` must only be called when an entry is resident under
+    /// `key`; an empty key declines without calling it.
+    /// `QueryResultsCacheProvider::store_raw_key` relies on this to tell an
+    /// empty key from a resident it declined to replace.
     async fn replace_if(
         &self,
         key: u64,

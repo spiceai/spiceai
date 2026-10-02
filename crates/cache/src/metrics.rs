@@ -317,7 +317,11 @@ pub enum RevalidationOutcome {
     /// The query ran but its result stream failed part-way through.
     CollectFailed,
     /// A table the revalidation read was invalidated while it ran, so its
-    /// result may predate that invalidation and was discarded.
+    /// result may predate that invalidation, and it was discarded: no
+    /// stale-while-revalidate window could serve it (none is configured, or it
+    /// had closed), or a query that began later had already stored its own
+    /// result under the key. With a window open, such a result is otherwise
+    /// stored to be served stale, and counts as [`Self::Stored`].
     InvalidatedMidFlight,
     /// The result carried transient HTTP error responses (5xx/429), so the
     /// previous entry was preserved rather than overwritten with them.
