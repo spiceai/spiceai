@@ -487,16 +487,18 @@ impl InsertStrategy for CayennePartitionedInsertStrategy {
                     &context.partition_by,
                     Arc::clone(&context.schema),
                 )?;
-                let sink = Arc::new(append::CayennePartitionedAppendSink::new(
-                    Arc::clone(&self.catalog),
-                    Arc::clone(&self.coordinator_lock),
-                    Arc::clone(&context.creator),
-                    Arc::clone(&context.partitions),
-                    Arc::clone(&context.schema),
-                    physical_exprs,
-                    self.table_root.clone(),
-                    context.user_statement,
-                ));
+                let sink = Arc::new(
+                    append::CayennePartitionedAppendSink::new(
+                        Arc::clone(&self.catalog),
+                        Arc::clone(&self.coordinator_lock),
+                        Arc::clone(&context.creator),
+                        Arc::clone(&context.partitions),
+                        Arc::clone(&context.schema),
+                        physical_exprs,
+                        self.table_root.clone(),
+                    )
+                    .with_user_statement(context.user_statement),
+                );
                 Ok(Arc::new(DataSinkExec::new(input, sink, None)))
             }
         }

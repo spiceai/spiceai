@@ -677,7 +677,6 @@ impl CayennePartitionedAppendSink {
         schema: SchemaRef,
         physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
         table_root: PathBuf,
-        user_statement: bool,
     ) -> Self {
         Self {
             catalog,
@@ -687,8 +686,15 @@ impl CayennePartitionedAppendSink {
             schema,
             physical_exprs,
             table_root,
-            user_statement,
+            user_statement: false,
         }
+    }
+
+    /// Mark the append as a user's statement, which keeps statement semantics
+    /// for the keys it repeats instead of resolving them.
+    pub(super) fn with_user_statement(mut self, user_statement: bool) -> Self {
+        self.user_statement = user_statement;
+        self
     }
 
     async fn classify_append_snapshot_pointers(

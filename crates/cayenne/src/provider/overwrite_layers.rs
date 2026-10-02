@@ -301,10 +301,14 @@ impl LayerSplitter {
                     position: 0,
                 };
                 if self.survivor == Survivor::Earliest {
-                    if keys.entries.contains_key(&digest) {
-                        keep.get_or_insert_with(|| vec![true; resolved.digests.len()])[row] = false;
-                    } else {
-                        keys.entries.insert(digest, latest);
+                    match keys.entries.entry(digest) {
+                        std::collections::hash_map::Entry::Occupied(_) => {
+                            keep.get_or_insert_with(|| vec![true; resolved.digests.len()])[row] =
+                                false;
+                        }
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(latest);
+                        }
                     }
                     continue;
                 }
@@ -590,7 +594,7 @@ impl CollapseWindow {
         self
     }
 
-    fn push(&mut self, resolved: ResolvedBatch) -> super::Result<()> {
+    fn push(&mut self, resolved: ResolvedBatch) {
         let index = self.batches.len();
         for (row, &digest) in resolved.digests.iter().enumerate() {
             if self.keep_first {
@@ -609,7 +613,6 @@ impl CollapseWindow {
         if self.reservation.try_resize(self.held_bytes()).is_err() {
             self.refused = true;
         }
-        Ok(())
     }
 
     /// Everything the window holds: its rows and the map of their keys.
@@ -909,7 +912,7 @@ impl Stream for LayerStream {
                         match state.window.as_mut() {
                             None => state.ready.push_back(resolved),
                             Some(window) => {
-                                window.push(resolved)?;
+                                window.push(resolved);
                                 if window.is_full() {
                                     state.ready = window.drain()?;
                                 }
@@ -991,7 +994,7 @@ impl Stream for CollapseStream {
             let step: super::Result<()> = match this.input.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
                     this.resolver.resolve_batch(&batch).and_then(|resolved| {
-                        this.window.push(resolved)?;
+                        this.window.push(resolved);
                         if this.window.is_full() {
                             this.ready = this.window.drain()?;
                         }
@@ -1316,9 +1319,7 @@ mod tests {
                 .collect();
             next_id += rows;
             let rows: Vec<(i64, &str)> = ids.iter().map(|(id, v)| (*id, v.as_str())).collect();
-            window
-                .push(resolver.resolve_batch(&batch(&rows)).expect("resolve"))
-                .expect("push");
+            window.push(resolver.resolve_batch(&batch(&rows)).expect("resolve"));
         };
         while !window.is_full() {
             push(&mut window, 8192);
