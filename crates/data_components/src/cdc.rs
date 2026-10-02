@@ -120,7 +120,7 @@ static SHUTDOWN_DRAIN: ShutdownDrain = ShutdownDrain {
 /// Holds the process's shutdown open for a CDC source that records state on its
 /// way out.
 ///
-/// The shared Postgres and MySQL pumps persist how far each of their
+/// The shared `PostgreSQL` and `MySQL` pumps persist how far each of their
 /// accelerations has been advanced when they stop: a source's acknowledgement
 /// moves on every keepalive, while the recorded position follows on a timer,
 /// and the stop is what reconciles the two. [`begin_shutdown`] alone does not
