@@ -162,8 +162,11 @@ fn kind(data_type: &DataType) -> Option<Kind> {
         DataType::Boolean => Kind::Boolean,
         DataType::Date32 => Kind::Date32,
         DataType::Date64 => Kind::Date64,
-        DataType::Time32(unit) => Kind::Time32(*unit),
-        DataType::Time64(unit) => Kind::Time64(*unit),
+        // The units Arrow defines for each: it builds no array of any other.
+        DataType::Time32(unit @ (TimeUnit::Second | TimeUnit::Millisecond)) => Kind::Time32(*unit),
+        DataType::Time64(unit @ (TimeUnit::Microsecond | TimeUnit::Nanosecond)) => {
+            Kind::Time64(*unit)
+        }
         DataType::Timestamp(unit, _) => Kind::Timestamp(*unit),
         DataType::Duration(unit) => Kind::Duration(*unit),
         DataType::Decimal128(_, _) => Kind::Decimal128,

@@ -16,10 +16,15 @@ limitations under the License.
 
 //! Machine-checked prefix-freedom of the compound key encoding.
 //!
-//! An index lookup compares encoded keys, so it is exact only if two distinct
-//! key tuples never encode to the same bytes. A compound key is its columns'
-//! encodings concatenated, and a concatenation of prefix-free encodings is
-//! injective: that is the property proved here. A variable-length value is escaped
+//! Two distinct key tuples must never encode to the same bytes. A compound key
+//! is its columns' encodings concatenated, and a concatenation of prefix-free
+//! encodings is injective: that is the property proved here. It is a property
+//! of the encoding, not of a lookup. An index stores a 64-bit word per key:
+//! the key's own bytes when its fields are fixed-width and fit 8 bytes (see
+//! `word_proof`), and otherwise a hash of these encoded bytes, which two
+//! distinct keys can share. A lookup then returns both keys' rows as
+//! candidates and the query's own filter drops the other's; injectivity makes
+//! the hash the only place two keys can collide. A variable-length value is escaped
 //! (`00` → `01 01`, `01` → `01 02`) and terminated by `00`; a nullable column
 //! is `00` for NULL or `01` followed by the value; a key is its columns'
 //! encodings concatenated. The lemmas below prove, for every input, that
