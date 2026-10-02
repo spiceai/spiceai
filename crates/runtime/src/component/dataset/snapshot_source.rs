@@ -371,7 +371,7 @@ impl SnapshotSource {
         }) {
             return conflict(
                 "params",
-                "so Spice chooses where it keeps its local copy of the snapshot, under `.spice/data`",
+                "so Spice keeps its local copy of the snapshot in the Spice data directory (`.spice/data`, or `SPICE_DATA_DIR` when set)",
                 format!("Remove `acceleration.params.{param}`"),
             );
         }
@@ -393,8 +393,8 @@ const LOCAL_COPY_PARAMS: &[&str] = &[
 ];
 
 /// Where a snapshot dataset keeps its local copy, for the engines that keep one file
-/// per dataset: under `.spice/data`, in a file named for the dataset and the location it
-/// reads.
+/// per dataset: under the Spice data directory, in a file named for the dataset and the
+/// location it reads.
 ///
 /// Scoping the file to the location keeps a dataset pointed at another location from
 /// reopening the previous location's copy, which `DuckDB` would otherwise serve from the

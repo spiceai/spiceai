@@ -64,17 +64,29 @@ pub mod swappable;
 pub mod types;
 pub mod upsert_dedup;
 
-/// Base directory Spice stores accelerator data under (`<cwd>/.spice/data`).
+/// Environment variable that sets [`spice_data_base_path`].
+const SPICE_DATA_DIR_ENV: &str = "SPICE_DATA_DIR";
+
+/// Base directory Spice stores accelerator data under: `$SPICE_DATA_DIR` when set and
+/// non-empty (a relative value resolves against the working directory), otherwise
+/// `<cwd>/.spice/data`.
 ///
 /// Lives here so an engine below `runtime` can resolve it without an upward
 /// dependency; `runtime` re-exports it.
 #[must_use]
 pub fn spice_data_base_path() -> String {
+    resolve_data_base_path(std::env::var_os(SPICE_DATA_DIR_ENV))
+}
+
+fn resolve_data_base_path(data_dir: Option<std::ffi::OsString>) -> String {
+    let data_dir = data_dir
+        .filter(|dir| !dir.is_empty())
+        .map_or_else(|| PathBuf::from(".spice/data"), PathBuf::from);
     let Ok(working_dir) = std::env::current_dir() else {
-        return ".".to_string();
+        return data_dir.to_str().unwrap_or(".").to_string();
     };
 
-    let base_folder = working_dir.join(".spice/data");
+    let base_folder = working_dir.join(data_dir);
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
@@ -1323,7 +1335,7 @@ mod tests {
     use super::{
         AcceleratorExternalTableBuilder, AcceleratorRuntimeConfig,
         cayenne_pk_conflict_detection_none, format_engine_list, get_primary_keys_from_constraints,
-        upsert_dedup::extract_upsert_options,
+        resolve_data_base_path, upsert_dedup::extract_upsert_options,
     };
     use ::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::{Constraint, Constraints, TableReference};
@@ -1587,5 +1599,21 @@ mod tests {
                 "default_for({engine}) must produce the {engine} variant"
             );
         }
+    }
+
+    #[test]
+    fn data_base_path_honours_spice_data_dir() {
+        let cwd = std::env::current_dir().expect("working directory");
+        let resolve = |dir: Option<&str>| resolve_data_base_path(dir.map(Into::into));
+
+        let default = cwd.join(".spice/data").to_string_lossy().into_owned();
+        assert_eq!(resolve(None), default);
+        assert_eq!(resolve(Some("")), default, "empty is the same as unset");
+        assert_eq!(resolve(Some("/data")), "/data");
+        assert_eq!(
+            resolve(Some("data")),
+            cwd.join("data").to_string_lossy().into_owned(),
+            "a relative value resolves against the working directory"
+        );
     }
 }
