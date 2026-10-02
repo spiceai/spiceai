@@ -27,6 +27,7 @@ limitations under the License.
 #![expect(clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,7 +139,7 @@ async fn load_with_access(
         .build();
     let rt = Runtime::builder().with_app(app).build().await;
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_secs(120)) => panic!("{label}: load timed out"),
+        () = tokio::time::sleep(Duration::from_mins(2)) => panic!("{label}: load timed out"),
         () = Arc::new(rt.clone()).load_components() => {}
     }
     let ready = runtime_ready_check_with_timeout_err(&rt, Duration::from_secs(15))
@@ -206,7 +207,7 @@ fn cases() -> Vec<Case> {
 fn repeated_across_batches() -> String {
     let mut csv = String::from("id,region,ts,v\n");
     for id in 0..8_192 {
-        csv.push_str(&format!("{id},us,2026-01-01T00:00:00,first\n"));
+        writeln!(csv, "{id},us,2026-01-01T00:00:00,first").expect("write to a String");
     }
     csv.push_str("0,us,2026-01-01T00:00:00,last\n");
     csv
@@ -400,7 +401,7 @@ async fn a_localpod_parents_refresh_resolves_repeated_keys() {
                 .build();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(120)) => panic!("load timed out"),
+                () = tokio::time::sleep(Duration::from_mins(2)) => panic!("load timed out"),
                 () = Arc::clone(&rt).load_components() => {}
             }
             runtime_ready_check_with_timeout_err(&rt, Duration::from_secs(30))
@@ -412,7 +413,7 @@ async fn a_localpod_parents_refresh_resolves_repeated_keys() {
             crate::acceleration::trigger_refresh(&rt, "t")
                 .await
                 .expect("refresh");
-            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let deadline = std::time::Instant::now() + Duration::from_mins(1);
             loop {
                 let values = value_of(&rt, 0).await;
                 if values.contains(&"last".to_string()) {
