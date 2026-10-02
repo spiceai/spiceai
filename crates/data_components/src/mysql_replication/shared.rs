@@ -919,7 +919,10 @@ async fn attach_member(
 
     if !source.pump_started.swap(true, Ordering::AcqRel) {
         let pump_source = Arc::clone(source);
-        tokio::spawn(run_pump(pump_source));
+        tokio::spawn(run_pump(
+            pump_source,
+            crate::cdc::ShutdownDrainGuard::hold(),
+        ));
     } else if !snapshotting {
         // A resuming/rejoining member needs the pump to reconnect so it
         // repositions to the (possibly lower) new min and re-runs promotion. A
@@ -1442,12 +1445,12 @@ async fn detect_source_gtid(params: &ReplicationParams) -> bool {
     reason = "single state machine over the multiplexed binlog event loop; mirrors the \
               per-dataset binlog_change_stream and postgres run_pump"
 )]
-async fn run_pump(source: Arc<SharedSource>) {
-    let shutdown_epoch = crate::cdc::shutdown_epoch();
-    // Held until this returns — on a runtime shutdown, after the final
-    // `persist_all` below. The runtime waits for it before closing the
-    // accelerations those positions are written into.
-    let _shutdown_drain = crate::cdc::ShutdownDrainGuard::hold();
+async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::ShutdownDrainGuard) {
+    // Captured when the pump was spawned. The guard is held until this returns
+    // — on a runtime shutdown, after the final `persist_all` below — and the
+    // runtime waits for it before closing the accelerations those positions
+    // are written into.
+    let shutdown_epoch = shutdown_drain.epoch();
     let params = source.params.clone();
     let connection = source.key.label();
     let mut backoff = super::resilience::StreamBackoff::default_for_stream();

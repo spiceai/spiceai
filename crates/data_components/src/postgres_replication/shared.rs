@@ -2554,7 +2554,10 @@ async fn attach_member(
 
     if !source.pump_started.swap(true, Ordering::AcqRel) {
         let pump_source = Arc::clone(source);
-        tokio::spawn(run_pump(pump_source));
+        tokio::spawn(run_pump(
+            pump_source,
+            crate::cdc::ShutdownDrainGuard::hold(),
+        ));
         tokio::spawn(run_applied_lsn_writer(
             Arc::clone(source),
             params.watermark_flush_interval,
@@ -3283,15 +3286,14 @@ enum Acquired {
     RecvError(pgwire_replication::PgWireError),
 }
 
-async fn run_pump(source: Arc<SharedSource>) {
-    // Captured at pump start: the pump stops when the epoch advances (this
-    // Runtime began shutting down); a pump started by a later Runtime in the
-    // same process captures the newer epoch and is unaffected.
-    let shutdown_epoch = crate::cdc::shutdown_epoch();
-    // Held until this returns — on a runtime shutdown, after the final position
-    // write below. The runtime waits for it before closing the accelerations that
-    // write goes into.
-    let _shutdown_drain = crate::cdc::ShutdownDrainGuard::hold();
+async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::ShutdownDrainGuard) {
+    // Captured when the pump was spawned: the pump stops when the epoch advances
+    // (this Runtime began shutting down); a pump started by a later Runtime in
+    // the same process captures the newer epoch and is unaffected. The guard is
+    // held until this returns — on a runtime shutdown, after the final position
+    // write below — and the runtime waits for it before closing the
+    // accelerations that write goes into.
+    let shutdown_epoch = shutdown_drain.epoch();
     let params = source.params.clone();
     let slot_name = source.key.slot_name.clone();
     let publication_name = params.publication_name.clone();

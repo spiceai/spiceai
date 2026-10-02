@@ -15,11 +15,9 @@ limitations under the License.
 */
 
 use std::{
+    collections::BTreeMap,
     fmt::Display,
-    sync::{
-        Arc, LazyLock, OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, LazyLock, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -107,15 +105,15 @@ pub async fn until_shutdown<F: Future<Output = ()>>(epoch: u64, wait: F) {
     }
 }
 
-/// How many [`ShutdownDrainGuard`]s are alive, and a wakeup for when one is
-/// dropped.
+/// The [`ShutdownDrainGuard`]s alive, counted by the shutdown epoch each
+/// holder captured, and a wakeup for when one is dropped.
 struct ShutdownDrain {
-    held: AtomicUsize,
+    held: Mutex<BTreeMap<u64, usize>>,
     released: tokio::sync::Notify,
 }
 
 static SHUTDOWN_DRAIN: ShutdownDrain = ShutdownDrain {
-    held: AtomicUsize::new(0),
+    held: Mutex::new(BTreeMap::new()),
     released: tokio::sync::Notify::const_new(),
 };
 
@@ -132,31 +130,67 @@ static SHUTDOWN_DRAIN: ShutdownDrain = ShutdownDrain {
 /// reads that as changes acknowledged but never applied and rebuilds the
 /// acceleration from the source (#14523). A pump holds one of these for its
 /// whole life, and [`drain_shutdown`] waits until every guard has been dropped.
+///
+/// The guard captures the shutdown epoch when it is taken, and that is the
+/// epoch its holder stops on: a source started after a shutdown was signalled
+/// captures the newer epoch, is not stopped by that shutdown, and is not waited
+/// for by it either.
 #[must_use = "the drain is held only while the guard is alive"]
-pub struct ShutdownDrainGuard(());
+pub struct ShutdownDrainGuard {
+    epoch: u64,
+}
 
 impl ShutdownDrainGuard {
-    /// Hold the shutdown open until the guard is dropped.
+    /// Hold the shutdown open until the guard is dropped. Take it before the
+    /// source's task is spawned, so a source the runtime has started but not
+    /// yet polled is already counted.
     pub fn hold() -> Self {
-        SHUTDOWN_DRAIN.held.fetch_add(1, Ordering::AcqRel);
-        Self(())
+        let epoch = shutdown_epoch();
+        *SHUTDOWN_DRAIN.held.lock().entry(epoch).or_insert(0) += 1;
+        Self { epoch }
+    }
+
+    /// The shutdown epoch the holder captured, for it to stop on.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 
 impl Drop for ShutdownDrainGuard {
     fn drop(&mut self) {
-        SHUTDOWN_DRAIN.held.fetch_sub(1, Ordering::AcqRel);
+        {
+            let mut held = SHUTDOWN_DRAIN.held.lock();
+            if let Some(count) = held.get_mut(&self.epoch) {
+                *count -= 1;
+                if *count == 0 {
+                    held.remove(&self.epoch);
+                }
+            }
+        }
         SHUTDOWN_DRAIN.released.notify_waiters();
     }
 }
 
-/// Wait until every [`ShutdownDrainGuard`] in the process has been dropped, or
-/// `timeout` has elapsed.
+/// How many guards are held by sources a shutdown has been signalled to: those
+/// whose captured epoch is older than the current one.
+fn signalled_guards_held() -> usize {
+    let current = shutdown_epoch();
+    SHUTDOWN_DRAIN
+        .held
+        .lock()
+        .range(..current)
+        .map(|(_, count)| count)
+        .sum()
+}
+
+/// Wait until every [`ShutdownDrainGuard`] held by a source the shutdown was
+/// signalled to has been dropped, or `timeout` has elapsed.
 ///
-/// Returns how many guards were still held when it gave up: `0` means every
-/// source has finished recording, and the accelerations can be closed. Call it
-/// after [`begin_shutdown`]; before it, a healthy source holds its guard
-/// indefinitely and this only returns at the timeout.
+/// Returns how many such guards were still held when it gave up: `0` means every
+/// signalled source has finished recording, and the accelerations can be
+/// closed. Call it after [`begin_shutdown`]; a guard taken since then belongs
+/// to a source that shutdown did not stop, and is not waited for.
 pub async fn drain_shutdown(timeout: Duration) -> usize {
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
@@ -167,12 +201,12 @@ pub async fn drain_shutdown(timeout: Duration) -> usize {
         let released = SHUTDOWN_DRAIN.released.notified();
         tokio::pin!(released);
         released.as_mut().enable();
-        if SHUTDOWN_DRAIN.held.load(Ordering::Acquire) == 0 {
+        if signalled_guards_held() == 0 {
             return 0;
         }
         tokio::select! {
             () = &mut released => {}
-            () = &mut deadline => return SHUTDOWN_DRAIN.held.load(Ordering::Acquire),
+            () = &mut deadline => return signalled_guards_held(),
         }
     }
 }
@@ -2525,64 +2559,85 @@ mod deferred_tests {
 mod shutdown_drain_tests {
     use super::*;
 
-    /// One test rather than three: the guard count and the epoch are process-wide,
-    /// so the phases must run in sequence, not in parallel with each other.
+    /// One test rather than several: the guard count and the epoch are
+    /// process-wide, so the phases must run in sequence, not in parallel with
+    /// each other.
     #[tokio::test]
-    async fn drain_waits_for_every_held_guard_and_reports_what_it_gave_up_on() {
+    async fn drain_waits_for_the_signalled_guards_and_reports_what_it_gave_up_on() {
         assert_eq!(
             drain_shutdown(Duration::from_secs(1)).await,
             0,
             "nothing held: returns at once"
         );
 
+        let epoch = shutdown_epoch();
         let first = ShutdownDrainGuard::hold();
         let second = ShutdownDrainGuard::hold();
         assert_eq!(
+            first.epoch(),
+            epoch,
+            "a guard captures the epoch it is taken at"
+        );
+        assert_eq!(
+            drain_shutdown(Duration::from_millis(50)).await,
+            0,
+            "no shutdown has been signalled to the holders, so there is nothing to wait for"
+        );
+
+        // Signal: a source that was waiting for it wakes, and the two guards
+        // taken before it now hold the drain.
+        let waiter = tokio::spawn(shutdown_signalled(epoch));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "nothing has been signalled yet");
+        begin_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("signalled promptly")
+            .expect("waiter task");
+        assert_eq!(
             drain_shutdown(Duration::from_millis(50)).await,
             2,
-            "gave up with both guards held"
+            "gave up with both signalled guards held"
         );
+
+        // A source started after the signal captures the new epoch: it is not
+        // stopped by that shutdown, and not waited for by it.
+        let later = shutdown_epoch();
+        assert!(later > epoch, "the epoch advanced");
+        let unaffected = ShutdownDrainGuard::hold();
+        assert_eq!(unaffected.epoch(), later);
+        let later_waiter = tokio::spawn(shutdown_signalled(later));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!later_waiter.is_finished(), "a later source is unaffected");
+        later_waiter.abort();
+        assert_eq!(
+            drain_shutdown(Duration::from_millis(50)).await,
+            2,
+            "a guard taken after the signal is not counted"
+        );
+
         drop(first);
         assert_eq!(
             drain_shutdown(Duration::from_millis(50)).await,
             1,
-            "gave up with one guard held"
+            "gave up with one signalled guard held"
         );
 
         let drained = tokio::spawn(drain_shutdown(Duration::from_secs(10)));
         // Time is what is under test here: the drain must still be waiting after a
         // delay long enough for it to have returned if it were not.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!drained.is_finished(), "must wait while a guard is held");
+        assert!(
+            !drained.is_finished(),
+            "must wait while a signalled guard is held"
+        );
         drop(second);
         assert_eq!(
             drained.await.expect("drain task"),
             0,
-            "released by the last guard's drop"
+            "released by the last signalled guard's drop"
         );
-    }
-
-    #[tokio::test]
-    async fn shutdown_is_signalled_to_a_waiting_source_and_not_to_a_later_one() {
-        let epoch = shutdown_epoch();
-        let waiter = tokio::spawn(shutdown_signalled(epoch));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!waiter.is_finished(), "nothing has been signalled yet");
-
-        begin_shutdown();
-        tokio::time::timeout(Duration::from_secs(5), waiter)
-            .await
-            .expect("signalled promptly")
-            .expect("waiter task");
-
-        // A source started after that shutdown captures the new epoch and is not
-        // stopped by it.
-        let later = shutdown_epoch();
-        assert!(later > epoch, "the epoch advanced");
-        let later_waiter = tokio::spawn(shutdown_signalled(later));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!later_waiter.is_finished(), "a later source is unaffected");
-        later_waiter.abort();
+        drop(unaffected);
 
         // A delay races the signal, not the other way round.
         let started = std::time::Instant::now();
