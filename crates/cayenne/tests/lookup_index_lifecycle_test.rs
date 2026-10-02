@@ -657,6 +657,7 @@ async fn dropping_an_indexed_table_releases_its_memory() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn appends_and_compactions_keep_the_index_current() {
     const ROWS: usize = 20_000;
+    const ROUNDS: usize = 6;
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
@@ -679,6 +680,18 @@ async fn appends_and_compactions_keep_the_index_current() {
         c.selected > 0
     })
     .await;
+    // The table's current data files, indexed or not.
+    let file_count = |table: &Arc<CayenneTableProvider>| {
+        let table = Arc::clone(table);
+        async move {
+            let verification = table
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            verification.files + verification.uncovered_files
+        }
+    };
+    let base_files = file_count(&table).await;
 
     let check = |label: &str, before: &LookupIndexCounters, after: &LookupIndexCounters| {
         assert_eq!(
@@ -691,7 +704,7 @@ async fn appends_and_compactions_keep_the_index_current() {
             "the literal and join lookups right after {label} were not both answered from the index: {before:?} -> {after:?}"
         );
     };
-    for round in 1..=6 {
+    for round in 1..=i64::try_from(ROUNDS).expect("fits") {
         let appended = rows_i64 * round;
         insert(
             &table,
@@ -706,8 +719,9 @@ async fn appends_and_compactions_keep_the_index_current() {
         check(&format!("append {round}"), &before, &counters(&table));
     }
 
-    // A compaction replaces the appended files; one may already be running
-    // after the last append.
+    // A compaction replaces the appended files. One may already be running
+    // after the last append, or have finished: each append wrote at least one
+    // file, so fewer files than the appends left means one already ran.
     let snapshot = |table: &Arc<CayenneTableProvider>| {
         let table = Arc::clone(table);
         async move {
@@ -725,6 +739,7 @@ async fn appends_and_compactions_keep_the_index_current() {
         .await
         .expect("compaction")
         && snapshot(&table).await == appended_snapshot
+        && file_count(&table).await >= base_files + ROUNDS
     {
         assert!(
             Instant::now() < deadline,
