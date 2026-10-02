@@ -20,6 +20,10 @@ limitations under the License.
 //! places: the userinfo (`https://user:password@host/…`) and the query string
 //! (`?api_key=…`). Anything that prints such a URL where a user can read it —
 //! an `EXPLAIN` plan, a log line, an error — goes through here first.
+//!
+//! A secret written into a path segment (`/bot123456:TOKEN/getUpdates`) has no
+//! structural marker and is kept: the path is what says which endpoint is
+//! read, and the operator chose to put the token there.
 
 use std::borrow::Cow;
 
@@ -51,20 +55,30 @@ pub fn url_without_secrets(url: &Url) -> Url {
 /// users already match on does not change for a credential-free `from`.
 #[must_use]
 pub fn redact_url_str(value: &str) -> Cow<'_, str> {
-    let Ok(url) = Url::parse(value) else {
-        return Cow::Borrowed(value);
-    };
-    if url.host_str().is_none() {
-        return Cow::Borrowed(value);
+    if let Some(redacted) = redacted_absolute_url(value) {
+        return Cow::Owned(redacted);
     }
+    // A connector prefix in front of the URL (`graphql:https://…`,
+    // `git:https://…`) makes the whole value parse as a URL with no host, so
+    // the URL behind the prefix is redacted on its own.
+    if let Some((prefix, rest)) = value.split_once(':')
+        && let Some(redacted) = redacted_absolute_url(rest)
+    {
+        return Cow::Owned(format!("{prefix}:{redacted}"));
+    }
+    Cow::Borrowed(value)
+}
+
+/// `Some` when `value` is an absolute URL with a host that carries a part to
+/// strip, holding the redacted rendering; `None` when there is nothing to do.
+fn redacted_absolute_url(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    url.host_str()?;
     let has_part_to_strip = !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some();
-    if !has_part_to_strip {
-        return Cow::Borrowed(value);
-    }
-    Cow::Owned(url_without_secrets(&url).to_string())
+    has_part_to_strip.then(|| url_without_secrets(&url).to_string())
 }
 
 #[cfg(test)]
@@ -138,7 +152,9 @@ mod tests {
             "https://api.example.com",
             "https://httpbin.org/json",
             "s3://spiceai-demo-datasets/taxi_trips/2024/",
+            "abfs://data/tpcds/catalog_sales/",
             "http://127.0.0.1:18997/api/data",
+            "git:https://github.com/spiceai/spiceai.git",
         ] {
             let redacted = redact_url_str(value);
             assert!(
@@ -147,6 +163,37 @@ mod tests {
             );
             assert_eq!(redacted, value);
         }
+    }
+
+    /// A connector prefix in front of the URL is kept, and the URL behind it
+    /// is redacted the same way as a bare one.
+    #[test]
+    fn a_prefixed_url_is_redacted_behind_its_prefix() {
+        assert_eq!(
+            redact_url_str("graphql:https://user:hunter2@api.example.com/graphql?token=SECRET123"),
+            "graphql:https://api.example.com/graphql"
+        );
+        assert_eq!(
+            redact_url_str("git:https://ghp_SECRETTOKEN@github.com/org/repo.git"),
+            "git:https://github.com/org/repo.git"
+        );
+        // A git ref after the path is not userinfo and stays.
+        let value = "git:https://github.com/org/repo.git@main";
+        assert!(matches!(redact_url_str(value), Cow::Borrowed(_)));
+        assert_eq!(redact_url_str(value), value);
+    }
+
+    /// A URL that cannot be a base (`mailto:`) has no userinfo to strip, and
+    /// the setters that refuse it must not turn into a panic or a change.
+    #[test]
+    fn a_url_that_cannot_be_a_base_passes_through() {
+        let value = "mailto:ops@example.com?subject=hi";
+        assert_eq!(
+            url_without_secrets(&parse(value)).as_str(),
+            "mailto:ops@example.com"
+        );
+        assert!(matches!(redact_url_str(value), Cow::Borrowed(_)));
+        assert_eq!(redact_url_str(value), value);
     }
 
     /// `from` values that are not URLs with a host pass through untouched,

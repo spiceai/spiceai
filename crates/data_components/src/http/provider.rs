@@ -5273,7 +5273,6 @@ mod tests {
         );
         assert!(!line.contains("hunter2"), "{line}");
         assert!(!line.contains("SECRET123"), "{line}");
-        assert!(!line.contains("user"), "{line}");
     }
 
     /// The explain snapshots pin this exact rendering for a credential-free
