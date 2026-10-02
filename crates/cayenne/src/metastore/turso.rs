@@ -17,8 +17,9 @@ limitations under the License.
 //! Turso implementation of the metastore backend.
 //!
 //! libSQL/Turso backend (gated on the `turso` feature). Unlike `SQLite`'s single writer,
-//! it uses `BEGIN CONCURRENT` MVCC writers that run in parallel and serialize at commit
-//! time only on actual conflicts, behind a fixed `K = 16` connection pool.
+//! it uses `BEGIN CONCURRENT` MVCC writers that run in parallel and conflict on the
+//! statement that writes a row another transaction has changed, or on `COMMIT`,
+//! behind a fixed `K = 16` connection pool.
 
 use super::{
     ExecuteParams, MetastoreBackend, MetastoreRow, MetastoreTransaction, MetastoreValue,
