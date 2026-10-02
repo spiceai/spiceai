@@ -453,6 +453,11 @@ tonic-health = { version = "0.14" }
 # extension. `tpchgen-arrow` would be the natural fit but wants arrow 59 and this
 # workspace is on the 58 fork; the core crate has no dependencies at all.
 tpchgen = "3.0.0"
+# Its TPC-DS sibling, from the same project, run in its C `dsdgen` compatibility
+# mode: TPC-DS fixtures for the correctness lanes whose process cannot drive
+# DuckDB's `dsdgen` (chDB aborts a process that does) or reach its extension
+# repository. Also dependency-free; pinned exactly while it is an alpha.
+tpcdsgen = "=0.1.0-alpha.1"
 tower = "0.5.2"
 tower-http = { version = "0.6.2", features = ["cors", "limit"] }
 tracing = "0.1.43"
