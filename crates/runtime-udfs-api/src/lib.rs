@@ -496,7 +496,7 @@ mod tests {
     /// of it is refused even by a backend that claims the name as native.
     #[test]
     fn a_datafusion_cast_builtin_is_denied_whatever_the_backend_carves_out() {
-        let state = SessionContext::new().state();
+        let state = util::session_state::session_context().state();
         let support = FunctionSupportBuilder::new()
             .native(DATAFUSION_CAST_BUILTINS)
             .build();
