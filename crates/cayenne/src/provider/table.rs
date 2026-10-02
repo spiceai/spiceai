@@ -21813,8 +21813,11 @@ impl CayenneTableProvider {
         }
         // Encode the RAM tier before either arm takes `write_lock`, so applies
         // keep flowing while it is written. The drain under the lock below then
-        // only has to catch rows that landed since.
-        if self.is_cdc_memory_mode() && !self.mem_tier.is_empty() {
+        // only has to catch rows that landed since. A caller that hands over
+        // `write_lock` already excludes applies, and a sharded tier's checkpoint
+        // would wait on that same lock, so the drain alone covers it.
+        if held_position_guards.is_none() && self.is_cdc_memory_mode() && !self.mem_tier.is_empty()
+        {
             self.checkpoint_mem_tier().await?;
         }
         let compaction_start = std::time::Instant::now();
@@ -45158,6 +45161,79 @@ mod tests {
             id_value_batch(Arc::clone(&schema), ids, &vec![0; ids.len()])
         })
         .await;
+    }
+
+    /// The small-file compaction hands the rewrite a `write_lock` it already
+    /// holds. With more than one shard a mem-tier checkpoint takes `write_lock`
+    /// itself, so the rewrite must drain the tier without re-acquiring it.
+    #[tokio::test]
+    async fn position_mode_rewrite_with_held_guards_drains_sharded_mem_tier() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "position_rewrite_held_guards_sharded_mem",
+            runtime_env,
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_min_flush_bytes: 0,
+                cdc_mem_tier_shards: 2,
+                deletion_mode: crate::metadata::DeletionMode::Position,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.mem_tier.shard_count() > 1, "premise: sharded tier");
+        assert!(
+            provider.should_capture_positions(),
+            "premise: the rewrite takes its position arm"
+        );
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let ctx = SessionContext::new();
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        for (ids, checkpoint) in [(&[1_i64, 2, 3][..], true), (&[4][..], false)] {
+            let write = provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(
+                        Arc::clone(&schema),
+                        ids,
+                        &vec![0; ids.len()],
+                    )),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("sharded CDC insert");
+            assert!(
+                write.in_memory_epoch().is_some(),
+                "premise: rows land in RAM"
+            );
+            if checkpoint {
+                provider.checkpoint_mem_tier().await.expect("checkpoint");
+                provider
+                    .flush_pending_maintenance()
+                    .await
+                    .expect("flush maintenance");
+            }
+        }
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4]);
+        assert_eq!(provider.mem_tier.total_rows(), 1, "premise: one row in RAM");
+
+        let guards = PositionRewriteGuards {
+            _write: provider.write_lock_arc().lock_owned().await,
+            _visibility: provider.visibility_lock_arc().lock_owned().await,
+        };
+        let committed = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.rewrite_current_snapshot_for_compaction_holding(Some(guards)),
+        )
+        .await
+        .expect("rewrite must not re-acquire the held write_lock")
+        .expect("rewrite");
+        assert!(committed, "the rewrite commits");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4]);
+        assert_eq!(
+            provider.mem_tier.total_rows(),
+            0,
+            "the rewrite drained the tier"
+        );
     }
 
     /// #14450 through the background compaction entry point: a mem-tier
