@@ -3144,6 +3144,8 @@ impl DataFusion {
         if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
             refresh = refresh.append_overlap(append_overlap);
         }
+        refresh =
+            refresh.upsert_dedup_by_time_column(acceleration_settings.upsert_dedup_by_time_column);
         if let Some(caching_ttl) = acceleration_settings.caching_ttl {
             refresh = refresh.caching_ttl(caching_ttl);
         }

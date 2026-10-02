@@ -204,6 +204,9 @@ pub enum OnConflictBehavior {
     Upsert,
     UpsertDedup,
     UpsertDedupByRowId,
+    /// Keep, per primary key, the row with the greatest dataset `time_column`: the newest
+    /// version among the rows a refresh reads and, on append, the version already stored.
+    UpsertDedupByTimeColumn,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -910,6 +913,20 @@ mod tests {
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::UpsertDedup)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_upsert_dedup_by_time_column() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert_dedup_by_time_column
+            ";
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::UpsertDedupByTimeColumn)
         );
     }
 
