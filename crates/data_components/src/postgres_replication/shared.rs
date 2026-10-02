@@ -1792,6 +1792,10 @@ struct SharedSource {
     dead: AtomicBool,
     /// Wakes [`run_applied_lsn_writer`] when a member publishes a position.
     watermark_notify: Arc<Notify>,
+    /// Serializes [`write_published_positions`] between the writer task and the
+    /// pump's final write, so a pass that read an older position cannot land after
+    /// a newer one.
+    position_write_lock: tokio::sync::Mutex<()>,
     /// Positions published by members that have since detached, which the writer's
     /// member sweep can no longer reach. See [`OrphanedPosition`].
     orphaned_positions: Mutex<Vec<OrphanedPosition>>,
@@ -1844,6 +1848,7 @@ impl SharedSource {
             restart_requested: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             watermark_notify: Arc::new(Notify::new()),
+            position_write_lock: tokio::sync::Mutex::new(()),
             orphaned_positions: Mutex::new(Vec::new()),
             slot_created_fresh: AtomicBool::new(false),
             slot_generation: AtomicU64::new(0),
@@ -3099,10 +3104,14 @@ fn publish_idle_positions(source: &Arc<SharedSource>) {
 }
 
 /// Persist every member whose published position has moved past what is recorded,
-/// plus any left behind by a detached member. Called only from the writer task and
-/// from the pump's shutdown, which never run concurrently: the pump sets `dead`
-/// before its final flush, and the writer exits on seeing it.
+/// plus any left behind by a detached member. Called from the writer task and from
+/// the pump's shutdown. The pump sets `dead` before its final flush and the writer
+/// exits on seeing it, but a writer pass already inside a store write when the pump
+/// stops is still in flight, so every pass holds
+/// [`SharedSource::position_write_lock`]: a pass reads each position only after the
+/// previous pass has landed, and the pump's final write is the last to land.
 async fn write_published_positions(source: &Arc<SharedSource>) {
+    let _serialized = source.position_write_lock.lock().await;
     // An orphan has no member left for the next sweep to rediscover, so a failed
     // write has to be put back or the detached member's last position is lost to a
     // transient sidecar error. Extend rather than assign, so a detach racing this
@@ -7547,6 +7556,104 @@ mod tests {
             t0.num_rows_hint(),
             1,
             "commits above the recorded position are delivered"
+        );
+    }
+
+    /// An [`AppliedLsnStore`] whose first `save` parks until released, so a test can
+    /// hold the background writer mid-write while another write runs.
+    #[derive(Default)]
+    struct GatedLsnStore {
+        stored: ParkingMutex<Option<u64>>,
+        gate_open: AtomicBool,
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl AppliedLsnStore for GatedLsnStore {
+        async fn load(
+            &self,
+        ) -> std::result::Result<
+            crate::postgres_replication::RecordedPosition,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(crate::postgres_replication::RecordedPosition::Absent)
+        }
+
+        async fn save(
+            &self,
+            applied: AppliedLsn,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if !self.gate_open.swap(true, Ordering::AcqRel) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            *self.stored.lock() = Some(applied.lsn);
+            Ok(())
+        }
+
+        async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+    }
+
+    /// The pump's final write at shutdown must not be overtaken by a writer pass
+    /// that captured an older position before it (#14523): the runtime's shutdown
+    /// drain ends when the pump returns, so a stale save landing after it moves the
+    /// recorded position backwards and the next start rebuilds the acceleration.
+    #[tokio::test]
+    async fn final_position_write_is_not_overtaken_by_an_in_flight_writer_pass() {
+        let (source, _probes) = test_source_with_members(0);
+        let store = Arc::new(GatedLsnStore::default());
+        let member_key = key("t0");
+        let (sender, _rx) = member_mailbox(4);
+        lock(&source.members).insert(
+            member_key.clone(),
+            Arc::new(MemberHandle {
+                applied_lsn_store: Arc::clone(&store) as Arc<dyn AppliedLsnStore>,
+                watermark_notify: Arc::new(Notify::new()),
+                dataset_name: "ds0".into(),
+                schema: tiny_schema(),
+                primary_keys: vec![],
+                generated_columns: vec![],
+                policy: SchemaEvolutionPolicy::Block,
+                sender,
+                metrics: ReplicationMetricsCollector::new(),
+                ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                write_back_registry: None,
+            }),
+        );
+        source.ack.register(&member_key, false);
+        let slot = source
+            .ack
+            .slot(&member_key)
+            .expect("member slot registered");
+
+        // The background writer captures 100 and parks inside the store.
+        slot.note_pending(100);
+        let writer = tokio::spawn({
+            let source = Arc::clone(&source);
+            async move { write_published_positions(&source).await }
+        });
+        store.entered.notified().await;
+
+        // The pump publishes 200 and runs its final write while the writer is parked.
+        slot.note_pending(200);
+        let final_write = tokio::spawn({
+            let source = Arc::clone(&source);
+            async move { write_published_positions(&source).await }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        store.release.notify_one();
+        writer.await.expect("writer pass completes");
+        final_write.await.expect("final write completes");
+
+        assert_eq!(
+            *store.stored.lock(),
+            Some(200),
+            "the recorded position must be the newest published one, not an older value an in-flight writer pass landed afterwards"
         );
     }
 }
