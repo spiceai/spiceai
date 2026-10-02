@@ -28,6 +28,9 @@ limitations under the License.
 //!   of the id, like the `spiced` freshness bench's `'svc-' || md5(id)`.
 //! - `tenant_service`: `(id % 997 i64, SV{id:032x} utf8)`.
 //! - `id`: the id as one `Int64`, an exact word.
+//! - `bytes`: 16 bytes of a hash of the id as one `Binary`, like a UUID
+//!   stored as `bytea`; about one value in eight holds a byte that needs
+//!   escaping.
 //!
 //! Rows are added in a shuffled order, `RUN_FINISH_FILE_ROWS` (default
 //! 1,192,000) to a file. `RUN_FINISH_ROWS` is a comma-separated list of sizes
@@ -47,7 +50,7 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow_array::{ArrayRef, Int64Array, StringArray};
+use arrow_array::{ArrayRef, BinaryArray, Int64Array, StringArray};
 use arrow_schema::DataType;
 use key_index::tiered::{IndexRun, RunBuilder, TieredIndex};
 use key_index::{KeyEncoder, KeyField};
@@ -67,8 +70,15 @@ fn id_key() -> bool {
     std::env::var("RUN_FINISH_KEY").is_ok_and(|key| key == "id")
 }
 
+/// A single `Binary` key of 16 hashed bytes.
+fn bytes_key() -> bool {
+    std::env::var("RUN_FINISH_KEY").is_ok_and(|key| key == "bytes")
+}
+
 fn encoder() -> KeyEncoder {
-    let fields = if id_key() {
+    let fields = if bytes_key() {
+        vec![KeyField::new(DataType::Binary, false)]
+    } else if id_key() {
         vec![KeyField::new(DataType::Int64, false)]
     } else if tenant_service() {
         vec![
@@ -95,6 +105,19 @@ fn shuffled(n: usize) -> Vec<i64> {
 }
 
 fn columns(chunk: &[i64]) -> Vec<ArrayRef> {
+    if bytes_key() {
+        let values: Vec<[u8; 16]> = chunk
+            .iter()
+            .map(|&id| {
+                let id = id.cast_unsigned();
+                let mut value = [0; 16];
+                value[..8].copy_from_slice(&mix(id).to_le_bytes());
+                value[8..].copy_from_slice(&mix(id ^ 0x5555).to_le_bytes());
+                value
+            })
+            .collect();
+        return vec![Arc::new(BinaryArray::from_iter_values(values.iter()))];
+    }
     if id_key() {
         return vec![Arc::new(Int64Array::from(chunk.to_vec()))];
     }

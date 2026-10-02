@@ -23,32 +23,13 @@ limitations under the License.
 //! multiplies every test's case count (default 1).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array};
-use arrow_schema::DataType;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
+use crate::test_support::{column, encoded, encoder};
 use crate::tiered::{Candidate, IndexRun, RunBuilder, TieredIndex, UNSEEN_GRACE};
-use crate::{KeyEncoder, KeyField, varint};
-
-fn encoder() -> KeyEncoder {
-    KeyEncoder::new(vec![KeyField::new(DataType::Int64, false)]).expect("int64 key")
-}
-
-fn column(keys: &[i64]) -> Vec<ArrayRef> {
-    vec![Arc::new(Int64Array::from(keys.to_vec()))]
-}
-
-fn encoded(key: i64) -> Vec<u8> {
-    let columns = column(&[key]);
-    let encoder = encoder();
-    let bound = encoder.bind(&columns).expect("bind");
-    let mut out = Vec::new();
-    bound.encode_row(0, &mut out);
-    out
-}
+use crate::{KeyEncoder, varint};
 
 /// One operation on an index. Files are named by the order they are created.
 #[derive(Debug, Clone)]

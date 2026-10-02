@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! A compact, order-preserving, prefix-free byte encoding of compound Arrow
-//! keys, readable one row at a time straight from the columns.
+//! keys, written one row at a time straight from the columns.
 //!
 //! A key is the concatenation of its columns' encodings, so the bytes of the
 //! leading columns are a prefix of the key and byte order is the order of the
@@ -49,8 +49,9 @@ limitations under the License.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Date32Type, Date64Type, Decimal128Type, DurationMicrosecondType, DurationMillisecondType,
-    DurationNanosecondType, DurationSecondType, Int8Type, Int16Type, Int32Type, Int64Type,
+    Date32Type, Date64Type, Decimal128Type, Decimal256Type, DurationMicrosecondType,
+    DurationMillisecondType, DurationNanosecondType, DurationSecondType, Int8Type, Int16Type,
+    Int32Type, Int64Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalYearMonthType,
     Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
@@ -63,14 +64,14 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use snafu::ensure;
 
-use crate::source::{KeySource, Run};
-use crate::{ColumnMismatchSnafu, Result, UnsupportedTypeSnafu};
+use crate::escape_proof::escape_value_into;
+use crate::{
+    ColumnCountSnafu, ColumnLengthSnafu, ColumnTypeSnafu, Result, UnexpectedNullSnafu,
+    UnsupportedTypeSnafu,
+};
 
-const NULL_MARK: &[u8] = &[0x00];
-const VALID_MARK: &[u8] = &[0x01];
-const TERMINATOR: &[u8] = &[0x00];
-const ESCAPED_00: &[u8] = &[0x01, 0x01];
-const ESCAPED_01: &[u8] = &[0x01, 0x02];
+const NULL_MARK: u8 = 0x00;
+const VALID_MARK: u8 = 0x01;
 
 /// One column of a compound key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,30 +115,110 @@ enum WordRule {
     Hashed { bits: u32 },
 }
 
-/// The encoded width of a value of `data_type` when it is fixed, for the
-/// types whose encoding is a fixed-width, injective image of the value. Other
-/// types return `None` and are hashed, which is always correct.
-fn fixed_width(data_type: &DataType) -> Option<usize> {
+/// A supported key column type: the Arrow types this encoding accepts, each
+/// named by how its values are read. [`kind`] is the one list of supported
+/// types; everything else matches a `Kind` exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Boolean,
+    Date32,
+    Date64,
+    Time32(TimeUnit),
+    Time64(TimeUnit),
+    Timestamp(TimeUnit),
+    Duration(TimeUnit),
+    Decimal128,
+    Decimal256,
+    Interval(IntervalUnit),
+    Utf8,
+    LargeUtf8,
+    Utf8View,
+    Binary,
+    LargeBinary,
+    BinaryView,
+    FixedSizeBinary(i32),
+}
+
+/// The [`Kind`] of `data_type`, or `None` when it has no order-preserving
+/// encoding here.
+fn kind(data_type: &DataType) -> Option<Kind> {
     Some(match data_type {
-        DataType::Int8 | DataType::UInt8 | DataType::Boolean => 1,
-        DataType::Int16 | DataType::UInt16 => 2,
-        DataType::Int32 | DataType::UInt32 | DataType::Date32 | DataType::Time32(_) => 4,
-        DataType::Int64
-        | DataType::UInt64
-        | DataType::Date64
-        | DataType::Time64(_)
-        | DataType::Timestamp(_, _)
-        | DataType::Duration(_) => 8,
-        DataType::FixedSizeBinary(width) => usize::try_from(*width).ok()?,
+        DataType::Int8 => Kind::Int8,
+        DataType::Int16 => Kind::Int16,
+        DataType::Int32 => Kind::Int32,
+        DataType::Int64 => Kind::Int64,
+        DataType::UInt8 => Kind::UInt8,
+        DataType::UInt16 => Kind::UInt16,
+        DataType::UInt32 => Kind::UInt32,
+        DataType::UInt64 => Kind::UInt64,
+        DataType::Boolean => Kind::Boolean,
+        DataType::Date32 => Kind::Date32,
+        DataType::Date64 => Kind::Date64,
+        DataType::Time32(unit) => Kind::Time32(*unit),
+        DataType::Time64(unit) => Kind::Time64(*unit),
+        DataType::Timestamp(unit, _) => Kind::Timestamp(*unit),
+        DataType::Duration(unit) => Kind::Duration(*unit),
+        DataType::Decimal128(_, _) => Kind::Decimal128,
+        DataType::Decimal256(_, _) => Kind::Decimal256,
+        DataType::Interval(unit) => Kind::Interval(*unit),
+        DataType::Utf8 => Kind::Utf8,
+        DataType::LargeUtf8 => Kind::LargeUtf8,
+        DataType::Utf8View => Kind::Utf8View,
+        DataType::Binary => Kind::Binary,
+        DataType::LargeBinary => Kind::LargeBinary,
+        DataType::BinaryView => Kind::BinaryView,
+        DataType::FixedSizeBinary(width) => Kind::FixedSizeBinary(*width),
         _ => return None,
     })
+}
+
+impl Kind {
+    /// The encoded width of a value when it is fixed, for the kinds whose
+    /// encoding is a fixed-width, injective image of the value and that may
+    /// fold into an exact word. Others return `None` and are hashed, which is
+    /// always correct.
+    fn fixed_width(self) -> Option<usize> {
+        match self {
+            Self::Int8 | Self::UInt8 | Self::Boolean => Some(1),
+            Self::Int16 | Self::UInt16 => Some(2),
+            Self::Int32 | Self::UInt32 | Self::Date32 | Self::Time32(_) => Some(4),
+            Self::Int64
+            | Self::UInt64
+            | Self::Date64
+            | Self::Time64(_)
+            | Self::Timestamp(_)
+            | Self::Duration(_) => Some(8),
+            Self::FixedSizeBinary(width) => usize::try_from(width).ok(),
+            Self::Decimal128
+            | Self::Decimal256
+            | Self::Interval(_)
+            | Self::Utf8
+            | Self::LargeUtf8
+            | Self::Utf8View
+            | Self::Binary
+            | Self::LargeBinary
+            | Self::BinaryView => None,
+        }
+    }
 }
 
 impl WordRule {
     fn of(fields: &[KeyField]) -> Self {
         let layout: Option<Vec<(bool, usize)>> = fields
             .iter()
-            .map(|field| fixed_width(&field.data_type).map(|width| (field.nullable, width)))
+            .map(|field| {
+                kind(&field.data_type)
+                    .and_then(Kind::fixed_width)
+                    .map(|width| (field.nullable, width))
+            })
             .collect();
         match layout {
             Some(layout) if layout.iter().map(|&(_, width)| width).sum::<usize>() <= 8 => {
@@ -158,7 +239,7 @@ impl KeyEncoder {
     pub fn new(fields: Vec<KeyField>) -> Result<Self> {
         for field in &fields {
             ensure!(
-                is_supported(&field.data_type),
+                kind(&field.data_type).is_some(),
                 UnsupportedTypeSnafu {
                     data_type: field.data_type.to_string(),
                 }
@@ -184,29 +265,30 @@ impl KeyEncoder {
     #[must_use]
     pub fn key_word(&self, key: &[u8]) -> u64 {
         let hashed = |key: &[u8]| hash_index::hash_key_bytes_oneshot(key);
-        if let WordRule::Hashed { bits } = self.words {
-            return hashed(key) & (u64::MAX >> (64 - bits));
-        }
-        if let WordRule::Exact(layout) = &self.words {
-            // The fields' value bytes without their markers: at most 8.
-            let mut bytes = [0_u8; 8];
-            let (mut at, mut len) = (0, 0);
-            for &(nullable, width) in layout {
-                at += usize::from(nullable);
-                let (Some(value), Some(slot)) =
-                    (key.get(at..at + width), bytes.get_mut(len..len + width))
-                else {
-                    return hashed(key);
-                };
-                slot.copy_from_slice(value);
-                at += width;
-                len += width;
+        match &self.words {
+            WordRule::Hashed { bits } => hashed(key) & (u64::MAX >> (64 - bits)),
+            WordRule::Exact(layout) => {
+                // The fields' value bytes without their markers: at most 8.
+                let mut bytes = [0_u8; 8];
+                let (mut at, mut len) = (0, 0);
+                for &(nullable, width) in layout {
+                    at += usize::from(nullable);
+                    let (Some(value), Some(slot)) =
+                        (key.get(at..at + width), bytes.get_mut(len..len + width))
+                    else {
+                        return hashed(key);
+                    };
+                    slot.copy_from_slice(value);
+                    at += width;
+                    len += width;
+                }
+                if at == key.len() {
+                    crate::word_proof::fold_word(&bytes[..len])
+                } else {
+                    hashed(key)
+                }
             }
-            if at == key.len() {
-                return crate::word_proof::fold_word(&bytes[..len]);
-            }
         }
-        hashed(key)
     }
 
     /// This encoder with every key hashed to a word of only `bits` bits (1 to
@@ -222,8 +304,8 @@ impl KeyEncoder {
     }
 
     /// Whether distinct keys always have distinct [words](Self::key_word).
-    #[must_use]
-    pub fn exact_words(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn exact_words(&self) -> bool {
         matches!(self.words, WordRule::Exact(_))
     }
 
@@ -231,17 +313,16 @@ impl KeyEncoder {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::ColumnMismatch`] when the number of arrays, a type, a
-    /// length, or a NULL in a non-nullable field does not match.
+    /// [`crate::Error::ColumnCount`], [`crate::Error::ColumnType`],
+    /// [`crate::Error::ColumnLength`] or [`crate::Error::UnexpectedNull`] when
+    /// the number of arrays, a type, a length, or a NULL in a non-nullable
+    /// field does not match.
     pub fn bind<'a>(&self, columns: &'a [ArrayRef]) -> Result<BoundKeyColumns<'a>> {
         ensure!(
             columns.len() == self.fields.len(),
-            ColumnMismatchSnafu {
-                reason: format!(
-                    "expected {} key columns but received {}",
-                    self.fields.len(),
-                    columns.len()
-                ),
+            ColumnCountSnafu {
+                expected: self.fields.len(),
+                received: columns.len(),
             }
         );
         let num_rows = columns
@@ -251,28 +332,23 @@ impl KeyEncoder {
         for (index, (column, field)) in columns.iter().zip(&self.fields).enumerate() {
             ensure!(
                 column.data_type() == &field.data_type,
-                ColumnMismatchSnafu {
-                    reason: format!(
-                        "key column {index} is {} but the key declares {}",
-                        column.data_type(),
-                        field.data_type
-                    ),
+                ColumnTypeSnafu {
+                    index,
+                    found: column.data_type().clone(),
+                    declared: field.data_type.clone(),
                 }
             );
             ensure!(
                 column.len() == num_rows,
-                ColumnMismatchSnafu {
-                    reason: format!(
-                        "key column {index} has {} rows but key column 0 has {num_rows}",
-                        column.len()
-                    ),
+                ColumnLengthSnafu {
+                    index,
+                    rows: column.len(),
+                    expected: num_rows,
                 }
             );
             ensure!(
                 field.nullable || column.null_count() == 0,
-                ColumnMismatchSnafu {
-                    reason: format!("key column {index} is declared non-nullable but holds NULL"),
-                }
+                UnexpectedNullSnafu { index }
             );
             bound.push(BoundColumn {
                 data: ColumnData::new(column.as_ref())?,
@@ -285,37 +361,6 @@ impl KeyEncoder {
             num_rows,
         })
     }
-}
-
-fn is_supported(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Boolean
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Time64(_)
-            | DataType::Timestamp(_, _)
-            | DataType::Duration(_)
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::Interval(_)
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Utf8View
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::BinaryView
-            | DataType::FixedSizeBinary(_)
-    )
 }
 
 /// The typed values of one bound column.
@@ -345,90 +390,74 @@ enum ColumnData<'a> {
 
 impl<'a> ColumnData<'a> {
     fn new(array: &'a dyn Array) -> Result<Self> {
-        Ok(match array.data_type() {
-            DataType::Int8 => Self::I8(array.as_primitive::<Int8Type>().values()),
-            DataType::Int16 => Self::I16(array.as_primitive::<Int16Type>().values()),
-            DataType::Int32 => Self::I32(array.as_primitive::<Int32Type>().values()),
-            DataType::Int64 => Self::I64(array.as_primitive::<Int64Type>().values()),
-            DataType::UInt8 => Self::U8(array.as_primitive::<UInt8Type>().values()),
-            DataType::UInt16 => Self::U16(array.as_primitive::<UInt16Type>().values()),
-            DataType::UInt32 => Self::U32(array.as_primitive::<UInt32Type>().values()),
-            DataType::UInt64 => Self::U64(array.as_primitive::<UInt64Type>().values()),
-            DataType::Boolean => Self::Bool(array.as_boolean()),
-            DataType::Date32 => Self::I32(array.as_primitive::<Date32Type>().values()),
-            DataType::Date64 => Self::I64(array.as_primitive::<Date64Type>().values()),
-            DataType::Time32(TimeUnit::Second) => {
+        let Some(kind) = kind(array.data_type()) else {
+            return UnsupportedTypeSnafu {
+                data_type: array.data_type().to_string(),
+            }
+            .fail();
+        };
+        Ok(match kind {
+            Kind::Int8 => Self::I8(array.as_primitive::<Int8Type>().values()),
+            Kind::Int16 => Self::I16(array.as_primitive::<Int16Type>().values()),
+            Kind::Int32 => Self::I32(array.as_primitive::<Int32Type>().values()),
+            Kind::Int64 => Self::I64(array.as_primitive::<Int64Type>().values()),
+            Kind::UInt8 => Self::U8(array.as_primitive::<UInt8Type>().values()),
+            Kind::UInt16 => Self::U16(array.as_primitive::<UInt16Type>().values()),
+            Kind::UInt32 => Self::U32(array.as_primitive::<UInt32Type>().values()),
+            Kind::UInt64 => Self::U64(array.as_primitive::<UInt64Type>().values()),
+            Kind::Boolean => Self::Bool(array.as_boolean()),
+            Kind::Date32 => Self::I32(array.as_primitive::<Date32Type>().values()),
+            Kind::Date64 => Self::I64(array.as_primitive::<Date64Type>().values()),
+            Kind::Time32(TimeUnit::Second) => {
                 Self::I32(array.as_primitive::<Time32SecondType>().values())
             }
-            DataType::Time32(_) => {
-                Self::I32(array.as_primitive::<Time32MillisecondType>().values())
-            }
-            DataType::Time64(TimeUnit::Nanosecond) => {
+            Kind::Time32(_) => Self::I32(array.as_primitive::<Time32MillisecondType>().values()),
+            Kind::Time64(TimeUnit::Nanosecond) => {
                 Self::I64(array.as_primitive::<Time64NanosecondType>().values())
             }
-            DataType::Time64(_) => {
-                Self::I64(array.as_primitive::<Time64MicrosecondType>().values())
-            }
-            DataType::Timestamp(TimeUnit::Second, _) => {
+            Kind::Time64(_) => Self::I64(array.as_primitive::<Time64MicrosecondType>().values()),
+            Kind::Timestamp(TimeUnit::Second) => {
                 Self::I64(array.as_primitive::<TimestampSecondType>().values())
             }
-            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            Kind::Timestamp(TimeUnit::Millisecond) => {
                 Self::I64(array.as_primitive::<TimestampMillisecondType>().values())
             }
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            Kind::Timestamp(TimeUnit::Microsecond) => {
                 Self::I64(array.as_primitive::<TimestampMicrosecondType>().values())
             }
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            Kind::Timestamp(TimeUnit::Nanosecond) => {
                 Self::I64(array.as_primitive::<TimestampNanosecondType>().values())
             }
-            DataType::Duration(TimeUnit::Second) => {
+            Kind::Duration(TimeUnit::Second) => {
                 Self::I64(array.as_primitive::<DurationSecondType>().values())
             }
-            DataType::Duration(TimeUnit::Millisecond) => {
+            Kind::Duration(TimeUnit::Millisecond) => {
                 Self::I64(array.as_primitive::<DurationMillisecondType>().values())
             }
-            DataType::Duration(TimeUnit::Microsecond) => {
+            Kind::Duration(TimeUnit::Microsecond) => {
                 Self::I64(array.as_primitive::<DurationMicrosecondType>().values())
             }
-            DataType::Duration(TimeUnit::Nanosecond) => {
+            Kind::Duration(TimeUnit::Nanosecond) => {
                 Self::I64(array.as_primitive::<DurationNanosecondType>().values())
             }
-            DataType::Decimal256(_, _) => Self::I256(
-                array
-                    .as_primitive::<arrow_array::types::Decimal256Type>()
-                    .values(),
-            ),
-            DataType::Interval(IntervalUnit::YearMonth) => Self::I32(
-                array
-                    .as_primitive::<arrow_array::types::IntervalYearMonthType>()
-                    .values(),
-            ),
-            DataType::Interval(IntervalUnit::DayTime) => Self::DayTime(
-                array
-                    .as_primitive::<arrow_array::types::IntervalDayTimeType>()
-                    .values(),
-            ),
-            DataType::Interval(IntervalUnit::MonthDayNano) => Self::MonthDayNano(
-                array
-                    .as_primitive::<arrow_array::types::IntervalMonthDayNanoType>()
-                    .values(),
-            ),
-            DataType::Decimal128(_, _) => {
-                Self::I128(array.as_primitive::<Decimal128Type>().values())
+            Kind::Decimal128 => Self::I128(array.as_primitive::<Decimal128Type>().values()),
+            Kind::Decimal256 => Self::I256(array.as_primitive::<Decimal256Type>().values()),
+            Kind::Interval(IntervalUnit::YearMonth) => {
+                Self::I32(array.as_primitive::<IntervalYearMonthType>().values())
             }
-            DataType::Utf8 => Self::Utf8(array.as_string::<i32>()),
-            DataType::LargeUtf8 => Self::LargeUtf8(array.as_string::<i64>()),
-            DataType::Utf8View => Self::Utf8View(array.as_string_view()),
-            DataType::Binary => Self::Binary(array.as_binary::<i32>()),
-            DataType::LargeBinary => Self::LargeBinary(array.as_binary::<i64>()),
-            DataType::BinaryView => Self::BinaryView(array.as_binary_view()),
-            DataType::FixedSizeBinary(_) => Self::FixedBinary(array.as_fixed_size_binary()),
-            other => {
-                return UnsupportedTypeSnafu {
-                    data_type: other.to_string(),
-                }
-                .fail();
+            Kind::Interval(IntervalUnit::DayTime) => {
+                Self::DayTime(array.as_primitive::<IntervalDayTimeType>().values())
             }
+            Kind::Interval(IntervalUnit::MonthDayNano) => {
+                Self::MonthDayNano(array.as_primitive::<IntervalMonthDayNanoType>().values())
+            }
+            Kind::Utf8 => Self::Utf8(array.as_string::<i32>()),
+            Kind::LargeUtf8 => Self::LargeUtf8(array.as_string::<i64>()),
+            Kind::Utf8View => Self::Utf8View(array.as_string_view()),
+            Kind::Binary => Self::Binary(array.as_binary::<i32>()),
+            Kind::LargeBinary => Self::LargeBinary(array.as_binary::<i64>()),
+            Kind::BinaryView => Self::BinaryView(array.as_binary_view()),
+            Kind::FixedSizeBinary(_) => Self::FixedBinary(array.as_fixed_size_binary()),
         })
     }
 }
@@ -447,7 +476,7 @@ pub struct BoundKeyColumns<'a> {
     num_rows: usize,
 }
 
-impl<'a> BoundKeyColumns<'a> {
+impl BoundKeyColumns<'_> {
     /// Number of rows in the bound columns.
     #[must_use]
     pub fn num_rows(&self) -> usize {
@@ -463,34 +492,20 @@ impl<'a> BoundKeyColumns<'a> {
             .any(|column| column.nulls.is_some_and(|nulls| nulls.is_null(row)))
     }
 
-    /// A [`KeySource`] that produces the key of `row` from the columns as it
-    /// is read. `row` must be below [`Self::num_rows`].
-    #[inline]
-    #[must_use]
-    pub fn source(&self, row: usize) -> RowKeySource<'_, 'a> {
-        debug_assert!(row < self.num_rows);
-        RowKeySource {
-            columns: &self.columns,
-            row,
-            column: 0,
-            pending: Pending::None,
-        }
-    }
-
-    /// Append the key of `row` to `out`. The same bytes [`Self::source`]
-    /// produces, by construction: this drains that source.
+    /// Append the key of `row` to `out`. `row` must be below
+    /// [`Self::num_rows`].
     #[inline]
     pub fn encode_row(&self, row: usize, out: &mut Vec<u8>) {
-        let mut source = self.source(row);
-        while let Some(run) = source.next_run() {
-            out.extend_from_slice(run.as_slice());
+        debug_assert!(row < self.num_rows);
+        for column in &self.columns {
+            column.encode(row, out);
         }
     }
 
     /// Every row's key, concatenated, with `offsets[i]..offsets[i + 1]` the
     /// range of row `i`.
-    #[must_use]
-    pub fn encode_all(&self) -> (Vec<u8>, Vec<usize>) {
+    #[cfg(test)]
+    pub(crate) fn encode_all(&self) -> (Vec<u8>, Vec<usize>) {
         let mut bytes = Vec::new();
         let mut offsets = Vec::with_capacity(self.num_rows + 1);
         offsets.push(0);
@@ -502,165 +517,61 @@ impl<'a> BoundKeyColumns<'a> {
     }
 }
 
-/// Bytes of the current column still to be produced.
-#[derive(Debug, Clone, Copy)]
-enum Pending<'a> {
-    None,
-    /// A variable-length value, escaped and then terminated.
-    Escaped(&'a [u8]),
-    /// A fixed-length value, produced as is.
-    Raw(&'a [u8]),
-    /// The second half of a value wider than one inline run (`Decimal256`).
-    Inline([u8; 16]),
-}
-
-/// The key of one row, produced column by column from the Arrow arrays
-/// without materializing it. Strings and binaries are borrowed from the
-/// arrays' buffers in runs between the bytes that need escaping.
-#[derive(Debug)]
-pub struct RowKeySource<'b, 'a> {
-    columns: &'b [BoundColumn<'a>],
-    row: usize,
-    column: usize,
-    pending: Pending<'a>,
-}
-
-#[inline]
-fn fixed<const N: usize>(marked: bool, bytes: [u8; N]) -> Run<'static> {
-    let mut buf = [0_u8; 17];
-    let start = usize::from(marked);
-    buf[0] = VALID_MARK[0];
-    buf[start..start + N].copy_from_slice(&bytes);
-    Run::inline(&buf[..start + N])
-}
-
-impl<'a> KeySource<'a> for RowKeySource<'_, 'a> {
+impl BoundColumn<'_> {
+    /// Append this column's encoding of `row` to `out`.
     #[inline]
-    fn next_run(&mut self) -> Option<Run<'a>> {
-        loop {
-            match self.pending {
-                Pending::None => {}
-                Pending::Raw(bytes) => {
-                    self.pending = Pending::None;
-                    self.column += 1;
-                    return Some(Run::borrowed(bytes));
-                }
-                Pending::Inline(bytes) => {
-                    self.pending = Pending::None;
-                    self.column += 1;
-                    return Some(Run::inline(&bytes));
-                }
-                Pending::Escaped(rest) => {
-                    return Some(match rest.iter().position(|&b| b < 0x02) {
-                        None if rest.is_empty() => {
-                            self.pending = Pending::None;
-                            self.column += 1;
-                            Run::borrowed(TERMINATOR)
-                        }
-                        None => {
-                            self.pending = Pending::Escaped(&[]);
-                            Run::borrowed(rest)
-                        }
-                        Some(0) => {
-                            self.pending = Pending::Escaped(&rest[1..]);
-                            Run::borrowed(if rest[0] == 0 { ESCAPED_00 } else { ESCAPED_01 })
-                        }
-                        Some(at) => {
-                            self.pending = Pending::Escaped(&rest[at..]);
-                            Run::borrowed(&rest[..at])
-                        }
-                    });
-                }
-            }
-
-            let column = self.columns.get(self.column)?;
-            let row = self.row;
-            if column.nulls.is_some_and(|nulls| nulls.is_null(row)) {
-                self.column += 1;
-                return Some(Run::borrowed(NULL_MARK));
-            }
-            let marked = column.nullable;
-            let run = match column.data {
-                ColumnData::I8(v) => fixed(marked, (v[row].cast_unsigned() ^ 0x80).to_be_bytes()),
-                ColumnData::I16(v) => {
-                    fixed(marked, (v[row].cast_unsigned() ^ (1 << 15)).to_be_bytes())
-                }
-                ColumnData::I32(v) => {
-                    fixed(marked, (v[row].cast_unsigned() ^ (1 << 31)).to_be_bytes())
-                }
-                ColumnData::I64(v) => {
-                    fixed(marked, (v[row].cast_unsigned() ^ (1 << 63)).to_be_bytes())
-                }
-                ColumnData::I128(v) => {
-                    fixed(marked, (v[row].cast_unsigned() ^ (1 << 127)).to_be_bytes())
-                }
-                ColumnData::I256(v) => {
-                    // 32 bytes, sign bit flipped, in two runs: the high half
-                    // (with the marker) now, the low half next.
-                    let mut bytes = v[row].to_be_bytes();
-                    bytes[0] ^= 0x80;
-                    self.pending = Pending::Inline(std::array::from_fn(|i| bytes[16 + i]));
-                    let high: [u8; 16] = std::array::from_fn(|i| bytes[i]);
-                    return Some(fixed(marked, high));
-                }
-                ColumnData::DayTime(v) => {
-                    let mut bytes = [0_u8; 8];
-                    bytes[..4]
-                        .copy_from_slice(&(v[row].days.cast_unsigned() ^ (1 << 31)).to_be_bytes());
-                    bytes[4..].copy_from_slice(
-                        &(v[row].milliseconds.cast_unsigned() ^ (1 << 31)).to_be_bytes(),
-                    );
-                    fixed(marked, bytes)
-                }
-                ColumnData::MonthDayNano(v) => {
-                    let mut bytes = [0_u8; 16];
-                    bytes[..4].copy_from_slice(
-                        &(v[row].months.cast_unsigned() ^ (1 << 31)).to_be_bytes(),
-                    );
-                    bytes[4..8]
-                        .copy_from_slice(&(v[row].days.cast_unsigned() ^ (1 << 31)).to_be_bytes());
-                    bytes[8..].copy_from_slice(
-                        &(v[row].nanoseconds.cast_unsigned() ^ (1 << 63)).to_be_bytes(),
-                    );
-                    fixed(marked, bytes)
-                }
-                ColumnData::U8(v) => fixed(marked, v[row].to_be_bytes()),
-                ColumnData::U16(v) => fixed(marked, v[row].to_be_bytes()),
-                ColumnData::U32(v) => fixed(marked, v[row].to_be_bytes()),
-                ColumnData::U64(v) => fixed(marked, v[row].to_be_bytes()),
-                ColumnData::Bool(v) => fixed(marked, [u8::from(v.value(row))]),
-                ColumnData::FixedBinary(v) => {
-                    self.pending = Pending::Raw(v.value(row));
-                    if marked {
-                        return Some(Run::borrowed(VALID_MARK));
-                    }
-                    continue;
-                }
-                ColumnData::Binary(v) => return self.start_escaped(v.value(row), marked),
-                ColumnData::LargeBinary(v) => return self.start_escaped(v.value(row), marked),
-                ColumnData::Utf8(v) => return self.start_escaped(v.value(row).as_bytes(), marked),
-                ColumnData::LargeUtf8(v) => {
-                    return self.start_escaped(v.value(row).as_bytes(), marked);
-                }
-                ColumnData::Utf8View(v) => {
-                    return self.start_escaped(v.value(row).as_bytes(), marked);
-                }
-                ColumnData::BinaryView(v) => return self.start_escaped(v.value(row), marked),
-            };
-            self.column += 1;
-            return Some(run);
+    fn encode(&self, row: usize, out: &mut Vec<u8>) {
+        if self.nulls.is_some_and(|nulls| nulls.is_null(row)) {
+            out.push(NULL_MARK);
+            return;
         }
-    }
-}
-
-impl<'a> RowKeySource<'_, 'a> {
-    #[inline]
-    fn start_escaped(&mut self, value: &'a [u8], marked: bool) -> Option<Run<'a>> {
-        self.pending = Pending::Escaped(value);
-        if marked {
-            Some(Run::borrowed(VALID_MARK))
-        } else {
-            self.next_run()
+        if self.nullable {
+            out.push(VALID_MARK);
+        }
+        match self.data {
+            ColumnData::I8(v) => out.push(v[row].cast_unsigned() ^ 0x80),
+            ColumnData::I16(v) => {
+                out.extend_from_slice(&(v[row].cast_unsigned() ^ (1 << 15)).to_be_bytes());
+            }
+            ColumnData::I32(v) => {
+                out.extend_from_slice(&(v[row].cast_unsigned() ^ (1 << 31)).to_be_bytes());
+            }
+            ColumnData::I64(v) => {
+                out.extend_from_slice(&(v[row].cast_unsigned() ^ (1 << 63)).to_be_bytes());
+            }
+            ColumnData::I128(v) => {
+                out.extend_from_slice(&(v[row].cast_unsigned() ^ (1 << 127)).to_be_bytes());
+            }
+            ColumnData::I256(v) => {
+                let mut bytes = v[row].to_be_bytes();
+                bytes[0] ^= 0x80;
+                out.extend_from_slice(&bytes);
+            }
+            ColumnData::DayTime(v) => {
+                out.extend_from_slice(&(v[row].days.cast_unsigned() ^ (1 << 31)).to_be_bytes());
+                out.extend_from_slice(
+                    &(v[row].milliseconds.cast_unsigned() ^ (1 << 31)).to_be_bytes(),
+                );
+            }
+            ColumnData::MonthDayNano(v) => {
+                out.extend_from_slice(&(v[row].months.cast_unsigned() ^ (1 << 31)).to_be_bytes());
+                out.extend_from_slice(&(v[row].days.cast_unsigned() ^ (1 << 31)).to_be_bytes());
+                out.extend_from_slice(
+                    &(v[row].nanoseconds.cast_unsigned() ^ (1 << 63)).to_be_bytes(),
+                );
+            }
+            ColumnData::U8(v) => out.push(v[row]),
+            ColumnData::U16(v) => out.extend_from_slice(&v[row].to_be_bytes()),
+            ColumnData::U32(v) => out.extend_from_slice(&v[row].to_be_bytes()),
+            ColumnData::U64(v) => out.extend_from_slice(&v[row].to_be_bytes()),
+            ColumnData::Bool(v) => out.push(u8::from(v.value(row))),
+            ColumnData::FixedBinary(v) => out.extend_from_slice(v.value(row)),
+            ColumnData::Binary(v) => escape_value_into(v.value(row), out),
+            ColumnData::LargeBinary(v) => escape_value_into(v.value(row), out),
+            ColumnData::Utf8(v) => escape_value_into(v.value(row).as_bytes(), out),
+            ColumnData::LargeUtf8(v) => escape_value_into(v.value(row).as_bytes(), out),
+            ColumnData::Utf8View(v) => escape_value_into(v.value(row).as_bytes(), out),
+            ColumnData::BinaryView(v) => escape_value_into(v.value(row), out),
         }
     }
 }
