@@ -4954,6 +4954,7 @@ dependencies = [
  "paste",
  "runtime",
  "runtime-component",
+ "runtime-datafusion",
  "runtime-parameters",
  "runtime-udfs-api",
  "secrecy",

@@ -24,7 +24,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::{common::DFSchema, logical_expr::Expr};
-use datafusion_table_providers::util::supported_functions::FunctionSupport;
+use datafusion_table_providers::util::supported_functions::{ExpressionSupport, FunctionSupport};
 use runtime_udfs_api::{FunctionSupportBuilder, datafusion_nested_function_names};
 
 /// The [`FunctionSupport`] for `DuckDB` connectors and accelerators: allows
@@ -205,6 +205,32 @@ pub fn bigquery_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) 
         && crate::dialect::integer_cast_is_renderable(expr, schema)
 }
 
+/// The per-expression gate for an engine reached through a generic driver,
+/// keyed by the name the driver is configured with — an ADBC `adbc_driver`
+/// value, or an ODBC profile — for a connector whose dialect is generic and
+/// whose policy is therefore the plain deny-list. The gate is what keeps a
+/// cast the engine evaluates differently from `DataFusion` (a fractional value
+/// into an integer, which these engines round where `DataFusion` truncates)
+/// out of the pushdown on that route too; without it the same statement
+/// answered differently through ADBC or ODBC than through the engine's own
+/// connector (issue #14482). `None` for an engine with no such shape, or one
+/// this crate has no gate for, which keeps the plain policy.
+#[must_use]
+pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> {
+    match engine {
+        "bigquery" => Some(Arc::new(bigquery_can_evaluate_expression)),
+        "duckdb" => Some(Arc::new(crate::dialect::duckdb_can_evaluate_expression)),
+        "postgres" | "postgresql" => {
+            Some(Arc::new(crate::dialect::postgres_can_evaluate_expression))
+        }
+        "mysql" => Some(Arc::new(crate::dialect::mysql_can_evaluate_expression)),
+        // Documented to round a fractional value cast into an integer, like the
+        // engines above; the gate costs them only the cast's pushdown.
+        "snowflake" | "athena" => Some(Arc::new(crate::dialect::integer_cast_is_renderable)),
+        _ => None,
+    }
+}
+
 /// `SQLite`-flavored deny-list as a value, for
 /// `SqliteTableProviderFactory::with_function_support`.
 ///
@@ -293,7 +319,7 @@ mod tests {
         deny_spice_functions_for_duckdb_dialect_without_carve_out,
         deny_spice_functions_for_duckdb_table_providers,
         deny_spice_functions_for_mysql_table_providers,
-        deny_spice_functions_for_postgres_table_providers,
+        deny_spice_functions_for_postgres_table_providers, expression_support_for_engine,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
@@ -645,6 +671,43 @@ mod tests {
                     "the {policy} policy must still federate:\n{plan}"
                 );
             }
+        }
+    }
+
+    /// Regression test for #14482 on the generic-driver routes: the gate an ADBC
+    /// driver name or an ODBC profile resolves to must refuse the same cast the
+    /// engine's own connector refuses, and an engine that truncates like
+    /// `DataFusion`, or one with no gate, keeps the plain policy.
+    #[test]
+    fn the_engine_gate_refuses_a_fractional_to_integer_cast_where_the_engine_rounds() {
+        use datafusion::prelude::cast;
+        let rounding = cast(lit(1.5_f64), DataType::Int64);
+        let harmless = cast(lit(1_i64), DataType::Int32);
+        for engine in [
+            "bigquery",
+            "duckdb",
+            "postgres",
+            "postgresql",
+            "mysql",
+            "snowflake",
+            "athena",
+        ] {
+            let gate = expression_support_for_engine(engine)
+                .unwrap_or_else(|| panic!("{engine} rounds the cast, so it needs a gate"));
+            assert!(
+                !gate(&rounding, None),
+                "{engine} rounds {rounding}, so its gate must keep it local"
+            );
+            assert!(
+                gate(&harmless, None),
+                "{engine} evaluates {harmless} as DataFusion does, so its gate must let it federate"
+            );
+        }
+        for engine in ["sqlite", "databricks", "flightsql", "unknown"] {
+            assert!(
+                expression_support_for_engine(engine).is_none(),
+                "{engine} has no gate: it truncates like DataFusion, or no policy exists for it"
+            );
         }
     }
 
