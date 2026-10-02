@@ -34,6 +34,7 @@ use tokio::sync::RwLock;
 
 mod lexer;
 mod params;
+pub mod preflight;
 pub mod stores;
 
 pub use params::{ParamError as SecretStoreParamError, expand_bootstrap_refs};

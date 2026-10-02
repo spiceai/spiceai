@@ -22,7 +22,6 @@ use std::{
 };
 
 use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
-use crate::status::RuntimeStatus;
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
@@ -47,6 +46,7 @@ use futures::StreamExt;
 use http::HeaderValue;
 use llms::chat::Chat;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_status::RuntimeStatus;
 use serde::Serialize;
 use tokio::{
     select,

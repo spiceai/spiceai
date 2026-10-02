@@ -18,13 +18,13 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use crate::cluster::ExecutorRegistry;
-use crate::status::RuntimeStatus;
 use axum::{
     Extension,
     extract::Query,
     http::status,
     response::{IntoResponse, Response},
 };
+use runtime_status::RuntimeStatus;
 use serde::{Deserialize, Serialize};
 
 /// Optional gates layered on top of the default readiness check.
@@ -337,7 +337,7 @@ mod tests {
     }
 
     fn status_ready() -> Arc<RuntimeStatus> {
-        use crate::status::{ComponentStatus, RuntimeReadyState};
+        use runtime_status::{ComponentStatus, RuntimeReadyState};
         let status = RuntimeStatus::new();
         status.set_ready_state(RuntimeReadyState::OnRegistration);
         status.update_component_status("test:probe", ComponentStatus::Ready);

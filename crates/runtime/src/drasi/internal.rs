@@ -41,7 +41,7 @@ use runtime_query_engine::query_engine::UpdateType;
 use spicepod::drasi::{RuntimeDrasi, RuntimeDrasiTable};
 
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
-use crate::drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
+use runtime_drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
 
 /// The forwarders configured by `runtime.drasi`, keyed by table.
 #[derive(Debug)]
@@ -521,7 +521,7 @@ mod tests {
         // The assertion is that the loop above returned at all: every enqueue
         // completed without waiting on Drasi, which is unreachable here. Where
         // the overflow *went* is asserted directly, against an explicit store,
-        // by `queue::tests::a_full_queue_retains_overflow_in_the_store`.
+        // by `runtime_drasi::queue::tests::a_full_queue_retains_overflow_in_the_store`.
         let _ = forwarder;
     }
 }

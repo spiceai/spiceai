@@ -7222,7 +7222,7 @@ mod tests {
 
         fn test_df() -> DataFusion {
             DataFusionBuilder::new(
-                crate::status::RuntimeStatus::new(),
+                runtime_status::RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::default()),
                 tokio::runtime::Handle::current(),
             )

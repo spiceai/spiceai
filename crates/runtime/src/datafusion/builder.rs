@@ -2102,10 +2102,10 @@ mod tests {
         validate_compaction_memory_fraction,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
-    use crate::status;
     #[cfg(not(windows))]
     use data_components::poly::PolyTableProvider;
     use runtime_object_store::registry::SpiceObjectStoreRegistry;
+    use runtime_status as status;
     #[cfg(not(windows))]
     use std::collections::HashMap;
     use std::sync::Arc;
