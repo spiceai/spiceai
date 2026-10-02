@@ -95,7 +95,9 @@ const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
 /// invalidation itself fails.
 #[derive(Clone, Copy, Debug)]
 enum CacheInvalidation {
-    /// The dataset stays registered and its contents may change.
+    /// The dataset stays configured and will be queryable again, though its contents
+    /// may change. It may be unregistered while its replacement is registered, so this
+    /// says nothing about whether the table stays in place.
     Reload,
     /// The dataset is being unloaded and stops being queryable.
     Unload,
@@ -1244,10 +1246,10 @@ impl Runtime {
 
     /// Unregisters `ds_name` and discards what is cached over it.
     ///
-    /// `cause` is the caller's intent, which this cannot infer: two of its three
-    /// callers unregister the dataset only to register a replacement, and telling
-    /// the results cache those were unloads would deny them the stale-serving
-    /// window their reload is exactly what revalidates.
+    /// `cause` is the caller's intent, which this cannot infer: most callers
+    /// unregister the dataset only to register a replacement, and telling the
+    /// results cache those were unloads would deny them the stale-serving window
+    /// their reload is exactly what revalidates.
     async fn remove_dataset(
         self: Arc<Self>,
         ds_name: TableReference,
