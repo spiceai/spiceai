@@ -22,9 +22,8 @@ limitations under the License.
 //! to its lease, paced locally with a GCRA/TAT-style scheduler so a long global
 //! lease window does not burst all tokens into the upstream backend at once.
 //!
-//! Schema is `PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION = 4`. Older state is
-//! treated as empty (with a warning); the previous PR was never shipped so no
-//! migration is required.
+//! Schema is `PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION = 3`. State written
+//! under a different schema is treated as empty (with a warning).
 //!
 //! ## Adaptive demand-weighted leasing
 //!
@@ -100,13 +99,17 @@ use tokio::sync::{Mutex, Notify};
 use crate::adaptive::{RequestOutcome, ThrottleState};
 use crate::phase_change_log::{Damping, PhaseChangeLog};
 
-/// Bumped to 4 for the `ok` / `failed` fields of cluster adaptive throttling.
-/// [`PersistedRateControlState::is_current_schema`] tests
-/// for an exact match and a reader discards a mismatch, so a fleet spanning two
-/// schema versions erases the shared state on every tick, in both directions.
-/// The `rate-control` feature is absent from the release build, so the bump is
-/// safe now and will not be once it ships.
-pub(crate) const PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION: u32 = 4;
+/// The format stays at 3. The cluster outcome counters (`ok`, `failed`) are
+/// optional and additive, and no persisted struct denies unknown fields, so one
+/// file serves a mixed-version fleet: an older instance ignores the counters and
+/// keeps static rate control working, and a newer instance reads an older file
+/// with the counters absent.
+///
+/// Bump this only for a change an older reader would misread.
+/// [`PersistedRateControlState::is_current_schema`] tests for an exact match and
+/// the reader then discards the whole state, so a fleet spanning two schema
+/// versions erases the shared state on every tick, in both directions.
+pub(crate) const PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION: u32 = 3;
 
 const MAX_LEASE_RETRIES: usize = 3;
 /// Number of windows of history to retain in the persisted file.
@@ -1195,8 +1198,8 @@ impl LeasedBucket {
         };
 
         for attempt in 0..MAX_LEASE_RETRIES {
-            // State written under an older schema is treated as empty; the
-            // previous PR was never shipped so no migration is required.
+            // State written under a different schema is treated as empty: the
+            // reader cannot tell which fields it would misread.
             let mut state = match self.read_state().await {
                 Ok(state) => state
                     .filter(PersistedRateControlState::is_current_schema)
@@ -1710,7 +1713,8 @@ mod tests {
     /// Pins the on-disk JSON. Replicas of different runtime versions read and
     /// write one shared file per origin, so any change to a field name, a
     /// field's presence or a map key encoding breaks a mixed-version cluster.
-    /// Update this snapshot only alongside a `schema_version` bump.
+    /// Update it only with a deliberate wire-format change, and bump
+    /// `schema_version` as well when an older reader would misread that change.
     #[test]
     fn persisted_state_json_is_stable() {
         assert_snapshot!(canonical_json(&wire_format_fixture()), @r###"
@@ -1743,7 +1747,7 @@ mod tests {
               }
             }
           },
-          "schema_version": 4,
+          "schema_version": 3,
           "updated_at_unix_ms": 1700000000500,
           "window_ms": 1000
         }
@@ -1765,7 +1769,7 @@ mod tests {
     #[test]
     fn persisted_state_reads_lease_without_optional_counts() {
         const ON_DISK: &str = r#"{
-            "schema_version": 4,
+            "schema_version": 3,
             "updated_at_unix_ms": 1700000000500,
             "window_ms": 1000,
             "limiters": {
@@ -1815,11 +1819,12 @@ mod tests {
         assert_eq!(lease.failed, None, "missing `failed` is absent, not zero");
     }
 
-    /// A file written under schema 3 is discarded, not read field by field. The
-    /// reader tests for an exact schema match, so a v3 window cannot leak into a
-    /// v4 replica's budget arithmetic.
+    /// A file from an instance that predates the outcome counters stays usable:
+    /// it is current, so its limiters, windows and leases are kept rather than
+    /// discarded, and its leases carry no outcome evidence, so they drop out of
+    /// the cluster error-rate estimate instead of reading as zero.
     #[test]
-    fn schema_three_state_is_not_current() {
+    fn state_written_without_the_outcome_counters_is_current_and_holds_no_evidence() {
         const ON_DISK: &str = r#"{
             "schema_version": 3,
             "updated_at_unix_ms": 1700000000500,
@@ -1833,8 +1838,10 @@ mod tests {
                             "leases": {
                                 "replica-a": {
                                     "granted": 7,
+                                    "consumed": 5,
+                                    "attempted": 12,
                                     "expires_at_unix_ms": 1700000001000,
-                                    "updated_at_unix_ms": 1700000000500
+                                    "updated_at_unix_ms": 1700000001500
                                 }
                             }
                         }
@@ -1844,10 +1851,32 @@ mod tests {
         }"#;
 
         let state: PersistedRateControlState =
-            serde_json::from_str(ON_DISK).expect("a v3 file still parses");
+            serde_json::from_str(ON_DISK).expect("a file without the counters deserializes");
         assert!(
-            !state.is_current_schema(),
-            "a v3 file must be discarded, so its windows never reach the budget arithmetic"
+            state.is_current_schema(),
+            "the counters are additive, so an older file is still read, not discarded"
+        );
+
+        let limiter = state
+            .limiters
+            .get("requests_per_second:burst=10:replenish_ns=100000000")
+            .expect("limiter present");
+        let lease = limiter
+            .windows
+            .get("1700000000")
+            .expect("window present")
+            .leases
+            .get("replica-a")
+            .expect("lease present");
+        assert_eq!(lease.granted, 7, "the lease survives the read");
+        assert_eq!((lease.ok, lease.failed), (None, None));
+
+        // The lease is final (written back past its window end), so only the
+        // absent counters keep it out of the estimate.
+        let sample = limiter.ewma_outcomes(1_700_000_001, OUTCOME_EWMA_LOOKBACK_WINDOWS, 1.0);
+        assert!(
+            sample.requests.abs() < 1e-9,
+            "a lease without counters is dropped from the cluster estimate, not read as zero"
         );
     }
 
