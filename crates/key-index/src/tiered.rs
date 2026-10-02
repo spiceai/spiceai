@@ -153,34 +153,31 @@ fn postings_intact(files: usize, slots: &[u32], postings: &[u8], rows: usize) ->
             total += 1;
             continue;
         }
-        let mut at = word_proof::slot_offset(slot) as usize;
-        if at != end {
+        if word_proof::slot_offset(slot) as usize != end {
             return false;
         }
-        let Some(count) = varint::get(postings, &mut at).filter(|&count| count > 0) else {
+        let Some(mut list) = varint::PostingList::at(postings, end) else {
             return false;
         };
-        let mut posting = 0_u64;
-        for i in 0..count {
-            let next = varint::get(postings, &mut at)
-                .filter(|&delta| i == 0 || delta > 0)
-                .and_then(|delta| posting.checked_add(delta));
-            let Some(next) = next else {
-                return false;
-            };
-            posting = next;
+        // Postings strictly ascend: a repeated one is a gap of zero.
+        let mut last: Option<u64> = None;
+        for posting in list.by_ref() {
+            match posting {
+                Ok(posting) if last.is_none_or(|last| posting > last) => last = Some(posting),
+                _ => return false,
+            }
         }
-        // Postings ascend, so the last holds the largest position. Each took
-        // at least one byte, so the count fits a `usize` and the total cannot
-        // overflow.
-        let Ok(count) = usize::try_from(count) else {
+        // The last posting holds the largest position; none at all is an
+        // empty list, which a word never has. Each posting took at least one
+        // byte, so the count fits a `usize` and the total cannot overflow.
+        let (Some(last), Ok(count)) = (last, usize::try_from(list.postings())) else {
             return false;
         };
-        if posting / files > POSITION_MASK {
+        if last / files > POSITION_MASK {
             return false;
         }
         total += count;
-        end = at;
+        end = list.end();
     }
     end == postings.len() && total == rows
 }
@@ -296,20 +293,14 @@ impl IndexRun {
             f(u64::from(slot));
             return;
         }
-        let mut from = word_proof::slot_offset(slot) as usize;
-        let Some(count) = varint::get(&self.postings, &mut from) else {
+        // `from_bytes` checks that every list decodes in full, and a built run
+        // is written by `RunWriter`, so neither ends early here.
+        let Some(list) =
+            varint::PostingList::at(&self.postings, word_proof::slot_offset(slot) as usize)
+        else {
             return;
         };
-        let mut posting = 0_u64;
-        for _ in 0..count {
-            // `from_bytes` checks that every stream decodes in full, and a
-            // built run is written by `finish`, so neither ends early here.
-            let Some(next) =
-                varint::get(&self.postings, &mut from).and_then(|delta| posting.checked_add(delta))
-            else {
-                return;
-            };
-            posting = next;
+        for posting in list.map_while(Result::ok) {
             f(posting);
         }
     }
@@ -420,10 +411,11 @@ struct RunWriter {
 }
 
 impl RunWriter {
-    fn new() -> Self {
+    /// A writer with room for `words` words.
+    fn with_capacity(words: usize) -> Self {
         Self {
-            words: Vec::new(),
-            slots: Vec::new(),
+            words: Vec::with_capacity(words),
+            slots: Vec::with_capacity(words),
             postings: Vec::new(),
             rows: 0,
         }
@@ -439,7 +431,6 @@ impl RunWriter {
                     .ok()
                     .filter(|&offset| offset < MULTI)
                     .ok_or(Error::TooLarge)?;
-                varint::put(&mut self.postings, postings.len() as u64);
                 varint::put_postings(&mut self.postings, postings);
                 word_proof::offset_slot(offset)
             }
@@ -464,7 +455,8 @@ impl RunWriter {
 /// Entries in each chunk of a [`RunBuilder`] after its first: 1 MiB.
 const CHUNK_ENTRIES: usize = 1 << 16;
 
-/// A `(word, file << POSITION_BITS | position)` entry of one indexed row.
+/// One indexed row: `(word, file << POSITION_BITS | position)` as it is added,
+/// and `(word, posting)` once [`RunBuilder::finish`] knows the run's files.
 type Entry = (u64, u64);
 
 /// Builds an [`IndexRun`] from rows as a writer emits them, in any order: the
@@ -655,33 +647,41 @@ impl RunBuilder {
     ///
     /// When the run's row addresses exceed 2 GiB.
     pub fn finish(self) -> Result<IndexRun> {
-        // One sorted copy of the entries, built by moving the chunks in and
-        // freeing each as it is moved, so no more than one chunk is held twice.
+        // One copy of the entries as `(word, posting)`, built by moving the
+        // chunks in and freeing each as it is moved, so no more than one
+        // chunk is held twice. A posting orders a word's rows as the run
+        // stores them, so one sort orders the whole run.
+        let files = self.files.len().max(1) as u64;
         let mut entries: Vec<Entry> = Vec::with_capacity(self.rows);
         for chunk in self.chunks {
-            entries.extend_from_slice(&chunk);
+            // A file id is below `files`, a position below 2^40 (checked as
+            // rows were added), and `files` at most `MAX_RUN_FILES`.
+            entries.extend(chunk.iter().map(|&(word, raw)| {
+                (
+                    word,
+                    word_proof::posting(raw & POSITION_MASK, raw >> POSITION_BITS, files),
+                )
+            }));
         }
         entries.sort_unstable();
-        let files = self.files.len().max(1) as u64;
-        let mut writer = RunWriter::new();
+        let words = 1 + entries
+            .windows(2)
+            .filter(|pair| pair[0].0 != pair[1].0)
+            .count();
+        let mut writer = RunWriter::with_capacity(if entries.is_empty() { 0 } else { words });
         let mut group: Vec<u64> = Vec::new();
         let mut i = 0;
         while i < entries.len() {
             let word = entries[i].0;
             group.clear();
             while i < entries.len() && entries[i].0 == word {
-                let raw = entries[i].1;
-                // A file id is below `files`, a position below 2^40 (checked
-                // as rows were added), and `files` at most `MAX_RUN_FILES`.
-                group.push(word_proof::posting(
-                    raw & POSITION_MASK,
-                    raw >> POSITION_BITS,
-                    files,
-                ));
+                // A row added twice is stored once.
+                let posting = entries[i].1;
+                if group.last() != Some(&posting) {
+                    group.push(posting);
+                }
                 i += 1;
             }
-            group.sort_unstable();
-            group.dedup();
             writer.push(word, &group)?;
         }
         Ok(writer.finish(self.files.into_iter().map(Arc::from).collect()))
@@ -902,7 +902,14 @@ fn merge_runs(sources: &[&RunEntry]) -> Result<IndexRun> {
         .enumerate()
         .filter_map(|(i, source)| source.run.words.first().map(|&word| Reverse((word, i))))
         .collect();
-    let mut writer = RunWriter::new();
+    // The merged run holds at least the words of its largest source.
+    let mut writer = RunWriter::with_capacity(
+        sources
+            .iter()
+            .map(|source| source.run.keys())
+            .max()
+            .unwrap_or(0),
+    );
     let mut group: Vec<u64> = Vec::new();
     // Appends source `i`'s postings for its next word to `group`, renumbered
     // into the merged run's files, and moves past it; returns the source's
@@ -911,34 +918,16 @@ fn merge_runs(sources: &[&RunEntry]) -> Result<IndexRun> {
         let (source, offset) = (sources[i], offsets[i]);
         let run = &source.run;
         let at = next[i];
-        if run.files.len() <= 1 {
-            // One file: a posting is the position itself.
-            if all_live[i] || source.live.first().copied().unwrap_or(false) {
-                run.postings_at(at, |position| {
-                    group.push(word_proof::posting(position, offset, merged_files));
-                });
-            }
-        } else if all_live[i] {
-            run.postings_at(at, |posting| {
-                let (file, position) = run.decode(posting);
+        run.postings_at(at, |posting| {
+            let (file, position) = run.decode(posting);
+            if all_live[i] || source.live.get(file).copied().unwrap_or(false) {
                 group.push(word_proof::posting(
                     position,
                     file as u64 + offset,
                     merged_files,
                 ));
-            });
-        } else {
-            run.postings_at(at, |posting| {
-                let (file, position) = run.decode(posting);
-                if source.live.get(file).copied().unwrap_or(false) {
-                    group.push(word_proof::posting(
-                        position,
-                        file as u64 + offset,
-                        merged_files,
-                    ));
-                }
-            });
-        }
+            }
+        });
         next[i] = at + 1;
         run.words.get(at + 1).copied()
     };
@@ -946,17 +935,23 @@ fn merge_runs(sources: &[&RunEntry]) -> Result<IndexRun> {
         group.clear();
         let mut following = take(first, &mut next, &mut group);
         // Every other source holding this word contributes its rows.
+        let mut shared = false;
         while let Some(&Reverse((other, i))) = heap.peek() {
             if other != word {
                 break;
             }
             heap.pop();
+            shared = true;
             if let Some(after) = take(i, &mut next, &mut group) {
                 heap.push(Reverse((after, i)));
             }
         }
         if !group.is_empty() {
-            group.sort_unstable();
+            // One source's postings are already ascending: renumbering its
+            // files keeps their order.
+            if shared {
+                group.sort_unstable();
+            }
             writer.push(word, &group)?;
         }
         // A source ahead of every other keeps the lead for as long as its
