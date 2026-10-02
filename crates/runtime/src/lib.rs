@@ -2157,7 +2157,7 @@ impl Runtime {
         // milliseconds. Waited on alongside the connection drain, under the same
         // timeout: a source that cannot finish in it costs a rebuild on the next
         // start, never a hung shutdown.
-        let (unfinished_sources, ()) = tokio::join!(
+        let (unfinished_sources, _) = tokio::join!(
             data_components::cdc::drain_shutdown(shutdown_timeout),
             join_all(shutdown_futures),
         );
