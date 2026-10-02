@@ -30,8 +30,10 @@ limitations under the License.
 //!    supplies them via [`FunctionSupportBuilder::deny_also`].
 //! 3. **The `DataFusion` cast built-ins** — [`DATAFUSION_CAST_BUILTINS`]
 //!    (`arrow_cast`, `cast_to_type`, …). The exception to set 2's default: they
-//!    are denied for every backend, because no source answers them as
-//!    `DataFusion` does.
+//!    are denied for every backend, because no source can be assumed to answer
+//!    them as `DataFusion` does. A source that is itself `DataFusion` (a
+//!    FlightSQL server, say) could, but nothing tells the connector that it is
+//!    talking to one, so these are kept local there too.
 //!
 //! Set 1 lives here because Spice owns it: every Spice function registers its
 //! name at its definition site with [`register_spice_function!`], collected into
