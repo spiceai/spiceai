@@ -2,9 +2,13 @@
 name: integration tests (management API)
 
 on:
-  schedule:
-    - cron: '0 2 * * *' # Daily at 02:00 UTC
-
+  # Manual dispatch only. The daily schedule is quarantined: every scheduled run since
+  # 2026-04-08 failed in 'Authenticate with Spice Cloud dev API' because the dev OAuth
+  # client behind SPICE_MANAGEMENT_CLIENT_ID_DEV is inactive, so the suite itself never
+  # ran. Restore the schedule once a manual dispatch is green with a working client:
+  #   schedule:
+  #     - cron: '0 2 * * *' # Daily at 02:00 UTC
+  # Tracking: https://github.com/spiceai/spiceai/issues/12376
   workflow_dispatch:
     inputs:
       update_snapshots:
