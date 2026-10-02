@@ -704,8 +704,8 @@ mod tests {
     }
 
     /// A rejected sampling control is explained upstream the same way, as an
-    /// `invalid_request_error` carrying `param` — the field Anthropic itself never sets — and
-    /// has to survive the fallback arm that re-types every other `invalid_request_error`.
+    /// `invalid_request_error` carrying `param` and `code` — fields Anthropic itself never sets —
+    /// and has to survive the fallback arm that re-types every other `invalid_request_error`.
     #[test]
     fn an_explained_rejected_control_passes_through_unchanged() {
         let explained = crate::anthropic::explain_rejected_sampling_control(
