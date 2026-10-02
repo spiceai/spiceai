@@ -21,7 +21,6 @@ use datafusion::{
     catalog::TableProviderFactory,
     common::{Constraint, Constraints},
     datasource::TableProvider,
-    execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use runtime_table_partition::expression::PartitionedBy;
@@ -127,7 +126,7 @@ impl DataAccelerator for ArrowAccelerator {
 
         enable_hash_index_for_primary_key_or_indexes(&mut cmd);
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let table_provider = TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
             .await
             .boxed()?;
