@@ -33,8 +33,8 @@ limitations under the License.
 //!
 //! All integers are little-endian. The trailing checksum is
 //! [`hash_index::hash_key_bytes_oneshot`] over everything before it, so a torn or
-//! corrupt file is rejected rather than read; a reader treats any error as a
-//! missing file and rebuilds.
+//! corrupt file is rejected rather than read; a caller should treat any error
+//! as a missing file and index its files again.
 
 use snafu::{Snafu, ensure};
 
