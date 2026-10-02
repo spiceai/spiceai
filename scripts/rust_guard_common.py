@@ -47,6 +47,11 @@ def cargo_metadata() -> dict:
         # sandbox or noexec mount refusing it).
         print(f"error: `cargo` could not be run: {e}", file=sys.stderr)
         raise SystemExit(2)
+    except UnicodeDecodeError as e:
+        # `text=True` decodes both streams inside `subprocess.run`, so bytes that are
+        # not valid in the locale's encoding fail here, before either is inspected.
+        print(f"error: `cargo metadata` output could not be decoded: {e}", file=sys.stderr)
+        raise SystemExit(2)
     except subprocess.CalledProcessError as e:
         print(f"error: `cargo metadata` failed (exit {e.returncode}).", file=sys.stderr)
         if e.stderr:

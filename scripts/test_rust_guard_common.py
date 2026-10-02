@@ -86,6 +86,13 @@ FAILURE_MODES = (
     ("a failing cargo", "echo 'error: bad manifest' >&2; exit 101", 0o755, "bad manifest"),
     ("no cargo on PATH", None, 0o755, "Rust toolchain installed"),
     ("a cargo that cannot be executed", "echo '{}'", 0o644, "could not be run"),
+    ("stdout that is not valid text", "printf '\\377'", 0o755, "could not be decoded"),
+    (
+        "stderr that is not valid text",
+        "printf '{}'; printf '\\377' >&2; exit 101",
+        0o755,
+        "could not be decoded",
+    ),
 )
 
 # Regression test for #13121: each guard, not just the helper, must report a
