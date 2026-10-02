@@ -291,15 +291,12 @@ jobs:
       SIGNOFF_ACTOR: ${{ github.actor }}
       SIGNOFF_DEBUG: '1'
       # The `Sign off` step's budget, declared once here and read twice: as that
-      # step's `timeout-minutes`, and by scripts/signoff as its own deadline. The
-      # runner enforces the budget by reaping the step's process tree *after* the
-      # post-job steps have run, without signalling the script, so a run that
-      # expires sees its `make` die with an ordinary failing status and — unless
-      # it knows the deadline — posts `signoff=failure` over the honest `pending`
-      # the "Resolve an incomplete sign-off" step restated seconds earlier
-      # (#13843). Measured on this pool, passing sign-offs peak at 345 minutes,
-      # so this gives up only on a run that was within minutes of the ~360-minute
-      # job wall anyway.
+      # step's `timeout-minutes`, and by scripts/signoff as its own deadline, so
+      # an expiry — which the runner enforces without signalling the script —
+      # is classified as one and publishes no verdict (#13843; the mechanism is
+      # at `budget_expired` in the script). Measured on this pool, passing
+      # sign-offs peak at 345 minutes, so this gives up only on a run that was
+      # within minutes of the ~360-minute job wall anyway.
       SIGNOFF_STEP_BUDGET_MINUTES: '353'
 
     steps:

@@ -123,31 +123,9 @@ assert_preflight() {
   echo "  ok: $name"
 }
 
-assert_failure_kind() {
-  local name="$1" check_status="$2" want="$3"
-  shift 3
-  tests_run=$((tests_run + 1))
-
-  local result rc output
-  result="$(call_subject "failure_kind ${check_status}" "$@")"
-  rc="${result%%|*}"
-  output="${result#*|}"
-
-  if [[ "$rc" -ne 0 ]]; then
-    fail_test "$name: expected exit 0, got ${rc} (output: ${output})"
-    return
-  fi
-  if [[ "$output" != "$want" ]]; then
-    fail_test "$name: expected kind '${want}', got '${output}'"
-    return
-  fi
-  echo "  ok: $name"
-}
-
-# As assert_failure_kind, with the elapsed seconds the run would report. The
-# budget reading is the one classification that depends on the clock rather
-# than on a status or a recorded flag, so it needs the second argument the
-# production call site passes.
+# Drives failure_kind with the exit status and the elapsed seconds the run would
+# report; the budget reading is the one classification that depends on the
+# clock rather than on a status or a recorded flag.
 assert_failure_kind_at() {
   local name="$1" check_status="$2" elapsed="$3" want="$4"
   shift 4
@@ -167,6 +145,14 @@ assert_failure_kind_at() {
     return
   fi
   echo "  ok: $name"
+}
+
+assert_failure_kind() {
+  local name="$1" check_status="$2" want="$3"
+  shift 3
+  # No elapsed: the snippet is then `failure_kind <status>`, the call every
+  # reading but the clock is classified from.
+  assert_failure_kind_at "$name" "$check_status" "" "$want" "$@"
 }
 
 echo "free_disk_gib"
@@ -1414,12 +1400,10 @@ assert_failure_kind "a signalled run stays signalled, not a rewritten lockfile" 
   SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # A step budget that expires is never delivered as a signal: the runner reaps the
 # step's `make` first and this script last, so the script sees a small failing
-# status with no signal recorded and, with nothing else to go on, published
-# "Sign-off checks failed after 21203s" over the honest `pending` the workflow
-# had restated seconds earlier (#13843). The clock is the only reading that can
-# see it, so the deadline the workflow declares is threaded in and a run that
-# ends within the grace of it is signalled. The elapsed values are the ones
-# dying runs reported against the 353-minute (21180 s) budget.
+# status with no signal recorded, and only the clock can tell that from a
+# failing recipe (#13843). The deadline the workflow declares is threaded in,
+# and a run that ends within the grace of it is signalled. The elapsed values
+# are the ones dying runs reported against the 353-minute (21180 s) budget.
 assert_failure_kind_at "calls a run that ended at its step budget signalled" 101 21203 "signalled" \
   SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # The script's clock starts a few seconds into the step, so the elapsed it reads
@@ -1452,12 +1436,22 @@ assert_failure_kind_at "a malformed budget is inert, not an expiry" 101 21225 "c
   SIGNOFF_STEP_BUDGET_MINUTES=soon SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_failure_kind_at "a malformed grace is inert, not an expiry" 101 21225 "checks" \
   SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_STEP_BUDGET_GRACE_SECONDS=2m SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# Two shapes `^[0-9]+$` would admit and bash's arithmetic would misread: a
+# leading zero is octal there (`0353` is 235 minutes, a budget that fires two
+# hours early) and a value past 2^63 wraps negative (every failure an expiry).
+# 14100 s is exactly where the octal reading would fire.
+assert_failure_kind_at "a leading-zero budget is read in base 10, not as octal" 101 14100 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=0353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "an overlong budget is inert, not an expiry" 101 1 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=9223372036854775807 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "an overlong grace is inert, not an expiry" 101 1 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_STEP_BUDGET_GRACE_SECONDS=99999999999999999999 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_failure_kind "a budget with no elapsed to read is inert" 101 "checks" \
   SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
-# "No verdict" outranks naming a cause, exactly as a recorded signal does: the
-# "Compiler subprocess crashed after 21200s" variant was a budget expiry whose
-# teardown happened to reap a compiler subprocess, and the disk and preflight
-# readings are no more a verdict on the branch than that was.
+# "No verdict" outranks naming a cause, exactly as a recorded signal does: a
+# teardown that reaps a compiler subprocess first leaves the crash signature
+# behind, and that, the disk hit and the preflight's refusal are each no more a
+# verdict on the branch than the expiry is.
 assert_failure_kind_at "an expiry outranks a crashed compiler subprocess the teardown reaped" 101 21203 "signalled" \
   SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_failure_kind_at "an expiry outranks a disk hit" 101 21203 "signalled" \
@@ -1747,11 +1741,11 @@ assert_describe "says a crashed compiler subprocess could not complete, not that
 assert_describe_lacks "does not call a crashed compiler subprocess a check failure" 101 \
   "checks failed" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
-# The budget expiry publishes nothing, like the signal it stands in for: the
-# verdicts it used to publish — "Sign-off checks failed after 21203s", and the
-# "Compiler subprocess crashed after 21200s" variant when the teardown reaped a
-# compiler first — both disqualified a commit nothing judged (#13843). The
-# 21195 s every describe case runs at is inside the 353-minute budget's grace.
+# The budget expiry publishes nothing, like the signal it stands in for: either
+# verdict it could otherwise reach — "Sign-off checks failed" or, when the
+# teardown reaped a compiler first, "Compiler subprocess crashed" — would
+# disqualify a commit nothing judged (#13843). The 21195 s every describe case
+# runs at is inside the 353-minute budget's grace.
 assert_describe "publishes no verdict when the step budget expired without a signal" 101 "" \
   "the checks reached no verdict" \
   SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
