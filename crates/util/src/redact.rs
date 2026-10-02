@@ -36,8 +36,9 @@ use url::Url;
 #[must_use]
 pub fn url_without_secrets(url: &Url) -> Url {
     let mut redacted = url.clone();
-    // Both setters fail only on a URL that cannot be a base (`mailto:`,
-    // `data:`), and such a URL has no userinfo to strip.
+    // Both setters refuse a URL with no host (`mailto:`, `data:`) and a
+    // `file:` URL, neither of which carries userinfo, so there is nothing to
+    // strip when they do.
     let _ = redacted.set_username("");
     let _ = redacted.set_password(None);
     redacted.set_query(None);
