@@ -981,12 +981,12 @@ The mechanics that make this correct:
 
 ### Keys repeated within one write
 
-A refresh can carry the same primary key more than once (two source files holding one key, say). Cayenne applies the documented `on_conflict` semantics, in which each incoming record batch is one upsert statement (`ConflictPolicy`, `KeyResolver` in `provider/key_conflicts.rs`):
+A refresh can carry the same primary key more than once (two source files holding one key, say). Cayenne applies `on_conflict` with each incoming record batch one upsert statement (`ConflictPolicy`, `KeyResolver` in `provider/key_conflicts.rs`):
 
 | `on_conflict` | repeat within a batch | repeat across batches |
 |---|---|---|
 | `drop` | first copy kept | first copy kept |
-| `upsert` | the write fails | last copy wins |
+| `upsert` | last copy wins | last copy wins |
 | `upsert_dedup` | identical rows collapse; differing ones fail the write | last copy wins |
 | `upsert_dedup_by_row_id` | last copy wins | last copy wins |
 

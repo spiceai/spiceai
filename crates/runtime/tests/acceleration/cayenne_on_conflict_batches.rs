@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 //! Cayenne resolves a primary key repeated in the incoming data of one refresh
-//! per the documented `on_conflict` semantics, in which each record batch is one
-//! upsert statement (regression tests for #14578):
+//! per `on_conflict`, each record batch being one upsert statement (regression
+//! tests for #14578):
 //!
 //! | `on_conflict`            | repeat within a batch          | repeat across batches |
 //! |--------------------------|--------------------------------|-----------------------|
 //! | `drop`                   | first copy kept                | first copy kept       |
-//! | `upsert`                 | error                          | last copy wins        |
+//! | `upsert`                 | last copy wins                 | last copy wins        |
 //! | `upsert_dedup`           | identical collapse, else error | last copy wins        |
 //! | `upsert_dedup_by_row_id` | last copy wins                 | last copy wins        |
 #![expect(clippy::expect_used)]
@@ -245,8 +245,8 @@ async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
             let expectations: [(&str, OnConflictBehavior, Option<&str>); 8] = [
                 (identical, OnConflictBehavior::Drop, Some("a")),
                 (differing, OnConflictBehavior::Drop, Some("a")),
-                (identical, OnConflictBehavior::Upsert, None),
-                (differing, OnConflictBehavior::Upsert, None),
+                (identical, OnConflictBehavior::Upsert, Some("a")),
+                (differing, OnConflictBehavior::Upsert, Some("c")),
                 (identical, OnConflictBehavior::UpsertDedup, Some("a")),
                 (differing, OnConflictBehavior::UpsertDedup, None),
                 (identical, OnConflictBehavior::UpsertDedupByRowId, Some("a")),

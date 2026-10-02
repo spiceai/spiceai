@@ -197,7 +197,7 @@ async fn streaming_append_keeps_last_copy_through_reopen_and_compaction() {
 #[tokio::test(flavor = "multi_thread")]
 async fn streaming_append_failure_leaves_previous_rows() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::DropIdentical).await;
         write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
@@ -211,10 +211,10 @@ async fn streaming_append_failure_leaves_previous_rows() {
             ],
         )
         .await
-        .expect_err("in-batch duplicate");
+        .expect_err("a differing repeat within one batch fails upsert_dedup");
         eprintln!("{mode:?} failed append: {error}");
         assert_eq!(visible(&provider).await, (owned(&[(9, "old")]), 1));
-        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        let provider = reopen(&catalog, &runtime_env, UpsertDedup::DropIdentical).await;
         assert_eq!(visible(&provider).await, (owned(&[(9, "old")]), 1));
     }
 }
@@ -566,12 +566,12 @@ async fn a_layered_overwrite_is_superseded_by_a_later_upsert_and_a_later_overwri
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_layered_overwrite_leaves_the_previous_table() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::DropIdentical).await;
         write(&provider, InsertOp::Overwrite, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
-        // The third batch repeats key 5 within itself, which plain `upsert` rejects,
-        // after the second batch has already opened a layer.
+        // The third batch repeats key 5 with differing values, which `upsert_dedup`
+        // rejects, after the second batch has already opened a layer.
         let error = write(
             &provider,
             InsertOp::Overwrite,
@@ -582,7 +582,7 @@ async fn a_failed_layered_overwrite_leaves_the_previous_table() {
             ],
         )
         .await
-        .expect_err("a repeat within one batch fails plain upsert");
+        .expect_err("a differing repeat within one batch fails upsert_dedup");
         assert!(
             error
                 .to_string()

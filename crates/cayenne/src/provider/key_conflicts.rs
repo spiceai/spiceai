@@ -16,15 +16,17 @@ limitations under the License.
 
 //! Primary keys repeated inside the incoming data of one write.
 //!
-//! The documented `on_conflict` semantics treat each incoming record batch as one
-//! upsert statement:
+//! Each incoming record batch is one upsert statement:
 //!
 //! | policy                   | repeat within a batch        | repeat across batches |
 //! |--------------------------|------------------------------|-----------------------|
 //! | `drop`                   | first copy kept              | first copy kept       |
-//! | `upsert`                 | error                        | last copy wins        |
+//! | `upsert`                 | last copy wins               | last copy wins        |
 //! | `upsert_dedup`           | identical rows collapse, else error | last copy wins |
 //! | `upsert_dedup_by_row_id` | last copy wins               | last copy wins        |
+//!
+//! A plain `upsert` keeps the last copy of a key a batch repeats, as conflict
+//! validation does for a statement's batch (`UpsertOptions::last_write_wins`).
 //!
 //! [`KeyResolver::resolve_batch`] applies the within-batch column, and
 //! [`KeyResolver::collapse_write`] applies both columns to a write whose batches
@@ -65,12 +67,11 @@ pub enum UpsertDedup {
 pub(crate) enum ConflictPolicy {
     /// `drop`: the first copy of a key is kept, within and across batches.
     KeepFirst,
-    /// `upsert`: a repeat within a batch fails; across batches the last copy wins.
-    Upsert,
     /// `upsert_dedup`: identical rows within a batch collapse, differing ones fail;
     /// across batches the last copy wins.
     UpsertDropIdentical,
-    /// `upsert_dedup_by_row_id`: the last copy wins, within and across batches.
+    /// `upsert` and `upsert_dedup_by_row_id`: the last copy wins, within and
+    /// across batches.
     UpsertKeepLast,
 }
 
@@ -80,9 +81,8 @@ impl ConflictPolicy {
         Some(match on_conflict? {
             OnConflict::DoNothing(_) | OnConflict::DoNothingAll => Self::KeepFirst,
             OnConflict::Upsert(_) => match dedup {
-                UpsertDedup::None => Self::Upsert,
                 UpsertDedup::DropIdentical => Self::UpsertDropIdentical,
-                UpsertDedup::KeepLast => Self::UpsertKeepLast,
+                UpsertDedup::None | UpsertDedup::KeepLast => Self::UpsertKeepLast,
             },
         })
     }
@@ -163,9 +163,9 @@ impl KeyResolver {
     pub(crate) fn for_change_stream(self) -> Self {
         let policy = match self.policy {
             ConflictPolicy::KeepFirst => ConflictPolicy::KeepFirst,
-            ConflictPolicy::Upsert
-            | ConflictPolicy::UpsertDropIdentical
-            | ConflictPolicy::UpsertKeepLast => ConflictPolicy::UpsertKeepLast,
+            ConflictPolicy::UpsertDropIdentical | ConflictPolicy::UpsertKeepLast => {
+                ConflictPolicy::UpsertKeepLast
+            }
         };
         Self {
             policy,
@@ -213,7 +213,6 @@ impl KeyResolver {
                     repeated = true;
                     match self.policy {
                         ConflictPolicy::KeepFirst => {}
-                        ConflictPolicy::Upsert => return Err(self.uniqueness_violation(batch)),
                         ConflictPolicy::UpsertDropIdentical => {
                             if !self.identical(batch, *entry.get(), row)? {
                                 return Err(self.uniqueness_violation(batch));
@@ -425,7 +424,7 @@ mod tests {
         );
         assert_eq!(
             ConflictPolicy::new(Some(&upsert), UpsertDedup::None),
-            Some(ConflictPolicy::Upsert)
+            Some(ConflictPolicy::UpsertKeepLast)
         );
         assert_eq!(
             ConflictPolicy::new(Some(&upsert), UpsertDedup::DropIdentical),
@@ -450,9 +449,6 @@ mod tests {
             ),
             owned(&[(1, "a"), (2, "b")])
         );
-        resolver(ConflictPolicy::Upsert)
-            .collapse_write(write())
-            .expect_err("upsert rejects a repeat within one batch");
         assert_eq!(
             rows(
                 &resolver(ConflictPolicy::UpsertDropIdentical)
@@ -469,14 +465,6 @@ mod tests {
             ),
             owned(&[(2, "b"), (1, "c")])
         );
-    }
-
-    #[test]
-    fn upsert_takes_the_last_copy_across_batches() {
-        let resolved = resolver(ConflictPolicy::Upsert)
-            .collapse_write(vec![batch(&[(1, "a"), (2, "b")]), batch(&[(1, "c")])])
-            .expect("a repeat across batches is an upsert");
-        assert_eq!(rows(&resolved), owned(&[(2, "b"), (1, "c")]));
     }
 
     #[test]
@@ -513,7 +501,6 @@ mod tests {
         .expect("batch");
         for policy in [
             ConflictPolicy::KeepFirst,
-            ConflictPolicy::Upsert,
             ConflictPolicy::UpsertDropIdentical,
             ConflictPolicy::UpsertKeepLast,
         ] {
