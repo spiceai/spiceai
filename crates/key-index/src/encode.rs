@@ -304,8 +304,8 @@ impl KeyEncoder {
     }
 
     /// Whether distinct keys always have distinct [words](Self::key_word).
-    #[must_use]
-    pub fn exact_words(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn exact_words(&self) -> bool {
         matches!(self.words, WordRule::Exact(_))
     }
 
@@ -504,8 +504,8 @@ impl<'a> BoundKeyColumns<'a> {
 
     /// Every row's key, concatenated, with `offsets[i]..offsets[i + 1]` the
     /// range of row `i`.
-    #[must_use]
-    pub fn encode_all(&self) -> (Vec<u8>, Vec<usize>) {
+    #[cfg(test)]
+    pub(crate) fn encode_all(&self) -> (Vec<u8>, Vec<usize>) {
         let mut bytes = Vec::new();
         let mut offsets = Vec::with_capacity(self.num_rows + 1);
         offsets.push(0);

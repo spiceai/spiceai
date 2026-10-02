@@ -52,35 +52,11 @@ mod word_proof;
 #[cfg(test)]
 mod proptests;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 
 pub use encode::{BoundKeyColumns, KeyEncoder, KeyField};
-
-/// One row's encoded key, owned.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EncodedKey(Vec<u8>);
-
-impl EncodedKey {
-    /// The key of `row` of `bound`.
-    #[must_use]
-    pub fn from_row(bound: &BoundKeyColumns<'_>, row: usize) -> Self {
-        let mut bytes = Vec::new();
-        bound.encode_row(row, &mut bytes);
-        Self(bytes)
-    }
-
-    /// A key already in [`KeyEncoder`]'s encoding.
-    #[must_use]
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    /// The encoded bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
 
 use snafu::Snafu;
 

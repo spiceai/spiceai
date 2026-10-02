@@ -29,7 +29,7 @@ limitations under the License.
 //! ```
 //!
 //! All integers are little-endian. The trailing checksum is
-//! [`hash_index::hash_key_bytes`] over everything before it, so a torn or
+//! [`hash_index::hash_key_bytes_oneshot`] over everything before it, so a torn or
 //! corrupt file is rejected rather than read; a reader treats any error as a
 //! missing file and rebuilds.
 
@@ -74,7 +74,7 @@ pub(crate) fn header(out: &mut Vec<u8>, kind: u32) {
 }
 
 pub(crate) fn seal(out: &mut Vec<u8>) {
-    let checksum = hash_index::hash_key_bytes(&[out]);
+    let checksum = hash_index::hash_key_bytes_oneshot(out);
     out.extend_from_slice(&checksum.to_le_bytes());
 }
 
@@ -89,7 +89,7 @@ pub(crate) fn open(bytes: &[u8], kind: u32) -> Result<Reader<'_>> {
     );
     let expected = u64::from_le_bytes(checksum.try_into().map_err(|_| Error::Truncated)?);
     ensure!(
-        hash_index::hash_key_bytes(&[body]) == expected,
+        hash_index::hash_key_bytes_oneshot(body) == expected,
         ChecksumSnafu
     );
     Ok(reader)
