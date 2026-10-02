@@ -993,7 +993,8 @@ fn merge_runs(sources: &[&RunEntry]) -> Result<IndexRun> {
         .enumerate()
         .filter_map(|(i, source)| source.run.words.first().map(|&word| Reverse((word, i))))
         .collect();
-    // The merged run holds at least the words of its largest source.
+    // The merged run holds every word of its largest source, unless a retired
+    // file held a word's only rows.
     let mut writer = RunWriter::with_capacity(
         sources
             .iter()
@@ -1239,6 +1240,7 @@ impl TieredIndex {
                 }
             },
             |_| FileState::Pending(0),
+            |_| true,
         );
     }
 
@@ -1259,17 +1261,20 @@ impl TieredIndex {
                     FileState::Retired
                 }
             },
+            RunEntry::any_live,
         );
     }
 
     /// Publishes `add` in one swap: each published file's state becomes
-    /// `retire(file, state)`, and each new file starts in `initial(file)`. A
-    /// run none of whose files is live, published or new, is dropped.
+    /// `retire(file, state)`, dropping a published run none of whose files
+    /// stays live, and each new file starts in `initial(file)`. A new run is
+    /// added when `admit` accepts its files' states.
     fn publish_runs(
         &self,
         add: Vec<IndexRun>,
         retire: impl Fn(&str, FileState) -> FileState,
         initial: impl Fn(&str) -> FileState,
+        admit: impl Fn(&[FileState]) -> bool,
     ) {
         let _swap = self.swap.lock();
         let current = self.layers.load_full();
@@ -1277,7 +1282,7 @@ impl TieredIndex {
         let mut admitted: Vec<(IndexRun, Arc<[FileState]>)> = Vec::with_capacity(add.len());
         for run in add {
             let states: Arc<[FileState]> = run.files.iter().map(|file| initial(file)).collect();
-            if RunEntry::any_live(&states) {
+            if admit(&states) {
                 admitted.push((run, states));
             }
         }

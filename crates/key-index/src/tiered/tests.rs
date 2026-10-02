@@ -270,6 +270,27 @@ fn merging_runs_keeps_every_live_row() {
     assert_eq!(got, model);
 }
 
+/// `publish` keeps every run it is given, one over no files included, while
+/// `publish_visible` drops a run none of whose files is live.
+#[test]
+fn publish_keeps_every_run_and_publish_visible_only_live_ones() {
+    let index = TieredIndex::new(encoder());
+    index.publish(
+        vec![RunBuilder::new(encoder()).finish().expect("empty run")],
+        &[],
+    );
+    assert_eq!(index.view().runs(), 1, "a run over no files is kept");
+    let live: HashSet<&str> = HashSet::new();
+    index.publish_visible(
+        vec![
+            RunBuilder::new(encoder()).finish().expect("empty run"),
+            run_of("gone", &[1]),
+        ],
+        &live,
+    );
+    assert_eq!(index.view().runs(), 1, "runs with no live file are dropped");
+}
+
 /// Rows at explicit positions (a read-back) index exactly like the same
 /// rows at contiguous ones (a write); a file declared with no indexed row
 /// is still covered; retiring a file ends its coverage.
