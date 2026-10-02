@@ -387,10 +387,11 @@ pub(crate) fn bigquery_cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>)
 }
 
 /// Whether values of `data_type` are text — Arrow's own classification,
-/// looking through a dictionary encoding of them.
+/// looking through a dictionary or run-end encoding of them.
 fn is_string_type(data_type: &DataType) -> bool {
     match data_type {
         DataType::Dictionary(_, value) => is_string_type(value),
+        DataType::RunEndEncoded(_, values) => is_string_type(values.data_type()),
         other => other.is_string(),
     }
 }
@@ -1243,6 +1244,13 @@ mod tests {
                 "k",
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
             ),
+            (
+                "r",
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    Arc::new(Field::new("values", DataType::Utf8, true)),
+                ),
+            ),
         ]);
         let targets = [
             DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -1253,6 +1261,7 @@ mod tests {
             col("l"),
             col("v"),
             col("k"),
+            col("r"),
             lit("2026-01-15T10:30:00.390436170Z"),
         ] {
             for target in &targets {
