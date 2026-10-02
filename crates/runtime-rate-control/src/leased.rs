@@ -64,12 +64,36 @@ limitations under the License.
 //! requests    = Σ_age weight(age) · Σ_leases (ok + failed)
 //! accepts     = Σ_age weight(age) · Σ_leases  ok
 //! coefficient = min( (K · accepts + 1) / (requests + 1),  1 )
-//! effective_burst = max(1, round(burst_per_window · coefficient))
+//! budget      = burst_per_window · coefficient
 //! ```
 //!
 //! `K = 1 / (1 - failure_threshold)`, so the coefficient is exactly 1 at or
-//! below the configured error rate and falls below it above. The floor of one
-//! request per window keeps recovery observable at any error rate.
+//! below the configured error rate and falls below it above.
+//!
+//! ### Carrying the fraction a lease cannot hold
+//!
+//! A lease is whole tokens, so the budget has to be split:
+//!
+//! ```text
+//! whole     = floor(budget)
+//! remainder = budget - whole        // in [0, 1)
+//! ```
+//!
+//! Dropping the remainder every window leaves two bands in which the control
+//! has no effect at all:
+//!
+//! 1. A small configured burst. At `burst_per_window = 1` the whole part is
+//!    only ever 0 or 1, so a floor of one token let the cluster send at its
+//!    configured rate however badly the origin failed.
+//! 2. A coefficient above `1 - 1/(2 · burst_per_window)`, where rounding
+//!    returned the configured budget in full and the throttle did nothing.
+//!
+//! Each replica therefore banks `remainder · its share of cluster demand` once
+//! per window, and spends one whole token when its bank holds one. The shares
+//! of a window sum to one, so the banks of the fleet hold exactly one window's
+//! remainder between them: the carry needs no replica-to-replica traffic and
+//! cannot raise the cluster above its budget. A bank is local to one replica
+//! and is never written to the shared file.
 //!
 //! Unlike the single-node controller, outcome counts are bucketed into whole
 //! windows rather than timestamped, so the decay runs on window identifiers:
@@ -79,8 +103,8 @@ limitations under the License.
 //! windows, whatever its local clock reads.
 //!
 //! The budget itself is never written back. Only the counts are shared; each
-//! replica derives `effective_burst` from them and holds it for the life of
-//! the window, so a tick cannot move the budget under a grant already issued.
+//! replica derives the budget from them and holds it for the life of the
+//! window, so a tick cannot move the budget under a grant already issued.
 
 use std::{
     collections::HashMap,
@@ -122,6 +146,13 @@ const OUTCOME_EWMA_LOOKBACK_WINDOWS: u64 = 5;
 /// The coefficient of a healthy origin: the configured cluster budget applies
 /// in full. Mirrors the single-node controller's `FULL_ADMISSION_COEFFICIENT`.
 const FULL_ADMISSION_COEFFICIENT: f64 = 1.0;
+/// The most fractional tokens one replica may hold in its bank.
+///
+/// A carried token the cluster cap refuses stays banked for a later window, but
+/// a replica refused for a long run must not store those windows up and release
+/// them together. Two tokens holds a full token plus one more window of accrual,
+/// which is all the normal refuse-then-spend path needs.
+const MAX_BANKED_TOKENS: f64 = 2.0;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -524,6 +555,27 @@ impl DemandSample {
             (total, mine) => u64::try_from((u128::from(burst) * mine) / total).unwrap_or(burst),
         }
     }
+
+    /// This replica's share of cluster demand, in `[0, 1]`, or `None` when the
+    /// sample cannot divide one.
+    ///
+    /// Shares taken from one sample sum to 1 across the replicas in it, and that
+    /// identity is what keeps the banked remainder of a window summing to one
+    /// window's remainder. Where the identity cannot hold there is no share to
+    /// give: with no cluster demand recorded at all, every replica would read a
+    /// share of 1 and the fleet would bank the remainder once per replica, so
+    /// the caller banks nothing instead. A replica of its own zero demand needs
+    /// no carry either.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "weighted per-window request counts; the ratio is what matters, not the last bit"
+    )]
+    fn share_fraction(self) -> Option<f64> {
+        if self.total == 0 || self.mine == 0 {
+            return None;
+        }
+        Some((self.mine as f64 / self.total as f64).clamp(0.0, 1.0))
+    }
 }
 
 /// Counts a replica publishes for a window alongside its lease.
@@ -699,7 +751,8 @@ pub struct LeasedBucketMetrics {
     /// [`NO_COEFFICIENT_BITS`] so a mode that cannot throttle reports no series
     /// rather than a constant `1` that reads like a live measurement.
     adaptive_admission_ratio_bits: AtomicU64,
-    /// The cluster budget of the current window after the coefficient.
+    /// The whole part of the cluster budget of the current window, after the
+    /// coefficient.
     cluster_effective_burst: AtomicU64,
 }
 
@@ -766,8 +819,11 @@ impl LeasedBucketMetrics {
         }
     }
 
-    /// The cluster budget of the most recently leased window, after the
-    /// coefficient. Equal to the configured burst while the origin is healthy.
+    /// The whole part of the cluster budget of the most recently leased window,
+    /// after the coefficient. Equal to the configured burst while the origin is
+    /// healthy. The fraction the whole part drops is carried by the replicas and
+    /// is reported by [`Self::adaptive_admission_ratio`], so a deeply throttled
+    /// cluster can read zero here and still send.
     #[must_use]
     pub fn cluster_effective_burst(&self) -> u64 {
         self.cluster_effective_burst.load(Ordering::Relaxed)
@@ -1036,6 +1092,128 @@ pub(crate) struct LeasedBucket {
     /// The budget this replica has already fixed for the windows it is
     /// currently leasing. Touched once per refresh tick, like `throttle_log`.
     budget_memo: SyncMutex<BudgetMemo>,
+    /// The fraction of the cluster budget this replica carries between windows.
+    /// Local to this replica, and never written to the shared file.
+    remainder_bank: SyncMutex<RemainderBank>,
+}
+
+/// The cluster budget for one window after the adaptive coefficient, split into
+/// the whole tokens a lease can carry and the fraction it cannot.
+///
+/// Capped at the configured burst, because adaptive control modifies a static
+/// limit and never raises it. Deliberately *not* floored at one: a floor of one
+/// token per window is itself a dead zone, because at a configured burst of one
+/// no error rate could then throttle the cluster at all. The fraction is not
+/// lost either — [`RemainderBank`] carries it.
+#[derive(Debug, Clone, Copy, Default)]
+struct ClusterBudget {
+    /// `floor(burst · coefficient)`: what a lease can hold.
+    whole: u64,
+    /// What the floor dropped, in `[0, 1)`.
+    remainder: f64,
+}
+
+impl ClusterBudget {
+    /// The configured budget in full: static mode, where there is no
+    /// coefficient and so nothing to carry.
+    fn full(burst: u64) -> Self {
+        Self {
+            whole: burst,
+            remainder: 0.0,
+        }
+    }
+
+    /// Split `burst · coefficient`, with `coefficient` in `[0, 1]`.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "burst is a per-window request count; the coefficient is clamped to [0, 1], so the product is non-negative and well within u64"
+    )]
+    fn scaled(burst: u64, coefficient: f64) -> Self {
+        let scaled = burst as f64 * coefficient.clamp(0.0, FULL_ADMISSION_COEFFICIENT);
+        let whole = (scaled.floor() as u64).min(burst);
+        Self {
+            whole,
+            // A product that reaches the cap has nothing left to carry.
+            remainder: if whole >= burst {
+                0.0
+            } else {
+                scaled - scaled.floor()
+            },
+        }
+    }
+
+    /// The whole part as a real number, for the arithmetic the carry needs.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a per-window request count, far below 2^53 in any real configuration"
+    )]
+    fn whole_tokens(self) -> f64 {
+        self.whole as f64
+    }
+
+    /// Tokens this window targets, the carried fraction included. `whole` is
+    /// what one lease can hold; this is what the cluster spends over time.
+    fn target(self) -> f64 {
+        self.whole_tokens() + self.remainder
+    }
+}
+
+/// Carries the fraction of the cluster budget that a whole-token lease drops.
+///
+/// Each window the replica banks its own share of that fraction and may spend a
+/// whole token once the bank holds one. The shares of a window sum to one, so
+/// the fleet's banks hold exactly one window's fraction between them without any
+/// replica-to-replica traffic.
+#[derive(Debug, Default)]
+struct RemainderBank {
+    /// Fractional tokens held, in `[0, MAX_BANKED_TOKENS]`.
+    banked: f64,
+    /// Highest window already banked for. The lease path visits a window many
+    /// times — once per refresh tick, as the current window and again as the
+    /// pre-leased one — and the fraction may be banked only once per window, or
+    /// a fast tick rate would multiply the budget.
+    highest_banked_window: Option<u64>,
+}
+
+impl RemainderBank {
+    /// Bank `remainder · share` for `window_id` if that window has not banked
+    /// yet, then report how many whole tokens the bank can fund.
+    ///
+    /// `share` is `None` when the demand sample cannot divide a share; the
+    /// window then banks nothing rather than have every replica bank the whole
+    /// fraction. See [`DemandSample::share_fraction`].
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the bank is non-negative and clamped to MAX_BANKED_TOKENS"
+    )]
+    fn accrue(&mut self, window_id: u64, remainder: f64, share: Option<f64>) -> u64 {
+        if self
+            .highest_banked_window
+            .is_none_or(|highest| window_id > highest)
+        {
+            self.highest_banked_window = Some(window_id);
+            if let Some(share) = share {
+                self.banked = (self.banked + remainder * share).clamp(0.0, MAX_BANKED_TOKENS);
+            }
+        }
+        self.banked.floor() as u64
+    }
+
+    /// Debit the carried tokens a lease actually granted.
+    ///
+    /// Only what was granted. A carried token the cluster cap refused stays
+    /// banked for a later window; debiting the request instead would make the
+    /// fleet admit steadily less than the budget it derived.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "at most MAX_BANKED_TOKENS whole tokens"
+    )]
+    fn debit(&mut self, tokens: u64) {
+        self.banked = (self.banked - tokens as f64).max(0.0);
+    }
 }
 
 /// Holds this replica's derived budget for the life of each window it leases.
@@ -1044,24 +1222,31 @@ pub(crate) struct LeasedBucket {
 /// third window is never live at once.
 #[derive(Debug, Default)]
 struct BudgetMemo {
-    slots: [Option<(u64, u64)>; 2],
+    slots: [Option<(u64, ClusterBudget)>; 2],
 }
 
 impl BudgetMemo {
     /// The budget already fixed for `window_id`, else `derive()`'s value,
     /// stored against it. Evicts the older window when both slots are taken.
-    fn get_or_derive(&mut self, window_id: u64, derive: impl FnOnce() -> u64) -> u64 {
-        if let Some((_, burst)) = self.slots.iter().flatten().find(|(id, _)| *id == window_id) {
-            return *burst;
+    fn get_or_derive(
+        &mut self,
+        window_id: u64,
+        derive: impl FnOnce() -> ClusterBudget,
+    ) -> ClusterBudget {
+        if let Some((_, budget)) = self.slots.iter().flatten().find(|(id, _)| *id == window_id) {
+            return *budget;
         }
-        let burst = derive();
+        let budget = derive();
+        // A budget holds a float and so is not ordered; compare the slots on
+        // window id, which is what "older" meant all along.
+        let window_of = |slot: &Option<(u64, ClusterBudget)>| slot.map_or(0, |(id, _)| id);
         let victim = self
             .slots
             .iter()
             .position(Option::is_none)
-            .unwrap_or_else(|| usize::from(self.slots[1] < self.slots[0]));
-        self.slots[victim] = Some((window_id, burst));
-        burst
+            .unwrap_or_else(|| usize::from(window_of(&self.slots[1]) < window_of(&self.slots[0])));
+        self.slots[victim] = Some((window_id, budget));
+        budget
     }
 }
 
@@ -1086,6 +1271,7 @@ impl LeasedBucket {
             metrics: Arc::new(LeasedBucketMetrics::default()),
             throttle_log: SyncMutex::new(PhaseChangeLog::new(ThrottleState::Healthy, hold)),
             budget_memo: SyncMutex::new(BudgetMemo::default()),
+            remainder_bank: SyncMutex::new(RemainderBank::default()),
             config,
         })
     }
@@ -1329,17 +1515,6 @@ impl LeasedBucket {
             );
             (adaptive, outcomes)
         });
-        // The budget this window is leased against, derived once and then held
-        // for the life of the window. A later tick must not move it: this
-        // replica's grant is already in the file, and a budget recomputed from
-        // fresher counts would republish a `budget_remaining` that contradicts
-        // the leases already written. Same reason the grant itself is
-        // first-write-wins.
-        let effective_burst = self.budget_memo.lock().get_or_derive(window_id, || {
-            reading.map_or(burst, |(adaptive, outcomes)| {
-                scale_burst(burst, outcomes.coefficient(adaptive.k))
-            })
-        });
 
         // Read the smoothed demand signal before taking a mutable borrow on
         // the window below.
@@ -1349,22 +1524,52 @@ impl LeasedBucket {
         // whatever the cluster is currently allowed. The share it wins, and the
         // clamps around it, are of the effective budget: that is the permission
         // actually being divided up.
-        let demand = limiter
-            .ewma_demand(instance, now_window, burst, DEMAND_EWMA_LOOKBACK_WINDOWS)
-            .demand_signal(effective_burst, local_demand_hint)
-            .max(min_lease(effective_burst))
-            .min(max_lease_per_replica(effective_burst));
+        let demand_sample =
+            limiter.ewma_demand(instance, now_window, burst, DEMAND_EWMA_LOOKBACK_WINDOWS);
 
-        let window = limiter.window_entry(window_id, effective_burst);
+        // The budget this window is leased against, derived once and then held
+        // for the life of the window. A later tick must not move it: this
+        // replica's grant is already in the file, and a budget recomputed from
+        // fresher counts would republish a `budget_remaining` that contradicts
+        // the leases already written. Same reason the grant itself is
+        // first-write-wins.
+        let budget = self.budget_memo.lock().get_or_derive(window_id, || {
+            reading.map_or_else(
+                || ClusterBudget::full(burst),
+                |(adaptive, outcomes)| {
+                    ClusterBudget::scaled(burst, outcomes.coefficient(adaptive.k))
+                },
+            )
+        });
+
+        // Bank this replica's share of the fraction the whole part dropped, and
+        // ask what the bank can fund on top of the demand-weighted slice. The
+        // bank accrues once per window however many ticks reach this line.
+        let carried = self.remainder_bank.lock().accrue(
+            window_id,
+            budget.remainder,
+            demand_sample.share_fraction(),
+        );
+
+        let demand = demand_sample
+            .demand_signal(budget.whole, local_demand_hint)
+            .max(min_lease(budget.whole))
+            .min(max_lease_per_replica(budget.whole));
+
+        let window = limiter.window_entry(window_id, budget.whole);
 
         // Only the current window can hold expired leases; a future window's
         // lease cannot have expired yet.
         window.drop_expired(now);
-        window.recompute_budget_remaining(effective_burst);
+        window.recompute_budget_remaining(budget.whole);
 
         let my_existing = window.granted_for(instance);
-        let max_possible_for_me =
-            effective_burst.saturating_sub(window.granted_by_others(instance));
+        // A carried token is funded by this replica's own bank rather than out
+        // of the cluster whole part, so it raises this replica's ceiling.
+        let max_possible_for_me = budget
+            .whole
+            .saturating_add(carried)
+            .saturating_sub(window.granted_by_others(instance));
 
         // Pick the new grant.
         //
@@ -1375,11 +1580,17 @@ impl LeasedBucket {
         // occur as demand-weighted recomputation ping-pongs leases between
         // replicas. Adjustments to demand show up in the *next* window's
         // pre-lease.
-        let new_grant = if my_existing > 0 {
-            my_existing
+        let (new_grant, carry_spent) = if my_existing > 0 {
+            (my_existing, 0)
         } else {
-            demand.min(max_possible_for_me)
+            let granted = demand.saturating_add(carried).min(max_possible_for_me);
+            (granted, granted.saturating_sub(demand))
         };
+
+        // Debit the bank by what the grant actually carried, never by what it
+        // asked for. A carried token the cluster cap refused has to stay banked
+        // for a later window, or the fleet admits less than its own budget.
+        self.remainder_bank.lock().debit(carry_spent);
 
         // Always re-publish so peers see updated `consumed`/`attempted`/
         // `ok`/`failed` counters even when our `granted` value is unchanged.
@@ -1397,15 +1608,20 @@ impl LeasedBucket {
             },
         );
 
-        window.recompute_budget_remaining(effective_burst);
+        window.recompute_budget_remaining(budget.whole);
 
+        // Decided on the ratio, not on the whole part: with the fraction
+        // carried, a budget whose whole part equals the configured burst can
+        // still be a throttled one.
+        let ratio = admission_ratio(budget, burst);
         WindowOutcome {
             granted: new_grant,
             budget_remaining_after: window.budget_remaining,
             throttle: reading.map(|(adaptive, outcomes)| ClusterThrottle {
-                effective_burst,
-                admission_ratio: admission_ratio(effective_burst, burst),
-                near_boundary: outcomes.is_near_boundary(adaptive.k, effective_burst < burst),
+                effective_burst: budget.whole,
+                admission_ratio: ratio,
+                near_boundary: outcomes
+                    .is_near_boundary(adaptive.k, ratio < FULL_ADMISSION_COEFFICIENT),
             }),
             dirty: published,
         }
@@ -1513,9 +1729,12 @@ struct WindowOutcome {
 /// and how confident the reading behind it is.
 #[derive(Debug, Clone, Copy)]
 struct ClusterThrottle {
-    /// The cluster budget for the window after the coefficient.
+    /// The whole part of the cluster budget for the window: what the leases of
+    /// the window can hold between them. The fraction the whole part drops is
+    /// carried by the replicas and shows up in `admission_ratio`.
     effective_burst: u64,
-    /// `effective_burst / burst_per_window`, in `[0, 1]`.
+    /// The fractional budget over the configured burst, in `[0, 1]`. Equal to
+    /// the coefficient, bar the cap at the configured burst.
     admission_ratio: f64,
     /// Whether one more recorded outcome could flip the state back, so the log
     /// has to hold the reading for a window before reporting it.
@@ -1540,25 +1759,14 @@ impl ClusterThrottle {
     }
 }
 
-/// The cluster budget for one window after the adaptive coefficient.
-///
-/// Floored at one: the cluster always sends at least one request per window,
-/// whatever the error rate, so recovery is always tested and the coefficient can
-/// rise again. Capped at the configured burst, because adaptive control is a
-/// modifier on a static limit and never raises it.
-fn scale_burst(burst: u64, coefficient: f64) -> u64 {
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "burst is a per-window request count; the coefficient is clamped to [0, 1], so the product is non-negative and well within u64"
-    )]
-    let scaled = (burst as f64 * coefficient).round() as u64;
-    scaled.clamp(1, burst.max(1))
-}
-
 /// The fraction of the configured budget a window is allowed to spend.
-fn admission_ratio(effective_burst: u64, burst: u64) -> f64 {
+///
+/// Measured against the fractional budget, not the whole part the lease path
+/// enforces. The remainder is spent as well — banked by each replica and
+/// released one whole token at a time — so reporting `whole / burst` would read
+/// as a deeper throttle than the cluster applies, and at a configured burst of
+/// one it would report 0 for every coefficient below 1.
+fn admission_ratio(budget: ClusterBudget, burst: u64) -> f64 {
     if burst == 0 {
         return FULL_ADMISSION_COEFFICIENT;
     }
@@ -1566,7 +1774,7 @@ fn admission_ratio(effective_burst: u64, burst: u64) -> f64 {
         clippy::cast_precision_loss,
         reason = "per-window request counts; the ratio is what matters, not the last bit"
     )]
-    let ratio = effective_burst as f64 / burst as f64;
+    let ratio = budget.target() / burst as f64;
     ratio.clamp(0.0, FULL_ADMISSION_COEFFICIENT)
 }
 
@@ -1580,17 +1788,30 @@ fn window_id_for(now: SystemTime, window: Duration) -> u64 {
     unix_millis(now) / duration_millis_u64(window).max(1)
 }
 
-fn min_lease(burst_per_window: u64) -> u64 {
-    let floor = burst_per_window / 100;
-    floor.max(1)
+/// The smallest slice a replica may lease: one percent of the budget, and never
+/// less than one token.
+///
+/// A budget of zero is the exception, and the reason the floor is spelled out
+/// rather than left as a `.max(1)`: a budget the coefficient has closed must
+/// grant nothing. One token there would give every replica a token per window
+/// and put back the band the carried remainder exists to remove.
+fn min_lease(budget_per_window: u64) -> u64 {
+    if budget_per_window == 0 {
+        return 0;
+    }
+    (budget_per_window / 100).max(1)
 }
 
-fn max_lease_per_replica(burst_per_window: u64) -> u64 {
-    // Allow a single replica to claim almost all the budget when no peer is
-    // demanding any. We always reserve at least `min_lease` so a newcomer can
-    // grab a starter slice in its first window.
-    burst_per_window
-        .saturating_sub(min_lease(burst_per_window))
+/// The largest slice one replica may lease. A single replica can claim almost
+/// the whole budget when no peer demands any; `min_lease` stays reserved so a
+/// newcomer can take a starter slice in its first window. Zero on a zero budget,
+/// for the reason [`min_lease`] gives.
+fn max_lease_per_replica(budget_per_window: u64) -> u64 {
+    if budget_per_window == 0 {
+        return 0;
+    }
+    budget_per_window
+        .saturating_sub(min_lease(budget_per_window))
         .max(1)
 }
 
@@ -2217,16 +2438,275 @@ mod tests {
         );
     }
 
-    /// The cluster always sends at least one request per window, whatever the
-    /// error rate, so recovery is always tested.
+    /// Tokens one replica admits per window, averaged over `windows` windows,
+    /// for a replica that holds the whole demand share and that the cluster cap
+    /// never refuses.
+    fn mean_admitted(burst: u64, coefficient: f64, windows: u32) -> f64 {
+        let budget = ClusterBudget::scaled(burst, coefficient);
+        let mut bank = RemainderBank::default();
+        let mut carried = 0_u32;
+        for window in 0..u64::from(windows) {
+            let offered = bank.accrue(window, budget.remainder, Some(1.0));
+            bank.debit(offered);
+            carried += u32::try_from(offered).unwrap_or(u32::MAX);
+        }
+        budget.whole_tokens() + f64::from(carried) / f64::from(windows)
+    }
+
+    /// The carry is what holds the throttle on target: over a few hundred
+    /// windows the cluster admits `burst · coefficient` per window, at a
+    /// configured burst of one as well as at six hundred.
     #[test]
-    fn effective_burst_never_falls_below_one() {
-        assert_eq!(scale_burst(10, 0.0), 1);
-        assert_eq!(scale_burst(10, 0.01), 1);
-        assert_eq!(scale_burst(1, 0.0), 1);
-        // And never rises above the configured limit.
-        assert_eq!(scale_burst(10, 1.0), 10);
-        assert_eq!(scale_burst(10, 0.5), 5);
+    fn the_carried_remainder_converges_on_the_fractional_budget() {
+        const WINDOWS: u32 = 400;
+        for (burst, coefficient) in [
+            (1_u32, 0.3_f64),
+            (1, 0.9),
+            (5, 0.3),
+            (5, 0.9),
+            (600, 0.3),
+            (600, 0.9),
+        ] {
+            let target = f64::from(burst) * coefficient;
+            let mean = mean_admitted(u64::from(burst), coefficient, WINDOWS);
+            assert!(
+                (mean - target).abs() < 0.01,
+                "burst {burst} at coefficient {coefficient} should admit about {target} per window, admitted {mean}"
+            );
+        }
+    }
+
+    /// The first dead zone: at a configured burst of one the whole part is only
+    /// ever 0 or 1, so with a floor of one token no error rate could throttle
+    /// the cluster at all.
+    #[test]
+    fn a_configured_burst_of_one_can_be_throttled() {
+        let budget = ClusterBudget::scaled(1, 0.3);
+        assert_eq!(
+            budget.whole, 0,
+            "a lease at a burst of one carries no whole token"
+        );
+        assert!((budget.remainder - 0.3).abs() < 1e-9);
+        assert!(
+            admission_ratio(budget, 1) < FULL_ADMISSION_COEFFICIENT,
+            "and the window has to report as throttled"
+        );
+        assert!((mean_admitted(1, 0.3, 400) - 0.3).abs() < 0.01);
+    }
+
+    /// The second dead zone: above `1 − 1/(2·B)` rounding returned the
+    /// configured budget in full, so a cluster that had started to fail kept
+    /// sending at its configured rate.
+    #[test]
+    fn a_coefficient_inside_the_old_rounding_band_still_throttles() {
+        let burst = 10_u64;
+        // 1 − 1/(2·10) = 0.95, and rounding 9.6 gave back all ten tokens.
+        let budget = ClusterBudget::scaled(burst, 0.96);
+        assert_eq!(
+            budget.whole, 9,
+            "the lease may carry only nine whole tokens"
+        );
+        assert!((budget.remainder - 0.6).abs() < 1e-9);
+        assert!(
+            admission_ratio(budget, burst) < FULL_ADMISSION_COEFFICIENT,
+            "and the window has to report as throttled"
+        );
+        assert!((mean_admitted(burst, 0.96, 400) - 9.6).abs() < 0.01);
+    }
+
+    /// A healthy origin is unchanged at any burst: the configured budget in
+    /// full, nothing carried, and an admission ratio of one.
+    #[test]
+    fn a_healthy_origin_keeps_the_whole_configured_budget() {
+        for burst in [1_u64, 5, 600] {
+            let budget = ClusterBudget::scaled(burst, FULL_ADMISSION_COEFFICIENT);
+            assert_eq!(budget.whole, burst);
+            assert!(budget.remainder.abs() < f64::EPSILON);
+            assert!(
+                (admission_ratio(budget, burst) - FULL_ADMISSION_COEFFICIENT).abs() < f64::EPSILON
+            );
+        }
+        // And the budget never rises above the configured limit.
+        assert_eq!(ClusterBudget::scaled(10, 2.0).whole, 10);
+    }
+
+    /// A carried token the cluster cap refuses stays banked and is spent in a
+    /// later window.
+    #[test]
+    fn a_refused_carried_token_stays_banked() {
+        let mut bank = RemainderBank::default();
+        assert_eq!(bank.accrue(0, 0.5, Some(1.0)), 0);
+        assert_eq!(bank.accrue(1, 0.5, Some(1.0)), 1);
+        bank.debit(0); // The cluster cap refused it.
+        assert_eq!(
+            bank.accrue(2, 0.5, Some(1.0)),
+            1,
+            "a refused token has to stay banked"
+        );
+        bank.debit(1);
+        assert_eq!(bank.accrue(3, 0.5, Some(1.0)), 1);
+        bank.debit(1);
+        assert_eq!(bank.accrue(4, 0.5, Some(1.0)), 0);
+    }
+
+    /// Debiting the request rather than the grant loses the fraction every time
+    /// the cluster cap refuses a token, and the fleet then admits steadily less
+    /// than the budget it derived.
+    #[test]
+    fn debiting_a_request_instead_of_a_grant_under_admits() {
+        const WINDOWS: u64 = 200;
+        const REMAINDER: f64 = 0.5;
+        // The cluster cap refuses the carried token in one window of every
+        // eight.
+        let refused = |window: u64| window % 8 == 1;
+
+        let mut honest = RemainderBank::default();
+        let mut naive = RemainderBank::default();
+        let (mut honest_total, mut naive_total) = (0_u32, 0_u32);
+        for window in 0..WINDOWS {
+            let offered = honest.accrue(window, REMAINDER, Some(1.0));
+            let granted = if refused(window) { 0 } else { offered };
+            honest.debit(granted);
+            honest_total += u32::try_from(granted).unwrap_or(0);
+
+            let offered = naive.accrue(window, REMAINDER, Some(1.0));
+            let granted = if refused(window) { 0 } else { offered };
+            naive.debit(offered); // The mistake: the request, not the grant.
+            naive_total += u32::try_from(granted).unwrap_or(0);
+        }
+
+        assert_eq!(
+            honest_total, 100,
+            "an honest debit admits the whole remainder: 200 windows of 0.5"
+        );
+        assert!(
+            naive_total < honest_total,
+            "debiting the request under-admits: {naive_total} against {honest_total}"
+        );
+    }
+
+    /// Shares taken from one demand sample sum to one, so the banks of the fleet
+    /// hold exactly one window's remainder between them.
+    #[test]
+    fn demand_shares_of_one_window_bank_its_whole_remainder() {
+        const REMAINDER: f64 = 0.4;
+        let total = 100_u128;
+        let mines = [50_u128, 30, 20];
+
+        let shares: f64 = mines
+            .iter()
+            .filter_map(|mine| DemandSample { mine: *mine, total }.share_fraction())
+            .sum();
+        assert!((shares - 1.0).abs() < 1e-9, "the shares sum to {shares}");
+
+        let banked: f64 = mines
+            .iter()
+            .map(|mine| {
+                let mut bank = RemainderBank::default();
+                bank.accrue(
+                    0,
+                    REMAINDER,
+                    DemandSample { mine: *mine, total }.share_fraction(),
+                );
+                bank.banked
+            })
+            .sum();
+        assert!(
+            (banked - REMAINDER).abs() < 1e-9,
+            "the fleet banked {banked}, not one window's {REMAINDER}"
+        );
+    }
+
+    /// A sample that cannot divide a share banks nothing. Reading a share of one
+    /// there would have every replica bank the whole remainder, and the fleet
+    /// would admit it once per replica.
+    #[test]
+    fn a_sample_that_cannot_divide_a_share_banks_nothing() {
+        assert!(DemandSample::default().share_fraction().is_none());
+        assert!(
+            DemandSample { mine: 5, total: 0 }
+                .share_fraction()
+                .is_none(),
+            "no cluster demand recorded: there is no share to take"
+        );
+        assert!(
+            DemandSample { mine: 0, total: 9 }
+                .share_fraction()
+                .is_none(),
+            "this replica asked for nothing"
+        );
+
+        let mut bank = RemainderBank::default();
+        assert_eq!(bank.accrue(0, 0.9, None), 0);
+        assert_eq!(bank.accrue(1, 0.9, None), 0);
+        assert!(bank.banked.abs() < f64::EPSILON);
+    }
+
+    /// The lease path reaches a window on every refresh tick, and again as the
+    /// pre-leased window. The remainder may be banked only once per window, or a
+    /// fast tick rate would multiply the budget.
+    #[test]
+    fn a_window_banks_its_remainder_once_however_many_ticks_reach_it() {
+        let mut bank = RemainderBank::default();
+        for _ in 0..10 {
+            assert_eq!(bank.accrue(7, 0.5, Some(1.0)), 0);
+        }
+        assert!((bank.banked - 0.5).abs() < 1e-9);
+        // The pre-leased window is a window of its own and banks its own share.
+        assert_eq!(bank.accrue(8, 0.5, Some(1.0)), 1);
+    }
+
+    /// A budget the coefficient has closed leases nothing. Every floor on the
+    /// lease path has to agree: the one token `min_lease` used to guarantee is
+    /// exactly the band the carry exists to remove.
+    #[test]
+    fn a_zero_budget_leases_no_tokens() {
+        assert_eq!(min_lease(0), 0);
+        assert_eq!(max_lease_per_replica(0), 0);
+        assert_eq!(DemandSample::default().demand_signal(0, 10), 0);
+        assert_eq!(DemandSample { mine: 3, total: 4 }.demand_signal(0, 0), 0);
+        // A live budget keeps the floors it had.
+        assert_eq!(min_lease(10), 1);
+        assert_eq!(max_lease_per_replica(10), 9);
+        assert_eq!(min_lease(600), 6);
+    }
+
+    /// End to end: a wholly failing origin at a configured burst of one leases
+    /// nothing at all. `min_lease` used to floor the grant at one token, so the
+    /// cluster kept sending at its configured rate however badly it failed.
+    #[tokio::test]
+    async fn a_wholly_failing_origin_at_a_burst_of_one_grants_nothing() {
+        let window = Duration::from_millis(150);
+        let mut cfg = config_for(1, "a", window);
+        cfg.adaptive = Some(adaptive_config(1.0));
+        let bucket = LeasedBucket::new(cfg);
+
+        // Three windows in which every recorded request failed.
+        for _ in 0..3 {
+            bucket.refresh_lease().await.expect("lease");
+            for _ in 0..20 {
+                bucket.record_outcome(RequestOutcome::Failure);
+            }
+            tokio::time::sleep(window + Duration::from_millis(20)).await;
+        }
+        // One pass writes the tail counts back, the next leases against them.
+        for _ in 0..2 {
+            bucket.refresh_lease().await.expect("lease");
+            tokio::time::sleep(window + Duration::from_millis(20)).await;
+        }
+        bucket.refresh_lease().await.expect("lease");
+
+        assert_eq!(
+            bucket.metrics.cluster_effective_burst(),
+            0,
+            "a total failure has to close the budget, not floor it at one"
+        );
+        assert_eq!(
+            bucket.metrics.lease_granted(),
+            0,
+            "and the lease has to grant nothing"
+        );
+        assert!(bucket.is_throttling());
     }
 
     /// The budget is derived per replica and never written back, so it must
