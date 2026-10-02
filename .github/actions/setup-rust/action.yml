@@ -94,23 +94,93 @@ runs:
           toolchain='stable'
         fi
 
-        # If the toolchain is already installed (e.g. spiceai-macos self-hosted
-        # runners), just verify it. Otherwise install it.
-        if rustup run "$toolchain" cargo --version >/dev/null 2>&1; then
-          echo "Toolchain $toolchain already available, skipping install"
-        else
-          if [ ! -x "$cargo_home/bin/rustup" ]; then
-            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
-            if [ -f "$cargo_home/env" ]; then
-              source "$cargo_home/env" || true
-            fi
+        # Several Actions runner services on one Mac share this user's RUSTUP_HOME.
+        # Two jobs installing the same toolchain race: cargo can land first, the
+        # other job skips install, then `rustup which rustc` tries to recover a
+        # half-written tree and dies with "Directory not empty" (os error 66).
+        # One lock covers the whole home. A toolchain counts as present only when
+        # rustc and cargo are on disk. If either is missing, remove the partial
+        # tree before install so rustup does not rename components onto leftovers.
+        rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+        mkdir -p "$rustup_home"
+        lockdir="$rustup_home/setup-rust.lock"
+
+        release_rustup_lock() {
+          if [ -f "$lockdir/pid" ] && [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$$" ]; then
+            rm -rf "$lockdir"
           fi
+        }
+        trap release_rustup_lock EXIT
+
+        waited=0
+        while ! mkdir "$lockdir" 2>/dev/null; do
+          now=$(date +%s)
+          if [ "$(uname)" = "Darwin" ]; then
+            mtime=$(stat -f %m "$lockdir" 2>/dev/null || echo "$now")
+          else
+            mtime=$(stat -c %Y "$lockdir" 2>/dev/null || echo "$now")
+          fi
+          age=$((now - mtime))
+          holder=""
+          if [ -f "$lockdir/pid" ]; then
+            holder="$(cat "$lockdir/pid" 2>/dev/null || true)"
+          fi
+          if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+            :
+          elif [ -z "$holder" ] && [ "$age" -lt 15 ]; then
+            :
+          else
+            rm -rf "$lockdir"
+            continue
+          fi
+          sleep 2
+          waited=$((waited + 2))
+          if [ "$waited" -gt 900 ]; then
+            echo "Timed out waiting for $lockdir" >&2
+            exit 1
+          fi
+        done
+        echo $$ > "$lockdir/pid"
+
+        if [ ! -x "$cargo_home/bin/rustup" ]; then
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+          if [ -f "$cargo_home/env" ]; then
+            source "$cargo_home/env" || true
+          fi
+        fi
+
+        case "$toolchain" in
+          *[!A-Za-z0-9._-]*)
+            echo "Invalid toolchain name: $toolchain" >&2
+            exit 1
+            ;;
+        esac
+
+        host="$(rustup show | awk '/^Default host:/ { print $3; exit }')"
+        if [ -z "$host" ]; then
+          echo "rustup did not report a default host" >&2
+          exit 1
+        fi
+        tool_dir="$rustup_home/toolchains/${toolchain}-${host}"
+
+        if [ -x "$tool_dir/bin/rustc" ] && [ -x "$tool_dir/bin/cargo" ] && [ -x "$tool_dir/bin/rustfmt" ] && [ -x "$tool_dir/bin/cargo-clippy" ]; then
+          echo "Toolchain $toolchain already available, skipping install"
+        elif [ -x "$tool_dir/bin/rustc" ] && [ -x "$tool_dir/bin/cargo" ]; then
+          echo "Toolchain $toolchain is missing rustfmt or clippy; adding them"
+          rustup component add rustfmt clippy --toolchain "$toolchain"
+        else
+          echo "Toolchain $toolchain is missing or incomplete; reinstalling"
+          rm -rf "$tool_dir"
+          rm -f "$rustup_home/update-hashes/${toolchain}-${host}"
           rustup toolchain install "$toolchain" \
             --component cargo \
             --component rustc \
             --component rustfmt \
             --component clippy
         fi
+
+        release_rustup_lock
+        trap - EXIT
 
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
