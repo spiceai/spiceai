@@ -17655,8 +17655,10 @@ dependencies = [
  "serde",
  "snafu",
  "spicepod",
+ "tempfile",
  "tracing",
  "util",
+ "yaml",
 ]
 
 [[package]]

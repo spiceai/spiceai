@@ -97,9 +97,9 @@ use datafusion::execution::{SendableRecordBatchStream, SessionState};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
+use datafusion::sql::TableReference;
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
@@ -168,6 +168,7 @@ pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
 
+pub(crate) use runtime_datafusion::resolve_table_reference;
 pub use runtime_datafusion::{
     SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_EVAL_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA, SPICE_SCP_SCHEMA, is_spice_internal_dataset, is_spice_internal_schema,
@@ -5620,12 +5621,6 @@ pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> 
     inner
         .downcast_ref::<Error>()
         .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
-}
-
-/// Normalizes a table reference to a full table reference with catalog, schema, and table name
-/// so it can be used for comparison.
-pub(crate) fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
-    table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 
 impl Drop for DataFusion {
