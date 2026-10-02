@@ -10,8 +10,9 @@
 # credentials: a stub `df` on PATH reports whatever free space a case needs, and a
 # stub `make` prints whatever a case needs the watcher to read.
 #
-# `failure_kind` names four further causes with the same consequence — a run that
-# was signalled and so judged nothing at all, a branch whose Makefile has no rule
+# `failure_kind` names five further causes with the same consequence — a run that
+# was signalled and so judged nothing at all, a step budget that expired without
+# the runner ever signalling the script, a branch whose Makefile has no rule
 # for a target the gate invokes, so nothing was compiled, a test binary the
 # runner's loader will not execute, so nothing was run, and a linker that died of
 # a signal, so nothing was built — so their cases live here too, alongside
@@ -122,13 +123,16 @@ assert_preflight() {
   echo "  ok: $name"
 }
 
-assert_failure_kind() {
-  local name="$1" check_status="$2" want="$3"
-  shift 3
+# Drives failure_kind with the exit status and the elapsed seconds the run would
+# report; the budget reading is the one classification that depends on the
+# clock rather than on a status or a recorded flag.
+assert_failure_kind_at() {
+  local name="$1" check_status="$2" elapsed="$3" want="$4"
+  shift 4
   tests_run=$((tests_run + 1))
 
   local result rc output
-  result="$(call_subject "failure_kind ${check_status}" "$@")"
+  result="$(call_subject "failure_kind ${check_status} ${elapsed}" "$@")"
   rc="${result%%|*}"
   output="${result#*|}"
 
@@ -141,6 +145,14 @@ assert_failure_kind() {
     return
   fi
   echo "  ok: $name"
+}
+
+assert_failure_kind() {
+  local name="$1" check_status="$2" want="$3"
+  shift 3
+  # No elapsed: the snippet is then `failure_kind <status>`, the call every
+  # reading but the clock is classified from.
+  assert_failure_kind_at "$name" "$check_status" "" "$want" "$@"
 }
 
 echo "free_disk_gib"
@@ -1386,6 +1398,66 @@ assert_failure_kind "keeps a rewritten lockfile distinct with a cache hit record
 # ...and, as for every other named cause, "no verdict" still outranks it.
 assert_failure_kind "a signalled run stays signalled, not a rewritten lockfile" 73 "signalled" \
   SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# A step budget that expires is never delivered as a signal: the runner reaps the
+# step's `make` first and this script last, so the script sees a small failing
+# status with no signal recorded, and only the clock can tell that from a
+# failing recipe (#13843). The deadline the workflow declares is threaded in,
+# and a run that ends within the grace of it is signalled. The elapsed values
+# are the ones dying runs reported against the 353-minute (21180 s) budget.
+assert_failure_kind_at "calls a run that ended at its step budget signalled" 101 21203 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The script's clock starts a few seconds into the step, so the elapsed it reads
+# when the kill lands can be short of the budget by about that much.
+assert_failure_kind_at "sees an expiry the clock reads as just short of the budget" 101 21170 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "sees an expiry whose teardown ran well past the budget" 101 21225 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The grace is a boundary, not a band around the budget: it opens exactly one
+# grace before the budget and never closes, since a run that outlives its
+# budget is still a run nothing judged.
+assert_failure_kind_at "the grace opens exactly one grace before the budget" 101 21060 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "a failure one second before the grace is still the branch's" 101 21059 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "a failure early in the run is still the branch's under a budget" 101 7200 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "a grace of zero fires at the budget itself and not before" 101 21180 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_STEP_BUDGET_GRACE_SECONDS=0 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "a grace of zero leaves the second before the budget to the branch" 101 21179 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_STEP_BUDGET_GRACE_SECONDS=0 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# No budget — a local run — leaves the clock out of it entirely, however long
+# the checks took.
+assert_failure_kind_at "no configured budget leaves the clock out of the classification" 101 21225 "checks" \
+  SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# A budget that is not a whole number of minutes must be inert rather than turn
+# every failure into an expiry; the same for the grace, and for an elapsed the
+# caller did not pass.
+assert_failure_kind_at "a malformed budget is inert, not an expiry" 101 21225 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=soon SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "a malformed grace is inert, not an expiry" 101 21225 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_STEP_BUDGET_GRACE_SECONDS=2m SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# Two shapes `^[0-9]+$` would admit and bash's arithmetic would misread: a
+# leading zero is octal there (`0353` is 235 minutes, a budget that fires two
+# hours early) and a value past 2^63 wraps negative (every failure an expiry).
+# 14100 s is exactly where the octal reading would fire.
+assert_failure_kind_at "a leading-zero budget is read in base 10, not as octal" 101 14100 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=0353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "an overlong budget is inert, not an expiry" 101 1 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=9223372036854775807 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "an overlong grace is inert, not an expiry" 101 1 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_STEP_BUDGET_GRACE_SECONDS=99999999999999999999 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "a budget with no elapsed to read is inert" 101 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# "No verdict" outranks naming a cause, exactly as a recorded signal does: a
+# teardown that reaps a compiler subprocess first leaves the crash signature
+# behind, and that, the disk hit and the preflight's refusal are each no more a
+# verdict on the branch than the expiry is.
+assert_failure_kind_at "an expiry outranks a crashed compiler subprocess the teardown reaped" 101 21203 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "an expiry outranks a disk hit" 101 21203 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "an expiry outranks the disk preflight's refusal" 70 21203 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 STUB_FREE_KB="$(gib_to_kb 60)"
 # The other direction matters just as much: a real defect on a tight disk must
 # not be excused as infrastructure, or a broken branch signs off as "re-dispatch
 # me". 10 GiB is under the 25 GiB preflight floor and well over the critical bar.
@@ -1669,6 +1741,26 @@ assert_describe "says a crashed compiler subprocess could not complete, not that
 assert_describe_lacks "does not call a crashed compiler subprocess a check failure" 101 \
   "checks failed" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The budget expiry publishes nothing, like the signal it stands in for: either
+# verdict it could otherwise reach — "Sign-off checks failed" or, when the
+# teardown reaped a compiler first, "Compiler subprocess crashed" — would
+# disqualify a commit nothing judged (#13843). The 21195 s every describe case
+# runs at is inside the 353-minute budget's grace.
+assert_describe "publishes no verdict when the step budget expired without a signal" 101 "" \
+  "the checks reached no verdict" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_lacks "does not call a budget expiry a check failure" 101 \
+  "checks failed" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_lacks "does not call a budget expiry a crashed compiler subprocess" 101 \
+  "Compiler subprocess crashed" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# A budget the run did not reach changes nothing: 358 minutes puts 21195 s
+# outside the grace, so the crash verdict is published as before.
+assert_describe "still publishes the crash verdict for a run that did not reach its budget" 101 \
+  "Compiler subprocess crashed after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
+  "the checks did not complete" \
+  SIGNOFF_STEP_BUDGET_MINUTES=358 SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # What a verdict must still say once GitHub is done with the line.
 #
 # post_commit_status cuts the description at STATUS_DESC_MAX_CHARS and the
