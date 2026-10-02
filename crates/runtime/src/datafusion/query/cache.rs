@@ -1214,11 +1214,8 @@ impl Query {
     ) {
         let cache_key_u64 = cache_key.as_u64();
         if let Some(cache_provider) = df.results_cache_provider() {
-            // A refresh, DML or CDC apply may have invalidated one of its
-            // tables while the revalidation ran. This only skips encoding a
-            // result no lookup could serve — see
-            // `QueryResultsCacheProvider::store_raw_key` for what is stored —
-            // and correctness comes from the check every cache hit performs.
+            // Skips encoding a result no lookup could serve; correctness comes
+            // from the check every cache hit performs.
             if !cache_provider.is_servable(&input_tables, revalidation_started_at) {
                 tracing::debug!(
                     cache_key = cache_key_u64,
@@ -1314,8 +1311,7 @@ impl Query {
                             );
                             record_revalidation_outcome(RevalidationOutcome::Stored);
                         }
-                        // `store_raw_key` logged why: the window closed while
-                        // the result was encoded, or a newer result holds the key.
+                        // `store_raw_key` logs the reason.
                         Ok(false) => {
                             record_revalidation_outcome(RevalidationOutcome::InvalidatedMidFlight);
                         }
@@ -2496,8 +2492,7 @@ mod tests {
         );
     }
 
-    /// The results-cache config these tests share: nothing expires on
-    /// `item_ttl`, so only the invalidation under test can make an entry stale.
+    /// A config where nothing expires on `item_ttl` during a test.
     fn sql_cache_config(stale_while_revalidate_ttl: Option<&str>) -> SQLResultsCacheConfig {
         SQLResultsCacheConfig {
             item_ttl: Some("10m".to_string()),
@@ -2507,16 +2502,13 @@ mod tests {
         }
     }
 
-    /// Separates two instants a test orders: a change recorded at the instant
-    /// a read began counts as having happened first.
+    /// Keeps two instants a test orders distinct: a tie counts as changed.
     async fn tick() {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
-    /// A table that changes while every query reads it, the way a CDC-fed
-    /// acceleration does when commits arrive faster than a query runs: each
-    /// scan invalidates the table, then returns how many scans have run, so a
-    /// result shows which read produced it.
+    /// A table invalidated during every scan, as under CDC. Each scan returns
+    /// its sequence number.
     #[derive(Debug)]
     struct ChangesDuringEveryScan {
         name: TableReference,
@@ -2574,12 +2566,9 @@ mod tests {
             .expect("should register table");
     }
 
-    /// Regression test for #14686, through the full query path. Every read of
-    /// the table is overtaken by a change, as on a CDC-fed acceleration whose
-    /// commits arrive faster than the query runs. With a stale window the
-    /// first result is stored and served stale, and each background
-    /// revalidation replaces it, so what is served keeps moving forward. It is
-    /// never served as a fresh hit.
+    /// Regression test for #14686 through the full query path: with a stale
+    /// window, results overtaken by every change are served stale, never as a
+    /// hit, and background revalidation keeps advancing them.
     #[tokio::test]
     async fn test_results_overtaken_by_every_change_are_served_stale_and_advance() {
         const SQL: &str = "SELECT scan FROM changing_table";
@@ -2603,8 +2592,7 @@ mod tests {
             "the first result must be stored and served stale, not dropped"
         );
 
-        // The hit above started a background revalidation. Poll until a later
-        // read replaces the first result rather than sleeping a fixed interval.
+        // Poll until the background revalidation replaces the first result.
         let mut advanced = None;
         for _ in 0..100 {
             let (status, served) = Arc::clone(&request_context)
@@ -2627,8 +2615,7 @@ mod tests {
         );
     }
 
-    /// The same table without a stale window: nothing anyone has agreed to be
-    /// served stale, so no result is ever cached and every request runs.
+    /// Without a stale window, nothing is cached and every request runs.
     #[tokio::test]
     async fn test_results_overtaken_by_every_change_are_not_cached_without_a_window() {
         const SQL: &str = "SELECT scan FROM changing_table_no_window";
@@ -2661,12 +2648,8 @@ mod tests {
         (schema, batch)
     }
 
-    /// Regression test for #14686. A table that changes during every
-    /// revalidation: each result is stored to be served stale — never fresh —
-    /// and replaces
-    /// the older stale entry, so what the cache serves moves forward on every
-    /// revalidation instead of staying at the first result. A revalidation that
-    /// finishes after a newer result is already stored leaves that result alone.
+    /// Regression test for #14686: each revalidation overtaken by a change
+    /// replaces the older stale entry, and an older one never replaces a newer.
     #[tokio::test]
     async fn test_swr_revalidation_advances_a_stale_entry_under_continuous_changes() {
         let df = prepare_runtime(Some(sql_cache_config(Some("5m")))).await;
@@ -2719,7 +2702,7 @@ mod tests {
             reads.push(revalidation_started_at);
         }
 
-        // A straggler that began before every stored result must not replace them.
+        // An older revalidation must not replace the newest result.
         let straggler_started_at = reads[0];
         Query::cache_revalidation_result(
             &df,

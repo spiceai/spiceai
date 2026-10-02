@@ -257,8 +257,7 @@ const MAX_ENCODING_COMPRESSION_RATIO: usize = 16;
 /// [`QueryResultsCacheProvider::tables_changed_since`], which documents why
 /// the comparison is deliberately conservative. It must be the start of the
 /// read, not the moment the result is stored: a change landing in between has
-/// to disqualify the entry *as fresh* too. Whether such a result is stored at
-/// all is [`QueryResultsCacheProvider::store_raw_key`]'s decision.
+/// to disqualify the entry as fresh too.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
@@ -343,8 +342,7 @@ pub fn to_cached_record_batch_stream(
                 );
             } else if !cache_provider.is_servable(&input_tables, read_started_at) {
                 // Not the guard — correctness comes from the check every cache
-                // hit performs. This only skips encoding a result no lookup
-                // could serve; see `QueryResultsCacheProvider::store_raw_key`.
+                // hit performs. This only skips encoding an unservable result.
                 tracing::debug!(
                     "A table read by this query changed while it ran and no stale-while-revalidate window could serve the result, skipping cache storage"
                 );
@@ -948,10 +946,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Regression test for #14686: with a stale window, a result whose table
-    /// changed during its read is stored, to be served stale and revalidated.
-    /// Dropping it left a table that changes more often than the query runs
-    /// with nothing cached once its previous entry expired.
+    /// Regression test for #14686: inside a stale window, a result overtaken
+    /// during its read is stored and served stale.
     #[tokio::test]
     async fn to_cached_record_batch_stream_keeps_result_invalidated_during_read_inside_a_stale_window()
      {
@@ -989,8 +985,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// A query that began before a change and drains after a later query must
-    /// not replace that later query's result.
+    /// An older stale result must not replace a newer one.
     #[tokio::test]
     async fn to_cached_record_batch_stream_does_not_replace_a_newer_result_with_an_older_one() {
         let provider = test_cache_provider_with_stale_window("5m");
