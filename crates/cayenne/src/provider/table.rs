@@ -12306,6 +12306,22 @@ impl CayenneTableProvider {
             }
         }
 
+        self.record_table_wide_pk_keys(keys, location, sequence);
+    }
+
+    /// The table-wide half of [`Self::record_pk_keys_with_location`], for a writer
+    /// whose keys are already in the per-shard index: the in-memory sharded apply
+    /// grows that index itself, and records here what the durable path and per-key
+    /// OCC read.
+    pub(crate) fn record_table_wide_pk_keys(
+        &self,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        sequence: i64,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
         let max_bytes = self.effective_single_keyset_budget();
         let mut guard = self.pk_keyset_cache.lock();
         // Take ownership so an over-budget Exact keyset can be replaced by a
@@ -15373,6 +15389,15 @@ impl CayenneTableProvider {
         //    account apply back-pressure is the lesser evil; bounding a
         //    `DoNothing` keyset needs a sound exact eviction, not a bloom.
         if !validated_keys.is_empty() {
+            // The appends above put these keys in the per-shard index. Record them in
+            // the table-wide index too, as the serial mem-tier apply records its keys:
+            // it is what the durable path validates against (a burst the in-memory tier
+            // cannot take, or the overload fallback) and what per-key OCC reads, and a
+            // copy missing a key this apply wrote reads a durable upsert of it as a new
+            // key and leaves two live rows. `MEM_TIER` is a key-based location, so it
+            // still hides the row after a checkpoint moves it into a file.
+            let record_seq = self.sequence_high_water().await;
+            self.record_table_wide_pk_keys(&validated_keys, &RowLocation::MEM_TIER, record_seq);
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             // Gate on the variant, not just the tally: only an `Exact` index grows
             // per recorded key and only it can be degraded, so this fires on the
@@ -69768,6 +69793,99 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+
+    /// A sharded apply records its keys in the table-wide index as well as the
+    /// per-shard one, as the serial mem-tier apply does, so the durable path and
+    /// per-key OCC read a complete index without rebuilding it from the table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sharded_apply_records_its_keys_in_the_table_wide_index() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_records_table_wide",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 1), (8, 1)])
+                .await
+                .is_some(),
+            "precondition: the burst takes the in-memory sharded path"
+        );
+
+        let key_7 = pk_digest_set_for_ids(&converter, &[7])
+            .iter_with_digest()
+            .next()
+            .expect("one key")
+            .0;
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Exact(keyset)) => assert!(
+                keyset.location_by_digest(key_7).is_some(),
+                "the table-wide index must hold key 7, which a sharded apply wrote"
+            ),
+            other => panic!(
+                "the warm table-wide index must stay cached, present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// A burst the in-memory tier cannot take is written durably: the runtime
+    /// checkpoints the tier, clears the slot advancer, and the durable path validates
+    /// against the table-wide index. The keys earlier sharded applies wrote must be in
+    /// that index, or an upsert of one reads as a new key and leaves two live rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_durable_upsert_after_sharded_applies_replaces_their_rows() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_durable_after_sharded",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.maybe_install_warm_pk_caches().await;
+
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 1), (8, 1)])
+                .await
+                .is_some(),
+            "precondition: the first burst takes the in-memory sharded path"
+        );
+
+        // The runtime's sequence for a burst that must be durable
+        // (`checkpoint_pending_memory_cdc_commits`, then `clear_slot_advancer`).
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint the in-memory tier");
+        provider.clear_slot_advancer();
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)])
+                .await
+                .is_none(),
+            "precondition: the second burst writes durably"
+        );
+
+        let rows = collect_id_value_pairs(&ctx, &provider, "pk_durable_after_sharded").await;
+        assert_eq!(
+            rows,
+            vec![(7, 2), (8, 1)],
+            "one live row per key, key 7 upserted"
+        );
     }
 
     /// An abandoned checkout must release the resident-byte accounting its window
