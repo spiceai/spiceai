@@ -135,8 +135,10 @@ jobs:
       # commit on the branch that has a built spiced, which is older than the branch head when the
       # head has no build of its own (a docs-only commit, say), so the check is keyed to that selected
       # commit: each scheduled release run records it as a `scheduled-bench-<branch>-<commit>`
-      # artifact, and a later run that selects a recorded commit dispatches nothing. A failed lookup
-      # dispatches the suite rather than skip it.
+      # artifact, and a later run that selects a recorded commit dispatches nothing. The record is
+      # kept for 60 days, this repository's artifact-retention limit, so an unchanged build is
+      # benchmarked again once that long has passed since its last run. A failed lookup dispatches
+      # the suite rather than skip it.
       - name: Check whether this release build was benchmarked
         id: benchmarked
         if: ${{ matrix.schedule == '' }}
@@ -350,7 +352,7 @@ jobs:
         with:
           name: ${{ steps.benchmarked.outputs.marker }}
           path: benchmarked-commit.txt
-          retention-days: 90
+          retention-days: 60
 
   dispatch-input:
     name: Dispatch tests - Input

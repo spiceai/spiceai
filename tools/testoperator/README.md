@@ -350,7 +350,7 @@ Append tests are not built by default, as the File connector source generation r
 
 Each source is benchmarked federated, and each accelerator configuration once, from the suite's canonical source: `file[parquet]` for TPC-H and TPC-DS, `s3[parquet]` for ClickBench. An accelerated benchmark measures the accelerator once the data is loaded, so re-running the same accelerator in front of another source repeats a measurement the canonical config already makes, while the source itself is covered by its federated config. An accelerated config from another source belongs in `dispatch/` only when it exercises something that source alone provides, such as `mongodb-duckdb[file]-changes`, which loads through MongoDB change streams.
 
-The release branch the schedule also covers changes only when a fix is cherry-picked onto it, so it dispatches its whole suite once per `spiced` build: a daily run dispatches nothing for it when the build it selects, the newest commit on the branch with a built `spiced`, was already benchmarked by an earlier scheduled run.
+The release branch the schedule also covers changes only when a fix is cherry-picked onto it, so it dispatches its whole suite once per `spiced` build: a daily run dispatches nothing for it when the build it selects, the newest commit on the branch with a built `spiced`, was already benchmarked by an earlier scheduled run. That record is a workflow artifact kept for 60 days, the repository's artifact-retention limit, so an unchanged build is benchmarked again once that long has passed since its last run.
 
 ### Other Examples
 
