@@ -263,6 +263,138 @@ fn streaming_encoder_matches_the_verified_escape() {
     }
 }
 
+/// The encoding of fixed keys, byte for byte. Persisted runs and a future
+/// range index depend on these exact bytes, so any change to them fails here.
+#[test]
+fn fixed_keys_encode_to_pinned_bytes() {
+    use arrow_array::{Decimal256Array, IntervalDayTimeArray};
+    use arrow_buffer::{IntervalDayTime, i256};
+    let encode = |fields: Vec<(DataType, bool)>, columns: Vec<ArrayRef>| -> Vec<Vec<u8>> {
+        let encoder = KeyEncoder::new(
+            fields
+                .into_iter()
+                .map(|(data_type, nullable)| KeyField::new(data_type, nullable))
+                .collect(),
+        )
+        .expect("supported key types");
+        let bound = encoder.bind(&columns).expect("columns match the key");
+        (0..bound.num_rows())
+            .map(|row| {
+                let mut key = Vec::new();
+                bound.encode_row(row, &mut key);
+                key
+            })
+            .collect()
+    };
+    let int64 = |nullable| vec![(DataType::Int64, nullable)];
+    assert_eq!(
+        encode(
+            int64(false),
+            vec![Arc::new(Int64Array::from(vec![1, i64::MIN]))]
+        ),
+        [
+            vec![0x80, 0, 0, 0, 0, 0, 0, 1],
+            vec![0, 0, 0, 0, 0, 0, 0, 0]
+        ]
+    );
+    assert_eq!(
+        encode(
+            int64(true),
+            vec![Arc::new(Int64Array::from(vec![None, Some(-1)]))]
+        ),
+        [
+            vec![0x00],
+            vec![0x01, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+        ]
+    );
+    assert_eq!(
+        encode(
+            vec![(DataType::Utf8, true)],
+            vec![Arc::new(StringArray::from(vec![
+                Some("a\0b\u{1}"),
+                Some(""),
+                None
+            ]))]
+        ),
+        [
+            vec![0x01, b'a', 0x01, 0x01, b'b', 0x01, 0x02, 0x00],
+            vec![0x01, 0x00],
+            vec![0x00]
+        ]
+    );
+    assert_eq!(
+        encode(
+            vec![(DataType::Utf8View, false)],
+            vec![Arc::new(StringViewArray::from(vec!["abcdefghijklm\u{1}"]))]
+        ),
+        [[&b"abcdefghijklm"[..], &[0x01, 0x02, 0x00]].concat()]
+    );
+    assert_eq!(
+        encode(
+            vec![(DataType::Binary, false)],
+            vec![Arc::new(BinaryArray::from(vec![
+                &b"\0"[..],
+                b"\x02\xff",
+                b""
+            ]))]
+        ),
+        [vec![0x01, 0x01, 0x00], vec![0x02, 0xff, 0x00], vec![0x00]]
+    );
+    // A compound key: nullable `Int32`, `Utf8`, `Boolean`, `UInt16`.
+    assert_eq!(
+        encode(
+            vec![
+                (DataType::Int32, true),
+                (DataType::Utf8, false),
+                (DataType::Boolean, false),
+                (DataType::UInt16, false),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![5])),
+                Arc::new(StringArray::from(vec!["x"])),
+                Arc::new(BooleanArray::from(vec![true])),
+                Arc::new(UInt16Array::from(vec![258])),
+            ]
+        ),
+        [vec![0x01, 0x80, 0, 0, 5, b'x', 0x00, 0x01, 0x01, 0x02]]
+    );
+    assert_eq!(
+        encode(
+            vec![(DataType::FixedSizeBinary(2), true)],
+            vec![Arc::new(
+                FixedSizeBinaryArray::try_from_iter([[0_u8, 1]].into_iter()).expect("fixed")
+            )]
+        ),
+        [vec![0x01, 0x00, 0x01]]
+    );
+    let mut one = vec![0x80];
+    one.extend([0; 30]);
+    one.push(1);
+    assert_eq!(
+        encode(
+            vec![(DataType::Decimal256(76, 0), false)],
+            vec![Arc::new(
+                Decimal256Array::from(vec![i256::from(1)])
+                    .with_precision_and_scale(76, 0)
+                    .expect("decimal")
+            )]
+        ),
+        [one]
+    );
+    assert_eq!(
+        encode(
+            vec![(
+                DataType::Interval(arrow_schema::IntervalUnit::DayTime),
+                false
+            )],
+            vec![Arc::new(IntervalDayTimeArray::from(vec![
+                IntervalDayTime::new(1, -1)
+            ]))]
+        ),
+        [vec![0x80, 0, 0, 1, 0x7f, 0xff, 0xff, 0xff]]
+    );
+}
+
 /// `Decimal256` and intervals encode in value order (field by field for
 /// intervals, as Arrow compares them), equal values identically, nullable
 /// columns included.

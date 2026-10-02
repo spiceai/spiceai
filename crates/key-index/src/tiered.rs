@@ -2299,6 +2299,83 @@ mod persist_tests {
         assert_eq!(IndexRun::from_bytes(&shared).err(), Some(Error::Corrupt));
     }
 
+    /// The persisted bytes of runs a fixed workload builds and merges, as
+    /// `(length, digest)`. A change to how runs are built, merged or written
+    /// that alters a single byte fails here; the format itself is versioned
+    /// by [`crate::persist::VERSION`], which this test does not replace.
+    #[test]
+    fn run_bytes_are_pinned() {
+        let digest = |run: &IndexRun| {
+            let bytes = run.to_bytes();
+            (bytes.len(), hash_index::hash_key_bytes_oneshot(&bytes))
+        };
+        let mut rng = StdRng::seed_from_u64(0xB17E5);
+        // Three files of a nullable compound key with escaped strings.
+        let compound = run(&mut rng, 5_000);
+        let empty = run(&mut rng, 0);
+
+        // Exact words, repeated keys across files, explicit positions with a
+        // repeated row and one too wide for a slot, and a file with no row.
+        let int = KeyEncoder::new(vec![KeyField::new(DataType::Int64, false)]).expect("int64");
+        let int_column =
+            |keys: Vec<i64>| -> Vec<ArrayRef> { vec![Arc::new(Int64Array::from(keys))] };
+        let mut builder = RunBuilder::new(int.clone());
+        for file in 0..4 {
+            let keys: Vec<i64> = (0..3_000).map(|_| rng.random_range(0..2_000)).collect();
+            builder
+                .add_batch(
+                    &format!("i{file}"),
+                    rng.random_range(0..1_000),
+                    &int_column(keys),
+                )
+                .expect("add");
+        }
+        builder
+            .add_batch_at("g", &[5, 5, 1 << 33, 9], &int_column(vec![1, 1, 2, 3]))
+            .expect("add at");
+        builder.add_file("empty").expect("file");
+        let exact = builder.finish().expect("finish");
+
+        // Hashed words merged from single- and multi-file runs, one with a
+        // retired file and one with every file live.
+        let utf8 = KeyEncoder::new(vec![KeyField::new(DataType::Utf8, false)]).expect("utf8");
+        let index = TieredIndex::new(utf8.clone());
+        let mut runs = Vec::new();
+        for run_no in 0..7 {
+            let mut builder = RunBuilder::new(utf8.clone());
+            for file_no in 0..if run_no < 2 { 2 } else { 1 } {
+                let keys: Vec<String> = (0..400)
+                    .map(|_| format!("svc\0{}", rng.random_range(0..600)))
+                    .collect();
+                let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(keys))];
+                builder
+                    .add_batch(&format!("r{run_no}f{file_no}"), 0, &columns)
+                    .expect("add");
+            }
+            runs.push(builder.finish().expect("finish"));
+        }
+        index.publish(runs, &[]);
+        index.publish(vec![], &["r0f1", "r4f0"]);
+        assert!(index.merge_all().expect("merge"));
+        let merged = index.view().run_list();
+        assert_eq!(merged.len(), 1);
+
+        assert_eq!(
+            [
+                digest(&compound),
+                digest(&empty),
+                digest(&exact),
+                digest(&merged[0])
+            ],
+            [
+                (35_584, 0xBF9B_0B3C_93C3_4467),
+                (87, 0x1B08_B93F_A4DA_911D),
+                (49_415, 0xEFBA_2365_1D7F_F00C),
+                (12_741, 0x4AC0_9C32_E0D6_B532),
+            ]
+        );
+    }
+
     /// Words out of order, or offsets that do not span the postings, are
     /// rejected even under a valid checksum: a run read out of order would
     /// miss rows.
