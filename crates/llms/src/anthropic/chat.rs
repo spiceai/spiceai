@@ -46,7 +46,7 @@ use super::types::{
     ResponseTextBlock, StopReason, TextBlockParam, ToolChoiceParam, ToolResultBlockParam,
     ToolUseBlockParam, default_max_tokens, tool_from_completion_tools,
 };
-use super::types_stream::transform_stream;
+use super::types_stream::{StreamErrorContext, transform_stream};
 use super::{
     Anthropic, explain_model_not_found, explain_rejected_sampling_control,
     forwarded_sampling_controls,
@@ -76,19 +76,27 @@ impl Chat for Anthropic {
 
         // A streaming request naming a model Anthropic does not serve still returns 200 from
         // `create_stream_byot` and delivers the `not_found_error` as a stream item, so the
-        // explanations are mapped over the items rather than over this call — and upstream of
-        // `transform_stream`, which rewrites the error type its own way.
+        // explanation is mapped over the items rather than over this call — and upstream of
+        // `transform_stream`, which rewrites the error type its own way. A refused sampling
+        // control is explained inside `transform_stream` instead, which is handed what that
+        // takes: see `StreamErrorContext`.
         let model = self.model.clone();
         let model_from_default = self.model_from_default;
         let endpoint_from_default = self.endpoint_from_default;
+        let context = StreamErrorContext {
+            model: self.model.clone(),
+            model_from_default,
+            controls,
+        };
 
-        Ok(transform_stream(Box::pin(stream.map(move |item| {
-            item.map_err(|e| {
-                let e =
-                    explain_model_not_found(&model, model_from_default, endpoint_from_default, e);
-                explain_rejected_sampling_control(&model, model_from_default, &controls, e)
-            })
-        }))))
+        Ok(transform_stream(
+            Box::pin(stream.map(move |item| {
+                item.map_err(|e| {
+                    explain_model_not_found(&model, model_from_default, endpoint_from_default, e)
+                })
+            })),
+            context,
+        ))
     }
 
     async fn chat_request(
@@ -112,12 +120,14 @@ impl Chat for Anthropic {
                     self.endpoint_from_default,
                     e,
                 );
-                explain_rejected_sampling_control(
+                match explain_rejected_sampling_control(
                     &self.model,
                     self.model_from_default,
                     &controls,
                     e,
-                )
+                ) {
+                    Ok(explained) | Err(explained) => explained,
+                }
             })?;
 
         CreateChatCompletionResponse::try_from(inner_resp)

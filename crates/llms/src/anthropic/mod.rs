@@ -178,22 +178,26 @@ fn rejected_control_sentence(control: &str) -> String {
 /// message echoes request detail the caller wrote, so the type alone cannot say a control was the
 /// problem and the message is never searched for one. The rejection is recognised only when the
 /// whole message is Anthropic's documented sentence for a control this adapter actually forwarded
-/// (`controls`) — an echoed tool name or message fragment cannot equal that sentence. Every other
-/// error is returned untouched, and the `ApiError` variant is preserved so callers classifying the
-/// failure still see the same error kind.
+/// (`controls`) — an echoed tool name or message fragment cannot equal that sentence.
+///
+/// Returns the explained error as `Ok`, and every other error untouched as `Err`, so a caller
+/// that formats errors further (the streaming path) knows which ones are already explained
+/// without reading a field for it — `param` and `code` are public `OpenAI` fields a gateway can
+/// set too. The `ApiError` variant and its `type` are preserved either way, so callers
+/// classifying the failure still see the same error kind.
 fn explain_rejected_sampling_control(
     model: &str,
     model_from_default: bool,
     controls: &[&'static str],
     err: OpenAIError,
-) -> OpenAIError {
+) -> Result<OpenAIError, OpenAIError> {
     let mut api_error = match err {
         OpenAIError::ApiError(api_error)
             if api_error.r#type.as_deref() == Some("invalid_request_error") =>
         {
             api_error
         }
-        other => return other,
+        other => return Err(other),
     };
 
     let Some(control) = controls
@@ -201,7 +205,7 @@ fn explain_rejected_sampling_control(
         .copied()
         .find(|control| api_error.message == rejected_control_sentence(control))
     else {
-        return OpenAIError::ApiError(api_error);
+        return Err(OpenAIError::ApiError(api_error));
     };
 
     // Reads as a clause of the sentence below, so it carries its own leading comma.
@@ -221,12 +225,11 @@ fn explain_rejected_sampling_control(
     // The model refused what the caller asked for, so it is the caller's request that is invalid:
     // `openai_error_to_response` reads `code` to pick the status, and without one the refusal
     // reports as a `500`. `param` names the control for a caller that reads fields rather than
-    // prose; Anthropic's own error schema has no `param`, so `transform_stream` also reads it as
-    // the mark of an error this adapter has already explained.
+    // prose.
     api_error.param = Some(control.to_string());
     api_error.code = Some("invalid_request_error".to_string());
 
-    OpenAIError::ApiError(api_error)
+    Ok(OpenAIError::ApiError(api_error))
 }
 
 #[cfg(test)]
@@ -539,7 +542,8 @@ mod tests {
             false,
             &["temperature"],
             rejected_control("temperature"),
-        );
+        )
+        .expect("a forwarded control's rejection is explained");
         let message = message_of(&err);
 
         assert!(
@@ -575,12 +579,15 @@ mod tests {
 
     #[test]
     fn a_rejected_control_on_the_default_model_says_where_the_id_came_from() {
-        let message = message_of(&explain_rejected_sampling_control(
-            DEFAULT_ANTHROPIC_MODEL,
-            true,
-            &["top_p"],
-            rejected_control("top_p"),
-        ));
+        let message = message_of(
+            &explain_rejected_sampling_control(
+                DEFAULT_ANTHROPIC_MODEL,
+                true,
+                &["top_p"],
+                rejected_control("top_p"),
+            )
+            .expect("a forwarded control's rejection is explained"),
+        );
 
         assert!(
             message.contains("built-in default"),
@@ -602,7 +609,8 @@ mod tests {
             false,
             &["temperature"],
             rejected_control("temperature"),
-        ) else {
+        )
+        .expect("a forwarded control's rejection is explained") else {
             panic!("rewriting the message must not change the error variant");
         };
 
@@ -622,7 +630,8 @@ mod tests {
             false,
             &[],
             rejected_control("temperature"),
-        );
+        )
+        .expect_err("no forwarded control, nothing to explain");
         assert_eq!(
             message_of(&not_forwarded),
             rejected_control_sentence("temperature")
@@ -634,7 +643,8 @@ mod tests {
             false,
             &["top_p"],
             rejected_control("temperature"),
-        );
+        )
+        .expect_err("a control the request did not forward cannot be the cause");
         assert_eq!(
             message_of(&other_control),
             rejected_control_sentence("temperature")
@@ -652,12 +662,15 @@ mod tests {
             code: None,
         });
         assert_eq!(
-            message_of(&explain_rejected_sampling_control(
-                "claude-sonnet-5",
-                false,
-                &["temperature"],
-                echoed
-            )),
+            message_of(
+                &explain_rejected_sampling_control(
+                    "claude-sonnet-5",
+                    false,
+                    &["temperature"],
+                    echoed
+                )
+                .expect_err("a message that merely contains the sentence is not the sentence")
+            ),
             echoed_message
         );
 
@@ -669,12 +682,15 @@ mod tests {
             code: None,
         });
         assert_eq!(
-            api_error_type(&explain_rejected_sampling_control(
-                "claude-sonnet-5",
-                false,
-                &["temperature"],
-                other_kind
-            )),
+            api_error_type(
+                &explain_rejected_sampling_control(
+                    "claude-sonnet-5",
+                    false,
+                    &["temperature"],
+                    other_kind
+                )
+                .expect_err("another error kind is never a refused control")
+            ),
             Some("authentication_error".to_string())
         );
     }

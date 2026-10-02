@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(deprecated)] // `function_call` argument is deprecated but no builder pattern alternative is available.
-use super::types::{MessageRole, StopReason, Usage};
+use super::explain_rejected_sampling_control;
+use super::types::{AnthropicModelVariant, MessageRole, StopReason, Usage};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::chat::{
@@ -228,7 +229,9 @@ pub struct MessageDelta {
 ///
 pub fn transform_stream(
     stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>>,
+    context: StreamErrorContext,
 ) -> ChatCompletionResponseStream {
+    let context = Arc::new(context);
     // As mentioned above, only first tool packet has tool metadata.
     // Format:
     //  First Message: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}
@@ -251,6 +254,7 @@ pub fn transform_stream(
     let transformed_stream = stream
         .filter_map(move |item| {
             let inner_state = Arc::clone(&state);
+            let context = Arc::clone(&context);
             async move {
                 let mut state = inner_state.lock().await;
                 match item {
@@ -361,8 +365,10 @@ pub fn transform_stream(
                     Ok(MessageCreateStreamResponse::Error { error }) => {
                         // An error Anthropic delivered as a stream packet is the same failure as
                         // one it delivered as an HTTP status, and is reported the same way.
-                        let formatted_error =
-                            format_anthropic_stream_error(OpenAIError::ApiError(error));
+                        let formatted_error = format_anthropic_stream_error(
+                            OpenAIError::ApiError(error),
+                            &context,
+                        );
                         tracing::debug!(
                             "Received an anthropic error stream packet: {:?}",
                             formatted_error
@@ -370,7 +376,7 @@ pub fn transform_stream(
                         Some(Err(formatted_error))
                     }
                     Err(e) => {
-                        let formatted_error = format_anthropic_stream_error(e);
+                        let formatted_error = format_anthropic_stream_error(e, &context);
                         tracing::debug!(
                             "Received an anthropic error stream packet: {:?}",
                             formatted_error
@@ -509,7 +515,30 @@ fn classify_untyped_stream_error(message: &str) -> StreamErrorKind {
     StreamErrorKind::Other
 }
 
-fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
+/// What the streaming path needs to explain a sampling control the model refused: the same
+/// inputs `chat_request` hands [`explain_rejected_sampling_control`]. The explanation runs here,
+/// inside the stream's own error formatting, rather than upstream of it: an explained error has
+/// no field a gateway answering in `OpenAI`'s shape could not also set, so nothing downstream can
+/// tell one apart after the fact.
+pub struct StreamErrorContext {
+    pub model: AnthropicModelVariant,
+    pub model_from_default: bool,
+    pub controls: Vec<&'static str>,
+}
+
+fn format_anthropic_stream_error(error: OpenAIError, context: &StreamErrorContext) -> OpenAIError {
+    // A refused sampling control is explained the way `chat_request` explains it, and keeps the
+    // `invalid_request_error` type and the `code` the explanation sets.
+    let error = match explain_rejected_sampling_control(
+        &context.model,
+        context.model_from_default,
+        &context.controls,
+        error,
+    ) {
+        Ok(explained) => return explained,
+        Err(error) => error,
+    };
+
     let OpenAIError::ApiError(api_error) = error else {
         return error;
     };
@@ -517,20 +546,7 @@ fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
     // A `not_found_error` arrives already explained by `explain_model_not_found`, which names the
     // model and the parameter to change. Returning it untouched keeps that explanation, and keeps
     // the `not_found_error` type a downstream check can still read.
-    //
-    // An `invalid_request_error` carrying both `param` and `code` was explained the same way, by
-    // `explain_rejected_sampling_control`: Anthropic's own error schema has neither field, so the
-    // pair is set only by this adapter, once the message names the model and the control. Both
-    // are required so that a gateway at a configured `endpoint` that answers in OpenAI's shape,
-    // which does carry `param`, still takes the arm below.
-    let explained_upstream = match api_error.r#type.as_deref() {
-        Some("not_found_error") => true,
-        Some("invalid_request_error") => {
-            api_error.param.is_some() && api_error.code.as_deref() == Some("invalid_request_error")
-        }
-        _ => false,
-    };
-    if explained_upstream {
+    if api_error.r#type.as_deref() == Some("not_found_error") {
         return OpenAIError::ApiError(api_error);
     }
 
@@ -597,6 +613,15 @@ fn create_anthropic_stream_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The streaming context of a request that forwarded `controls`, for a configured model.
+    fn context_with(controls: Vec<&'static str>) -> StreamErrorContext {
+        StreamErrorContext {
+            model: "claude-sonnet-5".to_string(),
+            model_from_default: false,
+            controls,
+        }
+    }
 
     #[test]
     fn usage_delta_accumulates_cache_tokens() {
@@ -695,7 +720,9 @@ mod tests {
         };
         let expected = before.message.clone();
 
-        let OpenAIError::ApiError(after) = format_anthropic_stream_error(explained) else {
+        let OpenAIError::ApiError(after) =
+            format_anthropic_stream_error(explained, &context_with(vec![]))
+        else {
             panic!("formatting must not change the error variant");
         };
 
@@ -703,63 +730,72 @@ mod tests {
         assert_eq!(after.r#type.as_deref(), Some("not_found_error"));
     }
 
-    /// A rejected sampling control is explained upstream the same way, as an
-    /// `invalid_request_error` carrying `param` and `code` — fields Anthropic itself never sets —
-    /// and has to survive the fallback arm that re-types every other `invalid_request_error`.
-    #[test]
-    fn an_explained_rejected_control_passes_through_unchanged() {
-        let explained = crate::anthropic::explain_rejected_sampling_control(
-            "claude-sonnet-5",
-            false,
-            &["temperature"],
-            OpenAIError::ApiError(ApiError {
-                message: "`temperature` is deprecated for this model.".to_string(),
-                r#type: Some("invalid_request_error".to_string()),
-                param: None,
-                code: None,
-            }),
-        );
-        let OpenAIError::ApiError(before) = &explained else {
-            panic!("the explanation must stay an ApiError");
-        };
-        assert_eq!(
-            before.param.as_deref(),
-            Some("temperature"),
-            "the explanation marks the error with the control it names"
-        );
-        let expected = before.message.clone();
+    /// Anthropic's answer to a sampling control the model does not accept, as the SSE client
+    /// delivers it: a typed `invalid_request_error` with no `param` and no `code`.
+    fn temperature_rejected() -> OpenAIError {
+        OpenAIError::ApiError(ApiError {
+            message: "`temperature` is deprecated for this model.".to_string(),
+            r#type: Some("invalid_request_error".to_string()),
+            param: None,
+            code: None,
+        })
+    }
 
-        let OpenAIError::ApiError(after) = format_anthropic_stream_error(explained) else {
+    /// A refused sampling control is explained here, inside the stream's own formatting, where
+    /// the fallback arm would otherwise re-type it as every other `invalid_request_error`.
+    #[test]
+    fn a_rejected_control_is_explained_before_the_fallback_arm() {
+        let OpenAIError::ApiError(after) = format_anthropic_stream_error(
+            temperature_rejected(),
+            &context_with(vec!["temperature"]),
+        ) else {
             panic!("formatting must not change the error variant");
         };
 
-        assert_eq!(after.message, expected);
+        assert!(
+            after.message.contains("'claude-sonnet-5'")
+                && after.message.contains("Remove `temperature`"),
+            "the explanation names the model and the control: {}",
+            after.message
+        );
         assert_eq!(after.r#type.as_deref(), Some("invalid_request_error"));
         assert_eq!(after.code.as_deref(), Some("invalid_request_error"));
+        assert_eq!(after.param.as_deref(), Some("temperature"));
     }
 
-    /// Anthropic's own `invalid_request_error` carries neither `param` nor `code`, and a gateway
-    /// answering in OpenAI's shape carries `param` alone; both still take the generic arm. Only an
-    /// error this adapter explained, which sets the pair, is passed through.
+    /// The same answer to a request that forwarded no control is not a refused control — it is
+    /// whatever Anthropic says it is — and takes the generic arm. So does a gateway's
+    /// `invalid_request_error` that happens to carry `param` and `code`: those are public fields,
+    /// never a mark of an explanation, and the explanation keys on the forwarded controls alone.
     #[test]
     fn an_unexplained_invalid_request_is_still_retyped() {
-        for param in [None, Some("temperature".to_string())] {
-            let OpenAIError::ApiError(after) =
-                format_anthropic_stream_error(OpenAIError::ApiError(ApiError {
-                    message: "`temperature` is deprecated for this model.".to_string(),
-                    r#type: Some("invalid_request_error".to_string()),
-                    param,
-                    code: None,
-                }))
+        let gateway_shaped = OpenAIError::ApiError(ApiError {
+            message: "messages: at least one message is required".to_string(),
+            r#type: Some("invalid_request_error".to_string()),
+            param: Some("messages".to_string()),
+            code: Some("invalid_request_error".to_string()),
+        });
+
+        for (error, context) in [
+            (temperature_rejected(), context_with(vec![])),
+            (temperature_rejected(), context_with(vec!["top_p"])),
+            (gateway_shaped, context_with(vec!["temperature"])),
+        ] {
+            let OpenAIError::ApiError(before) = &error else {
+                panic!("the fixture is an ApiError");
+            };
+            let cause = before.message.clone();
+
+            let OpenAIError::ApiError(after) = format_anthropic_stream_error(error, &context)
             else {
                 panic!("formatting must not change the error variant");
             };
 
             assert_eq!(after.r#type.as_deref(), Some("AnthropicStreamError"));
             assert!(
-                after
-                    .message
-                    .contains("`temperature` is deprecated for this model.")
+                after.message.contains(&cause),
+                "the cause must survive: {}",
+                after.message
             );
         }
     }
@@ -805,7 +841,9 @@ mod tests {
             }),
         );
 
-        let OpenAIError::ApiError(after) = format_anthropic_stream_error(explained) else {
+        let OpenAIError::ApiError(after) =
+            format_anthropic_stream_error(explained, &context_with(vec![]))
+        else {
             panic!("formatting must not change the error variant");
         };
 
