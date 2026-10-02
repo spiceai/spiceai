@@ -3654,6 +3654,7 @@ impl DataFusion {
         );
         accelerated_table_builder.engine_type_rewrites(engine_type_rewrites);
         accelerated_table_builder.change_sink_engine(change_sink_engine);
+        accelerated_table_builder.cache_memory_pool(Arc::clone(self.ctx.task_ctx().memory_pool()));
 
         source
             .on_accelerator_setup(dataset, &mut accelerated_table_builder)

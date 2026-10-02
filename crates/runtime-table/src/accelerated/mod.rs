@@ -18,7 +18,7 @@ use runtime_component::ClusterRole;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -294,7 +294,8 @@ pub struct AcceleratedTable {
     refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>,
 
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
-    pub handlers: Vec<JoinHandle<()>>,
+    pub handlers: parking_lot::Mutex<Vec<JoinHandle<()>>>,
+    changes_drain: std::sync::OnceLock<runtime_acceleration::change_sink::Publication>,
     zero_results_action: ZeroResultsAction,
     ready_state: ReadyState,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
@@ -305,7 +306,8 @@ pub struct AcceleratedTable {
     write_mode: WriteMode,
     synchronized_with: Option<SynchronizedTable>,
     /// Child accelerators that should receive cached data when this parent stores new cache entries (caching mode only)
-    synchronized_children: Arc<RwLock<Vec<Arc<dyn TableProvider>>>>,
+    synchronized_children: caching::SynchronizedChildren,
+    cache_children_closed: Arc<AtomicBool>,
     cache_ttl: Option<Duration>,
     cache_stale_while_revalidate_ttl: Option<Duration>,
     cache_stale_if_error: StaleIfError,
@@ -420,6 +422,7 @@ pub struct Builder {
     federated_source: String,
     accelerator: Arc<dyn TableProvider>,
     change_sink_engine: Option<Arc<dyn data_accelerator_api::DataAccelerator>>,
+    cache_memory_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
     refresh: refresh::Refresh,
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
@@ -485,6 +488,7 @@ impl Builder {
             federated_source,
             accelerator,
             change_sink_engine: None,
+            cache_memory_pool: None,
             refresh,
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
@@ -538,6 +542,14 @@ impl Builder {
         engine: Option<Arc<dyn data_accelerator_api::DataAccelerator>>,
     ) -> &mut Self {
         self.change_sink_engine = engine;
+        self
+    }
+
+    pub fn cache_memory_pool(
+        &mut self,
+        pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    ) -> &mut Self {
+        self.cache_memory_pool = Some(pool);
         self
     }
 
@@ -978,17 +990,32 @@ impl Builder {
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
+        // Resolve fallible write bindings before registering a child or starting producers.
+        let write_mode = if self.dual_write {
+            WriteMode::resolve_dual_write(&self.accelerator, &self.federated)?
+        } else if self.write_back {
+            WriteMode::WriteBack
+        } else if self.write_to_accelerator_only {
+            WriteMode::AcceleratorOnly
+        } else {
+            WriteMode::WriteThrough
+        };
         let refresh_mode = self.refresh.mode;
-        let change_sink = if matches!(refresh_mode, RefreshMode::Changes | RefreshMode::Append) {
+        let change_sink = if matches!(
+            refresh_mode,
+            RefreshMode::Changes | RefreshMode::Append | RefreshMode::Caching
+        ) {
             use runtime_acceleration::change_sink::provider::ProviderChangeSinkBackend;
             use runtime_acceleration::change_sink::{ChangeSink, ChangeSinkContext};
 
             let mut context =
                 ChangeSinkContext::new(self.dataset_name.clone(), Arc::clone(&self.accelerator));
             context.write_lock = Arc::clone(&self.accelerator_write_mutex);
-            let federated = Arc::clone(&self.federated);
-            context.external_indexes =
-                Arc::new(move || refresh_task::indexes_from_federated(&federated));
+            if refresh_mode != RefreshMode::Caching {
+                let federated = Arc::clone(&self.federated);
+                context.external_indexes =
+                    Arc::new(move || refresh_task::indexes_from_federated(&federated));
+            }
             let runtime = self
                 .cdc_apply_runtime
                 .as_ref()
@@ -1004,14 +1031,16 @@ impl Builder {
             } else {
                 None
             };
-            Some(native.unwrap_or_else(|| {
-                ChangeSink::new(
-                    Arc::new(ProviderChangeSinkBackend::new(context)),
-                    util::session_state::session_context(),
-                    &runtime,
-                    capacity,
-                )
-            }))
+            native.or_else(|| {
+                (refresh_mode != RefreshMode::Caching).then(|| {
+                    ChangeSink::new(
+                        Arc::new(ProviderChangeSinkBackend::new(context)),
+                        util::session_state::session_context(),
+                        &runtime,
+                        capacity,
+                    )
+                })
+            })
         } else {
             None
         };
@@ -1080,8 +1109,6 @@ impl Builder {
         // that was never built. `refresher.start` below is the first such task, so
         // this has to come before it, not merely before `handlers`.
         //
-        // `WriteMode::WriteBack` is `write_back` without `dual_write`, resolved
-        // further down.
         let write_back_worker = if self.write_back && !self.dual_write {
             match write::dual_write::extract_cayenne_write_target(&self.accelerator) {
                 Some(write::CayenneWriteTarget::Staged(cayenne))
@@ -1099,6 +1126,61 @@ impl Builder {
         } else {
             None
         };
+
+        let (batch_write_tx, batch_write_rx) = if refresh_mode == RefreshMode::Caching {
+            if let Some(sink) = &change_sink {
+                let memory_pool =
+                    self.cache_memory_pool
+                        .as_ref()
+                        .ok_or_else(|| Error::FailedToWriteData {
+                            source: DataFusionError::Internal(
+                                "Cache writes require the configured runtime memory pool".into(),
+                            ),
+                        })?;
+                (
+                    Some(caching::CacheWriteSender::from_sink(
+                        sink.clone(),
+                        self.accelerator.schema(),
+                        self.dataset_name.clone(),
+                        Arc::clone(&self.runtime_status),
+                        Arc::clone(&last_updated_at),
+                        Arc::clone(memory_pool),
+                    )),
+                    None,
+                )
+            } else {
+                let (sender, receiver) = caching::create_cache_write_channel();
+                (Some(sender), Some(receiver))
+            }
+        } else {
+            (None, None)
+        };
+        refresher.with_cache_write_sender(batch_write_tx.clone());
+
+        if let (Some(synchronize_with), Some(writer)) = (&self.synchronize_with, &batch_write_tx) {
+            let child = caching::SynchronizedCacheTarget {
+                accelerator: Arc::clone(&self.accelerator),
+                writer: writer.clone(),
+                in_flight: Arc::clone(&in_flight_revalidations),
+            };
+            let rows = synchronize_with
+                .initialize_cache_child(child)
+                .await
+                .map_err(|source| Error::FailedToWriteData { source })?;
+            if rows > 0 {
+                tracing::info!(
+                    "Initialized caching child {} with {} rows from parent {}",
+                    self.dataset_name,
+                    rows,
+                    synchronize_with.parent_dataset_name()
+                );
+            }
+            tracing::info!(
+                "Registered caching child {} with parent {}",
+                self.dataset_name,
+                synchronize_with.parent_dataset_name()
+            );
+        }
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
@@ -1130,9 +1212,8 @@ impl Builder {
                     refresh_trigger,
                 )
             };
+        let mut handlers = refresher.take_background_tasks();
         let refresher = Arc::new(refresher);
-
-        let mut handlers = vec![];
         if let Some(refresh_handle) = refresh_handle {
             handlers.push(refresh_handle);
         }
@@ -1155,24 +1236,17 @@ impl Builder {
             );
         }
 
-        // For caching mode, create the batched write channel and spawn consumer task.
-        let batch_write_tx = if refresh_mode == RefreshMode::Caching {
-            let (tx, rx) = caching::create_cache_write_channel();
-            let consumer_handle = caching::spawn_batched_cache_write_task(
-                rx,
+        if let Some(receiver) = batch_write_rx {
+            handlers.push(caching::spawn_batched_cache_write_task(
+                receiver,
                 Arc::clone(&self.accelerator),
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator_write_mutex),
                 Arc::clone(&in_flight_revalidations),
                 Arc::clone(&last_updated_at),
                 Arc::clone(&self.runtime_status),
-            );
-            // The consumer task will be automatically stopped (aborted) when AcceleratedTable is dropped
-            handlers.push(consumer_handle);
-            Some(tx)
-        } else {
-            None
-        };
+            ));
+        }
 
         // A caching accelerator is bounded by `caching_eviction` as a computed
         // retention policy rather than by a loop of its own, so the cache is
@@ -1283,66 +1357,6 @@ impl Builder {
             ReadyState::OnLoad => {}
         }
 
-        // For caching mode with synchronization, register the child with the parent immediately
-        // so the parent can propagate cached data to this child.
-        if refresh_mode == RefreshMode::Caching
-            && let Some(synchronize_with) = &self.synchronize_with
-        {
-            synchronize_with.register_child_with_parent().await;
-            tracing::info!(
-                "Registered caching child {} with parent {}",
-                self.dataset_name,
-                synchronize_with.parent_dataset_name()
-            );
-
-            // Initialize child accelerator from parent's existing cached data.
-            // This ensures the child has the parent's cache state when the parent
-            // has existing data (e.g., from file-mode DuckDB restored from disk,
-            // or from a snapshot bootstrap).
-            let parent_accelerator = synchronize_with.parent_accelerator();
-            match caching::CacheRefreshHelper::initialize_child_from_parent(
-                &parent_accelerator,
-                &self.accelerator,
-                &self.dataset_name.to_string(),
-            )
-            .await
-            {
-                Ok(rows) if rows > 0 => {
-                    tracing::info!(
-                        "Initialized caching child {} with {} rows from parent {}",
-                        self.dataset_name,
-                        rows,
-                        synchronize_with.parent_dataset_name()
-                    );
-                }
-                Ok(_) => {
-                    tracing::debug!(
-                        "No existing data in parent {} to initialize child {}",
-                        synchronize_with.parent_dataset_name(),
-                        self.dataset_name
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to initialize caching child {} from parent {}: {}",
-                        self.dataset_name,
-                        synchronize_with.parent_dataset_name(),
-                        e
-                    );
-                }
-            }
-        }
-
-        let write_mode = if self.dual_write {
-            WriteMode::resolve_dual_write(&self.accelerator, &self.federated)?
-        } else if self.write_back {
-            WriteMode::WriteBack
-        } else if self.write_to_accelerator_only {
-            WriteMode::AcceleratorOnly
-        } else {
-            WriteMode::WriteThrough
-        };
-
         // Started here rather than where it was built, so it is aborted on drop
         // with the other handlers.
         if let Some(worker) = write_back_worker {
@@ -1359,7 +1373,8 @@ impl Builder {
             change_sink,
             federated: self.federated,
             refresh_trigger,
-            handlers,
+            handlers: parking_lot::Mutex::new(handlers),
+            changes_drain: std::sync::OnceLock::new(),
             zero_results_action: self.zero_results_action,
             ready_state: self.ready_state,
             refresh_params,
@@ -1369,6 +1384,7 @@ impl Builder {
             write_mode,
             synchronized_with: self.synchronize_with,
             synchronized_children: Arc::new(RwLock::new(Vec::new())),
+            cache_children_closed: Arc::new(AtomicBool::new(false)),
             cache_ttl: self.caching_ttl,
             cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
             cache_stale_if_error: self.caching_stale_if_error,
@@ -1389,15 +1405,74 @@ impl AcceleratedTable {
         self.change_sink.as_ref()
     }
 
+    /// Fence cache and sink admission, stop producers, and retain their complete
+    /// drain independently of callers. Repeated calls observe the same result.
+    #[must_use]
+    pub fn begin_changes_drain(&self) -> runtime_acceleration::change_sink::Publication {
+        self.changes_drain
+            .get_or_init(|| {
+                self.cache_children_closed.store(true, Ordering::Release);
+                let children = Arc::clone(&self.synchronized_children);
+                let cache_work = self
+                    .batch_write_tx
+                    .as_ref()
+                    .and_then(caching::CacheWriteSender::begin_drain);
+                let publication = self.change_sink.as_ref().map(|sink| sink.begin_close());
+                let handlers = std::mem::take(&mut *self.handlers.lock());
+                for handler in &handlers {
+                    handler.abort();
+                }
+                let dataset = self.dataset_name.clone();
+                let synchronized = (self.refresh_mode == RefreshMode::Caching)
+                    .then(|| self.synchronized_with.clone())
+                    .flatten();
+                let claims = Arc::clone(&self.in_flight_revalidations);
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                self.io_runtime.spawn(async move {
+                    let mut producer_failure = None;
+                    for handler in handlers {
+                        if let Err(error) = handler.await
+                            && !error.is_cancelled()
+                        {
+                            producer_failure = Some(DataFusionError::Execution(format!(
+                                "Failed to stop change ingestion for dataset '{dataset}': {error}"
+                            )));
+                        }
+                    }
+                    let storage_result = match publication {
+                        Some(publication) => publication.wait().await,
+                        None => Ok(()),
+                    };
+                    if let Some(cache_work) = cache_work {
+                        cache_work.wait().await;
+                    }
+                    // Initialization owns the registry write guard. The admission
+                    // fence prevents a later initializer from attaching a child.
+                    drop(children.write().await);
+                    if let Some(synchronized) = synchronized {
+                        synchronized.unregister_cache_child(&claims).await;
+                    }
+                    let result = match storage_result {
+                        Err(error) => Err(error),
+                        Ok(()) => producer_failure.map_or(Ok(()), Err),
+                    };
+                    sender.send_replace(Some(result.map_err(Arc::new)));
+                });
+                runtime_acceleration::change_sink::Publication::Pending(receiver)
+            })
+            .clone()
+    }
+
     /// Stop producers and drain accepted changes before the storage target can
-    /// be removed or rebound. A failed drain leaves admission fenced.
+    /// be removed or rebound. Cancellation stops waiting, not the owned drain.
     pub async fn drain_changes(&self, timeout: Duration) -> DataFusionResult<()> {
-        if let Some(sink) = &self.change_sink {
-            for handler in &self.handlers {
-                handler.abort();
-            }
-            sink.close(timeout).await?;
-        }
+        let publication = self.begin_changes_drain();
+        tokio::time::timeout(timeout, publication.wait()).await.map_err(|_| {
+            DataFusionError::Execution(format!(
+                "Change ingestion for dataset '{}' is still draining; its storage remains fenced",
+                self.dataset_name,
+            ))
+        })??;
         Ok(())
     }
 
@@ -1588,18 +1663,9 @@ impl AcceleratedTable {
         &self.accelerator
     }
 
-    /// Add a child accelerator that should receive cached data when this parent stores new cache entries.
-    /// This is used for localpod caching synchronization.
-    pub async fn add_synchronized_child(&self, child_accelerator: Arc<dyn TableProvider>) {
-        self.synchronized_children
-            .write()
-            .await
-            .push(child_accelerator);
-    }
-
     /// Get the list of synchronized child accelerators for caching mode.
     #[must_use]
-    pub fn synchronized_children(&self) -> Arc<RwLock<Vec<Arc<dyn TableProvider>>>> {
+    pub fn synchronized_children(&self) -> caching::SynchronizedChildren {
         Arc::clone(&self.synchronized_children)
     }
 
@@ -1672,6 +1738,11 @@ impl AcceleratedTable {
 
         let filter_refs: Vec<&Expr> = filters.iter().collect();
         let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
+        if pushdown_support.len() != filters.len() {
+            return Err(DataFusionError::Internal(
+                "Accelerator returned an incomplete filter-pushdown classification".into(),
+            ));
+        }
 
         let filters_to_reapply: Vec<Expr> = filters
             .iter()
@@ -1705,12 +1776,7 @@ impl AcceleratedTable {
 
 impl Drop for AcceleratedTable {
     fn drop(&mut self) {
-        for handler in self.handlers.drain(..) {
-            handler.abort();
-        }
-        if let Some(sink) = &self.change_sink {
-            sink.begin_close();
-        }
+        let _ = self.begin_changes_drain();
     }
 }
 
@@ -1732,7 +1798,7 @@ impl RegisteredAcceleratedTable for AcceleratedTable {
     }
 
     fn attach_task(&mut self, task: JoinHandle<()>) {
-        self.handlers.push(task);
+        self.handlers.get_mut().push(task);
     }
 }
 
@@ -1792,29 +1858,6 @@ impl AcceleratedTable {
             }
         }
 
-        // For caching mode, extend the accelerator scan projection to
-        // include the storage-only columns the caching pipeline needs:
-        // `_fetched_at` (freshness check inside
-        // `CachingAccelerationScanExec`) and `__spice_cache_namespace`
-        // (per-principal isolation `FilterExec` applied below). The added
-        // columns are stripped from the user-facing output by
-        // `SchemaCastScanExec` on top of the plan, so they never leak
-        // into query results.
-        //
-        // Done unconditionally for caching mode (not gated on having
-        // user filters) because the namespace `FilterExec` is always
-        // applied and must always be able to resolve the namespace
-        // column. Without this, a caching-mode scan with a non-empty
-        // user projection but no user filters (e.g. `SELECT content FROM
-        // ds`) would push only the user's columns to the accelerator
-        // and the FilterExec on top would fail with `No field named
-        // __spice_cache_namespace`.
-        let extended_projection = if is_caching_mode {
-            extend_projection_for_caching(projection, &self.accelerator.schema())
-        } else {
-            None
-        };
-        let scan_projection = extended_projection.as_ref().or(projection);
         // For caching mode, scope the accelerator scan to the current
         // request's namespace by appending a `__spice_cache_namespace = $ns_id`
         // predicate. The federated source still receives only the user's
@@ -1847,18 +1890,47 @@ impl AcceleratedTable {
         } else {
             None
         };
-        let storage_filters: Vec<Expr> = if let Some(ref nf) = namespace_filter {
-            let mut sf = filters.to_vec();
-            sf.push(nf.clone());
-            sf
+        let mut storage_filters = if is_caching_mode {
+            caching::cache_lookup_filters(self.accelerator.schema().as_ref(), filters)
         } else {
             filters.to_vec()
         };
+        if let Some(nf) = namespace_filter {
+            storage_filters.push(nf);
+        }
         let scan_filters: &[Expr] = if is_caching_mode {
             &storage_filters
         } else {
             filters
         };
+        let filters_to_reapply = if is_caching_mode {
+            self.get_filters_to_reapply(&storage_filters)?
+        } else {
+            Vec::new()
+        };
+        // Retain freshness, namespace and residual-filter columns through the
+        // cache lookup. The output schema cast removes unrequested columns.
+        let extended_projection = if is_caching_mode {
+            projection.map(|projection| {
+                let schema = self.accelerator.schema();
+                let mut extended = extend_projection_for_caching(Some(projection), &schema)
+                    .unwrap_or_else(|| projection.clone());
+                let required: std::collections::HashSet<_> = filters_to_reapply
+                    .iter()
+                    .flat_map(Expr::column_refs)
+                    .map(|column| column.name.clone())
+                    .collect();
+                for (index, field) in schema.fields().iter().enumerate() {
+                    if required.contains(field.name()) && !extended.contains(&index) {
+                        extended.push(index);
+                    }
+                }
+                extended
+            })
+        } else {
+            None
+        };
+        let scan_projection = extended_projection.as_ref().or(projection);
         let input = if matches!(
             (is_caching_mode, &self.zero_results_action),
             (false, ZeroResultsAction::ReturnEmpty)
@@ -1879,45 +1951,9 @@ impl AcceleratedTable {
 
         let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
-                // Check which user filters the accelerator doesn't fully
-                // support and need to be re-applied. This ensures correct
-                // results when the accelerator returns Inexact or
-                // Unsupported for some filters.
-                let mut filters_to_reapply = self.get_filters_to_reapply(filters)?;
-                // Re-apply the cache-namespace predicate as a hard
-                // FilterExec only if the accelerator does NOT report exact
-                // pushdown for it.
-                //
-                // The DataFusion contract for `supports_filters_pushdown`
-                // is: `Exact` means the provider guarantees the predicate
-                // will be applied (the caller does not have to re-apply);
-                // `Inexact` / `Unsupported` mean the caller MUST re-apply
-                // or rows that should be filtered may slip through. Cache
-                // isolation is a correctness invariant, so we re-apply
-                // whenever the accelerator does not give an exact
-                // guarantee.
-                //
-                // We deliberately do NOT wrap on `Exact`: the wrap is not
-                // just redundant, it is harmful. `FilterExec` coalesces
-                // its output through `BatchCoalescer`, which strictly
-                // compares `Field` metadata across consecutive batches.
-                // Some accelerator <-> source schema combinations (notably
-                // `Map` field naming round-tripped through DuckDB, which
-                // canonicalizes `keys`/`values` to `key`/`value`) trigger
-                // a false-positive panic in `BatchCoalescer` even though
-                // the data itself is well-formed. This bites the localpod
-                // chained-accelerator path in particular.
-                if let Some(nf) = namespace_filter {
-                    let nf_pushdown = self
-                        .accelerator
-                        .supports_filters_pushdown(&[&nf])?
-                        .into_iter()
-                        .next()
-                        .unwrap_or(TableProviderFilterPushDown::Unsupported);
-                    if !matches!(nf_pushdown, TableProviderFilterPushDown::Exact) {
-                        filters_to_reapply.push(nf);
-                    }
-                }
+                let mut batch_write_tx = self.batch_write_tx.clone().ok_or_else(|| {
+                    DataFusionError::Internal("batch_write_tx missing in caching mode".to_string())
+                })?;
                 let input = if caching::uses_source_first(
                     filters,
                     self.cache_ttl,
@@ -1942,6 +1978,9 @@ impl AcceleratedTable {
                         schema,
                     }
                 } else {
+                    // A scan can bind a storage snapshot during planning. Observe
+                    // publication before that snapshot, not only at execution.
+                    batch_write_tx = batch_write_tx.observe_cache_scan();
                     let input = self
                         .accelerator
                         .scan(state, scan_projection, scan_filters, limit)
@@ -1954,10 +1993,6 @@ impl AcceleratedTable {
                 };
 
                 let federated_provider = self.federated.table_provider().await;
-                // SAFETY: batch_write_tx is always Some in caching mode (set in start())
-                let batch_write_tx = self.batch_write_tx.clone().ok_or_else(|| {
-                    DataFusionError::Internal("batch_write_tx missing in caching mode".to_string())
-                })?;
                 Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
                     self.cache_ttl,

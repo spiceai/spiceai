@@ -29968,6 +29968,62 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Refuse a keyless permanent-memory append that cannot fit before any
+    /// provider planning or replacement deletion runs. `incoming_bytes` must
+    /// include every normalized input chunk's retained Arrow allocation.
+    ///
+    /// This is a rejection preflight, not a capacity reservation. A successful
+    /// return does not guarantee that subsequent execution can fit; that write
+    /// must still enforce its limit under its own write-lock hold. Keyed writes
+    /// are not checked because conflict handling can reduce their input.
+    ///
+    /// Replacement filters must be stable predicates over the table schema. A
+    /// replacement with matching resident rows proceeds to normal execution:
+    /// this method neither estimates freed bytes nor discounts retained buffers.
+    /// Only a capacity breach triggers that predicate probe; appends never probe.
+    /// The write lock keeps the capacity observation and predicate probe coherent.
+    /// This method does not mutate storage or indexes, including on error.
+    pub async fn preflight_memory_append(
+        &self,
+        incoming_bytes: u64,
+        replacement_filters: Option<&[Expr]>,
+    ) -> Result<()> {
+        if !self.is_memory_resident_mode() || !self.pk_column_indices.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.write_lock.lock().await;
+        let Err(refusal) = self.enforce_memory_limit(incoming_bytes) else {
+            return Ok(());
+        };
+        let Some(filters) = replacement_filters else {
+            return Err(refusal);
+        };
+        if incoming_bytes >= self.context.mem_tier_max_bytes_capped() {
+            return Err(refusal);
+        }
+        let coerced = self.coerce_filters_for_inlined_delete(filters)?;
+        let physical = self.build_physical_filters_for_inlined_delete(&coerced)?;
+        if physical.is_empty() {
+            // An unfiltered delete may remove the entire tier.
+            return Ok(());
+        }
+        for shard in self.mem_tier.shards() {
+            let current = shard.load_full();
+            for segment in current.segments.iter() {
+                for batch in segment.batches.iter() {
+                    if self
+                        .delete_match_mask(batch, &physical)?
+                        .is_some_and(|matched| matched.true_count() > 0)
+                    {
+                        return Ok(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        Err(refusal)
+    }
+
     /// Write `batches` into the RAM mem-tier for a `mode: memory` table via the
     /// standard-DML (`full`/`append` refresh) path — the mem-tier is the permanent
     /// store, so nothing is ever encoded to Vortex. `overwrite` (full refresh)
@@ -44729,6 +44785,123 @@ mod tests {
             matches!(err, Error::MemTierLimitExceeded { .. }),
             "expected MemTierLimitExceeded, got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_append_preflight_is_read_only_and_preserves_replacements() {
+        let ctx = SessionContext::new();
+        let seed = int64_id_batch(&[0; 80]);
+        let bytes = seed.get_array_memory_size() as u64;
+        let cap = bytes + bytes / 2;
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "memory_append_preflight",
+            seed.schema(),
+            VortexConfig {
+                memory_mode: true,
+                cdc_mem_tier_max_bytes: i64::try_from(cap).expect("cap fits"),
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        insert_batch_with_context(&ctx, &provider, seed.clone()).await;
+        let original = provider.mem_tier.tier().load_full();
+        let missing = [datafusion_expr::col("id").eq(datafusion_expr::lit(9_i64))];
+        let existing = [datafusion_expr::col("id").eq(datafusion_expr::lit(0_i64))];
+
+        // The preflight observes capacity only while holding the writer lock.
+        let guard = provider.write_lock.lock().await;
+        let fresh = provider.preflight_memory_append(bytes, None);
+        tokio::pin!(fresh);
+        assert!(futures::poll!(&mut fresh).is_pending());
+        drop(guard);
+        assert!(matches!(
+            fresh.await,
+            Err(Error::MemTierLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            provider
+                .preflight_memory_append(bytes, Some(&missing))
+                .await,
+            Err(Error::MemTierLimitExceeded { .. }),
+        ));
+        assert!(matches!(
+            provider.preflight_memory_append(cap, Some(&existing)).await,
+            Err(Error::MemTierLimitExceeded { .. }),
+        ));
+        assert!(Arc::ptr_eq(
+            &original,
+            &provider.mem_tier.tier().load_full()
+        ));
+
+        provider
+            .preflight_memory_append(bytes, Some(&existing))
+            .await
+            .expect("replacement can free capacity through its normal delete");
+        assert!(Arc::ptr_eq(
+            &original,
+            &provider.mem_tier.tier().load_full()
+        ));
+        drop(original);
+
+        // An Ok preflight must not suppress the executor's capacity check.
+        let input = MemorySourceConfig::try_new_exec(&[vec![seed.clone()]], seed.schema(), None)
+            .expect("input plan");
+        let insert = provider
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("append plan");
+        collect(insert, ctx.task_ctx())
+            .await
+            .expect_err("old rows are still resident");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![0; 80]);
+
+        let delete = provider
+            .delete_from(&ctx.state(), existing.to_vec())
+            .await
+            .expect("replacement delete plan");
+        collect(delete, ctx.task_ctx())
+            .await
+            .expect("replacement delete");
+        insert_batch_with_context(&ctx, &provider, seed).await;
+        assert_eq!(scan_sorted_ids(&provider).await, vec![0; 80]);
+
+        let small = int64_id_batch(&[1]);
+        provider
+            .preflight_memory_append(small.get_array_memory_size() as u64, None)
+            .await
+            .expect("a smaller later input fits");
+        insert_batch_with_context(&ctx, &provider, small).await;
+        let mut expected = vec![0; 80];
+        expected.push(1);
+        assert_eq!(scan_sorted_ids(&provider).await, expected);
+    }
+
+    #[tokio::test]
+    async fn memory_append_preflight_does_not_guess_conflict_reductions() {
+        let ctx = SessionContext::new();
+        let duplicated = int64_id_batch(&[0; 1000]);
+        let cap = duplicated.get_array_memory_size() as u64 / 2;
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "memory_append_preflight_keyed",
+            duplicated.schema(),
+            VortexConfig {
+                memory_mode: true,
+                cdc_mem_tier_max_bytes: i64::try_from(cap).expect("cap fits"),
+                ..VortexConfig::default()
+            },
+            vec!["id".into()],
+            ctx.runtime_env(),
+        )
+        .await;
+        insert_batch_with_context(&ctx, &provider, int64_id_batch(&[0])).await;
+        provider
+            .preflight_memory_append(duplicated.get_array_memory_size() as u64, None)
+            .await
+            .expect("raw input bytes cannot decide a keyed write's capacity");
+        insert_batch_with_context(&ctx, &provider, duplicated).await;
+        assert_eq!(scan_sorted_ids(&provider).await, vec![0]);
     }
 
     /// Overwrite still counts resident tier bytes: while buffering a full refresh
