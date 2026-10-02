@@ -571,18 +571,148 @@ fn key_words_are_exact_for_keys_that_fit_eight_bytes() {
     assert_ne!(got[0], got[1]);
 }
 
-/// Floating-point values SQL holds equal can differ in bits (`0.0` and `-0.0`,
-/// NaNs with different payloads), so a lookup encoding the bits would miss
-/// rows. Such a key is refused rather than indexed.
+/// Each row of `column`, encoded alone under a key of its type.
+fn encode_each(column: ArrayRef) -> Vec<Vec<u8>> {
+    let encoder =
+        KeyEncoder::new(vec![KeyField::new(column.data_type().clone(), false)]).expect("key");
+    let columns = vec![column];
+    let bound = encoder.bind(&columns).expect("bind");
+    (0..columns[0].len())
+        .map(|row| {
+            let mut out = Vec::new();
+            bound.encode_row(row, &mut out);
+            out
+        })
+        .collect()
+}
+
+/// `values` as a column of each float width, by their `f64` bits narrowed with
+/// `as` (so a NaN payload and the sign of zero carry over).
+fn float_columns(values: &[f64]) -> Vec<ArrayRef> {
+    use arrow_array::types::Float16Type;
+    use arrow_array::{ArrowPrimitiveType, Float32Array, Float64Array, PrimitiveArray};
+    type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+    #[expect(clippy::cast_possible_truncation, reason = "narrowed on purpose")]
+    let narrow = |v: f64| v as f32;
+    vec![
+        Arc::new(PrimitiveArray::<Float16Type>::from_iter_values(
+            values.iter().map(|&v| F16::from_f64(v)),
+        )),
+        Arc::new(Float32Array::from_iter_values(
+            values.iter().map(|&v| narrow(v)),
+        )),
+        Arc::new(Float64Array::from_iter_values(values.iter().copied())),
+    ]
+}
+
+/// SQL can hold `-0.0` equal to `0.0`, and one NaN equal to another, so each
+/// such pair encodes identically at every width: a lookup for one must find
+/// rows holding the other. Infinities stay apart from NaN and from each other.
 #[test]
-fn floating_point_keys_are_refused() {
-    for data_type in [DataType::Float16, DataType::Float32, DataType::Float64] {
-        assert_eq!(
-            KeyEncoder::new(vec![KeyField::new(data_type.clone(), false)]).err(),
-            Some(Error::UnsupportedType {
-                data_type: data_type.to_string(),
-            }),
+fn floats_sql_holds_equal_encode_identically() {
+    let negative_nan = -f64::NAN;
+    let payload_nan = f64::from_bits(0x7FF0_0000_0000_0001);
+    let values = [
+        0.0,
+        -0.0,
+        f64::NAN,
+        negative_nan,
+        payload_nan,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    assert!(negative_nan.is_nan() && payload_nan.is_nan());
+    for column in float_columns(&values) {
+        let data_type = column.data_type().clone();
+        let got = encode_each(column);
+        assert_eq!(got[0], got[1], "{data_type}: -0.0 and 0.0");
+        assert_eq!(got[2], got[3], "{data_type}: NaN and -NaN");
+        assert_eq!(got[2], got[4], "{data_type}: NaN payloads");
+        assert_ne!(got[2], got[5], "{data_type}: NaN and infinity");
+        assert_ne!(got[5], got[6], "{data_type}: the two infinities");
+    }
+}
+
+/// Distinct floats encode distinctly and in numeric order at every width,
+/// from negative infinity through subnormals to positive infinity, with the
+/// one NaN above them all.
+#[test]
+fn floats_encode_in_numeric_order() {
+    let ordered = [
+        f64::NEG_INFINITY,
+        -1.0e300,
+        -65_504.0,
+        -1.5,
+        -1.0,
+        -6.0e-8,
+        0.0,
+        6.0e-8,
+        1.0,
+        1.5,
+        65_504.0,
+        1.0e300,
+        f64::INFINITY,
+        f64::NAN,
+    ];
+    for column in float_columns(&ordered) {
+        let data_type = column.data_type().clone();
+        let got = encode_each(column);
+        let mut deduped = got.clone();
+        // A value too large or too small for the width becomes its infinity
+        // or zero when narrowed, so equal neighbours encode equally.
+        deduped.dedup();
+        assert!(
+            deduped.windows(2).all(|pair| pair[0] < pair[1]),
+            "{data_type}: not ascending: {got:?}"
         );
+        assert!(deduped.len() >= 9, "{data_type}: too few distinct values");
+    }
+    let mut rng = StdRng::seed_from_u64(31);
+    let samples: Vec<f64> = (0..20_000)
+        .map(|_| f64::from_bits(rng.random::<u64>()))
+        .filter(|v| !v.is_nan())
+        .collect();
+    let encoded = encode_each(Arc::new(arrow_array::Float64Array::from(samples.clone())));
+    for i in 1..samples.len() {
+        let (a, b) = (samples[i - 1], samples[i]);
+        assert_eq!(
+            a.partial_cmp(&b).expect("not NaN"),
+            encoded[i - 1].cmp(&encoded[i]),
+            "{a} vs {b}"
+        );
+    }
+}
+
+/// An integer column widened to `Float64` (as a schema change can widen
+/// `Int32`) keeps exactly the integers' equality and order: two values encode
+/// alike only when the integers were equal, and sort as the integers did.
+#[test]
+fn integers_widened_to_floats_keep_their_equality_and_order() {
+    let mut rng = StdRng::seed_from_u64(32);
+    let mut ints: Vec<i32> = vec![i32::MIN, i32::MIN + 1, -1, 0, 1, i32::MAX - 1, i32::MAX];
+    ints.extend((0..5_000).map(|_| rng.random::<i32>()));
+    ints.extend((0..1_000).map(|_| rng.random_range(-50..50)));
+    let widened = encode_each(Arc::new(arrow_array::Float64Array::from_iter_values(
+        ints.iter().map(|&v| f64::from(v)),
+    )));
+    let as_ints = encode_each(Arc::new(Int32Array::from(ints.clone())));
+    for i in 0..ints.len() {
+        for j in [0, ints.len() / 2, ints.len() - 1, (i + 1) % ints.len()] {
+            assert_eq!(
+                ints[i].cmp(&ints[j]),
+                widened[i].cmp(&widened[j]),
+                "{} vs {} widened",
+                ints[i],
+                ints[j]
+            );
+            assert_eq!(
+                widened[i] == widened[j],
+                as_ints[i] == as_ints[j],
+                "{} vs {}",
+                ints[i],
+                ints[j]
+            );
+        }
     }
 }
 
