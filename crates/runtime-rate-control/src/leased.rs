@@ -1564,12 +1564,12 @@ impl LeasedBucket {
         window.recompute_budget_remaining(budget.whole);
 
         let my_existing = window.granted_for(instance);
-        // A carried token is funded by this replica's own bank rather than out
-        // of the cluster whole part, so it raises this replica's ceiling.
-        let max_possible_for_me = budget
-            .whole
-            .saturating_add(carried)
-            .saturating_sub(window.granted_by_others(instance));
+        let max_possible_for_me = replica_ceiling(
+            budget.whole,
+            carried,
+            burst,
+            window.granted_by_others(instance),
+        );
 
         // Pick the new grant.
         //
@@ -1786,6 +1786,22 @@ fn admission_ratio(budget: ClusterBudget, burst: u64) -> f64 {
 /// different versions in different windows.
 fn window_id_for(now: SystemTime, window: Duration) -> u64 {
     unix_millis(now) / duration_millis_u64(window).max(1)
+}
+
+/// The most tokens this replica may hold in a window.
+///
+/// A carried token is funded by the replica's own bank rather than out of the
+/// cluster whole part, so it raises this replica's ceiling — but never above
+/// the configured burst. The bank outlives the window that filled it, so a
+/// replica whose carry the cluster refused can still hold a whole token when
+/// the coefficient recovers and the whole part is already the configured
+/// burst. Without the cap the pair would lease `burst + 1`, and adaptive
+/// control would admit more than the static limit it only ever modifies down.
+fn replica_ceiling(whole: u64, carried: u64, burst: u64, granted_by_others: u64) -> u64 {
+    whole
+        .saturating_add(carried)
+        .min(burst)
+        .saturating_sub(granted_by_others)
 }
 
 /// The smallest slice a replica may lease: one percent of the budget, and never
@@ -2669,6 +2685,32 @@ mod tests {
         assert_eq!(min_lease(10), 1);
         assert_eq!(max_lease_per_replica(10), 9);
         assert_eq!(min_lease(600), 6);
+    }
+
+    /// Adaptive control only ever lowers the static limit, so a carried token
+    /// must never lift the cluster above the configured burst.
+    ///
+    /// The bank outlives the window that filled it. A replica can therefore
+    /// accrue a whole token while throttled, have the cluster refuse it, and
+    /// still hold it in the window the coefficient recovers in — where the
+    /// whole part is already the configured burst and there is no room for it.
+    #[test]
+    fn a_carried_token_never_lifts_the_cluster_above_the_configured_burst() {
+        // Recovered: the whole part is the full burst and a token is banked.
+        assert_eq!(replica_ceiling(1, 1, 1, 0), 1, "a carry cannot make it two");
+        assert_eq!(replica_ceiling(600, 2, 600, 0), 600);
+
+        // Throttled: the carry is what the bank exists for, so it still lands.
+        assert_eq!(
+            replica_ceiling(0, 1, 1, 0),
+            1,
+            "a closed budget still probes"
+        );
+        assert_eq!(replica_ceiling(4, 1, 10, 0), 5);
+
+        // A peer that spent first closes the ceiling behind it.
+        assert_eq!(replica_ceiling(4, 1, 10, 5), 0);
+        assert_eq!(replica_ceiling(1, 1, 1, 1), 0);
     }
 
     /// End to end: a wholly failing origin at a configured burst of one leases
