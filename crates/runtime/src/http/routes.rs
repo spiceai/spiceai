@@ -497,6 +497,7 @@ pub(crate) fn routes(
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(rt.completion_llms()))
             .layer(Extension(rt.evaluate_models()))
+            .layer(Extension(rt.responses_api_support()))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))

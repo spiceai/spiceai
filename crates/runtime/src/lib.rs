@@ -808,6 +808,15 @@ impl Runtime {
         Arc::clone(&self.rerankers)
     }
 
+    /// How each loaded model supports the Responses API, including which models are
+    /// evaluation-only.
+    #[must_use]
+    pub fn responses_api_support(
+        &self,
+    ) -> Arc<RwLock<HashMap<String, crate::model::ResponsesApiSupport>>> {
+        self.llm_runtime_stores.responses_api_support()
+    }
+
     pub async fn responses_api_support_for_model(
         &self,
         model_name: &str,

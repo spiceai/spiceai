@@ -57,8 +57,8 @@ use super::on_conflict::{
     PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
     PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
-    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
-    pk_deletion_snapshot_for_strategy,
+    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
+    ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
@@ -3769,31 +3769,38 @@ fn select_protected_snapshot_merge_tier(
     max_pass_bytes: Option<u64>,
     below_tier: Option<u32>,
 ) -> ProtectedMergeSelection {
-    if inputs.len() < 2 || min_runs < 2 {
-        // A merge needs at least two runs, and a floor below 2 is meaningless.
-        return ProtectedMergeSelection::NoQualifyingTier;
-    }
-
     // Group input indices by tier, preserving oldest-first order within a tier.
     let mut tiers: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
     for (idx, (_, _, bytes)) in inputs.iter().enumerate() {
         let tier = protected_snapshot_size_tier(*bytes, base_bytes, growth);
         tiers.entry(tier).or_default().push(idx);
     }
+    let no_qualifying_tier = || ProtectedMergeSelection::NoQualifyingTier {
+        runs_per_tier: tiers
+            .iter()
+            .map(|(tier, indices)| (*tier, indices.len()))
+            .collect(),
+    };
+
+    if min_runs < 2 {
+        // A floor below 2 is meaningless: a merge needs at least two runs. Fewer than
+        // two inputs needs no guard, since no tier can then reach `min_runs`.
+        return no_qualifying_tier();
+    }
 
     // BTreeMap iterates tiers in ascending order, so the first qualifying tier
     // is the lowest one.
-    let tiers = tiers
-        .into_iter()
-        .take_while(|(tier, _)| below_tier.is_none_or(|below| *tier < below));
-    for (_tier, indices) in tiers {
+    let eligible = tiers
+        .iter()
+        .take_while(|(tier, _)| below_tier.is_none_or(|below| **tier < below));
+    for (_tier, indices) in eligible {
         if indices.len() < min_runs {
             continue;
         }
         let width = max_width.max(2);
         let mut selected: Vec<(String, i64)> = Vec::with_capacity(width.min(indices.len()));
         let mut selected_bytes: u64 = 0;
-        for &idx in &indices {
+        for &idx in indices {
             if selected.len() == width {
                 break;
             }
@@ -3827,7 +3834,7 @@ fn select_protected_snapshot_merge_tier(
         };
     }
 
-    ProtectedMergeSelection::NoQualifyingTier
+    no_qualifying_tier()
 }
 
 /// Outcome of [`select_protected_snapshot_merge_tier`], distinguishing "nothing
@@ -3837,8 +3844,13 @@ fn select_protected_snapshot_merge_tier(
 enum ProtectedMergeSelection {
     /// Consolidate these runs: always at least 2, oldest-first.
     Merge(Vec<(String, i64)>),
-    /// No size tier has accumulated `min_runs` same-size runs yet.
-    NoQualifyingTier,
+    /// No size tier this pass may merge has accumulated `min_runs` same-size runs.
+    NoQualifyingTier {
+        /// Runs per size tier (`tier -> runs`) across every input, including tiers
+        /// at or above a running merge's tier, which this pass may not select.
+        /// `min_runs` applies to each tier on its own, never to the total.
+        runs_per_tier: std::collections::BTreeMap<u32, usize>,
+    },
     /// A tier has enough runs, but its two OLDEST do not fit `max_pass_bytes`, so
     /// the oldest-first walk cannot form a pair and the pass declines.
     ///
@@ -3855,12 +3867,13 @@ enum ProtectedMergeSelection {
     },
 }
 
+#[cfg(test)]
 impl ProtectedMergeSelection {
     /// The runs to merge, or empty for either declining outcome.
     fn into_inputs(self) -> Vec<(String, i64)> {
         match self {
             Self::Merge(inputs) => inputs,
-            Self::NoQualifyingTier | Self::OverPassBudget { .. } => Vec::new(),
+            Self::NoQualifyingTier { .. } | Self::OverPassBudget { .. } => Vec::new(),
         }
     }
 }
@@ -10110,10 +10123,16 @@ impl CayenneTableProvider {
             let snapshot_id = snapshot_id.to_string();
             let schema = Arc::clone(schema);
             handles.push(tokio::spawn(async move {
-                let unit_bytes = unit
-                    .iter()
-                    .map(|b| b.get_array_memory_size() as u64)
-                    .fold(0u64, u64::saturating_add);
+                // The unit is fully materialized, so its size is the resident
+                // memory of its batches with each Arrow allocation counted once.
+                // A PK-shard unit was rebuilt by the shard split
+                // (`filter_record_batch` allocates), so it shares nothing and the
+                // count matches its per-reference sum. The inline-corpus unit comes
+                // straight out of the metastore's IPC blobs, where every buffer of an
+                // entry points into one body allocation: a per-reference sum bills
+                // that allocation once per buffer and fans the unit out into ~its
+                // buffer count in files.
+                let unit_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&unit);
                 let estimated_bytes = Some(unit_bytes);
                 let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                     &[unit],
@@ -10161,13 +10180,14 @@ impl CayenneTableProvider {
     }
 
     /// The per-shard encode fan-out for the concurrent checkpoint encode: how many
-    /// files a shard of `unit_bytes` (uncompressed Arrow) must split into so no
-    /// output file exceeds the target Vortex file size — `ceil(unit_bytes / target)`,
-    /// min 1. A shard no larger than one target file stays a single file; a larger
-    /// shard rolls into just enough files to honor the target. Arrow over-counts vs
-    /// the compressed on-disk size, the safe direction (files land under the target
-    /// with margin). `write_to_snapshot` further clamps the result to the write
-    /// budget. `target_size_bytes == 0` means size rolling is DISABLED (one file per
+    /// files a shard of `unit_bytes` (resident Arrow bytes, each allocation counted
+    /// once) must split into so no output file exceeds the target Vortex file size
+    /// — `ceil(unit_bytes / target)`, min 1. A shard no larger than one target file
+    /// stays a single file; a larger shard rolls into just enough files to honor the
+    /// target. Resident Arrow still over-counts vs the compressed on-disk size, the
+    /// safe direction (files land under the target with margin).
+    /// `write_to_snapshot` further clamps the result to the write budget.
+    /// `target_size_bytes == 0` means size rolling is DISABLED (one file per
     /// write is intended — see the config warning), so the shard stays a single
     /// file, matching the pre-roll behavior.
     fn shard_encode_target_partitions(unit_bytes: u64, target_size_bytes: usize) -> usize {
@@ -10207,15 +10227,20 @@ impl CayenneTableProvider {
     ///   lower bound on it) supply a real estimate; only genuinely-unsized
     ///   streams fall back here.
     ///
-    /// **Units (deliberately asymmetric).** `estimated_bytes` is *uncompressed
-    /// in-memory Arrow* size (`RecordBatch::get_array_memory_size`), while
-    /// `target_size_bytes` is the target *on-disk Vortex* file size. Vortex
-    /// compresses, so `arrow_bytes / vortex_target` over-counts the files a write
-    /// will actually produce — i.e. it biases toward *more* shards. That is the
-    /// intended, safe direction: the surplus is bounded by `write_concurrency`,
-    /// extra encode parallelism is free on a multi-core host, and the transient
-    /// sub-target files it emits are merged by compaction (which is pinned to a
-    /// single output shard). The opposite error — discounting for compression and
+    /// **Units (deliberately asymmetric).** `estimated_bytes` is the *uncompressed
+    /// resident Arrow* size — what the batches hold in memory, each physical
+    /// allocation counted once
+    /// ([`RetainedBytes`](arrow_tools::batch_bytes::RetainedBytes)) rather than
+    /// once per buffer referencing it — while `target_size_bytes` is the target
+    /// *on-disk Vortex* file size. Vortex compresses, so `arrow_bytes /
+    /// vortex_target` over-counts the files a write will actually produce — i.e. it
+    /// biases toward *more* shards. That is the intended, safe direction: the
+    /// surplus is bounded by `write_concurrency`, extra encode parallelism is free
+    /// on a multi-core host, and the transient sub-target files it emits are merged
+    /// by compaction (which is pinned to a single output shard). Counting one
+    /// allocation once per buffer referencing it would be a different error
+    /// entirely — not a bias but a multiple, so a sub-target write fans out to the
+    /// concurrency ceiling. The opposite error — discounting for compression and
     /// then *under*-sharding a genuinely large, incompressible write into one
     /// oversized, serially-encoded file — is the costly one, so we do not apply a
     /// compression factor here. A faithful on-disk count would require an
@@ -15028,41 +15053,61 @@ impl CayenneTableProvider {
         ))
     }
 
-    pub(crate) async fn validate_and_append_sharded(
+    /// Split every raw batch of an apply into the tier's N per-shard sub-batches
+    /// (order-preserving Arrow filter on the `OwnedRow` shard hash), and measure
+    /// what each shard will hold.
+    ///
+    /// `per_shard_batches[s]` accumulates shard s's sub-batches in apply order;
+    /// empty sub-batches are dropped (an empty append is a no-op). At N>1 the
+    /// filter copies every column into fresh allocations, so the shards share
+    /// nothing with the raw batches or with each other, and each carries its own
+    /// buffer padding and array bookkeeping: their bytes can sum to more than the
+    /// raw batches'. The returned total is therefore what the caller must budget
+    /// and reserve — the same figure the shard segments record and a checkpoint
+    /// later releases, so reservation and release net to zero.
+    pub(crate) fn split_apply_by_pk_shard(
         &self,
-        batches: Vec<RecordBatch>,
-        mut sharded_index: Option<CheckedOutShardedPkIndex>,
+        batches: &[RecordBatch],
         pk_indices: &[usize],
         converter: &RowConverter,
-        on_conflict: &OnConflict,
-        total_incoming_bytes: u64,
-    ) -> Result<ShardedApplyResult> {
+    ) -> Result<ShardedApplyBatches> {
         let n = self.mem_tier.shard_count().max(1);
-
-        // 1. Split every raw batch into N per-shard sub-batches (order-preserving
-        //    Arrow filter on the OwnedRow shard hash).
-        //    `per_shard_batches[s]` accumulates shard s's sub-batches in apply
-        //    order. Empty sub-batches are dropped (an empty append is a no-op).
         let mut per_shard_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
-        let mut per_shard_bytes: Vec<u64> = vec![0; n];
-        for batch in &batches {
+        for batch in batches {
             let shards = Self::split_batch_by_pk_shard(batch, pk_indices, converter, n)?;
             for (s, sub) in shards.into_iter().enumerate() {
                 if sub.num_rows() == 0 {
                     continue;
                 }
-                per_shard_bytes[s] =
-                    per_shard_bytes[s].saturating_add(sub.get_array_memory_size() as u64);
                 per_shard_batches[s].push(sub);
             }
         }
-        // Guard against rounding loss: ensure the byte reservation accounting sums
-        // back to the whole-apply figure the caller reserved (assign any remainder
-        // to shard 0). At N=1 `per_shard_bytes[0]` is the whole apply.
-        let assigned: u64 = per_shard_bytes.iter().fold(0, |a, b| a.saturating_add(*b));
-        if assigned < total_incoming_bytes && !per_shard_bytes.is_empty() {
-            per_shard_bytes[0] = per_shard_bytes[0].saturating_add(total_incoming_bytes - assigned);
-        }
+        let per_shard_bytes = per_shard_batches
+            .iter()
+            .map(|shard| arrow_tools::batch_bytes::RetainedBytes::of(shard))
+            .collect();
+        Ok(ShardedApplyBatches {
+            per_shard_batches,
+            per_shard_bytes,
+        })
+    }
+
+    /// Validate and append an apply already split by
+    /// [`Self::split_apply_by_pk_shard`], whose
+    /// [`ShardedApplyBatches::total_bytes`] the caller has reserved against the
+    /// global budget.
+    pub(crate) async fn validate_and_append_sharded(
+        &self,
+        split: ShardedApplyBatches,
+        mut sharded_index: Option<CheckedOutShardedPkIndex>,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        on_conflict: &OnConflict,
+    ) -> Result<ShardedApplyResult> {
+        let ShardedApplyBatches {
+            per_shard_batches,
+            per_shard_bytes,
+        } = split;
 
         // 2. Validate each shard CONCURRENTLY against ITS existence view, building
         //    that shard's `OnConflictDeletions`. The shards are independent — a key
@@ -15108,9 +15153,12 @@ impl CayenneTableProvider {
             let index_ref = sharded_index.as_ref().map(CheckedOutShardedPkIndex::index);
             let non_empty_shards = per_shard_batches.iter().filter(|b| !b.is_empty()).count();
             // Total rows in this apply. Split preserves every row (only empty
-            // sub-batches are dropped), so the incoming batches sum to the same
-            // count the shards do — computed here without re-touching the data.
-            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            // sub-batches are dropped), so the shards sum to the incoming count.
+            let total_rows: usize = per_shard_batches
+                .iter()
+                .flatten()
+                .map(RecordBatch::num_rows)
+                .sum();
             if non_empty_shards <= 1 || total_rows <= SMALL_APPLY_INLINE_ROWS {
                 // INLINE: either ≤1 non-empty shard (no cross-shard parallelism to
                 // exploit) or a small enough apply that the per-shard OS-thread
@@ -15154,7 +15202,7 @@ impl CayenneTableProvider {
                     // a lazy spawn-then-join iterator chain would start each thread
                     // only as the join step pulled it, validating the shards one at a
                     // time instead of together.
-                    let mut handles: Vec<Option<_>> = Vec::with_capacity(n);
+                    let mut handles: Vec<Option<_>> = Vec::with_capacity(per_shard_batches.len());
                     for (s, shard_batches) in per_shard_batches.into_iter().enumerate() {
                         if shard_batches.is_empty() {
                             handles.push(None);
@@ -15262,6 +15310,19 @@ impl CayenneTableProvider {
         // this apply is about to hide/supersede. The serial feed after
         // `try_join_all` reuses this epoch (dense applier chain).
         let ivm_epoch = self.pre_bump_maintained_aggregate_epoch_for_concurrent_apply();
+        // A shard that validation left with neither rows nor deletions (a
+        // `DoNothing` apply whose keys all exist) appends no segment, so nothing
+        // would ever record — or a checkpoint release — the bytes reserved for it;
+        // they are handed back once the appends land. Memory mode reserves nothing
+        // globally.
+        let unappended_bytes = per_shard_validated
+            .iter()
+            .zip(&per_shard_bytes)
+            .filter(|((filtered_batches, deletions, _), _)| {
+                !filtered_batches.iter().any(|b| b.num_rows() > 0)
+                    && deletions.total_superseded() == 0
+            })
+            .fold(0u64, |total, (_, bytes)| total.saturating_add(*bytes));
         let append_futures = per_shard_validated.iter().enumerate().filter_map(
             |(s, (filtered_batches, deletions, kept))| {
                 let has_rows = filtered_batches.iter().any(|b| b.num_rows() > 0);
@@ -15289,6 +15350,11 @@ impl CayenneTableProvider {
         // The per-shard `MemTier::epoch`s returned here are NOT the slot-ack axis at
         // N>1 (incommensurable); they are drained to surface append errors only.
         futures::future::try_join_all(append_futures).await?;
+        // Only after every append succeeded: on an append error the caller
+        // releases the whole reservation itself.
+        if unappended_bytes > 0 && !self.is_memory_resident_mode() {
+            crate::provider::mem_tier_budget::release_bytes(unappended_bytes);
+        }
         // The relation and published epoch now agree. Registry maintenance can
         // remain asynchronous: scans at the new epoch fall back until it catches up.
         drop(ivm_visibility_guard);
@@ -24124,57 +24190,62 @@ impl CayenneTableProvider {
             in_flight.min_tier(),
         );
 
-        if let ProtectedMergeSelection::OverPassBudget {
-            tier_runs,
-            oldest_pair_bytes,
-        } = &selection
-        {
-            // Declining here costs less than it appears. A merge's benefit is one fewer
-            // scan branch, which is the same whether the runs are 8 MiB or 8 GiB; its
-            // cost is the bytes it rewrites. So a large-run tier is the worst-value work
-            // this pass can do, and leaving it settled is the same call the
-            // current-snapshot picker makes for files at or above the target size.
-            //
-            // The alarm for the read amplification that remains belongs to the read
-            // path, which already WARNs at `8 x compaction_trigger_protected_snapshots`
-            // protected snapshots (`scan_protected_snapshots`) — on the harm itself
-            // rather than on this proxy for it. This line is the cause, for whoever
-            // investigates that warning.
-            maintenance_metrics::track_compaction(
-                table_name,
-                CompactionKind::ProtectedSubset,
-                CompactionOutcome::DeclinedOverPassBudget,
-            );
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
+        let inputs = match selection {
+            ProtectedMergeSelection::Merge(inputs) => inputs,
+            ProtectedMergeSelection::OverPassBudget {
                 tier_runs,
                 oldest_pair_bytes,
-                max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
-                "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
-                 runs exceed the pass memory budget"
-            );
-            return Ok(false);
-        }
-
-        let inputs = selection.into_inputs();
-        if inputs.len() < 2 {
-            maintenance_metrics::track_compaction(
-                table_name,
-                CompactionKind::ProtectedSubset,
-                CompactionOutcome::DeclinedNoQualifyingTier,
-            );
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                candidates = sized_candidates.len(),
-                min_runs,
-                tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
-                max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
-                "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
-            );
-            return Ok(false);
-        }
+            } => {
+                // Declining here costs less than it appears. A merge's benefit is one fewer
+                // scan branch, which is the same whether the runs are 8 MiB or 8 GiB; its
+                // cost is the bytes it rewrites. So a large-run tier is the worst-value work
+                // this pass can do, and leaving it settled is the same call the
+                // current-snapshot picker makes for files at or above the target size.
+                //
+                // The alarm for the read amplification that remains belongs to the read
+                // path, which already WARNs at `8 x compaction_trigger_protected_snapshots`
+                // protected snapshots (`scan_protected_snapshots`) — on the harm itself
+                // rather than on this proxy for it. This line is the cause, for whoever
+                // investigates that warning.
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::ProtectedSubset,
+                    CompactionOutcome::DeclinedOverPassBudget,
+                );
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    tier_runs,
+                    oldest_pair_bytes,
+                    max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
+                    "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
+                     runs exceed the pass memory budget"
+                );
+                return Ok(false);
+            }
+            ProtectedMergeSelection::NoQualifyingTier { runs_per_tier } => {
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::ProtectedSubset,
+                    CompactionOutcome::DeclinedNoQualifyingTier,
+                );
+                // `min_runs` is a per-tier threshold, so `runs_per_tier` is what to read it
+                // against: 4 candidates split {0: 3, 1: 1} decline under `min_runs=4` (#13622).
+                // Tiers at or above `running_merge_min_tier` are not eligible this pass.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    runs_per_tier = ?runs_per_tier,
+                    min_runs,
+                    running_merge_min_tier = ?in_flight.min_tier(),
+                    candidates = sized_candidates.len(),
+                    tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
+                    max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
+                    "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
+                );
+                return Ok(false);
+            }
+        };
 
         // Diagnostics over the SELECTED (single-tier) input set.
         let selected_ids: std::collections::HashSet<&str> =
@@ -31463,10 +31534,12 @@ impl CayenneTableProvider {
         }
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let estimated_flushed_bytes = batches
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .fold(0u64, u64::saturating_add);
+        // Resident memory of the captured corpus, each Arrow allocation counted
+        // once: the tier retains the batches an apply handed it, and one fed over
+        // Arrow IPC (Flight, Flight SQL) points every buffer at one message body,
+        // which a per-reference sum bills once per buffer. It sizes the encode
+        // fan-out, so that over-count is files on disk, not just a number.
+        let estimated_flushed_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
         let estimated_bytes = Some(estimated_flushed_bytes);
         tracing::debug!(
             table = %self.table_metadata.table_name,
@@ -32861,16 +32934,14 @@ impl CayenneTableProvider {
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         // The inline memtable is fully materialized here, so we can size the
-        // checkpoint write exactly (sum of in-memory Arrow bytes). This lets the
-        // write shard count scale with the actual flush size instead of always
+        // checkpoint write exactly: the resident memory of the batches, each Arrow
+        // allocation counted once. The corpus is decoded from the metastore's IPC
+        // blobs, so every buffer of an entry points into that entry's one body
+        // allocation and a per-reference sum bills it once per buffer. This lets
+        // the write shard count scale with the actual flush size instead of always
         // fanning out — a small inline flush stays a single file. Computed before
         // `batches` is moved into the MemorySource below.
-        let estimated_bytes = Some(
-            batches
-                .iter()
-                .map(|b| b.get_array_memory_size() as u64)
-                .fold(0u64, u64::saturating_add),
-        );
+        let estimated_bytes = Some(arrow_tools::batch_bytes::RetainedBytes::of(&batches));
 
         // Extract Int64 PKs from the batches before they're moved into the
         // `MemorySource` below. After the flush, these PKs live in the new
@@ -40382,8 +40453,11 @@ mod tests {
         );
         assert_eq!(
             select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, Some(1)),
-            ProtectedMergeSelection::NoQualifyingTier,
-            "tier 1 must not merge alongside a running tier-1 merge"
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1), (1, 2)].into(),
+            },
+            "tier 1 must not merge alongside a running tier-1 merge, and the decline still \
+             reports the ineligible tier's runs"
         );
     }
 
@@ -40395,7 +40469,30 @@ mod tests {
         let inputs = vec![sized("a", 1024), sized("b", base * 4)];
         assert_eq!(
             select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, None),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1), (1, 1)].into(),
+            }
+        );
+    }
+
+    /// Regression test for #13622: four candidates under `min_runs = 4` decline when
+    /// they are split across tiers, and the decline carries the per-tier split that
+    /// explains it rather than only the total.
+    #[test]
+    fn select_merge_tier_reports_runs_per_tier_when_the_total_reaches_min_runs() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        let inputs = vec![
+            sized("merged", base * 2), // tier 1
+            sized("a", 1024),          // tier 0
+            sized("b", 2048),          // tier 0
+            sized("c", 4096),          // tier 0
+        ];
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&inputs, 4, 32, base, growth, None, None),
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 3), (1, 1)].into(),
+            }
         );
     }
 
@@ -40424,7 +40521,9 @@ mod tests {
         // Fewer than two inputs, or a sub-2 floor, can never merge.
         assert_eq!(
             select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth, None, None),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1)].into(),
+            }
         );
         assert_eq!(
             select_protected_snapshot_merge_tier(
@@ -40436,7 +40535,9 @@ mod tests {
                 None,
                 None
             ),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 2)].into(),
+            }
         );
     }
 
