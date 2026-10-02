@@ -526,6 +526,15 @@ impl SpiceTestQueryWorker {
                         query_iteration_durations
                             .insert(Arc::clone(&query.name), (query_start, end));
                         query_statuses.insert(Arc::clone(&query.name), query_status);
+
+                        // Opt-in: after the timed iterations (so they are not affected),
+                        // capture `EXPLAIN ANALYZE` for this query N times.
+                        if self.id == 0
+                            && let Some(runs) = explain_analyze_runs()
+                            && let Some(client) = self.executor.as_spice_client()
+                        {
+                            capture_explain_analyze(client, &self.name, query, runs).await;
+                        }
                     }
                 }
             }
@@ -1096,6 +1105,71 @@ impl SpiceTestQueryWorker {
 /// timed iterations pass `Skip` for `snapshot_mode` so they never re-assert it.
 /// A status that skipped the warmup would let a wrong answer, or a missing
 /// baseline, finish the benchmark green.
+/// Number of `EXPLAIN ANALYZE` captures per query, from
+/// `SPICE_TESTOPERATOR_EXPLAIN_ANALYZE_RUNS`; unset or `0` disables the capture.
+fn explain_analyze_runs() -> Option<usize> {
+    std::env::var("SPICE_TESTOPERATOR_EXPLAIN_ANALYZE_RUNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// Runs `EXPLAIN ANALYZE` for `query` `runs` times and writes each plan to
+/// `$SPICE_TESTOPERATOR_EXPLAIN_ANALYZE_DIR/<test>/<query>-<run>.txt` (default
+/// `explain-analyze/`), also printing it. A failure is logged, never fatal: this
+/// is a diagnostic capture alongside the benchmark, not part of its verdict.
+async fn capture_explain_analyze(
+    client: Arc<spiceai::Client>,
+    test_name: &str,
+    query: &Query,
+    runs: usize,
+) {
+    let dir = std::path::PathBuf::from(
+        std::env::var("SPICE_TESTOPERATOR_EXPLAIN_ANALYZE_DIR")
+            .unwrap_or_else(|_| "explain-analyze".to_string()),
+    )
+    .join(test_name.replace(['/', '[', ']'], "_"));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        println!(
+            "EXPLAIN ANALYZE '{}': cannot create {}: {e}",
+            query.name,
+            dir.display()
+        );
+        return;
+    }
+    let sql = format!("EXPLAIN ANALYZE {}", query.sql);
+    for run in 1..=runs {
+        let params = match query.get_parameters_batch().transpose() {
+            Ok(p) => p,
+            Err(e) => {
+                println!("EXPLAIN ANALYZE '{}': parameters: {e}", query.name);
+                return;
+            }
+        };
+        let started = std::time::Instant::now();
+        match crate::flight::query_to_batches(Arc::clone(&client), &sql, params).await {
+            Ok(batches) => {
+                let elapsed = started.elapsed();
+                let text = arrow::util::pretty::pretty_format_batches(&batches)
+                    .map_or_else(|e| format!("<format error: {e}>"), |t| t.to_string());
+                println!(
+                    "=== EXPLAIN ANALYZE '{}' run {run}/{runs} wall={elapsed:?} ===\n{text}",
+                    query.name
+                );
+                let path = dir.join(format!("{}-{run}.txt", query.name));
+                if let Err(e) = std::fs::write(&path, format!("wall={elapsed:?}\n{text}\n")) {
+                    println!(
+                        "EXPLAIN ANALYZE '{}': write {}: {e}",
+                        query.name,
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => println!("EXPLAIN ANALYZE '{}' run {run} failed: {e}", query.name),
+        }
+    }
+}
+
 fn status_after_run(current: QueryStatus, query_failure: Option<String>) -> QueryStatus {
     match query_failure {
         Some(failure) => QueryStatus::Failed(Some(failure.into())),

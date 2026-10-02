@@ -572,6 +572,8 @@ jobs:
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
+          SPICE_TESTOPERATOR_EXPLAIN_ANALYZE_RUNS: '3'
+          SPICE_TESTOPERATOR_EXPLAIN_ANALYZE_DIR: ${{ github.workspace }}/explain-analyze
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
@@ -632,6 +634,15 @@ jobs:
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
           CHBENCH_PG_HOST: 127.0.0.1
 
+
+      - name: Upload EXPLAIN ANALYZE captures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: explain-analyze-${{ github.event.inputs.spiced_commit }}
+          path: |
+            ${{ github.workspace }}/explain-analyze
+          if-no-files-found: warn
       - name: Install GH CLI
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
         run: |
