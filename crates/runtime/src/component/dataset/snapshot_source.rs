@@ -890,8 +890,14 @@ mod tests {
         let mut declared = snapshot_dataset();
         declared.acceleration = Some(spicepod_acceleration::Acceleration {
             params: Some(Params::from_string_map(HashMap::from([
-                ("cayenne_file_path".to_string(), "/data/modules/".to_string()),
-                ("cayenne_metadata_dir".to_string(), "/data/metadata/".to_string()),
+                (
+                    "cayenne_file_path".to_string(),
+                    "/data/modules/".to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    "/data/metadata/".to_string(),
+                ),
             ]))),
             ..Default::default()
         });
@@ -905,8 +911,14 @@ mod tests {
                 .and_then(|params| params.data.get(name))
                 .map(ParamValue::as_string)
         };
-        assert_eq!(param("cayenne_file_path").as_deref(), Some("/data/modules/"));
-        assert_eq!(param("cayenne_metadata_dir").as_deref(), Some("/data/metadata/"));
+        assert_eq!(
+            param("cayenne_file_path").as_deref(),
+            Some("/data/modules/")
+        );
+        assert_eq!(
+            param("cayenne_metadata_dir").as_deref(),
+            Some("/data/metadata/")
+        );
     }
 
     #[test]
