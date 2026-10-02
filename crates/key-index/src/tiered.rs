@@ -688,9 +688,6 @@ impl RunBuilder {
     }
 }
 
-/// [`RunEntry::seen`] of a file a reconcile has seen live.
-const SEEN: u8 = u8::MAX;
-
 /// Reconciles a run's file may stay unseen before it is retired. Runs are
 /// published when their write returns, just before the write becomes
 /// visible, so a live file is seen by the next reconcile after that; the
@@ -698,31 +695,118 @@ const SEEN: u8 = u8::MAX;
 /// costs a read of the file in full, never a wrong answer.
 pub const UNSEEN_GRACE: u8 = 4;
 
-/// A published run and which of its files are still live. Retiring some of
-/// a run's files replaces this entry, not the run.
+/// Where one of a run's files stands. A file seen live by a
+/// [`TieredIndex::reconcile`] and later missing is retired, so a run published
+/// before its write became visible is kept; one never seen is retired after
+/// [`UNSEEN_GRACE`] reconciles, so a write that never became visible (it
+/// failed, or its files were replaced before a reconcile saw them) does not
+/// keep its run forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileState {
+    /// Live, and not yet seen by a reconcile: how many reconciles have not
+    /// seen it.
+    Pending(u8),
+    /// Live, and seen live by a reconcile.
+    Seen,
+    /// No longer live: a view skips its rows.
+    Retired,
+}
+
+impl FileState {
+    fn is_live(self) -> bool {
+        self != Self::Retired
+    }
+
+    /// The state after a reconcile that did (`present`) or did not see the
+    /// file in the live set.
+    fn reconciled(self, present: bool) -> Self {
+        match self {
+            Self::Retired => Self::Retired,
+            _ if present => Self::Seen,
+            Self::Seen => Self::Retired,
+            Self::Pending(unseen) => {
+                let unseen = unseen.saturating_add(1);
+                if unseen < UNSEEN_GRACE {
+                    Self::Pending(unseen)
+                } else {
+                    Self::Retired
+                }
+            }
+        }
+    }
+}
+
+/// A published run and where each of its files stands. Retiring some of a
+/// run's files replaces this entry, not the run.
 #[derive(Debug, Clone)]
 struct RunEntry {
     run: Arc<IndexRun>,
-    live: Arc<[bool]>,
-    /// Per file, [`SEEN`] once a [`TieredIndex::reconcile`] has seen it in
-    /// the live file set, and otherwise how many reconciles have not. A file
-    /// seen there and later missing is retired, so a run published before its
-    /// write became visible is kept; one never seen is retired after
-    /// [`UNSEEN_GRACE`] reconciles, so a write that never became visible (it
-    /// failed, or its files were replaced before a reconcile saw them) does
-    /// not keep its run forever.
-    seen: Arc<[u8]>,
+    /// Per file of the run, in order.
+    files: Arc<[FileState]>,
+}
+
+/// What a change of file states did to a [`RunEntry`].
+enum Transition {
+    /// No file changed state.
+    Unchanged,
+    /// Some file changed state and at least one is still live.
+    Changed(RunEntry),
+    /// No file is live any more, so the run is dropped.
+    Dropped,
 }
 
 impl RunEntry {
-    fn new(run: IndexRun) -> Self {
-        let files = run.files.len();
-        Self {
-            run: Arc::new(run),
-            live: vec![true; files].into(),
-            seen: vec![0; files].into(),
+    fn any_live(states: &[FileState]) -> bool {
+        states.iter().any(|state| state.is_live())
+    }
+
+    /// This entry with each file's state replaced by `next(file, state)`.
+    /// Allocates only once a state changes.
+    fn transition(&self, mut next: impl FnMut(&str, FileState) -> FileState) -> Transition {
+        let mut changed: Option<Vec<FileState>> = None;
+        for (i, (file, &state)) in self.run.files.iter().zip(self.files.iter()).enumerate() {
+            let after = next(file, state);
+            match &mut changed {
+                Some(states) => states.push(after),
+                None if after != state => {
+                    let mut states = Vec::with_capacity(self.files.len());
+                    states.extend_from_slice(&self.files[..i]);
+                    states.push(after);
+                    changed = Some(states);
+                }
+                None => {}
+            }
+        }
+        match changed {
+            None => Transition::Unchanged,
+            Some(states) if Self::any_live(&states) => Transition::Changed(Self {
+                run: Arc::clone(&self.run),
+                files: states.into(),
+            }),
+            Some(_) => Transition::Dropped,
         }
     }
+}
+
+/// `runs` with each file's state replaced by `next(file, state)`, dropping
+/// the runs none of whose files stays live, and whether any state changed.
+fn transition_runs(
+    runs: &[RunEntry],
+    mut next: impl FnMut(&str, FileState) -> FileState,
+) -> (Vec<RunEntry>, bool) {
+    let mut kept = Vec::with_capacity(runs.len());
+    let mut changed = false;
+    for entry in runs {
+        match entry.transition(&mut next) {
+            Transition::Unchanged => kept.push(entry.clone()),
+            Transition::Changed(entry) => {
+                changed = true;
+                kept.push(entry);
+            }
+            Transition::Dropped => changed = true,
+        }
+    }
+    (kept, changed)
 }
 
 /// A filter over the keys of every run, so a key no run holds costs one
@@ -815,8 +899,8 @@ impl Layers {
                     .run
                     .files
                     .iter()
-                    .zip(entry.live.iter())
-                    .filter(|&(_, &live)| live)
+                    .zip(entry.files.iter())
+                    .filter(|&(_, state)| state.is_live())
                     .map(|(file, _)| Arc::clone(file))
             })
             .collect();
@@ -893,7 +977,7 @@ fn merge_runs(sources: &[&RunEntry]) -> Result<IndexRun> {
     // Sources every file of which is live need no per-posting check.
     let all_live: Vec<bool> = sources
         .iter()
-        .map(|source| source.live.iter().all(|&live| live))
+        .map(|source| source.files.iter().all(|state| state.is_live()))
         .collect();
     // Per source, the index of its next word.
     let mut next: Vec<usize> = vec![0; sources.len()];
@@ -920,7 +1004,7 @@ fn merge_runs(sources: &[&RunEntry]) -> Result<IndexRun> {
         let at = next[i];
         run.postings_at(at, |posting| {
             let (file, position) = run.decode(posting);
-            if all_live[i] || source.live.get(file).copied().unwrap_or(false) {
+            if all_live[i] || source.files.get(file).is_some_and(|state| state.is_live()) {
                 group.push(word_proof::posting(
                     position,
                     file as u64 + offset,
@@ -1006,7 +1090,7 @@ impl IndexView {
             return;
         }
         for entry in &layers.runs {
-            let (live, run) = (&entry.live, &entry.run);
+            let (states, run) = (&entry.files, &entry.run);
             if !run.filter.might_contain(hash) {
                 continue;
             }
@@ -1015,7 +1099,7 @@ impl IndexView {
             };
             run.postings_at(at, |posting| {
                 let (file, position) = run.decode(posting);
-                if live.get(file).copied().unwrap_or(false)
+                if states.get(file).is_some_and(|state| state.is_live())
                     && let Some(path) = run.files.get(file)
                 {
                     f(Candidate {
@@ -1137,42 +1221,18 @@ impl TieredIndex {
     /// the files in `retired`, dropping each run once all its files are. One
     /// atomic swap: call it where the write becomes visible.
     pub fn publish(&self, add: Vec<IndexRun>, retired: &[&str]) {
-        let _swap = self.swap.lock();
-        let current = self.layers.load_full();
         let retired: HashSet<&str> = retired.iter().copied().collect();
-        let mut runs: Vec<RunEntry> = Vec::with_capacity(current.runs.len() + add.len());
-        for entry in &current.runs {
-            let touched = entry
-                .run
-                .files
-                .iter()
-                .zip(entry.live.iter())
-                .any(|(file, &live)| live && retired.contains(&**file));
-            if !touched {
-                runs.push(entry.clone());
-                continue;
-            }
-            let live: Arc<[bool]> = entry
-                .run
-                .files
-                .iter()
-                .zip(entry.live.iter())
-                .map(|(file, &live)| live && !retired.contains(&**file))
-                .collect();
-            // Dropped once none of its files is live.
-            if live.iter().any(|&live| live) {
-                runs.push(RunEntry {
-                    run: Arc::clone(&entry.run),
-                    live,
-                    seen: Arc::clone(&entry.seen),
-                });
-            }
-        }
-        // Into the filter before the runs are visible, so no reader sees a
-        // run whose keys the filter rejects.
-        let filter = Layers::filter_after_publish(&current.filter, &runs, &add);
-        runs.extend(add.into_iter().map(RunEntry::new));
-        self.layers.store(Arc::new(Layers::new(runs, filter)));
+        self.publish_runs(
+            add,
+            |file, state| {
+                if retired.contains(file) {
+                    FileState::Retired
+                } else {
+                    state
+                }
+            },
+            |_| FileState::Pending(0),
+        );
     }
 
     /// [`Self::publish`] for runs over files that are already visible, where
@@ -1182,31 +1242,47 @@ impl TieredIndex {
     /// between its write and this call) is retired at once instead of being
     /// covered forever. A run none of whose files is live is dropped.
     pub fn publish_visible(&self, add: Vec<IndexRun>, live: &HashSet<&str>) {
+        self.publish_runs(
+            add,
+            |_, state| state,
+            |file| {
+                if live.contains(file) {
+                    FileState::Seen
+                } else {
+                    FileState::Retired
+                }
+            },
+        );
+    }
+
+    /// Publishes `add` in one swap: each published file's state becomes
+    /// `retire(file, state)`, and each new file starts in `initial(file)`. A
+    /// run none of whose files is live, published or new, is dropped.
+    fn publish_runs(
+        &self,
+        add: Vec<IndexRun>,
+        retire: impl Fn(&str, FileState) -> FileState,
+        initial: impl Fn(&str) -> FileState,
+    ) {
         let _swap = self.swap.lock();
         let current = self.layers.load_full();
-        let mut admitted: Vec<(IndexRun, Arc<[bool]>)> = Vec::with_capacity(add.len());
+        let (mut runs, _) = transition_runs(&current.runs, retire);
+        let mut admitted: Vec<(IndexRun, Arc<[FileState]>)> = Vec::with_capacity(add.len());
         for run in add {
-            let live: Arc<[bool]> = run
-                .files
-                .iter()
-                .map(|file| live.contains(&**file))
-                .collect();
-            if live.iter().any(|&live| live) {
-                admitted.push((run, live));
+            let states: Arc<[FileState]> = run.files.iter().map(|file| initial(file)).collect();
+            if RunEntry::any_live(&states) {
+                admitted.push((run, states));
             }
         }
-        let (add, lives): (Vec<IndexRun>, Vec<Arc<[bool]>>) = admitted.into_iter().unzip();
-        // Into the filter before the runs are visible.
-        let filter = Layers::filter_after_publish(&current.filter, &current.runs, &add);
-        let mut runs = current.runs.clone();
-        for (run, live) in add.into_iter().zip(lives) {
-            let seen = vec![SEEN; run.files.len()].into();
-            runs.push(RunEntry {
-                run: Arc::new(run),
-                live,
-                seen,
-            });
-        }
+        let (add, states): (Vec<IndexRun>, Vec<Arc<[FileState]>>) = admitted.into_iter().unzip();
+        // Into the filter before the runs are visible, so no reader sees a
+        // run whose keys the filter rejects.
+        let filter = Layers::filter_after_publish(&current.filter, &runs, &add);
+        runs.reserve(add.len());
+        runs.extend(add.into_iter().zip(states).map(|(run, files)| RunEntry {
+            run: Arc::new(run),
+            files,
+        }));
         self.layers.store(Arc::new(Layers::new(runs, filter)));
     }
 
@@ -1297,19 +1373,19 @@ impl TieredIndex {
         let now = self.layers.load_full();
         // The merged run's files, in source order, as live as the sources are
         // now: a source dropped meanwhile had all its files retired.
-        let mut live: Vec<bool> = Vec::with_capacity(merged.files.len());
-        let mut seen: Vec<u8> = Vec::with_capacity(merged.files.len());
+        let mut states: Vec<FileState> = Vec::with_capacity(merged.files.len());
         for source in &sources {
             if let Some(entry) = now
                 .runs
                 .iter()
                 .find(|entry| Arc::ptr_eq(&entry.run, &source.run))
             {
-                live.extend(entry.live.iter());
-                seen.extend(entry.seen.iter());
+                states.extend(entry.files.iter());
             } else {
-                live.extend(std::iter::repeat_n(false, source.run.files.len()));
-                seen.extend(std::iter::repeat_n(SEEN, source.run.files.len()));
+                states.extend(std::iter::repeat_n(
+                    FileState::Retired,
+                    source.run.files.len(),
+                ));
             }
         }
         let mut runs: Vec<RunEntry> = now
@@ -1322,11 +1398,10 @@ impl TieredIndex {
             })
             .cloned()
             .collect();
-        if live.iter().any(|&live| live) {
+        if RunEntry::any_live(&states) {
             runs.push(RunEntry {
                 run: Arc::new(merged),
-                live: live.into(),
-                seen: seen.into(),
+                files: states.into(),
             });
         }
         // The merged run's keys are its sources', already in the filter.
@@ -1345,59 +1420,14 @@ impl TieredIndex {
     pub fn reconcile(&self, live: &std::collections::HashSet<&str>) -> usize {
         let _swap = self.swap.lock();
         let current = self.layers.load_full();
-        let mut changed = false;
         let mut retired = 0;
-        let mut runs: Vec<RunEntry> = Vec::with_capacity(current.runs.len());
-        for entry in &current.runs {
-            let now_live: Vec<bool> = entry
-                .run
-                .files
-                .iter()
-                .map(|file| live.contains(&**file))
-                .collect();
-            let next_seen: Vec<u8> = entry
-                .seen
-                .iter()
-                .zip(&now_live)
-                .map(|(&seen, &now)| {
-                    if now || seen == SEEN {
-                        SEEN
-                    } else {
-                        seen.saturating_add(1)
-                    }
-                })
-                .collect();
-            let next_live: Vec<bool> = entry
-                .live
-                .iter()
-                .zip(entry.seen.iter())
-                .zip(next_seen.iter())
-                .zip(&now_live)
-                // Retired: seen live before and missing now, or never seen
-                // within the grace.
-                .map(|(((&was, &seen), &next), &now)| {
-                    was && (now || (seen != SEEN && next < UNSEEN_GRACE))
-                })
-                .collect();
-            if next_live.as_slice() == &*entry.live && next_seen.as_slice() == &*entry.seen {
-                runs.push(entry.clone());
-                continue;
+        let (runs, changed) = transition_runs(&current.runs, |file, state| {
+            let next = state.reconciled(live.contains(file));
+            if state.is_live() && !next.is_live() {
+                retired += 1;
             }
-            changed = true;
-            retired += entry
-                .live
-                .iter()
-                .zip(&next_live)
-                .filter(|&(&was, &now)| was && !now)
-                .count();
-            if next_live.iter().any(|&live| live) {
-                runs.push(RunEntry {
-                    run: Arc::clone(&entry.run),
-                    live: next_live.into(),
-                    seen: next_seen.into(),
-                });
-            }
-        }
+            next
+        });
         if changed {
             self.layers
                 .store(Arc::new(Layers::new(runs, Arc::clone(&current.filter))));
