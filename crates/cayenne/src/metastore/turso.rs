@@ -1170,6 +1170,13 @@ pub struct TursoTransaction {
 impl Drop for TursoTransaction {
     fn drop(&mut self) {
         if let Some(guard) = self.conn.take() {
+            // A statement's write-write conflict ends the transaction inside Turso and
+            // returns the connection to autocommit. Nothing is left to roll back then,
+            // so release the pool slot now rather than from a task whose `ROLLBACK`
+            // could only fail.
+            if matches!(guard.is_autocommit(), Ok(true)) {
+                return;
+            }
             let rollback = async move {
                 tracing::debug!(
                     "TursoTransaction dropped without explicit commit or rollback; \
@@ -1314,6 +1321,13 @@ impl MetastoreTransaction for TursoTransaction {
         let conn = self.conn.take().ok_or_else(|| CatalogError::Database {
             message: "Transaction already completed".to_string(),
         })?;
+
+        // A statement's write-write conflict ends the transaction inside Turso and
+        // returns the connection to autocommit, so the transaction is already rolled
+        // back; a `ROLLBACK` would only fail with "no transaction is active".
+        if matches!(conn.is_autocommit(), Ok(true)) {
+            return Ok(());
+        }
 
         conn.execute("ROLLBACK", ())
             .await
@@ -1611,5 +1625,73 @@ mod tests {
             unreadable.to_string().contains("Cannot confirm"),
             "the error should say the state could not be confirmed, got: {unreadable}"
         );
+    }
+
+    /// A statement that writes a row another open transaction has written fails with
+    /// a write-write conflict, and Turso ends the conflicted transaction on the spot.
+    /// Rolling it back afterwards must still succeed: the commit envelopes roll a
+    /// conflicted attempt back before they retry it, and an error there would report an
+    /// expected retry as a failure. The connection it held must go back to the pool in
+    /// autocommit, so the next borrower is not refused.
+    #[tokio::test]
+    async fn rolling_back_a_transaction_a_write_conflict_ended_succeeds() {
+        let (_dir, metastore) = temp_metastore();
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
+            .await
+            .expect("create table");
+        metastore
+            .execute(ExecuteParams {
+                sql: "INSERT INTO t (id, n) VALUES (1, 0)",
+                params: vec![],
+            })
+            .await
+            .expect("seed the row");
+
+        let holder = metastore
+            .begin_transaction()
+            .await
+            .expect("begin the transaction that holds the row");
+        holder
+            .execute(ExecuteParams {
+                sql: "UPDATE t SET n = n + 1 WHERE id = 1",
+                params: vec![],
+            })
+            .await
+            .expect("write the row");
+
+        let conflicted = metastore
+            .begin_transaction()
+            .await
+            .expect("begin the transaction that conflicts");
+        let error = conflicted
+            .execute(ExecuteParams {
+                sql: "UPDATE t SET n = n + 2 WHERE id = 1",
+                params: vec![],
+            })
+            .await
+            .expect_err("writing a row another open transaction has written conflicts");
+        assert!(
+            crate::cayenne_catalog::is_retryable_write_conflict(&error),
+            "the statement should fail with a retryable write conflict, got: {error}"
+        );
+        conflicted
+            .rollback()
+            .await
+            .expect("rolling back a transaction the conflict already ended succeeds");
+        holder
+            .rollback()
+            .await
+            .expect("end the transaction that holds the row");
+
+        let pool = Arc::clone(metastore.pool().await.expect("pool"));
+        for _ in 0..pool.conns.len() {
+            let guard = pool.acquire().await.expect("acquire a pooled connection");
+            assert_eq!(
+                count_rows(&guard).await,
+                1,
+                "every pooled connection should read the committed row"
+            );
+        }
     }
 }

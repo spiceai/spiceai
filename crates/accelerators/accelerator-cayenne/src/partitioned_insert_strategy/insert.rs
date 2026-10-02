@@ -340,9 +340,18 @@ impl CayennePartitionedOverwriteSink {
                 }
             }
             if let Some(e) = apply_err {
-                // Drop the transaction (auto-rollback). Retry if the failure
+                // Roll back explicitly (not via the transaction's best-effort,
+                // possibly-detached Drop) so the metastore connection is released
+                // before this attempt backs off and retries. Retry if the failure
                 // looks transient.
-                drop(txn);
+                if let Err(rollback_error) = txn.rollback().await {
+                    tracing::debug!(
+                        attempt,
+                        max_attempts,
+                        %rollback_error,
+                        "Rolling back the multi-partition commit before retrying reported an error"
+                    );
+                }
                 if attempt < max_attempts && cayenne::is_retryable_write_conflict(&e) {
                     let delay = turso_shared::retry_backoff_delay(attempt);
                     tracing::debug!(

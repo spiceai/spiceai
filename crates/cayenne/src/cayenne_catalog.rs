@@ -5498,12 +5498,11 @@ async fn sleep_before_metastore_write_retry(
 /// failed and, when attempts remain, back off before the next one. Returns
 /// whether to retry; on `false` the caller returns the conflict.
 ///
-/// Turso rolls the transaction back itself when a statement raises a write-write
-/// conflict, so this `ROLLBACK` can report that no transaction is open. That is
-/// harmless: the connection returns to the pool in autocommit either way, which
-/// is what the next attempt needs. The attempt is rolled back explicitly even
-/// when it was the last one, rather than dropped, because a dropped
-/// transaction's rollback writes that expected failure to the error log.
+/// The attempt is rolled back explicitly, the last one included, rather than
+/// dropped: a dropped transaction rolls back from a detached task, so its
+/// connection, and under `SQLite` the write lock, could still be held when the
+/// next attempt begins. Under Turso the conflict has already ended the
+/// transaction, and the rollback only returns the connection to the pool.
 async fn end_conflicted_attempt(
     tx: Box<dyn MetastoreTransaction>,
     attempt: u32,
