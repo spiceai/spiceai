@@ -71,7 +71,7 @@ pub struct DispatchArgs {
 pub enum Schedule {
     #[default]
     Daily,
-    /// For tests whose source is a hosted service billed per use.
+    /// For tests whose source is a hosted service.
     Weekly,
 }
 

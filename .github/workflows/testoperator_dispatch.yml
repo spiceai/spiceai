@@ -4,8 +4,8 @@ on:
   schedule:
     # daily, 0900 UTC / 0200 PDT — the bench suites, except the configs on the weekly schedule
     - cron: '0 9 * * *'
-    # weekly, Sunday 0000 UTC / Saturday 1700 PDT — the configs whose source is a hosted service
-    # billed per use, marked `schedule: weekly` in their dispatch config
+    # weekly, Sunday 0000 UTC / Saturday 1700 PDT — the configs whose source is a hosted service,
+    # marked `schedule: weekly` in their dispatch config
     - cron: '0 0 * * 0'
 
   workflow_dispatch:
@@ -45,6 +45,14 @@ on:
           - 'daily'
           - 'weekly'
 
+# A scheduled dispatch plans, dispatches and records its release commit as one unit: a second run
+# of the same schedule (a manual run during the cron's, say) waits until the first one finishes, so
+# it plans against the commit the first run recorded instead of dispatching that commit again. A
+# manual run that dispatches no schedule gets a group of its own.
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event_name == 'schedule' && (github.event.schedule == '0 0 * * 0' && 'weekly' || 'daily')) || ((github.event.inputs.schedule == 'daily' || github.event.inputs.schedule == 'weekly') && github.event.inputs.schedule) || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   # Resolves which schedule this run dispatches (the cron that fired, or the manual `schedule`
   # input) and for which branches. trunk dispatches the configs on that schedule. A release
@@ -54,7 +62,7 @@ jobs:
   plan-scheduled:
     name: Plan scheduled dispatch
     runs-on: ubuntu-24.04
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.schedule != 'none') }}
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.schedule == 'daily' || github.event.inputs.schedule == 'weekly' }}
     outputs:
       schedule: ${{ steps.plan.outputs.schedule }}
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -71,7 +79,8 @@ jobs:
           case "$CRON" in
             '0 9 * * *') schedule=daily ;;
             '0 0 * * 0') schedule=weekly ;;
-            '')          schedule="$INPUT_SCHEDULE" ;;   # manual dispatch
+            '')          # manual dispatch
+                         case "$INPUT_SCHEDULE" in daily|weekly) schedule="$INPUT_SCHEDULE" ;; *) schedule= ;; esac ;;
             *)           schedule= ;;                      # unrecognized cron — dispatch nothing
           esac
           echo "Resolved schedule: ${schedule:-<none>}"
@@ -110,9 +119,6 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.plan-scheduled.outputs.matrix) }}
-    concurrency:
-      group: testoperator-dispatch-scheduled-${{ matrix.branch }}-${{ needs.plan-scheduled.outputs.schedule }}
-      cancel-in-progress: false
     env:
       # `daily` or `weekly` on trunk, passed to every `testoperator dispatch` as `--schedule`. Empty on
       # a release branch, which dispatches its whole suite.
@@ -328,7 +334,7 @@ jobs:
   dispatch-input:
     name: Dispatch tests - Input
     runs-on: spiceai-dev-runners
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.schedule == 'none' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.schedule != 'daily' && github.event.inputs.schedule != 'weekly' }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false
