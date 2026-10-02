@@ -975,7 +975,7 @@ pub struct DataFusion {
     // What the pod's Cayenne accelerations demand of the host, classified from the
     // Spicepod in the Runtime builder. Retained so `spiced` can decide which
     // dedicated thread pools are worth bringing up without re-reading the app.
-    cayenne_workload: crate::builder::CayenneWorkload,
+    cayenne_workload: runtime_acceleration::CayenneWorkload,
     // Cgroup-aware total memory, captured once at build time. `get_total_memory`
     // rebuilds a sysinfo System on every call, so the budget installers read this
     // rather than re-probing.
@@ -2111,7 +2111,7 @@ impl DataFusion {
     /// Spicepod at build time). `spiced` reads this to skip bringing up dedicated
     /// thread pools nothing in the pod can use.
     #[must_use]
-    pub fn cayenne_workload(&self) -> crate::builder::CayenneWorkload {
+    pub fn cayenne_workload(&self) -> runtime_acceleration::CayenneWorkload {
         self.cayenne_workload
     }
 
