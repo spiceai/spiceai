@@ -240,6 +240,11 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
         is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
     ) -> Option<std::sync::Arc<V>>;
     async fn put_raw_key(&self, key: &u64, value: V);
+    /// Store `value`, which the caller has already sized: `weight` must be what
+    /// [`Sizeable::get_memory_size`] returns for it. A cache that bills entries
+    /// by size can then admit a small value on the calling task without walking
+    /// it again; one that bounds entries by count ignores `weight`.
+    async fn put_raw_key_with_weight(&self, key: &u64, value: V, weight: usize);
     /// Replace the value at `key` only when `should_replace` accepts the
     /// currently stored value. See [`crate::backend::CacheBackend::replace_if`].
     async fn replace_if(
@@ -1024,6 +1029,24 @@ impl QueryResultsCacheProvider {
     ) -> Result<()> {
         let res = self.cache.put_raw_key(&raw_key.as_u64(), result).await;
         Ok(res)
+    }
+
+    /// Like [`Self::put_raw_key`], for a caller that has already sized
+    /// `result`: `weight` must be `result.get_memory_size()`.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to access the cache
+    pub async fn put_raw_key_with_weight(
+        &self,
+        raw_key: &RawCacheKey,
+        result: CachedQueryResult,
+        weight: usize,
+    ) -> Result<()> {
+        self.cache
+            .put_raw_key_with_weight(&raw_key.as_u64(), result, weight)
+            .await;
+        Ok(())
     }
 
     /// Decode `result` for serving. The first successful decode of an encoded

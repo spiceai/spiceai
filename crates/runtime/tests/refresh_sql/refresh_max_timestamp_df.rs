@@ -132,10 +132,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 &df.clone().explain(false, false)?.collect().await?,
             )?;
 
-            insta::assert_snapshot!(
-                format!("refresh_max_timestamp_df_explain_plan"),
-                explain_plan
-            );
+            insta::assert_snapshot!("refresh_max_timestamp_df_explain_plan", explain_plan);
 
             Ok(())
         })

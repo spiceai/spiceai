@@ -115,6 +115,8 @@ pub(crate) mod structural_version;
 pub(crate) mod table;
 pub(crate) mod transaction;
 pub(crate) mod tuning;
+#[cfg(test)]
+mod tuning_sim;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod wal_checksum;

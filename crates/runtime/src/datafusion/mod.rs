@@ -155,6 +155,7 @@ pub use runtime_datafusion::param_utils;
 pub use runtime_datafusion::pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
+pub(crate) mod point_lookup;
 pub(crate) use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
 pub use runtime_datafusion::retention_sql;
@@ -612,7 +613,7 @@ fn validate_distributed_engine(
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
 /// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
-fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
+pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => Some(AccelerationEngine::DuckDB),
@@ -729,7 +730,7 @@ const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 /// not specify `refresh_check_interval` explicitly. Picked to be slightly
 /// shorter than the default snapshot creation interval so a freshly created
 /// snapshot is picked up promptly without aggressive object-store load.
-const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
+pub(crate) const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
 
 pub enum Table {
     Accelerated {
@@ -1460,6 +1461,31 @@ impl DataFusion {
                         .register_table(dataset_table_ref.clone(), table_provider)
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
+                    notifier
+                } else if crate::dataconnector::sink::registers_from_acceleration(
+                    dataset.acceleration.as_ref(),
+                    source.as_ref(),
+                ) {
+                    // The acceleration already holds this dataset's rows and the schema they
+                    // were written under, so there is a table to build now. Register it,
+                    // rather than leaving the stored rows unqueryable until the next write.
+                    let notifier = self
+                        .register_accelerated_table(
+                            dataset,
+                            source,
+                            federated_read_table,
+                            secrets,
+                            bootstrap_status,
+                            initial_partition_filters,
+                        )
+                        .await?;
+                    // A sink has nothing to load from: its rows arrive by write, so being
+                    // registered is the whole of its readiness — the same point the parked
+                    // path below reports ready at. Say so here too, or a sink whose
+                    // `refresh_mode` resolves to `disabled` (its default) starts no refresh
+                    // and so never leaves `Refreshing`.
+                    self.runtime_status
+                        .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
                     notifier
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
@@ -3093,10 +3119,16 @@ impl DataFusion {
             // snapshotting enabled, we delay readiness until the first refresh completes so that
             // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
             // Additionally, for CDC we let connector/stream to decide when dataset is ready.
+            //
+            // A dataset that reads snapshots (`file_format: snapshot`) is ready only once it
+            // has restored a snapshot in this process: a copy left from an earlier run can be
+            // arbitrarily old, or from a location the dataset no longer reads.
             let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
                 && dataset.time_column.is_some()
                 && acceleration_settings.snapshot_behavior.bootstrap_enabled()
-                || matches!(refresh_mode, RefreshMode::Changes);
+                || matches!(refresh_mode, RefreshMode::Changes)
+                || (dataset.is_snapshot_source()
+                    && bootstrap_status.loaded_snapshot_id().is_none());
 
             if !delay_initial_ready {
                 self.runtime_status
