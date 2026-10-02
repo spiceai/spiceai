@@ -75,6 +75,7 @@ use futures::{FutureExt, StreamExt};
 use opentelemetry::KeyValue;
 use runtime_async::is_shutdown_cancellation;
 use runtime_metrics::{self as metrics, components::register_component_metric};
+use runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
@@ -1046,8 +1047,21 @@ impl Runtime {
 
     /// The schema `ds`'s existing acceleration was checkpointed with, when it has one
     /// to serve from.
+    /// A checkpoint written before the acceleration's primary key was recorded does
+    /// not count: registering without the source could build the accelerator without
+    /// a key its table has, so that dataset waits for its source once, and its next
+    /// checkpoint records the key.
     async fn existing_acceleration_schema(ds: &Dataset) -> Option<arrow_schema::SchemaRef> {
-        crate::dataconnector::sink::recorded_checkpoint_schema(ds).await
+        let schema = crate::dataconnector::sink::recorded_checkpoint_schema(ds).await?;
+        if records_acceleration_primary_key(&schema) {
+            return Some(schema);
+        }
+        tracing::debug!(
+            dataset = %ds.name,
+            "The acceleration checkpoint for dataset {} does not record its primary key (written by an earlier version), so it waits for its source before serving.",
+            ds.name
+        );
+        None
     }
 
     /// Reads `ds`'s source provider in its own task, so the read can outlive a caller

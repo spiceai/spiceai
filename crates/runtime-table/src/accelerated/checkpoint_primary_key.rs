@@ -23,6 +23,10 @@ limitations under the License.
 //! against the existing keyed table ("Primary keys do not match"). Recording the
 //! key in the checkpoint schema's metadata lets that registration rebuild the
 //! same constraints without the source.
+//!
+//! Every checkpoint records the key, as an empty list when the acceleration has
+//! none, so a checkpoint without the entry is one written before the key was
+//! recorded: its key is unknown, and the dataset waits for its source once.
 
 use std::sync::Arc;
 
@@ -34,16 +38,14 @@ use arrow_tools::metadata_keys::ACCELERATION_PRIMARY_KEY_METADATA_KEY;
 use search::generation::util::get_primary_keys;
 
 /// `schema` with the primary key `accelerator` was built with recorded in its
-/// metadata, or `schema` unchanged when the accelerator has none.
+/// metadata, as an empty list when it has none. `schema` is returned unchanged
+/// when the key cannot be read, so the checkpoint does not claim a key it may lack.
 #[must_use]
 pub fn with_acceleration_primary_key(
     schema: SchemaRef,
     accelerator: &Arc<dyn TableProvider>,
 ) -> SchemaRef {
-    let Some(columns) = get_primary_keys(accelerator)
-        .ok()
-        .filter(|columns| !columns.is_empty())
-    else {
+    let Ok(columns) = get_primary_keys(accelerator) else {
         return schema;
     };
     let Ok(encoded) = serde_json::to_string(&columns) else {
@@ -75,6 +77,15 @@ pub fn acceleration_primary_key(checkpoint_schema: &Schema) -> Option<Constraint
     )]))
 }
 
+/// Whether a checkpoint schema records the acceleration's primary key (possibly
+/// as having none). A checkpoint written before the key was recorded does not.
+#[must_use]
+pub fn records_acceleration_primary_key(checkpoint_schema: &Schema) -> bool {
+    checkpoint_schema
+        .metadata()
+        .contains_key(ACCELERATION_PRIMARY_KEY_METADATA_KEY)
+}
+
 /// `schema` without the recorded primary key.
 ///
 /// The key describes the acceleration, not the data: it must not reach a
@@ -102,7 +113,8 @@ mod tests {
     use datafusion::datasource::{MemTable, TableProvider};
 
     use super::{
-        acceleration_primary_key, with_acceleration_primary_key, without_acceleration_primary_key,
+        acceleration_primary_key, records_acceleration_primary_key, with_acceleration_primary_key,
+        without_acceleration_primary_key,
     };
     use arrow_tools::metadata_keys::ACCELERATION_PRIMARY_KEY_METADATA_KEY;
 
@@ -146,15 +158,23 @@ mod tests {
     }
 
     #[test]
-    fn an_acceleration_without_a_primary_key_records_nothing() {
+    fn an_acceleration_without_a_primary_key_records_that_it_has_none() {
         let recorded = with_acceleration_primary_key(accelerator_schema(), &accelerator(None));
 
-        assert!(
-            !recorded
+        assert_eq!(
+            recorded
                 .metadata()
-                .contains_key(ACCELERATION_PRIMARY_KEY_METADATA_KEY)
+                .get(ACCELERATION_PRIMARY_KEY_METADATA_KEY)
+                .map(String::as_str),
+            Some("[]")
         );
+        assert!(records_acceleration_primary_key(&recorded));
         assert_eq!(acceleration_primary_key(&recorded), None);
+    }
+
+    #[test]
+    fn a_checkpoint_from_before_the_key_was_recorded_is_told_apart() {
+        assert!(!records_acceleration_primary_key(&accelerator_schema()));
     }
 
     #[test]
