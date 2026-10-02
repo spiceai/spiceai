@@ -9107,9 +9107,33 @@ mod tests {
     /// above it still recognises as retryable. With the conflicting transaction
     /// held open, each envelope therefore spends all its attempts, one `BEGIN`
     /// each; once that transaction ends, the same write succeeds.
+    ///
+    /// The rows here are still in the MVCC store, where Turso already failed the
+    /// conflicting statement before 0.8.
     #[cfg(feature = "turso")]
     #[tokio::test]
     async fn turso_statement_write_conflicts_are_retried_by_every_commit_envelope() {
+        assert_every_commit_envelope_retries_a_statement_write_conflict(false).await;
+    }
+
+    /// [`turso_statement_write_conflicts_are_retried_by_every_commit_envelope`] on
+    /// rows checkpointed into the B-tree, whose write-write conflict Turso 0.8 moved
+    /// from `COMMIT` to the conflicting statement (tursodatabase/turso#8961).
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_statement_write_conflicts_on_checkpointed_rows_are_retried_by_every_commit_envelope()
+     {
+        assert_every_commit_envelope_retries_a_statement_write_conflict(true).await;
+    }
+
+    /// The body of the statement-write-conflict tests above. With
+    /// `checkpoint_every_commit`, the metastore checkpoints after every commit, so
+    /// every row the conflicting transactions write lives in the B-tree rather than
+    /// the MVCC store.
+    #[cfg(feature = "turso")]
+    async fn assert_every_commit_envelope_retries_a_statement_write_conflict(
+        checkpoint_every_commit: bool,
+    ) {
         let (_table_root, base_path) = test_table_root();
         let metastore_dir = tempfile::tempdir().expect("create a temporary metastore directory");
         let catalog = CayenneCatalog::new(format!(
@@ -9118,6 +9142,16 @@ mod tests {
         ))
         .expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
+        if checkpoint_every_commit {
+            catalog
+                .metastore
+                .execute_helper(ExecuteParams {
+                    sql: "PRAGMA mvcc_checkpoint_threshold = 0",
+                    params: vec![],
+                })
+                .await
+                .expect("checkpoint the metastore after every commit");
+        }
         let table_id = catalog
             .create_table(CreateTableOptions {
                 table_name: "statement_conflicts".to_string(),
