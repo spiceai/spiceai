@@ -79,21 +79,24 @@ impl SnapshotEngineError {
 #[async_trait]
 pub trait SnapshotEngine: Send + Sync {
     /// Hook invoked on the **live** accelerator file *before* it is copied to a
-    /// temporary snapshot location. Engines that buffer writes outside the
-    /// primary file (e.g. SQLite/Turso WAL) should checkpoint here so that the
-    /// subsequent `fs::copy` produces a self-contained file.
+    /// temporary snapshot location. An engine that buffers writes outside the
+    /// primary file — `DuckDB`, `SQLite` and `Turso` all keep a write-ahead log —
+    /// must checkpoint here so that the subsequent `fs::copy` produces a
+    /// self-contained file. An engine with nothing to flush returns `Ok(())`.
     ///
-    /// Default implementation is a no-op.
+    /// **Deliberately has no default.** A no-op default is invisible to an engine that
+    /// needed to override it: `DuckDB` inherited one for as long as it existed and
+    /// shipped snapshots missing every write still in its log (#13912).
     ///
     /// The caller holds the accelerator's write lock for the duration of this
-    /// call, so no concurrent writes are in flight.
+    /// call, so no concurrent writes are in flight. Only the file-layout snapshot
+    /// path invokes it; a directory-layout engine captures its own state through
+    /// [`SnapshotEngine::prepare_directory_snapshot`] instead.
     async fn checkpoint_live(
         &self,
-        _live_path: &Path,
-        _dataset_name: &str,
-    ) -> Result<(), SnapshotEngineError> {
-        Ok(())
-    }
+        live_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError>;
 
     /// Prepares a snapshot file for upload.
     /// For engines that support compaction (e.g., `DuckDB`), this may compact the file.
@@ -186,6 +189,16 @@ pub struct DefaultSnapshotEngine;
 
 #[async_trait]
 impl SnapshotEngine for DefaultSnapshotEngine {
+    /// Nothing to flush: this engine is the fallback for accelerators that do not
+    /// buffer writes outside the file the snapshot copies.
+    async fn checkpoint_live(
+        &self,
+        _live_path: &Path,
+        _dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        Ok(())
+    }
+
     async fn prepare_for_upload(
         &self,
         source_path: &Path,
