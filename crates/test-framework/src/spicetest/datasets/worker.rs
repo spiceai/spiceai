@@ -1137,6 +1137,35 @@ async fn capture_explain_analyze(
         );
         return;
     }
+    // Planning only: `EXPLAIN` plans the query without executing it, so its wall
+    // time is planning plus one round trip. Recorded as min/max over 5 runs.
+    let explain_sql = format!("EXPLAIN {}", query.sql);
+    let mut planning = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let Ok(params) = query.get_parameters_batch().transpose() else {
+            break;
+        };
+        let started = std::time::Instant::now();
+        if crate::flight::query_to_batches(Arc::clone(&client), &explain_sql, params)
+            .await
+            .is_ok()
+        {
+            planning.push(started.elapsed());
+        }
+    }
+    if let (Some(min), Some(max)) = (planning.iter().min(), planning.iter().max()) {
+        println!(
+            "=== PLANNING '{}' explain_min_us={} explain_max_us={} ===",
+            query.name,
+            min.as_micros(),
+            max.as_micros()
+        );
+        let _ = std::fs::write(
+            dir.join(format!("{}-planning.tsv", query.name)),
+            format!("{}\t{}\t{}\n", query.name, min.as_micros(), max.as_micros()),
+        );
+    }
+
     let sql = format!("EXPLAIN ANALYZE {}", query.sql);
     for run in 1..=runs {
         let params = match query.get_parameters_batch().transpose() {
