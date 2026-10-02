@@ -2564,6 +2564,7 @@ mod tests {
             None
         }
         async fn put_raw_key(&self, _key: &u64, _value: V) {}
+        async fn put_raw_key_with_weight(&self, _key: &u64, _value: V, _weight: usize) {}
         async fn replace_if(
             &self,
             _key: &u64,
