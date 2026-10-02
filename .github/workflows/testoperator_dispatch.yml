@@ -164,7 +164,8 @@ jobs:
       # first attempt failed are re-run; a cancelled run is left alone, because a cancel may be
       # deliberate. The dispatch's runs are the release-branch `workflow_dispatch` runs of the child
       # workflows created between the start of the run that recorded the build and the record itself.
-      # A failed lookup re-runs nothing and records nothing, so the next scheduled run tries again.
+      # A failed lookup or re-run request leaves the build unrecorded, so the next scheduled run tries
+      # again.
       - name: Re-run this release build's failed runs once
         id: retry
         if: ${{ matrix.schedule == '' && steps.benchmarked.outputs.skip == 'true' }}
@@ -240,14 +241,23 @@ jobs:
             fi
             echo "${workflow}: ${listed} run(s), ${picked} failed on the first attempt."
           done
+          # A run whose re-run request fails stays on its first attempt, so leaving the build unrecorded
+          # makes the next scheduled run request it again, while the runs re-run here, now on their
+          # second attempt, are not selected again.
           echo "Re-running the failed jobs of ${#failed[@]} run(s) once."
+          refused=0
           for id in "${failed[@]}"; do
             if api -X POST "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${id}/rerun-failed-jobs" > /dev/null; then
               echo "  ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${id}"
             else
               echo "  could not re-run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${id}"
+              refused=$((refused + 1))
             fi
           done
+          if [ "$refused" -gt 0 ]; then
+            echo "${refused} re-run request(s) failed; not recording the re-run, so the next scheduled run requests them again."
+            exit 0
+          fi
           echo "record=true" >> "$GITHUB_OUTPUT"
 
       - name: Record that this release build's failed runs were re-run
