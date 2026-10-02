@@ -69,10 +69,12 @@ def run_helper(cargo_body: str | None, mode: int = 0o755) -> subprocess.Complete
 
 print("cargo_metadata() answering")
 
-result = run_helper('echo \'{"ok": "parsed"}\'')
+result = run_helper('echo \'{"ok": "parsed", "packages": [], "workspace_members": []}\'')
 check("valid JSON is returned parsed", (result.returncode, result.stdout.strip()), (0, "parsed"))
 
-result = run_helper('echo "{\\"ok\\": \\"$*\\"}"')
+result = run_helper(
+    'echo "{\\"ok\\": \\"$*\\", \\"packages\\": [], \\"workspace_members\\": []}"'
+)
 check(
     "cargo is asked for the workspace only, never resolving dependencies",
     result.stdout.split(),
@@ -83,6 +85,20 @@ check(
 # cargo at all, its file mode, what the error must say).
 FAILURE_MODES = (
     ("output that is not JSON", "echo 'warning: not json'", 0o755, "emitted invalid JSON"),
+    ("JSON that is not an object", "echo '[]'", 0o755, "workspace layout cannot be read"),
+    ("an object without packages", "echo '{}'", 0o755, "workspace layout cannot be read"),
+    (
+        "packages that is not an array",
+        'echo \'{"packages": {}, "workspace_members": []}\'',
+        0o755,
+        "workspace layout cannot be read",
+    ),
+    (
+        "no workspace_members array",
+        'echo \'{"packages": []}\'',
+        0o755,
+        "workspace layout cannot be read",
+    ),
     ("a failing cargo", "echo 'error: bad manifest' >&2; exit 101", 0o755, "bad manifest"),
     ("no cargo on PATH", None, 0o755, "Rust toolchain installed"),
     ("a cargo that cannot be executed", "echo '{}'", 0o644, "could not be run"),

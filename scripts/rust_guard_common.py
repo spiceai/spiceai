@@ -58,7 +58,20 @@ def cargo_metadata() -> dict:
             print(e.stderr.strip(), file=sys.stderr)
         raise SystemExit(2)
     try:
-        return json.loads(out.stdout)
+        meta = json.loads(out.stdout)
     except json.JSONDecodeError as e:
         print(f"error: `cargo metadata` emitted invalid JSON: {e}", file=sys.stderr)
         raise SystemExit(2)
+    # Valid JSON of the wrong shape is still a tooling error: a guard that indexed
+    # it would crash with a traceback (exit 1), and one that defaulted a missing
+    # key to empty would check nothing and report a clean tree (exit 0).
+    if not isinstance(meta, dict) or not all(
+        isinstance(meta.get(key), list) for key in ("packages", "workspace_members")
+    ):
+        print(
+            "error: `cargo metadata` emitted JSON without `packages` and "
+            "`workspace_members` arrays, so the workspace layout cannot be read.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return meta
