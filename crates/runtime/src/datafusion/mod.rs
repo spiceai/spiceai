@@ -3153,13 +3153,15 @@ impl DataFusion {
             if !delay_initial_ready {
                 // The existing acceleration serves scans from here on. Readiness under
                 // `ready_state: on_schema_resolved` also promises the source was reached,
-                // so while the source is still unresolved the accelerated table's builder
-                // marks the dataset ready once it resolves instead.
+                // so while the source has not been reached the accelerated table's builder
+                // marks the dataset ready once it is. A source reached with a different
+                // schema has been reached: that dataset is ready now, serving the
+                // acceleration's schema.
                 // Until then it reports `Initializing` rather than the `Refreshing` set
                 // before registration: no refresh may be due, and one that is reports
                 // `Refreshing` itself when it starts.
                 let awaits_source = effective_ready_state == ReadyState::OnSchemaResolved
-                    && matches!(&*source_table_provider, FederatedTable::Deferred(_));
+                    && source_table_provider.awaits_source();
                 let initial_status = if awaits_source {
                     status::ComponentStatus::Initializing
                 } else {

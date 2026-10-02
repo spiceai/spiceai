@@ -135,6 +135,10 @@ pub struct DeferredTableProvider {
     /// detected source schema change; holds the actionable message that the
     /// registration path surfaces as the dataset's error status.
     schema_change_failure: Option<String>,
+    /// True when the provider is deferred because its source has not been reached,
+    /// rather than because a reached source's schema differs from the acceleration's;
+    /// see [`FederatedTable::awaits_source`].
+    awaits_source: bool,
 }
 
 /// A read of the source already in progress when the provider is deferred; the
@@ -445,13 +449,23 @@ impl FederatedTable {
         shutdown_token: CancellationToken,
         first_attempt: Option<ProviderAttempt>,
     ) -> Self {
-        Self::Deferred(Self::new_deferred_with_schema(
+        let mut deferred = Self::new_deferred_with_schema(
             dataset,
             source,
             checkpoint_schema,
             shutdown_token,
             first_attempt,
-        ))
+        );
+        deferred.awaits_source = true;
+        Self::Deferred(deferred)
+    }
+
+    /// Whether this table is waiting for its source to be reached for the first time.
+    /// A table deferred because the source it reached has a different schema has
+    /// reached its source, so it does not await it.
+    #[must_use]
+    pub fn awaits_source(&self) -> bool {
+        matches!(self, Self::Deferred(deferred) if deferred.awaits_source)
     }
 
     /// The source's constraints. While the source is unreachable (a deferred
@@ -665,6 +679,7 @@ impl FederatedTable {
             dataset_name: dataset_name_str,
             constraints,
             schema_change_failure: None,
+            awaits_source: false,
         }
     }
 }
@@ -706,6 +721,7 @@ mod tests {
             dataset_name: "deferred_ds".to_string(),
             constraints: None,
             schema_change_failure: None,
+            awaits_source: false,
         });
         (table, tx)
     }

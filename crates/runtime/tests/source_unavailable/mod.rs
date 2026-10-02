@@ -68,6 +68,7 @@ struct UnreachableSource {
     builds: AtomicUsize,
     reads: AtomicUsize,
     primary_key: AtomicBool,
+    extra_column: AtomicBool,
 }
 
 impl UnreachableSource {
@@ -83,6 +84,7 @@ impl UnreachableSource {
             builds: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
             primary_key: AtomicBool::new(false),
+            extra_column: AtomicBool::new(false),
         })
     }
 
@@ -140,6 +142,11 @@ impl UnreachableSource {
         self.reads.load(Ordering::SeqCst)
     }
 
+    /// Adds a column `w` to the source's schema, as a source-side schema change.
+    fn add_column(&self) {
+        self.extra_column.store(true, Ordering::SeqCst);
+    }
+
     fn report_primary_key(&self) {
         self.primary_key.store(true, Ordering::SeqCst);
     }
@@ -148,24 +155,30 @@ impl UnreachableSource {
         self.connect_attempts.load(Ordering::SeqCst)
     }
 
-    fn schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
+    fn schema(&self) -> SchemaRef {
+        let mut fields = vec![
             Field::new("id", DataType::Int32, false),
             Field::new("v", DataType::Int32, false),
-        ]))
+        ];
+        if self.extra_column.load(Ordering::SeqCst) {
+            fields.push(Field::new("w", DataType::Int32, false));
+        }
+        Arc::new(Schema::new(fields))
     }
 
     /// Three rows, each with the source's current `value` in `v`.
     fn table(&self) -> Result<MemTable, datafusion::error::DataFusionError> {
         let value = i32::try_from(self.value.load(Ordering::SeqCst)).unwrap_or(i32::MAX);
-        let batch = RecordBatch::try_new(
-            Self::schema(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(Int32Array::from(vec![value; 3])),
-            ],
-        )?;
-        let table = MemTable::try_new(Self::schema(), vec![vec![batch]])?;
+        let schema = self.schema();
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![value; 3])),
+        ];
+        if self.extra_column.load(Ordering::SeqCst) {
+            columns.push(Arc::new(Int32Array::from(vec![0; 3])));
+        }
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
         Ok(if self.primary_key.load(Ordering::SeqCst) {
             table.with_constraints(datafusion::common::Constraints::new_unverified(vec![
                 datafusion::common::Constraint::PrimaryKey(vec![0]),
@@ -773,6 +786,35 @@ mod served_from_acceleration {
             ready,
             "the dataset is ready once its source is reached ({:?})",
             dataset_status(&rt, "orders")
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A source reached with a different schema has been reached: under
+    /// `ready_state: on_schema_resolved` the dataset is ready, serving the
+    /// acceleration's schema, rather than waiting for a source schema that matches.
+    #[tokio::test]
+    async fn on_schema_resolved_is_ready_when_the_reached_source_schema_changed()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("schema-changed").await?;
+        let source = &fixture.source;
+        seed(source, fixture.dataset(ReadyState::OnLoad)).await?;
+
+        source.add_column();
+        let (rt, loader) = start(fixture.dataset(ReadyState::OnSchemaResolved)).await;
+        let ready =
+            wait_until_true(Duration::from_secs(10), || async { rt.status().is_ready() }).await;
+        assert!(
+            ready,
+            "a reached source with a changed schema must not hold on_schema_resolved unready ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(10)).await,
+            "the acceleration keeps serving its schema, got {:?}",
+            sum_and_count(&rt).await
         );
         stop(rt, loader).await;
         Ok(())
