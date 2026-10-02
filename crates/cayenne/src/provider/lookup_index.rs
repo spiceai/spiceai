@@ -542,15 +542,18 @@ impl Shape {
         })
     }
 
-    /// Identifies this key's persisted runs: its label, its encoded types and the
-    /// persisted format, so a persisted run is only ever read back by the key and
-    /// format that wrote it.
+    /// Identifies this key's persisted runs: its label, the words its encoder
+    /// gives keys (its encoded types, their nullability and how keys become
+    /// words) and the persisted format. A reopened table therefore reads back
+    /// only runs written by the same key, encoding and format, and deletes the
+    /// rest: a key column relaxed to nullable in place changes every key's word.
     fn persisted_key(&self) -> u64 {
-        let mut descriptor = format!("{}|{}", self.label, key_index::persist::VERSION);
-        for data_type in &self.encoded_types {
-            descriptor.push('|');
-            descriptor.push_str(&data_type.to_string());
-        }
+        let descriptor = format!(
+            "{}|{}|{:016x}",
+            self.label,
+            key_index::persist::VERSION,
+            self.encoder.word_identity()
+        );
         hash_index::hash_key_bytes(&[descriptor.as_bytes()])
     }
 

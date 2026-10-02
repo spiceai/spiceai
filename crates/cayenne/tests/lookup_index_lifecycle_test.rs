@@ -1032,3 +1032,196 @@ async fn a_reopened_table_loads_its_persisted_runs() {
         "without persisted runs a reopened table starts uncovered: {verification:?}"
     );
 }
+
+/// Relaxing a key column from `NOT NULL` to nullable is an in-place schema
+/// evolution: the table keeps its id and its persisted runs. A nullable column
+/// encodes each value behind a validity byte, so a run built while the column
+/// was `NOT NULL` holds other words for the same keys. A reopened table must not
+/// answer lookups from those runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_column_relaxed_to_nullable_does_not_reuse_its_persisted_runs() {
+    const ROWS: usize = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "relaxed";
+    let config = || VortexConfig {
+        target_vortex_file_size_mb: 1,
+        ..VortexConfig::default()
+    };
+    let table = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    overwrite(&table, rows(0, ROWS)).await;
+    wait_for_persisted_runs(&fixture, name, 1).await;
+    drop(table);
+
+    let stored = fixture
+        .catalog
+        .get_table(name)
+        .await
+        .expect("table metadata");
+    let relaxed = Arc::new(Schema::new(
+        stored
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let field = field.as_ref().clone();
+                if field.name() == "ServiceId" {
+                    field.with_nullable(true)
+                } else {
+                    field
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    fixture
+        .catalog
+        .update_table_schema(&stored.table_id, &relaxed)
+        .await
+        .expect("relax ServiceId to nullable");
+    let stale: Vec<String> = registered_runs(&fixture, name)
+        .await
+        .into_iter()
+        .map(|record| record.index_key)
+        .collect();
+
+    let reopened = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    let verification = reopened
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    println!("after relaxing a key column to nullable: {verification:?}");
+    assert!(verification.agrees(), "{verification:?}");
+    assert_eq!(
+        verification.files, 0,
+        "no run built before the column became nullable may cover a file: {verification:?}"
+    );
+    let kept: Vec<String> = registered_runs(&fixture, name)
+        .await
+        .into_iter()
+        .map(|record| record.index_key)
+        .filter(|key| stale.contains(key))
+        .collect();
+    assert!(
+        kept.is_empty(),
+        "the runs built before the column became nullable must be deleted: {kept:?}"
+    );
+    lookup(&reopened, name, 7).await;
+}
+
+/// A key column relaxed to nullable on an open table: rows written after it,
+/// including one whose key column is NULL, are found by their keys, and the
+/// rows written before it still are. The open index keeps the encoding it was
+/// built with, so it does not cover the files written after the change; they
+/// are read in full until the table is reopened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_column_relaxed_to_nullable_on_an_open_table_keeps_lookups_exact() {
+    use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
+    const ROWS: usize = 20_000;
+    // Rows written after relaxing: enough for files of their own, the last
+    // with a NULL key column.
+    const AFTER: i64 = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "relaxed_live";
+    let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
+    overwrite(&table, rows(0, ROWS)).await;
+    lookup(&table, name, 11).await;
+
+    let relaxed = Arc::new(Schema::new(vec![
+        Field::new("AutoId", DataType::Int64, false),
+        Field::new("TenantId", DataType::Int64, false),
+        Field::new("ServiceId", DataType::Utf8, true),
+        Field::new("Payload", DataType::Utf8, false),
+    ]));
+    let SchemaEvolution::Widening(plan) = classify(
+        table.schema().as_ref(),
+        &relaxed,
+        &EvolutionContext {
+            constraint_columns: &[],
+        },
+    ) else {
+        panic!("relaxing ServiceId to nullable must be a widening");
+    };
+    table
+        .evolve_schema_live(&plan)
+        .await
+        .expect("relax ServiceId to nullable");
+
+    let first = i64::try_from(ROWS).expect("fits");
+    let ids: Vec<i64> = (first..first + AFTER).collect();
+    let (id, null_id) = (first + 1, first + AFTER - 1);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&relaxed),
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(Int64Array::from(
+                ids.iter().map(|i| i % 997).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                ids.iter()
+                    .map(|&i| (i != null_id).then(|| format!("SV{i:032x}")))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                ids.iter().map(|i| format!("after-{i}")).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("batch after relaxing");
+    let ctx = SessionContext::new();
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register target");
+    let mem =
+        datafusion::datasource::MemTable::try_new(relaxed, vec![vec![batch]]).expect("memtable");
+    ctx.register_table("src", Arc::new(mem))
+        .expect("register src");
+    let inserted = ctx
+        .sql(&format!("INSERT INTO {name} SELECT * FROM src"))
+        .await
+        .expect("insert plan")
+        .collect()
+        .await;
+    println!("insert after relaxing: {:?}", inserted.as_ref().map(|_| ()));
+    inserted.expect("insert after relaxing");
+
+    lookup(&table, name, id).await;
+    lookup(&table, name, 11).await;
+    let nulls = ctx
+        .sql(&format!(
+            "SELECT \"AutoId\" FROM {name} WHERE \"TenantId\" = {} AND \"ServiceId\" IS NULL",
+            null_id % 997
+        ))
+        .await
+        .expect("plan null lookup")
+        .collect()
+        .await
+        .expect("run null lookup");
+    let found: usize = nulls.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(found, 1, "the row with a NULL key column must be read");
+    let verification = table
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    println!("after relaxing on an open table: {verification:?}");
+    assert!(verification.agrees(), "{verification:?}");
+}
