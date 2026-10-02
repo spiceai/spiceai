@@ -899,6 +899,41 @@ mod persist {
         }
     }
 
+    /// A run with rows but no files is rejected: its postings name a file it
+    /// does not have, so it would report rows that no lookup can return.
+    #[test]
+    fn a_run_with_rows_but_no_files_is_rejected() {
+        for slot in [word_proof::lone_slot(0), word_proof::offset_slot(0)] {
+            let postings = if word_proof::slot_is_lone(slot) {
+                Vec::new()
+            } else {
+                varints(&[1, 0])
+            };
+            let bytes = IndexRun::from_parts(
+                0,
+                Vec::new().into(),
+                vec![7].into(),
+                vec![slot].into(),
+                postings.into(),
+                1,
+            )
+            .to_bytes();
+            assert_eq!(IndexRun::from_bytes(&bytes).err(), Some(Error::Corrupt));
+        }
+        let empty = IndexRun::from_parts(
+            0,
+            Vec::new().into(),
+            Vec::new().into(),
+            Vec::new().into(),
+            Vec::new().into(),
+            0,
+        );
+        assert!(
+            IndexRun::from_bytes(&empty.to_bytes()).is_ok(),
+            "a run of no rows and no files loads"
+        );
+    }
+
     /// Two words whose slots share one posting stream, leaving the stream of
     /// the second unreferenced, are rejected even when the row count adds
     /// up: the second word's lookups would read the first's rows and miss
