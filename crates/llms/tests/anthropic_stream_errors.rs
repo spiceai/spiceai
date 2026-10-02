@@ -401,7 +401,7 @@ fn assert_names_the_rejected_control(message: &str) {
         "the model that refused the control must be named: {message}"
     );
     assert!(
-        message.contains("Remove `temperature` from the request and `anthropic_temperature` (or its `openai_temperature` alias) from the model's `params`"),
+        message.contains("Remove `temperature` from the request and from the model's `params` (as `temperature`, `anthropic_temperature` or `openai_temperature`)"),
         "the control and where to remove it must be named: {message}"
     );
     assert!(
@@ -415,8 +415,8 @@ fn assert_names_the_rejected_control(message: &str) {
 }
 
 /// A streaming request carrying `temperature` to a model that rejects it: the refusal arrives as a
-/// stream item, is explained upstream of `transform_stream`, and has to survive that function's
-/// re-typing of every other `invalid_request_error`.
+/// stream item and is explained inside `transform_stream`'s own error formatting, ahead of the arm
+/// that re-types every other `invalid_request_error` behind the generic stream prefix.
 #[tokio::test]
 async fn a_rejected_sampling_control_is_explained_on_the_streaming_path() {
     let base = serve_one_error("400 Bad Request", TEMPERATURE_REJECTED);
