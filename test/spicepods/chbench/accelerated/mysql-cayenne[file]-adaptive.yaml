@@ -56,8 +56,7 @@ name: mysql-cayenne[file]-adaptive
 # mem-tier checkpoints, files reclaimed, encode waits) is flat between the arms.
 
 # All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
-# (server_id derived from the connection identity - the engine default). The
-# -split variant pins distinct per-dataset server_ids for separate dumps.
+# (server_id derived from the connection identity - the engine default).
 mysql_connection_params: &mysql_params
   mysql_host: ${env:CHBENCH_MYSQL_HOST}
   mysql_tcp_port: 3306
