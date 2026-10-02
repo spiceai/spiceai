@@ -472,6 +472,10 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    // Each test holds its own dataset name: the holds live in one map for the whole
+    // process, and the tests run concurrently, so a shared name lets one test replace
+    // or remove another's hold.
+
     #[tokio::test]
     async fn a_dataset_without_a_restore_hold_is_not_paused() {
         let name = TableReference::bare("unheld");
@@ -485,9 +489,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_restore_hold_blocks_until_it_is_released() {
-        let hold = SnapshotRestoreHold::install("held");
+        let hold = SnapshotRestoreHold::install("held_until_released");
         let waiting = tokio::spawn(async {
-            wait_for_installed_restore_hold(&TableReference::bare("held")).await;
+            wait_for_installed_restore_hold(&TableReference::bare("held_until_released")).await;
         });
         tokio::time::timeout(Duration::from_secs(1), hold.wait_until_restore_started())
             .await
@@ -505,7 +509,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_restore_hold_does_not_pause_another_dataset() {
-        let _hold = SnapshotRestoreHold::install("held");
+        let _hold = SnapshotRestoreHold::install("held_for_another_dataset");
         tokio::time::timeout(
             Duration::from_secs(1),
             wait_for_installed_restore_hold(&TableReference::bare("other")),
