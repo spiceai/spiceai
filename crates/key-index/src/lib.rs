@@ -24,9 +24,9 @@ limitations under the License.
 //! first) and prefix-free per column, so the concatenation of a compound key's
 //! columns is injective: two distinct key tuples never encode to the same
 //! bytes. Arrow's row format is not used. `escape_proof` machine-checks the
-//! prefix-freedom of the encoding's specification and of a verified escape;
-//! the streaming encoder that writes keys is tied to that verified escape by
-//! a differential test, not by the proof.
+//! prefix-freedom of the encoding's specification, and the escape the encoder
+//! writes every string and binary value with is verified against that
+//! specification.
 //!
 //! An index stores a 64-bit word per key ([`KeyEncoder::key_word`]): the
 //! key's own bytes when its fields are fixed-width and fit 8 bytes, so
@@ -43,16 +43,8 @@ limitations under the License.
 //!   a reader uses the index only for the files a live run covers.
 
 mod encode;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the verified escape the streaming encoder is tested against; only tests call it"
-    )
-)]
 mod escape_proof;
 pub mod persist;
-mod source;
 pub mod tiered;
 mod varint;
 mod word_proof;
@@ -60,35 +52,11 @@ mod word_proof;
 #[cfg(test)]
 mod proptests;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 
-pub use encode::{BoundKeyColumns, KeyEncoder, KeyField, RowKeySource};
-
-/// One row's encoded key, owned.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EncodedKey(Vec<u8>);
-
-impl EncodedKey {
-    /// The key of `row` of `bound`.
-    #[must_use]
-    pub fn from_row(bound: &BoundKeyColumns<'_>, row: usize) -> Self {
-        let mut bytes = Vec::new();
-        bound.encode_row(row, &mut bytes);
-        Self(bytes)
-    }
-
-    /// A key already in [`KeyEncoder`]'s encoding.
-    #[must_use]
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    /// The encoded bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
+pub use encode::{BoundKeyColumns, KeyEncoder, KeyField};
 
 use snafu::Snafu;
 
@@ -105,11 +73,50 @@ pub enum Error {
         data_type: String,
     },
 
-    /// The bound columns do not match the encoder's key fields.
-    #[snafu(display("Failed to encode an index key: {reason}"))]
-    ColumnMismatch {
-        /// What did not match.
-        reason: String,
+    /// A different number of columns was bound than the key has fields.
+    #[snafu(display(
+        "Failed to encode an index key: expected {expected} key columns but received {received}"
+    ))]
+    ColumnCount {
+        /// The key's fields.
+        expected: usize,
+        /// The columns bound.
+        received: usize,
+    },
+
+    /// A bound column's type is not its key field's.
+    #[snafu(display(
+        "Failed to encode an index key: key column {index} is {found} but the key declares {declared}"
+    ))]
+    ColumnType {
+        /// The column's position in the key.
+        index: usize,
+        /// The bound array's type.
+        found: arrow_schema::DataType,
+        /// The key field's type.
+        declared: arrow_schema::DataType,
+    },
+
+    /// The bound columns do not all have the same number of rows.
+    #[snafu(display(
+        "Failed to encode an index key: key column {index} has {rows} rows but key column 0 has {expected}"
+    ))]
+    ColumnLength {
+        /// The column's position in the key.
+        index: usize,
+        /// Its rows.
+        rows: usize,
+        /// The first column's rows.
+        expected: usize,
+    },
+
+    /// A column of a non-nullable key field holds NULL.
+    #[snafu(display(
+        "Failed to encode an index key: key column {index} is declared non-nullable but holds NULL"
+    ))]
+    UnexpectedNull {
+        /// The column's position in the key.
+        index: usize,
     },
 }
 
