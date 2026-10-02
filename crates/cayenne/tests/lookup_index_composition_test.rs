@@ -148,8 +148,10 @@ fn scored_schema() -> Arc<Schema> {
     ]))
 }
 
+/// A floating-point column can be an index column at every width: the table is
+/// created with an index on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn floating_point_index_columns_are_rejected_at_table_creation() {
+async fn floating_point_index_columns_are_accepted_at_table_creation() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
@@ -179,24 +181,15 @@ async fn floating_point_index_columns_are_rejected_at_table_creation() {
         };
         let catalog = Arc::clone(&fixture.catalog);
         let catalog: Arc<dyn MetadataCatalog> = catalog;
-        let Err(error) = CayenneTableProviderBuilder::new(catalog, Arc::clone(&runtime_env))
+        let table = CayenneTableProviderBuilder::new(catalog, Arc::clone(&runtime_env))
             .with_context(context)
             .with_secondary_indexes(vec![vec!["Score".to_string()]])
             .create(options)
             .await
-        else {
-            panic!("{data_type} lookup index was accepted");
-        };
-        let message = error.to_string();
+            .unwrap_or_else(|error| panic!("{data_type} lookup index was refused: {error}"));
         assert!(
-            message.contains("lookup index column 'Score'")
-                && message.contains("unsupported floating-point type")
-                && message.contains(&data_type.to_string()),
-            "unexpected error for {data_type}: {message}"
-        );
-        assert!(
-            fixture.catalog.get_table(&name).await.is_err(),
-            "an invalid index left table metadata behind"
+            table.lookup_index_counters().is_some(),
+            "{data_type}: the table has no index"
         );
     }
 }
