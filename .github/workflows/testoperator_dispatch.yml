@@ -164,8 +164,9 @@ jobs:
       # first attempt failed are re-run; a cancelled run is left alone, because a cancel may be
       # deliberate. The dispatch's runs are the release-branch `workflow_dispatch` runs of the child
       # workflows created between the start of the run that recorded the build and the record itself.
-      # A failed lookup or re-run request leaves the build unrecorded, so the next scheduled run tries
-      # again.
+      # A failed lookup or re-run request, or a first attempt that has not finished yet, leaves the
+      # build unrecorded, so the next scheduled run tries again; it selects only first attempts, so a
+      # run already re-run is never re-run twice.
       - name: Re-run this release build's failed runs once
         id: retry
         if: ${{ matrix.schedule == '' && steps.benchmarked.outputs.skip == 'true' }}
@@ -208,10 +209,12 @@ jobs:
           # each one must add up to the API's own total, and the bench listing, which every release
           # dispatch fills, must not be empty.
           failed=()
+          unfinished=0
           for workflow in testoperator_run_bench.yml testoperator_run_append.yml testoperator_run_schema.yml; do
             page=1
             listed=0
             picked=0
+            pending=0
             while :; do
               if ! runs=$(api -G "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs" \
                   --data-urlencode "branch=${BRANCH}" --data-urlencode "event=workflow_dispatch" \
@@ -230,6 +233,7 @@ jobs:
                 | .id' <<< "$runs")
               failed+=("${ids[@]}")
               picked=$((picked + ${#ids[@]}))
+              pending=$((pending + $(jq '[.workflow_runs[] | select(.status != "completed" and .run_attempt == 1)] | length' <<< "$runs")))
               if [ "$count" -lt 100 ]; then
                 break
               fi
@@ -239,7 +243,8 @@ jobs:
               echo "The ${workflow} listing came back incomplete (${listed} of ${total} runs); re-running nothing, so the next scheduled run tries again."
               exit 0
             fi
-            echo "${workflow}: ${listed} run(s), ${picked} failed on the first attempt."
+            echo "${workflow}: ${listed} run(s), ${picked} failed on the first attempt, ${pending} not finished."
+            unfinished=$((unfinished + pending))
           done
           # A run whose re-run request fails stays on its first attempt, so leaving the build unrecorded
           # makes the next scheduled run request it again, while the runs re-run here, now on their
@@ -256,6 +261,12 @@ jobs:
           done
           if [ "$refused" -gt 0 ]; then
             echo "${refused} re-run request(s) failed; not recording the re-run, so the next scheduled run requests them again."
+            exit 0
+          fi
+          # A first attempt that has not finished may still fail, so the build stays unrecorded until
+          # every first attempt has finished.
+          if [ "$unfinished" -gt 0 ]; then
+            echo "${unfinished} first attempt(s) have not finished; not recording the re-run, so the next scheduled run re-runs any of them that fail."
             exit 0
           fi
           echo "record=true" >> "$GITHUB_OUTPUT"
