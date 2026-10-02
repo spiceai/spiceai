@@ -462,8 +462,7 @@ impl LeasedBucket {
             if let Some(limiter) = state.limiters.get_mut(&self.config.limiter_key) {
                 limiter.windows.retain(|id, _| {
                     id.parse::<u64>()
-                        .ok()
-                        .is_some_and(|id| id + STALE_WINDOW_RETENTION >= now_window)
+                        .is_ok_and(|id| id + STALE_WINDOW_RETENTION >= now_window)
                 });
             }
 
