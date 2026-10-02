@@ -231,7 +231,6 @@ pub fn transform_stream(
     stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>>,
     context: StreamErrorContext,
 ) -> ChatCompletionResponseStream {
-    let context = Arc::new(context);
     // As mentioned above, only first tool packet has tool metadata.
     // Format:
     //  First Message: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}
@@ -250,6 +249,7 @@ pub fn transform_stream(
     }
 
     let state = Arc::new(Mutex::new(StreamState::default()));
+    let context = Arc::new(context);
 
     let transformed_stream = stream
         .filter_map(move |item| {
