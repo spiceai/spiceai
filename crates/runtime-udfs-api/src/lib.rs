@@ -17,8 +17,7 @@ limitations under the License.
 //! Which functions a remote backend must not be asked to evaluate.
 //!
 //! Federating a filter to a data source is only safe if that source can evaluate
-//! every function in it. Two independent sets of names are unsafe to push down,
-//! and they have opposite defaults:
+//! every function in it. Three sets of names are unsafe to push down:
 //!
 //! 1. **Spice functions** — the UDFs Spice defines (`bucket`, `cosine_distance`,
 //!    `rerank`, …) plus any the user registers. No remote source knows them, so
@@ -29,6 +28,9 @@ limitations under the License.
 //!    nested array/list/map functions relative to `PostgreSQL`. These are
 //!    allowed by default; only the backend knows which subset it lacks, so it
 //!    supplies them via [`FunctionSupportBuilder::deny_also`].
+//! 3. **`DataFusion` built-ins that describe the plan** — the
+//!    [`PLAN_INTROSPECTION_BUILTINS`] (`arrow_typeof`, …). No backend can
+//!    answer them, so every policy denies them and no carve-out re-admits them.
 //!
 //! Set 1 lives here because Spice owns it: every Spice function registers its
 //! name at its definition site with [`register_spice_function!`], collected into
@@ -358,14 +360,16 @@ impl<'a> FunctionSupportBuilder<'a> {
 }
 
 /// The [`FunctionSupport`] for a backend that evaluates no Spice function and
-/// every `DataFusion` built-in — the conservative default.
+/// every `DataFusion` built-in except the [`PLAN_INTROSPECTION_BUILTINS`] — the
+/// conservative default.
 #[must_use]
 pub fn function_support() -> FunctionSupport {
     FunctionSupportBuilder::new().build()
 }
 
 /// The functions no remote source may be asked to evaluate: every Spice
-/// function plus every user-registered one. Safe to call from per-query filter
+/// function, every user-registered one, and the
+/// [`PLAN_INTROSPECTION_BUILTINS`]. Safe to call from per-query filter
 /// pushdown paths.
 #[must_use]
 pub fn deny_spice_specific_functions() -> std::sync::Arc<FunctionSupport> {

@@ -1190,3 +1190,73 @@ async fn duckdb_regexp_like_and_replace_stay_local_where_the_engines_disagree()
         })
         .await
 }
+
+/// `arrow_typeof` describes the `DataFusion` plan's type, and `DuckDB` has no
+/// function of that name: unparsed into the accelerator's SQL, the query failed
+/// with `Catalog Error: Scalar Function with name arrow_typeof does not exist!`
+/// (regression test for #14334). The call must stay above the federated scan
+/// and answer what local evaluation answers.
+#[tokio::test]
+async fn duckdb_accelerated_arrow_typeof_stays_local_and_agrees_with_local()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("typeof.csv");
+            write_csv_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_arrow_typeof")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            let query = "SELECT id, arrow_typeof(id) AS id_type, arrow_typeof(name) AS name_type \
+                         FROM {table} ORDER BY id";
+            let plan = to_pretty_display(
+                &run_query(
+                    &rt,
+                    &format!("EXPLAIN {}", query.replace("{table}", "accelerated")),
+                )
+                .await?,
+            )?
+            .to_string();
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                !remote_sql.is_empty(),
+                "the scan must still be federated to DuckDB; plan was:\n{plan}"
+            );
+            assert!(
+                !remote_sql.contains("arrow_typeof"),
+                "arrow_typeof must be evaluated above the federated scan, not sent to DuckDB; \
+                 plan was:\n{plan}"
+            );
+
+            let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &query.replace("{table}", "local")).await?;
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "DuckDB-accelerated arrow_typeof must agree with local evaluation"
+            );
+            assert_eq!(
+                accelerated
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                4,
+                "every source row is answered"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
