@@ -23,10 +23,13 @@ limitations under the License.
 //!
 //! ```text
 //! magic "CIDX" | version | kind | body | checksum
-//! body (run): files u32 | (len u32 | name)* | rows u64
+//! body (run): encoding u64 | files u32 | (len u32 | name)* | rows u64
 //!             | words u64 | u64 * words | u32 * words (slots)
 //!             | postings u64 | postings bytes
 //! ```
+//!
+//! `encoding` is the [`KeyEncoder::word_identity`](crate::KeyEncoder::word_identity)
+//! of the encoder that built the run; an index publishes only runs of its own.
 //!
 //! All integers are little-endian. The trailing checksum is
 //! [`hash_index::hash_key_bytes_oneshot`] over everything before it, so a torn or
@@ -37,7 +40,7 @@ use snafu::{Snafu, ensure};
 
 const MAGIC: u32 = u32::from_le_bytes(*b"CIDX");
 /// Bumped on any change to the byte layout.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub(crate) const KIND_RUN: u32 = 2;
 
 /// Why persisted bytes were rejected.

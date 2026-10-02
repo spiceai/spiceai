@@ -162,8 +162,11 @@ fn kind(data_type: &DataType) -> Option<Kind> {
         DataType::Boolean => Kind::Boolean,
         DataType::Date32 => Kind::Date32,
         DataType::Date64 => Kind::Date64,
-        DataType::Time32(unit) => Kind::Time32(*unit),
-        DataType::Time64(unit) => Kind::Time64(*unit),
+        // The units Arrow defines for each: it builds no array of any other.
+        DataType::Time32(unit @ (TimeUnit::Second | TimeUnit::Millisecond)) => Kind::Time32(*unit),
+        DataType::Time64(unit @ (TimeUnit::Microsecond | TimeUnit::Nanosecond)) => {
+            Kind::Time64(*unit)
+        }
         DataType::Timestamp(unit, _) => Kind::Timestamp(*unit),
         DataType::Duration(unit) => Kind::Duration(*unit),
         DataType::Decimal128(_, _) => Kind::Decimal128,
@@ -253,6 +256,32 @@ impl KeyEncoder {
     #[must_use]
     pub fn fields(&self) -> &[KeyField] {
         &self.fields
+    }
+
+    /// Identifies the words this encoder gives keys: two encoders with the same
+    /// identity give every key the same word. It covers each field's type,
+    /// whether the field is nullable (a nullable field encodes each value
+    /// behind a validity byte), and how keys become words. A run records the
+    /// identity of the encoder that built it and an index publishes only runs
+    /// of its own, so a run built under another encoding, whose words match
+    /// none of the index's keys, never answers a lookup.
+    #[must_use]
+    pub fn word_identity(&self) -> u64 {
+        let mut descriptor = Vec::new();
+        for field in &self.fields {
+            descriptor.extend_from_slice(field.data_type.to_string().as_bytes());
+            // A type's name never contains a control byte, so the separator
+            // and the nullability after it keep each field's part distinct.
+            descriptor.extend_from_slice(&[0, u8::from(field.nullable)]);
+        }
+        match &self.words {
+            WordRule::Exact(_) => descriptor.push(0),
+            WordRule::Hashed { bits } => {
+                descriptor.push(1);
+                descriptor.extend_from_slice(&bits.to_le_bytes());
+            }
+        }
+        hash_index::hash_key_bytes_oneshot(&descriptor)
     }
 
     /// The 64-bit word an index stores for the encoded `key` of a row with no

@@ -585,3 +585,38 @@ fn floating_point_keys_are_refused() {
         );
     }
 }
+
+/// Arrow defines `Time32` only in seconds and milliseconds and `Time64` only in
+/// micro- and nanoseconds, and refuses to build an array of any other unit. A
+/// key field declared with one is refused when the key is declared, rather
+/// than accepted for a type no data can have; every defined unit is accepted.
+#[test]
+fn time_units_arrow_does_not_define_are_refused() {
+    use arrow_schema::TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
+    let declare = |data_type: DataType| KeyEncoder::new(vec![KeyField::new(data_type, false)]);
+    for undefined in [
+        DataType::Time32(Microsecond),
+        DataType::Time32(Nanosecond),
+        DataType::Time64(Second),
+        DataType::Time64(Millisecond),
+    ] {
+        assert!(
+            matches!(
+                declare(undefined.clone()),
+                Err(Error::UnsupportedType { .. })
+            ),
+            "{undefined:?} must be refused"
+        );
+    }
+    for defined in [
+        DataType::Time32(Second),
+        DataType::Time32(Millisecond),
+        DataType::Time64(Microsecond),
+        DataType::Time64(Nanosecond),
+    ] {
+        assert!(
+            declare(defined.clone()).is_ok(),
+            "{defined:?} must be accepted"
+        );
+    }
+}

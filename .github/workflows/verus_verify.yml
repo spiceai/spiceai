@@ -17,7 +17,9 @@ name: Verus Verification
 #
 # `crates/key-index/src/escape_proof.rs`: the key encoding is prefix-free per
 # column for every input, so a compound key's concatenated encoding is
-# injective and an index lookup on encoded keys matches exactly one key tuple.
+# injective: distinct key tuples never encode to the same bytes. A lookup can
+# still return another key's rows, because a wide key is indexed by a 64-bit
+# hash of those bytes; the query's own filter drops them.
 #
 # `crates/sharded-cache/src/layout.rs`: both array indices the results cache
 # derives from a key — the shard, and the `TinyLFU` counter cell — subscript
