@@ -34,10 +34,12 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
-  # Report the required job name on pull requests without running ADBC tests;
-  # the real check runs against the merge-group commit.
+  # On a pull request both jobs are skipped at the job level, so the required
+  # check is published under its name as `skipped` rather than a `success`
+  # nothing ran for (#13841); the merge-group commit is what runs the tests.
   check_changes:
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: spiceai-dev-runners
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
     # cold runner having to clone from scratch, not the ~1 min a warm
     # self-hosted workspace takes.
@@ -45,18 +47,12 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - name: Pull request passthrough
-        if: ${{ github.event_name == 'pull_request' }}
-        run: echo "ADBC integration tests run on the merge-group commit"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ github.event_name != 'pull_request' }}
         with:
           persist-credentials: false
           fetch-depth: 0
 
       - name: Check for code changes
-        if: ${{ github.event_name != 'pull_request' }}
         id: check
         uses: ./.github/actions/check-code-changes
 
@@ -65,14 +61,11 @@ jobs:
     needs: check_changes
     # Slowest observed success in the 2026-07-25..08-08 window: 50 min.
     timeout-minutes: 150
-    # On non-PR events, run the required check unconditionally and gate each
-    # step so docs-only merge groups still report success.
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    if: ${{ github.event_name != 'pull_request' }}
+    # Gate each step rather than the job, so docs-only merge groups still
+    # report success.
+    runs-on: spiceai-dev-runners
     steps:
-      - name: Pull request passthrough
-        if: ${{ github.event_name == 'pull_request' }}
-        run: echo "ADBC integration tests run on the merge-group commit"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:

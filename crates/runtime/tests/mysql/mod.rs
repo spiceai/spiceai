@@ -281,11 +281,11 @@ async fn mysql_integration_test() -> Result<(), String> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("MySQL Integration Test Results"),
+                        description => "MySQL Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("mysql_integration_test_select"), results);
+                        insta::assert_snapshot!("mysql_integration_test_select", results);
                     });
                 })),
             )];
@@ -372,11 +372,11 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
                         .expect("should pretty print result batch");
 
                     insta::with_settings!({
-                        description => format!("MySQL Integration Test Results"),
+                        description => "MySQL Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("character_set_results_default"), results);
+                        insta::assert_snapshot!("character_set_results_default", results);
                     });
                 })),
             )];
