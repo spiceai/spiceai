@@ -3769,31 +3769,38 @@ fn select_protected_snapshot_merge_tier(
     max_pass_bytes: Option<u64>,
     below_tier: Option<u32>,
 ) -> ProtectedMergeSelection {
-    if inputs.len() < 2 || min_runs < 2 {
-        // A merge needs at least two runs, and a floor below 2 is meaningless.
-        return ProtectedMergeSelection::NoQualifyingTier;
-    }
-
     // Group input indices by tier, preserving oldest-first order within a tier.
     let mut tiers: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
     for (idx, (_, _, bytes)) in inputs.iter().enumerate() {
         let tier = protected_snapshot_size_tier(*bytes, base_bytes, growth);
         tiers.entry(tier).or_default().push(idx);
     }
+    let no_qualifying_tier = || ProtectedMergeSelection::NoQualifyingTier {
+        runs_per_tier: tiers
+            .iter()
+            .map(|(tier, indices)| (*tier, indices.len()))
+            .collect(),
+    };
+
+    if min_runs < 2 {
+        // A floor below 2 is meaningless: a merge needs at least two runs. Fewer than
+        // two inputs needs no guard, since no tier can then reach `min_runs`.
+        return no_qualifying_tier();
+    }
 
     // BTreeMap iterates tiers in ascending order, so the first qualifying tier
     // is the lowest one.
-    let tiers = tiers
-        .into_iter()
-        .take_while(|(tier, _)| below_tier.is_none_or(|below| *tier < below));
-    for (_tier, indices) in tiers {
+    let eligible = tiers
+        .iter()
+        .take_while(|(tier, _)| below_tier.is_none_or(|below| **tier < below));
+    for (_tier, indices) in eligible {
         if indices.len() < min_runs {
             continue;
         }
         let width = max_width.max(2);
         let mut selected: Vec<(String, i64)> = Vec::with_capacity(width.min(indices.len()));
         let mut selected_bytes: u64 = 0;
-        for &idx in &indices {
+        for &idx in indices {
             if selected.len() == width {
                 break;
             }
@@ -3827,7 +3834,7 @@ fn select_protected_snapshot_merge_tier(
         };
     }
 
-    ProtectedMergeSelection::NoQualifyingTier
+    no_qualifying_tier()
 }
 
 /// Outcome of [`select_protected_snapshot_merge_tier`], distinguishing "nothing
@@ -3837,8 +3844,13 @@ fn select_protected_snapshot_merge_tier(
 enum ProtectedMergeSelection {
     /// Consolidate these runs: always at least 2, oldest-first.
     Merge(Vec<(String, i64)>),
-    /// No size tier has accumulated `min_runs` same-size runs yet.
-    NoQualifyingTier,
+    /// No size tier this pass may merge has accumulated `min_runs` same-size runs.
+    NoQualifyingTier {
+        /// Runs per size tier (`tier -> runs`) across every input, including tiers
+        /// at or above a running merge's tier, which this pass may not select.
+        /// `min_runs` applies to each tier on its own, never to the total.
+        runs_per_tier: std::collections::BTreeMap<u32, usize>,
+    },
     /// A tier has enough runs, but its two OLDEST do not fit `max_pass_bytes`, so
     /// the oldest-first walk cannot form a pair and the pass declines.
     ///
@@ -3855,12 +3867,13 @@ enum ProtectedMergeSelection {
     },
 }
 
+#[cfg(test)]
 impl ProtectedMergeSelection {
     /// The runs to merge, or empty for either declining outcome.
     fn into_inputs(self) -> Vec<(String, i64)> {
         match self {
             Self::Merge(inputs) => inputs,
-            Self::NoQualifyingTier | Self::OverPassBudget { .. } => Vec::new(),
+            Self::NoQualifyingTier { .. } | Self::OverPassBudget { .. } => Vec::new(),
         }
     }
 }
@@ -24177,57 +24190,62 @@ impl CayenneTableProvider {
             in_flight.min_tier(),
         );
 
-        if let ProtectedMergeSelection::OverPassBudget {
-            tier_runs,
-            oldest_pair_bytes,
-        } = &selection
-        {
-            // Declining here costs less than it appears. A merge's benefit is one fewer
-            // scan branch, which is the same whether the runs are 8 MiB or 8 GiB; its
-            // cost is the bytes it rewrites. So a large-run tier is the worst-value work
-            // this pass can do, and leaving it settled is the same call the
-            // current-snapshot picker makes for files at or above the target size.
-            //
-            // The alarm for the read amplification that remains belongs to the read
-            // path, which already WARNs at `8 x compaction_trigger_protected_snapshots`
-            // protected snapshots (`scan_protected_snapshots`) — on the harm itself
-            // rather than on this proxy for it. This line is the cause, for whoever
-            // investigates that warning.
-            maintenance_metrics::track_compaction(
-                table_name,
-                CompactionKind::ProtectedSubset,
-                CompactionOutcome::DeclinedOverPassBudget,
-            );
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
+        let inputs = match selection {
+            ProtectedMergeSelection::Merge(inputs) => inputs,
+            ProtectedMergeSelection::OverPassBudget {
                 tier_runs,
                 oldest_pair_bytes,
-                max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
-                "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
-                 runs exceed the pass memory budget"
-            );
-            return Ok(false);
-        }
-
-        let inputs = selection.into_inputs();
-        if inputs.len() < 2 {
-            maintenance_metrics::track_compaction(
-                table_name,
-                CompactionKind::ProtectedSubset,
-                CompactionOutcome::DeclinedNoQualifyingTier,
-            );
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                candidates = sized_candidates.len(),
-                min_runs,
-                tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
-                max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
-                "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
-            );
-            return Ok(false);
-        }
+            } => {
+                // Declining here costs less than it appears. A merge's benefit is one fewer
+                // scan branch, which is the same whether the runs are 8 MiB or 8 GiB; its
+                // cost is the bytes it rewrites. So a large-run tier is the worst-value work
+                // this pass can do, and leaving it settled is the same call the
+                // current-snapshot picker makes for files at or above the target size.
+                //
+                // The alarm for the read amplification that remains belongs to the read
+                // path, which already WARNs at `8 x compaction_trigger_protected_snapshots`
+                // protected snapshots (`scan_protected_snapshots`) — on the harm itself
+                // rather than on this proxy for it. This line is the cause, for whoever
+                // investigates that warning.
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::ProtectedSubset,
+                    CompactionOutcome::DeclinedOverPassBudget,
+                );
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    tier_runs,
+                    oldest_pair_bytes,
+                    max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
+                    "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
+                     runs exceed the pass memory budget"
+                );
+                return Ok(false);
+            }
+            ProtectedMergeSelection::NoQualifyingTier { runs_per_tier } => {
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::ProtectedSubset,
+                    CompactionOutcome::DeclinedNoQualifyingTier,
+                );
+                // `min_runs` is a per-tier threshold, so `runs_per_tier` is what to read it
+                // against: 4 candidates split {0: 3, 1: 1} decline under `min_runs=4` (#13622).
+                // Tiers at or above `running_merge_min_tier` are not eligible this pass.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    runs_per_tier = ?runs_per_tier,
+                    min_runs,
+                    running_merge_min_tier = ?in_flight.min_tier(),
+                    candidates = sized_candidates.len(),
+                    tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
+                    max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
+                    "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
+                );
+                return Ok(false);
+            }
+        };
 
         // Diagnostics over the SELECTED (single-tier) input set.
         let selected_ids: std::collections::HashSet<&str> =
@@ -40435,8 +40453,11 @@ mod tests {
         );
         assert_eq!(
             select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, Some(1)),
-            ProtectedMergeSelection::NoQualifyingTier,
-            "tier 1 must not merge alongside a running tier-1 merge"
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1), (1, 2)].into(),
+            },
+            "tier 1 must not merge alongside a running tier-1 merge, and the decline still \
+             reports the ineligible tier's runs"
         );
     }
 
@@ -40448,7 +40469,30 @@ mod tests {
         let inputs = vec![sized("a", 1024), sized("b", base * 4)];
         assert_eq!(
             select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, None),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1), (1, 1)].into(),
+            }
+        );
+    }
+
+    /// Regression test for #13622: four candidates under `min_runs = 4` decline when
+    /// they are split across tiers, and the decline carries the per-tier split that
+    /// explains it rather than only the total.
+    #[test]
+    fn select_merge_tier_reports_runs_per_tier_when_the_total_reaches_min_runs() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        let inputs = vec![
+            sized("merged", base * 2), // tier 1
+            sized("a", 1024),          // tier 0
+            sized("b", 2048),          // tier 0
+            sized("c", 4096),          // tier 0
+        ];
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&inputs, 4, 32, base, growth, None, None),
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 3), (1, 1)].into(),
+            }
         );
     }
 
@@ -40477,7 +40521,9 @@ mod tests {
         // Fewer than two inputs, or a sub-2 floor, can never merge.
         assert_eq!(
             select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth, None, None),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1)].into(),
+            }
         );
         assert_eq!(
             select_protected_snapshot_merge_tier(
@@ -40489,7 +40535,9 @@ mod tests {
                 None,
                 None
             ),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 2)].into(),
+            }
         );
     }
 
