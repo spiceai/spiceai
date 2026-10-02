@@ -37,8 +37,7 @@ limitations under the License.
 //! Every write adds a run, and a lookup of a key some run may hold probes
 //! every run's filter (one filter over all runs' keys turns the others away
 //! with a single probe), so [`TieredIndex::merge_step`] merges runs of about
-//! the same size (a
-//! size-tiered policy): the data files do not change, only which run indexes
+//! the same size (a size-tiered policy): the data files do not change, only which run indexes
 //! them, so a merge only renumbers file ids — no position moves. It runs off
 //! to the side and swaps the merged run in under a short lock, using the
 //! source runs' liveness as of the swap, so files retired while it ran stay
@@ -46,8 +45,9 @@ limitations under the License.
 //!
 //! # Contract
 //!
-//! `publish`, `publish_visible`, `reconcile` and `merge_step` run
-//! concurrently with one another, and views and lookups are lock-free.
+//! Every `TieredIndex` method is safe to call concurrently with any other;
+//! changes to the runs serialize on a short lock, and views and lookups are
+//! lock-free.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -59,14 +59,16 @@ use hash_index::SplitBlockBloomFilter;
 use parking_lot::Mutex;
 use snafu::{ResultExt, Snafu, ensure};
 
+use crate::word_proof::{self, MULTI};
 use crate::{BoundKeyColumns, KeyEncoder, varint};
 
 /// Bits of a file-local row position. A run stores a row as the mixed-radix
 /// posting `position * files + file`, so a posting takes the few bytes its
-/// position needs rather than a 40-bit-shifted file id's.
+/// position needs.
 pub const POSITION_BITS: u32 = 40;
 const POSITION_MASK: u64 = (1 << POSITION_BITS) - 1;
-/// Files one run can cover: the rest of a posting below the value tag bit.
+/// Files one run can cover: 2^23, so a posting `position * files + file`
+/// stays below 2^63.
 pub const MAX_RUN_FILES: usize = 1 << (63 - POSITION_BITS);
 /// Runs of one size tier that [`TieredIndex::merge_step`] merges at once, and
 /// the size ratio between tiers.
@@ -117,8 +119,6 @@ pub enum Error {
 /// Result alias for this module.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-use crate::word_proof::{self, MULTI};
-
 // The verified encodings in `word_proof` are proved for exactly these limits.
 const _: () = assert!(
     (1_u64 << POSITION_BITS) == word_proof::POSITION_LIMIT
@@ -126,7 +126,8 @@ const _: () = assert!(
 );
 
 /// A word's filter hash. A word is either a hash already or the bytes of a
-/// small fixed-width key, which have few random bits, so it is mixed first.
+/// small fixed-width key, which have few random bits, so it is mixed first
+/// with the `SplitMix64` finalizer.
 fn word_hash(word: u64) -> u64 {
     let mut x = word ^ (word >> 30);
     x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -303,8 +304,13 @@ impl IndexRun {
             .map(|at| start + at)
     }
 
-    /// Call `f` with each posting of the word at `at`, ascending.
-    fn postings_at(&self, at: usize, mut f: impl FnMut(u64)) {
+    /// Call `f(file, position)` with each row of the word at `at`, in posting
+    /// order: `file` indexes [`Self::files`].
+    fn rows_at(&self, at: usize, mut f: impl FnMut(usize, u64)) {
+        let mut f = |posting| {
+            let (file, position) = self.decode(posting);
+            f(file, position);
+        };
         let slot = self.slots[at];
         if word_proof::slot_is_lone(slot) {
             f(u64::from(slot));
@@ -326,8 +332,7 @@ impl IndexRun {
     /// order.
     pub fn for_each_row(&self, mut f: impl FnMut(u64, &str, u64)) {
         for (at, &word) in self.words.iter().enumerate() {
-            self.postings_at(at, |posting| {
-                let (file, position) = self.decode(posting);
+            self.rows_at(at, |file, position| {
                 if let Some(path) = self.files.get(file) {
                     f(word, path, position);
                 }
@@ -346,8 +351,7 @@ impl IndexRun {
         let Some(at) = self.find(word) else {
             return;
         };
-        self.postings_at(at, |posting| {
-            let (file, position) = self.decode(posting);
+        self.rows_at(at, |file, position| {
             if let Some(path) = self.files.get(file) {
                 f(path, position);
             }
@@ -692,28 +696,15 @@ impl RunBuilder {
             }));
         }
         entries.sort_unstable();
-        let words = 1 + entries
-            .windows(2)
-            .filter(|pair| pair[0].0 != pair[1].0)
-            .count();
-        let mut writer = RunWriter::with_capacity(
-            self.encoder.word_identity(),
-            if entries.is_empty() { 0 } else { words },
-        );
+        let by_word = || entries.chunk_by(|a, b| a.0 == b.0);
+        let mut writer = RunWriter::with_capacity(self.encoder.word_identity(), by_word().count());
         let mut group: Vec<u64> = Vec::new();
-        let mut i = 0;
-        while i < entries.len() {
-            let word = entries[i].0;
+        for rows in by_word() {
             group.clear();
-            while i < entries.len() && entries[i].0 == word {
-                // A row added twice is stored once.
-                let posting = entries[i].1;
-                if group.last() != Some(&posting) {
-                    group.push(posting);
-                }
-                i += 1;
-            }
-            writer.push(word, &group)?;
+            group.extend(rows.iter().map(|&(_, posting)| posting));
+            // A row added twice is stored once.
+            group.dedup();
+            writer.push(rows[0].0, &group)?;
         }
         Ok(writer.finish(self.files.into_boxed_slice()))
     }
@@ -1035,8 +1026,7 @@ fn merge_runs(encoding: u64, sources: &[&RunEntry]) -> Result<IndexRun> {
         let (source, offset) = (sources[i], offsets[i]);
         let run = &source.run;
         let at = next[i];
-        run.postings_at(at, |posting| {
-            let (file, position) = run.decode(posting);
+        run.rows_at(at, |file, position| {
             if all_live[i] || source.files.get(file).is_some_and(|state| state.is_live()) {
                 group.push(word_proof::posting(
                     position,
@@ -1130,8 +1120,7 @@ impl IndexView {
             let Some(at) = run.find(word) else {
                 continue;
             };
-            run.postings_at(at, |posting| {
-                let (file, position) = run.decode(posting);
+            run.rows_at(at, |file, position| {
                 if states.get(file).is_some_and(|state| state.is_live())
                     && let Some(path) = run.files.get(file)
                 {
@@ -1460,7 +1449,7 @@ impl TieredIndex {
     /// is kept, since its write may not be visible yet, for up to
     /// [`UNSEEN_GRACE`] calls. Call it once per distinct file set: every call
     /// counts toward the grace. Returns the number of files retired.
-    pub fn reconcile(&self, live: &std::collections::HashSet<&str>) -> usize {
+    pub fn reconcile(&self, live: &HashSet<&str>) -> usize {
         let _swap = self.swap.lock();
         let current = self.layers.load_full();
         let mut retired = 0;

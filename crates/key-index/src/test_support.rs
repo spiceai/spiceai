@@ -21,6 +21,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::DataType;
 
+use crate::tiered::{IndexRun, RunBuilder};
 use crate::{KeyEncoder, KeyField};
 
 pub(crate) fn encoder() -> KeyEncoder {
@@ -40,6 +41,26 @@ pub(crate) fn encoded(key: i64) -> Vec<u8> {
     let mut out = Vec::new();
     bound.encode_row(0, &mut out);
     out
+}
+
+/// A run of [`encoder`]'s keys over one file holding `keys` at positions
+/// `0..`.
+pub(crate) fn run_of(file: &str, keys: &[i64]) -> IndexRun {
+    let mut builder = RunBuilder::new(encoder());
+    builder.add_batch(file, 0, &column(keys)).expect("add");
+    builder.finish().expect("finish")
+}
+
+/// Each row of `columns`, encoded under `encoder`.
+pub(crate) fn encode_rows(encoder: &KeyEncoder, columns: &[ArrayRef]) -> Vec<Vec<u8>> {
+    let bound = encoder.bind(columns).expect("bind");
+    (0..columns.first().map_or(0, |column| column.len()))
+        .map(|row| {
+            let mut out = Vec::new();
+            bound.encode_row(row, &mut out);
+            out
+        })
+        .collect()
 }
 
 /// The word of the key `key`.

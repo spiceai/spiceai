@@ -25,6 +25,7 @@ use arrow_schema::DataType;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
+use crate::test_support::encode_rows;
 use crate::{Error, KeyEncoder, KeyField};
 
 // ---- key encoding --------------------------------------------------------
@@ -520,13 +521,9 @@ fn wide_decimals_and_intervals_encode_in_order() {
 fn key_words_are_exact_for_keys_that_fit_eight_bytes() {
     use arrow_array::{Int32Array, Int64Array, StringArray};
     let words = |encoder: &KeyEncoder, columns: &[ArrayRef]| -> Vec<u64> {
-        let bound = encoder.bind(columns).expect("bind");
-        (0..bound.num_rows())
-            .map(|row| {
-                let mut key = Vec::new();
-                bound.encode_row(row, &mut key);
-                encoder.key_word(&key)
-            })
+        encode_rows(encoder, columns)
+            .iter()
+            .map(|key| encoder.key_word(key))
             .collect()
     };
     let values: Vec<i64> = vec![i64::MIN, -5, -1, 0, 1, 7, i64::MAX];
@@ -575,15 +572,7 @@ fn key_words_are_exact_for_keys_that_fit_eight_bytes() {
 fn encode_each(column: ArrayRef) -> Vec<Vec<u8>> {
     let encoder =
         KeyEncoder::new(vec![KeyField::new(column.data_type().clone(), false)]).expect("key");
-    let columns = vec![column];
-    let bound = encoder.bind(&columns).expect("bind");
-    (0..columns[0].len())
-        .map(|row| {
-            let mut out = Vec::new();
-            bound.encode_row(row, &mut out);
-            out
-        })
-        .collect()
+    encode_rows(&encoder, &[column])
 }
 
 /// `values` as a column of each float width, by their `f64` bits narrowed with
