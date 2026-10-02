@@ -66,7 +66,16 @@ static CDC_SHUTDOWN_EPOCH: LazyLock<tokio::sync::watch::Sender<u64>> =
 /// how far its accelerations were advanced — needs the process to stay up until
 /// it has recorded it, so the runtime follows this with [`drain_shutdown`] and
 /// waits for that before it closes the accelerations.
+///
+/// The epoch advances under the guard registry's lock, the lock
+/// [`ShutdownDrainGuard::hold`] reads the epoch and registers under, so a guard
+/// is always registered under the epoch that was current when it was counted.
+/// Without that, a guard could read the old epoch, lose the lock to this
+/// signal, and register after the drain had already found nothing to wait for —
+/// a source the signal reached, stopping and recording after the accelerations
+/// had closed, which is the missed flush the drain exists to prevent.
 pub fn begin_shutdown() {
+    let _registry = SHUTDOWN_DRAIN.held.lock();
     CDC_SHUTDOWN_EPOCH.send_modify(|epoch| *epoch += 1);
 }
 
@@ -134,7 +143,9 @@ static SHUTDOWN_DRAIN: ShutdownDrain = ShutdownDrain {
 /// The guard captures the shutdown epoch when it is taken, and that is the
 /// epoch its holder stops on: a source started after a shutdown was signalled
 /// captures the newer epoch, is not stopped by that shutdown, and is not waited
-/// for by it either.
+/// for by it either. The capture and the registration happen under the one
+/// lock [`begin_shutdown`] advances the epoch under, so the two cannot
+/// interleave: a guard is either counted by a signal or started after it.
 #[must_use = "the drain is held only while the guard is alive"]
 pub struct ShutdownDrainGuard {
     epoch: u64,
@@ -145,8 +156,11 @@ impl ShutdownDrainGuard {
     /// source's task is spawned, so a source the runtime has started but not
     /// yet polled is already counted.
     pub fn hold() -> Self {
+        let mut held = SHUTDOWN_DRAIN.held.lock();
+        // Read the epoch under the lock, not before taking it: see
+        // `begin_shutdown`, which advances it under the same lock.
         let epoch = shutdown_epoch();
-        *SHUTDOWN_DRAIN.held.lock().entry(epoch).or_insert(0) += 1;
+        *held.entry(epoch).or_insert(0) += 1;
         Self { epoch }
     }
 
@@ -175,13 +189,9 @@ impl Drop for ShutdownDrainGuard {
 /// How many guards are held by sources a shutdown has been signalled to: those
 /// whose captured epoch is older than the current one.
 fn signalled_guards_held() -> usize {
+    let held = SHUTDOWN_DRAIN.held.lock();
     let current = shutdown_epoch();
-    SHUTDOWN_DRAIN
-        .held
-        .lock()
-        .range(..current)
-        .map(|(_, count)| count)
-        .sum()
+    held.range(..current).map(|(_, count)| count).sum()
 }
 
 /// Wait until every [`ShutdownDrainGuard`] held by a source the shutdown was
@@ -2646,5 +2656,40 @@ mod shutdown_drain_tests {
             started.elapsed() < Duration::from_secs(5),
             "an already-signalled shutdown cuts the delay short"
         );
+
+        // Registration and the signal are serialized (regression test for the
+        // interleaving raised on #14702): a guard taken while a shutdown is being
+        // signalled registers under the epoch the signal leaves behind, so the
+        // drain that follows the signal counts every source it reached. Hold the
+        // registry's lock from here, so both a signal and a registration started
+        // now have to wait for it; then advance the epoch underneath the waiting
+        // registration, which must read the epoch only once it holds the lock.
+        let before = shutdown_epoch();
+        let registry = SHUTDOWN_DRAIN.held.lock();
+        let signal = std::thread::spawn(begin_shutdown);
+        let registration = std::thread::spawn(ShutdownDrainGuard::hold);
+        // Time is under test: both threads must still be waiting after a delay
+        // long enough for either to have finished if it did not take the lock.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !signal.is_finished(),
+            "begin_shutdown must wait for the guard registry's lock"
+        );
+        assert!(
+            !registration.is_finished(),
+            "hold must wait for the guard registry's lock"
+        );
+        // The test's own advance, bypassing the lock it is itself holding.
+        CDC_SHUTDOWN_EPOCH.send_modify(|current| *current += 1);
+        drop(registry);
+        signal.join().expect("signal thread");
+        let registered = registration.join().expect("registration thread");
+        assert!(
+            registered.epoch() > before,
+            "a registration that waited for the lock captures the epoch current once it holds \
+             it ({} > {before}), never one read before the wait",
+            registered.epoch()
+        );
+        drop(registered);
     }
 }
