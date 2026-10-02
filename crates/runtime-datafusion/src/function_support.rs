@@ -23,7 +23,13 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion::{common::DFSchema, logical_expr::Expr};
+use arrow::datatypes::DataType;
+use arrow_tools::schema_evolution::is_widening_cast;
+use datafusion::{
+    common::DFSchema,
+    logical_expr::{Expr, ExprSchemable as _},
+    scalar::ScalarValue,
+};
 use datafusion_table_providers::util::supported_functions::{ExpressionSupport, FunctionSupport};
 use runtime_udfs_api::{FunctionSupportBuilder, datafusion_nested_function_names};
 
@@ -242,11 +248,93 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
 /// rewrite through, so the call is denied and evaluates locally above the
 /// federated scan instead. That costs the pushdown for those plans and returns
 /// the right rows, which is the trade the deny-list exists to make.
+///
+/// Casts are gated by [`sqlite_can_evaluate_expression`].
 #[must_use]
 pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also([crate::dialect::BTRIM_NAME.to_string()])
         .build()
+        .with_expression_support(Arc::new(sqlite_can_evaluate_expression))
+}
+
+/// Whether `SQLite` evaluates this non-function expression node the way
+/// `DataFusion` does.
+///
+/// `SQLite` has no `TRY_CAST`, so a federated one fails the query with a
+/// syntax error; it always stays local (issue #14398).
+///
+/// `SQLite`'s `CAST` never fails: it converts the longest numeric prefix of
+/// its operand and answers `0` when there is none, and saturates a float too
+/// large for an integer. `DataFusion` refuses those values, so a federated cast
+/// answers rows where the local query raises — `CAST('abc' AS BIGINT)` is `0`,
+/// `CAST('12abc' AS BIGINT)` is `12`, `CAST(1e30 AS BIGINT)` is
+/// `9223372036854775807`, and every binary value casts to `0`. In a filter the
+/// wrong value then selects rows. The formatting of a cast into text differs
+/// too (`1.0e+30` for `1e30`, `1` for `true`), and a binary value cast into
+/// text is not validated as UTF-8, so a filter over it matches bytes
+/// `DataFusion` refuses. A `SQLite` accelerator stores dates and timestamps
+/// in its own representation, and a cast between them selects different rows.
+///
+/// So a cast federates only when it is one `SQLite` is known to evaluate the
+/// same way — see [`sqlite_cast_is_faithful`] — and every other cast stays
+/// local, which costs the pushdown and cannot return a wrong row. An operand
+/// whose type cannot be read (no scope) is refused rather than assumed. A
+/// literal carries its own type; a date literal is the one literal shape
+/// admitted beyond that set (see [`sqlite_date_literal_is_canonical`]).
+#[must_use]
+pub fn sqlite_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
+    match expr {
+        Expr::TryCast(_) => false,
+        Expr::Cast(cast) => {
+            let to = cast.field.data_type();
+            if let Expr::Literal(value, _) = cast.expr.as_ref() {
+                return sqlite_cast_is_faithful(&value.data_type(), to)
+                    || sqlite_date_literal_is_canonical(value, to);
+            }
+            cast.expr
+                .get_type(schema.unwrap_or_else(|| DFSchema::empty_ref()))
+                .is_ok_and(|from| sqlite_cast_is_faithful(&from, to))
+        }
+        _ => true,
+    }
+}
+
+/// Whether a string literal cast into a date is one `SQLite` compares the way
+/// `DataFusion` does.
+///
+/// `DATE '1994-01-01'` reaches federation as a cast of a string literal, which
+/// the `SQLite` dialect renders as `CAST('1994-01-01' AS TEXT)`: the string
+/// itself, compared as text against the stored `YYYY-MM-DD` values. That is
+/// the same comparison exactly when the literal is already written in that
+/// form. `DataFusion` also parses `'1994-1-5'` as 1994-01-05, which as text
+/// matches no stored date, so a literal in any other spelling stays local.
+fn sqlite_date_literal_is_canonical(value: &ScalarValue, to: &DataType) -> bool {
+    let (Some(Some(literal)), DataType::Date32) = (value.try_as_str(), to) else {
+        return false;
+    };
+    value
+        .cast_to(&DataType::Date32)
+        .and_then(|date| date.cast_to(&DataType::Utf8))
+        .is_ok_and(|canonical| canonical.try_as_str() == Some(Some(literal)))
+}
+
+/// The casts `SQLite` evaluates exactly as `DataFusion` does: between string
+/// types, between binary types, an integer widened to an integer that holds
+/// every value of it, an integer or `Float32` to `Float64`, and an integer
+/// into text.
+fn sqlite_cast_is_faithful(from: &DataType, to: &DataType) -> bool {
+    if from == to || (from.is_string() && to.is_string()) || (from.is_binary() && to.is_binary()) {
+        return true;
+    }
+    if from.is_integer() {
+        // Lossless widening, and only into an integer: `is_widening_cast` also
+        // admits floats, which SQLite stores as a double whatever the width.
+        return to.is_string()
+            || *to == DataType::Float64
+            || (to.is_integer() && is_widening_cast(from, to));
+    }
+    *from == DataType::Float32 && *to == DataType::Float64
 }
 
 /// MySQL-flavored deny-list as a value, for
@@ -319,12 +407,14 @@ mod tests {
         deny_spice_functions_for_duckdb_dialect_without_carve_out,
         deny_spice_functions_for_duckdb_table_providers,
         deny_spice_functions_for_mysql_table_providers,
-        deny_spice_functions_for_postgres_table_providers, expression_support_for_engine,
+        deny_spice_functions_for_postgres_table_providers,
+        deny_spice_functions_for_sqlite_table_providers, expression_support_for_engine,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::common::DFSchema;
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
     use datafusion::logical_expr::{LogicalPlan, table_scan};
-    use datafusion::prelude::{Expr, col, lit};
+    use datafusion::prelude::{Expr, cast, col, lit, try_cast};
     use datafusion::scalar::ScalarValue;
     use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
     use runtime_udfs_api::{add_user_function, remove_user_function};
@@ -394,6 +484,198 @@ mod tests {
             !contains_unsupported_functions(&plan_projecting(col("s").like(lit("u%"))), &support,)
                 .expect("the support check must not error"),
             "ordinary LIKE is valid GoogleSQL and must keep federating"
+        );
+    }
+
+    fn sqlite_scope() -> DFSchema {
+        DFSchema::try_from(Schema::new(vec![
+            Field::new("bin", DataType::Binary, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("i8", DataType::Int8, true),
+            Field::new("i32", DataType::Int32, true),
+            Field::new("i64", DataType::Int64, true),
+            Field::new("u8", DataType::UInt8, true),
+            Field::new("u64", DataType::UInt64, true),
+            Field::new("f32", DataType::Float32, true),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("b", DataType::Boolean, true),
+            Field::new("d", DataType::Date32, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        ]))
+        .expect("scope schema")
+    }
+
+    /// Regression test for #14398: `SQLite` has no `TRY_CAST`, and its `CAST`
+    /// answers a value where `DataFusion` refuses one, so every `TRY_CAST` and
+    /// every cast outside the faithful set stays local.
+    #[test]
+    fn sqlite_keeps_unfaithful_casts_local() {
+        let scope = sqlite_scope();
+        let support = deny_spice_functions_for_sqlite_table_providers();
+        let mut refused = vec![
+            // No `TRY_CAST` in SQLite, whatever the types.
+            try_cast(col("bin"), DataType::Utf8),
+            try_cast(col("s"), DataType::Int64),
+            try_cast(col("i64"), DataType::Utf8),
+            try_cast(col("i32"), DataType::Int64),
+        ];
+        for (operand, target) in [
+            // Binary into anything but binary, text included.
+            ("bin", DataType::Int64),
+            ("bin", DataType::Float64),
+            ("bin", DataType::Utf8),
+            ("bin", DataType::Utf8View),
+            // Text into a number, a boolean, or a date.
+            ("s", DataType::Int64),
+            ("s", DataType::Float64),
+            ("s", DataType::Boolean),
+            ("s", DataType::Date32),
+            // A float into an integer saturates; into text it formats differently.
+            ("f64", DataType::Int64),
+            ("f64", DataType::Int32),
+            ("f64", DataType::Utf8),
+            ("f64", DataType::Float32),
+            // Narrowing, and a signed value into an unsigned type.
+            ("i64", DataType::Int32),
+            ("i32", DataType::UInt64),
+            ("u64", DataType::Int64),
+            // An integer into Float32: SQLite's REAL is a double.
+            ("i32", DataType::Float32),
+            ("i32", DataType::Decimal128(10, 2)),
+            ("i32", DataType::Boolean),
+            // Booleans and temporals.
+            ("b", DataType::Utf8),
+            ("b", DataType::Int32),
+            ("d", DataType::Utf8),
+            ("d", DataType::Timestamp(TimeUnit::Microsecond, None)),
+            ("ts", DataType::Date32),
+        ] {
+            refused.push(cast(col(operand), target));
+        }
+        for expr in refused {
+            assert!(
+                !support.supports(&expr, Some(&scope)),
+                "{expr} has no faithful SQLite rendering and must stay local"
+            );
+        }
+    }
+
+    /// The complement: the casts `SQLite` evaluates the same way still
+    /// federate, and a node that is not a cast is not this check's to refuse.
+    #[test]
+    fn sqlite_federates_faithful_casts() {
+        let scope = sqlite_scope();
+        let support = deny_spice_functions_for_sqlite_table_providers();
+        for (operand, target) in [
+            ("s", DataType::LargeUtf8),
+            ("s", DataType::Utf8View),
+            ("bin", DataType::LargeBinary),
+            ("i8", DataType::Int32),
+            ("i32", DataType::Int64),
+            ("u8", DataType::Int16),
+            ("u8", DataType::UInt64),
+            ("i32", DataType::Float64),
+            ("i64", DataType::Float64),
+            ("f32", DataType::Float64),
+            ("i64", DataType::Utf8),
+            ("u8", DataType::Utf8View),
+        ] {
+            let expr = cast(col(operand), target);
+            assert!(
+                support.supports(&expr, Some(&scope)),
+                "{expr} is faithful on SQLite and must federate"
+            );
+        }
+        for expr in [col("bin"), col("s").like(lit("a%")), col("i32").is_null()] {
+            assert!(
+                support.supports(&expr, Some(&scope)),
+                "{expr} must federate"
+            );
+        }
+    }
+
+    /// With no scope a column's type cannot be read, so a cast of it stays
+    /// local; a literal carries its own type.
+    #[test]
+    fn sqlite_refuses_a_cast_whose_operand_type_cannot_be_read() {
+        let support = deny_spice_functions_for_sqlite_table_providers();
+        assert!(!support.supports(&cast(col("i32"), DataType::Int64), None));
+        assert!(support.supports(&cast(lit(1_i32), DataType::Int64), None));
+        assert!(!support.supports(&cast(lit("abc"), DataType::Int64), None));
+    }
+
+    /// `DATE '…'` is a cast of a string literal, which `SQLite` compares as
+    /// text: only a literal already spelled `YYYY-MM-DD` compares the same way.
+    #[test]
+    fn sqlite_federates_only_a_canonical_date_literal() {
+        let support = deny_spice_functions_for_sqlite_table_providers();
+        for canonical in ["1994-01-01", "2024-02-29", "0001-01-01"] {
+            assert!(
+                support.supports(&cast(lit(canonical), DataType::Date32), None),
+                "{canonical} is canonical and must federate"
+            );
+        }
+        for other in [
+            "1994-1-5",
+            "1994-01-01T00:00:00",
+            " 1994-01-01",
+            "not a date",
+        ] {
+            assert!(
+                !support.supports(&cast(lit(other), DataType::Date32), None),
+                "{other:?} compares differently as text and must stay local"
+            );
+        }
+        assert!(
+            !support.supports(
+                &cast(
+                    lit("1994-01-01"),
+                    DataType::Timestamp(TimeUnit::Microsecond, None)
+                ),
+                None
+            ),
+            "a timestamp literal is not a date literal"
+        );
+        assert!(
+            !support.supports(&cast(col("s"), DataType::Date32), Some(&sqlite_scope())),
+            "a string column cast into a date is not a literal"
+        );
+    }
+
+    /// The check reaches a cast nested in a filter predicate of a real plan,
+    /// which is where a wrong value selects wrong rows.
+    #[test]
+    fn a_sqlite_plan_filtering_on_an_unfaithful_cast_is_not_federated() {
+        let support = deny_spice_functions_for_sqlite_table_providers();
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+        ]);
+        let plan = |predicate: Expr| {
+            table_scan(Some("t"), &schema, None)
+                .expect("scan t")
+                .filter(predicate)
+                .expect("filter")
+                .project(vec![col("id")])
+                .expect("project")
+                .build()
+                .expect("build plan")
+        };
+        assert!(
+            contains_unsupported_functions(
+                &plan(cast(col("s"), DataType::Int64).eq(lit(0_i64))),
+                &support
+            )
+            .expect("the support check must not error"),
+            "CAST(s AS BIGINT) = 0 selects 'abc' on SQLite and must stay local"
+        );
+        assert!(
+            !contains_unsupported_functions(
+                &plan(cast(col("id"), DataType::Utf8).eq(lit("1"))),
+                &support
+            )
+            .expect("the support check must not error"),
+            "an integer cast into text is faithful and must keep federating"
         );
     }
 

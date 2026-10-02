@@ -31,7 +31,8 @@ use futures::stream::BoxStream;
 use object_store::{
     Attributes, CopyMode, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult,
     MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, path::Path,
+    PutResult,
+    path::{Path, PathPart},
 };
 use smb::{ShareSession, SmbConfig, SmbPool, WalWriter};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
@@ -131,21 +132,60 @@ impl SMBConfig {
     /// internal SMB client. Only strips when the share name occupies a full
     /// path segment — `share="data"` against `"database/file"` is left alone.
     fn normalize_subpath<'a>(&self, subpath: &'a str) -> &'a str {
-        let trimmed = subpath.trim_start_matches('/');
-        let share = self.share.as_str();
-        if trimmed == share {
-            return "";
+        self.strip_share(subpath)
+            .unwrap_or_else(|| subpath.trim_start_matches('/'))
+    }
+
+    /// The share-relative remainder of `subpath`, or `None` when its first
+    /// segment is not the share.
+    fn strip_share<'a>(&self, subpath: &'a str) -> Option<&'a str> {
+        let rest = subpath
+            .trim_start_matches('/')
+            .strip_prefix(self.share.as_str())?;
+        match rest.as_bytes().first() {
+            None => Some(""),
+            Some(b'/' | b'\\') => Some(rest.trim_start_matches(['/', '\\'])),
+            Some(_) => None,
         }
-        if let Some(rest) = trimmed.strip_prefix(share)
-            && matches!(rest.as_bytes().first().copied(), Some(b'/' | b'\\'))
-        {
-            return rest.trim_start_matches(['/', '\\']);
-        }
-        trimmed
     }
 
     fn key_for(&self, path: &Path) -> String {
         self.normalize_subpath(path.as_ref()).to_string()
+    }
+
+    /// Split a listing prefix into the share-relative directory handed to the
+    /// SMB client and the root that listed locations must be named under.
+    ///
+    /// The store is registered per host (`smb://<host>`), so a caller's paths
+    /// begin with the share segment, and a listed location must carry it too:
+    /// `ListingTableUrl` keeps only the locations under its own share-prefixed
+    /// path and later reads them back through `get`. A prefix that does not
+    /// name the share is already share-relative, and so are its locations.
+    fn listing_root<'a>(&self, prefix: &'a str) -> (&'a str, Option<&str>) {
+        let trimmed = prefix.trim_start_matches('/');
+        match self.strip_share(trimmed) {
+            Some(relative) => (relative, Some(self.share.as_str())),
+            None if trimmed.is_empty() => ("", Some(self.share.as_str())),
+            None => (trimmed, None),
+        }
+    }
+}
+
+/// Name a share-relative listed object under `root`, keeping the
+/// already-encoded parts of its location as they are.
+fn reroot_meta(root: Option<&str>, meta: ObjectMeta) -> ObjectMeta {
+    ObjectMeta {
+        location: reroot(root, meta.location),
+        ..meta
+    }
+}
+
+fn reroot(root: Option<&str>, location: Path) -> Path {
+    match root {
+        None => location,
+        Some(root) => std::iter::once(PathPart::from(root))
+            .chain(location.parts())
+            .collect(),
     }
 }
 
@@ -303,15 +343,15 @@ impl SMBObjectStore {
         let share = self.get_share().await?;
         let config = self.config();
         let prefix_str = prefix.unwrap_or_default();
-        let normalized = config.normalize_subpath(&prefix_str).to_string();
+        let (relative, root) = config.listing_root(&prefix_str);
 
         let mut results = Vec::new();
-        let mut queue = vec![normalized];
+        let mut queue = vec![relative.to_string()];
 
         while let Some(dir_path) = queue.pop() {
             let entries = Self::list_dir_entries(&share, config, &dir_path).await?;
             let (files, dirs) = process_directory_entries(&dir_path, entries);
-            results.extend(files);
+            results.extend(files.into_iter().map(|meta| reroot_meta(root, meta)));
             queue.extend(dirs);
         }
 
@@ -324,10 +364,13 @@ impl SMBObjectStore {
     ) -> object_store::Result<ListResult> {
         let share = self.get_share().await?;
         let prefix_str = prefix.map_or(String::new(), Path::to_string);
-        let normalized = self.config().normalize_subpath(&prefix_str).to_string();
+        let (relative, root) = self.config().listing_root(&prefix_str);
 
-        let entries = Self::list_dir_entries(&share, self.config(), &normalized).await?;
-        Ok(process_directory_entries_shallow(&normalized, entries))
+        let entries = Self::list_dir_entries(&share, self.config(), relative).await?;
+        Ok(reroot_listing(
+            root,
+            process_directory_entries_shallow(relative, entries),
+        ))
     }
 
     /// Put the payload to the SMB share without a concat-copy.
@@ -382,6 +425,22 @@ impl SMBObjectStore {
             e_tag: Some(meta.etag),
             version: None,
         })
+    }
+}
+
+/// Name every object and common prefix of a share-relative listing under `root`.
+fn reroot_listing(root: Option<&str>, listing: ListResult) -> ListResult {
+    ListResult {
+        common_prefixes: listing
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| reroot(root, prefix))
+            .collect(),
+        objects: listing
+            .objects
+            .into_iter()
+            .map(|meta| reroot_meta(root, meta))
+            .collect(),
     }
 }
 
@@ -768,6 +827,69 @@ mod tests {
             config.normalize_subpath("/myshare/data/file.parquet"),
             "data/file.parquet"
         );
+    }
+
+    fn fixture_config(share: &str) -> SMBConfig {
+        SMBConfig {
+            server: "server".to_string(),
+            port: DEFAULT_SMB_PORT,
+            share: share.to_string(),
+            username: fixture_user(),
+            password: fixture_password(),
+            timeout: None,
+        }
+    }
+
+    #[test]
+    fn test_listing_root_names_locations_under_the_share_the_prefix_named() {
+        let config = fixture_config("data");
+        let share = Some("data");
+        assert_eq!(config.listing_root("data/sales"), ("sales", share));
+        assert_eq!(config.listing_root("/data/sales/"), ("sales/", share));
+        assert_eq!(config.listing_root("data"), ("", share));
+        assert_eq!(config.listing_root(""), ("", share));
+        // A directory inside the share named like the share: only the first
+        // segment is the share.
+        assert_eq!(config.listing_root("data/data"), ("data", share));
+        // A prefix that does not name the share is already share-relative.
+        assert_eq!(config.listing_root("sales"), ("sales", None));
+        assert_eq!(config.listing_root("database/x"), ("database/x", None));
+    }
+
+    /// Regression test for #14060: a listing of `data/sales` must return
+    /// locations under `data/sales/`, or `ListingTableUrl` drops every one.
+    #[test]
+    fn test_listing_locations_carry_the_share_segment() {
+        let config = fixture_config("data");
+        let (relative, root) = config.listing_root("data/sales");
+        let modified = epoch_secs_to_datetime(0);
+        let listing = reroot_listing(
+            root,
+            process_directory_entries_shallow(
+                relative,
+                vec![
+                    DirEntry::file("sales.parquet".to_string(), 10, modified),
+                    DirEntry::directory("sub".to_string()),
+                ],
+            ),
+        );
+        let requested = Path::from("data/sales");
+        assert_eq!(
+            listing.objects[0].location,
+            Path::from("data/sales/sales.parquet")
+        );
+        assert_eq!(listing.common_prefixes, vec![Path::from("data/sales/sub")]);
+        assert!(listing.objects[0].location.prefix_matches(&requested));
+        assert_eq!(listing.objects[0].size, 10);
+    }
+
+    #[test]
+    fn test_reroot_keeps_encoded_parts() {
+        let location = Path::from("sales/100% done.csv");
+        let rerooted = reroot(Some("data"), location.clone());
+        assert_eq!(rerooted, Path::from("data/sales/100% done.csv"));
+        assert_eq!(rerooted.as_ref(), "data/sales/100%25 done.csv");
+        assert_eq!(reroot(None, location.clone()), location);
     }
 
     #[test]
