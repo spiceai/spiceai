@@ -970,6 +970,13 @@ impl DataFusionBuilder {
             );
         }
 
+        // Byte-range splitting of a file scan only fires once the scan's files
+        // total at least this many bytes. DataFusion 55 lowered its default from
+        // 10 MiB to 1 MiB (apache/datafusion#22439), which splits small files
+        // `target_partitions` ways; each range is a separate file open, and a
+        // Vortex range pays its own footer read. Keep the 10 MiB threshold.
+        config.options_mut().optimizer.repartition_file_min_size = 10 * 1024 * 1024;
+
         // `HashJoinExec` build sides are not spillable, so very large joins can
         // exhaust the query memory pool outright. Setting this to `false` makes
         // the planner emit spillable sort-merge joins instead. Left unset,
