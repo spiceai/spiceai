@@ -75,6 +75,18 @@ impl ConditionalWriteSupport {
             && !matches!(self.update, Enforcement::Unknown(_))
     }
 
+    /// Why the probe could not tell, or `None` when it told for both kinds of
+    /// conditional write. Names the first kind left [`Enforcement::Unknown`].
+    #[must_use]
+    pub fn inconclusive_reason(&self) -> Option<&str> {
+        [&self.create, &self.update]
+            .into_iter()
+            .find_map(|enforcement| match enforcement {
+                Enforcement::Unknown(reason) => Some(reason.as_str()),
+                Enforcement::Enforced | Enforcement::Ignored | Enforcement::Unsupported => None,
+            })
+    }
+
     /// Why shared state must not be kept in this store, worded to follow "the
     /// store …", or `None` when the probe found nothing that rules it out.
     #[must_use]

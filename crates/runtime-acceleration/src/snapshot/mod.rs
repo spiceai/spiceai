@@ -724,6 +724,14 @@ pub enum SnapshotUploadError {
         location: String,
         reason: String,
     },
+    #[snafu(display(
+        "Failed to create a snapshot of dataset '{dataset}': could not confirm that the snapshot location '{location}' enforces conditional writes, so the snapshot was not published. The next attempt checks again. If this persists, allow Spice to create, update and delete `.spice-conditional-write-probe-*` objects under '{location}'. Cause: {reason}. See: {SNAPSHOTS_DOCS}"
+    ))]
+    ConditionalWritesUnconfirmed {
+        dataset: String,
+        location: String,
+        reason: String,
+    },
     #[snafu(display("Failed to serialize snapshot metadata at {path}: {source}"))]
     UploadSerializeMetadata {
         path: String,
@@ -768,9 +776,10 @@ impl SnapshotUploadError {
     /// Whether a fresh attempt may succeed. Schema and format errors need a change
     /// outside the runtime, and so does a store that cannot update the snapshot metadata
     /// conditionally; everything else (network, local I/O, an archive walk that raced
-    /// engine maintenance) may pass on retry. A metadata update that loses to another
-    /// writer is retried by the metadata update loop itself, so neither a conflict nor an
-    /// exhausted conflict budget is retried here: the next scheduled snapshot tries again.
+    /// engine maintenance, a conditional-write probe that could not tell) may pass on
+    /// retry. A metadata update that loses to another writer is retried by the metadata
+    /// update loop itself, so neither a conflict nor an exhausted conflict budget is
+    /// retried here: the next scheduled snapshot tries again.
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         match self {
@@ -923,8 +932,6 @@ struct ConditionalWriteCheck {
     /// A conclusive probe result. An inconclusive one is not kept, so the next publish
     /// probes again.
     conclusive: tokio::sync::OnceCell<ConditionalWriteSupport>,
-    /// Whether an inconclusive probe has been reported, so the warning is logged once.
-    warned_inconclusive: AtomicBool,
 }
 
 impl std::fmt::Debug for SnapshotManager {
@@ -1748,9 +1755,10 @@ impl SnapshotManager {
     /// Publishing rewrites `metadata.json` at the version it read. On a store that ignores
     /// the condition, two instances publishing at once would each overwrite the other's
     /// entry, so this manager probes its store before its first publish. A probe that
-    /// cannot tell — for example because it may not write its probe object — does not
-    /// block publishing: every metadata write is still conditional, so a store that
-    /// rejects a condition fails the publish with that error.
+    /// cannot tell — after a transient error, or because it may not write its probe
+    /// object — refuses the publish too, since only the probe can tell a store that
+    /// ignores conditions from one that enforces them. That result is not kept, so the
+    /// next attempt probes again.
     async fn ensure_conditional_writes(&self) -> Result<(), SnapshotUploadError> {
         let probed = self
             .conditional_write_check
@@ -1780,29 +1788,15 @@ impl SnapshotManager {
             });
         }
 
-        // Inconclusive: the probe could not tell (for example a transient error, or no
-        // permission to write its probe object). Every metadata write is still
-        // conditional, and the next publish probes again.
-        if self
-            .conditional_write_check
-            .warned_inconclusive
-            .swap(true, Ordering::Relaxed)
-        {
-            tracing::debug!(
-                dataset = %self.dataset_name,
-                location = %self.snapshot_location_uri,
-                "Conditional-write check of the snapshot location is still inconclusive: {support:?}"
-            );
-        } else {
-            tracing::warn!(
-                dataset = %self.dataset_name,
-                location = %self.snapshot_location_uri,
-                "Could not confirm that the snapshot location '{}' enforces conditional writes ({support:?}), so snapshots of dataset '{}' are published without that check until a later check succeeds; if the store ignores write conditions, instances publishing at the same time can overwrite each other's snapshot metadata. See: {SNAPSHOTS_DOCS}",
-                self.snapshot_location_uri,
-                self.dataset_name,
-            );
-        }
-        Ok(())
+        // Inconclusive: the probe could not tell, so the store may be one that ignores
+        // write conditions.
+        Err(SnapshotUploadError::ConditionalWritesUnconfirmed {
+            dataset: self.dataset_name.clone(),
+            location: self.snapshot_location_uri.clone(),
+            reason: support
+                .inconclusive_reason()
+                .map_or_else(|| format!("{support:?}"), str::to_string),
+        })
     }
 
     /// Creates a snapshot from a single file-based accelerator.
@@ -5250,10 +5244,12 @@ mod tests {
         assert_eq!(entries.len(), 1, "recorded exactly once: {entries:?}");
     }
 
-    /// An inconclusive probe (here a transient error) is not kept: the next publish
-    /// probes again and records the conclusive result.
+    /// An inconclusive probe (here a transient error) defers the publish before anything
+    /// is uploaded, since only a conclusive probe tells a store that ignores write
+    /// conditions from one that enforces them. The result is not kept: the next publish
+    /// probes again and goes ahead.
     #[tokio::test]
-    async fn an_inconclusive_probe_is_retried_on_the_next_publish() {
+    async fn an_inconclusive_probe_defers_the_publish_until_a_probe_concludes() {
         let store = Arc::new(ScriptedStore::new(Script::FailFirstProbeWrite));
         let dir = TempDir::new().expect("tempdir");
         let local_path = dir.path().join("accelerated.db");
@@ -5265,10 +5261,38 @@ mod tests {
         );
 
         std::fs::write(&local_path, b"first").expect("write accelerator file");
-        publish(&manager, &schema)
+        let err = publish(&manager, &schema)
             .await
-            .expect("an inconclusive probe does not block publishing")
-            .expect("snapshot created");
+            .expect_err("an inconclusive probe must defer the publish");
+        assert!(
+            matches!(
+                err,
+                SnapshotUploadError::ConditionalWritesUnconfirmed { .. }
+            ),
+            "{err}"
+        );
+        assert!(err.is_retriable(), "a retry probes again: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("dataset '{DATASET_NAME}'")),
+            "names the dataset: {message}"
+        );
+        assert!(
+            message.contains("`.spice-conditional-write-probe-*`"),
+            "names the probe objects to allow: {message}"
+        );
+        assert!(
+            message.contains("Cause: could not write a probe object"),
+            "carries the probe's reason: {message}"
+        );
+        assert!(
+            message.contains(SNAPSHOTS_DOCS),
+            "links the docs: {message}"
+        );
+        let listed: Vec<_> = futures::TryStreamExt::try_collect(store.inner.list(None))
+            .await
+            .expect("list");
+        assert!(listed.is_empty(), "nothing may be uploaded: {listed:?}");
         assert!(
             manager.conditional_write_check.conclusive.get().is_none(),
             "an inconclusive result is not kept"
@@ -6512,6 +6536,11 @@ mod tests {
             location: "s3://bucket/snapshots".to_string(),
             reason: "accepted a write whose condition should have failed".to_string(),
         };
+        let unconfirmed = SnapshotUploadError::ConditionalWritesUnconfirmed {
+            dataset: "t".to_string(),
+            location: "s3://bucket/snapshots".to_string(),
+            reason: "could not write a probe object: connection reset".to_string(),
+        };
         let missing_bucket = SnapshotUploadError::StartUpload {
             path: "t.cayenne".to_string(),
             source: object_store::Error::NotFound {
@@ -6558,6 +6587,10 @@ mod tests {
         assert!(
             !not_enforced.is_retriable(),
             "a store that does not enforce write conditions needs user action"
+        );
+        assert!(
+            unconfirmed.is_retriable(),
+            "a conditional-write probe that could not tell may conclude on retry"
         );
         assert!(
             !missing_bucket.is_retriable(),
