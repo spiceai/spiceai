@@ -27,6 +27,7 @@ limitations under the License.
 //! | nullable, valid | `01` then the value's encoding |
 //! | signed integers, dates, times, timestamps, durations, `Decimal128` | big-endian, sign bit flipped |
 //! | unsigned integers | big-endian |
+//! | floating point | canonical bits big-endian, all bits flipped when negative, else the sign bit |
 //! | `Boolean` | `00` or `01` |
 //! | `FixedSizeBinary` | the bytes as is |
 //! | strings and binaries (all offset sizes and views) | the bytes with `00` → `01 01` and `01` → `01 02`, then a `00` terminator |
@@ -43,18 +44,25 @@ limitations under the License.
 //! on the value. The declared [`KeyField`] type still has to match the bound
 //! array exactly, so a mismatch is an error rather than a silent miss.
 //!
-//! Floating-point columns are refused. Values SQL holds equal can have
-//! different bits (`0.0` and `-0.0`, or NaNs with different payloads), so
-//! encoding the bits would make a lookup for one miss rows holding the other.
+//! A floating-point value is encoded by its bits after two values with several
+//! bit patterns are given one: `-0.0` encodes as `0.0`, and every NaN as the
+//! one quiet NaN of its width. SQL may hold those equal (`-0.0 = 0.0`, and a
+//! NaN equal to every NaN under total ordering), so a key holding one of them
+//! must encode as every value equal to it does, or a lookup for one would miss
+//! rows holding the other. Merging them can only give values SQL tells apart a
+//! shared encoding, which costs a lookup candidate rows that its filter
+//! drops, never a row it should return. Every other value keeps its own bits,
+//! and the sign transform orders them as the numbers they are.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Date32Type, Date64Type, Decimal128Type, Decimal256Type, DurationMicrosecondType,
-    DurationMillisecondType, DurationNanosecondType, DurationSecondType, Int8Type, Int16Type,
-    Int32Type, Int64Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalYearMonthType,
-    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    DurationMillisecondType, DurationNanosecondType, DurationSecondType, Float16Type, Float32Type,
+    Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, IntervalDayTimeType,
+    IntervalMonthDayNanoType, IntervalYearMonthType, Time32MillisecondType, Time32SecondType,
+    Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
+    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
+    UInt32Type, UInt64Type,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, GenericBinaryArray,
@@ -69,6 +77,36 @@ use crate::{
     ColumnCountSnafu, ColumnLengthSnafu, ColumnTypeSnafu, Result, UnexpectedNullSnafu,
     UnsupportedTypeSnafu,
 };
+
+/// The encoded bits of a float of `width` bits (16, 32 or 64) whose bits are
+/// `bits`: `-0.0` as `0.0` and every NaN as the quiet NaN with no payload (see
+/// the module docs), then ordered as the number is, all bits flipped for a
+/// negative value and the sign bit set for a positive one.
+fn float_key(bits: u64, width: u32) -> u64 {
+    let (exponent_bits, mask) = match width {
+        16 => (5, u64::from(u16::MAX)),
+        32 => (8, u64::from(u32::MAX)),
+        _ => (11, u64::MAX),
+    };
+    let sign = 1_u64 << (width - 1);
+    let fraction_bits = width - 1 - exponent_bits;
+    let exponent = ((1_u64 << exponent_bits) - 1) << fraction_bits;
+    let fraction = (1_u64 << fraction_bits) - 1;
+    let magnitude = bits & !sign;
+    let canonical = if magnitude == 0 {
+        0
+    } else if magnitude & exponent == exponent && magnitude & fraction != 0 {
+        exponent | (1 << (fraction_bits - 1))
+    } else {
+        bits
+    };
+    let ordered = if canonical & sign == 0 {
+        canonical | sign
+    } else {
+        !canonical
+    };
+    ordered & mask
+}
 
 const NULL_MARK: u8 = 0x00;
 const VALID_MARK: u8 = 0x01;
@@ -128,6 +166,9 @@ enum Kind {
     UInt16,
     UInt32,
     UInt64,
+    Float16,
+    Float32,
+    Float64,
     Boolean,
     Date32,
     Date64,
@@ -159,6 +200,9 @@ fn kind(data_type: &DataType) -> Option<Kind> {
         DataType::UInt16 => Kind::UInt16,
         DataType::UInt32 => Kind::UInt32,
         DataType::UInt64 => Kind::UInt64,
+        DataType::Float16 => Kind::Float16,
+        DataType::Float32 => Kind::Float32,
+        DataType::Float64 => Kind::Float64,
         DataType::Boolean => Kind::Boolean,
         DataType::Date32 => Kind::Date32,
         DataType::Date64 => Kind::Date64,
@@ -191,10 +235,11 @@ impl Kind {
     fn fixed_width(self) -> Option<usize> {
         match self {
             Self::Int8 | Self::UInt8 | Self::Boolean => Some(1),
-            Self::Int16 | Self::UInt16 => Some(2),
-            Self::Int32 | Self::UInt32 | Self::Date32 | Self::Time32(_) => Some(4),
+            Self::Int16 | Self::UInt16 | Self::Float16 => Some(2),
+            Self::Int32 | Self::UInt32 | Self::Float32 | Self::Date32 | Self::Time32(_) => Some(4),
             Self::Int64
             | Self::UInt64
+            | Self::Float64
             | Self::Date64
             | Self::Time64(_)
             | Self::Timestamp(_)
@@ -407,6 +452,9 @@ enum ColumnData<'a> {
     U16(&'a [u16]),
     U32(&'a [u32]),
     U64(&'a [u64]),
+    F16(&'a [<Float16Type as arrow_array::ArrowPrimitiveType>::Native]),
+    F32(&'a [f32]),
+    F64(&'a [f64]),
     Bool(&'a BooleanArray),
     Binary(&'a GenericBinaryArray<i32>),
     LargeBinary(&'a GenericBinaryArray<i64>),
@@ -434,6 +482,9 @@ impl<'a> ColumnData<'a> {
             Kind::UInt16 => Self::U16(array.as_primitive::<UInt16Type>().values()),
             Kind::UInt32 => Self::U32(array.as_primitive::<UInt32Type>().values()),
             Kind::UInt64 => Self::U64(array.as_primitive::<UInt64Type>().values()),
+            Kind::Float16 => Self::F16(array.as_primitive::<Float16Type>().values()),
+            Kind::Float32 => Self::F32(array.as_primitive::<Float32Type>().values()),
+            Kind::Float64 => Self::F64(array.as_primitive::<Float64Type>().values()),
             Kind::Boolean => Self::Bool(array.as_boolean()),
             Kind::Date32 => Self::I32(array.as_primitive::<Date32Type>().values()),
             Kind::Date64 => Self::I64(array.as_primitive::<Date64Type>().values()),
@@ -593,6 +644,17 @@ impl BoundColumn<'_> {
             ColumnData::U16(v) => out.extend_from_slice(&v[row].to_be_bytes()),
             ColumnData::U32(v) => out.extend_from_slice(&v[row].to_be_bytes()),
             ColumnData::U64(v) => out.extend_from_slice(&v[row].to_be_bytes()),
+            ColumnData::F16(v) => {
+                let bits = float_key(u64::from(v[row].to_bits()), 16);
+                out.extend_from_slice(&bits.to_be_bytes()[6..]);
+            }
+            ColumnData::F32(v) => {
+                let bits = float_key(u64::from(v[row].to_bits()), 32);
+                out.extend_from_slice(&bits.to_be_bytes()[4..]);
+            }
+            ColumnData::F64(v) => {
+                out.extend_from_slice(&float_key(v[row].to_bits(), 64).to_be_bytes());
+            }
             ColumnData::Bool(v) => out.push(u8::from(v.value(row))),
             ColumnData::FixedBinary(v) => out.extend_from_slice(v.value(row)),
             ColumnData::Binary(v) => escape_value_into(v.value(row), out),

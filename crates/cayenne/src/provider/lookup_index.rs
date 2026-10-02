@@ -420,16 +420,6 @@ impl KeyColumn {
             }
             field.as_ref()
         };
-        if matches!(
-            field.data_type(),
-            DataType::Float16 | DataType::Float32 | DataType::Float64
-        ) {
-            return Err(format!(
-                "lookup index column '{}' has unsupported floating-point type {}; use an integer, decimal, string, or other exact-equality type",
-                field.name(),
-                field.data_type()
-            ));
-        }
         Ok(Self {
             name: field.name().clone(),
             data_type: field.data_type().clone(),
@@ -3422,17 +3412,15 @@ mod tests {
         assert!(service.nullable);
     }
 
+    /// Floating-point columns can be indexed: the key encoding gives every
+    /// pair of floats SQL can hold equal one encoding.
     #[test]
-    fn floating_point_key_columns_are_refused() {
+    fn floating_point_key_columns_can_be_indexed() {
         for data_type in [DataType::Float16, DataType::Float32, DataType::Float64] {
             let schema =
                 arrow_schema::Schema::new(vec![Field::new("score", data_type.clone(), false)]);
-            let error = KeyColumn::resolve(&schema, "score").expect_err("float index rejected");
-            assert!(
-                error.contains("unsupported floating-point type")
-                    && error.contains(&data_type.to_string()),
-                "unexpected error for {data_type}: {error}"
-            );
+            KeyColumn::resolve(&schema, "score").expect("a float column resolves");
+            supported_key_type(&data_type).expect("a float key is supported");
         }
     }
 
@@ -3523,8 +3511,8 @@ mod tests {
     /// A schema change resets the index of exactly the keys whose encoding it
     /// changes: `service` becoming `LargeUtf8` changes `(tenant, service)`,
     /// whose index then covers nothing until it is rebuilt, and leaves
-    /// `tenant`'s index as it was. A change that leaves a key column a type the
-    /// index cannot hold is refused before anything is swapped.
+    /// `tenant`'s index as it was. A key column of a type the index cannot hold
+    /// is refused before anything is swapped.
     #[tokio::test]
     async fn a_schema_change_resets_only_the_keys_whose_encoding_it_changes() {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
@@ -3548,15 +3536,19 @@ mod tests {
         };
         assert_eq!(covers(&state), vec![true, true]);
 
-        let floats = arrow_schema::Schema::new(vec![
-            Field::new("tenant", DataType::Float64, true),
+        let nested = arrow_schema::Schema::new(vec![
+            Field::new(
+                "tenant",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
             Field::new("service", DataType::Utf8, true),
             Field::new("value", DataType::Int64, false),
         ]);
         let refused = state
-            .shapes_for(&floats)
+            .shapes_for(&nested)
             .err()
-            .expect("a float key is refused");
+            .expect("a nested key is refused");
         assert!(refused.contains("tenant"), "{refused}");
         assert_eq!(
             covers(&state),
