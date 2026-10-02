@@ -371,8 +371,13 @@ impl SnapshotSource {
         }) {
             return conflict(
                 "params",
-                "so Spice keeps its local copy of the snapshot in the Spice data directory (`.spice/data`, or `SPICE_DATA_DIR` when set)",
-                format!("Remove `acceleration.params.{param}`"),
+                &format!(
+                    "so Spice keeps its local copy of the snapshot in the Spice data directory '{}'",
+                    data_accelerator_api::spice_data_base_path()
+                ),
+                format!(
+                    "Remove `acceleration.params.{param}`, or set `SPICE_DATA_DIR` to move the data directory"
+                ),
             );
         }
 
