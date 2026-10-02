@@ -56,9 +56,8 @@ concurrency:
 jobs:
   # Resolves which schedule this run dispatches (the cron that fired, or the manual `schedule`
   # input) and for which branches. trunk dispatches the configs on that schedule. A release
-  # branch changes only when a fix is cherry-picked onto it, so its whole suite, weekly configs
-  # included, is dispatched once per commit on the daily schedule, and a commit an earlier
-  # scheduled run already benchmarked is skipped.
+  # branch changes only when a fix is cherry-picked onto it, so the daily schedule also plans it,
+  # and its job dispatches the whole suite, weekly configs included, once per spiced build.
   plan-scheduled:
     name: Plan scheduled dispatch
     runs-on: ubuntu-24.04
@@ -70,7 +69,6 @@ jobs:
       - name: Plan
         id: plan
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CRON: ${{ github.event.schedule }}
           INPUT_SCHEDULE: ${{ github.event.inputs.schedule }}
           RELEASE_BRANCH: 'release/2.3'
@@ -91,19 +89,7 @@ jobs:
             matrix=$(jq -cn --arg schedule "$schedule" '[{branch: "trunk", schedule: $schedule}]')
           fi
           if [ "$schedule" = daily ]; then
-            # Each scheduled release run uploads a `scheduled-bench-<branch>-<commit>` artifact for the
-            # spiced commit it benchmarked. A failed lookup dispatches the suite rather than skip it.
-            found=0
-            if sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${RELEASE_BRANCH}" --jq .object.sha); then
-              marker="scheduled-bench-${RELEASE_BRANCH//\//-}-${sha}"
-              found=$(gh api -X GET "repos/${GITHUB_REPOSITORY}/actions/artifacts" -f name="$marker" \
-                --jq '[.artifacts[] | select(.expired | not)] | length') || found=0
-            fi
-            if [ "$found" -gt 0 ]; then
-              echo "${RELEASE_BRANCH} is still at ${sha}, which an earlier scheduled run benchmarked; skipping it."
-            else
-              matrix=$(jq -c --arg branch "$RELEASE_BRANCH" '. + [{branch: $branch, schedule: ""}]' <<< "$matrix")
-            fi
+            matrix=$(jq -c --arg branch "$RELEASE_BRANCH" '. + [{branch: $branch, schedule: ""}]' <<< "$matrix")
           fi
           echo "Dispatching for: $matrix"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -145,7 +131,32 @@ jobs:
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
+      # A release branch dispatches its suite once per spiced build. setup-spiced selects the newest
+      # commit on the branch that has a built spiced, which is older than the branch head when the
+      # head has no build of its own (a docs-only commit, say), so the check is keyed to that selected
+      # commit: each scheduled release run records it as a `scheduled-bench-<branch>-<commit>`
+      # artifact, and a later run that selects a recorded commit dispatches nothing. A failed lookup
+      # dispatches the suite rather than skip it.
+      - name: Check whether this release build was benchmarked
+        id: benchmarked
+        if: ${{ matrix.schedule == '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ matrix.branch }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: |
+          marker="scheduled-bench-${BRANCH//\//-}-${SPICED_COMMIT}"
+          echo "marker=$marker" >> "$GITHUB_OUTPUT"
+          found=$(curl -fsSL -G -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts" --data-urlencode "name=${marker}" \
+            | jq '[.artifacts[] | select(.expired | not)] | length') || found=0
+          if [ "${found:-0}" -gt 0 ]; then
+            echo "An earlier scheduled run already benchmarked spiced ${SPICED_COMMIT} for ${BRANCH}; dispatching nothing."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build Testoperator
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         uses: ./.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -153,6 +164,7 @@ jobs:
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Build spicepod validator
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         id: build-spicepod-validator
         uses: ./.github/actions/build-spicepod-validator
         with:
@@ -161,9 +173,11 @@ jobs:
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Set spicepod validator path
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
 
       - name: Validate spicepods - TPCH - SF1
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
@@ -172,6 +186,7 @@ jobs:
           done
 
       - name: Validate spicepods - TPCDS - SF1
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
@@ -180,6 +195,7 @@ jobs:
           done
 
       - name: Validate spicepods - ClickBench - SF1
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
@@ -188,6 +204,7 @@ jobs:
           done
 
       - name: Validate spicepods - TPCH - SF100
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
@@ -196,6 +213,7 @@ jobs:
           done
 
       - name: Validate spicepods - TPCDS - SF100
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/tpcds/sf100/**/*.yaml; do
@@ -204,6 +222,7 @@ jobs:
           done
 
       - name: Validate spicepods - CH-BenCHmark
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/chbench/**/*.yaml; do
@@ -212,6 +231,7 @@ jobs:
           done
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF1
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           shopt -s globstar nullglob
           failed=0
@@ -233,6 +253,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
@@ -241,6 +262,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - ClickBench
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
@@ -251,6 +273,7 @@ jobs:
       # Catalog-connector discovery tests. Only the dispatch configs that declare a
       # `schema` block are dispatched, so this is the catalog spicepods.
       - name: Dispatch Testoperator - Scheduled Schema - TPCH - SF1
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow schema ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
@@ -259,6 +282,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Append - TPCH - SF1
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow append ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
@@ -267,6 +291,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF100
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
@@ -275,6 +300,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS - SF100
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
@@ -311,23 +337,18 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
-      # A release branch dispatches its suite once per commit: record the commit this run benchmarked
-      # so the next scheduled run's plan job skips the branch until it moves.
+      # Record the spiced commit this release run benchmarked, for the check above.
       - name: Record the benchmarked release commit
-        id: benchmarked
-        if: ${{ matrix.schedule == '' }}
+        if: ${{ matrix.schedule == '' && steps.benchmarked.outputs.skip != 'true' }}
         env:
-          BRANCH: ${{ matrix.branch }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-        run: |
-          echo "$SPICED_COMMIT" > benchmarked-commit.txt
-          echo "name=scheduled-bench-${BRANCH//\//-}-${SPICED_COMMIT}" >> "$GITHUB_OUTPUT"
+        run: echo "$SPICED_COMMIT" > benchmarked-commit.txt
 
       - name: Upload the benchmarked release commit
-        if: ${{ matrix.schedule == '' }}
+        if: ${{ matrix.schedule == '' && steps.benchmarked.outputs.skip != 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ${{ steps.benchmarked.outputs.name }}
+          name: ${{ steps.benchmarked.outputs.marker }}
           path: benchmarked-commit.txt
           retention-days: 90
 
