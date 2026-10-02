@@ -38,7 +38,7 @@ use std::{
     collections::HashMap,
     fmt::Write,
     ops::Not,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{
         Arc, LazyLock,
@@ -241,6 +241,27 @@ struct SnapshotEntry {
         rename = "snapshot-last-updated-at-ms"
     )]
     snapshot_last_updated_at_ms: Option<i64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "index-snapshots"
+    )]
+    index_snapshots: Vec<IndexSnapshotRef>,
+}
+
+/// A durable index artifact associated with the same point-in-time as a DB snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexSnapshotRef {
+    #[serde(rename = "index-kind")]
+    pub index_kind: String,
+    pub columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discriminator: Option<String>,
+    pub uri: String,
+    pub checksum: String,
+    #[serde(rename = "checksum-algorithm")]
+    pub checksum_algorithm: String,
+    pub size: u64,
 }
 
 impl SnapshotMetadata {
@@ -278,6 +299,12 @@ pub struct SnapshotDownloadInfo {
     pub bytes_downloaded: u64,
     pub checksum: String,
     pub last_updated_at: Option<i64>,
+    /// Index artifacts captured with this snapshot.
+    pub index_snapshots: Vec<IndexSnapshotRef>,
+    /// The `location` recorded in the metadata this snapshot was read from. Index artifact
+    /// URIs resolve against it, so a reader of a replicated prefix finds them in its own
+    /// bucket (see [`SnapshotManager::snapshot_uri_to_object_path`]).
+    pub metadata_location: String,
 }
 
 #[derive(Debug, Clone)]
@@ -477,6 +504,15 @@ impl SchemaMetadata {
 
 #[derive(Debug, Snafu)]
 pub enum SnapshotDownloadError {
+    #[snafu(display("Failed to restore snapshot artifact for index {index}: {source}"))]
+    IndexRestore {
+        index: String,
+        source: datafusion::error::DataFusionError,
+    },
+    #[snafu(display(
+        "Index {index} not found in snapshot's index artifacts. Likely the snapshot was created without this index. Partial index snapshotting is not supported."
+    ))]
+    IndexNotFound { index: String },
     #[snafu(display("Dataset checkpointer factory not set for snapshot manager"))]
     CheckpointerFactoryNotSet,
     #[snafu(display("Failed to read snapshot metadata at {path}: {source}"))]
@@ -700,6 +736,38 @@ pub enum SnapshotUploadError {
         path: PathBuf,
         source: directory_archive::ArchiveError,
     },
+    #[snafu(display("Failed to freeze index {index} for snapshot: {source}"))]
+    IndexFreeze {
+        index: String,
+        source: datafusion::error::DataFusionError,
+    },
+    #[snafu(display(
+        "Failed to create local staging directory for index {index} snapshot: {source}"
+    ))]
+    IndexStagingDir {
+        index: String,
+        source: std::io::Error,
+    },
+    #[snafu(display("Failed to copy index {index} snapshot into staging: {source}"))]
+    IndexStagingCopy {
+        index: String,
+        source: std::io::Error,
+    },
+    #[snafu(display("Index {index} snapshot staging task failed: {source}"))]
+    IndexStagingTask {
+        index: String,
+        source: tokio::task::JoinError,
+    },
+    #[snafu(display("Failed to archive index {index} snapshot: {source}"))]
+    IndexArchive {
+        index: String,
+        source: crate::snapshot::directory_archive::ArchiveError,
+    },
+    #[snafu(display("Failed to upload index {index} snapshot: {source}"))]
+    IndexUpload {
+        index: String,
+        source: Box<SnapshotUploadError>,
+    },
 }
 
 impl SnapshotUploadError {
@@ -765,6 +833,27 @@ impl<'a> SnapshotPathLayout<'a> {
             .join(day_partition)
             .join(dataset_partition)
             .join(self.snapshot_filename(instant))
+    }
+
+    fn index_location(
+        &self,
+        base: &ObjectPath,
+        instant: DateTime<Utc>,
+        filename: &str,
+    ) -> ObjectPath {
+        let month_partition = format!("month={}", instant.format("%Y-%m"));
+        let day_partition = format!("day={}", instant.format("%Y-%m-%d"));
+        let index_directory = format!(
+            "{}_{}_indexes",
+            self.dataset_name,
+            instant.format(SNAPSHOT_TIMESTAMP_FORMAT)
+        );
+        base.clone()
+            .join(month_partition)
+            .join(day_partition)
+            .join(self.dataset_partition_raw())
+            .join(index_directory)
+            .join(filename)
     }
 }
 
@@ -834,6 +923,7 @@ pub struct SnapshotManager {
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
     snapshots_creation_policy: SnapshotsCreationPolicy,
     network_retry_strategy: RetryBackoff,
+    indexes: Arc<RwLock<Vec<Arc<dyn spice_table::Index + Send + Sync>>>>,
 }
 
 impl std::fmt::Debug for SnapshotManager {
@@ -856,6 +946,56 @@ impl std::fmt::Debug for SnapshotManager {
 
 #[derive(Clone, Copy)]
 pub struct ForceCreate(pub bool);
+
+/// The snapshot artifacts for a given [`spice_table::Index`], captured
+/// and copied locally at a given point in time.
+struct CapturedIndex {
+    identity: spice_table::SnapshotIndexIdentity,
+    directory: tempfile::TempDir,
+}
+
+impl CapturedIndex {
+    /// The archive object's filename: the identity's `kind`/`columns`/`discriminator`,
+    /// sanitized to safe path characters, followed by a UUID.
+    ///
+    /// The identity alone is not a collision-proof filename — sanitizing replaces every
+    /// non-alphanumeric character with `_`, so a single column named `a_b` and two columns
+    /// `a`/`b` both sanitize to `a_b` and would otherwise collide on the same object within one
+    /// snapshot's index folder, silently overwriting one index's artifact with the other's. The
+    /// UUID suffix (not a timestamp — this runs per index, not per snapshot, and the snapshot
+    /// timestamp is already the enclosing folder name) guarantees uniqueness regardless of
+    /// whether the identity portion collides.
+    fn archive_filename(&self) -> String {
+        fn sanitize(value: &str) -> String {
+            value
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect()
+        }
+
+        let mut filename = format!(
+            "{}__{}",
+            sanitize(self.identity.kind),
+            self.identity
+                .columns
+                .iter()
+                .map(|column| sanitize(column))
+                .collect::<Vec<_>>()
+                .join("_")
+        );
+        if let Some(discriminator) = &self.identity.discriminator {
+            filename.push_str("__");
+            filename.push_str(&sanitize(discriminator));
+        }
+        let _ = write!(filename, "__{}", uuid::Uuid::now_v7());
+        filename.push_str(".tar");
+        filename
+    }
+}
+
+fn copy_index_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    util::directory_copy::copy_directory_rejecting_symlinks(source, destination, "index directory")
+}
 
 impl Not for ForceCreate {
     type Output = bool;
@@ -909,6 +1049,167 @@ impl SnapshotManager {
             (false, Some(rel)) => format!("{base}/{rel}"),
             (false, None) => base,
         }
+    }
+
+    /// Downloads and verifies an index artifact, then extracts it into caller-owned staging.
+    ///
+    /// The staging directory is intentionally the only directory this method mutates: callers
+    /// must validate the extracted index and atomically install it themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the staging directory cannot be created, the artifact's object store
+    /// URI cannot be resolved, the download fails or is interrupted, the archive cannot be
+    /// written to local disk, the downloaded size or checksum does not match the artifact's
+    /// recorded metadata, the checksum algorithm is unsupported, or the downloaded archive
+    /// cannot be extracted.
+    pub async fn download_index_artifact_to_staging(
+        &self,
+        artifact: &IndexSnapshotRef,
+        metadata_location: Option<&str>,
+        staging_dir: &Path,
+    ) -> Result<(), SnapshotDownloadError> {
+        use crate::snapshot::directory_archive::extract_archive_file_with_options;
+
+        fs::create_dir_all(staging_dir).await.map_err(|source| {
+            SnapshotDownloadError::CreateLocalDir {
+                path: staging_dir.to_path_buf(),
+                source,
+            }
+        })?;
+        let object_path = self.snapshot_uri_to_object_path(&artifact.uri, metadata_location)?;
+        let path_display = object_path.to_string();
+        let get_result = self
+            .object_store
+            .get(&object_path)
+            .await
+            .map_err(|source| SnapshotDownloadError::Download {
+                path: path_display.clone(),
+                source,
+            })?;
+        let archive_path = staging_dir.join(".index-artifact.tar");
+        let mut file = fs::File::create(&archive_path).await.map_err(|source| {
+            SnapshotDownloadError::WriteLocal {
+                path: archive_path.clone(),
+                source,
+            }
+        })?;
+        let mut stream = get_result.into_stream();
+        let mut hasher = Sha256::new();
+        let mut actual_size = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|source| SnapshotDownloadError::DownloadBytes {
+                path: path_display.clone(),
+                source,
+            })?;
+            actual_size += chunk.len() as u64;
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|source| SnapshotDownloadError::WriteLocal {
+                    path: archive_path.clone(),
+                    source,
+                })?;
+        }
+        file.flush()
+            .await
+            .map_err(|source| SnapshotDownloadError::WriteLocal {
+                path: archive_path.clone(),
+                source,
+            })?;
+        drop(file);
+        if actual_size != artifact.size {
+            let _ = fs::remove_file(&archive_path).await;
+            return Err(SnapshotDownloadError::SizeMismatch {
+                path: path_display,
+                expected: artifact.size,
+                actual: actual_size,
+            });
+        }
+        if !artifact
+            .checksum_algorithm
+            .eq_ignore_ascii_case(SNAPSHOT_CHECKSUM_ALGORITHM)
+        {
+            let _ = fs::remove_file(&archive_path).await;
+            return Err(SnapshotDownloadError::UnsupportedChecksumAlgorithm {
+                path: artifact.uri.clone(),
+                algorithm: artifact.checksum_algorithm.clone(),
+            });
+        }
+        let actual_checksum = format!("{:x}", hasher.finalize());
+        if actual_checksum != artifact.checksum {
+            let _ = fs::remove_file(&archive_path).await;
+            return Err(SnapshotDownloadError::ChecksumMismatch {
+                path: artifact.uri.clone(),
+                expected: artifact.checksum.clone(),
+                actual: actual_checksum,
+            });
+        }
+        extract_archive_file_with_options(
+            &archive_path,
+            staging_dir,
+            crate::snapshot::directory_archive::ExtractOptions::default(),
+        )
+        .await
+        .map_err(|source| SnapshotDownloadError::ArchiveExtract {
+            path: archive_path.clone(),
+            source: std::io::Error::other(source.to_string()),
+        })?;
+        let _ = fs::remove_file(archive_path).await;
+        Ok(())
+    }
+
+    /// Restores every configured index with a matching artifact from a downloaded snapshot.
+    ///
+    /// This is used by snapshot replicas after the database artifact is verified but before its
+    /// provider is made visible. Partial index snapshotting is not supported: a configured index
+    /// with no matching artifact in `download.index_snapshots` is a hard failure
+    /// ([`IndexNotFoundSnafu`]), the same as a matching artifact which cannot be restored, so
+    /// the caller never publishes a DB/index generation mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a local staging directory cannot be created, downloading or verifying
+    /// a matching artifact fails (see [`Self::download_index_artifact_to_staging`]), the index
+    /// fails to restore from the downloaded artifact, or a configured index has no matching
+    /// artifact in `download.index_snapshots`.
+    pub async fn restore_indexes_from_snapshot(
+        &self,
+        download: &SnapshotDownloadInfo,
+    ) -> Result<(), SnapshotDownloadError> {
+        let artifacts = &download.index_snapshots;
+        let metadata_location = Some(download.metadata_location.as_str());
+        let indexes = self.indexes.read().await.clone();
+        for index in indexes {
+            let Some(identity) = index.snapshot_identity() else {
+                continue;
+            };
+            let Some(artifact) = artifacts.iter().find(|artifact| {
+                artifact.index_kind == identity.kind
+                    && artifact.columns == identity.columns
+                    && artifact.discriminator == identity.discriminator
+            }) else {
+                // Handle new indexes not in snapshot by hydrating from acceleration snapshot. Tracked #13608
+                IndexNotFoundSnafu {
+                    index: identity.kind.to_string(),
+                }
+                .fail()?
+            };
+            let staging =
+                tempfile::tempdir().map_err(|source| SnapshotDownloadError::CreateLocalDir {
+                    path: std::env::temp_dir(),
+                    source,
+                })?;
+            self.download_index_artifact_to_staging(artifact, metadata_location, staging.path())
+                .await?;
+            index.restore_from(staging.path()).await.map_err(|source| {
+                SnapshotDownloadError::IndexRestore {
+                    index: identity.kind.to_string(),
+                    source,
+                }
+            })?;
+        }
+        Ok(())
     }
 
     async fn load_metadata(&self) -> Result<Option<MetadataHandle>, MetadataLoadError> {
@@ -1114,6 +1415,7 @@ impl SnapshotManager {
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
             network_retry_strategy,
+            indexes: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -1190,6 +1492,7 @@ impl SnapshotManager {
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
             network_retry_strategy,
+            indexes: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -1198,6 +1501,111 @@ impl SnapshotManager {
     pub fn with_checkpointer_factory(mut self, factory: DatasetCheckpointerFactory) -> Self {
         self.checkpointer_factory = Some(factory);
         self
+    }
+
+    /// Replaces the indexes captured with future snapshots for this dataset.
+    pub async fn set_indexes(&self, indexes: Vec<Arc<dyn spice_table::Index + Send + Sync>>) {
+        *self.indexes.write().await = indexes;
+    }
+
+    /// Captures every configured, snapshotable index's durable state into local staging
+    /// directories.
+    ///
+    /// Partial index snapshotting is not supported: a database snapshot and its index
+    /// artifacts must always describe the same generation, so `restore_indexes_from_snapshot`
+    /// can match every configured index by identity later. If any configured index fails to
+    /// freeze or stage here, the whole capture fails rather than silently publishing a database
+    /// snapshot with a missing index artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a configured, snapshotable index fails to freeze its durable state,
+    /// if a local staging directory cannot be created, or if copying the frozen directory into
+    /// staging fails.
+    async fn capture_indexes(&self) -> Result<Vec<CapturedIndex>, SnapshotUploadError> {
+        let indexes = self.indexes.read().await.clone();
+        let mut captured = Vec::new();
+        for index in indexes {
+            let Some(identity) = index.snapshot_identity() else {
+                continue;
+            };
+            let directory = index
+                .freeze_for_snapshot()
+                .await
+                .context(IndexFreezeSnafu {
+                    index: identity.kind,
+                })?;
+            let temp_dir = tempfile::tempdir().context(IndexStagingDirSnafu {
+                index: identity.kind,
+            })?;
+            let destination = temp_dir.path().join("index");
+            tokio::task::spawn_blocking({
+                let directory = directory.clone();
+                let destination = destination.clone();
+                move || copy_index_directory(&directory, &destination)
+            })
+            .await
+            .context(IndexStagingTaskSnafu {
+                index: identity.kind,
+            })?
+            .context(IndexStagingCopySnafu {
+                index: identity.kind,
+            })?;
+            captured.push(CapturedIndex {
+                identity,
+                directory: temp_dir,
+            });
+        }
+        Ok(captured)
+    }
+
+    /// Archives and uploads every captured index snapshot.
+    ///
+    /// Partial index snapshotting is not supported (see [`Self::capture_indexes`]): if any
+    /// captured index fails to archive or upload, the whole operation fails so the caller never
+    /// commits `current-snapshot-id` metadata that points at a partial artifact list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if archiving a captured index's staging directory fails, or if
+    /// uploading the resulting archive fails.
+    async fn upload_captured_indexes(
+        &self,
+        captured: Vec<CapturedIndex>,
+        layout: &SnapshotPathLayout<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<IndexSnapshotRef>, SnapshotUploadError> {
+        use crate::snapshot::directory_archive::archive_directories_to_file_with_plan;
+
+        let mut artifacts = Vec::new();
+        for captured in captured {
+            let filename = captured.archive_filename();
+            let object_location = layout.index_location(&self.snapshots_location, now, &filename);
+            let archive = captured.directory.path().join("index.tar");
+            let source = captured.directory.path().join("index");
+            archive_directories_to_file_with_plan(&[(source, String::new())], &archive, &[], &[])
+                .await
+                .context(IndexArchiveSnafu {
+                    index: captured.identity.kind,
+                })?;
+            let (size, checksum) = self
+                .upload_snapshot_file(&archive, &object_location)
+                .await
+                .map_err(|source| SnapshotUploadError::IndexUpload {
+                    index: captured.identity.kind.to_string(),
+                    source: Box::new(source),
+                })?;
+            artifacts.push(IndexSnapshotRef {
+                index_kind: captured.identity.kind.to_string(),
+                columns: captured.identity.columns,
+                discriminator: captured.identity.discriminator,
+                uri: self.snapshot_uri_for_location(&object_location),
+                checksum,
+                checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+                size,
+            });
+        }
+        Ok(artifacts)
     }
 
     /// Replaces the snapshot engine. Used by accelerators (notably Cayenne)
@@ -1598,6 +2006,12 @@ impl SnapshotManager {
             "Uploading snapshot"
         );
 
+        // Freeze and copy index directories while the shared accelerator write lock is held.
+        // The database snapshot methods consume the guard when their own stable copy is ready.
+        // Partial index snapshotting is not supported (see `capture_indexes`), so a failure here
+        // aborts before the database is even copied.
+        let captured_indexes = self.capture_indexes().await?;
+
         let (total_bytes, checksum) = match &self.layout {
             AccelerationLayout::None => {
                 return Err(SnapshotUploadError::AdapterDisabled {
@@ -1614,6 +2028,14 @@ impl SnapshotManager {
             }
         };
 
+        // Partial index snapshotting is not supported (see `upload_captured_indexes`): if any
+        // captured index fails to archive or upload, this aborts before `current-snapshot-id`
+        // metadata is advanced, so a later `restore_indexes_from_snapshot` never sees a
+        // snapshot with a missing index artifact.
+        let index_snapshots = self
+            .upload_captured_indexes(captured_indexes, &layout, now)
+            .await?;
+
         self.update_metadata_after_upload(
             &destination_location,
             checksum.clone(),
@@ -1622,6 +2044,7 @@ impl SnapshotManager {
             schema,
             last_updated_at,
             row_count,
+            index_snapshots,
         )
         .await?;
 
@@ -2539,6 +2962,8 @@ impl SnapshotManager {
             bytes_downloaded: actual_size,
             checksum: actual_checksum,
             last_updated_at: entry.snapshot_last_updated_at_ms,
+            index_snapshots: entry.index_snapshots.clone(),
+            metadata_location: metadata_location.to_string(),
         })
     }
 
@@ -2910,6 +3335,7 @@ impl SnapshotManager {
         schema: &SchemaRef,
         last_updated_at: Option<i64>,
         row_count: Option<u64>,
+        index_snapshots: Vec<IndexSnapshotRef>,
     ) -> Result<(), SnapshotUploadError> {
         let metadata_path = self.metadata_path();
         let metadata_path_display = metadata_path.to_string();
@@ -3077,6 +3503,7 @@ impl SnapshotManager {
                 snapshot_engine: Some(self.engine.to_string()),
                 snapshot_row_count: row_count,
                 snapshot_last_updated_at_ms: last_updated_at,
+                index_snapshots: index_snapshots.clone(),
             };
 
             dataset_entry.snapshots.push(snapshot_entry);
@@ -3830,6 +4257,7 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            indexes: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -3950,6 +4378,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let schema = sample_schema();
@@ -4030,6 +4459,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
         let schema = sample_schema();
         let metadata = SnapshotMetadata {
@@ -4170,6 +4600,7 @@ mod tests {
             snapshot_engine: Some(AccelerationEngine::Cayenne.to_string()),
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         }
     }
 
@@ -4469,6 +4900,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
         let metadata = SnapshotMetadata {
             format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
@@ -4609,6 +5041,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let valid_checksum = compute_sha256_hex(second_contents.as_ref());
@@ -4622,6 +5055,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let schema = sample_schema();
@@ -5029,6 +5463,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5097,6 +5532,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5165,6 +5601,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5238,6 +5675,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5317,6 +5755,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5393,6 +5832,7 @@ mod tests {
             snapshot_engine: Some("sqlite".to_string()),
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5480,6 +5920,7 @@ mod tests {
             snapshot_engine: Some("sqlite".to_string()),
             snapshot_row_count: Some(50),
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let valid_checksum = compute_sha256_hex(second_contents.as_ref());
@@ -5493,6 +5934,7 @@ mod tests {
             snapshot_engine: Some("duckdb".to_string()),
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let schema = sample_schema();
@@ -5570,6 +6012,7 @@ mod tests {
             snapshot_engine: Some("cayenne".to_string()),
             snapshot_row_count: Some(10),
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let schema = sample_schema();
@@ -5660,6 +6103,7 @@ mod tests {
             snapshot_engine: Some("sqlite".to_string()),
             snapshot_row_count: Some(10),
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let good_checksum = compute_sha256_hex(good_contents.as_ref());
@@ -5673,6 +6117,7 @@ mod tests {
             snapshot_engine: Some("duckdb".to_string()),
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let schema = sample_schema();
@@ -6202,6 +6647,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let schema = sample_schema();
@@ -6855,6 +7301,7 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: Some(1_704_153_600_000),
+                    index_snapshots: Vec::new(),
                 }],
                 current_snapshot_id: Some(0),
                 properties: HashMap::default(),
@@ -6903,6 +7350,7 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            indexes: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -6939,6 +7387,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: Some(1_704_153_600_000),
+            index_snapshots: Vec::new(),
         };
 
         let mut datasets = HashMap::new();
@@ -7007,6 +7456,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let missing_entry = SnapshotEntry {
@@ -7019,6 +7469,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let mut datasets = HashMap::new();
@@ -7093,6 +7544,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let mut datasets = HashMap::new();
@@ -7160,6 +7612,7 @@ mod tests {
                 snapshot_engine: None,
                 snapshot_row_count: None,
                 snapshot_last_updated_at_ms: None,
+                index_snapshots: Vec::new(),
             });
             store
                 .put(&Path::from(filename), Bytes::from_static(b"data").into())
@@ -7220,6 +7673,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let mut datasets = HashMap::new();
@@ -7322,6 +7776,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let snapshot_entry2 = SnapshotEntry {
@@ -7334,6 +7789,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let mut datasets = HashMap::new();
@@ -7423,6 +7879,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
 
         let mut datasets = HashMap::new();
@@ -7548,6 +8005,7 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            indexes: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -7611,6 +8069,7 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
+                    index_snapshots: Vec::new(),
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -7662,6 +8121,7 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
+                    index_snapshots: Vec::new(),
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -7720,6 +8180,7 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
+                    index_snapshots: Vec::new(),
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -7742,6 +8203,7 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
+                    index_snapshots: Vec::new(),
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -7808,6 +8270,7 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
+                    index_snapshots: Vec::new(),
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -7932,6 +8395,7 @@ mod tests {
                 snapshot_engine: Some("duckdb".to_string()),
                 snapshot_row_count: Some(100),
                 snapshot_last_updated_at_ms: Some(1_704_240_000_000),
+                index_snapshots: Vec::new(),
             });
             dataset.current_snapshot_id = Some(1);
         }
@@ -8150,6 +8614,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            index_snapshots: Vec::new(),
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -8310,6 +8775,306 @@ mod tests {
         assert!(
             !declares_nullable_entries(&raw),
             "the published snapshot metadata must not keep a Map declaration MapArray::try_new refuses"
+        );
+    }
+
+    /// An index whose `snapshot_identity` and `restore_from` are test-controlled, for exercising
+    /// `restore_indexes_from_snapshot`'s identity matching and error propagation without a real
+    /// full-text or vector index implementation.
+    #[derive(Debug)]
+    struct MockSnapshotIndex {
+        identity: spice_table::SnapshotIndexIdentity,
+        should_fail: bool,
+        restored_from: Arc<Mutex<Option<PathBuf>>>,
+    }
+
+    #[async_trait]
+    impl spice_table::Index for MockSnapshotIndex {
+        fn name(&self) -> &'static str {
+            "mock_snapshot_index"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            self.identity.columns.clone()
+        }
+
+        fn snapshot_identity(&self) -> Option<spice_table::SnapshotIndexIdentity> {
+            Some(self.identity.clone())
+        }
+
+        async fn restore_from(
+            &self,
+            extracted_dir: &std::path::Path,
+        ) -> datafusion::error::Result<()> {
+            if self.should_fail {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "mock index restore failure".to_string(),
+                ));
+            }
+            *self.restored_from.lock().await = Some(extracted_dir.to_path_buf());
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Builds a valid, extractable index artifact in `store` for `identity` and returns the
+    /// `IndexSnapshotRef` pointing at it — everything `restore_indexes_from_snapshot` needs to
+    /// download, verify, and extract before calling `Index::restore_from`.
+    async fn write_index_artifact(
+        store: &InMemory,
+        manager: &SnapshotManager,
+        identity: &spice_table::SnapshotIndexIdentity,
+        // Distinguishes this artifact's object path from any other artifact written for the
+        // same identity `kind` in the same test (e.g. two candidates that differ only by
+        // discriminator), so writing one never overwrites another's stored bytes.
+        filename_suffix: &str,
+        marker_contents: &[u8],
+    ) -> IndexSnapshotRef {
+        use crate::snapshot::directory_archive::archive_directories_to_file_with_plan;
+
+        let source_dir = TempDir::new().expect("create source dir");
+        std::fs::write(source_dir.path().join("marker.txt"), marker_contents)
+            .expect("write marker file");
+
+        let archive_dir = TempDir::new().expect("create archive dir");
+        let archive_path = archive_dir.path().join("index.tar");
+        archive_directories_to_file_with_plan(
+            &[(source_dir.path().to_path_buf(), String::new())],
+            &archive_path,
+            &[],
+            &[],
+        )
+        .await
+        .expect("archive index directory");
+
+        let bytes = std::fs::read(&archive_path).expect("read archive");
+        let checksum = compute_sha256_hex(&bytes);
+        let size = bytes.len() as u64;
+        let object_path = Path::from(format!(
+            "{SNAPSHOT_BASE_PATH}/indexes/{}-{filename_suffix}.tar",
+            identity.kind
+        ));
+        store
+            .put(&object_path, bytes.into())
+            .await
+            .expect("write index artifact to store");
+
+        IndexSnapshotRef {
+            index_kind: identity.kind.to_string(),
+            columns: identity.columns.clone(),
+            discriminator: identity.discriminator.clone(),
+            uri: manager.snapshot_uri_for_location(&object_path),
+            checksum,
+            checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            size,
+        }
+    }
+
+    /// Wraps `artifacts` in the `SnapshotDownloadInfo` the restore path consumes. Artifacts
+    /// from `write_index_artifact` name this manager's own snapshot location, so unless a test
+    /// says otherwise the recorded metadata location is that same location.
+    fn download_info_with(
+        schema: &SchemaRef,
+        artifacts: Vec<IndexSnapshotRef>,
+        metadata_location: &str,
+    ) -> SnapshotDownloadInfo {
+        SnapshotDownloadInfo {
+            snapshot_id: 1,
+            schema: Arc::clone(schema),
+            bytes_downloaded: 0,
+            checksum: String::new(),
+            last_updated_at: None,
+            index_snapshots: artifacts,
+            metadata_location: metadata_location.to_string(),
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restore_indexes_from_snapshot_matches_by_kind_columns_and_discriminator() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let identity = spice_table::SnapshotIndexIdentity {
+            kind: "full_text",
+            columns: vec!["body".to_string(), "title".to_string()],
+            discriminator: Some("bm25".to_string()),
+        };
+        let matching_artifact =
+            write_index_artifact(&store, &manager, &identity, "matching", b"matching").await;
+        // A same-kind artifact with a different discriminator must not match: identity is
+        // kind + columns + discriminator together, not kind alone.
+        let other_identity = spice_table::SnapshotIndexIdentity {
+            kind: "full_text",
+            columns: vec!["body".to_string(), "title".to_string()],
+            discriminator: Some("other".to_string()),
+        };
+        let other_artifact =
+            write_index_artifact(&store, &manager, &other_identity, "other", b"non-matching").await;
+
+        let restored_from = Arc::new(Mutex::new(None));
+        let index = Arc::new(MockSnapshotIndex {
+            identity,
+            should_fail: false,
+            restored_from: Arc::clone(&restored_from),
+        });
+        manager.set_indexes(vec![index]).await;
+
+        manager
+            .restore_indexes_from_snapshot(&download_info_with(
+                &schema,
+                vec![other_artifact, matching_artifact],
+                SNAPSHOT_URI_PREFIX,
+            ))
+            .await
+            .expect("restore should succeed using the matching artifact");
+
+        assert!(
+            restored_from.lock().await.is_some(),
+            "restore_from should have been called with the matching artifact's extracted directory"
+        );
+    }
+
+    // regression test for #14425: index artifacts follow the same resolution as the database
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restore_indexes_from_snapshot_resolves_artifacts_against_metadata_location() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let identity = spice_table::SnapshotIndexIdentity {
+            kind: "full_text",
+            columns: vec!["body".to_string()],
+            discriminator: None,
+        };
+        let mut artifact =
+            write_index_artifact(&store, &manager, &identity, "replicated", b"replicated").await;
+        // This reader's snapshots.location is a replica of the writer's prefix in another
+        // bucket, so every recorded artifact URI names the writer's bucket, not this one.
+        let writer_location = "s3://writer-bucket/snapshots";
+        artifact.uri = artifact.uri.replace(SNAPSHOT_URI_PREFIX, writer_location);
+        assert!(artifact.uri.starts_with(writer_location));
+
+        let restored_from = Arc::new(Mutex::new(None));
+        let index = Arc::new(MockSnapshotIndex {
+            identity,
+            should_fail: false,
+            restored_from: Arc::clone(&restored_from),
+        });
+        manager.set_indexes(vec![index]).await;
+
+        manager
+            .restore_indexes_from_snapshot(&download_info_with(
+                &schema,
+                vec![artifact],
+                writer_location,
+            ))
+            .await
+            .expect("artifact recorded under the writer's bucket must read from this replica");
+
+        assert!(
+            restored_from.lock().await.is_some(),
+            "restore_from should have been called with the extracted directory"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restore_indexes_from_snapshot_fails_hard_on_missing_artifact() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let identity = spice_table::SnapshotIndexIdentity {
+            kind: "full_text",
+            columns: vec!["body".to_string()],
+            discriminator: None,
+        };
+        let index = Arc::new(MockSnapshotIndex {
+            identity,
+            should_fail: false,
+            restored_from: Arc::new(Mutex::new(None)),
+        });
+        manager.set_indexes(vec![index]).await;
+
+        // No artifacts at all: the configured index has nothing to match, which must be a hard
+        // failure (partial index snapshotting is not supported), not a silently-ignored gap.
+        let result = manager
+            .restore_indexes_from_snapshot(&download_info_with(
+                &schema,
+                Vec::new(),
+                SNAPSHOT_URI_PREFIX,
+            ))
+            .await;
+
+        assert!(
+            matches!(result, Err(SnapshotDownloadError::IndexNotFound { .. })),
+            "expected IndexNotFound for a configured index with no matching artifact, got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restore_indexes_from_snapshot_propagates_restore_failure() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let identity = spice_table::SnapshotIndexIdentity {
+            kind: "full_text",
+            columns: vec!["body".to_string()],
+            discriminator: None,
+        };
+        let artifact =
+            write_index_artifact(&store, &manager, &identity, "content", b"content").await;
+        let index = Arc::new(MockSnapshotIndex {
+            identity,
+            should_fail: true,
+            restored_from: Arc::new(Mutex::new(None)),
+        });
+        manager.set_indexes(vec![index]).await;
+
+        let result = manager
+            .restore_indexes_from_snapshot(&download_info_with(
+                &schema,
+                vec![artifact],
+                SNAPSHOT_URI_PREFIX,
+            ))
+            .await;
+
+        assert!(
+            matches!(result, Err(SnapshotDownloadError::IndexRestore { .. })),
+            "an artifact that downloads and extracts fine but fails Index::restore_from must \
+             surface as IndexRestore, not be swallowed, got {result:?}"
         );
     }
 
