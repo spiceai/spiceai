@@ -25,6 +25,7 @@ http.workspace = true
 libnfs = { path = "../libnfs", optional = true }
 nix = { workspace = true, features = ["fs"], optional = true }
 object_store.workspace = true
+object_store_occ = { path = "../object_store_occ", optional = true }
 reqwest.workspace = true
 runtime-parameters = { path = "../runtime-parameters", optional = true }
 # Secret stores are opted into by the binary; this crate only needs the `Secrets` type.
@@ -56,6 +57,7 @@ smb = ["dep:smb", "dep:bb8"]
 # The runtime state store (`state`), which resolves params through secrets. Only
 # `runtime` needs it, so other dependents skip the params/secrets/spicepod deps.
 state = [
+    "dep:object_store_occ",
     "dep:runtime-parameters",
     "dep:runtime-secrets",
     "dep:secrecy",
