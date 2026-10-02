@@ -708,6 +708,55 @@ mod merge {
     }
 }
 
+/// A run holds the words of the encoder that built it. A nullable field encodes
+/// each value behind a validity byte, so the same string has another word under
+/// a `NOT NULL` field: a run built while the column was `NOT NULL` and
+/// published into an index of the column made nullable would cover its files
+/// while matching none of their keys, and a lookup would miss their rows. Such
+/// a run, persisted and read back, is refused, its files are left uncovered so
+/// a reader scans them, and a run of the index's own encoding is published.
+#[test]
+fn a_run_of_another_encoding_is_not_published() {
+    let utf8 = |nullable| {
+        KeyEncoder::new(vec![KeyField::new(DataType::Utf8, nullable)]).expect("utf8 key")
+    };
+    let (strict, nullable) = (utf8(false), utf8(true));
+    assert_eq!(strict.word_identity(), utf8(false).word_identity());
+    assert_ne!(strict.word_identity(), nullable.word_identity());
+    let int64 = KeyEncoder::new(vec![KeyField::new(DataType::Int64, false)]).expect("int64 key");
+    let exact = int64.word_identity();
+    assert_ne!(
+        exact,
+        int64.with_word_bits(64).word_identity(),
+        "an encoder giving keys their own bytes and one hashing them must differ"
+    );
+    let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["a", "b"]))];
+    let run = |encoder: &KeyEncoder, file: &str| {
+        let mut builder = RunBuilder::new(encoder.clone());
+        builder.add_batch(file, 0, &columns).expect("add");
+        IndexRun::from_bytes(&builder.finish().expect("finish").to_bytes()).expect("round trip")
+    };
+    let stale = run(&strict, "stale");
+    assert_eq!(stale.encoding(), strict.word_identity());
+
+    let index = TieredIndex::new(nullable.clone());
+    index.publish(vec![stale], &[]);
+    assert!(
+        !index.view().covers("stale"),
+        "a run of another encoding must not cover its files"
+    );
+    index.publish(vec![run(&nullable, "own")], &[]);
+    assert!(index.view().covers("own"));
+    let bound = nullable.bind(&columns).expect("bind");
+    let mut key = Vec::new();
+    bound.encode_row(0, &mut key);
+    let mut found = Vec::new();
+    index.candidates(&key, |candidate| {
+        found.push((candidate.file.to_string(), candidate.position));
+    });
+    assert_eq!(found, vec![("own".to_string(), 0)]);
+}
+
 mod persist {
     use std::collections::BTreeMap;
 
@@ -805,6 +854,7 @@ mod persist {
     /// with a valid checksum, as a writer bug or a crafted file could leave.
     fn sealed_with_postings(postings: Vec<u8>, rows: usize) -> Vec<u8> {
         IndexRun::from_parts(
+            0,
             vec![Arc::from("a")].into(),
             vec![7].into(),
             vec![word_proof::offset_slot(0)].into(),
@@ -860,6 +910,7 @@ mod persist {
         postings.extend(varints(&[2, 1, 2]));
         let sealed = |slots: Vec<u32>, rows: usize| {
             IndexRun::from_parts(
+                0,
                 vec![Arc::from("a")].into(),
                 vec![7, 9].into(),
                 slots.into(),
@@ -953,10 +1004,10 @@ mod persist {
                 digest(&merged[0])
             ],
             [
-                (35_584, 0xBF9B_0B3C_93C3_4467),
-                (87, 0x1B08_B93F_A4DA_911D),
-                (49_415, 0xEFBA_2365_1D7F_F00C),
-                (12_741, 0x4AC0_9C32_E0D6_B532),
+                (35_592, 0xB56C_576B_EAC6_1324),
+                (95, 0xCBA3_9660_1670_7D8D),
+                (49_423, 0xF5F8_EEA9_AF2A_AA0E),
+                (12_749, 0x3A66_5409_8906_7BBE),
             ]
         );
     }
