@@ -753,11 +753,13 @@ mod tests {
         );
     }
 
-    /// A scan of `t(id, a)` with `a` binary, filtered by `predicate` and
-    /// projecting `projection` — the shapes #14355 measured.
+    /// A scan of `t(id, s, a)` with `s` text and `a` binary, filtered by
+    /// `predicate` and projecting `projection` — the shapes #14355 and #14397
+    /// measured.
     fn plan_over_binary(predicate: Option<Expr>, projection: Expr) -> LogicalPlan {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
             Field::new("a", DataType::Binary, true),
         ]);
         let mut plan = table_scan(Some("t"), &schema, None).expect("scan t");
@@ -770,13 +772,9 @@ mod tests {
             .expect("build plan")
     }
 
-    /// Regression test for #14355, through both `DuckDB` accessors: a cast of a
-    /// binary column into text answers with a row on `DuckDB` where
-    /// `DataFusion` raises (`CAST`) or answers NULL (`TRY_CAST`), so a plan
-    /// holding one, in a projection or a filter, must stay local.
-    #[test]
-    fn a_duckdb_text_cast_over_a_binary_column_is_not_federated() {
-        use datafusion::prelude::{cast, try_cast};
+    /// Asserts, through both `DuckDB` accessors, that every plan in `local`
+    /// stays local and every plan in `federated` still federates.
+    fn assert_duckdb_federation(local: &[LogicalPlan], federated: &[LogicalPlan]) {
         for (accessor, support) in [
             (
                 "table providers",
@@ -787,7 +785,61 @@ mod tests {
                 deny_spice_functions_for_duckdb_dialect_without_carve_out(),
             ),
         ] {
-            for plan in [
+            for plan in local {
+                assert!(
+                    contains_unsupported_functions(plan, &support)
+                        .expect("the support check must not error"),
+                    "the {accessor} accessor must keep this plan local:\n{plan}"
+                );
+            }
+            for plan in federated {
+                assert!(
+                    !contains_unsupported_functions(plan, &support)
+                        .expect("the support check must not error"),
+                    "the {accessor} accessor must still federate:\n{plan}"
+                );
+            }
+        }
+    }
+
+    /// Regression test for #14397, through both `DuckDB` accessors: no cast into
+    /// a binary type has a `DuckDB` rendering that answers what `DataFusion`
+    /// does, so a plan holding one, in a projection or a filter, stays local.
+    #[test]
+    fn a_duckdb_cast_into_binary_is_not_federated() {
+        assert_duckdb_federation(
+            &[
+                plan_over_binary(None, cast(col("s"), DataType::Binary)),
+                plan_over_binary(None, try_cast(col("s"), DataType::Binary)),
+                plan_over_binary(
+                    Some(cast(col("s"), DataType::Binary).eq(col("a"))),
+                    col("id"),
+                ),
+                // A literal cast is sent as the bare string, which `DuckDB`
+                // reads under its own escape rules.
+                plan_over_binary(
+                    Some(col("a").eq(cast(lit("\\xFF"), DataType::Binary))),
+                    col("id"),
+                ),
+            ],
+            // Casts into other types, and the binary column itself, still
+            // federate: the refusal costs only the casts it is about.
+            &[
+                plan_over_binary(None, col("a")),
+                plan_over_binary(None, cast(col("s"), DataType::Utf8View)),
+                plan_over_binary(Some(col("a").is_not_null()), col("id")),
+            ],
+        );
+    }
+
+    /// Regression test for #14355, through both `DuckDB` accessors: a cast of a
+    /// binary column into text answers with a row on `DuckDB` where
+    /// `DataFusion` raises (`CAST`) or answers NULL (`TRY_CAST`), so a plan
+    /// holding one, in a projection or a filter, must stay local.
+    #[test]
+    fn a_duckdb_text_cast_over_a_binary_column_is_not_federated() {
+        assert_duckdb_federation(
+            &[
                 plan_over_binary(None, cast(col("a"), DataType::Utf8)),
                 plan_over_binary(None, try_cast(col("a"), DataType::Utf8)),
                 plan_over_binary(None, cast(col("a"), DataType::Utf8View)),
@@ -795,28 +847,15 @@ mod tests {
                     Some(cast(col("a"), DataType::Utf8).like(lit("%bad%"))),
                     col("id"),
                 ),
-            ] {
-                assert!(
-                    contains_unsupported_functions(&plan, &support)
-                        .expect("the support check must not error"),
-                    "the {accessor} accessor must keep this plan local:\n{plan}"
-                );
-            }
-
+            ],
             // The binary column itself, and a text cast over a non-binary
             // column, still federate: the refusal costs only the casts it is
             // about.
-            for plan in [
+            &[
                 plan_over_binary(None, col("a")),
                 plan_over_binary(None, cast(col("id"), DataType::Utf8)),
                 plan_over_binary(Some(col("a").is_not_null()), col("id")),
-            ] {
-                assert!(
-                    !contains_unsupported_functions(&plan, &support)
-                        .expect("the support check must not error"),
-                    "the {accessor} accessor must still federate:\n{plan}"
-                );
-            }
-        }
+            ],
+        );
     }
 }
