@@ -3734,6 +3734,7 @@ dependencies = [
  "tokio",
  "tokio-rusqlite",
  "tokio-stream",
+ "tpcdsgen",
  "tpchgen",
  "tracing",
  "turso",
@@ -8242,6 +8243,20 @@ dependencies = [
  "snafu",
  "tokio",
  "utoipa",
+]
+
+[[package]]
+name = "evaluate-chat"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-trait",
+ "chat-api",
+ "evaluate-api",
+ "insta",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -17239,6 +17254,7 @@ dependencies = [
  "duration-parse",
  "elasticsearch",
  "evaluate-api",
+ "evaluate-chat",
  "event_stream",
  "flight_client",
  "fundu",
@@ -22100,6 +22116,12 @@ dependencies = [
  "snafu",
  "tracing",
 ]
+
+[[package]]
+name = "tpcdsgen"
+version = "0.1.0-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07cae4643a0296068b425716c22e16e5b639ef8c7f7717a513436b20b0a7924a"
 
 [[package]]
 name = "tpchgen"

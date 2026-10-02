@@ -1910,7 +1910,9 @@ jobs:
 
   mssql_connector_quickstart:
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
-    runs-on: ${{ matrix.target.runner }}
+    # The Microsoft apt list below is the Ubuntu 24.04 repository. ubuntu-latest
+    # moves on its own, so this Linux-only job stays on ubuntu-24.04.
+    runs-on: ubuntu-24.04
     needs:
       - build
       - setup-matrix
@@ -1938,10 +1940,12 @@ jobs:
 
       - name: Install mssql-tools
         run: |
-          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
-          curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          # Ubuntu 24.04 prod.list pins signed-by to this keyring path.
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /usr/share/keyrings/microsoft-prod.gpg >/dev/null
+          sudo chmod 644 /usr/share/keyrings/microsoft-prod.gpg
+          curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
           sudo apt-get update
-          sudo apt-get install -y mssql-tools18 unixodbc-dev
+          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
           # echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
           # source ~/.bashrc
 
