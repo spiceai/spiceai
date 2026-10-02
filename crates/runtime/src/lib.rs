@@ -2297,7 +2297,7 @@ impl Runtime {
 
 // The accelerator data directory is named by `data-accelerator-api`, so an engine
 // below `runtime` can resolve it; re-exported here for path compatibility.
-pub use data_accelerator_api::spice_data_base_path;
+pub use data_accelerator_api::{spice_data_base_path, validate_spice_data_dir};
 
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {
     let mut base_folder = PathBuf::from(spice_data_base_path());

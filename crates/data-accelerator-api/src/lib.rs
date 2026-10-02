@@ -78,6 +78,22 @@ pub fn spice_data_base_path() -> String {
     resolve_data_base_path(std::env::var_os(SPICE_DATA_DIR_ENV))
 }
 
+/// Rejects a `SPICE_DATA_DIR` that is not valid UTF-8, which [`spice_data_base_path`]
+/// cannot represent, so `spiced` refuses to start instead of writing elsewhere.
+///
+/// # Errors
+///
+/// Returns the message to print when the value is not valid UTF-8.
+pub fn validate_spice_data_dir() -> Result<(), String> {
+    match std::env::var(SPICE_DATA_DIR_ENV) {
+        Err(std::env::VarError::NotUnicode(value)) => Err(format!(
+            "`SPICE_DATA_DIR` is not valid UTF-8 ('{}'). Set it to a UTF-8 path. See: https://spiceai.org/docs",
+            value.to_string_lossy()
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn resolve_data_base_path(data_dir: Option<std::ffi::OsString>) -> String {
     let data_dir = data_dir
         .filter(|dir| !dir.is_empty())
