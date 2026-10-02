@@ -62,24 +62,29 @@ pub(crate) fn coerce_arrow_schema_for_iceberg_v2(schema: &ArrowSchema) -> ArrowS
     let fields: Vec<Field> = schema
         .fields()
         .iter()
-        .map(|f| {
-            let coerced = match f.data_type() {
-                DataType::Timestamp(unit, tz) if *unit != TimeUnit::Microsecond => {
-                    Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
-                }
-                DataType::Date64 => Some(DataType::Date32),
-                DataType::Time32(_) | DataType::Time64(TimeUnit::Nanosecond) => {
-                    Some(DataType::Time64(TimeUnit::Microsecond))
-                }
-                _ => None,
-            };
-            match coerced {
+        .map(
+            |f| match coerce_temporal_type_for_iceberg_v2(f.data_type()) {
                 Some(dt) => f.as_ref().clone().with_data_type(dt),
                 None => f.as_ref().clone(),
-            }
-        })
+            },
+        )
         .collect();
     ArrowSchema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+/// The temporal coercions of [`coerce_arrow_schema_for_iceberg_v2`] for a single
+/// (non-nested) data type, or `None` when the type needs no coercion.
+pub(crate) fn coerce_temporal_type_for_iceberg_v2(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::Timestamp(unit, tz) if *unit != TimeUnit::Microsecond => {
+            Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
+        }
+        DataType::Date64 => Some(DataType::Date32),
+        DataType::Time32(_) | DataType::Time64(TimeUnit::Nanosecond) => {
+            Some(DataType::Time64(TimeUnit::Microsecond))
+        }
+        _ => None,
+    }
 }
 
 /// A shared, lazily-initialized weak reference to the [`DataFusion`] instance.
