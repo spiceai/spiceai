@@ -308,6 +308,30 @@ async fn lookups_until(
     }
 }
 
+/// Runs lookups until a rebuild covers every file of `name` again, failing
+/// with the last verification after 30 seconds; returns that verification.
+async fn healed(
+    provider: &Arc<CayenneTableProvider>,
+    name: &str,
+) -> cayenne::lookup_index::LookupIndexVerification {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        lookup(provider, name, 7).await;
+        let verification = provider
+            .verify_lookup_index_against_read_back()
+            .await
+            .expect("verify");
+        if verification.uncovered_files == 0 {
+            return verification;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "'{name}' was not rebuilt to cover every file: {verification:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The index follows the `indexes` each registration passes, not whatever the
 /// table was first created with: adding an entry to an existing table indexes
 /// it, and removing it stops indexing.
@@ -754,4 +778,116 @@ fn vortex_files(
             by_name.entry(name).or_default().push(path);
         }
     }
+}
+
+/// A key column relaxed to nullable on an open table: rows written after it,
+/// including one whose key column is NULL, are found by their keys, and the
+/// rows written before it still are. The change alters the key's encoding, so
+/// the index built before it is dropped and rebuilt from the table's files by
+/// the next lookups, and then covers the files written before and after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_column_relaxed_to_nullable_on_an_open_table_keeps_lookups_exact() {
+    use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
+    const ROWS: usize = 20_000;
+    // Rows written after relaxing: enough for files of their own, the last
+    // with a NULL key column.
+    const AFTER: i64 = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "relaxed_live";
+    let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
+    overwrite(&table, rows(0, ROWS)).await;
+    lookup(&table, name, 11).await;
+
+    let relaxed = Arc::new(Schema::new(vec![
+        Field::new("AutoId", DataType::Int64, false),
+        Field::new("TenantId", DataType::Int64, false),
+        Field::new("ServiceId", DataType::Utf8, true),
+        Field::new("Payload", DataType::Utf8, false),
+    ]));
+    let SchemaEvolution::Widening(plan) = classify(
+        table.schema().as_ref(),
+        &relaxed,
+        &EvolutionContext {
+            constraint_columns: &[],
+        },
+    ) else {
+        panic!("relaxing ServiceId to nullable must be a widening");
+    };
+    table
+        .evolve_schema_live(&plan)
+        .await
+        .expect("relax ServiceId to nullable");
+
+    let first = i64::try_from(ROWS).expect("fits");
+    let ids: Vec<i64> = (first..first + AFTER).collect();
+    let (id, null_id) = (first + 1, first + AFTER - 1);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&relaxed),
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(Int64Array::from(
+                ids.iter().map(|i| i % 997).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                ids.iter()
+                    .map(|&i| (i != null_id).then(|| format!("SV{i:032x}")))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                ids.iter().map(|i| format!("after-{i}")).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("batch after relaxing");
+    let ctx = SessionContext::new();
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register target");
+    let mem =
+        datafusion::datasource::MemTable::try_new(relaxed, vec![vec![batch]]).expect("memtable");
+    ctx.register_table("src", Arc::new(mem))
+        .expect("register src");
+    let inserted = ctx
+        .sql(&format!("INSERT INTO {name} SELECT * FROM src"))
+        .await
+        .expect("insert plan")
+        .collect()
+        .await;
+    println!("insert after relaxing: {:?}", inserted.as_ref().map(|_| ()));
+    inserted.expect("insert after relaxing");
+
+    lookup(&table, name, id).await;
+    lookup(&table, name, 11).await;
+    let nulls = ctx
+        .sql(&format!(
+            "SELECT \"AutoId\" FROM {name} WHERE \"TenantId\" = {} AND \"ServiceId\" IS NULL",
+            null_id % 997
+        ))
+        .await
+        .expect("plan null lookup")
+        .collect()
+        .await
+        .expect("run null lookup");
+    let found: usize = nulls.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(found, 1, "the row with a NULL key column must be read");
+    let verification = table
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    println!("after relaxing on an open table: {verification:?}");
+    assert!(verification.agrees(), "{verification:?}");
+    // The index heals: a lookup over the uncovered files rebuilds it, after
+    // which every file is covered again and lookups use it.
+    let healed = healed(&table, name).await;
+    println!("after the rebuild: {healed:?}");
+    assert!(healed.agrees(), "{healed:?}");
+    let before = counters(&table);
+    lookup(&table, name, 7).await;
+    assert_eq!(
+        counters(&table).selected - before.selected,
+        1,
+        "a lookup after the rebuild must use the index"
+    );
 }

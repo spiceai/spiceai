@@ -83,7 +83,7 @@ use std::time::{Duration, Instant};
 
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
 use crate::row_converter::{RowConverter, SortField};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::UInt64Type;
 use arrow::record_batch::RecordBatch;
@@ -489,6 +489,13 @@ pub(crate) fn supported_key_type(data_type: &DataType) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Every key's shape, in spec order.
+type Shapes = Arc<Vec<Arc<Shape>>>;
+
+/// Every key's shape under a table schema, from
+/// [`LookupIndexState::shapes_for`].
+pub(crate) struct KeyShapes(Vec<Shape>);
+
 /// One indexed key: its resolved columns and its tiered index, whose runs
 /// cover the files the table's writes and read-back builds indexed.
 struct Shape {
@@ -497,7 +504,10 @@ struct Shape {
     /// Per column, the type the key is encoded in.
     encoded_types: Vec<DataType>,
     encoder: KeyEncoder,
-    index: TieredIndex,
+    /// Shared with the shape that replaces this one when a schema change
+    /// leaves the key's encoding as it was (see
+    /// [`LookupIndexState::adopt_shapes`]).
+    index: Arc<TieredIndex>,
 }
 
 impl Shape {
@@ -531,7 +541,7 @@ impl Shape {
             label: spec.label().to_string(),
             columns,
             encoded_types,
-            index: TieredIndex::new(encoder.clone()),
+            index: Arc::new(TieredIndex::new(encoder.clone())),
             encoder,
         })
     }
@@ -622,6 +632,10 @@ impl Shape {
 /// must be read in full. That per-file rule is what keeps the index usable
 /// while files come and go.
 pub(crate) struct LookupIndexView {
+    /// The keys the views were taken of. A probe encodes its keys with these,
+    /// never with the table's current shapes, so a key's encoding and the
+    /// runs it is looked up in always agree.
+    shapes: Shapes,
     views: Vec<IndexView>,
     labels: Vec<String>,
     /// Rows the runs hold, for the runtime probe's row bound.
@@ -1320,7 +1334,10 @@ impl BuildSchedule {
 pub(crate) struct LookupIndexState {
     table_name: String,
     specs: Vec<KeySpec>,
-    shapes: Vec<Shape>,
+    /// One per spec, replaced together when a schema change alters a key's
+    /// encoding ([`Self::adopt_shapes`]).
+    shapes: ArcSwap<Vec<Arc<Shape>>>,
+    word_bits: Option<u32>,
     /// The pool a build's working memory is reserved against.
     pool: Arc<dyn MemoryPool>,
     /// The table's account, which holds the runs' resident bytes.
@@ -1377,7 +1394,7 @@ impl LookupIndexState {
         }
         let shapes = specs
             .iter()
-            .map(|spec| Shape::new(spec, schema, word_bits))
+            .map(|spec| Shape::new(spec, schema, word_bits).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
         let labels: Vec<&str> = specs.iter().map(KeySpec::label).collect();
         tracing::info!(
@@ -1388,7 +1405,8 @@ impl LookupIndexState {
         let state = Arc::new(Self {
             table_name: table_name.to_string(),
             specs,
-            shapes,
+            shapes: ArcSwap::from_pointee(shapes),
+            word_bits,
             pool,
             account,
             index: ArcSwapOption::empty(),
@@ -1414,6 +1432,62 @@ impl LookupIndexState {
         self.index.load_full()
     }
 
+    /// Every key's shape under `schema`, the table's schema after a change,
+    /// for [`Self::adopt_shapes`] to swap in once the change is committed.
+    ///
+    /// # Errors
+    ///
+    /// When a key column can no longer be indexed under `schema`, as opening
+    /// the table with it would report.
+    pub(crate) fn shapes_for(&self, schema: &arrow_schema::Schema) -> Result<KeyShapes, String> {
+        self.specs
+            .iter()
+            .map(|spec| Shape::new(spec, schema, self.word_bits))
+            .collect::<Result<Vec<_>, _>>()
+            .map(KeyShapes)
+    }
+
+    /// Swaps in `shapes`, from [`Self::shapes_for`] under the table's new
+    /// schema. A key whose encoding is unchanged keeps its index. A key whose
+    /// encoding changed (a key column relaxed to nullable, or widened to
+    /// another type) gets an empty index, as if none of the table's files had
+    /// been indexed: its runs no longer match its keys, so they are dropped and
+    /// deleted from disk, every file reads as uncovered, and the next lookup
+    /// rebuilds the index from the files. A run still being built under the old
+    /// encoding is refused when it is published.
+    pub(crate) fn adopt_shapes(self: &Arc<Self>, shapes: KeyShapes) {
+        let mut rebuilt: Vec<String> = Vec::new();
+        {
+            let _publishing = self.publish_lock.lock();
+            let current = self.shapes.load_full();
+            let shapes: Vec<Arc<Shape>> = shapes
+                .0
+                .into_iter()
+                .zip(current.iter())
+                .map(|(mut shape, old)| {
+                    if shape.encoder.word_identity() == old.encoder.word_identity() {
+                        shape.index = Arc::clone(&old.index);
+                    } else {
+                        rebuilt.push(shape.label.clone());
+                    }
+                    Arc::new(shape)
+                })
+                .collect();
+            self.shapes.store(Arc::new(shapes));
+            self.charge(self.run_bytes());
+            self.repin();
+        }
+        if rebuilt.is_empty() {
+            return;
+        }
+        self.report_coverage();
+        tracing::info!(
+            table = %self.table_name,
+            "{}",
+            rebuilt_index_message(&self.table_name, &rebuilt)
+        );
+    }
+
     pub(crate) fn counters(&self) -> LookupIndexCounters {
         let index_bytes = self
             .reservation
@@ -1427,17 +1501,15 @@ impl LookupIndexState {
     /// Pins every key's current view as the published one. The caller holds
     /// `publish_lock`.
     fn repin(&self) {
-        let views: Vec<IndexView> = self.shapes.iter().map(|shape| shape.index.view()).collect();
+        let shapes = self.shapes.load_full();
+        let views: Vec<IndexView> = shapes.iter().map(|shape| shape.index.view()).collect();
         let rows = views
             .first()
             .map_or(0, |view| view.run_list().iter().map(|run| run.len()).sum());
         let view = LookupIndexView {
+            labels: shapes.iter().map(|shape| shape.label.clone()).collect(),
+            shapes,
             views,
-            labels: self
-                .shapes
-                .iter()
-                .map(|shape| shape.label.clone())
-                .collect(),
             rows,
         };
         self.index.store(Some(Arc::new(view)));
@@ -1454,7 +1526,7 @@ impl LookupIndexState {
                     u64::try_from(files).unwrap_or(u64::MAX),
                     &[
                         telemetry::KeyValue::new("table", self.table_name.clone()),
-                        telemetry::KeyValue::new("shape", label.to_string()),
+                        telemetry::KeyValue::new("shape", label.clone()),
                         telemetry::KeyValue::new("coverage", coverage),
                     ],
                 );
@@ -1464,15 +1536,16 @@ impl LookupIndexState {
 
     /// Per key, its label and how many of the table's current data files its
     /// runs cover and do not cover; `None` before a scan has listed them.
-    fn coverage(&self) -> Option<Vec<(&str, usize, usize)>> {
+    fn coverage(&self) -> Option<Vec<(String, usize, usize)>> {
         let live = self.live_files.lock().clone()?;
         Some(
             self.shapes
+                .load()
                 .iter()
                 .map(|shape| {
                     let view = shape.index.view();
                     let covered = live.iter().filter(|file| view.covers(file)).count();
-                    (shape.label.as_str(), covered, live.len() - covered)
+                    (shape.label.clone(), covered, live.len() - covered)
                 })
                 .collect(),
         )
@@ -1481,6 +1554,7 @@ impl LookupIndexState {
     /// Resident bytes of every key's runs.
     fn run_bytes(&self) -> usize {
         self.shapes
+            .load()
             .iter()
             .map(|shape| shape.index.view().run_heap_bytes())
             .sum()
@@ -1533,17 +1607,16 @@ impl LookupIndexState {
                 self.report_refusal();
                 return false;
             }
-            for (shape, run) in self.shapes.iter().zip(runs) {
+            for (shape, run) in self.shapes.load().iter().zip(runs) {
                 match live {
                     Some(live) => shape.index.publish_visible(vec![run], live),
                     None => shape.index.publish(vec![run], &[]),
                 }
             }
-            // A run over files that already left the set was dropped, so
-            // charge what is actually held.
-            if live.is_some() {
-                self.charge(self.run_bytes());
-            }
+            // A run over files that already left the set was dropped, as is a
+            // run built under a key's previous encoding, so charge what is
+            // actually held.
+            self.charge(self.run_bytes());
             self.repin();
         }
         self.refusal_reported.store(false, Ordering::Relaxed);
@@ -1570,7 +1643,7 @@ impl LookupIndexState {
     /// filter once it is overfull (a publish never rebuilds it, so no write
     /// waits for that). One at a time.
     fn maybe_merge(self: &Arc<Self>) {
-        let busy = self.shapes.iter().any(|shape| {
+        let busy = self.shapes.load().iter().any(|shape| {
             shape.index.view().runs() > MERGE_ABOVE_RUNS || shape.index.filter_overfull()
         });
         if !busy || self.merging.swap(true, Ordering::AcqRel) {
@@ -1583,7 +1656,7 @@ impl LookupIndexState {
         let state = Arc::clone(self);
         // Merging decodes and re-encodes runs: CPU work for the blocking pool.
         runtime.spawn_blocking(move || {
-            for shape in &state.shapes {
+            for shape in state.shapes.load_full().iter() {
                 shape.index.rebuild_overfull_filter();
                 while shape.index.view().runs() > MERGE_ABOVE_RUNS {
                     match shape.index.merge_step() {
@@ -1633,6 +1706,7 @@ impl LookupIndexState {
         let publishing = self.publish_lock.lock();
         let retired: usize = self
             .shapes
+            .load()
             .iter()
             .map(|shape| shape.index.reconcile(&live))
             .sum();
@@ -1664,9 +1738,13 @@ impl LookupIndexState {
         capacity: usize,
         gate: Option<std::sync::mpsc::Receiver<()>>,
     ) -> Arc<RunObserver> {
+        let shapes = self.shapes.load_full();
         let shared = Arc::new(ObserverShared {
             state: Arc::clone(self),
-            builders: Mutex::new(Some(self.shapes.iter().map(Shape::run_builder).collect())),
+            builders: Mutex::new(Some(
+                shapes.iter().map(|shape| shape.run_builder()).collect(),
+            )),
+            shapes,
             reservation: Mutex::new(self.build_reservation()),
             failure: Mutex::new(None),
             lock_wait_ns: AtomicU64::new(0),
@@ -1907,7 +1985,7 @@ impl LookupIndexState {
         // One key keeps every candidate, as an equality lookup always has;
         // several are bounded like a runtime key set.
         let max_rows = (keys.len() > 1).then_some(RUNTIME_INDEX_MAX_ROWS);
-        let Ok(encoded) = self.shapes[shape].encode_keys(&keys) else {
+        let Ok(encoded) = index.shapes[shape].encode_keys(&keys) else {
             return LookupProbe::Fallback(LookupIndexExplain::scanned(
                 Some(label),
                 LookupIndexScanReason::ValueNotIndexable,
@@ -1960,7 +2038,7 @@ impl LookupIndexState {
         let max_rows = RUNTIME_INDEX_MIN_ROWS
             .max(index.rows / 1_000)
             .min(RUNTIME_INDEX_MAX_ROWS);
-        let hit = self.shapes[spec]
+        let hit = index.shapes[spec]
             .encode_keys(keys)
             .ok()
             .and_then(|encoded| index.probe_keys(spec, &encoded, Some(max_rows)));
@@ -2107,6 +2185,8 @@ pub(crate) struct RunObserver {
 /// What a write's writer and its indexing thread share.
 struct ObserverShared {
     state: Arc<LookupIndexState>,
+    /// The keys the builders were made for.
+    shapes: Shapes,
     /// One builder per key; `None` once taken, or dropped on a failure.
     builders: Mutex<Option<Vec<RunBuilder>>>,
     /// The builders' working memory.
@@ -2173,7 +2253,7 @@ impl ObserverShared {
         };
         let indexed = builders
             .iter_mut()
-            .zip(&self.state.shapes)
+            .zip(self.shapes.iter())
             .zip(&job.columns)
             .try_for_each(|((builder, shape), raw)| {
                 let columns = shape.cast_key_columns(raw)?;
@@ -2209,7 +2289,6 @@ impl vortex_datafusion::VortexWriteObserver for RunObserver {
     ) {
         let shared = &self.shared;
         let columns: Result<Vec<Vec<ArrayRef>>, String> = shared
-            .state
             .shapes
             .iter()
             .map(|shape| shape.raw_key_columns(batch))
@@ -2291,6 +2370,15 @@ pub(crate) fn record_probe_outcome(
         telemetry::KeyValue::new("shape", shape.to_string()),
         telemetry::KeyValue::new("outcome", outcome.as_str()),
     ]);
+}
+
+/// The line a table logs when a schema change alters the encoding of the keys
+/// `labels` name, so their indexes are rebuilt.
+fn rebuilt_index_message(table_name: &str, labels: &[String]) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): the schema change altered the key columns of its secondary index on {}, so the index is rebuilt from the table's files as lookups need it; until then those lookups read every file",
+        labels.join(", ")
+    )
 }
 
 /// What the warning says when the memory pool refuses to fit an index.
@@ -2432,11 +2520,12 @@ async fn read_back_files(
 ) -> Result<Option<Vec<RunBuilder>>, String> {
     use vortex::expr::{get_item, pack, root};
 
-    let mut builders: Vec<RunBuilder> = state.shapes.iter().map(Shape::run_builder).collect();
+    let shapes = state.shapes.load_full();
+    let mut builders: Vec<RunBuilder> = shapes.iter().map(|shape| shape.run_builder()).collect();
     let reservation = state.build_reservation();
     // Every key column of every key, read once per file.
     let mut columns: Vec<&KeyColumn> = Vec::new();
-    for shape in &state.shapes {
+    for shape in shapes.iter() {
         for column in &shape.columns {
             if !columns.iter().any(|seen| seen.name == column.name) {
                 columns.push(column);
@@ -2499,7 +2588,7 @@ async fn read_back_files(
                 .column_by_name(READ_BACK_POSITION_COLUMN)
                 .and_then(|column| column.as_primitive_opt::<UInt64Type>())
                 .ok_or_else(|| format!("{}: row positions are not UInt64", file.path))?;
-            for (builder, shape) in builders.iter_mut().zip(&state.shapes) {
+            for (builder, shape) in builders.iter_mut().zip(shapes.iter()) {
                 let key_columns = shape.key_columns(&batch)?;
                 builder
                     .add_batch_at(name, positions.values(), &key_columns)
@@ -3067,6 +3156,68 @@ mod tests {
         .expect("state")
     }
 
+    /// A schema change resets the index of exactly the keys whose encoding it
+    /// changes: `service` becoming `LargeUtf8` changes `(tenant, service)`,
+    /// whose index then covers nothing until it is rebuilt, and leaves
+    /// `tenant`'s index as it was. A change that leaves a key column a type the
+    /// index cannot hold is refused before anything is swapped.
+    #[tokio::test]
+    async fn a_schema_change_resets_only_the_keys_whose_encoding_it_changes() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let state = keyed_state(&pool);
+        write(
+            &state,
+            &[(
+                "a.vortex",
+                0,
+                keyed_batch(&[Some(1), Some(2)], &[Some("x"), Some("y")]),
+            )],
+        )
+        .await;
+        let covers = |state: &LookupIndexState| -> Vec<bool> {
+            state
+                .shapes
+                .load()
+                .iter()
+                .map(|shape| shape.index.view().covers("a.vortex"))
+                .collect()
+        };
+        assert_eq!(covers(&state), vec![true, true]);
+
+        let floats = arrow_schema::Schema::new(vec![
+            Field::new("tenant", DataType::Float64, true),
+            Field::new("service", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, false),
+        ]);
+        let refused = state
+            .shapes_for(&floats)
+            .err()
+            .expect("a float key is refused");
+        assert!(refused.contains("tenant"), "{refused}");
+        assert_eq!(
+            covers(&state),
+            vec![true, true],
+            "a refused change swaps nothing"
+        );
+
+        let large = arrow_schema::Schema::new(vec![
+            Field::new("tenant", DataType::Int64, true),
+            Field::new("service", DataType::LargeUtf8, true),
+            Field::new("value", DataType::Int64, false),
+        ]);
+        state.adopt_shapes(state.shapes_for(&large).expect("indexable"));
+        assert_eq!(
+            covers(&state),
+            vec![true, false],
+            "only the key whose encoding changed is reset"
+        );
+        let view = state.published().expect("published");
+        assert!(
+            !view.covers("table/snapshot/a.vortex"),
+            "the published view must not cover a file the reset key does not"
+        );
+    }
+
     fn path(name: &str) -> object_store::path::Path {
         object_store::path::Path::from(format!("table/snapshot/{name}"))
     }
@@ -3220,7 +3371,10 @@ mod tests {
         );
         assert_eq!(
             state.coverage(),
-            Some(vec![("tenant", 0, 3), ("(tenant, service)", 0, 3)])
+            Some(vec![
+                ("tenant".to_string(), 0, 3),
+                ("(tenant, service)".to_string(), 0, 3)
+            ])
         );
         write(
             &state,
@@ -3233,7 +3387,10 @@ mod tests {
         .await;
         assert_eq!(
             state.coverage(),
-            Some(vec![("tenant", 1, 2), ("(tenant, service)", 1, 2)])
+            Some(vec![
+                ("tenant".to_string(), 1, 2),
+                ("(tenant, service)".to_string(), 1, 2)
+            ])
         );
     }
 
@@ -3470,7 +3627,7 @@ mod tests {
             assert_eq!(state.shape_label(shape), "tenant");
             let keys = key_tuples(&["tenant".to_string(), "service".to_string()], &values)
                 .expect("bounded");
-            let encoded = state.shapes[1].encode_keys(&keys).expect("encodes");
+            let encoded = state.shapes.load()[1].encode_keys(&keys).expect("encodes");
             assert_eq!(encoded.iter().filter(|key| key.is_none()).count(), 1);
             let hit = view.probe_keys(1, &encoded, None).expect("unbounded");
             let mut expected: Vec<(String, u64)> = ["s0", "s2"]
