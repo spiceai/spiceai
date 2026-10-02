@@ -476,7 +476,7 @@ pub struct BoundKeyColumns<'a> {
     num_rows: usize,
 }
 
-impl<'a> BoundKeyColumns<'a> {
+impl BoundKeyColumns<'_> {
     /// Number of rows in the bound columns.
     #[must_use]
     pub fn num_rows(&self) -> usize {

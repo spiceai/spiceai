@@ -883,7 +883,7 @@ mod persist {
         let int = KeyEncoder::new(vec![KeyField::new(DataType::Int64, false)]).expect("int64");
         let int_column =
             |keys: Vec<i64>| -> Vec<ArrayRef> { vec![Arc::new(Int64Array::from(keys))] };
-        let mut builder = RunBuilder::new(int.clone());
+        let mut builder = RunBuilder::new(int);
         for file in 0..4 {
             let keys: Vec<i64> = (0..3_000).map(|_| rng.random_range(0..2_000)).collect();
             builder

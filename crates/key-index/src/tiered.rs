@@ -156,28 +156,30 @@ fn postings_intact(files: usize, slots: &[u32], postings: &[u8], rows: usize) ->
         if word_proof::slot_offset(slot) as usize != end {
             return false;
         }
-        let Some(mut list) = varint::PostingList::at(postings, end) else {
+        let Some(mut stream) = varint::PostingList::at(postings, end) else {
             return false;
         };
         // Postings strictly ascend: a repeated one is a gap of zero.
-        let mut last: Option<u64> = None;
-        for posting in list.by_ref() {
+        let mut greatest: Option<u64> = None;
+        for posting in stream.by_ref() {
             match posting {
-                Ok(posting) if last.is_none_or(|last| posting > last) => last = Some(posting),
+                Ok(posting) if greatest.is_none_or(|before| posting > before) => {
+                    greatest = Some(posting);
+                }
                 _ => return false,
             }
         }
         // The last posting holds the largest position; none at all is an
         // empty list, which a word never has. Each posting took at least one
         // byte, so the count fits a `usize` and the total cannot overflow.
-        let (Some(last), Ok(count)) = (last, usize::try_from(list.postings())) else {
+        let (Some(greatest), Ok(count)) = (greatest, usize::try_from(stream.postings())) else {
             return false;
         };
-        if last / files > POSITION_MASK {
+        if greatest / files > POSITION_MASK {
             return false;
         }
         total += count;
-        end = list.end();
+        end = stream.end();
     }
     end == postings.len() && total == rows
 }
