@@ -265,6 +265,23 @@ impl SnapshotSource {
             );
         }
 
+        if engine != Engine::Cayenne
+            && let Some(param) = acceleration.params.as_ref().and_then(|params| {
+                CAYENNE_PATH_PARAMS
+                    .iter()
+                    .find(|param| params.data.contains_key(**param))
+            })
+        {
+            return InvalidConfigurationSnafu {
+                config_key: "acceleration.params",
+                message: format!(
+                    "Dataset '{name}' reads snapshots from '{}' that were created with the '{engine}' engine, so `acceleration.params.{param}`, which sets where a Cayenne copy is kept, does not apply. Remove `acceleration.params.{param}`. See: {SNAPSHOT_SOURCE_DOCS}",
+                    self.location
+                ),
+            }
+            .fail();
+        }
+
         acceleration.enabled = true;
         acceleration.engine = Some(engine.to_string());
         acceleration.mode = Mode::File;
@@ -382,8 +399,8 @@ impl SnapshotSource {
 
 /// The accelerator params that choose where a dataset's data lives on disk. Where a
 /// snapshot dataset keeps its local copy is Spice's choice; see [`local_copy_params`].
-/// Cayenne's `cayenne_file_path` and `cayenne_metadata_dir` are allowed: its copy is
-/// per dataset, not per location, wherever it lives.
+/// [`CAYENNE_PATH_PARAMS`] are allowed: a Cayenne copy is per dataset, not per
+/// location, wherever it lives.
 const LOCAL_COPY_PARAMS: &[&str] = &[
     "duckdb_file",
     "duckdb_data_dir",
@@ -391,6 +408,10 @@ const LOCAL_COPY_PARAMS: &[&str] = &[
     "turso_file",
     "cayenne_s3_zone_ids",
 ];
+
+/// Where a Cayenne snapshot dataset keeps its copy, when it chooses. Rejected once the
+/// snapshots turn out to be another engine's.
+const CAYENNE_PATH_PARAMS: &[&str] = &["cayenne_file_path", "cayenne_metadata_dir"];
 
 /// Where a snapshot dataset keeps its local copy, for the engines that keep one file
 /// per dataset: under `.spice/data`, in a file named for the dataset and the location it
@@ -917,6 +938,15 @@ mod tests {
         assert_eq!(
             param("cayenne_metadata_dir").as_deref(),
             Some("/data/metadata/")
+        );
+
+        let message = source(&declared)
+            .acceleration(&TableReference::bare("modules"), Engine::DuckDB)
+            .expect_err("Cayenne paths do not apply to DuckDB snapshots")
+            .to_string();
+        assert!(
+            message.contains("Remove `acceleration.params.cayenne_"),
+            "{message}"
         );
     }
 
