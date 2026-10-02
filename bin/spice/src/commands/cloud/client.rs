@@ -1228,11 +1228,11 @@ pub async fn confirm_org_access(client: &CloudClient, org: &str) -> Result<()> {
     }
 }
 
-/// A stored credential Spice Cloud accepts as a user, and the organization it acts on.
+/// A stored credential Spice Cloud accepts as a user, and the organization it is bound to.
 #[derive(PartialEq, Eq)]
 pub struct UserCredential {
     pub token: String,
-    /// The organization Spice Cloud described for this credential, when it described one.
+    /// The organization the credential is bound to, when Spice Cloud described one.
     ///
     /// A Cloud Connect request that carries only the bearer token is answered for this
     /// organization, whatever organization the command selected.
@@ -1306,11 +1306,15 @@ async fn first_user_credential_with_probe(
     for token in candidates {
         let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
 
-        // `Some(acts_on)` when Spice Cloud described the credential; the identity probe
+        // `Some(bound_to)` when Spice Cloud described the credential; the identity probe
         // sends no organization, so the organization it answers with is the one the
-        // credential acts on by itself.
+        // credential is bound to. The name is server-supplied and is only carried when it
+        // is one the CLI would accept from the user, so it can be shown as-is.
         let described = match probe(&client).await {
-            Ok(context) => Some(Some(context.org_name).filter(|org| !org.is_empty())),
+            Ok(context) => Some(
+                Some(context.org_name)
+                    .filter(|org| !org.is_empty() && org::validate_org_name(org).is_ok()),
+            ),
             Err(err) => match classify_identity_failure(&err) {
                 IdentityFailure::Rejected => {
                     rejected += 1;
@@ -1339,10 +1343,10 @@ async fn first_user_credential_with_probe(
             continue;
         }
 
-        if let Some(acts_on) = described {
+        if let Some(bound_to) = described {
             return Ok(UserCredentialSearch::Found(UserCredential {
                 token: token.clone(),
-                org: acts_on,
+                org: bound_to,
             }));
         }
         fallback.get_or_insert(token);
@@ -1944,7 +1948,7 @@ mod tests {
     /// travels with the credential, so `spice cloud link` can say which
     /// organization its project listing was answered for.
     #[tokio::test]
-    async fn a_described_credential_carries_the_organization_it_acts_on() {
+    async fn a_described_credential_carries_the_organization_it_is_bound_to() {
         fn described_identity_probe(_: &CloudClient) -> IdentityProbeFuture<'_> {
             Box::pin(async {
                 Ok(spice_cloud_client::types::AuthContext {
@@ -1979,8 +1983,53 @@ mod tests {
         );
     }
 
+    /// A described credential whose organization Spice Cloud left blank, or named
+    /// in a shape the CLI would not accept from the user, carries no organization:
+    /// the name is shown to the user as-is, so only an acceptable one is kept.
+    #[tokio::test]
+    async fn a_described_credential_keeps_only_an_acceptable_organization_name() {
+        fn described_as(org_name: &str) -> spice_cloud_client::types::AuthContext {
+            spice_cloud_client::types::AuthContext {
+                username: "ada".to_string(),
+                email: "ada@example.com".to_string(),
+                org_name: org_name.to_string(),
+                app_name: None,
+                app_api_key: None,
+            }
+        }
+        fn blank_org_probe(_: &CloudClient) -> IdentityProbeFuture<'_> {
+            Box::pin(async { Ok(described_as("")) })
+        }
+        fn hostile_org_probe(_: &CloudClient) -> IdentityProbeFuture<'_> {
+            Box::pin(async { Ok(described_as("acme\x1b[31m\nSee: evil")) })
+        }
+
+        for (label, probe) in [
+            ("blank", blank_org_probe as IdentityProbe),
+            ("hostile", hostile_org_probe as IdentityProbe),
+        ] {
+            let outcome = first_user_credential_with_probe(
+                &["described-token".to_string()],
+                "https://cloud.invalid",
+                None,
+                probe,
+            )
+            .await
+            .expect("a described credential is found");
+
+            assert_eq!(
+                outcome,
+                UserCredentialSearch::Found(UserCredential {
+                    token: "described-token".to_string(),
+                    org: None,
+                }),
+                "a {label} organization name must not be carried"
+            );
+        }
+    }
+
     /// A credential Spice Cloud could not describe is still usable, but the
-    /// organization it acts on is unknown rather than guessed.
+    /// organization it is bound to is unknown rather than guessed.
     #[tokio::test]
     async fn an_undescribed_fallback_credential_carries_no_organization() {
         fn undescribed_identity_probe(_: &CloudClient) -> IdentityProbeFuture<'_> {
