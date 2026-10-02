@@ -49,8 +49,9 @@ limitations under the License.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Date32Type, Date64Type, Decimal128Type, DurationMicrosecondType, DurationMillisecondType,
-    DurationNanosecondType, DurationSecondType, Int8Type, Int16Type, Int32Type, Int64Type,
+    Date32Type, Date64Type, Decimal128Type, Decimal256Type, DurationMicrosecondType,
+    DurationMillisecondType, DurationNanosecondType, DurationSecondType, Int8Type, Int16Type,
+    Int32Type, Int64Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalYearMonthType,
     Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
@@ -64,7 +65,10 @@ use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use snafu::ensure;
 
 use crate::escape_proof::escape_value_into;
-use crate::{ColumnMismatchSnafu, Result, UnsupportedTypeSnafu};
+use crate::{
+    ColumnCountSnafu, ColumnLengthSnafu, ColumnTypeSnafu, Result, UnexpectedNullSnafu,
+    UnsupportedTypeSnafu,
+};
 
 const NULL_MARK: u8 = 0x00;
 const VALID_MARK: u8 = 0x01;
@@ -111,30 +115,110 @@ enum WordRule {
     Hashed { bits: u32 },
 }
 
-/// The encoded width of a value of `data_type` when it is fixed, for the
-/// types whose encoding is a fixed-width, injective image of the value. Other
-/// types return `None` and are hashed, which is always correct.
-fn fixed_width(data_type: &DataType) -> Option<usize> {
+/// A supported key column type: the Arrow types this encoding accepts, each
+/// named by how its values are read. [`kind`] is the one list of supported
+/// types; everything else matches a `Kind` exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Boolean,
+    Date32,
+    Date64,
+    Time32(TimeUnit),
+    Time64(TimeUnit),
+    Timestamp(TimeUnit),
+    Duration(TimeUnit),
+    Decimal128,
+    Decimal256,
+    Interval(IntervalUnit),
+    Utf8,
+    LargeUtf8,
+    Utf8View,
+    Binary,
+    LargeBinary,
+    BinaryView,
+    FixedSizeBinary(i32),
+}
+
+/// The [`Kind`] of `data_type`, or `None` when it has no order-preserving
+/// encoding here.
+fn kind(data_type: &DataType) -> Option<Kind> {
     Some(match data_type {
-        DataType::Int8 | DataType::UInt8 | DataType::Boolean => 1,
-        DataType::Int16 | DataType::UInt16 => 2,
-        DataType::Int32 | DataType::UInt32 | DataType::Date32 | DataType::Time32(_) => 4,
-        DataType::Int64
-        | DataType::UInt64
-        | DataType::Date64
-        | DataType::Time64(_)
-        | DataType::Timestamp(_, _)
-        | DataType::Duration(_) => 8,
-        DataType::FixedSizeBinary(width) => usize::try_from(*width).ok()?,
+        DataType::Int8 => Kind::Int8,
+        DataType::Int16 => Kind::Int16,
+        DataType::Int32 => Kind::Int32,
+        DataType::Int64 => Kind::Int64,
+        DataType::UInt8 => Kind::UInt8,
+        DataType::UInt16 => Kind::UInt16,
+        DataType::UInt32 => Kind::UInt32,
+        DataType::UInt64 => Kind::UInt64,
+        DataType::Boolean => Kind::Boolean,
+        DataType::Date32 => Kind::Date32,
+        DataType::Date64 => Kind::Date64,
+        DataType::Time32(unit) => Kind::Time32(*unit),
+        DataType::Time64(unit) => Kind::Time64(*unit),
+        DataType::Timestamp(unit, _) => Kind::Timestamp(*unit),
+        DataType::Duration(unit) => Kind::Duration(*unit),
+        DataType::Decimal128(_, _) => Kind::Decimal128,
+        DataType::Decimal256(_, _) => Kind::Decimal256,
+        DataType::Interval(unit) => Kind::Interval(*unit),
+        DataType::Utf8 => Kind::Utf8,
+        DataType::LargeUtf8 => Kind::LargeUtf8,
+        DataType::Utf8View => Kind::Utf8View,
+        DataType::Binary => Kind::Binary,
+        DataType::LargeBinary => Kind::LargeBinary,
+        DataType::BinaryView => Kind::BinaryView,
+        DataType::FixedSizeBinary(width) => Kind::FixedSizeBinary(*width),
         _ => return None,
     })
+}
+
+impl Kind {
+    /// The encoded width of a value when it is fixed, for the kinds whose
+    /// encoding is a fixed-width, injective image of the value and that may
+    /// fold into an exact word. Others return `None` and are hashed, which is
+    /// always correct.
+    fn fixed_width(self) -> Option<usize> {
+        match self {
+            Self::Int8 | Self::UInt8 | Self::Boolean => Some(1),
+            Self::Int16 | Self::UInt16 => Some(2),
+            Self::Int32 | Self::UInt32 | Self::Date32 | Self::Time32(_) => Some(4),
+            Self::Int64
+            | Self::UInt64
+            | Self::Date64
+            | Self::Time64(_)
+            | Self::Timestamp(_)
+            | Self::Duration(_) => Some(8),
+            Self::FixedSizeBinary(width) => usize::try_from(width).ok(),
+            Self::Decimal128
+            | Self::Decimal256
+            | Self::Interval(_)
+            | Self::Utf8
+            | Self::LargeUtf8
+            | Self::Utf8View
+            | Self::Binary
+            | Self::LargeBinary
+            | Self::BinaryView => None,
+        }
+    }
 }
 
 impl WordRule {
     fn of(fields: &[KeyField]) -> Self {
         let layout: Option<Vec<(bool, usize)>> = fields
             .iter()
-            .map(|field| fixed_width(&field.data_type).map(|width| (field.nullable, width)))
+            .map(|field| {
+                kind(&field.data_type)
+                    .and_then(Kind::fixed_width)
+                    .map(|width| (field.nullable, width))
+            })
             .collect();
         match layout {
             Some(layout) if layout.iter().map(|&(_, width)| width).sum::<usize>() <= 8 => {
@@ -155,7 +239,7 @@ impl KeyEncoder {
     pub fn new(fields: Vec<KeyField>) -> Result<Self> {
         for field in &fields {
             ensure!(
-                is_supported(&field.data_type),
+                kind(&field.data_type).is_some(),
                 UnsupportedTypeSnafu {
                     data_type: field.data_type.to_string(),
                 }
@@ -181,29 +265,30 @@ impl KeyEncoder {
     #[must_use]
     pub fn key_word(&self, key: &[u8]) -> u64 {
         let hashed = |key: &[u8]| hash_index::hash_key_bytes_oneshot(key);
-        if let WordRule::Hashed { bits } = self.words {
-            return hashed(key) & (u64::MAX >> (64 - bits));
-        }
-        if let WordRule::Exact(layout) = &self.words {
-            // The fields' value bytes without their markers: at most 8.
-            let mut bytes = [0_u8; 8];
-            let (mut at, mut len) = (0, 0);
-            for &(nullable, width) in layout {
-                at += usize::from(nullable);
-                let (Some(value), Some(slot)) =
-                    (key.get(at..at + width), bytes.get_mut(len..len + width))
-                else {
-                    return hashed(key);
-                };
-                slot.copy_from_slice(value);
-                at += width;
-                len += width;
+        match &self.words {
+            WordRule::Hashed { bits } => hashed(key) & (u64::MAX >> (64 - bits)),
+            WordRule::Exact(layout) => {
+                // The fields' value bytes without their markers: at most 8.
+                let mut bytes = [0_u8; 8];
+                let (mut at, mut len) = (0, 0);
+                for &(nullable, width) in layout {
+                    at += usize::from(nullable);
+                    let (Some(value), Some(slot)) =
+                        (key.get(at..at + width), bytes.get_mut(len..len + width))
+                    else {
+                        return hashed(key);
+                    };
+                    slot.copy_from_slice(value);
+                    at += width;
+                    len += width;
+                }
+                if at == key.len() {
+                    crate::word_proof::fold_word(&bytes[..len])
+                } else {
+                    hashed(key)
+                }
             }
-            if at == key.len() {
-                return crate::word_proof::fold_word(&bytes[..len]);
-            }
         }
-        hashed(key)
     }
 
     /// This encoder with every key hashed to a word of only `bits` bits (1 to
@@ -228,17 +313,16 @@ impl KeyEncoder {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::ColumnMismatch`] when the number of arrays, a type, a
-    /// length, or a NULL in a non-nullable field does not match.
+    /// [`crate::Error::ColumnCount`], [`crate::Error::ColumnType`],
+    /// [`crate::Error::ColumnLength`] or [`crate::Error::UnexpectedNull`] when
+    /// the number of arrays, a type, a length, or a NULL in a non-nullable
+    /// field does not match.
     pub fn bind<'a>(&self, columns: &'a [ArrayRef]) -> Result<BoundKeyColumns<'a>> {
         ensure!(
             columns.len() == self.fields.len(),
-            ColumnMismatchSnafu {
-                reason: format!(
-                    "expected {} key columns but received {}",
-                    self.fields.len(),
-                    columns.len()
-                ),
+            ColumnCountSnafu {
+                expected: self.fields.len(),
+                received: columns.len(),
             }
         );
         let num_rows = columns
@@ -248,28 +332,23 @@ impl KeyEncoder {
         for (index, (column, field)) in columns.iter().zip(&self.fields).enumerate() {
             ensure!(
                 column.data_type() == &field.data_type,
-                ColumnMismatchSnafu {
-                    reason: format!(
-                        "key column {index} is {} but the key declares {}",
-                        column.data_type(),
-                        field.data_type
-                    ),
+                ColumnTypeSnafu {
+                    index,
+                    found: column.data_type().clone(),
+                    declared: field.data_type.clone(),
                 }
             );
             ensure!(
                 column.len() == num_rows,
-                ColumnMismatchSnafu {
-                    reason: format!(
-                        "key column {index} has {} rows but key column 0 has {num_rows}",
-                        column.len()
-                    ),
+                ColumnLengthSnafu {
+                    index,
+                    rows: column.len(),
+                    expected: num_rows,
                 }
             );
             ensure!(
                 field.nullable || column.null_count() == 0,
-                ColumnMismatchSnafu {
-                    reason: format!("key column {index} is declared non-nullable but holds NULL"),
-                }
+                UnexpectedNullSnafu { index }
             );
             bound.push(BoundColumn {
                 data: ColumnData::new(column.as_ref())?,
@@ -282,37 +361,6 @@ impl KeyEncoder {
             num_rows,
         })
     }
-}
-
-fn is_supported(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Boolean
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Time64(_)
-            | DataType::Timestamp(_, _)
-            | DataType::Duration(_)
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::Interval(_)
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Utf8View
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::BinaryView
-            | DataType::FixedSizeBinary(_)
-    )
 }
 
 /// The typed values of one bound column.
@@ -342,90 +390,74 @@ enum ColumnData<'a> {
 
 impl<'a> ColumnData<'a> {
     fn new(array: &'a dyn Array) -> Result<Self> {
-        Ok(match array.data_type() {
-            DataType::Int8 => Self::I8(array.as_primitive::<Int8Type>().values()),
-            DataType::Int16 => Self::I16(array.as_primitive::<Int16Type>().values()),
-            DataType::Int32 => Self::I32(array.as_primitive::<Int32Type>().values()),
-            DataType::Int64 => Self::I64(array.as_primitive::<Int64Type>().values()),
-            DataType::UInt8 => Self::U8(array.as_primitive::<UInt8Type>().values()),
-            DataType::UInt16 => Self::U16(array.as_primitive::<UInt16Type>().values()),
-            DataType::UInt32 => Self::U32(array.as_primitive::<UInt32Type>().values()),
-            DataType::UInt64 => Self::U64(array.as_primitive::<UInt64Type>().values()),
-            DataType::Boolean => Self::Bool(array.as_boolean()),
-            DataType::Date32 => Self::I32(array.as_primitive::<Date32Type>().values()),
-            DataType::Date64 => Self::I64(array.as_primitive::<Date64Type>().values()),
-            DataType::Time32(TimeUnit::Second) => {
+        let Some(kind) = kind(array.data_type()) else {
+            return UnsupportedTypeSnafu {
+                data_type: array.data_type().to_string(),
+            }
+            .fail();
+        };
+        Ok(match kind {
+            Kind::Int8 => Self::I8(array.as_primitive::<Int8Type>().values()),
+            Kind::Int16 => Self::I16(array.as_primitive::<Int16Type>().values()),
+            Kind::Int32 => Self::I32(array.as_primitive::<Int32Type>().values()),
+            Kind::Int64 => Self::I64(array.as_primitive::<Int64Type>().values()),
+            Kind::UInt8 => Self::U8(array.as_primitive::<UInt8Type>().values()),
+            Kind::UInt16 => Self::U16(array.as_primitive::<UInt16Type>().values()),
+            Kind::UInt32 => Self::U32(array.as_primitive::<UInt32Type>().values()),
+            Kind::UInt64 => Self::U64(array.as_primitive::<UInt64Type>().values()),
+            Kind::Boolean => Self::Bool(array.as_boolean()),
+            Kind::Date32 => Self::I32(array.as_primitive::<Date32Type>().values()),
+            Kind::Date64 => Self::I64(array.as_primitive::<Date64Type>().values()),
+            Kind::Time32(TimeUnit::Second) => {
                 Self::I32(array.as_primitive::<Time32SecondType>().values())
             }
-            DataType::Time32(_) => {
-                Self::I32(array.as_primitive::<Time32MillisecondType>().values())
-            }
-            DataType::Time64(TimeUnit::Nanosecond) => {
+            Kind::Time32(_) => Self::I32(array.as_primitive::<Time32MillisecondType>().values()),
+            Kind::Time64(TimeUnit::Nanosecond) => {
                 Self::I64(array.as_primitive::<Time64NanosecondType>().values())
             }
-            DataType::Time64(_) => {
-                Self::I64(array.as_primitive::<Time64MicrosecondType>().values())
-            }
-            DataType::Timestamp(TimeUnit::Second, _) => {
+            Kind::Time64(_) => Self::I64(array.as_primitive::<Time64MicrosecondType>().values()),
+            Kind::Timestamp(TimeUnit::Second) => {
                 Self::I64(array.as_primitive::<TimestampSecondType>().values())
             }
-            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            Kind::Timestamp(TimeUnit::Millisecond) => {
                 Self::I64(array.as_primitive::<TimestampMillisecondType>().values())
             }
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            Kind::Timestamp(TimeUnit::Microsecond) => {
                 Self::I64(array.as_primitive::<TimestampMicrosecondType>().values())
             }
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            Kind::Timestamp(TimeUnit::Nanosecond) => {
                 Self::I64(array.as_primitive::<TimestampNanosecondType>().values())
             }
-            DataType::Duration(TimeUnit::Second) => {
+            Kind::Duration(TimeUnit::Second) => {
                 Self::I64(array.as_primitive::<DurationSecondType>().values())
             }
-            DataType::Duration(TimeUnit::Millisecond) => {
+            Kind::Duration(TimeUnit::Millisecond) => {
                 Self::I64(array.as_primitive::<DurationMillisecondType>().values())
             }
-            DataType::Duration(TimeUnit::Microsecond) => {
+            Kind::Duration(TimeUnit::Microsecond) => {
                 Self::I64(array.as_primitive::<DurationMicrosecondType>().values())
             }
-            DataType::Duration(TimeUnit::Nanosecond) => {
+            Kind::Duration(TimeUnit::Nanosecond) => {
                 Self::I64(array.as_primitive::<DurationNanosecondType>().values())
             }
-            DataType::Decimal256(_, _) => Self::I256(
-                array
-                    .as_primitive::<arrow_array::types::Decimal256Type>()
-                    .values(),
-            ),
-            DataType::Interval(IntervalUnit::YearMonth) => Self::I32(
-                array
-                    .as_primitive::<arrow_array::types::IntervalYearMonthType>()
-                    .values(),
-            ),
-            DataType::Interval(IntervalUnit::DayTime) => Self::DayTime(
-                array
-                    .as_primitive::<arrow_array::types::IntervalDayTimeType>()
-                    .values(),
-            ),
-            DataType::Interval(IntervalUnit::MonthDayNano) => Self::MonthDayNano(
-                array
-                    .as_primitive::<arrow_array::types::IntervalMonthDayNanoType>()
-                    .values(),
-            ),
-            DataType::Decimal128(_, _) => {
-                Self::I128(array.as_primitive::<Decimal128Type>().values())
+            Kind::Decimal128 => Self::I128(array.as_primitive::<Decimal128Type>().values()),
+            Kind::Decimal256 => Self::I256(array.as_primitive::<Decimal256Type>().values()),
+            Kind::Interval(IntervalUnit::YearMonth) => {
+                Self::I32(array.as_primitive::<IntervalYearMonthType>().values())
             }
-            DataType::Utf8 => Self::Utf8(array.as_string::<i32>()),
-            DataType::LargeUtf8 => Self::LargeUtf8(array.as_string::<i64>()),
-            DataType::Utf8View => Self::Utf8View(array.as_string_view()),
-            DataType::Binary => Self::Binary(array.as_binary::<i32>()),
-            DataType::LargeBinary => Self::LargeBinary(array.as_binary::<i64>()),
-            DataType::BinaryView => Self::BinaryView(array.as_binary_view()),
-            DataType::FixedSizeBinary(_) => Self::FixedBinary(array.as_fixed_size_binary()),
-            other => {
-                return UnsupportedTypeSnafu {
-                    data_type: other.to_string(),
-                }
-                .fail();
+            Kind::Interval(IntervalUnit::DayTime) => {
+                Self::DayTime(array.as_primitive::<IntervalDayTimeType>().values())
             }
+            Kind::Interval(IntervalUnit::MonthDayNano) => {
+                Self::MonthDayNano(array.as_primitive::<IntervalMonthDayNanoType>().values())
+            }
+            Kind::Utf8 => Self::Utf8(array.as_string::<i32>()),
+            Kind::LargeUtf8 => Self::LargeUtf8(array.as_string::<i64>()),
+            Kind::Utf8View => Self::Utf8View(array.as_string_view()),
+            Kind::Binary => Self::Binary(array.as_binary::<i32>()),
+            Kind::LargeBinary => Self::LargeBinary(array.as_binary::<i64>()),
+            Kind::BinaryView => Self::BinaryView(array.as_binary_view()),
+            Kind::FixedSizeBinary(_) => Self::FixedBinary(array.as_fixed_size_binary()),
         })
     }
 }

@@ -97,11 +97,50 @@ pub enum Error {
         data_type: String,
     },
 
-    /// The bound columns do not match the encoder's key fields.
-    #[snafu(display("Failed to encode an index key: {reason}"))]
-    ColumnMismatch {
-        /// What did not match.
-        reason: String,
+    /// A different number of columns was bound than the key has fields.
+    #[snafu(display(
+        "Failed to encode an index key: expected {expected} key columns but received {received}"
+    ))]
+    ColumnCount {
+        /// The key's fields.
+        expected: usize,
+        /// The columns bound.
+        received: usize,
+    },
+
+    /// A bound column's type is not its key field's.
+    #[snafu(display(
+        "Failed to encode an index key: key column {index} is {found} but the key declares {declared}"
+    ))]
+    ColumnType {
+        /// The column's position in the key.
+        index: usize,
+        /// The bound array's type.
+        found: arrow_schema::DataType,
+        /// The key field's type.
+        declared: arrow_schema::DataType,
+    },
+
+    /// The bound columns do not all have the same number of rows.
+    #[snafu(display(
+        "Failed to encode an index key: key column {index} has {rows} rows but key column 0 has {expected}"
+    ))]
+    ColumnLength {
+        /// The column's position in the key.
+        index: usize,
+        /// Its rows.
+        rows: usize,
+        /// The first column's rows.
+        expected: usize,
+    },
+
+    /// A column of a non-nullable key field holds NULL.
+    #[snafu(display(
+        "Failed to encode an index key: key column {index} is declared non-nullable but holds NULL"
+    ))]
+    UnexpectedNull {
+        /// The column's position in the key.
+        index: usize,
     },
 }
 

@@ -183,19 +183,60 @@ fn fixed_width_and_sliced_columns_encode_by_value() {
 fn bind_rejects_mismatched_columns() {
     let encoder = KeyEncoder::new(vec![KeyField::new(DataType::Int64, false)]).expect("int64 key");
     let wrong_type: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![1]))];
-    assert!(matches!(
-        encoder.bind(&wrong_type),
-        Err(Error::ColumnMismatch { .. })
-    ));
+    let error = encoder.bind(&wrong_type).expect_err("wrong type");
+    assert_eq!(
+        error,
+        Error::ColumnType {
+            index: 0,
+            found: DataType::Int32,
+            declared: DataType::Int64,
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "Failed to encode an index key: key column 0 is Int32 but the key declares Int64"
+    );
     let with_null: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(1), None]))];
-    assert!(matches!(
-        encoder.bind(&with_null),
-        Err(Error::ColumnMismatch { .. })
-    ));
-    assert!(matches!(
-        encoder.bind(&[]),
-        Err(Error::ColumnMismatch { .. })
-    ));
+    let error = encoder.bind(&with_null).expect_err("NULL");
+    assert_eq!(error, Error::UnexpectedNull { index: 0 });
+    assert_eq!(
+        error.to_string(),
+        "Failed to encode an index key: key column 0 is declared non-nullable but holds NULL"
+    );
+    let error = encoder.bind(&[]).expect_err("no columns");
+    assert_eq!(
+        error,
+        Error::ColumnCount {
+            expected: 1,
+            received: 0,
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "Failed to encode an index key: expected 1 key columns but received 0"
+    );
+    let pair = KeyEncoder::new(vec![
+        KeyField::new(DataType::Int64, false),
+        KeyField::new(DataType::Int64, false),
+    ])
+    .expect("pair key");
+    let uneven: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![1, 2])),
+        Arc::new(Int64Array::from(vec![1])),
+    ];
+    let error = pair.bind(&uneven).expect_err("uneven");
+    assert_eq!(
+        error,
+        Error::ColumnLength {
+            index: 1,
+            rows: 1,
+            expected: 2,
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "Failed to encode an index key: key column 1 has 1 rows but key column 0 has 2"
+    );
     assert!(matches!(
         KeyEncoder::new(vec![KeyField::new(
             DataType::List(Arc::new(arrow_schema::Field::new(
