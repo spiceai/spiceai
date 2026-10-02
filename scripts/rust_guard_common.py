@@ -65,12 +65,17 @@ def cargo_metadata() -> dict:
     # Valid JSON of the wrong shape is still a tooling error: a guard that indexed
     # it would crash with a traceback (exit 1), and one that defaulted a missing
     # key to empty would check nothing and report a clean tree (exit 0).
-    if not isinstance(meta, dict) or not all(
-        isinstance(meta.get(key), list) for key in ("packages", "workspace_members")
+    if not (
+        isinstance(meta, dict)
+        and isinstance(meta.get("packages"), list)
+        and isinstance(meta.get("workspace_members"), list)
+        and all(isinstance(pkg, dict) for pkg in meta["packages"])
+        and all(isinstance(member, str) for member in meta["workspace_members"])
     ):
         print(
-            "error: `cargo metadata` emitted JSON without `packages` and "
-            "`workspace_members` arrays, so the workspace layout cannot be read.",
+            "error: `cargo metadata` emitted JSON without a `packages` array of objects "
+            "and a `workspace_members` array of strings, so the workspace layout cannot "
+            "be read.",
             file=sys.stderr,
         )
         raise SystemExit(2)

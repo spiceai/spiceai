@@ -94,6 +94,18 @@ FAILURE_MODES = (
         "workspace layout cannot be read",
     ),
     (
+        "a package that is not an object",
+        'echo \'{"packages": [null], "workspace_members": []}\'',
+        0o755,
+        "workspace layout cannot be read",
+    ),
+    (
+        "a workspace member that is not a string",
+        'echo \'{"packages": [], "workspace_members": [null]}\'',
+        0o755,
+        "workspace layout cannot be read",
+    ),
+    (
         "no workspace_members array",
         'echo \'{"packages": []}\'',
         0o755,
