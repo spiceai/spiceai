@@ -126,9 +126,11 @@ use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion_common::JoinSide;
 use datafusion_common::stats::Precision;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
@@ -1054,11 +1056,18 @@ fn finish_sort_merge_rewrite(
         .with_preserve_partitioning(true),
     );
 
+    let filter = match hash_join.filter() {
+        None => None,
+        Some(filter) => match left_first_join_filter(filter)? {
+            Some(filter) => Some(filter),
+            None => return Ok(None),
+        },
+    };
     let join = SortMergeJoinExec::try_new(
         left,
         right,
         hash_join.on().to_vec(),
-        hash_join.filter().cloned(),
+        filter,
         *hash_join.join_type(),
         sort_options,
         hash_join.null_equality(),
@@ -1083,6 +1092,78 @@ fn finish_sort_merge_rewrite(
     );
 
     Ok(Some(join))
+}
+
+/// `filter` with its columns reordered so every left-side column precedes every
+/// right-side one, computing the same predicate.
+///
+/// `SortMergeJoinExec` assembles a filter's intermediate batch as all of its
+/// left-side columns followed by all of its right-side ones
+/// (`get_filter_columns`), whatever order the filter lists them in, while the
+/// filter's schema and expression follow the listed order. A hash join whose
+/// inputs were swapped lists them right first — `JoinFilter::swap` flips each
+/// column's side but keeps its position — so rewriting it to sort-merge unchanged
+/// puts the predicate's inputs in the wrong slots, and the query fails at
+/// execution (CH-benCH q17: `column types must match schema types, expected
+/// Int32 but found Float64 at column index 0`).
+///
+/// `None` when a column belongs to neither input (a mark join's), which a
+/// sort-merge join cannot evaluate; the caller keeps the hash join.
+fn left_first_join_filter(filter: &JoinFilter) -> Result<Option<JoinFilter>> {
+    let indices = filter.column_indices();
+    if indices
+        .iter()
+        .any(|column| !matches!(column.side, JoinSide::Left | JoinSide::Right))
+    {
+        return Ok(None);
+    }
+    let order: Vec<usize> = (0..indices.len())
+        .filter(|&i| indices[i].side == JoinSide::Left)
+        .chain((0..indices.len()).filter(|&i| indices[i].side == JoinSide::Right))
+        .collect();
+    if order
+        .iter()
+        .enumerate()
+        .all(|(position, &listed)| position == listed)
+    {
+        return Ok(Some(filter.clone()));
+    }
+    let mut position_of = vec![0; order.len()];
+    for (position, &listed) in order.iter().enumerate() {
+        position_of[listed] = position;
+    }
+    let listed_schema = filter.schema();
+    let fields: Vec<_> = order
+        .iter()
+        .map(|&listed| Arc::clone(&listed_schema.fields()[listed]))
+        .collect();
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        listed_schema.metadata().clone(),
+    ));
+    let column_indices = order
+        .iter()
+        .map(|&listed| indices[listed].clone())
+        .collect();
+    let expression = Arc::clone(filter.expression())
+        .transform(|expr| {
+            let Some(column) = expr.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(expr));
+            };
+            let Some(&position) = position_of.get(column.index()) else {
+                return Err(DataFusionError::Internal(format!(
+                    "join filter column {} (#{}) is outside its {}-column intermediate schema",
+                    column.name(),
+                    column.index(),
+                    position_of.len()
+                )));
+            };
+            Ok(Transformed::yes(
+                Arc::new(Column::new(column.name(), position)) as Arc<dyn PhysicalExpr>,
+            ))
+        })
+        .data()?;
+    Ok(Some(JoinFilter::new(expression, column_indices, schema)))
 }
 
 /// `HashJoinExec` may embed a column projection that `SortMergeJoinExec` does
@@ -3605,6 +3686,146 @@ mod tests {
             rewritten.num_rows(),
             100,
             "restored Hash child must emit every left-outer row"
+        );
+    }
+
+    /// Regression test for CH-benCH q17 failing under load with `column types
+    /// must match schema types, expected Int32 but found Float64 at column index
+    /// 0`. Once the planner swaps a hash join's inputs, its residual filter lists
+    /// the right input's column first; the sort-merge rewrite must hand
+    /// `SortMergeJoinExec` a filter in the left-first layout it assembles, and the
+    /// rewritten join must return the hash join's rows.
+    #[tokio::test]
+    async fn sort_merge_rewrite_keeps_a_right_first_join_filter_evaluable() {
+        use arrow::array::Float64Array;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+        use datafusion_common::JoinSide;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+
+        // Build side: q17's aggregated subquery `t(i_id, a)`.
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("i_id", DataType::Int64, false),
+            Field::new("a", DataType::Float64, false),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            Arc::clone(&left_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Float64Array::from(vec![5.0, 1.5])),
+            ],
+        )
+        .expect("left batch");
+        // Probe side: `order_line(ol_i_id, ol_quantity, ol_amount)`.
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("ol_i_id", DataType::Int64, false),
+            Field::new("ol_quantity", DataType::Int32, false),
+            Field::new("ol_amount", DataType::Int64, false),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 2, 2, 3])),
+                Arc::new(Int32Array::from(vec![3, 7, 1, 2, 1])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .expect("right batch");
+        let left =
+            MemorySourceConfig::try_new_exec(&[vec![left_batch]], Arc::clone(&left_schema), None)
+                .expect("left exec");
+        let right =
+            MemorySourceConfig::try_new_exec(&[vec![right_batch]], Arc::clone(&right_schema), None)
+                .expect("right exec");
+
+        // `CAST(ol_quantity@0 AS Float64) < a@1`, listed right first: the layout
+        // `JoinFilter::swap` leaves when the planner makes `t` the build side.
+        let filter_schema = Arc::new(Schema::new(vec![
+            Field::new("ol_quantity", DataType::Int32, false),
+            Field::new("a", DataType::Float64, false),
+        ]));
+        let predicate = Arc::new(BinaryExpr::new(
+            cast(
+                Arc::new(Column::new("ol_quantity", 0)),
+                filter_schema.as_ref(),
+                DataType::Float64,
+            )
+            .expect("cast ol_quantity"),
+            Operator::Lt,
+            Arc::new(Column::new("a", 1)),
+        )) as Arc<dyn PhysicalExpr>;
+        let filter = JoinFilter::new(
+            predicate,
+            vec![
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Right,
+                },
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+            ],
+            filter_schema,
+        );
+        let hash_join = HashJoinExec::try_new(
+            left,
+            right,
+            vec![(
+                Arc::new(Column::new("i_id", 0)) as Arc<dyn PhysicalExpr>,
+                Arc::new(Column::new("ol_i_id", 0)) as Arc<dyn PhysicalExpr>,
+            )],
+            Some(filter),
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .expect("hash join");
+
+        let rewritten = super::finish_sort_merge_rewrite(&hash_join, false)
+            .expect("the rewrite plans")
+            .expect("an inner hash join with a residual filter is rewritten");
+        assert!(
+            rewritten.is::<SortMergeJoinExec>(),
+            "the rewrite must produce the sort-merge join under test, got {}",
+            displayable(rewritten.as_ref()).one_line()
+        );
+
+        let rows = |batch: &RecordBatch| -> Vec<(i64, i32, i64)> {
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("i_id");
+            let quantity = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("ol_quantity");
+            let amount = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ol_amount");
+            let mut rows: Vec<_> = (0..batch.num_rows())
+                .map(|i| (id.value(i), quantity.value(i), amount.value(i)))
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+        let task = datafusion::execution::context::SessionContext::new().task_ctx();
+        let expected = rows(&collect_plan_rows(Arc::new(hash_join), Arc::clone(&task)).await);
+        assert_eq!(
+            expected,
+            vec![(1, 3, 10), (2, 1, 30)],
+            "hash join oracle: each item keeps only the lines below its average"
+        );
+        assert_eq!(
+            rows(&collect_plan_rows(rewritten, task).await),
+            expected,
+            "the sort-merge rewrite must return the hash join's rows"
         );
     }
 
