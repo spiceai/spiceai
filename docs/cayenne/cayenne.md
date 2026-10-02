@@ -109,7 +109,11 @@ Omitting `mode` on a Cayenne dataset therefore selects fully in-RAM Cayenne. Set
   configuration error). A per-table hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`;
   default unbounded) is enforced as a structured error during buffering; peak checks
   count **resident + incoming** even for overwrite, because the old tier stays live
-  until the atomic replace. S3 Express / `cayenne_file_path` params are ignored in
+  until the atomic replace. Bytes are the batches' resident memory with each Arrow
+  allocation counted once (`RetainedBytes`), not `get_array_memory_size()`, which
+  bills a batch decoded from Arrow IPC once per buffer sharing its message body — a
+  multiple of its real size equal to its buffer count. The per-table cap, the process-global `MemTierBudget` and its query-pool mirror all
+  charge this figure. S3 Express / `cayenne_file_path` params are ignored in
   this mode (no object store is built).
 
 Source: acceleration `mode` → `!is_file_accelerated()` in
@@ -1669,6 +1673,8 @@ All of these are cheap reads (atomic loads, a non-blocking `try_lock`, and one s
 
 The PK existence index is what an upsert-heavy apply leans on hardest, and its failures are silent: a discarded index is rebuilt from the table, which is correct but costs a full keyset scan.
 
+**Both indexes see every committed key.** Other writers record into the table-wide index and the per-shard index through `record_pk_keys_with_location`. The in-memory sharded apply grows the per-shard index itself and records into the table-wide one (`record_table_wide_pk_keys`), as the serial mem-tier apply does. The table-wide index is what the durable path validates against when a burst the in-memory tier cannot take (a truncate, a delete it cannot absorb, a commit that cannot defer) or the overload fallback writes durably, and what per-key OCC reads. A copy missing a key the sharded apply wrote would read an upsert of it as a new key and leave two live rows. The keys are recorded as `MEM_TIER`, a key-based location, so they still hide their rows after a checkpoint moves them into files.
+
 **A checkpoint does not cost the index.** The in-memory CDC checkpoint flushes the inline rows to files off `write_lock`, often while an apply has the per-shard index checked out for validation. A flush changes where rows live, not which keys are live, so the restore relabels the index's pre-flush `Inlined` entries (and the pending keys committed before the flush) as `FileUnlocated` and caches the index, exactly as the flush relabels an index sitting in its cache cell; a Bloom holds no locations and is simply kept. An index *rebuilt* during that checkout is kept too. Its rebuild reads the inline rows under the same listing fence as the snapshot list the flush registers its file in, so each moved row is in one or the other. Discarding instead would cost the next apply a full-table keyset rebuild under `write_lock`. On a large table that rebuild can outlast the next checkpoint, which could then discard the rebuilt index in turn.
 
 **Reported per cache, not per table.** A sharded (N>1) table keeps **two** indexes at once — the table-wide keyset and the per-shard index — each bounded by *half* the configured budget, and they transition independently. One can be an exact keyset still growing while the other has already degraded to a bloom, so every per-cache metric here carries `site` ∈ `table_keyset`, `sharded_keyset`. A per-table aggregate cannot express that mixed state, and the cache nearing its transition is the one worth knowing about.
@@ -1705,7 +1711,7 @@ The three are only interpretable together. Bytes alone cannot distinguish an **e
   Both are emitted on every tick whose `try_lock` on the cache succeeds (a busy cache skips them along with its shape) and **zeroed when that cache holds no bloom**, not skipped. A skipped gauge keeps its last value, so a cache that rebuilt an exact index would go on reporting the density of a filter that no longer exists — and a stale over-allocation reads exactly like a live one. A live bloom always allocates bits, so zero here unambiguously means "no bloom", which `cayenne_pk_index_format` states independently.
 - `cayenne_pk_bloom_split_rows_total{table, result}` — apply rows the filter split: `miss` rows skip on-conflict validation entirely, `hit` rows are validated. This is the filter's return on its resident bytes, stated directly.
 
-`cayenne_write_shape_shards{table, decision}` reports the encode fan-out a write resolved to together with the branch that chose it — `serial_sort_columns`, `serial_required`, `size_bounded`, `concurrency_bounded`. The shard count alone cannot be acted on: a fan-out of 1 from a configured write concurrency is a knob to raise, while one from a sort order is structural and no knob reaches it.
+`cayenne_write_shape_shards{table, decision}` reports the encode fan-out a write resolved to together with the branch that chose it — `serial_sort_columns`, `serial_required`, `size_bounded`, `concurrency_bounded`. The shard count alone cannot be acted on: a fan-out of 1 from a configured write concurrency is a knob to raise, while one from a sort order is structural and no knob reaches it. The size the `size_bounded` branch divides is the write's **resident** Arrow bytes, each physical allocation counted once (`RetainedBytes`). A checkpoint's corpus can arrive as Arrow IPC, where every buffer of a message points into one body allocation: the inline memtable always does (it is decoded out of the metastore's blobs), and so does an unsharded RAM CDC tier fed over Flight, which retains the batches as the source handed them. A sharded tier (`cdc_mem_tier_shards` > 1) does not: the PK-shard split rebuilds every column into fresh allocations, so only its inline corpus carries the shared body. Billing that allocation once per buffer over-counts a flush by its buffer count and fans a write smaller than one target file out to the concurrency ceiling, leaving compaction that many files to fold.
 
 ## A note on resolution
 
