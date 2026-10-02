@@ -41,6 +41,9 @@ name: mysql-cayenne[file]-adaptive-turso
 # The cold store is the shared MinIO (`s3://benchmarks`). Each run writes under its own prefix,
 # the Actions run id, so the HTAP workflow can delete that run's objects afterwards without
 # touching a concurrent run's.
+# spiced does not resolve `${env:…}` in `cayenne_datalake_location` yet (#14711), so the HTAP
+# workflow substitutes the run id into it before spiced starts. A move holds the table's write
+# lock for its whole duration (#12849), so CDC apply on that table pauses while it runs.
 
 # All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
 # (server_id derived from the connection identity - the engine default).

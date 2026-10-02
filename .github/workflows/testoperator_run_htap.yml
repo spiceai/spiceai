@@ -130,6 +130,26 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
+      # The adaptive configs place their Cayenne datalake tier under this run's id, via
+      # `${env:GITHUB_RUN_ID}` in `cayenne_datalake_location`. spiced does not resolve references
+      # in that parameter yet (#14711) and would write under a literal `${env:GITHUB_RUN_ID}`
+      # prefix that every run shares and the cleanup step below never deletes, so the reference is
+      # substituted into the checked-out spicepod before spiced reads it.
+      - name: Scope the Cayenne datalake tier to this run
+        env:
+          SPICEPOD: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+        run: |
+          if ! grep -q 'cayenne_datalake_location:.*\${env:GITHUB_RUN_ID}' "${SPICEPOD}"; then
+            echo "No run-scoped datalake location in ${SPICEPOD}; nothing to substitute."
+            exit 0
+          fi
+          sed -i "/cayenne_datalake_location:/ s|\${env:GITHUB_RUN_ID}|${GITHUB_RUN_ID}|g" "${SPICEPOD}"
+          if grep -q 'cayenne_datalake_location:.*\${' "${SPICEPOD}"; then
+            echo "::error::A reference is still left in cayenne_datalake_location in ${SPICEPOD}; spiced would write the datalake tier under it literally."
+            exit 1
+          fi
+          grep -n 'cayenne_datalake_location:' "${SPICEPOD}"
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
@@ -489,8 +509,9 @@ jobs:
       # would otherwise accumulate cold files every run: each promotion writes a new UUID-named
       # prefix and nothing GCs them (the query path reads the metastore manifest, never an S3
       # listing, so a fresh run never references a prior run's objects — they are dead weight, not
-      # a collision). The adaptive configs write under `s3://benchmarks/cayenne-datalake/<run id>/`,
-      # so this drops exactly this run's objects, never those of a run still in flight; the
+      # a collision). The adaptive configs write under `s3://benchmarks/cayenne-datalake/<run id>/`
+      # (substituted by the "Scope the Cayenne datalake tier to this run" step), so this drops
+      # exactly this run's objects, never those of a run still in flight; the
       # hand-tuned `-cold` configs use fixed `cayenne-cold-sf*` prefixes, dropped after their own
       # runs. `mc` + the `spice-minio` alias come from the Install MinIO step above. Runs on
       # failure/cancel too so a crashed run leaves no orphans.
