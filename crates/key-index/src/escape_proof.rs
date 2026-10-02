@@ -26,11 +26,12 @@ limitations under the License.
 //! each of those steps keeps the set of encodings prefix-free, so every
 //! compound key is.
 //!
-//! [`escape_into`] is a verified executable escape: its postcondition is the
-//! specification the lemmas are about. The streaming encoder in
-//! [`crate::encode`] produces the same bytes without materializing them; a
-//! differential test pins it to [`escape_into`], since the verifier cannot
-//! follow the streaming source's borrowed runs.
+//! [`escape_value_into`] is the executable escape [`crate::encode`] writes
+//! every string and binary value with, and its postcondition is the
+//! specification the lemmas are about. A value with no byte to escape (the
+//! common case) is copied whole and terminated, which [`lemma_escape_plain`]
+//! proves is its escape; any other value goes through [`escape_into`] byte by
+//! byte.
 //!
 //! Verus reads the `verus!` block; a normal `cargo build` erases the
 //! specifications and compiles the body as ordinary Rust. `cargo verus focus`
@@ -236,8 +237,73 @@ pub proof fn lemma_concat_prefix_free(
     }
 }
 
-/// Append the escape of `value` to `out`: the executable escape, verified
-/// against [`escape`].
+/// Whether no byte of `s` needs escaping: every byte is above `01`.
+pub open spec fn plain(s: Seq<u8>) -> bool {
+    forall|i: int| 0 <= i < s.len() ==> s[i] >= 2u8
+}
+
+/// A value with no byte to escape escapes to itself and the terminator.
+pub proof fn lemma_escape_plain(s: Seq<u8>)
+    requires
+        plain(s),
+    ensures
+        escape(s) == s + seq![0u8],
+    decreases s.len(),
+{
+    if s.len() == 0 {
+        assert(escape(s) =~= s + seq![0u8]);
+    } else {
+        let rest = s.subrange(1, s.len() as int);
+        assert(plain(rest));
+        lemma_escape_plain(rest);
+        assert(escape(s) == escape_byte(s[0]) + escape(rest));
+        assert(escape_byte(s[0]) == seq![s[0]]);
+        assert(escape(s) =~= s + seq![0u8]);
+    }
+}
+
+/// Whether no byte of `value` needs escaping.
+fn is_plain(value: &[u8]) -> (result: bool)
+    ensures
+        result == plain(value@),
+{
+    let mut i: usize = 0;
+    while i < value.len()
+        invariant
+            i <= value.len(),
+            forall|j: int| 0 <= j < i ==> value@[j] >= 2u8,
+        decreases value.len() - i,
+    {
+        if value[i] < 2 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Append the escape of `value` to `out`, verified against [`escape`]: the
+/// value copied whole and terminated when no byte needs escaping, and
+/// otherwise escaped byte by byte.
+#[inline]
+pub fn escape_value_into(value: &[u8], out: &mut Vec<u8>)
+    ensures
+        final(out)@ == old(out)@ + escape(value@),
+{
+    if is_plain(value) {
+        proof {
+            lemma_escape_plain(value@);
+        }
+        out.extend_from_slice(value);
+        out.push(0u8);
+        assert(out@ =~= old(out)@ + (value@ + seq![0u8]));
+    } else {
+        escape_into(value, out);
+    }
+}
+
+/// Append the escape of `value` to `out` one byte at a time, verified against
+/// [`escape`].
 pub fn escape_into(value: &[u8], out: &mut Vec<u8>)
     ensures
         final(out)@ == old(out)@ + escape(value@),

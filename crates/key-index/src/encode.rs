@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! A compact, order-preserving, prefix-free byte encoding of compound Arrow
-//! keys, readable one row at a time straight from the columns.
+//! keys, written one row at a time straight from the columns.
 //!
 //! A key is the concatenation of its columns' encodings, so the bytes of the
 //! leading columns are a prefix of the key and byte order is the order of the
@@ -63,14 +63,11 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use snafu::ensure;
 
-use crate::source::{KeySource, Run};
+use crate::escape_proof::escape_value_into;
 use crate::{ColumnMismatchSnafu, Result, UnsupportedTypeSnafu};
 
-const NULL_MARK: &[u8] = &[0x00];
-const VALID_MARK: &[u8] = &[0x01];
-const TERMINATOR: &[u8] = &[0x00];
-const ESCAPED_00: &[u8] = &[0x01, 0x01];
-const ESCAPED_01: &[u8] = &[0x01, 0x02];
+const NULL_MARK: u8 = 0x00;
+const VALID_MARK: u8 = 0x01;
 
 /// One column of a compound key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,27 +460,13 @@ impl<'a> BoundKeyColumns<'a> {
             .any(|column| column.nulls.is_some_and(|nulls| nulls.is_null(row)))
     }
 
-    /// A [`KeySource`] that produces the key of `row` from the columns as it
-    /// is read. `row` must be below [`Self::num_rows`].
-    #[inline]
-    #[must_use]
-    pub fn source(&self, row: usize) -> RowKeySource<'_, 'a> {
-        debug_assert!(row < self.num_rows);
-        RowKeySource {
-            columns: &self.columns,
-            row,
-            column: 0,
-            pending: Pending::None,
-        }
-    }
-
-    /// Append the key of `row` to `out`. The same bytes [`Self::source`]
-    /// produces, by construction: this drains that source.
+    /// Append the key of `row` to `out`. `row` must be below
+    /// [`Self::num_rows`].
     #[inline]
     pub fn encode_row(&self, row: usize, out: &mut Vec<u8>) {
-        let mut source = self.source(row);
-        while let Some(run) = source.next_run() {
-            out.extend_from_slice(run.as_slice());
+        debug_assert!(row < self.num_rows);
+        for column in &self.columns {
+            column.encode(row, out);
         }
     }
 
@@ -502,165 +485,61 @@ impl<'a> BoundKeyColumns<'a> {
     }
 }
 
-/// Bytes of the current column still to be produced.
-#[derive(Debug, Clone, Copy)]
-enum Pending<'a> {
-    None,
-    /// A variable-length value, escaped and then terminated.
-    Escaped(&'a [u8]),
-    /// A fixed-length value, produced as is.
-    Raw(&'a [u8]),
-    /// The second half of a value wider than one inline run (`Decimal256`).
-    Inline([u8; 16]),
-}
-
-/// The key of one row, produced column by column from the Arrow arrays
-/// without materializing it. Strings and binaries are borrowed from the
-/// arrays' buffers in runs between the bytes that need escaping.
-#[derive(Debug)]
-pub struct RowKeySource<'b, 'a> {
-    columns: &'b [BoundColumn<'a>],
-    row: usize,
-    column: usize,
-    pending: Pending<'a>,
-}
-
-#[inline]
-fn fixed<const N: usize>(marked: bool, bytes: [u8; N]) -> Run<'static> {
-    let mut buf = [0_u8; 17];
-    let start = usize::from(marked);
-    buf[0] = VALID_MARK[0];
-    buf[start..start + N].copy_from_slice(&bytes);
-    Run::inline(&buf[..start + N])
-}
-
-impl<'a> KeySource<'a> for RowKeySource<'_, 'a> {
+impl BoundColumn<'_> {
+    /// Append this column's encoding of `row` to `out`.
     #[inline]
-    fn next_run(&mut self) -> Option<Run<'a>> {
-        loop {
-            match self.pending {
-                Pending::None => {}
-                Pending::Raw(bytes) => {
-                    self.pending = Pending::None;
-                    self.column += 1;
-                    return Some(Run::borrowed(bytes));
-                }
-                Pending::Inline(bytes) => {
-                    self.pending = Pending::None;
-                    self.column += 1;
-                    return Some(Run::inline(&bytes));
-                }
-                Pending::Escaped(rest) => {
-                    return Some(match rest.iter().position(|&b| b < 0x02) {
-                        None if rest.is_empty() => {
-                            self.pending = Pending::None;
-                            self.column += 1;
-                            Run::borrowed(TERMINATOR)
-                        }
-                        None => {
-                            self.pending = Pending::Escaped(&[]);
-                            Run::borrowed(rest)
-                        }
-                        Some(0) => {
-                            self.pending = Pending::Escaped(&rest[1..]);
-                            Run::borrowed(if rest[0] == 0 { ESCAPED_00 } else { ESCAPED_01 })
-                        }
-                        Some(at) => {
-                            self.pending = Pending::Escaped(&rest[at..]);
-                            Run::borrowed(&rest[..at])
-                        }
-                    });
-                }
-            }
-
-            let column = self.columns.get(self.column)?;
-            let row = self.row;
-            if column.nulls.is_some_and(|nulls| nulls.is_null(row)) {
-                self.column += 1;
-                return Some(Run::borrowed(NULL_MARK));
-            }
-            let marked = column.nullable;
-            let run = match column.data {
-                ColumnData::I8(v) => fixed(marked, (v[row].cast_unsigned() ^ 0x80).to_be_bytes()),
-                ColumnData::I16(v) => {
-                    fixed(marked, (v[row].cast_unsigned() ^ (1 << 15)).to_be_bytes())
-                }
-                ColumnData::I32(v) => {
-                    fixed(marked, (v[row].cast_unsigned() ^ (1 << 31)).to_be_bytes())
-                }
-                ColumnData::I64(v) => {
-                    fixed(marked, (v[row].cast_unsigned() ^ (1 << 63)).to_be_bytes())
-                }
-                ColumnData::I128(v) => {
-                    fixed(marked, (v[row].cast_unsigned() ^ (1 << 127)).to_be_bytes())
-                }
-                ColumnData::I256(v) => {
-                    // 32 bytes, sign bit flipped, in two runs: the high half
-                    // (with the marker) now, the low half next.
-                    let mut bytes = v[row].to_be_bytes();
-                    bytes[0] ^= 0x80;
-                    self.pending = Pending::Inline(std::array::from_fn(|i| bytes[16 + i]));
-                    let high: [u8; 16] = std::array::from_fn(|i| bytes[i]);
-                    return Some(fixed(marked, high));
-                }
-                ColumnData::DayTime(v) => {
-                    let mut bytes = [0_u8; 8];
-                    bytes[..4]
-                        .copy_from_slice(&(v[row].days.cast_unsigned() ^ (1 << 31)).to_be_bytes());
-                    bytes[4..].copy_from_slice(
-                        &(v[row].milliseconds.cast_unsigned() ^ (1 << 31)).to_be_bytes(),
-                    );
-                    fixed(marked, bytes)
-                }
-                ColumnData::MonthDayNano(v) => {
-                    let mut bytes = [0_u8; 16];
-                    bytes[..4].copy_from_slice(
-                        &(v[row].months.cast_unsigned() ^ (1 << 31)).to_be_bytes(),
-                    );
-                    bytes[4..8]
-                        .copy_from_slice(&(v[row].days.cast_unsigned() ^ (1 << 31)).to_be_bytes());
-                    bytes[8..].copy_from_slice(
-                        &(v[row].nanoseconds.cast_unsigned() ^ (1 << 63)).to_be_bytes(),
-                    );
-                    fixed(marked, bytes)
-                }
-                ColumnData::U8(v) => fixed(marked, v[row].to_be_bytes()),
-                ColumnData::U16(v) => fixed(marked, v[row].to_be_bytes()),
-                ColumnData::U32(v) => fixed(marked, v[row].to_be_bytes()),
-                ColumnData::U64(v) => fixed(marked, v[row].to_be_bytes()),
-                ColumnData::Bool(v) => fixed(marked, [u8::from(v.value(row))]),
-                ColumnData::FixedBinary(v) => {
-                    self.pending = Pending::Raw(v.value(row));
-                    if marked {
-                        return Some(Run::borrowed(VALID_MARK));
-                    }
-                    continue;
-                }
-                ColumnData::Binary(v) => return self.start_escaped(v.value(row), marked),
-                ColumnData::LargeBinary(v) => return self.start_escaped(v.value(row), marked),
-                ColumnData::Utf8(v) => return self.start_escaped(v.value(row).as_bytes(), marked),
-                ColumnData::LargeUtf8(v) => {
-                    return self.start_escaped(v.value(row).as_bytes(), marked);
-                }
-                ColumnData::Utf8View(v) => {
-                    return self.start_escaped(v.value(row).as_bytes(), marked);
-                }
-                ColumnData::BinaryView(v) => return self.start_escaped(v.value(row), marked),
-            };
-            self.column += 1;
-            return Some(run);
+    fn encode(&self, row: usize, out: &mut Vec<u8>) {
+        if self.nulls.is_some_and(|nulls| nulls.is_null(row)) {
+            out.push(NULL_MARK);
+            return;
         }
-    }
-}
-
-impl<'a> RowKeySource<'_, 'a> {
-    #[inline]
-    fn start_escaped(&mut self, value: &'a [u8], marked: bool) -> Option<Run<'a>> {
-        self.pending = Pending::Escaped(value);
-        if marked {
-            Some(Run::borrowed(VALID_MARK))
-        } else {
-            self.next_run()
+        if self.nullable {
+            out.push(VALID_MARK);
+        }
+        match self.data {
+            ColumnData::I8(v) => out.push(v[row].cast_unsigned() ^ 0x80),
+            ColumnData::I16(v) => {
+                out.extend_from_slice(&(v[row].cast_unsigned() ^ (1 << 15)).to_be_bytes());
+            }
+            ColumnData::I32(v) => {
+                out.extend_from_slice(&(v[row].cast_unsigned() ^ (1 << 31)).to_be_bytes());
+            }
+            ColumnData::I64(v) => {
+                out.extend_from_slice(&(v[row].cast_unsigned() ^ (1 << 63)).to_be_bytes());
+            }
+            ColumnData::I128(v) => {
+                out.extend_from_slice(&(v[row].cast_unsigned() ^ (1 << 127)).to_be_bytes());
+            }
+            ColumnData::I256(v) => {
+                let mut bytes = v[row].to_be_bytes();
+                bytes[0] ^= 0x80;
+                out.extend_from_slice(&bytes);
+            }
+            ColumnData::DayTime(v) => {
+                out.extend_from_slice(&(v[row].days.cast_unsigned() ^ (1 << 31)).to_be_bytes());
+                out.extend_from_slice(
+                    &(v[row].milliseconds.cast_unsigned() ^ (1 << 31)).to_be_bytes(),
+                );
+            }
+            ColumnData::MonthDayNano(v) => {
+                out.extend_from_slice(&(v[row].months.cast_unsigned() ^ (1 << 31)).to_be_bytes());
+                out.extend_from_slice(&(v[row].days.cast_unsigned() ^ (1 << 31)).to_be_bytes());
+                out.extend_from_slice(
+                    &(v[row].nanoseconds.cast_unsigned() ^ (1 << 63)).to_be_bytes(),
+                );
+            }
+            ColumnData::U8(v) => out.push(v[row]),
+            ColumnData::U16(v) => out.extend_from_slice(&v[row].to_be_bytes()),
+            ColumnData::U32(v) => out.extend_from_slice(&v[row].to_be_bytes()),
+            ColumnData::U64(v) => out.extend_from_slice(&v[row].to_be_bytes()),
+            ColumnData::Bool(v) => out.push(u8::from(v.value(row))),
+            ColumnData::FixedBinary(v) => out.extend_from_slice(v.value(row)),
+            ColumnData::Binary(v) => escape_value_into(v.value(row), out),
+            ColumnData::LargeBinary(v) => escape_value_into(v.value(row), out),
+            ColumnData::Utf8(v) => escape_value_into(v.value(row).as_bytes(), out),
+            ColumnData::LargeUtf8(v) => escape_value_into(v.value(row).as_bytes(), out),
+            ColumnData::Utf8View(v) => escape_value_into(v.value(row).as_bytes(), out),
+            ColumnData::BinaryView(v) => escape_value_into(v.value(row), out),
         }
     }
 }

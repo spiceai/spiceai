@@ -209,12 +209,11 @@ fn bind_rejects_mismatched_columns() {
     ));
 }
 
-/// The streaming encoder produces exactly the verified escape
-/// (`escape_proof::escape_into`), so the prefix-freedom proved for the
-/// specification holds for the bytes stored in the runs. This test, not the
-/// proof, is what ties the streaming encoder to the specification.
+/// A key's bytes are the byte-by-byte escape (`escape_proof::escape_into`) of
+/// its value, behind a nullable column's marker, whether or not the value has
+/// a byte to escape: the encoder's whole-value fast path writes the same bytes.
 #[test]
-fn streaming_encoder_matches_the_verified_escape() {
+fn encoded_values_match_the_byte_by_byte_escape() {
     let mut rng = StdRng::seed_from_u64(0x5afe);
     let values: Vec<Vec<u8>> = (0..5_000)
         .map(|_| {
