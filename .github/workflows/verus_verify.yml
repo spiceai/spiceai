@@ -127,15 +127,31 @@ jobs:
       # from them. `--no-deps` reads the workspace's manifests without resolving
       # or building anything, and the runner's preinstalled stable is enough for
       # that: the pinned toolchain is only installed once there is work to do.
+      #
+      # The opt-in alone would let a crate leave the gate by flipping it to
+      # `verify = false` while keeping its proofs. Every crate that depends on
+      # `vstd` must therefore have opted in: proofs cannot be written without
+      # `vstd`, so the only way out of this list is to delete them.
       - name: List the verified crates
         id: crates
         run: |
           set -euo pipefail
-          dirs=$(RUSTUP_TOOLCHAIN=stable cargo metadata --no-deps --format-version 1 \
-            | jq -r --arg root "$PWD/" '.packages[]
-                | select(.metadata.verus.verify == true)
-                | .manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml")' \
-            | sort)
+          metadata=$(RUSTUP_TOOLCHAIN=stable cargo metadata --no-deps --format-version 1)
+          crate_dirs() {
+            jq -r --arg root "$PWD/" ".packages[] | select($1)
+                | .manifest_path | ltrimstr(\$root) | rtrimstr(\"/Cargo.toml\")" \
+              <<<"$metadata" | sort
+          }
+          dirs=$(crate_dirs '.metadata.verus.verify == true')
+          with_vstd=$(crate_dirs 'any(.dependencies[]; .name == "vstd")')
+          unverified=$(comm -13 <(echo "$dirs") <(echo "$with_vstd"))
+          if [ -n "$unverified" ]; then
+            echo "::error::These crates depend on vstd but do not set" \
+                 "[package.metadata.verus] verify = true, so their proofs would" \
+                 "go unchecked: $(echo $unverified). Opt them in, or remove" \
+                 "their proofs and the vstd dependency."
+            exit 1
+          fi
           if [ -z "$dirs" ]; then
             echo "::error::No workspace crate sets [package.metadata.verus] verify = true," \
                  "so this gate would verify nothing."
