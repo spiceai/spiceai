@@ -712,13 +712,13 @@ mod tests {
     use super::*;
     use crate::accelerated::refresh_completion::RefreshRequestId;
     use arrow_schema::{DataType, Field};
+    use async_trait::async_trait;
     use data_connector_api::accelerated::RefreshRequestError;
+    use runtime_acceleration::dataset_checkpoint::Result as CheckpointResult;
     use runtime_acceleration::snapshot::notifications::TestAnnouncer;
     use std::sync::atomic::AtomicUsize;
-    use tokio::task::JoinHandle;
-    use async_trait::async_trait;
-    use runtime_acceleration::dataset_checkpoint::Result as CheckpointResult;
     use std::time::SystemTime;
+    use tokio::task::JoinHandle;
 
     /// Stands in for a table's refresh loop. Each request is a reload of the
     /// snapshot published when it was requested; it completes at once unless
