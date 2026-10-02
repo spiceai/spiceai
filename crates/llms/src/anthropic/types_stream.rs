@@ -518,12 +518,16 @@ fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
     // model and the parameter to change. Returning it untouched keeps that explanation, and keeps
     // the `not_found_error` type a downstream check can still read.
     //
-    // An `invalid_request_error` carrying `param` was explained the same way, by
-    // `explain_rejected_sampling_control`: Anthropic's own error schema has no `param`, so the
-    // field is set only by this adapter, once the message names the model and the control.
+    // An `invalid_request_error` carrying both `param` and `code` was explained the same way, by
+    // `explain_rejected_sampling_control`: Anthropic's own error schema has neither field, so the
+    // pair is set only by this adapter, once the message names the model and the control. Both
+    // are required so that a gateway at a configured `endpoint` that answers in OpenAI's shape,
+    // which does carry `param`, still takes the arm below.
     let explained_upstream = match api_error.r#type.as_deref() {
         Some("not_found_error") => true,
-        Some("invalid_request_error") => api_error.param.is_some(),
+        Some("invalid_request_error") => {
+            api_error.param.is_some() && api_error.code.as_deref() == Some("invalid_request_error")
+        }
         _ => false,
     };
     if explained_upstream {
@@ -734,27 +738,30 @@ mod tests {
         assert_eq!(after.code.as_deref(), Some("invalid_request_error"));
     }
 
-    /// Anthropic's own `invalid_request_error` carries no `param`, so it still takes the generic
-    /// arm: only an error this adapter explained is passed through.
+    /// Anthropic's own `invalid_request_error` carries neither `param` nor `code`, and a gateway
+    /// answering in OpenAI's shape carries `param` alone; both still take the generic arm. Only an
+    /// error this adapter explained, which sets the pair, is passed through.
     #[test]
     fn an_unexplained_invalid_request_is_still_retyped() {
-        let OpenAIError::ApiError(after) =
-            format_anthropic_stream_error(OpenAIError::ApiError(ApiError {
-                message: "`temperature` is deprecated for this model.".to_string(),
-                r#type: Some("invalid_request_error".to_string()),
-                param: None,
-                code: None,
-            }))
-        else {
-            panic!("formatting must not change the error variant");
-        };
+        for param in [None, Some("temperature".to_string())] {
+            let OpenAIError::ApiError(after) =
+                format_anthropic_stream_error(OpenAIError::ApiError(ApiError {
+                    message: "`temperature` is deprecated for this model.".to_string(),
+                    r#type: Some("invalid_request_error".to_string()),
+                    param,
+                    code: None,
+                }))
+            else {
+                panic!("formatting must not change the error variant");
+            };
 
-        assert_eq!(after.r#type.as_deref(), Some("AnthropicStreamError"));
-        assert!(
-            after
-                .message
-                .contains("`temperature` is deprecated for this model.")
-        );
+            assert_eq!(after.r#type.as_deref(), Some("AnthropicStreamError"));
+            assert!(
+                after
+                    .message
+                    .contains("`temperature` is deprecated for this model.")
+            );
+        }
     }
 
     /// The `type` decides, and a message is never consulted when there is one. An
