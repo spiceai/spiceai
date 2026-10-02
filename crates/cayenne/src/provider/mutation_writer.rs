@@ -1033,7 +1033,8 @@ impl<'a> AppendMutationWriter<'a> {
                 // the tier. Instead run validation only to produce the combined
                 // on-conflict deletions for the durable path. The simplest correct
                 // route: re-run validation through the standard serial prepare on
-                // the durable side (it rebuilds the single index). We therefore
+                // the durable side, against the table-wide index (current: every
+                // sharded apply records its keys there too). We therefore
                 // hand back the raw batches with an EMPTY post-validation; the
                 // durable `write_prepared_stream` re-validates via its own
                 // `prepare_stream_for_insert`. To keep that contract, the fallback
