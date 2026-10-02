@@ -249,6 +249,14 @@ pub enum Error {
     #[snafu(display("Unable to delete table: {reason}"))]
     UnableToDeleteTable { reason: String },
 
+    #[snafu(display(
+        "Failed to drain changes for dataset '{dataset_name}', so its acceleration cannot be replaced: {source}"
+    ))]
+    UnableToDrainChanges {
+        dataset_name: String,
+        source: DataFusionError,
+    },
+
     #[snafu(display("Unable to parse SQL: {}", format_datafusion_error(source)))]
     UnableToParseSql { source: DataFusionError },
 
@@ -2868,10 +2876,35 @@ impl DataFusion {
         Ok(())
     }
 
+    async fn drain_registered_changes(&self, dataset_name: &TableReference) -> Result<()> {
+        if self.is_accelerated(dataset_name).await {
+            let provider = self
+                .get_accelerated_table_provider(&dataset_name.to_string())
+                .await?;
+            let table = spice_table::find_layer::<AcceleratedTable>(
+                provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            )
+            .ok_or_else(|| Error::UnableToDrainChanges {
+                dataset_name: dataset_name.to_string(),
+                source: DataFusionError::Internal(
+                    "Registered acceleration has no table-generation owner".into(),
+                ),
+            })?;
+            table.drain_changes(Duration::from_secs(30)).await.context(
+                UnableToDrainChangesSnafu {
+                    dataset_name: dataset_name.to_string(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     pub async fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
         }
+        self.drain_registered_changes(dataset_name).await?;
 
         if let Err(e) = self.ctx.deregister_table(dataset_name.clone()) {
             return UnableToDeleteTableSnafu {
@@ -2996,6 +3029,10 @@ impl DataFusion {
         // constraint guard: constraint columns must never be widened in place.
         let constraint_columns =
             dataset_constraint_columns(dataset, source_constraints, &source_schema);
+
+        // A replacement can open the same persistent storage. Fence and drain
+        // its previous owner before schema recovery or a new producer can write.
+        self.drain_registered_changes(&dataset.name).await?;
 
         let evolved_schema = self
             .handle_schema_difference(
@@ -3605,14 +3642,18 @@ impl DataFusion {
         // precision, Cayenne/Vortex has no half-precision float). The refresh sink
         // compares the incoming schema against the accelerated one, so without these
         // rules it reports the engine's own type as the acceleration lagging the source.
-        let engine_type_rewrites = self
+        let change_sink_engine = self
             .accelerator_engine_registry
             .get_accelerator_engine(acceleration_settings.engine)
-            .await
-            .map_or::<arrow_tools::type_rewrite::TypeRewriteRules, _>(&[], |accel| {
-                accel.type_rewrite_rules()
-            });
+            .await;
+        let engine_type_rewrites = change_sink_engine
+            .as_ref()
+            .map_or::<arrow_tools::type_rewrite::TypeRewriteRules, _>(
+            &[],
+            |accel| accel.type_rewrite_rules(),
+        );
         accelerated_table_builder.engine_type_rewrites(engine_type_rewrites);
+        accelerated_table_builder.change_sink_engine(change_sink_engine);
 
         source
             .on_accelerator_setup(dataset, &mut accelerated_table_builder)

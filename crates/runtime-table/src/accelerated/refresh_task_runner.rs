@@ -51,6 +51,7 @@ pub struct RefreshTaskRunnerBuilder {
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
     metrics: Option<Metrics>,
@@ -91,6 +92,7 @@ impl RefreshTaskRunnerBuilder {
             federated_source,
             refresh,
             accelerator,
+            change_sink: None,
             disable_federation: false,
             semaphore: None,
             metrics: None,
@@ -105,6 +107,15 @@ impl RefreshTaskRunnerBuilder {
             snapshot_refresh_state: None,
             in_flight_revalidations: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_change_sink(
+        mut self,
+        sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    ) -> Self {
+        self.change_sink = sink;
+        self
     }
 
     /// Sets the `disable_federation` flag
@@ -200,6 +211,7 @@ impl RefreshTaskRunnerBuilder {
             self.accelerator_write_mutex,
         )
         .with_disable_federation(self.disable_federation)
+        .with_change_sink(self.change_sink)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
         .with_metrics(self.metrics);
 

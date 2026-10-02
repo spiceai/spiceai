@@ -541,6 +541,7 @@ pub struct Refresher {
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
     // `Weak` reference to `Caching` is used to prevent blocking cache cleanup during runtime termination.
     caching: Option<Weak<Caching>>,
     /// The caching accelerator's claim set, forwarded to the refresh task so
@@ -615,6 +616,7 @@ impl Refresher {
             federated_source,
             refresh,
             accelerator,
+            change_sink: None,
             caching: None,
             in_flight_revalidations: None,
             refresh_task_runner: None,
@@ -647,6 +649,14 @@ impl Refresher {
         in_flight_revalidations: crate::accelerated::caching::InFlightRevalidations,
     ) -> &mut Self {
         self.in_flight_revalidations = Some(in_flight_revalidations);
+        self
+    }
+
+    pub fn with_change_sink(
+        &mut self,
+        sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    ) -> &mut Self {
+        self.change_sink = sink;
         self
     }
 
@@ -934,7 +944,9 @@ impl Refresher {
             refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
         }
 
-        refresh_task_runner = refresh_task_runner.with_metrics(self.metrics.clone());
+        refresh_task_runner = refresh_task_runner
+            .with_metrics(self.metrics.clone())
+            .with_change_sink(self.change_sink.clone());
 
         refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
 
@@ -1241,7 +1253,8 @@ impl Refresher {
         .with_s3_express_acceleration(self.is_s3_express_acceleration)
         .with_engine_type_rewrites(self.engine_type_rewrites)
         .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
-        .with_cdc_param_overrides(self.cdc_param_overrides.clone());
+        .with_cdc_param_overrides(self.cdc_param_overrides.clone())
+        .with_change_sink(self.change_sink.clone());
 
         let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);
