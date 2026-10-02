@@ -2108,7 +2108,11 @@ impl Runtime {
                         .find(|current| current.name == ds.name)
                         .and_then(|current| current.acceleration.clone());
                     Arc::clone(&self)
-                        .remove_dataset(ds.name.clone(), current_acceleration.as_ref())
+                        .remove_dataset(
+                            ds.name.clone(),
+                            current_acceleration.as_ref(),
+                            CacheInvalidation::Reload,
+                        )
                         .await;
                     self.status
                         .update_dataset(&ds.name, status::ComponentStatus::Initializing);
@@ -2135,7 +2139,11 @@ impl Runtime {
             // and before its load completed.
             if still_loading.contains(&ds.name) && self.df.table_exists(&ds.name) {
                 Arc::clone(&self)
-                    .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                    .remove_dataset(
+                        ds.name.clone(),
+                        ds.acceleration.as_ref(),
+                        CacheInvalidation::Reload,
+                    )
                     .await;
             }
 
