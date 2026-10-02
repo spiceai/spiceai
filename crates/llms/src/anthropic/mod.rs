@@ -147,7 +147,7 @@ fn explain_model_not_found(
 
 /// The sampling controls a request forwards to Anthropic, by the request field carrying each.
 ///
-/// `top_k` is deliberately absent: no OpenAI request field maps onto it, so the converter never
+/// `top_k` is deliberately absent: no `OpenAI` request field maps onto it, so the converter never
 /// sets it (see `MessageCreateParams::try_from`).
 fn forwarded_sampling_controls(params: &MessageCreateParams) -> Vec<&'static str> {
     let mut controls = Vec::new();
@@ -170,7 +170,7 @@ fn rejected_control_sentence(control: &str) -> String {
 ///
 /// Anthropic's newest generation rejects `temperature` and `top_p` outright — not a degraded
 /// result, a `400` on every request — and its error says only ``temperature` is deprecated for
-/// this model.`: it names no model, and does not say that the value reaches the request from the
+/// this model.``: it names no model, and does not say that the value reaches the request from the
 /// model's `params` as readily as from the request itself
 /// (<https://github.com/spiceai/spiceai/issues/13564>).
 ///
