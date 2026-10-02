@@ -4358,10 +4358,10 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     }
 
     /// Regression test for #14609: a source that is down when the dataset loads
-    /// reports `UnableToConnectInvalidHostOrPort`, which
-    /// `DataConnectorError::is_retriable` lists as unretriable. The dataset must keep
-    /// retrying so it recovers once the source is reachable. Rejected credentials and
-    /// TLS failures are configuration errors and stay permanent.
+    /// reports `UnableToConnectInvalidHostOrPort`, which must not be a permanent
+    /// failure, so the dataset keeps retrying and recovers once the source is
+    /// reachable. Rejected credentials and TLS failures are configuration errors and
+    /// stay permanent.
     #[test]
     fn an_unreachable_source_stays_retriable_but_rejected_credentials_do_not() {
         let component = crate::dataconnector::ConnectorComponent::Dataset(Arc::new(
