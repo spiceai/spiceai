@@ -143,7 +143,11 @@ fn word_hash(word: u64) -> u64 {
 /// `rows`. A stream that ended early would skip rows after the damage, and two
 /// words sharing one would give the second the first's rows.
 fn postings_intact(files: usize, slots: &[u32], postings: &[u8], rows: usize) -> bool {
-    let files = files.max(1) as u64;
+    // A posting names one of the run's files, so a run of none holds none.
+    if files == 0 {
+        return slots.is_empty() && postings.is_empty() && rows == 0;
+    }
+    let files = files as u64;
     // Where the next word's stream has to start.
     let mut end = 0_usize;
     let mut total = 0_usize;
