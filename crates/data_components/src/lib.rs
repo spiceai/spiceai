@@ -60,7 +60,6 @@ pub mod duckdb;
 pub mod ducklake;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
-#[cfg(feature = "federation")]
 pub mod federation;
 pub mod flight;
 #[cfg(feature = "flightsql")]

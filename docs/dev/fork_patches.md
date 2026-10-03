@@ -209,16 +209,17 @@ The unparser rows are the highest-consequence set in this file: every one of the
 changes the SQL sent to a federated engine, and every failure mode is *more or fewer
 rows than the plan asked for*, with no error.
 
-Every guard naming `crates/data_components/src/federation.rs` needs the crate's
-`federation` feature, which is **not** in its defaults:
+Every guard naming `crates/data_components/src/federation.rs` runs in a plain scoped
+test of the crate, with no feature flag:
 
 ```sh
-cargo test -p data_components --features federation --lib federation::
+cargo test -p data_components --lib federation::
 ```
 
-Without it the module is not compiled and the whole file is skipped — the run is
-green and reports nothing, which is the same shape as the loss these guards exist to
-catch.
+The module is compiled unconditionally — the crate enables
+`datafusion-table-providers/federation` itself rather than behind an opt-in feature —
+so no scoped run can leave the file out and report green with nothing checked, which
+is the same shape as the loss these guards exist to catch ([#13625](https://github.com/spiceai/spiceai/issues/13625)).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|

@@ -65,8 +65,12 @@ use util::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("HTTP request failed: {source}"))]
-    HttpRequest { source: reqwest::Error },
+    /// Build with [`Error::http_request`].
+    #[snafu(display("HTTP request to {endpoint} failed: {source}"))]
+    HttpRequest {
+        endpoint: String,
+        source: reqwest::Error,
+    },
 
     #[snafu(display("HTTP request failed with status code {status}"))]
     HttpServerError { status: u16 },
@@ -76,11 +80,6 @@ pub enum Error {
 
     #[snafu(display("HTTP request was rate limited: {message}"))]
     RateLimited { message: String },
-
-    #[snafu(display(
-        "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
-    ))]
-    AllRetriesFailed { max_retries: usize, url: String },
 
     #[snafu(display("Invalid URL: {source}"))]
     InvalidUrl { source: url::ParseError },
@@ -106,6 +105,24 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The part of an endpoint that is safe to put in an error or a log line: its origin.
+/// Userinfo, path and query can carry an API key, a signed parameter or a query-supplied
+/// filter value, and whoever reads a query error need not be the spicepod's operator.
+fn endpoint_label(url: &Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+impl Error {
+    /// A transport failure on a request to `endpoint`. `reqwest::Error`'s `Display` appends
+    /// the full request URL, so it is stripped and only [`endpoint_label`] is named.
+    fn http_request(endpoint: &Url, source: reqwest::Error) -> Self {
+        Error::HttpRequest {
+            endpoint: endpoint_label(endpoint),
+            source: source.without_url(),
+        }
+    }
+}
+
 /// A retryable HTTP status retains its response so the final allowed attempt
 /// can supply its body and metadata after the retry budget is exhausted.
 enum RequestAttemptError {
@@ -129,21 +146,16 @@ impl From<Error> for DataFusionError {
             Error::HttpServerError { status } => DataFusionError::External(Box::new(
                 std::io::Error::other(format!("HTTP request failed with status code {status}")),
             )),
-            // Retry exhaustion is an external error
-            Error::AllRetriesFailed { max_retries, url } => {
-                DataFusionError::External(Box::new(std::io::Error::other(format!(
-                    "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
-                ))))
-            }
             Error::RateLimited { message } => DataFusionError::External(Box::new(
                 std::io::Error::other(format!("HTTP request was rate limited: {message}")),
             )),
             // All other errors are internal/external errors
-            Error::HttpRequest { source } => DataFusionError::External(Box::new(source)),
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
-            err @ Error::JsonNesting { .. } => DataFusionError::External(Box::new(err)),
+            err @ (Error::HttpRequest { .. } | Error::JsonNesting { .. }) => {
+                DataFusionError::External(Box::new(err))
+            }
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
@@ -1195,7 +1207,9 @@ impl HttpTableProvider {
             test_url
         };
 
-        tracing::debug!("Validating HTTP endpoint: {test_url}");
+        // The probe URL keeps the configured query string, so log only its origin.
+        let endpoint = endpoint_label(&test_url);
+        tracing::debug!("Validating HTTP endpoint: {endpoint}");
 
         let _rate_control_permit = self.acquire_rate_control_permit().await?;
 
@@ -1206,22 +1220,21 @@ impl HttpTableProvider {
                 let status = response.status();
                 if self.health_probe.is_some() {
                     tracing::debug!(
-                        "HTTP endpoint validation response using health probe: {test_url} (status: {status})"
+                        "HTTP endpoint validation response using health probe: {endpoint} (status: {status})"
                     );
                     // For custom health probe, require successful status (2xx)
                     if !status.is_success() {
                         return Err(Error::HttpClientError {
                             status: status.as_u16(),
                             message: format!(
-                                "Failed to validate HTTP endpoint {}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
-                                self.base_url,
+                                "Failed to validate HTTP endpoint {endpoint}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
                                 test_url.path()
                             ),
                         });
                     }
                 } else {
                     tracing::debug!(
-                        "HTTP endpoint validation response: {test_url} (status: {status}). Any status (including 404) is expected for the random probe path."
+                        "HTTP endpoint validation response: {endpoint} (status: {status}). Any status (including 404) is expected for the random probe path."
                     );
                     // Any response (including 404) means the endpoint is reachable
                 }
@@ -1229,7 +1242,7 @@ impl HttpTableProvider {
             }
             Err(e) => {
                 // Check the error type to provide more specific messages and just return the error
-                Err(Error::HttpRequest { source: e })
+                Err(Error::http_request(&self.base_url, e))
             }
         }
     }
@@ -1484,11 +1497,13 @@ impl HttpTableProvider {
             url.set_query(Some(q));
         }
 
-        let final_url = url.as_str().to_owned();
-        final_url
+        url.as_str()
             .parse::<Uri>()
             .map_err(|err| Error::FilterRejected {
-                message: format!("Constructed request URI '{final_url}' is invalid: {err}"),
+                message: format!(
+                    "Constructed request URI for {} is invalid: {err}",
+                    endpoint_label(&url)
+                ),
             })?;
 
         Ok(url)
@@ -1561,6 +1576,7 @@ impl HttpTableProvider {
                 let status_code = response.status().as_u16();
                 Self::extract_response(
                     *response,
+                    &self.base_url,
                     status_code,
                     path_label,
                     attempt_started,
@@ -1635,10 +1651,9 @@ impl HttpTableProvider {
         }
 
         let response = request_builder.send().await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {e}");
-            RetryError::transient(RequestAttemptError::Failure(Error::HttpRequest {
-                source: e,
-            }))
+            let err = Error::http_request(&self.base_url, e);
+            tracing::debug!("{err}");
+            RetryError::transient(RequestAttemptError::Failure(err))
         })?;
 
         let status_code = response.status().as_u16();
@@ -1658,6 +1673,7 @@ impl HttpTableProvider {
         // 2xx, 3xx, 4xx: valid response; 4xx may be a business response.
         Self::extract_response(
             response,
+            &self.base_url,
             status_code,
             path_label,
             attempt_started,
@@ -1676,6 +1692,7 @@ impl HttpTableProvider {
     /// Extract content and metadata from an HTTP response.
     async fn extract_response(
         response: reqwest::Response,
+        endpoint: &Url,
         status_code: u16,
         path_label: &str,
         attempt_started: Instant,
@@ -1798,7 +1815,7 @@ impl HttpTableProvider {
         let content = response
             .text()
             .await
-            .map_err(|e| RetryError::transient(Error::HttpRequest { source: e }))?;
+            .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -3186,8 +3203,8 @@ fn resolve_and_validate_url(raw: &str, base_url: &Url, context: &str) -> Result<
         return Err(Error::Pagination {
             message: format!(
                 "{context} URL origin '{}' does not match base URL origin '{}'. The next page URL must stay on the same origin.",
-                resolved.origin().ascii_serialization(),
-                base_url.origin().ascii_serialization(),
+                endpoint_label(&resolved),
+                endpoint_label(base_url),
             ),
         });
     }
@@ -5322,7 +5339,7 @@ mod tests {
             else {
                 panic!("connection refusal should fail");
             };
-            assert!(matches!(error, Error::HttpRequest { source } if source.is_connect()));
+            assert!(matches!(error, Error::HttpRequest { source, .. } if source.is_connect()));
             assert_eq!(permits.permits_acquired_total(), budget as u64 + 1);
         }
 
@@ -5335,10 +5352,77 @@ mod tests {
         else {
             panic!("timed out origin should fail");
         };
-        assert!(matches!(error, Error::HttpRequest { source } if source.is_timeout()));
+        assert!(matches!(error, Error::HttpRequest { source, .. } if source.is_timeout()));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert_eq!(permits.permits_acquired_total(), 1);
         server.abort();
+    }
+
+    /// A transport failure names the endpoint's origin and nothing a URL can carry a
+    /// secret in: userinfo, path or query (regression test for #13534).
+    #[tokio::test]
+    async fn http_transport_failure_does_not_render_request_url() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refusal socket");
+        let addr = listener.local_addr().expect("socket address");
+        drop(listener);
+        let url = Url::parse(&format!(
+            "http://user:pass-secret@{addr}/path-secret?api_key=query-secret"
+        ))
+        .expect("valid URL");
+        let origin = format!("http://{addr}");
+        let (provider, _) = retry_test_provider(url.clone(), 0, Duration::from_secs(2));
+
+        let Err(send_error) = provider
+            .perform_request_with_retry(url, None, None, "/path-secret")
+            .await
+        else {
+            panic!("connection refusal should fail");
+        };
+        let validate_error = provider
+            .validate_endpoint()
+            .await
+            .expect_err("connection refusal should fail validation");
+
+        for error in [send_error, validate_error] {
+            assert!(matches!(&error, Error::HttpRequest { source, .. } if source.is_connect()));
+            let rendered = [error.to_string(), DataFusionError::from(error).to_string()];
+            for message in rendered {
+                assert_names_only_origin(&message, &origin);
+            }
+        }
+    }
+
+    /// A health probe that answers non-2xx names the endpoint's origin, not the configured
+    /// URL with its userinfo and query (regression test for #13534).
+    #[tokio::test]
+    async fn http_health_probe_failure_does_not_render_configured_url() {
+        let (mut url, _, server) =
+            retry_test_server(vec![(404, String::new())], Duration::ZERO).await;
+        let origin = endpoint_label(&url);
+        url.set_username("user").expect("set username");
+        url.set_password(Some("pass-secret")).expect("set password");
+        url.set_path("/path-secret");
+        url.set_query(Some("api_key=query-secret"));
+        let (provider, _) = retry_test_provider(url, 0, Duration::from_secs(2));
+        let provider = provider
+            .with_health_probe(Some("/health".to_string()))
+            .expect("valid health probe");
+
+        let error = provider
+            .validate_endpoint()
+            .await
+            .expect_err("a 404 health probe should fail validation");
+        assert_names_only_origin(&error.to_string(), &origin);
+        server.abort();
+    }
+
+    fn assert_names_only_origin(message: &str, origin: &str) {
+        assert!(message.contains(origin), "names the origin: {message}");
+        for secret in ["pass-secret", "path-secret", "query-secret", "user:"] {
+            assert!(!message.contains(secret), "leaks {secret}: {message}");
+        }
     }
 
     #[tokio::test]
