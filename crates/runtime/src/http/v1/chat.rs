@@ -48,7 +48,6 @@ use futures::StreamExt;
 use http::HeaderValue;
 use llms::chat::Chat;
 use runtime_request_context::{AsyncMarker, RequestContext};
-use runtime_status::RuntimeStatus;
 use serde::Serialize;
 use tokio::{
     select,
