@@ -141,6 +141,32 @@ fn default_expected_dir(scale_factor: f64) -> PathBuf {
     ))
 }
 
+/// Accept `--scale-factor` only when it is a positive finite number.
+fn require_scale_factor(scale_factor: Option<f64>) -> Result<()> {
+    match scale_factor {
+        Some(scale_factor) => datagen::require_positive_scale_factor(scale_factor),
+        None => Ok(()),
+    }
+}
+
+/// Goldens for a `--scale-factor` / `--expected` run. The scale factor is
+/// checked first: `0` and `-1` map to directories that are not committed, so
+/// a missing-directory check here would hide `InvalidScaleFactor`.
+fn resolve_expected_dir(
+    scale_factor: Option<f64>,
+    expected: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    require_scale_factor(scale_factor)?;
+    let expected_dir = expected.or_else(|| scale_factor.map(default_expected_dir));
+    if let Some(dir) = &expected_dir {
+        ensure!(
+            dir.is_dir(),
+            error::MissingExpectedDirSnafu { path: dir.clone() }
+        );
+    }
+    Ok(expected_dir)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -154,6 +180,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<ExitCode> {
     let args = Args::parse();
+    require_scale_factor(args.scale_factor)?;
     if let (Some(dir), Some(scale_factor)) = (&args.write_data, args.scale_factor) {
         return write_data(scale_factor, dir).await;
     }
@@ -165,16 +192,7 @@ async fn run() -> Result<ExitCode> {
         .out_csv
         .clone()
         .unwrap_or_else(|| args.mode.default_output("csv"));
-    let expected_dir = args
-        .expected
-        .clone()
-        .or_else(|| args.scale_factor.map(default_expected_dir));
-    if let Some(dir) = &expected_dir {
-        ensure!(
-            dir.is_dir(),
-            error::MissingExpectedDirSnafu { path: dir.clone() }
-        );
-    }
+    let expected_dir = resolve_expected_dir(args.scale_factor, args.expected)?;
     let suite = load_tpch_suite(&args.suite, expected_dir.as_deref())?;
     println!(
         "Loaded IBM suite '{}' v{} ({} cases) from {}",
@@ -349,5 +367,41 @@ mod tests {
             })
             .expect("the workspace patches `datafusion` to a spiceai/datafusion revision");
         assert_eq!(super::DATAFUSION_FORK_REV, pinned);
+    }
+
+    /// `--scale-factor 0` / `-1` must not become `MissingExpectedDir`.
+    /// Those values map to `expected/sf0` and `expected/sf-1`, which are not
+    /// committed, so a directory check before this validation hides the
+    /// actionable error (regression for the review on #14522).
+    #[test]
+    fn invalid_scale_factor_is_rejected_before_the_expected_dir_is_resolved() {
+        for scale_factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let err = super::resolve_expected_dir(Some(scale_factor), None)
+                .err()
+                .expect("invalid scale factor");
+            assert!(
+                matches!(err, crate::error::Error::InvalidScaleFactor { .. }),
+                "{scale_factor}: {err}"
+            );
+            let dir = super::default_expected_dir(scale_factor);
+            assert!(
+                !dir.is_dir(),
+                "{scale_factor}: {} must not exist; a directory check here would hide InvalidScaleFactor",
+                dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_expected_dir_is_still_reported_when_the_scale_factor_is_valid() {
+        let path =
+            std::path::PathBuf::from("tools/substrait-compliance/expected/sf-does-not-exist");
+        let err = super::resolve_expected_dir(Some(1.0), Some(path.clone()))
+            .err()
+            .expect("missing expected dir");
+        assert!(
+            matches!(err, crate::error::Error::MissingExpectedDir { ref path: p } if *p == path),
+            "{err}"
+        );
     }
 }

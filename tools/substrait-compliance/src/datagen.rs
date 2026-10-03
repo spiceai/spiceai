@@ -79,16 +79,26 @@ impl GeneratedTable {
     }
 }
 
+/// Reject a `--scale-factor` that is not a positive finite number.
+///
+/// Called from `main` immediately after parse: `0` and `-1` map to
+/// `expected/sf0` and `expected/sf-1`, which are not committed, so a
+/// missing-directory check would fire first and hide this error.
+pub(crate) fn require_positive_scale_factor(scale_factor: f64) -> Result<()> {
+    ensure!(
+        scale_factor.is_finite() && scale_factor > 0.0,
+        error::InvalidScaleFactorSnafu { scale_factor }
+    );
+    Ok(())
+}
+
 /// Generate all eight TPC-H tables at `scale_factor`, each split `parts` ways
 /// and generated in parallel.
 ///
 /// `nation` and `region` are always one part: their generators ignore the
 /// part arguments and return every row, so splitting them would repeat rows.
 pub async fn generate(scale_factor: f64, parts: usize) -> Result<Vec<GeneratedTable>> {
-    ensure!(
-        scale_factor.is_finite() && scale_factor > 0.0,
-        error::InvalidScaleFactorSnafu { scale_factor }
-    );
+    require_positive_scale_factor(scale_factor)?;
     let parts = i32::try_from(parts.max(1)).unwrap_or(i32::MAX);
 
     let mut tasks = JoinSet::new();
