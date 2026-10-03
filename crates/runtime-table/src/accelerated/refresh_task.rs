@@ -685,6 +685,12 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<RefreshOutcome, RetryError<super::Error>> {
+        // A refresh whose source has not been reached yet waits for it before it runs,
+        // and reports `Refreshing` only then: while the source cannot be reached, the
+        // dataset is served from its acceleration and reports `Error` with the cause.
+        // Immediate for a source already reached.
+        let _ = self.federated.try_wait_table_provider().await;
+
         self.set_refresh_status(
             refresh.display_sql().as_deref(),
             status::ComponentStatus::Refreshing,

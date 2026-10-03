@@ -1054,6 +1054,47 @@ mod served_from_acceleration {
         Ok(())
     }
 
+    /// A refresh started while the source cannot be reached waits for the source before
+    /// it runs, so the dataset keeps reporting `Error` rather than flipping to
+    /// `Refreshing` for as long as the source stays down.
+    #[tokio::test]
+    async fn a_refresh_waiting_for_an_unreachable_source_does_not_report_refreshing()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("refresh-while-down").await?;
+        let source = &fixture.source;
+        // No refresh is due after the restart; the test starts one itself.
+        let spec = || with_refresh_check_interval(fixture.dataset(ReadyState::OnLoad), "1h");
+        seed(source, spec()).await?;
+
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
+        assert!(served_from_acceleration(&rt, Duration::from_secs(10)).await);
+        assert!(
+            reports_served_error(&rt).await,
+            "the unreachable source sets Error ({:?})",
+            dataset_status(&rt, "orders")
+        );
+
+        rt.datafusion()
+            .refresh_table(&datafusion::sql::TableReference::bare("orders"), None)
+            .await
+            .map_err(|err| anyhow::anyhow!("the refresh request to be accepted: {err}"))?;
+        // Sampled over time on purpose: the defect is a status that flips after the
+        // refresh starts.
+        for _ in 0..30 {
+            assert!(
+                !matches!(
+                    dataset_status(&rt, "orders"),
+                    Some(ComponentStatus::Refreshing)
+                ),
+                "a refresh waiting for an unreachable source does not report Refreshing"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stop(rt, loader).await;
+        Ok(())
+    }
+
     /// A source that reports a primary key creates the acceleration's table with
     /// it. Registering while the source is down must recover that key from the
     /// checkpoint: an accelerator built without it fails every refresh after the
