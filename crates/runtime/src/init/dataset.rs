@@ -294,12 +294,24 @@ impl Runtime {
             return;
         }
 
-        // Create a map of dataset names to their futures
-        let mut dataset_futures = HashMap::new();
-        let mut background_loads = HashSet::new();
-        let mut localpod_datasets = Vec::new();
+        // Keyed by resolved name, so a `localpod` path of `source`, `public.source`, or
+        // `spice.public.source` finds the same parent. The value carries the dataset's own name
+        // for the log line its task writes.
+        let mut dataset_futures: HashMap<
+            ResolvedTableReference,
+            (TableReference, PendingDatasetLoad),
+        > = HashMap::new();
+        // Loads waiting on a snapshot's first publication, which component startup does not
+        // wait for. Their tasks stay registered for cancellation on reload or shutdown.
+        let mut background_roots = HashSet::new();
+        let mut background_chains: Vec<(TableReference, PendingDatasetLoad)> = Vec::new();
+        // Keyed by parent so several `localpod` datasets reading from one dataset all chain
+        // behind the same load, rather than the first one consuming it.
+        let mut localpod_by_parent: HashMap<
+            ResolvedTableReference,
+            Vec<(Arc<Dataset>, BootstrapStatus)>,
+        > = HashMap::new();
 
-        // First create futures for non-localpod datasets
         for ds in &startup_datasets {
             let bootstrap_status = match init_results.get(&ds.name) {
                 Some(Ok(status)) => status.clone(),
@@ -313,26 +325,30 @@ impl Runtime {
                 }
             };
 
-            if ds.source() == LOCALPOD_DATACONNECTOR {
-                localpod_datasets.push((Arc::clone(ds), bootstrap_status));
+            self.status
+                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+
+            if let Some(parent) = localpod_parent(ds) {
+                localpod_by_parent
+                    .entry(parent)
+                    .or_default()
+                    .push((Arc::clone(ds), bootstrap_status));
                 continue;
             }
 
-            self.status
-                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             let pending = matches!(bootstrap_status, BootstrapStatus::Pending { .. });
             let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
             let load_semaphore = Arc::clone(&semaphore);
             let load = self.dataset_loads.begin(&ds.name);
-            let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+            let future: PendingDatasetLoad = Box::pin(async move {
                 cloned_self
                     .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
                     .await;
-            })
-                as Pin<Box<dyn Future<Output = ()> + Send>>;
+            });
+            let resolved = resolve_table_reference(ds.name.clone());
             let future = if pending {
-                background_loads.insert(ds.name.clone());
+                background_roots.insert(resolved.clone());
                 self.track_snapshot_bootstrap(
                     &ds.name,
                     future,
@@ -342,81 +358,98 @@ impl Runtime {
             } else {
                 future
             };
-            dataset_futures.insert(ds.name.clone(), future);
+            dataset_futures.insert(resolved, (ds.name.clone(), future));
         }
 
-        // For each localpod dataset, chain it after its parent's future
-        for (ds, bootstrap_status) in localpod_datasets {
-            self.status
-                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-
-            // Get the parent dataset path from the localpod dataset
-            let path = ds.path();
-            let path_table_ref = TableReference::parse_str(path);
-
-            // Find and remove the parent dataset's future
-            if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
-                let background = background_loads.remove(&path_table_ref)
-                    || matches!(bootstrap_status, BootstrapStatus::Pending { .. });
-                let ds_clone = Arc::clone(&ds);
-                let cloned_self = Arc::clone(&self);
-                let load_semaphore = Arc::clone(&semaphore);
-                // Registered now rather than once the parent has loaded, so a
-                // Spicepod change can supersede the load while it waits.
-                let load = self.dataset_loads.begin(&ds.name);
-                // Chain the localpod dataset load after its parent
-                let chained_future = Box::pin(async move {
-                    parent_future.await;
-                    cloned_self
-                        .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
+        // Each `localpod` dataset loads after the dataset it reads from, and a `localpod`
+        // dataset reading from another `localpod` dataset loads after that one, so every chain
+        // hangs off the load of a non-`localpod` dataset.
+        let roots: Vec<_> = localpod_by_parent
+            .extract_if(|parent, _| dataset_futures.contains_key(parent))
+            .collect();
+        for (parent, children) in roots {
+            let parent_background = background_roots.contains(&parent);
+            // Signalled once the parent's load ends, however it ends, so a chain running in
+            // the background starts only after its parent.
+            let parent_done = tokio_util::sync::CancellationToken::new();
+            let mut chains = Vec::new();
+            for (ds, bootstrap_status) in children {
+                let background = parent_background
+                    || localpod_chain_pending(&ds, &bootstrap_status, &localpod_by_parent);
+                let name = ds.name.clone();
+                let chain = Arc::clone(&self).localpod_load_chain(
+                    ds,
+                    bootstrap_status,
+                    &mut localpod_by_parent,
+                    ReplacesRegistration::No,
+                );
+                if background {
+                    let parent_done = parent_done.clone();
+                    let chain: PendingDatasetLoad = Box::pin(async move {
+                        parent_done.cancelled().await;
+                        chain.await;
+                    });
+                    let chain = self
+                        .track_snapshot_bootstrap(
+                            &name,
+                            chain,
+                            Some(self.initial_load.cancel.clone()),
+                        )
                         .await;
-                }) as Pin<Box<dyn Future<Output = ()> + Send>>;
-
-                // Replace parent future with the chained future
-                let chained_future = if background {
-                    background_loads.insert(ds.name.clone());
-                    self.track_snapshot_bootstrap(
-                        &ds.name,
-                        chained_future,
-                        Some(self.initial_load.cancel.clone()),
-                    )
-                    .await
+                    background_chains.push((name, chain));
                 } else {
-                    chained_future
-                };
-                dataset_futures.insert(ds.name.clone(), chained_future);
-            } else {
-                // Parent doesn't exist, provide an error message to the user
-                tracing::error!(
-                    "Failed to load localpod dataset '{}': Parent dataset '{}' doesn't exist. \
-                    Ensure the '{}' dataset is configured in the Spicepod.",
-                    ds.name,
-                    path_table_ref,
-                    path_table_ref
-                );
-                self.status.update_dataset(
-                    &ds.name,
-                    status::ComponentStatus::error_with_message(format!(
-                        "Parent dataset '{path_table_ref}' doesn't exist"
-                    )),
-                );
+                    chains.push(chain);
+                }
+            }
+            if let Some((_, parent_future)) = dataset_futures.get_mut(&parent) {
+                let parent_load = std::mem::replace(parent_future, Box::pin(async {}));
+                *parent_future = Box::pin(async move {
+                    {
+                        let _parent_done = parent_done.drop_guard();
+                        parent_load.await;
+                    }
+                    join_all(chains).await;
+                });
             }
         }
 
-        let mut spawned_tasks = vec![];
-        let dispatched = dataset_futures.len();
+        // Whatever is still queued has no chain to a dataset that is loading: its parent is
+        // not configured, failed to initialize, or is part of a `localpod` cycle.
+        for (ds, _) in localpod_by_parent.into_values().flatten() {
+            let path_table_ref = TableReference::parse_str(ds.path());
+            tracing::error!(
+                "Failed to load localpod dataset '{}': Parent dataset '{}' doesn't exist. \
+                Ensure the '{}' dataset is configured in the Spicepod.",
+                ds.name,
+                path_table_ref,
+                path_table_ref
+            );
+            self.status.update_dataset(
+                &ds.name,
+                status::ComponentStatus::error_with_message(format!(
+                    "Parent dataset '{path_table_ref}' doesn't exist"
+                )),
+            );
+        }
 
-        for (ds, dataset_load_future) in dataset_futures {
-            let background = background_loads.contains(&ds);
+        let mut spawned_tasks = vec![];
+        let dispatched = dataset_futures.len() + background_chains.len();
+
+        for (resolved, (ds, dataset_load_future)) in dataset_futures {
             let handle = tokio::spawn(async move {
                 tracing::info!("Dataset {ds} initializing...");
                 dataset_load_future.await;
             });
             // A reader's first publication is independent of component startup.
-            // Its task remains registered for cancellation on reload or shutdown.
-            if !background {
+            if !background_roots.contains(&resolved) {
                 spawned_tasks.push(handle);
             }
+        }
+        for (ds, chain) in background_chains {
+            tokio::spawn(async move {
+                tracing::info!("Dataset {ds} initializing...");
+                chain.await;
+            });
         }
 
         // Aggregate startup summary so users see "3/5 queued, 2 skipped at init" at a glance
@@ -2368,6 +2401,7 @@ impl Runtime {
                         ds,
                         bootstrap_status,
                         &mut localpod_by_parent,
+                        ReplacesRegistration::Yes,
                     )
                 })
                 .collect();
@@ -2435,13 +2469,19 @@ impl Runtime {
             ResolvedTableReference,
             Vec<(Arc<Dataset>, BootstrapStatus)>,
         >,
+        replaces_registration: ReplacesRegistration,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let children: Vec<_> = localpod_by_parent
             .remove(&resolve_table_reference(ds.name.clone()))
             .unwrap_or_default()
             .into_iter()
             .map(|(child, child_status)| {
-                Arc::clone(&self).localpod_load_chain(child, child_status, localpod_by_parent)
+                Arc::clone(&self).localpod_load_chain(
+                    child,
+                    child_status,
+                    localpod_by_parent,
+                    replaces_registration,
+                )
             })
             .collect();
         let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
@@ -2456,8 +2496,11 @@ impl Runtime {
             // The registration this dataset reads through has just been replaced, so mark its
             // results-cache clock again, as `update_dataset` does after its swap: a result read
             // from the previous registration after the mark above must not be stored as fresh.
-            // For a dataset new to this apply the mark is a no-op.
-            self.invalidate_cached_results_for(&name).await;
+            // For a dataset new to this apply the mark is a no-op; at startup there is no previous
+            // registration, so it is skipped.
+            if replaces_registration == ReplacesRegistration::Yes {
+                self.invalidate_cached_results_for(&name).await;
+            }
             join_all(children).await;
         })
     }
@@ -2965,6 +3008,35 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 /// Whether a dataset's `drasi:` block is live.
 fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
+}
+
+/// A dataset's pending load, as startup queues it before spawning.
+type PendingDatasetLoad = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Whether a `localpod` load chain runs over registrations a spicepod apply is replacing, whose
+/// cached results must be invalidated once each dataset reloads, or at startup, where nothing was
+/// registered before.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplacesRegistration {
+    Yes,
+    No,
+}
+
+/// Whether `ds`, or a `localpod` dataset queued anywhere below it, is still waiting for a
+/// snapshot's first publication, so its chain must not hold up component startup.
+fn localpod_chain_pending(
+    ds: &Dataset,
+    bootstrap_status: &BootstrapStatus,
+    localpod_by_parent: &HashMap<ResolvedTableReference, Vec<(Arc<Dataset>, BootstrapStatus)>>,
+) -> bool {
+    matches!(bootstrap_status, BootstrapStatus::Pending { .. })
+        || localpod_by_parent
+            .get(&resolve_table_reference(ds.name.clone()))
+            .is_some_and(|children| {
+                children.iter().any(|(child, child_status)| {
+                    localpod_chain_pending(child, child_status, localpod_by_parent)
+                })
+            })
 }
 
 /// The dataset a `localpod` dataset reads through, resolved as the query engine resolves it (so

@@ -396,7 +396,7 @@ pub struct CayenneTableProvider {
     new_files_since_last_compaction: Arc<AtomicUsize>,
     staging_wal_present: Arc<AtomicBool>,
     staging_may_have_files: Arc<AtomicBool>,
-    post_write_compaction_scheduled: Arc<AtomicBool>,
+    post_write_compaction_state: Arc<AtomicU8>,
     post_write_maintenance: Arc<PostWriteMaintenance>,
     background_compactor: Arc<OnceLock<BackgroundCompactor>>,
 }
