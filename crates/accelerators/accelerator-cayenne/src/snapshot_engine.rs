@@ -215,11 +215,14 @@ async fn unreferenced_data_entries(
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().into_owned();
         if Some(&name) == table_id.as_ref() {
-            // `<table_id>/<snapshot_id>/`: keep the referenced snapshots.
+            // `<table_id>/<snapshot_id>/`: keep the referenced snapshots, and
+            // the persisted secondary index runs the slice registers (a file
+            // no run is registered for is deleted when the table opens).
             let mut children = tokio::fs::read_dir(entry.path()).await?;
             while let Some(child) = children.next_entry().await? {
                 let child_name = child.file_name().to_string_lossy().into_owned();
-                if !referenced.contains(&child_name) {
+                if child_name != cayenne::LOOKUP_INDEX_DIR_NAME && !referenced.contains(&child_name)
+                {
                     skip.insert(PathBuf::from(&name).join(child_name));
                 }
             }
@@ -1020,7 +1023,12 @@ mod tests {
                     names.sort();
                     return names;
                 }
-                assert!(Instant::now() < deadline, "the runs were not persisted");
+                assert!(
+                    Instant::now() < deadline,
+                    "the runs were not persisted: {} registered and {} run files, expected at least {runs}",
+                    registered.len(),
+                    run_files(data_dir)
+                );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }

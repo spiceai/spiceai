@@ -124,7 +124,9 @@ pub use metadata::{
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 #[cfg(feature = "partition-table-provider")]
 pub use partition_creator::CayennePartitionCreator;
-pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
+pub use provider::constants::{
+    LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
+};
 pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
     CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction, EncodeBudgetSnapshot,
