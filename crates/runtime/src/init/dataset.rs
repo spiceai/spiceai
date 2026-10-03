@@ -2760,7 +2760,7 @@ async fn await_hot_reload_initial_refresh(
 ///
 /// Everything else stays retriable, so a source that is merely unreachable or
 /// an accelerator that is momentarily unavailable still recovers on its own.
-fn is_permanent_dataset_failure(err: &Error) -> bool {
+pub(crate) fn is_permanent_dataset_failure(err: &Error) -> bool {
     match err {
         // The Spicepod names a connector this build cannot provide.
         Error::UnknownDataConnector { .. }

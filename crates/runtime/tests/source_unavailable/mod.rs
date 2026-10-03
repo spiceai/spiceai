@@ -948,6 +948,40 @@ mod served_from_acceleration {
         Ok(())
     }
 
+    /// A configuration error no retry can clear (here a misspelled connector, after
+    /// the acceleration was built) is reported as one while the acceleration is
+    /// served, rather than as an unreachable source that is being retried.
+    #[tokio::test]
+    async fn a_configuration_error_while_served_is_reported_as_one() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("configuration-error").await?;
+        seed(&fixture.source, fixture.dataset(ReadyState::OnLoad)).await?;
+
+        let mut misspelled = fixture.dataset(ReadyState::OnLoad);
+        misspelled.from = "no_such_connector:orders".to_string();
+        let (rt, loader) = start(misspelled).await;
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(10)).await,
+            "the acceleration is served despite the configuration error, got {:?}",
+            sum_and_count(&rt).await
+        );
+        let reported = wait_until_true(Duration::from_secs(10), || async {
+            matches!(
+                dataset_status(&rt, "orders"),
+                Some(ComponentStatus::Error(Some(message)))
+                    if message.contains("cannot connect to its source because of its configuration")
+            )
+        })
+        .await;
+        assert!(
+            reported,
+            "the status reports a configuration error, not a source being retried ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
     /// A dataset whose configuration needs its source to start (here
     /// `on_schema_change: append_new_columns`, which needs the live schema) waits for
     /// it even with an acceleration on disk, and its status says it is not served and

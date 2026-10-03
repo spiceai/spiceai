@@ -137,8 +137,12 @@ impl ReconnectingConnector {
     }
 
     /// The connector's own error when construction failed with one, so the message
-    /// matches what a failed load reports; otherwise the failure wrapped as a read failure.
+    /// matches what a failed load reports. Otherwise the failure is wrapped as a
+    /// configuration error when no retry can clear it (an unknown connector, a
+    /// parameter that fails validation), so it is reported as one, and as a read
+    /// failure, which is retried, when it can.
     fn build_error(&self, dataset: &DatasetSpec, err: crate::Error) -> DataConnectorError {
+        let permanent = crate::init::dataset::is_permanent_dataset_failure(&err);
         let source: Box<dyn std::error::Error + Send + Sync> = match err {
             crate::Error::UnableToInitializeDataConnector { source } => {
                 match source.downcast::<DataConnectorError>() {
@@ -148,6 +152,13 @@ impl ReconnectingConnector {
             }
             err => Box::new(err),
         };
+        if permanent {
+            return DataConnectorError::InvalidConfigurationSourceOnly {
+                dataconnector: self.source_name.clone(),
+                connector_component: ConnectorComponent::from(dataset),
+                source,
+            };
+        }
         DataConnectorError::UnableToGetReadProvider {
             dataconnector: self.source_name.clone(),
             connector_component: ConnectorComponent::from(dataset),
