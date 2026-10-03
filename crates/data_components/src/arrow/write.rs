@@ -106,6 +106,10 @@ pub struct MemTable {
     /// When specified, data is sorted before being written to improve
     /// zone map efficiency for range queries.
     sort_columns: Vec<String>,
+
+    /// Whether an upsert write that repeats a primary key keeps the last copy of it, in
+    /// the order the write's rows arrive, instead of failing on the repeat.
+    keep_last_repeated_key: bool,
 }
 
 impl MemTable {
@@ -140,7 +144,18 @@ impl MemTable {
             sort_order: Arc::new(Mutex::new(vec![])),
             on_conflict: None,
             sort_columns: Vec::new(),
+            keep_last_repeated_key: false,
         })
+    }
+
+    /// Make an upsert write that repeats a primary key keep the last copy of it, in the
+    /// order the write's rows arrive, instead of failing on the repeat. A writer that sends
+    /// a key's versions oldest first (`on_conflict: upsert_dedup_by_time_column`) relies on
+    /// this to keep the newest.
+    #[must_use]
+    pub fn with_keep_last_repeated_key(mut self, keep_last_repeated_key: bool) -> Self {
+        self.keep_last_repeated_key = keep_last_repeated_key;
+        self
     }
 
     #[must_use]
@@ -325,14 +340,17 @@ impl TableProvider for MemTable {
             self.verify_on_conflict_matches_primary_key(pk, on_conflict)?;
         }
 
-        let sink = Arc::new(MemSink::new(
-            self.batches.clone(),
-            overwrite,
-            primary_key,
-            self.schema(),
-            self.on_conflict.clone(),
-            self.sort_columns.clone(),
-        ));
+        let sink = Arc::new(
+            MemSink::new(
+                self.batches.clone(),
+                overwrite,
+                primary_key,
+                self.schema(),
+                self.on_conflict.clone(),
+                self.sort_columns.clone(),
+            )
+            .with_keep_last_repeated_key(self.on_conflict.is_some() && self.keep_last_repeated_key),
+        );
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
 
@@ -608,6 +626,10 @@ struct MemSink {
 
     /// Optional columns to sort by before writing
     sort_columns: Vec<String>,
+
+    /// Keep the last copy of a primary key this write repeats; see
+    /// [`MemTable::with_keep_last_repeated_key`].
+    keep_last_repeated_key: bool,
 }
 
 impl Debug for MemSink {
@@ -651,8 +673,50 @@ impl MemSink {
             schema,
             on_conflict,
             sort_columns,
+            keep_last_repeated_key: false,
         }
     }
+
+    fn with_keep_last_repeated_key(mut self, keep_last_repeated_key: bool) -> Self {
+        self.keep_last_repeated_key = keep_last_repeated_key;
+        self
+    }
+}
+
+/// `batches` with only the last copy, in row order, of each primary key they repeat.
+/// Rows with a NULL key are kept, so the NULL check that follows still reports them.
+fn keep_last_copy_of_each_key(
+    batches: Vec<RecordBatch>,
+    primary_keys_ordered: &[usize],
+) -> Result<Vec<RecordBatch>> {
+    let refs: Vec<&RecordBatch> = batches.iter().collect();
+    let ids = primary_key_identifier(&refs, primary_keys_ordered)?;
+    let mut last: HashMap<&str, usize> = HashMap::with_capacity(ids.len());
+    for (row, id) in ids.iter().enumerate() {
+        if let Some(id) = id {
+            last.insert(id.as_str(), row);
+        }
+    }
+    if last.len() == ids.iter().filter(|id| id.is_some()).count() {
+        return Ok(batches);
+    }
+    let mut offset = 0;
+    batches
+        .iter()
+        .map(|batch| {
+            let keep: BooleanArray = (offset..offset + batch.num_rows())
+                .map(|row| {
+                    Some(
+                        ids[row]
+                            .as_deref()
+                            .is_none_or(|id| last.get(id) == Some(&row)),
+                    )
+                })
+                .collect();
+            offset += batch.num_rows();
+            Ok(filter_record_batch(batch, &keep)?)
+        })
+        .collect()
 }
 
 /// Check that all primary key ids are non-null and unique.
@@ -1323,10 +1387,8 @@ impl DataSink for MemSink {
     ) -> Result<u64> {
         let num_partitions = self.batches.len();
 
-        // Collect data into partitions (round-robin distribution)
-        let mut new_batches = vec![vec![]; num_partitions];
-        let mut i = 0;
-        let mut row_count = 0;
+        // Collect the write's batches in arrival order.
+        let mut incoming = Vec::new();
         let mut data = data;
         while let Some(batch) = data
             .next()
@@ -1336,9 +1398,23 @@ impl DataSink for MemSink {
         {
             let batch = arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&self.schema))
                 .map_err(DataFusionError::from)?;
+            incoming.push(batch);
+        }
+        // Resolve repeated keys before the rows are spread over partitions, which loses
+        // their arrival order.
+        if self.keep_last_repeated_key
+            && let Some(ref pks) = self.primary_key
+            && !matches!(self.overwrite, InsertOp::Replace)
+        {
+            incoming = keep_last_copy_of_each_key(incoming, pks)?;
+        }
+
+        // Distribute into partitions (round-robin)
+        let mut new_batches = vec![vec![]; num_partitions];
+        let mut row_count = 0;
+        for (i, batch) in incoming.into_iter().enumerate() {
             row_count += batch.num_rows();
-            new_batches[i].push(batch);
-            i = (i + 1) % num_partitions;
+            new_batches[i % num_partitions].push(batch);
         }
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
@@ -3181,5 +3257,91 @@ mod tests {
                 "partition {i} should have 3 rows due to round-robin distribution"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_upsert_write_that_repeats_a_key_keeps_its_last_copy_only_when_asked() {
+        use arrow::array::{AsArray, Int64Array};
+        use datafusion::prelude::SessionContext;
+        use datafusion_table_providers::util::{
+            column_reference::ColumnReference, on_conflict::OnConflict,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        let batch = |ids: Vec<i64>, values: Vec<&str>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .expect("valid batch")
+        };
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        let table = async |keep_last: bool| {
+            super::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("table")
+                .try_with_constraints(constraints.clone())
+                .await
+                .expect("constraints")
+                .with_on_conflict(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ])))
+                .with_keep_last_repeated_key(keep_last)
+        };
+        // Key 1's versions arrive oldest first, in different batches of one write.
+        let rows = vec![
+            batch(vec![1, 2], vec!["old", "b"]),
+            batch(vec![1], vec!["new"]),
+        ];
+
+        let ctx = SessionContext::new();
+        let keeping = Arc::new(table(true).await);
+        ctx.register_table("keeping", Arc::clone(&keeping) as Arc<dyn TableProvider>)
+            .expect("register");
+        let source = Arc::new(
+            super::MemTable::try_new(Arc::clone(&schema), vec![rows.clone()]).expect("source"),
+        );
+        ctx.register_table("source", source).expect("register");
+        ctx.sql("INSERT INTO keeping SELECT * FROM source")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("insert keeps the last copy");
+        let kept = ctx
+            .sql("SELECT v FROM keeping ORDER BY id")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("query");
+        let values: Vec<String> = kept
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_string::<i32>()
+                    .iter()
+                    .map(|v| v.unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, ["new", "b"]);
+
+        let failing = Arc::new(table(false).await);
+        ctx.register_table("failing", failing as Arc<dyn TableProvider>)
+            .expect("register");
+        let err = ctx
+            .sql("INSERT INTO failing SELECT * FROM source")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a plain upsert still refuses a repeated key");
+        assert!(err.to_string().contains("must be unique"), "{err}");
     }
 }

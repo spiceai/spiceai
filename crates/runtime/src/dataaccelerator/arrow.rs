@@ -115,6 +115,18 @@ impl DataAccelerator for ArrowAccelerator {
             cmd.constraints = Constraints::new_unverified(vec![]);
         }
 
+        // `on_conflict: upsert_dedup_by_time_column` writes a key's versions oldest first
+        // within one refresh write, so the table must keep the last copy of a repeated key.
+        if source
+            .and_then(|s| s.acceleration())
+            .is_some_and(|a| a.upsert_dedup_by_time_column.is_some())
+        {
+            cmd.options.insert(
+                data_components::arrow::KEEP_LAST_REPEATED_KEY_OPTION.to_string(),
+                "true".to_string(),
+            );
+        }
+
         // Extract sort_columns from acceleration params if provided
         if let Some(source) = source
             && let Some(acceleration) = source.acceleration()

@@ -109,6 +109,9 @@ pub mod changes;
 mod deletion;
 mod latest_by_time;
 
+/// The largest UTC offset a time may carry (+14:00), in nanoseconds.
+const MAX_UTC_OFFSET_NANOS: u128 = 14 * 3_600 * 1_000_000_000;
+
 // Reuse the single shared schema-evolution instrument rather than registering a
 // same-named counter under a second meter.
 use runtime_component::schema_evolution::SCHEMA_EVOLUTION_FAILED;
@@ -240,6 +243,10 @@ pub struct RefreshTaskBuilder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
@@ -290,6 +297,7 @@ impl RefreshTaskBuilder {
             cpu_runtime: None,
             io_runtime,
             resource_monitor: None,
+            query_runtime_env: None,
             accelerator_write_mutex,
             on_stream_batch_process_callback: None,
             last_updated_at: Arc::new(AtomicI64::new(0)),
@@ -335,6 +343,15 @@ impl RefreshTaskBuilder {
         monitor: runtime_resources::ResourceMonitor,
     ) -> RefreshTaskBuilder {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_runtime_env(
+        mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> RefreshTaskBuilder {
+        self.query_runtime_env = Some(runtime_env);
         self
     }
 
@@ -468,6 +485,7 @@ impl RefreshTaskBuilder {
             cpu_runtime: self.cpu_runtime,
             io_runtime: self.io_runtime,
             resource_monitor: self.resource_monitor,
+            query_runtime_env: self.query_runtime_env,
             accelerator_write_mutex: self.accelerator_write_mutex,
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
             last_updated_at: self.last_updated_at,
@@ -537,6 +555,10 @@ pub struct RefreshTask {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
@@ -1266,14 +1288,15 @@ impl RefreshTask {
         window_start: Option<u128>,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let dataset = self.dataset_name.to_string();
-        let permanent = |message: String| {
-            RetryError::permanent(super::Error::FailedToRefreshDataset {
-                source: DataFusionError::Plan(message),
+        let not_applied = |error: &DataFusionError| {
+            RetryError::permanent(super::Error::RefreshNotApplied {
+                message: latest_by_time::not_applied_message(error)
+                    .unwrap_or_else(|| error.to_string()),
             })
         };
         let Some(time_column) = refresh.time_column.clone() else {
-            return Err(permanent(format!(
-                "Failed to refresh dataset '{dataset}': 'acceleration.on_conflict: upsert_dedup_by_time_column' requires a 'time_column'. Set 'time_column' to the column that records when each row occurred. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+            return Err(not_applied(&latest_by_time::not_applied(
+                "'acceleration.on_conflict: upsert_dedup_by_time_column' requires a 'time_column'. Set 'time_column' to the column that records when each row occurred.",
             )));
         };
         let accelerator_schema = self.accelerator.schema();
@@ -1287,8 +1310,8 @@ impl RefreshTask {
                 )
             });
         if key_columns.is_empty() {
-            return Err(permanent(format!(
-                "Failed to refresh dataset '{dataset}': 'acceleration.on_conflict: upsert_dedup_by_time_column' requires 'acceleration.primary_key', the key it keeps the latest row for. Set 'acceleration.primary_key' to the column(s) that identify a row. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+            return Err(not_applied(&latest_by_time::not_applied(
+                "'acceleration.on_conflict: upsert_dedup_by_time_column' requires 'acceleration.primary_key'. Set it to the column(s) that identify a row.",
             )));
         }
         let mut selector = latest_by_time::LatestByTime::try_new(
@@ -1298,7 +1321,10 @@ impl RefreshTask {
             time_column.clone(),
             refresh.time_format,
         )
-        .map_err(|e| permanent(e.to_string()))?;
+        .map_err(|e| not_applied(&e))?;
+        if let Some(runtime_env) = &self.query_runtime_env {
+            selector = selector.with_runtime_env(Arc::clone(runtime_env));
+        }
         selector.publish_zero();
 
         if let Some(value) = window_start
@@ -1313,10 +1339,27 @@ impl RefreshTask {
                 self.io_runtime.clone(),
             )
             .await;
-            let mut columns: Vec<&str> = key_columns.iter().map(String::as_str).collect();
-            columns.push(&time_column);
+            // Every incoming column: a stored row's content hash settles ties with it.
+            let incoming = update.data.schema();
+            let columns: Vec<&str> = incoming.fields().iter().map(|f| f.name().as_str()).collect();
+            // A string time column is filtered by comparing strings, which misorders values
+            // with different UTC offsets; starting the read 14 hours (the largest offset)
+            // earlier can only add rows, which the selector then compares as instants.
+            let string_time = accelerator_schema
+                .field_with_name(&time_column)
+                .is_ok_and(|f| {
+                    matches!(
+                        f.data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                    )
+                });
+            let start = if string_time {
+                value.saturating_sub(MAX_UTC_OFFSET_NANOS)
+            } else {
+                value
+            };
             let mut stored = accelerator_df(&Arc::clone(&self.accelerator), &ctx)
-                .and_then(|df| df.filter(filter_converter.convert_high_water_mark(value)))
+                .and_then(|df| df.filter(filter_converter.convert_high_water_mark(start)))
                 .and_then(|df| df.select_columns(&columns))
                 .map_err(find_datafusion_root)
                 .context(super::UnableToScanTableProviderSnafu)?
@@ -1328,10 +1371,15 @@ impl RefreshTask {
                 let batch = batch
                     .map_err(find_datafusion_root)
                     .context(super::UnableToScanTableProviderSnafu)?;
-                selector
-                    .seed(&batch)
-                    .map_err(find_datafusion_root)
-                    .context(super::UnableToScanTableProviderSnafu)?;
+                selector.seed(&batch).await.map_err(|e| {
+                    if latest_by_time::not_applied_message(&e).is_some() {
+                        not_applied(&e)
+                    } else {
+                        RetryError::permanent(super::Error::UnableToScanTableProvider {
+                            source: find_datafusion_root(e),
+                        })
+                    }
+                })?;
             }
         }
 
@@ -3146,6 +3194,11 @@ fn dedup_predicates(
 }
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
+    // A refresh the dataset's configuration refused (e.g. a NULL `time_column` under
+    // `upsert_dedup_by_time_column`) carries its own complete cause.
+    if let Some(message) = latest_by_time::not_applied_message(&error) {
+        return RetryError::permanent(super::Error::RefreshNotApplied { message });
+    }
     if is_retriable_error(&error) || is_object_generation_changed_error(&error) {
         return RetryError::transient(super::Error::UnableToGetDataFromConnector {
             source: find_datafusion_root(error),

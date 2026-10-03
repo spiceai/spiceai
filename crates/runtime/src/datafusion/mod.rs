@@ -3144,8 +3144,9 @@ impl DataFusion {
         if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
             refresh = refresh.append_overlap(append_overlap);
         }
-        refresh =
-            refresh.upsert_dedup_by_time_column(acceleration_settings.upsert_dedup_by_time_column);
+        refresh = refresh.upsert_dedup_by_time_column(
+            acceleration_settings.upsert_dedup_by_time_column.is_some(),
+        );
         if let Some(caching_ttl) = acceleration_settings.caching_ttl {
             refresh = refresh.caching_ttl(caching_ttl);
         }
@@ -3449,6 +3450,8 @@ impl DataFusion {
         if let Some(ref resource_monitor) = self.resource_monitor {
             accelerated_table_builder.with_resource_monitor(resource_monitor.clone());
         }
+
+        accelerated_table_builder.with_query_runtime_env(self.ctx.runtime_env());
 
         if let Some(metrics) = &self.metrics {
             accelerated_table_builder.metrics(metrics.clone());

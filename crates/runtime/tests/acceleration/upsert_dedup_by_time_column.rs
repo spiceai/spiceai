@@ -54,18 +54,24 @@ const FILLER_KEYS: i64 = 10_000;
 
 #[derive(Clone, Copy, Debug)]
 enum Engine {
+    Arrow,
     Cayenne,
     #[cfg(feature = "sqlite")]
     Sqlite,
 }
 
 fn engines() -> Vec<(Engine, Mode)> {
-    let mut cases = vec![
+    let cases = vec![
+        (Engine::Arrow, Mode::Memory),
         (Engine::Cayenne, Mode::Memory),
         (Engine::Cayenne, Mode::File),
     ];
     #[cfg(feature = "sqlite")]
-    cases.extend([(Engine::Sqlite, Mode::Memory), (Engine::Sqlite, Mode::File)]);
+    let cases = {
+        let mut cases = cases;
+        cases.extend([(Engine::Sqlite, Mode::Memory), (Engine::Sqlite, Mode::File)]);
+        cases
+    };
     cases
 }
 
@@ -93,6 +99,7 @@ async fn load(
 ) -> (Arc<Runtime>, bool) {
     let mut params = HashMap::new();
     let engine_name = match engine {
+        Engine::Arrow => "arrow",
         Engine::Cayenne => {
             if *mode == Mode::File {
                 params.insert(

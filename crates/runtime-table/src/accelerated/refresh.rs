@@ -576,6 +576,10 @@ pub struct Refresher {
     cdc_apply_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
     /// Shared with `DataConnector` and `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
@@ -643,6 +647,7 @@ impl Refresher {
             cdc_apply_runtime,
             io_runtime,
             resource_monitor: None,
+            query_runtime_env: None,
             accelerator_write_mutex,
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
@@ -767,6 +772,14 @@ impl Refresher {
         monitor: runtime_resources::ResourceMonitor,
     ) -> &mut Self {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    pub fn with_query_runtime_env(
+        &mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> &mut Self {
+        self.query_runtime_env = Some(runtime_env);
         self
     }
 
@@ -951,6 +964,11 @@ impl Refresher {
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresh_task_runner =
                 refresh_task_runner.with_resource_monitor(resource_monitor.clone());
+        }
+
+        if let Some(ref runtime_env) = self.query_runtime_env {
+            refresh_task_runner =
+                refresh_task_runner.with_query_runtime_env(Arc::clone(runtime_env));
         }
 
         refresh_task_runner =

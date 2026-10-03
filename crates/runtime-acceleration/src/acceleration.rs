@@ -546,10 +546,11 @@ pub struct Acceleration {
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
-    /// `on_conflict: upsert_dedup_by_time_column`: the refresh keeps, per primary key, only
-    /// rows newer (by the dataset `time_column`) than the version already kept, and the
-    /// engine upserts what remains. `on_conflict` itself records a plain upsert.
-    pub upsert_dedup_by_time_column: bool,
+    /// `on_conflict: upsert_dedup_by_time_column`, and the columns it is set on: the
+    /// refresh keeps, per primary key, only rows newer (by the dataset `time_column`) than
+    /// the version already kept, and the engine upserts what remains. `on_conflict` itself
+    /// records a plain upsert.
+    pub upsert_dedup_by_time_column: Option<ColumnReference>,
 
     pub maintained_aggregates: spicepod_acceleration::MaintainedAggregates,
 
@@ -956,17 +957,13 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         let mut on_conflict = HashMap::new();
-        let upsert_dedup_by_time_column = acceleration.on_conflict.values().any(|behavior| {
-            matches!(
-                behavior,
-                spicepod_acceleration::OnConflictBehavior::UpsertDedupByTimeColumn
-            )
-        });
+        let mut upsert_dedup_by_time_column = None;
         for (k, v) in acceleration.on_conflict {
-            on_conflict.insert(
-                try_parse_column_reference(k.as_str())?,
-                OnConflictBehavior::from(v),
-            );
+            let columns = try_parse_column_reference(k.as_str())?;
+            if v == spicepod_acceleration::OnConflictBehavior::UpsertDedupByTimeColumn {
+                upsert_dedup_by_time_column = Some(columns.clone());
+            }
+            on_conflict.insert(columns, OnConflictBehavior::from(v));
         }
 
         let mut params = acceleration.params.clone();
@@ -1125,7 +1122,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
-            upsert_dedup_by_time_column: false,
+            upsert_dedup_by_time_column: None,
             maintained_aggregates: spicepod_acceleration::MaintainedAggregates::default(),
             write_mode: spicepod_acceleration::WriteMode::default(),
             storage_profile: StorageProfile::default(),

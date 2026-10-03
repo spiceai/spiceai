@@ -134,6 +134,10 @@ fn parse_indexes_option(
     Ok(indexes)
 }
 
+/// Internal `CreateExternalTable` option: an upsert write that repeats a primary key keeps
+/// the last copy of it instead of failing.
+pub const KEEP_LAST_REPEATED_KEY_OPTION: &str = "keep_last_repeated_key";
+
 #[async_trait]
 impl TableProviderFactory for ArrowFactory {
     async fn create(
@@ -152,6 +156,13 @@ impl TableProviderFactory for ArrowFactory {
             .options
             .get("hash_index")
             .is_some_and(|v| v.eq_ignore_ascii_case("enabled"));
+
+        // Set by the runtime for `on_conflict: upsert_dedup_by_time_column`, whose refresh
+        // writes a key's versions oldest first and relies on the last copy being kept.
+        let keep_last_repeated_key = cmd
+            .options
+            .get(KEEP_LAST_REPEATED_KEY_OPTION)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
         // If hash index is enabled, use IndexedMemTable
         if enable_hash_index {
@@ -228,6 +239,8 @@ impl TableProviderFactory for ArrowFactory {
                 indexed_table
             };
 
+            let indexed_table = indexed_table.with_keep_last_repeated_key(keep_last_repeated_key);
+
             // Apply sort_columns if specified
             let indexed_table = if let Some(sort_cols_str) = cmd.options.get("sort_columns") {
                 let sort_columns: Vec<String> = sort_cols_str
@@ -262,6 +275,8 @@ impl TableProviderFactory for ArrowFactory {
                 })?,
             );
         }
+
+        mem_table = mem_table.with_keep_last_repeated_key(keep_last_repeated_key);
 
         // Parse sort_columns if provided
         if let Some(sort_cols_str) = cmd.options.get("sort_columns") {

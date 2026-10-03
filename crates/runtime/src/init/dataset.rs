@@ -45,7 +45,9 @@ use crate::{
     accelerated::AcceleratedTable,
     component::dataset::{
         Dataset,
-        acceleration::{Acceleration, DurableWriteBackKey, Engine, Mode, RefreshMode},
+        acceleration::{
+            Acceleration, DurableWriteBackKey, Engine, Mode, OnConflictBehavior, RefreshMode,
+        },
         builder::DatasetBuilder,
     },
     component::{
@@ -953,12 +955,13 @@ impl Runtime {
         }
 
         if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled)
-            && acceleration.upsert_dedup_by_time_column
+            && let Some(on_conflict_key) = acceleration.upsert_dedup_by_time_column.as_ref()
         {
             let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
             if let Some(reason) = upsert_dedup_by_time_column_refusal(
                 ds.time_column.as_deref(),
                 acceleration.primary_key.as_ref(),
+                on_conflict_key,
                 refresh_mode,
                 acceleration.engine,
             ) {
@@ -978,6 +981,17 @@ impl Runtime {
                     upsert_dedup_by_time_column_no_overlap_warning(&ds.name.to_string())
                 );
             }
+        }
+
+        if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled)
+            && acceleration.refresh_append_overlap.is_some()
+            && data_connector.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Append
+            && let Some(on_conflict) = upsert_overwritten_by_overlap(acceleration)
+        {
+            tracing::warn!(
+                "{}",
+                upsert_with_overlap_warning(&ds.name.to_string(), on_conflict)
+            );
         }
 
         // A `drasi` block only takes effect through the change stream, so a
@@ -2369,6 +2383,7 @@ const UPSERT_DEDUP_BY_TIME_COLUMN_DOCS: &str =
 fn upsert_dedup_by_time_column_refusal(
     time_column: Option<&str>,
     primary_key: Option<&datafusion_table_providers::util::column_reference::ColumnReference>,
+    on_conflict_key: &datafusion_table_providers::util::column_reference::ColumnReference,
     refresh_mode: RefreshMode,
     engine: Engine,
 ) -> Option<String> {
@@ -2380,44 +2395,75 @@ fn upsert_dedup_by_time_column_refusal(
     };
     let Some(primary_key) = primary_key.filter(|key| !key.is_empty()) else {
         return Some(format!(
-            "{MODE} requires 'acceleration.primary_key', the key it keeps the latest row for. Set 'acceleration.primary_key' to the column(s) that identify a row."
+            "{MODE} requires 'acceleration.primary_key'. Set it to the column(s) that identify a row."
         ));
     };
+    if on_conflict_key != primary_key {
+        return Some(format!(
+            "{MODE} is set on '{on_conflict_key}', which is not 'acceleration.primary_key' ('{primary_key}'). Set it on the primary key."
+        ));
+    }
     if primary_key.iter().any(|column| column == time_column) {
         return Some(format!(
-            "'time_column' '{time_column}' is part of 'acceleration.primary_key', so each version of a row has its own key and there is nothing to choose between. Set 'time_column' to a column outside the primary key, or use 'acceleration.on_conflict: upsert'."
+            "'time_column' '{time_column}' is part of 'acceleration.primary_key', so every version has its own key. Use a column outside the key, or 'acceleration.on_conflict: upsert'."
         ));
     }
-    match refresh_mode {
-        RefreshMode::Full | RefreshMode::Append => {}
-        RefreshMode::Changes => {
-            return Some(format!(
-                "{MODE} supports 'acceleration.refresh_mode: full' and 'append', not 'changes'. Use 'acceleration.on_conflict: upsert' for a change-data-capture dataset."
-            ));
-        }
-        other => {
-            return Some(format!(
-                "{MODE} supports 'acceleration.refresh_mode: full' and 'append', not '{}'.",
-                format!("{other:?}").to_lowercase()
-            ));
-        }
-    }
-    // A refresh writes a key's versions in increasing time order, and only Cayenne and
-    // SQLite apply a key repeated across one write's batches in that order. DuckDB applies
-    // the whole write as one statement and keeps an unspecified copy of a repeated key.
-    if !matches!(engine, Engine::Cayenne | Engine::Sqlite) {
+    if !matches!(refresh_mode, RefreshMode::Full | RefreshMode::Append) {
         return Some(format!(
-            "{MODE} is not supported by 'acceleration.engine: {engine}'. Use 'acceleration.engine: cayenne' or 'sqlite'."
+            "{MODE} supports 'acceleration.refresh_mode: full' and 'append', not '{}'. Set one of those, or use 'acceleration.on_conflict: upsert' for change data capture.",
+            format!("{refresh_mode:?}").to_lowercase()
         ));
     }
-    None
+    // A refresh writes a key's versions in increasing time order, so the engine has to
+    // keep the last copy of a key repeated across one write's batches. DuckDB applies the
+    // whole write as one statement and keeps an unspecified copy, and a partitioned Arrow
+    // acceleration writes each partition as its own table.
+    match engine {
+        Engine::Cayenne | Engine::Sqlite | Engine::Arrow => None,
+        Engine::PartitionedArrow => Some(format!(
+            "{MODE} is not supported by a partitioned 'acceleration.engine: arrow' acceleration. Remove 'acceleration.partition_by', or set 'acceleration.engine: cayenne' or 'sqlite'."
+        )),
+        other => Some(format!(
+            "{MODE} is not supported by 'acceleration.engine: {other}'. Set 'acceleration.engine: cayenne', 'sqlite' or 'arrow'."
+        )),
+    }
 }
 
 /// Warning for an append refresh under `on_conflict: upsert_dedup_by_time_column` with no
 /// `refresh_append_overlap`.
 fn upsert_dedup_by_time_column_no_overlap_warning(dataset_name: &str) -> String {
     format!(
-        "Dataset '{dataset_name}' uses 'acceleration.on_conflict: upsert_dedup_by_time_column' with 'acceleration.refresh_mode: append' and no 'acceleration.refresh_append_overlap', so a row older than the newest row already loaded is never fetched, even when it is the newest version of its key, and that key keeps showing its previous version. Set 'acceleration.refresh_append_overlap' to the most a row can arrive late. See: {UPSERT_DEDUP_BY_TIME_COLUMN_DOCS}"
+        "Dataset '{dataset_name}' uses 'acceleration.on_conflict: upsert_dedup_by_time_column' on append with no 'acceleration.refresh_append_overlap', so a row older than the newest one loaded is never fetched. Set 'acceleration.refresh_append_overlap' to the most a row can arrive late. See: {UPSERT_DEDUP_BY_TIME_COLUMN_DOCS}"
+    )
+}
+
+/// The `on_conflict` value, as spelled in the Spicepod, of an upsert that lets a late,
+/// older row re-read by `refresh_append_overlap` replace the newer row already loaded:
+/// every upsert except `upsert_dedup_by_time_column`, which orders versions by time.
+fn upsert_overwritten_by_overlap(acceleration: &Acceleration) -> Option<&'static str> {
+    if acceleration.upsert_dedup_by_time_column.is_some() {
+        return None;
+    }
+    acceleration
+        .on_conflict
+        .values()
+        .find_map(|behavior| match behavior {
+            OnConflictBehavior::Upsert(options) if options.last_write_wins => {
+                Some("upsert_dedup_by_row_id")
+            }
+            OnConflictBehavior::Upsert(options) if options.remove_duplicates => {
+                Some("upsert_dedup")
+            }
+            OnConflictBehavior::Upsert(_) => Some("upsert"),
+            OnConflictBehavior::Drop => None,
+        })
+}
+
+/// Warning for an append refresh that re-reads `refresh_append_overlap` under an upsert
+/// that does not order versions by time.
+fn upsert_with_overlap_warning(dataset_name: &str, on_conflict: &str) -> String {
+    format!(
+        "Dataset '{dataset_name}' uses 'acceleration.on_conflict: {on_conflict}' with 'acceleration.refresh_append_overlap', so a late, older row the overlap re-reads replaces the newer one already loaded. Use 'acceleration.on_conflict: upsert_dedup_by_time_column' to keep the newest version by 'time_column'. See: {UPSERT_DEDUP_BY_TIME_COLUMN_DOCS}"
     )
 }
 
@@ -2835,23 +2881,42 @@ mod tests {
             ColumnReference::new(columns.iter().map(ToString::to_string).collect())
         }
 
+        /// The refusal with `on_conflict` set on the primary key (or on `id` without one).
         fn refusal(
             time_column: Option<&str>,
             primary_key: Option<&ColumnReference>,
             refresh_mode: RefreshMode,
             engine: Engine,
         ) -> Option<String> {
-            upsert_dedup_by_time_column_refusal(time_column, primary_key, refresh_mode, engine)
+            let on_conflict_key = primary_key.cloned().unwrap_or_else(|| key(&["id"]));
+            upsert_dedup_by_time_column_refusal(
+                time_column,
+                primary_key,
+                &on_conflict_key,
+                refresh_mode,
+                engine,
+            )
         }
 
         #[test]
         fn accepts_full_and_append_on_every_supported_engine() {
             let id = key(&["id"]);
-            for engine in [Engine::Cayenne, Engine::Sqlite] {
+            for engine in [Engine::Cayenne, Engine::Sqlite, Engine::Arrow] {
                 for mode in [RefreshMode::Full, RefreshMode::Append] {
                     assert_eq!(refusal(Some("occurred_at"), Some(&id), mode, engine), None);
                 }
             }
+            // A composite key matches whatever order `on_conflict` lists it in.
+            assert_eq!(
+                upsert_dedup_by_time_column_refusal(
+                    Some("occurred_at"),
+                    Some(&key(&["tenant_id", "id"])),
+                    &key(&["id", "tenant_id"]),
+                    RefreshMode::Full,
+                    Engine::Cayenne,
+                ),
+                None
+            );
         }
 
         #[test]
@@ -2865,7 +2930,17 @@ mod tests {
                 ),
                 (
                     refusal(Some("occurred_at"), None, full, Engine::Cayenne),
-                    "'acceleration.on_conflict: upsert_dedup_by_time_column' requires 'acceleration.primary_key', the key it keeps the latest row for. Set 'acceleration.primary_key' to the column(s) that identify a row.",
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' requires 'acceleration.primary_key'. Set it to the column(s) that identify a row.",
+                ),
+                (
+                    upsert_dedup_by_time_column_refusal(
+                        Some("occurred_at"),
+                        Some(&id),
+                        &key(&["tenant_id"]),
+                        full,
+                        Engine::Cayenne,
+                    ),
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' is set on 'tenant_id', which is not 'acceleration.primary_key' ('id'). Set it on the primary key.",
                 ),
                 (
                     refusal(
@@ -2874,7 +2949,7 @@ mod tests {
                         full,
                         Engine::Cayenne,
                     ),
-                    "'time_column' 'occurred_at' is part of 'acceleration.primary_key', so each version of a row has its own key and there is nothing to choose between. Set 'time_column' to a column outside the primary key, or use 'acceleration.on_conflict: upsert'.",
+                    "'time_column' 'occurred_at' is part of 'acceleration.primary_key', so every version has its own key. Use a column outside the key, or 'acceleration.on_conflict: upsert'.",
                 ),
                 (
                     refusal(
@@ -2883,7 +2958,7 @@ mod tests {
                         RefreshMode::Changes,
                         Engine::Cayenne,
                     ),
-                    "'acceleration.on_conflict: upsert_dedup_by_time_column' supports 'acceleration.refresh_mode: full' and 'append', not 'changes'. Use 'acceleration.on_conflict: upsert' for a change-data-capture dataset.",
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' supports 'acceleration.refresh_mode: full' and 'append', not 'changes'. Set one of those, or use 'acceleration.on_conflict: upsert' for change data capture.",
                 ),
                 (
                     refusal(
@@ -2892,15 +2967,20 @@ mod tests {
                         RefreshMode::Caching,
                         Engine::Cayenne,
                     ),
-                    "'acceleration.on_conflict: upsert_dedup_by_time_column' supports 'acceleration.refresh_mode: full' and 'append', not 'caching'.",
-                ),
-                (
-                    refusal(Some("occurred_at"), Some(&id), full, Engine::Arrow),
-                    "'acceleration.on_conflict: upsert_dedup_by_time_column' is not supported by 'acceleration.engine: arrow'. Use 'acceleration.engine: cayenne' or 'sqlite'.",
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' supports 'acceleration.refresh_mode: full' and 'append', not 'caching'. Set one of those, or use 'acceleration.on_conflict: upsert' for change data capture.",
                 ),
                 (
                     refusal(Some("occurred_at"), Some(&id), full, Engine::DuckDB),
-                    "'acceleration.on_conflict: upsert_dedup_by_time_column' is not supported by 'acceleration.engine: duckdb'. Use 'acceleration.engine: cayenne' or 'sqlite'.",
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' is not supported by 'acceleration.engine: duckdb'. Set 'acceleration.engine: cayenne', 'sqlite' or 'arrow'.",
+                ),
+                (
+                    refusal(
+                        Some("occurred_at"),
+                        Some(&id),
+                        full,
+                        Engine::PartitionedArrow,
+                    ),
+                    "'acceleration.on_conflict: upsert_dedup_by_time_column' is not supported by a partitioned 'acceleration.engine: arrow' acceleration. Remove 'acceleration.partition_by', or set 'acceleration.engine: cayenne' or 'sqlite'.",
                 ),
             ];
             for (actual, expected) in cases {
@@ -2924,10 +3004,45 @@ mod tests {
         }
 
         #[test]
+        fn the_upsert_with_overlap_warning_names_the_value_and_the_fix() {
+            assert_eq!(
+                upsert_with_overlap_warning("events", "upsert"),
+                "Dataset 'events' uses 'acceleration.on_conflict: upsert' with 'acceleration.refresh_append_overlap', so a late, older row the overlap re-reads replaces the newer one already loaded. Use 'acceleration.on_conflict: upsert_dedup_by_time_column' to keep the newest version by 'time_column'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+            );
+        }
+
+        #[test]
+        fn every_upsert_but_by_time_column_is_overwritten_by_the_overlap() {
+            use spicepod::acceleration::OnConflictBehavior as B;
+            let with = |behavior: B| {
+                let mut spicepod = spicepod::acceleration::Acceleration::default();
+                spicepod.on_conflict.insert("id".to_string(), behavior);
+                Acceleration::try_from(spicepod).expect("valid acceleration")
+            };
+            assert_eq!(
+                upsert_overwritten_by_overlap(&with(B::Upsert)),
+                Some("upsert")
+            );
+            assert_eq!(
+                upsert_overwritten_by_overlap(&with(B::UpsertDedup)),
+                Some("upsert_dedup")
+            );
+            assert_eq!(
+                upsert_overwritten_by_overlap(&with(B::UpsertDedupByRowId)),
+                Some("upsert_dedup_by_row_id")
+            );
+            assert_eq!(
+                upsert_overwritten_by_overlap(&with(B::UpsertDedupByTimeColumn)),
+                None
+            );
+            assert_eq!(upsert_overwritten_by_overlap(&with(B::Drop)), None);
+        }
+
+        #[test]
         fn the_no_overlap_warning_explains_what_is_never_fetched() {
             assert_eq!(
                 upsert_dedup_by_time_column_no_overlap_warning("events"),
-                "Dataset 'events' uses 'acceleration.on_conflict: upsert_dedup_by_time_column' with 'acceleration.refresh_mode: append' and no 'acceleration.refresh_append_overlap', so a row older than the newest row already loaded is never fetched, even when it is the newest version of its key, and that key keeps showing its previous version. Set 'acceleration.refresh_append_overlap' to the most a row can arrive late. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+                "Dataset 'events' uses 'acceleration.on_conflict: upsert_dedup_by_time_column' on append with no 'acceleration.refresh_append_overlap', so a row older than the newest one loaded is never fetched. Set 'acceleration.refresh_append_overlap' to the most a row can arrive late. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
             );
         }
     }

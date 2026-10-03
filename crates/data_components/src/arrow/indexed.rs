@@ -473,6 +473,16 @@ impl IndexedMemTable {
         self
     }
 
+    /// Keep the last copy of a primary key an upsert write repeats; see
+    /// [`MemTable::with_keep_last_repeated_key`].
+    #[must_use]
+    pub fn with_keep_last_repeated_key(mut self, keep_last_repeated_key: bool) -> Self {
+        self.inner = self
+            .inner
+            .with_keep_last_repeated_key(keep_last_repeated_key);
+        self
+    }
+
     /// Configures sort columns.
     #[must_use]
     pub fn with_sort_columns(mut self, sort_columns: Vec<String>) -> Self {

@@ -196,20 +196,22 @@ pub static REFRESH_ROWS_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Rows a refresh read from the source but did not write under
-/// `on_conflict: upsert_dedup_by_time_column`, because a version of the same key with an
-/// equal or greater `time_column` was already kept. Labelled by `reason`: `older` or
-/// `equal_time`. Rows read = `refresh_rows_written` + `refresh_rows_superseded`.
+/// Rows a refresh read from the source but did not write, because its `on_conflict` mode
+/// kept another version of the same key. Labelled by `reason`; under
+/// `on_conflict: upsert_dedup_by_time_column`:
 ///
-/// Counted per read, not per distinct version: an append re-reads its overlap window on
-/// every refresh and counts each re-read row again (a stored row as `equal_time`, a late
-/// row that lost as `older`). The selector keeps only each key's newest time, so it cannot
-/// tell a re-read from a different row with the same or an older time.
+/// - `older`: a version of the key with a greater `time_column` was already kept;
+/// - `equal_time`: a row with the same time was read earlier in the same refresh, so
+///   `time_column` is not unique per key;
+/// - `unchanged`: the time equals the stored version's — on append, the overlap re-reading
+///   a row already loaded. A different row with the stored time is counted here too.
+///
+/// Rows read = `refresh_rows_written` + `refresh_rows_superseded`.
 pub static REFRESH_ROWS_SUPERSEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("dataset_acceleration_refresh_rows_superseded")
         .with_description(
-            "Cumulative number of rows read from the federated source and not written because the accelerated table already kept a version of the same key with an equal or greater time.",
+            "Cumulative number of rows read from the federated source and not written because the dataset's on_conflict mode kept another version of the same key.",
         )
         .with_unit("rows")
         .build()
