@@ -33,7 +33,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use cayenne::CayenneCatalog;
+use cayenne::{CayenneCatalog, MetadataCatalog};
 use tempfile::TempDir;
 use turso::{Builder, Connection, Database, Value};
 

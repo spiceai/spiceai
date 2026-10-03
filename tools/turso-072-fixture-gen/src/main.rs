@@ -89,18 +89,22 @@ async fn open_db(path: &Path, checkpoint_every_commit: bool) -> Session {
         .expect("open turso 0.7.2 database");
     let conn = db.connect().expect("connect");
     // `PRAGMA journal_mode` returns a row; `execute` rejects that as Misuse.
+    // The PRAGMA runs when it is stepped, so a failure surfaces from `next()`.
     let mut journal = conn
         .query("PRAGMA journal_mode = 'mvcc'", ())
         .await
         .expect("enable MVCC journal mode");
-    let _ = journal.next().await;
+    journal.next().await.expect("enable MVCC journal mode");
     drop(journal);
     if checkpoint_every_commit {
         let mut threshold = conn
             .query("PRAGMA mvcc_checkpoint_threshold = 0", ())
             .await
             .expect("checkpoint after every commit");
-        let _ = threshold.next().await;
+        threshold
+            .next()
+            .await
+            .expect("checkpoint after every commit");
         drop(threshold);
     }
     Session { db, conn }
@@ -335,7 +339,10 @@ async fn write_cayenne_metastore(out_dir: &Path) -> Result<(), String> {
         .query("PRAGMA user_version = 1", ())
         .await
         .map_err(|e| format!("stamp user_version: {e}"))?;
-    let _ = version.next().await;
+    version
+        .next()
+        .await
+        .map_err(|e| format!("stamp user_version: {e}"))?;
     drop(version);
 
     session
@@ -403,7 +410,11 @@ fn copy_turso_sidecars(
     let entries =
         std::fs::read_dir(work).map_err(|e| format!("read work dir {}: {e}", work.display()))?;
     let mut copied = 0_usize;
-    for entry in entries.flatten() {
+    for entry in entries {
+        // A failed entry read could be a sidecar the fixture needs, so it
+        // fails the run instead of leaving an incomplete fixture behind.
+        let entry =
+            entry.map_err(|e| format!("read an entry of work dir {}: {e}", work.display()))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
