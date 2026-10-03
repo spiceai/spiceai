@@ -1538,6 +1538,9 @@ mod tests {
         },
         status,
     };
+    use datafusion::catalog::Session;
+    use datafusion::datasource::TableProvider;
+    use datafusion::logical_expr::{Expr, TableType};
     use datafusion::prelude::SessionContext;
     use runtime_request_context::{
         CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
@@ -2109,19 +2112,90 @@ mod tests {
         assert_eq!(value, 1);
     }
 
-    /// SWR background revalidation must run under the originating user's
-    /// namespace, not `System`. Without this, any sub-cache lookups in the
-    /// background task (planner cache, accelerator cache) would land in the
-    /// wrong scope and either leak across users or never serve the user
-    /// who triggered the refresh.
+    /// A one-row table whose value is the cache namespace of the request that
+    /// planned the scan. It reads the namespace the way the caching accelerator
+    /// scopes its rows: from the `RequestContext` that `Query::run_internal`
+    /// attaches to the session, since DataFusion does not carry the task-local
+    /// across `scan`.
+    #[derive(Debug)]
+    struct NamespaceEchoTable {
+        schema: arrow::datatypes::SchemaRef,
+    }
+
+    #[async_trait::async_trait]
+    impl TableProvider for NamespaceEchoTable {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            let namespace = state
+                .config()
+                .get_extension::<RequestContext>()
+                .map(|context| context.cache_namespace().storage_id().to_string());
+            let batch = arrow::array::RecordBatch::try_new(
+                Arc::clone(&self.schema),
+                vec![Arc::new(arrow::array::StringArray::from(vec![namespace]))],
+            )?;
+            datafusion::datasource::MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?
+                .scan(state, projection, filters, limit)
+                .await
+        }
+    }
+
+    /// Runs `sql` to completion under `request_context`, draining the stream so
+    /// any cache write completes, and returns the cache status with the first
+    /// row's string value.
+    async fn run_string_query(
+        df: &Arc<DataFusion>,
+        request_context: &Arc<RequestContext>,
+        sql: &'static str,
+    ) -> (CacheStatus, Option<String>) {
+        use arrow::array::Array;
+
+        let query = QueryBuilder::new(sql, Arc::clone(df)).build();
+        Arc::clone(request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                let cache_status = result.cache_status;
+                let batches = result.collect_batches().await.expect("should drain");
+                let column = batches
+                    .first()
+                    .expect("query should return one batch")
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("query should return a Utf8 column");
+                let value = (!column.is_null(0)).then(|| column.value(0).to_string());
+                (cache_status, value)
+            })
+            .await
+    }
+
+    /// SWR background revalidation must run under the originating principal's
+    /// namespace, not `System` or `Public`. Whatever the refresh reads that is
+    /// scoped per principal, such as the caching accelerator's rows, it must
+    /// read as the principal it refreshes for, because the result is stored
+    /// under that principal's key.
     ///
-    /// We verify the contract end-to-end: Alice triggers SWR, the background
-    /// refresh runs, and a second principal (Bob) still sees a MISS for the
-    /// same SQL. If the background context fell back to `System`, Bob would
-    /// either see a cross-user HIT (security regression) or Alice's refresh
-    /// would land in `System` and leave her STALE.
+    /// The query reads a table that echoes the namespace its scan was planned
+    /// under, so each cached result records which principal produced it.
+    /// Alice triggers SWR, and once the background refresh lands, her fresh
+    /// HIT must still read `apikey:alice`. Bob, running the same SQL, gets a
+    /// MISS that runs as him: the refresh did not leak into his scope.
     #[tokio::test]
     async fn test_swr_revalidation_inherits_originating_namespace() {
+        let sql = "SELECT ns FROM whoami";
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("1s".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
@@ -2129,6 +2203,17 @@ mod tests {
             ..Default::default()
         }))
         .await;
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "ns",
+            arrow::datatypes::DataType::Utf8,
+            true,
+        )]));
+        df.ctx
+            .register_table(
+                TableReference::bare("whoami"),
+                Arc::new(NamespaceEchoTable { schema }),
+            )
+            .expect("should register table");
 
         let alice = create_test_request_context_in_namespace(
             CacheControl::MaxStale(CacheKeyType::Raw, Some(Duration::from_secs(5))),
@@ -2138,63 +2223,51 @@ mod tests {
             CacheControl::Cache(CacheKeyType::Raw),
             CacheNamespace::Principal("apikey:bob".into()),
         );
+        let as_alice = Some("apikey:alice".to_string());
 
         // Alice populates her namespace.
-        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
-        Arc::clone(&alice)
-            .scope(async move {
-                let r = q.run().await.expect("ok");
-                assert_eq!(r.cache_status, CacheStatus::CacheMiss);
-                let _ = r.collect_batches().await.expect("drain");
-            })
-            .await;
+        assert_eq!(
+            run_string_query(&df, &alice, sql).await,
+            (CacheStatus::CacheMiss, as_alice.clone())
+        );
 
         // Wait past TTL but within stale-while-revalidate window.
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
-        // Alice's stale request triggers background revalidation.
-        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
-        Arc::clone(&alice)
-            .scope(async move {
-                let r = q.run().await.expect("ok");
-                assert_eq!(r.cache_status, CacheStatus::CacheStaleWhileRevalidate);
-                let _ = r.collect_batches().await.expect("drain");
-            })
-            .await;
+        // Alice's stale request is served her entry and triggers background
+        // revalidation.
+        assert_eq!(
+            run_string_query(&df, &alice, sql).await,
+            (CacheStatus::CacheStaleWhileRevalidate, as_alice.clone())
+        );
 
         // Poll for the background revalidation instead of sleeping a fixed
-        // interval. Alice seeing a fresh HIT proves SWR wrote back into her
-        // namespace, not into System.
-        let mut last_status = CacheStatus::CacheStaleWhileRevalidate;
+        // interval. A fresh HIT proves the refresh was stored under Alice's
+        // key; its value proves the refresh ran as Alice.
+        let mut last = (CacheStatus::CacheStaleWhileRevalidate, None);
         for _ in 0..100 {
             if let Some(cp) = df.results_cache_provider() {
                 cp.run_pending_tasks().await;
             }
-            last_status = run_and_drain(Arc::clone(&df), Arc::clone(&alice), "SELECT 42").await;
-            if last_status == CacheStatus::CacheHit {
+            last = run_string_query(&df, &alice, sql).await;
+            if last.0 == CacheStatus::CacheHit {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(
-            last_status,
-            CacheStatus::CacheHit,
-            "background revalidation never refreshed alice's entry"
+            last,
+            (CacheStatus::CacheHit, as_alice),
+            "the background revalidation must refresh alice's entry, running as alice"
         );
 
         // Bob still sees MISS for the same SQL — SWR did not bleed Alice's
         // entry into a cross-user scope.
-        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
-        Arc::clone(&bob)
-            .scope(async move {
-                let r = q.run().await.expect("ok");
-                assert_eq!(
-                    r.cache_status,
-                    CacheStatus::CacheMiss,
-                    "SWR refresh must not leak into bob's scope"
-                );
-            })
-            .await;
+        assert_eq!(
+            run_string_query(&df, &bob, sql).await,
+            (CacheStatus::CacheMiss, Some("apikey:bob".to_string())),
+            "SWR refresh must not leak into bob's scope"
+        );
     }
 
     /// Registers an empty in-memory table, so a query over it records a real
