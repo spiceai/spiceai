@@ -863,13 +863,32 @@ impl SnapshotEngine for CayenneSnapshotEngine {
         // Also the backstop for an archive written by a build that could not verify at
         // creation time.
         if let Err(reason) = verify_slice_against_disk(&slice, &self.data_dir_anchor).await {
-            // Clear what was extracted before giving up. `has_existing_acceleration` reads
-            // any entry under the data directory as "an acceleration is already here", so
-            // leaving a half-restored tree behind would make every later cold start skip
-            // the bootstrap — turning one bad archive into a permanently un-restorable
-            // volume. Only the data directory is cleared; the metadata directory is shared
-            // with every other Cayenne dataset in the pod.
-            if let Err(cleanup) = fs::remove_dir_all(&self.data_dir_anchor).await {
+            // A first restore clears what it extracted before giving up.
+            // `has_existing_acceleration` reads any entry under the data directory as "an
+            // acceleration is already here", so leaving a half-restored tree behind would
+            // make every later cold start skip the bootstrap — turning one bad archive into
+            // a permanently un-restorable volume. A reload extracts over the acceleration it
+            // replaces, so the directory also holds the files the table is serving, and
+            // clearing it would delete them while the table still reads them. The metastore
+            // tells the two apart: a bootstrap runs only while it does not know the table.
+            // Only the data directory is ever cleared; the metadata directory is shared with
+            // every other Cayenne dataset in the pod.
+            let first_restore = match self.catalog.get_table(&self.dataset_name).await {
+                Err(cayenne::CatalogError::TableNotFound { .. }) => true,
+                Ok(_) => false,
+                // Whether the directory holds a live acceleration cannot be told, so it is
+                // left alone: extracted files can be removed by hand, deleted ones cannot be
+                // brought back.
+                Err(err) => {
+                    tracing::warn!(
+                        "Left the files the refused snapshot of '{}' extracted at {} in place, because the Cayenne metastore could not say whether they sit beside a live acceleration: {err}",
+                        self.dataset_name,
+                        self.data_dir_anchor.display()
+                    );
+                    false
+                }
+            };
+            if first_restore && let Err(cleanup) = fs::remove_dir_all(&self.data_dir_anchor).await {
                 tracing::warn!(
                     "Failed to clear the partially extracted acceleration of '{}' at {} after refusing its snapshot; remove it before restarting or the next start will skip the bootstrap: {cleanup}",
                     self.dataset_name,
@@ -889,10 +908,17 @@ impl SnapshotEngine for CayenneSnapshotEngine {
                     slice_path.display()
                 );
             }
-            return Err(SnapshotEngineError::from_display(format!(
-                "the snapshot of '{}' is incomplete, so it was not restored and the acceleration starts empty: {reason}",
-                self.dataset_name
-            )));
+            return Err(SnapshotEngineError::from_display(if first_restore {
+                format!(
+                    "the snapshot of '{}' is incomplete, so it was not restored and the acceleration starts empty: {reason}",
+                    self.dataset_name
+                )
+            } else {
+                format!(
+                    "the snapshot of '{}' is incomplete, so it was not loaded and the acceleration keeps the data it had: {reason}",
+                    self.dataset_name
+                )
+            }));
         }
 
         self.catalog
@@ -1703,7 +1729,11 @@ mod tests {
             .await
             .expect("restore the first snapshot");
         assert_eq!(served_rows().await.expect("read the restored table"), 100);
-        let table_id = reader_catalog.get_table("trips").await.expect("meta").table_id;
+        let table_id = reader_catalog
+            .get_table("trips")
+            .await
+            .expect("meta")
+            .table_id;
         let served_snapshot = reader_catalog
             .get_table("trips")
             .await
@@ -1717,7 +1747,11 @@ mod tests {
             .prepare_directory_snapshot(&writer_dirs, "trips")
             .await
             .expect("prepare the second snapshot");
-        let next_snapshot = catalog.get_table("trips").await.expect("meta").current_snapshot_id;
+        let next_snapshot = catalog
+            .get_table("trips")
+            .await
+            .expect("meta")
+            .current_snapshot_id;
         let next_dir = data_dir.join(&table_id).join(&next_snapshot);
         let dropped = std::fs::read_dir(&next_dir)
             .expect("list the second snapshot")
@@ -1732,10 +1766,7 @@ mod tests {
             .finalize_directory_snapshot(&reader_dirs, "trips")
             .await
             .expect_err("an archive missing a referenced file is refused");
-        assert!(
-            refusal.to_string().contains("is incomplete"),
-            "{refusal}"
-        );
+        assert!(refusal.to_string().contains("is incomplete"), "{refusal}");
 
         assert!(
             reader_data.join(&table_id).join(&served_snapshot).is_dir(),
