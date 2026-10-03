@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 
 use arrow_schema::Field;
@@ -111,6 +112,11 @@ pub(crate) struct VortexOpener {
     pub layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
     /// Shared full-file natural split ranges keyed by file path.
     pub natural_split_ranges: Arc<DashMap<Path, Arc<[Range<u64>]>>>,
+    /// Per-path lock guarding the natural-split-range computation for that file,
+    /// so a miss for one path never blocks a concurrent miss for another path
+    /// that happens to hash to the same `DashMap` shard. See
+    /// [`natural_split_ranges_for_file`].
+    pub natural_split_range_locks: Arc<DashMap<Path, Arc<Mutex<()>>>>,
     /// Whether the query has output ordering specified
     pub has_output_ordering: bool,
 
@@ -168,6 +174,7 @@ impl FileOpener for VortexOpener {
         let limit = self.limit;
         let layout_reader = Arc::clone(&self.layout_readers);
         let natural_split_ranges = Arc::clone(&self.natural_split_ranges);
+        let natural_split_range_locks = Arc::clone(&self.natural_split_range_locks);
         let has_output_ordering = self.has_output_ordering;
         let scan_concurrency = self.scan_concurrency;
 
@@ -403,6 +410,7 @@ impl FileOpener for VortexOpener {
                 Some(file_range) => {
                     let natural_split_ranges = natural_split_ranges_for_file(
                         natural_split_ranges.as_ref(),
+                        natural_split_range_locks.as_ref(),
                         &file.object_meta.location,
                         &layout_reader,
                     )?;
@@ -874,6 +882,7 @@ fn collect_vortex_pushdown_conjunct(
 
 fn natural_split_ranges_for_file(
     natural_split_ranges: &DashMap<Path, Arc<[Range<u64>]>>,
+    natural_split_range_locks: &DashMap<Path, Arc<Mutex<()>>>,
     path: &Path,
     layout_reader: &Arc<dyn LayoutReader>,
 ) -> DFResult<Arc<[Range<u64>]>> {
@@ -881,15 +890,35 @@ fn natural_split_ranges_for_file(
         return Ok(Arc::clone(split_ranges.value()));
     }
 
-    let split_ranges = compute_natural_split_ranges(layout_reader.as_ref())?;
+    // Claim this path's own lock under a brief `entry` guard on the *lock* map,
+    // then drop that guard before computing. A miss for an unrelated path that
+    // happens to hash to the same shard only ever waits behind this cheap
+    // get-or-insert, never behind the layout walk below - unlike taking the
+    // entry of `natural_split_ranges` itself and computing inside it, which
+    // holds that shard write-locked for the full traversal.
+    let path_lock = Arc::clone(
+        natural_split_range_locks
+            .entry(path.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value(),
+    );
 
-    match natural_split_ranges.entry(path.clone()) {
-        Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
-        Entry::Vacant(entry) => {
-            entry.insert(Arc::clone(&split_ranges));
-            Ok(split_ranges)
-        }
+    // Serializes racing splits of the same file on the one lock that matters to
+    // them. The computation is synchronous and touches no other entry of either
+    // map, so the guard is held across no await and can close no cycle.
+    let _guard = path_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Another split may have computed and inserted the ranges while this one
+    // waited for the path lock.
+    if let Some(split_ranges) = natural_split_ranges.get(path) {
+        return Ok(Arc::clone(split_ranges.value()));
     }
+
+    let split_ranges = compute_natural_split_ranges(layout_reader.as_ref())?;
+    natural_split_ranges.insert(path.clone(), Arc::clone(&split_ranges));
+    Ok(split_ranges)
 }
 
 fn compute_natural_split_ranges(layout_reader: &dyn LayoutReader) -> DFResult<Arc<[Range<u64>]>> {
@@ -1177,6 +1206,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            natural_split_range_locks: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1744,6 +1774,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            natural_split_range_locks: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1835,6 +1866,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            natural_split_range_locks: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1994,6 +2026,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            natural_split_range_locks: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -2058,6 +2091,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            natural_split_range_locks: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -2306,6 +2340,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            natural_split_range_locks: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
