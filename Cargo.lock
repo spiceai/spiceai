@@ -11244,6 +11244,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "key-index"
+version = "2.4.0-unstable"
+dependencies = [
+ "arc-swap",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
+ "hash-index",
+ "parking_lot",
+ "rand 0.10.1",
+ "snafu",
+ "vstd",
+]
+
+[[package]]
 name = "keyed_priority_queue"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
