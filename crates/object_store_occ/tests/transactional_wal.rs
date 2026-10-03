@@ -946,3 +946,160 @@ fn process_restart_at_wal_publication_boundaries() {
         });
     }
 }
+
+async fn replace_json(state: &dyn StateStore, key: &Path, value: &serde_json::Value) {
+    let previous = state
+        .read(key)
+        .await
+        .expect("read record to damage")
+        .expect("record exists");
+    assert!(matches!(
+        state
+            .compare_exchange(
+                key,
+                ExpectedRevision::Exact(&previous.revision),
+                StateChange::Set(Bytes::from(
+                    serde_json::to_vec(value).expect("encode injected record")
+                )),
+                WriteId::new(),
+            )
+            .await
+            .expect("replace damaged record"),
+        WriteOutcome::Applied
+    ));
+}
+
+fn referenced_key(kind: &str, reference: &serde_json::Value) -> Path {
+    let id: [u8; 16] = serde_json::from_value(reference["id"].clone()).expect("object identity");
+    Path::from(format!("domain/{kind}/{}", uuid::Uuid::from_bytes(id)))
+}
+
+async fn json_record(state: &dyn StateStore, key: &Path) -> serde_json::Value {
+    let record = state
+        .read(key)
+        .await
+        .expect("read JSON record")
+        .expect("record");
+    serde_json::from_slice(&record.value.expect("record value")).expect("decode JSON record")
+}
+
+#[tokio::test]
+async fn missing_and_corrupt_checkpoint_artifacts_fail_closed() {
+    for kind in ["pages", "checkpoints"] {
+        for missing in [true, false] {
+            let state = memory();
+            let store = open(Arc::clone(&state)).await;
+            let attempt = prepare(&store, "key", b"value").await;
+            committed(&store.commit(&attempt).await.expect("commit"));
+            let retained = store.snapshot().await.expect("retained snapshot");
+            assert!(matches!(
+                store.checkpoint(&retained).await.expect("checkpoint"),
+                WriteOutcome::Applied
+            ));
+            let head = json_record(state.as_ref(), &Path::from("domain/head")).await;
+            let manifest_key = referenced_key("checkpoints", &head["checkpoint"]["object"]);
+            let target = if kind == "pages" {
+                let checkpoint = json_record(state.as_ref(), &manifest_key).await;
+                referenced_key("pages", &checkpoint["pages"][0])
+            } else {
+                manifest_key
+            };
+            let record = state
+                .read(&target)
+                .await
+                .expect("target read")
+                .expect("target");
+            let damage = if missing {
+                StateChange::Tombstone
+            } else {
+                StateChange::Set(Bytes::from_static(b"damaged"))
+            };
+            assert!(matches!(
+                state
+                    .compare_exchange(
+                        &target,
+                        ExpectedRevision::Exact(&record.revision),
+                        damage,
+                        WriteId::new()
+                    )
+                    .await
+                    .expect("inject damage"),
+                WriteOutcome::Applied
+            ));
+            let reopened = open(Arc::clone(&state)).await;
+            assert!(matches!(
+                reopened
+                    .snapshot()
+                    .await
+                    .expect_err("do not expose partial state"),
+                Error::InvalidRecord { .. }
+            ));
+            assert_eq!(retained.get("key"), Some(&Bytes::from_static(b"value")));
+            println!(
+                "checkpoint artifact={kind}, missing={missing}: recovery rejected, retained snapshot unchanged"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn inconsistent_checkpoint_metadata_fails_even_with_valid_content_digest() {
+    for damage in [
+        "sequence",
+        "incarnation",
+        "commit",
+        "duplicate_page",
+        "reversed_pages",
+        "totals",
+    ] {
+        let state = memory();
+        let store = open(Arc::clone(&state)).await;
+        for key in ["a", "b"] {
+            let mut tx = store.begin().await.expect("begin");
+            tx.put(key, Bytes::from(vec![1; 80 * 1024]))
+                .expect("page-sized value");
+            committed(
+                &store
+                    .commit(&tx.prepare().await.expect("prepare"))
+                    .await
+                    .expect("commit"),
+            );
+        }
+        let snapshot = store.snapshot().await.expect("snapshot");
+        assert!(matches!(
+            store.checkpoint(&snapshot).await.expect("checkpoint"),
+            WriteOutcome::Applied
+        ));
+        let head_key = Path::from("domain/head");
+        let mut head = json_record(state.as_ref(), &head_key).await;
+        let key = referenced_key("checkpoints", &head["checkpoint"]["object"]);
+        let mut checkpoint = json_record(state.as_ref(), &key).await;
+        match damage {
+            "sequence" => checkpoint["sequence"] = serde_json::json!(1),
+            "incarnation" => checkpoint["incarnation"] = serde_json::json!(vec![0; 16]),
+            "commit" => checkpoint["commit"] = serde_json::Value::Null,
+            "duplicate_page" => {
+                let first = checkpoint["pages"][0].clone();
+                checkpoint["pages"]
+                    .as_array_mut()
+                    .expect("pages")
+                    .push(first);
+            }
+            "reversed_pages" => checkpoint["pages"].as_array_mut().expect("pages").reverse(),
+            "totals" => checkpoint["keys"] = serde_json::json!(0),
+            _ => panic!("unknown test damage"),
+        }
+        let bytes = serde_json::to_vec(&checkpoint).expect("damaged manifest");
+        head["checkpoint"]["object"]["digest"] = serde_json::json!(blake3::hash(&bytes).as_bytes());
+        replace_json(state.as_ref(), &key, &checkpoint).await;
+        replace_json(state.as_ref(), &head_key, &head).await;
+        assert!(matches!(
+            store
+                .snapshot()
+                .await
+                .expect_err("reject inconsistent manifest"),
+            Error::InvalidRecord { .. }
+        ));
+        println!("checkpoint metadata={damage}: recovery rejected");
+    }
+}

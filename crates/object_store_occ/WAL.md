@@ -7,7 +7,10 @@ it automatically, and existing `ObjectState<T>` JSON formats are unchanged.
 Use an exclusive namespace and a backend providing fresh reads and atomic
 conditional writes. The library cannot create durability or consistency that the
 backend does not supply. In-memory and local integration runs do not qualify cloud
-providers, local power loss, or the local adapter's cancellation behavior.
+providers or local power loss. The local adapter keeps conditional publication
+on a dedicated filesystem worker with a bounded queue, retaining its advisory
+lock through caller cancellation and Tokio runtime shutdown. Accepted writes
+drain after the last handle is dropped; callers still resolve cancelled writes.
 
 ## API and commit contract
 
@@ -112,7 +115,7 @@ latency or massive-scale qualification is claimed for this initial library.
 Run the local public-API and filesystem/fault suites:
 
 ```sh
-cargo test --profile dev -p object_store_occ --lib --test state_store --test transactional_wal
+cargo test --profile dev -p object_store_occ --lib --test state_store --test transactional_wal --test local_cancellation
 make lint-rust PACKAGES=object_store_occ FEATURES= RUST_PROFILE=dev
 ```
 
@@ -122,3 +125,33 @@ lost responses, cancellation, delayed writes, corruption and resource bounds.
 Its subprocess test exits around the publication boundary and recovers from real
 local files. This exercises process termination, not machine power loss.
 The existing S3 suites require explicit credentials and bucket configuration.
+
+
+The process-level harness starts independent writer, reader and checkpoint
+processes through the public library API. It retains JSONL requests/responses,
+receipts persisted before dispatch, stderr and backing stores. SIGKILL tests
+cover boundaries between storage operations; separate filesystem tests cancel
+an upload while its staging file is growing and shut down its Tokio runtime.
+Neither test simulates power loss.
+
+```sh
+cargo build --locked --profile dev -p object_store_occ --example wal_test_driver
+python3 -m venv /tmp/wal-oracle
+/tmp/wal-oracle/bin/pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
+/tmp/wal-oracle/bin/python test/object_store_occ/e2e.py \
+  --driver target/debug/examples/wal_test_driver \
+  --artifacts /tmp/wal-e2e-run --slatedb
+```
+
+The artifact directory must be new for each run. `--slatedb` requires the pinned
+SlateDB 0.17.0 Python package, an independent implementation outside Spice's
+runtime dependencies. Equivalent committed histories compare point state, ordered
+scans, transactional overlays, pinned snapshots and reopen recovery. The oracle
+waits for `await_durable()` before treating a SlateDB commit as durable. It does
+not compare identical abort decisions: SlateDB's finer-grained validation differs
+from this library's whole-head OCC. Concurrent CAS and atomicity are checked by
+separate multi-process histories.
+
+`.github/workflows/object_store_wal.yml` runs these suites and the mandatory
+SlateDB oracle on Linux and macOS for changes to this crate and in the merge queue.
+This qualifies the library path; it is not a Cayenne/runtime integration test.

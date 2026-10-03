@@ -139,7 +139,90 @@ test result: FAILED. 0 passed; 10 failed; 0 ignored; 0 measured; 0 filtered out;
 ```
 
 The explicit local-suite command above avoids invoking those cloud tests. No
-cloud qualification, local power-loss/cancellation qualification, engine-level
+cloud qualification, local power-loss qualification, engine-level
 transaction test, performance benchmark, or full-workspace sign-off is claimed.
 Production retention/GC, restore and ownership-transfer protocols remain outside
 this internal library; see [its contract](../../crates/object_store_occ/WAL.md).
+
+
+## Process-level hardening
+
+`test/object_store_occ/e2e.py` supervises independent real filesystem clients.
+The local run (SlateDB not installed locally) used:
+
+```sh
+cargo build --profile dev -p object_store_occ --example wal_test_driver
+python3 test/object_store_occ/e2e.py --driver target/debug/examples/wal_test_driver --artifacts /tmp/spice-wal-e2e-local
+```
+
+Actual output:
+
+```text
+SlateDB differential testing NOT RUN (pass --slatedb)
+history seed=0: 96 transactions; reads, overlays, snapshots, checkpoints, reopen agree
+history seed=1: 96 transactions; reads, overlays, snapshots, checkpoints, reopen agree
+history seed=17: 96 transactions; reads, overlays, snapshots, checkpoints, reopen agree
+history seed=5489: 96 transactions; reads, overlays, snapshots, checkpoints, reopen agree
+concurrency: 80 acknowledged transfers, 99 reader snapshots, 35 competing checkpoints
+SIGKILL commit boundary=1: rows=[], sequence=0
+SIGKILL commit boundary=2: rows=[], sequence=0
+SIGKILL commit boundary=3: rows=[['a', [1]], ['b', [2]]], sequence=1
+SIGKILL checkpoint boundary=1: recovered all 3 pages
+SIGKILL checkpoint boundary=3: recovered all 3 pages
+SIGKILL checkpoint boundary=4: recovered all 3 pages
+SIGKILL checkpoint boundary=5: recovered all 3 pages
+PASS: WAL process-level qualification
+```
+
+The SIGKILL barriers are between storage calls. The filesystem cancellation test
+separately observes an active, growing staging file before aborting the caller.
+It reproduced a lost update on the PR's initial local adapter: the contender
+returned `Ok(PutResult { ... })`, then the cancelled upload overwrote its
+acknowledged 12-byte value with 262,144 bytes. The dedicated filesystem worker
+keeps lock acquisition, comparison and publication under one owner. The same
+experiment now returns `Err(Precondition { ... })` for the stale contender.
+
+`local_cancellation` also covers runtime shutdown with one blocking thread and
+dropping the last store handle with accepted active and queued writes. Checkpoint
+fault cases cover missing/corrupt pages and manifests, and structurally inconsistent
+sequence, incarnation, ancestor, duplicate/reversed pages and totals even when
+content hashes are recomputed by the fault injector.
+
+The dedicated `Object Store WAL E2E` workflow installs the pinned SlateDB oracle
+and runs the full comparison on Linux and macOS. See that check on PR #14732 for
+its captured output and downloadable histories; the local model run above is not
+a substitute for an oracle run. PyPI was unreachable from the local sandbox.
+
+
+Cancellation reproduction command, with the same test source on `b80ab208` and
+the worker implementation (an isolated target directory avoids sharing artifacts
+between checkouts):
+
+```sh
+env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/tmp/spice-wal-repro-target cargo test --profile dev -p object_store_occ --test local_cancellation cancelled_local_write_cannot_overwrite_an_acknowledged_contender -- --exact --nocapture
+```
+
+Before:
+
+```text
+contender after cancellation: Ok(PutResult { e_tag: Some("2027f572-65cf3b8737494-c"), version: None })
+final length=262144, first byte=Some(120)
+cancelled write overwrote acknowledged state: length=262144
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out
+```
+
+After:
+
+```text
+contender after cancellation: Err(Precondition { ... })
+final length=262144, first byte=Some(120)
+test cancelled_local_write_cannot_overwrite_an_acknowledged_contender ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out
+```
+
+A baseline rerun sharing a target directory with the other checkout passed; the
+clean-target run above reproduced the overwrite. This timing-based experiment
+requires observing a partially written staging file and fails if it cannot engage
+that boundary. It demonstrates the observed lost update, not a failure on every
+possible schedule. Full command output is in `/tmp/spice-wal-cancellation-base-clean.log`
+and `/tmp/spice-wal-cancellation-fixed-clean.log`.

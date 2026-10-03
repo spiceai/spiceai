@@ -16,7 +16,10 @@ limitations under the License.
 
 //! Public-trait conformance tests with local I/O and faults after write application.
 
-#![allow(clippy::expect_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "test failures include operation context"
+)]
 
 use std::fmt::{self, Display, Formatter};
 use std::ops::Range;
