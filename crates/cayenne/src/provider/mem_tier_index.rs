@@ -41,9 +41,8 @@ use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
 use datafusion_common::ScalarValue;
 
 use super::lookup_index::{
-    WarnOnce,
-    Counters, Coverage, KeyColumn, KeySpec, LookupIndexCounters, LookupIndexScanReason, cast_to,
-    key_converter, key_tuples, record_probe_outcome,
+    Counters, Coverage, KeyColumn, KeySpec, LookupIndexCounters, LookupIndexScanReason, WarnOnce,
+    cast_to, key_converter, key_tuples, record_probe_outcome,
 };
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
 use crate::row_converter::RowConverter;

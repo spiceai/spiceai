@@ -35806,7 +35806,9 @@ impl CayenneTableProvider {
             let (_, protected_files) = self
                 .lookup_index_protected_files(&self.protected_snapshots.load_full())
                 .await
-                .map_err(|error| format!("could not list the protected snapshots' files: {error}"))?;
+                .map_err(|error| {
+                    format!("could not list the protected snapshots' files: {error}")
+                })?;
             files.extend(
                 protected_files
                     .into_iter()

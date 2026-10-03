@@ -1234,6 +1234,7 @@ impl WarnOnce {
     }
 
     /// Whether it has warned since the last reset.
+    #[cfg(test)]
     pub(crate) fn warned(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
@@ -3817,11 +3818,7 @@ mod tests {
     async fn a_lookup_over_several_snapshots_is_counted_with_its_merged_coverage() {
         let pool = unbounded_pool();
         let state = keyed_state(&pool);
-        write(
-            &state,
-            &[("a.vortex", 0, keyed_batch(&[Some(1)], &[None]))],
-        )
-        .await;
+        write(&state, &[("a.vortex", 0, keyed_batch(&[Some(1)], &[None]))]).await;
         let view = state.published();
         let counts = |state: &LookupIndexState| {
             let counters = state.counters.snapshot(0);
@@ -3836,16 +3833,11 @@ mod tests {
             let (_, _, protected_explain, _) = selection
                 .clone()
                 .restrict(group(protected), no_table_plans());
-            let (_, _, current_explain, _) =
-                selection.restrict(group(current), no_table_plans());
+            let (_, _, current_explain, _) = selection.restrict(group(current), no_table_plans());
             let explain = current_explain.merge(protected_explain);
             state.record_lookup(&explain);
             let after = counts(&state);
-            let recorded = (
-                after.0 - before.0,
-                after.1 - before.1,
-                after.2 - before.2,
-            );
+            let recorded = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
             let reported = match explain.outcome {
                 LookupIndexExplainOutcome::Probed(Coverage::Unindexed) => (1, 0, 0),
                 LookupIndexExplainOutcome::Probed(Coverage::Partial) => (0, 1, 0),
@@ -3857,7 +3849,10 @@ mod tests {
                 LookupIndexExplainOutcome::Probed(expected),
                 "{current:?} + {protected:?}"
             );
-            assert_eq!(recorded, reported, "{current:?} + {protected:?}: the metric matches EXPLAIN");
+            assert_eq!(
+                recorded, reported,
+                "{current:?} + {protected:?}: the metric matches EXPLAIN"
+            );
         }
     }
 
