@@ -27,9 +27,20 @@ limitations under the License.
 //!     --policy <none|drop|upsert|keep_last> --keys 1000000 --passes 4 [--refreshes 2]
 //! ```
 //!
+//! `--append` writes the generated data as an append refresh instead, through
+//! the streaming append path (`stream_publish_interval_ms: 0`), so its repeats
+//! are resolved as an append resolves them; `--refreshes` then appends again
+//! over the rows the previous append left.
+//!
 //! `--refreshes` repeats the refresh over the table the previous one left; every
 //! refresh after the first replaces a table of known size, which is the common
 //! shape of a scheduled refresh.
+//!
+//! `--progress-rows N` prints the rate the refresh pulls rows from its source
+//! over each `N` rows, so a rate that falls as the write grows shows up.
+//! `--memory-limit-mb M` runs the refresh under an `M` MiB memory pool, as
+//! `spiced` does under `runtime.query.memory_limit`. `--skip-queries` stops
+//! after the refresh.
 
 #![expect(
     clippy::print_stdout,
@@ -63,28 +74,97 @@ fn arg(name: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-fn schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("pass", DataType::Int64, false),
-        Field::new("payload", DataType::Utf8, false),
-    ]))
+/// Rows the source emits: `keys * passes`, or, with `--dup-fraction f`, every
+/// key once followed by a second copy of `f * keys` of them.
+fn total_rows(keys: usize, passes: usize) -> usize {
+    match arg("--dup-fraction", "").parse::<f64>() {
+        Ok(fraction) => keys + (keys as f64 * fraction).round() as usize,
+        Err(_) => keys * passes,
+    }
 }
 
-/// `passes` sweeps over `keys` keys in a scrambled order, generated lazily.
-fn source(keys: usize, passes: usize) -> SendableRecordBatchStream {
-    let total = keys * passes;
+/// The primary key's shape (`--key-kind`): one `Int64` (`int`), one 32-character
+/// hex string (`string`), or an `Int64` tenant plus a string id (`composite`).
+static KEY_KIND: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| arg("--key-kind", "int"));
+
+fn key_columns() -> Vec<String> {
+    match KEY_KIND.as_str() {
+        "int" | "string" => vec!["id".to_string()],
+        "composite" => vec!["tenant".to_string(), "id".to_string()],
+        other => panic!("unknown key kind {other}"),
+    }
+}
+
+fn schema() -> SchemaRef {
+    let mut fields = Vec::new();
+    match KEY_KIND.as_str() {
+        "int" => fields.push(Field::new("id", DataType::Int64, false)),
+        "string" => fields.push(Field::new("id", DataType::Utf8, false)),
+        _ => {
+            fields.push(Field::new("tenant", DataType::Int64, false));
+            fields.push(Field::new("id", DataType::Utf8, false));
+        }
+    }
+    fields.push(Field::new("pass", DataType::Int64, false));
+    fields.push(Field::new("payload", DataType::Utf8, false));
+    Arc::new(Schema::new(fields))
+}
+
+/// `passes` sweeps over `keys` keys in a scrambled order, generated lazily,
+/// printing the rate rows are pulled at over each `progress_rows` rows.
+fn source(keys: usize, passes: usize, progress_rows: usize) -> SendableRecordBatchStream {
+    let started = Instant::now();
+    let mut mark = (0_usize, started);
+    let total = total_rows(keys, passes);
+    // `--key-order sorted` emits each pass in key order instead, which the first
+    // load cannot cut split points from, so it hashes its key.
+    let sorted = arg("--key-order", "scrambled") == "sorted";
     let batches = (0..total.div_ceil(BATCH)).map(move |b| {
         let start = b * BATCH;
         let end = (start + BATCH).min(total);
-        let ids: Int64Array = (start..end)
+        let scrambled: Vec<u64> = (start..end)
             .map(|row| {
                 let k = (row % keys) as u64;
+                if sorted {
+                    return k;
+                }
                 // A bijection on 0..keys when keys is odd-coprime; spreads keys
                 // across the key space so every batch spans the range.
-                ((k.wrapping_mul(2_654_435_761)) % keys as u64) as i64
+                (k.wrapping_mul(2_654_435_761)) % keys as u64
             })
             .collect();
+        let mut key_arrays: Vec<arrow::array::ArrayRef> = Vec::new();
+        match KEY_KIND.as_str() {
+            "int" => key_arrays.push(Arc::new(
+                scrambled.iter().map(|k| *k as i64).collect::<Int64Array>(),
+            )),
+            "string" => key_arrays.push(Arc::new(StringArray::from_iter_values(
+                scrambled
+                    .iter()
+                    .map(|k| format!("{:032x}", k.wrapping_mul(0x9e37_79b9_7f4a_7c15))),
+            ))),
+            _ => {
+                key_arrays.push(Arc::new(
+                    scrambled
+                        .iter()
+                        .map(|k| (k % 1024) as i64)
+                        .collect::<Int64Array>(),
+                ));
+                key_arrays.push(Arc::new(StringArray::from_iter_values(
+                    scrambled.iter().map(|k| format!("{:024x}", k / 1024)),
+                )));
+            }
+        }
+        if progress_rows > 0 && end - mark.0 >= progress_rows {
+            let now = Instant::now();
+            println!(
+                "  progress rows={end} elapsed_s={:.1} interval_rows_per_s={:.0}",
+                now.duration_since(started).as_secs_f64(),
+                (end - mark.0) as f64 / now.duration_since(mark.1).as_secs_f64()
+            );
+            mark = (end, now);
+        }
         let pass: Int64Array = (start..end).map(|row| (row / keys) as i64).collect();
         let payload: StringArray = (start..end)
             .map(|row| {
@@ -94,16 +174,82 @@ fn source(keys: usize, passes: usize) -> SendableRecordBatchStream {
                 ))
             })
             .collect();
-        Ok(RecordBatch::try_new(
-            schema(),
-            vec![Arc::new(ids), Arc::new(pass), Arc::new(payload)],
-        )
-        .expect("batch"))
+        key_arrays.push(Arc::new(pass));
+        key_arrays.push(Arc::new(payload));
+        Ok(RecordBatch::try_new(schema(), key_arrays).expect("batch"))
     });
     Box::pin(RecordBatchStreamAdapter::new(
         schema(),
         futures::stream::iter(batches),
     ))
+}
+
+/// A plan that yields `stream` once, so an append reads the generated source
+/// lazily through `insert_into`.
+struct OneShot {
+    schema: SchemaRef,
+    stream: std::sync::Mutex<Option<SendableRecordBatchStream>>,
+}
+
+impl std::fmt::Debug for OneShot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OneShot")
+    }
+}
+
+impl datafusion::physical_plan::streaming::PartitionStream for OneShot {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _ctx: Arc<datafusion::execution::TaskContext>) -> SendableRecordBatchStream {
+        self.stream
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("the source is read once")
+    }
+}
+
+async fn append(
+    provider: &Arc<cayenne::CayenneTableProvider>,
+    ctx: &SessionContext,
+    stream: SendableRecordBatchStream,
+) -> u64 {
+    use datafusion::datasource::TableProvider;
+    let partition: Arc<dyn datafusion::physical_plan::streaming::PartitionStream> =
+        Arc::new(OneShot {
+            schema: schema(),
+            stream: std::sync::Mutex::new(Some(stream)),
+        });
+    let source = Arc::new(
+        datafusion::physical_plan::streaming::StreamingTableExec::try_new(
+            schema(),
+            vec![partition],
+            None,
+            Vec::new(),
+            false,
+            None,
+        )
+        .expect("source"),
+    );
+    let plan = provider
+        .insert_into(
+            &ctx.state(),
+            source,
+            datafusion::logical_expr::dml::InsertOp::Append,
+        )
+        .await
+        .expect("plan");
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .expect("append");
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .expect("count")
+        .value(0)
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -173,8 +319,24 @@ async fn main() {
             .expect("catalog"),
     ) as Arc<dyn MetadataCatalog>;
     catalog.init().await.expect("init");
-    let ctx = SessionContext::new();
-    let key = ColumnReference::new(vec!["id".to_string()]);
+    let progress_rows: usize = arg("--progress-rows", "0").parse().expect("progress rows");
+    let memory_limit_mb: usize = arg("--memory-limit-mb", "0").parse().expect("memory limit");
+    let skip_queries = std::env::args().any(|a| a == "--skip-queries");
+    let append_mode = std::env::args().any(|a| a == "--append");
+    let ctx = if memory_limit_mb == 0 {
+        SessionContext::new()
+    } else {
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(
+                datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                    memory_limit_mb * 1024 * 1024,
+                ),
+            ))
+            .build_arc()
+            .expect("runtime env");
+        SessionContext::new_with_config_rt(datafusion::prelude::SessionConfig::new(), runtime)
+    };
+    let key = ColumnReference::new(key_columns());
     let (on_conflict, dedup) = match policy.as_str() {
         "none" => (None, UpsertDedup::None),
         "drop" => (Some(OnConflict::DoNothing(key)), UpsertDedup::None),
@@ -187,7 +349,7 @@ async fn main() {
         .create(CreateTableOptions {
             table_name: "t".to_string(),
             schema: schema(),
-            primary_key: vec!["id".to_string()],
+            primary_key: key_columns(),
             on_conflict,
             base_path: dir.path().join("data").display().to_string(),
             partition_column: None,
@@ -195,6 +357,11 @@ async fn main() {
                 deletion_mode,
                 inline_max_rows: 0,
                 compaction_background_interval_ms: 3_600_000,
+                stream_publish_interval_ms: if append_mode {
+                    0
+                } else {
+                    VortexConfig::default().stream_publish_interval_ms
+                },
                 ..VortexConfig::default()
             },
         })
@@ -206,16 +373,32 @@ async fn main() {
     let mut written = 0;
     for refresh in 1..=refreshes {
         let start = Instant::now();
+        if append_mode {
+            written = append(&provider, &ctx, source(keys, passes, progress_rows)).await;
+            refresh_s = start.elapsed().as_secs_f64();
+            if refreshes > 1 {
+                println!("  append {refresh} of {refreshes}: refresh_s={refresh_s:.2}");
+            }
+            continue;
+        }
         let prepared = provider
             .begin_overwrite(
-                source(keys, passes),
+                source(keys, passes, progress_rows),
                 ctx.state().config().target_partitions(),
             )
             .await
             .expect("refresh");
         written = prepared.row_count();
+        let begun = start.elapsed();
+        let phase = Instant::now();
         prepared.apply_owned_txn().await.expect("commit");
+        let committed = phase.elapsed();
+        let phase = Instant::now();
         prepared.finish().await.expect("publish");
+        eprintln!(
+            "PHASE begin_overwrite {begun:?} commit {committed:?} publish {:?}",
+            phase.elapsed()
+        );
         refresh_s = start.elapsed().as_secs_f64();
         if refreshes > 1 {
             println!("  refresh {refresh} of {refreshes}: refresh_s={refresh_s:.2}");
@@ -227,10 +410,81 @@ async fn main() {
         .expect("layers")
         .len();
     println!(
-        "policy={policy} deletion_mode={deletion_mode:?} keys={keys} passes={passes} rows_in={} rows_written={written} layers={layers} refresh_s={refresh_s:.2} rows_per_s={:.0}",
-        keys * passes,
-        (keys * passes) as f64 / refresh_s,
+        "mode={} policy={policy} deletion_mode={deletion_mode:?} keys={keys} passes={passes} rows_in={} rows_written={written} layers={layers} refresh_s={refresh_s:.2} rows_per_s={:.0}",
+        if append_mode { "append" } else { "overwrite" },
+        total_rows(keys, passes),
+        total_rows(keys, passes) as f64 / refresh_s,
     );
+    if std::env::args().any(|a| a == "--dup-query") {
+        // The cost of finding repeated keys after the write, as a post-pass
+        // would: a parallel aggregate over the key column.
+        let ctx =
+            SessionContext::new_with_config_rt(ctx.state().config().clone(), ctx.runtime_env());
+        ctx.register_table(
+            "t",
+            Arc::clone(&provider) as Arc<dyn datafusion::datasource::TableProvider>,
+        )
+        .expect("register");
+        let plan = ctx
+            .sql("EXPLAIN ANALYZE SELECT id FROM t GROUP BY id HAVING COUNT(*) > 1")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("explain");
+        println!(
+            "{}",
+            arrow::util::pretty::pretty_format_batches(&plan).expect("format")
+        );
+        for attempt in 1..=3 {
+            let start = Instant::now();
+            let repeated = ctx
+                .sql("SELECT id FROM t GROUP BY id HAVING COUNT(*) > 1")
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("query")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>();
+            println!(
+                "  dup_query attempt={attempt} repeated_keys={repeated} s={:.2}",
+                start.elapsed().as_secs_f64()
+            );
+        }
+    }
+    let sql = arg("--sql", "");
+    if !sql.is_empty() {
+        let ctx =
+            SessionContext::new_with_config_rt(ctx.state().config().clone(), ctx.runtime_env());
+        ctx.register_table(
+            "t",
+            Arc::clone(&provider) as Arc<dyn datafusion::datasource::TableProvider>,
+        )
+        .expect("register");
+        for attempt in 1..=3 {
+            let start = Instant::now();
+            let batches = ctx
+                .sql(&sql)
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("query");
+            println!(
+                "  sql attempt={attempt} s={:.2} result={}",
+                start.elapsed().as_secs_f64(),
+                arrow::util::pretty::pretty_format_batches(&batches)
+                    .expect("format")
+                    .to_string()
+                    .replace('\n', " ")
+            );
+        }
+    }
+    if skip_queries {
+        return;
+    }
     // Vortex files per snapshot directory (the main snapshot and each layer).
     let mut files_per_dir: Vec<usize> = std::fs::read_dir(dir.path().join("data"))
         .into_iter()
@@ -258,7 +512,7 @@ async fn main() {
     println!(
         "  snapshot dirs with files={} vortex files per dir={files_per_dir:?} input batches={}",
         files_per_dir.len(),
-        (keys * passes).div_ceil(BATCH)
+        total_rows(keys, passes).div_ceil(BATCH)
     );
     ctx.register_table(
         "t",

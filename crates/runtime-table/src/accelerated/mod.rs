@@ -68,6 +68,8 @@ use tokio::task::JoinHandle;
 
 pub mod caching;
 pub mod caching_eviction;
+#[cfg(test)]
+mod caching_scan_tests;
 pub mod federation;
 pub mod refresh;
 pub mod refresh_completion;
@@ -1769,8 +1771,6 @@ impl AcceleratedTable {
             None
         };
         let scan_projection = extended_projection.as_ref().or(projection);
-        // For UseSource mode, the scan is handled inside the match arm below (with filter
-        // splitting). For all other modes, perform the accelerator scan upfront.
         // For caching mode, scope the accelerator scan to the current
         // request's namespace by appending a `__spice_cache_namespace = $ns_id`
         // predicate. The federated source still receives only the user's
@@ -1817,15 +1817,15 @@ impl AcceleratedTable {
         };
         let input = if matches!(
             (is_caching_mode, &self.zero_results_action),
-            (false, ZeroResultsAction::UseSource)
+            (false, ZeroResultsAction::ReturnEmpty)
         ) {
-            None
-        } else {
             Some(
                 self.accelerator
                     .scan(state, scan_projection, scan_filters, limit)
                     .await?,
             )
+        } else {
+            None
         };
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
@@ -1835,13 +1835,6 @@ impl AcceleratedTable {
 
         let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
-                // Caching mode: wrap with cache execution plan to handle staleness and background refresh
-                let input = input.ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "accelerator scan input missing in caching mode".to_string(),
-                    )
-                })?;
-
                 // Check which user filters the accelerator doesn't fully
                 // support and need to be re-applied. This ensures correct
                 // results when the accelerator returns Inexact or
@@ -1881,10 +1874,39 @@ impl AcceleratedTable {
                         filters_to_reapply.push(nf);
                     }
                 }
-                let input = if filters_to_reapply.is_empty() {
-                    input
+                let input = if caching::uses_source_first(
+                    filters,
+                    self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
+                    self.cache_stale_if_error,
+                ) {
+                    let schema = match scan_projection {
+                        Some(projection) => {
+                            Arc::new(self.accelerator.schema().project(projection)?)
+                        }
+                        None => self.accelerator.schema(),
+                    };
+                    caching::CachingScanInput::Deferred {
+                        accelerator: Arc::clone(&self.accelerator),
+                        scan_params: TableScanParams::new(
+                            state,
+                            scan_projection,
+                            scan_filters,
+                            limit,
+                        ),
+                        filters_to_reapply,
+                        schema,
+                    }
                 } else {
-                    wrap_with_filter(input, state, &filters_to_reapply)?
+                    let input = self
+                        .accelerator
+                        .scan(state, scan_projection, scan_filters, limit)
+                        .await?;
+                    caching::CachingScanInput::Planned(wrap_with_filter(
+                        input,
+                        state,
+                        &filters_to_reapply,
+                    )?)
                 };
 
                 let federated_provider = self.federated.table_provider().await;
@@ -2167,21 +2189,12 @@ impl TableLayer for AcceleratedTable {
 
         self.stamp_unguarded_write();
 
+        let statement = user_statement(state);
+        let state: &dyn Session = statement.as_ref().map_or(state, |marked| marked);
         let plan = match &self.write_mode {
             WriteMode::AcceleratorOnly => {
                 // When on_conflict is configured, writes go only to the accelerator
                 // (the federated source may not support writes, e.g., file connector).
-                // A user's statement: the accelerator keeps its statement
-                // semantics rather than resolving the keys it repeats per
-                // `on_conflict`, which it does for its own writes.
-                let statement = state
-                    .as_any()
-                    .downcast_ref::<datafusion::execution::SessionState>()
-                    .map(util::session_state::mark_user_statement);
-                let state: &dyn Session = match &statement {
-                    Some(statement) => statement,
-                    None => state,
-                };
                 let accelerated_insert_plan = self
                     .accelerator
                     .insert_into(state, input, overwrite)
@@ -2287,6 +2300,10 @@ impl TableLayer for AcceleratedTable {
 
         self.stamp_unguarded_write();
 
+        // `UPDATE` writes its new rows through the accelerator's own insert, which
+        // must keep statement semantics too.
+        let statement = user_statement(state);
+        let state: &dyn Session = statement.as_ref().map_or(state, |marked| marked);
         let plan = match &self.write_mode {
             WriteMode::AcceleratorOnly => {
                 self.accelerator.update(state, assignments, filters).await?
@@ -2733,6 +2750,15 @@ impl Retention {
     }
 }
 
+/// `state` marked as a user's statement, so the accelerator keeps statement
+/// semantics for the keys it repeats rather than resolving them per
+/// `on_conflict`, as it does for its own writes (refreshes and change streams).
+fn user_statement(state: &dyn Session) -> Option<datafusion::execution::SessionState> {
+    state
+        .as_any()
+        .downcast_ref::<datafusion::execution::SessionState>()
+        .map(util::session_state::mark_user_statement)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

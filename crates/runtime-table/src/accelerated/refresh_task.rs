@@ -31,7 +31,7 @@ use arrow::{
     error::ArrowError,
 };
 use arrow_schema::SchemaRef;
-use arrow_tools::record_batch::try_cast_to;
+use arrow_tools::record_batch::{slice_memory_size, try_cast_to};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use arrow_tools::type_rewrite::rewrite_data_type;
 use async_stream::stream;
@@ -1042,16 +1042,21 @@ impl RefreshTask {
                         match batch {
                             Ok(batch) => {
                                 tracing.on_new_batch_received(&batch);
+                                // Size the batch by the rows it holds, not by the
+                                // buffers it shares. A read path that slices one
+                                // decoded chunk hands out batches that all point at
+                                // the same buffers, so a whole-buffer measurement
+                                // counts those buffers once per batch.
+                                let batch_bytes = slice_memory_size(&batch);
                                 stat.num_rows += batch.num_rows();
-                                stat.memory_size += batch.get_array_memory_size();
+                                stat.memory_size += batch_bytes;
 
                                 // Record incremental ingestion counters per batch.
                                 // Reuse the prebuilt dataset label (no per-batch
                                 // `dataset` string copy) — see `DatasetMetricLabels`.
                                 let labels = metric_labels.dataset();
                                 metrics::REFRESH_ROWS_WRITTEN.add(batch.num_rows() as u64, labels);
-                                metrics::REFRESH_BYTES_WRITTEN
-                                    .add(batch.get_array_memory_size() as u64, labels);
+                                metrics::REFRESH_BYTES_WRITTEN.add(batch_bytes as u64, labels);
 
                                 // Check memory usage after processing each batch
                                 if let Some(ref monitor) = resource_monitor {
@@ -2823,7 +2828,10 @@ impl DataLoadTracing {
 
     fn on_new_batch_received(&mut self, batch: &RecordBatch) {
         let num_rows = batch.num_rows();
-        let batch_size = batch.get_array_memory_size();
+        // See the note at the refresh accumulator: measure the rows this batch
+        // holds, so a sequence of slices of one parent does not report the
+        // parent's buffers once per slice.
+        let batch_size = slice_memory_size(batch);
 
         tracing::trace!("Dataset {} received {num_rows} records", self.dataset,);
         self.num_records_received += num_rows;
@@ -3592,7 +3600,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("Failed to create batch");
 
-        let batch_size = batch.get_array_memory_size();
+        let batch_size = slice_memory_size(&batch);
         let num_rows = batch.num_rows();
 
         // Process the batch
@@ -3602,6 +3610,46 @@ mod tests {
         assert_eq!(tracing.num_records_received, num_rows);
         assert_eq!(tracing.bytes_received, batch_size);
         assert!(tracing.bytes_received > 0);
+    }
+
+    /// Byte accounting must scale with the rows in each batch.
+    ///
+    /// Read paths that decode a large chunk and then emit zero-copy slices of
+    /// it give the refresh a sequence of batches that all share one set of
+    /// buffers. A whole-buffer measurement counts the parent buffers once per
+    /// slice, so the reported bytes grow with the slice count while the rows
+    /// stay correct.
+    #[test]
+    fn test_data_load_tracing_does_not_inflate_sliced_batches() {
+        let rows = 4096;
+        let slice_rows = 32;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col1",
+            DataType::Int32,
+            false,
+        )]));
+        let array = Int32Array::from(
+            (0..rows)
+                .map(|i| i32::try_from(i).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>(),
+        );
+        let parent = RecordBatch::try_new(schema, vec![Arc::new(array)])
+            .expect("Failed to create parent batch");
+        let parent_bytes = slice_memory_size(&parent);
+
+        let dataset = TableReference::bare("test_dataset");
+        let mut tracing = DataLoadTracing::new(&dataset);
+        for i in 0..rows / slice_rows {
+            tracing.on_new_batch_received(&parent.slice(i * slice_rows, slice_rows));
+        }
+
+        assert_eq!(tracing.num_records_received, rows);
+        assert!(
+            tracing.bytes_received <= parent_bytes * 2,
+            "reported {} bytes for the {parent_bytes} bytes the slices cover",
+            tracing.bytes_received
+        );
     }
 
     #[test]

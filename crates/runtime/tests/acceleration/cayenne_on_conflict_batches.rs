@@ -27,6 +27,7 @@ limitations under the License.
 #![expect(clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -36,6 +37,7 @@ use arrow::array::{AsArray, RecordBatch};
 use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
+use spicepod::component::access::AccessMode;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use spicepod::partitioning::PartitionedBy;
@@ -79,6 +81,16 @@ async fn load(
     behavior: OnConflictBehavior,
     label: &str,
 ) -> (Option<Runtime>, tempfile::TempDir) {
+    load_with_access(csv, case, behavior, label, AccessMode::Read).await
+}
+
+async fn load_with_access(
+    csv: &str,
+    case: &Case,
+    behavior: OnConflictBehavior,
+    label: &str,
+    access: AccessMode,
+) -> (Option<Runtime>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("rows.csv");
     std::fs::write(&file, csv).expect("csv");
@@ -99,6 +111,7 @@ async fn load(
         "id"
     };
     let mut dataset = Dataset::new(format!("file://{}", file.display()), "t");
+    dataset.access = access;
     // An append refresh of a partitioned table needs a time column to load.
     if case.partitioned && case.refresh == RefreshMode::Append {
         dataset.time_column = Some("ts".to_string());
@@ -284,6 +297,61 @@ async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
                 }
             }
             assert!(failures.is_empty(), "{failures:#?}");
+        })
+        .await;
+}
+
+/// A user's `UPDATE` keeps statement semantics: moving rows from several batches
+/// onto one key fails it, rather than resolving the repeat per `on_conflict` as
+/// a refresh does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_update_repeating_a_key_across_batches_still_fails() {
+    test_request_context()
+        .scope(async {
+            let distinct: String = std::iter::once("id,region,ts,v\n".to_string())
+                .chain((0..8_193).map(|id| format!("{id},us,2026-01-01T00:00:00,first\n")))
+                .collect();
+            for mode in [Mode::Memory, Mode::File] {
+                let case = Case {
+                    mode,
+                    refresh: RefreshMode::Full,
+                    partitioned: false,
+                };
+                let label = format!("{}/update", case.label());
+                let (rt, _dir) = load_with_access(
+                    &distinct,
+                    &case,
+                    OnConflictBehavior::Upsert,
+                    &label,
+                    AccessMode::ReadWrite,
+                )
+                .await;
+                let rt = rt.expect("the distinct keys load");
+                let result = rt
+                    .datafusion()
+                    .query_builder("UPDATE t SET id = 0")
+                    .build()
+                    .run()
+                    .await;
+                let outcome = match result {
+                    Err(error) => Err(error.to_string()),
+                    Ok(query) => query
+                        .data
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .map_err(|error| error.to_string()),
+                };
+                let Err(error) = outcome else {
+                    panic!(
+                        "{label}: an UPDATE moving every row onto key 0 must fail; table now holds {} rows",
+                        count(&rt).await
+                    );
+                };
+                assert!(
+                    error.contains("duplicate primary key across batches"),
+                    "{label}: {error}"
+                );
+            }
         })
         .await;
 }

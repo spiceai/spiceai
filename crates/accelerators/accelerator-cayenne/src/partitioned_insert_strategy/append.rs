@@ -851,12 +851,9 @@ impl CayennePartitionedAppendSink {
                 "This Cayenne partition does not support atomic deferred append".to_string(),
             ));
         }
-        let cayenne_owned = cayenne.clone_for_write_operations();
-        let cayenne_owned = if self.user_statement {
-            cayenne_owned.for_user_statement()
-        } else {
-            cayenne_owned
-        };
+        let cayenne_owned = cayenne
+            .clone_for_write_operations()
+            .for_user_statement(self.user_statement);
         let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
             PARTITION_WRITER_CHANNEL_DEPTH,
         );

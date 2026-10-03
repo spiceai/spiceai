@@ -311,7 +311,7 @@ async fn overwrite_keeps_the_last_copy_across_batches_through_its_lifecycle() {
                 .expect("seed");
             write(&provider, InsertOp::Overwrite, repeated_across_batches())
                 .await
-                .expect("layered overwrite");
+                .expect("overwrite repeating keys");
             let expected = last_copies();
             let mut check =
                 |stage: &str, (rows, count): (Vec<(i64, String)>, i64), layers: usize| {
@@ -365,10 +365,10 @@ async fn overwrite_keeps_the_last_copy_across_batches_through_its_lifecycle() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// A layered overwrite publishes one snapshot: a position-deletion table hides
+/// An overwrite that repeats keys publishes one snapshot: a position-deletion table hides
 /// the superseded copies by position, and a key-deletion table drops them from
 /// its files, leaving no deletes at all.
-fn assert_layered_shape(provider: &CayenneTableProvider, mode: DeletionMode) {
+fn assert_resolved_shape(provider: &CayenneTableProvider, mode: DeletionMode) {
     let position_deleted: u64 = provider
         .pk_deletion_strategy
         .position_cache()
@@ -388,15 +388,15 @@ fn assert_layered_shape(provider: &CayenneTableProvider, mode: DeletionMode) {
     assert_eq!(position_deleted, expected, "{mode:?}: position deletes");
 }
 
-/// After a layered overwrite on a position-deletion table, position capture and
+/// After an overwrite that repeats keys on a position-deletion table, position capture and
 /// a later upsert of the repeated keys still leave exactly one row per key.
 #[tokio::test(flavor = "multi_thread")]
-async fn position_capture_after_a_layered_overwrite_locates_the_live_copy() {
+async fn position_capture_after_an_overwrite_repeating_keys_locates_the_live_copy() {
     let (provider, _catalog, _runtime_env, _dir) =
         table(DeletionMode::Position, UpsertDedup::None).await;
     write(&provider, InsertOp::Overwrite, repeated_across_batches())
         .await
-        .expect("layered overwrite");
+        .expect("overwrite repeating keys");
     // Rebuild the keyset from a scan, then locate its keys by read-back.
     write(&provider, InsertOp::Append, vec![batch(&[(7, "x")])])
         .await
@@ -428,7 +428,7 @@ async fn position_capture_after_a_layered_overwrite_locates_the_live_copy() {
 /// A composite, non-`Int64` key must be identified the same way by the write
 /// and by the read-back that locates its superseded copies.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_layered_overwrite_resolves_a_string_key_in_both_modes() {
+async fn an_overwrite_repeating_a_string_key_resolves_it_in_both_modes() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Utf8, false),
@@ -512,13 +512,13 @@ async fn a_layered_overwrite_resolves_a_string_key_in_both_modes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_layered_overwrite_is_superseded_by_a_later_upsert_and_a_later_overwrite() {
+async fn an_overwrite_repeating_keys_is_superseded_by_a_later_upsert_and_overwrite() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::None).await;
         write(&provider, InsertOp::Overwrite, repeated_across_batches())
             .await
-            .expect("layered overwrite");
-        assert_layered_shape(&provider, mode);
+            .expect("overwrite repeating keys");
+        assert_resolved_shape(&provider, mode);
         write(
             &provider,
             InsertOp::Append,
@@ -564,7 +564,7 @@ async fn a_layered_overwrite_is_superseded_by_a_later_upsert_and_a_later_overwri
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failed_layered_overwrite_leaves_the_previous_table() {
+async fn a_failed_overwrite_repeating_keys_leaves_the_previous_table() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::DropIdentical).await;
         write(&provider, InsertOp::Overwrite, vec![batch(&[(9, "old")])])
@@ -647,7 +647,7 @@ async fn repeats_within_the_collapse_window_publish_one_snapshot() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         let (mut provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::None).await;
         provider.collapse_window_bytes =
-            super::super::super::overwrite_layers::COLLAPSE_WINDOW_BYTES;
+            super::super::super::collapse_window::COLLAPSE_WINDOW_BYTES;
         write(&provider, InsertOp::Overwrite, repeated_across_batches())
             .await
             .expect("overwrite");
@@ -664,7 +664,7 @@ async fn repeats_within_the_collapse_window_publish_one_snapshot() {
 /// rows or the table's statistics. A key-deletion table keeps its statistics
 /// exact, since its superseded copies leave its files.
 #[tokio::test(flavor = "multi_thread")]
-async fn aggregates_after_a_layered_overwrite_ignore_superseded_copies() {
+async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies() {
     let mut failures = Vec::new();
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::None).await;
@@ -677,7 +677,7 @@ async fn aggregates_after_a_layered_overwrite_ignore_superseded_copies() {
             ],
         )
         .await
-        .expect("layered overwrite");
+        .expect("overwrite repeating keys");
         for (stage, provider) in [
             ("after overwrite", provider.clone_for_write()),
             (
@@ -846,4 +846,315 @@ async fn a_refresh_in_a_small_memory_pool_spills_and_keeps_the_last_copy() {
             "{mode:?}: (rows, keys, last copies)"
         );
     }
+}
+
+/// The live row count the table's statistics report once its post-write
+/// maintenance has run.
+async fn statistics_rows(provider: &CayenneTableProvider) -> Option<usize> {
+    provider
+        .flush_pending_maintenance()
+        .await
+        .expect("flush maintenance");
+    provider
+        .statistics()
+        .and_then(|stats| stats.num_rows.get_value().copied())
+}
+
+async fn upsert_table(
+    mode: DeletionMode,
+    on_conflict: OnConflict,
+) -> (
+    CayenneTableProvider,
+    Arc<dyn MetadataCatalog>,
+    Arc<RuntimeEnv>,
+    TempDir,
+) {
+    let runtime_env = SessionContext::new().runtime_env();
+    let (mut provider, catalog, dir) = create_cdc_table_with_schema(
+        "t",
+        Arc::clone(&runtime_env),
+        schema(),
+        vec!["id".to_string()],
+        VortexConfig {
+            deletion_mode: mode,
+            inline_max_rows: 0,
+            stream_publish_interval_ms: 0,
+            compaction_background_interval_ms: 3_600_000,
+            ..VortexConfig::default()
+        },
+        on_conflict,
+    )
+    .await;
+    provider.collapse_window_bytes = 1;
+    (provider, catalog, runtime_env, dir)
+}
+
+fn upsert_on_id() -> OnConflict {
+    OnConflict::Upsert(
+        datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+            "id".to_string(),
+        ]),
+    )
+}
+
+fn drop_on_id() -> OnConflict {
+    OnConflict::DoNothing(
+        datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+            "id".to_string(),
+        ]),
+    )
+}
+
+/// A key a streaming append repeats across batches that also meets a stored
+/// copy supersedes that stored copy once: the rows, `COUNT(*)` and the live row
+/// count the statistics carry all hold one row per key.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_supersedes_a_stored_copy_once_per_key() {
+    let mut failures = Vec::new();
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = upsert_table(mode, upsert_on_id()).await;
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![batch(&[(1, "old"), (2, "old"), (9, "old")])],
+        )
+        .await
+        .expect("seed");
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![
+                batch(&[(1, "a"), (2, "a")]),
+                batch(&[(2, "b"), (1, "b")]),
+                batch(&[(1, "c")]),
+            ],
+        )
+        .await
+        .expect("streaming append");
+        let expected = (owned(&[(1, "c"), (2, "b"), (9, "old")]), 3);
+        for (stage, provider) in [
+            ("after append", provider.clone_for_write()),
+            (
+                "after reopen",
+                reopen(&catalog, &runtime_env, UpsertDedup::None).await,
+            ),
+        ] {
+            let observed = visible(&provider).await;
+            let rows = statistics_rows(&provider).await;
+            eprintln!("{mode:?} {stage}: {observed:?}, statistics rows {rows:?}");
+            if observed != expected {
+                failures.push(format!("{mode:?} {stage}: {observed:?}"));
+            }
+            if rows.is_some_and(|rows| rows != 3) {
+                failures.push(format!("{mode:?} {stage}: statistics rows {rows:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Under `drop`, a stored key keeps its stored copy however often a streaming
+/// append repeats it, and a new key keeps its first copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_drop_keeps_stored_then_first_copies() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = upsert_table(mode, drop_on_id()).await;
+        write(&provider, InsertOp::Append, vec![batch(&[(1, "old")])])
+            .await
+            .expect("seed");
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![
+                batch(&[(1, "a"), (2, "a")]),
+                batch(&[(2, "b"), (1, "b"), (3, "b")]),
+                batch(&[(3, "c")]),
+            ],
+        )
+        .await
+        .expect("streaming drop append");
+        let expected = (owned(&[(1, "old"), (2, "a"), (3, "b")]), 3);
+        assert_eq!(visible(&provider).await, expected, "{mode:?}");
+        assert_eq!(statistics_rows(&provider).await.unwrap_or(3), 3, "{mode:?}");
+        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        assert_eq!(visible(&provider).await, expected, "{mode:?}: reopened");
+    }
+}
+
+/// `upsert_dedup` collapses an identical repeat within a batch and keeps the
+/// last copy of a key repeated across batches.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_upsert_dedup_keeps_the_last_copy_across_batches() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, _catalog, _runtime_env, _dir) =
+            table(mode, UpsertDedup::DropIdentical).await;
+        write(&provider, InsertOp::Append, vec![batch(&[(1, "old")])])
+            .await
+            .expect("seed");
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![
+                batch(&[(1, "a"), (1, "a"), (2, "a")]),
+                batch(&[(2, "b")]),
+                batch(&[(1, "c"), (3, "c"), (3, "c")]),
+            ],
+        )
+        .await
+        .expect("streaming upsert_dedup append");
+        assert_eq!(
+            visible(&provider).await,
+            (owned(&[(1, "c"), (2, "b"), (3, "c")]), 3),
+            "{mode:?}"
+        );
+        assert_eq!(statistics_rows(&provider).await.unwrap_or(3), 3, "{mode:?}");
+    }
+}
+
+/// A streaming append spanning many batches and files keeps the last copy of
+/// every key, including keys it repeats that were already stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_resolves_repeats_across_many_batches() {
+    const KEYS: i64 = 50_000;
+    const STORED: i64 = 10_000;
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, _catalog, _runtime_env, _dir) = upsert_table(mode, upsert_on_id()).await;
+        let seed: Vec<(i64, &str)> = (0..STORED).map(|id| (id, "old")).collect();
+        write(
+            &provider,
+            InsertOp::Append,
+            seed.chunks(4096).map(batch).collect(),
+        )
+        .await
+        .expect("seed");
+        let rows: Vec<(i64, &str)> = ["first", "last"]
+            .iter()
+            .flat_map(|value| (0..KEYS).map(move |id| (id, *value)))
+            .collect();
+        write(
+            &provider,
+            InsertOp::Append,
+            rows.chunks(8192).map(batch).collect(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{mode:?}: streaming append failed: {error}"));
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider.clone_for_write()))
+            .expect("register");
+        let counts = ctx
+            .sql("SELECT COUNT(*), COUNT(DISTINCT id), SUM(CASE WHEN value = 'last' THEN 1 ELSE 0 END) FROM t")
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("collect");
+        let column = |index: usize| {
+            counts[0]
+                .column(index)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .value(0)
+        };
+        assert_eq!(
+            (column(0), column(1), column(2)),
+            (KEYS, KEYS, KEYS),
+            "{mode:?}: (rows, keys, last copies)"
+        );
+        let rows = statistics_rows(&provider).await;
+        eprintln!("{mode:?}: statistics rows {rows:?}");
+        let keys = usize::try_from(KEYS).expect("key count fits");
+        assert_eq!(rows.unwrap_or(keys), keys, "{mode:?}: statistics rows");
+    }
+}
+
+/// A refresh whose written files are cut into many key ranges — equal-width for
+/// an integer key, at sampled quantiles for a string key — still keeps exactly
+/// the last copy of every key, in both deletion modes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_cut_into_many_key_ranges_keeps_the_last_copy_of_every_key() {
+    use std::sync::atomic::Ordering;
+    const KEYS: i64 = 20_000;
+    super::super::super::overwrite_postpass::TEST_CHUNK_ROWS.store(1_000, Ordering::Relaxed);
+    for string_key in [false, true] {
+        for mode in [DeletionMode::Key, DeletionMode::Position] {
+            let key_type = if string_key {
+                DataType::Utf8
+            } else {
+                DataType::Int64
+            };
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", key_type, false),
+                Field::new("pass", DataType::Int64, false),
+            ]));
+            let batch_of = |pass: i64, keys: &[i64]| {
+                let key: arrow::array::ArrayRef = if string_key {
+                    Arc::new(StringArray::from_iter_values(
+                        keys.iter()
+                            .map(|k| format!("key-{:016x}", k.wrapping_mul(0x9e37_79b9))),
+                    ))
+                } else {
+                    Arc::new(Int64Array::from_iter_values(keys.iter().copied()))
+                };
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![key, Arc::new(Int64Array::from_value(pass, keys.len()))],
+                )
+                .expect("batch")
+            };
+            // Each pass visits every key in a scrambled order, in 4,096-row batches.
+            let order: Vec<i64> = (0..KEYS).map(|k| (k * 7_919) % KEYS).collect();
+            let batches: Vec<RecordBatch> = [0, 1]
+                .iter()
+                .flat_map(|&pass| order.chunks(4_096).map(move |keys| (pass, keys)))
+                .map(|(pass, keys)| batch_of(pass, keys))
+                .collect();
+            let runtime_env = SessionContext::new().runtime_env();
+            let (provider, _catalog, _dir) = create_cdc_table_with_schema(
+                "t",
+                Arc::clone(&runtime_env),
+                Arc::clone(&schema),
+                vec!["k".to_string()],
+                VortexConfig {
+                    deletion_mode: mode,
+                    inline_max_rows: 0,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+                OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "k".to_string(),
+                    ]),
+                ),
+            )
+            .await;
+            let ctx = SessionContext::new();
+            let source = MemorySourceConfig::try_new_exec(&[batches], Arc::clone(&schema), None)
+                .expect("source");
+            let plan = provider
+                .insert_into(&ctx.state(), source, InsertOp::Overwrite)
+                .await
+                .expect("plan");
+            collect(plan, ctx.task_ctx()).await.expect("overwrite");
+            ctx.register_table("t", Arc::new(provider.clone_for_write()))
+                .expect("register");
+            let batches = ctx
+                .sql("SELECT COUNT(*), COUNT(DISTINCT k), MIN(pass) FROM t")
+                .await
+                .expect("query")
+                .collect()
+                .await
+                .expect("collect");
+            let value = |column: usize| {
+                batches[0]
+                    .column(column)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .value(0)
+            };
+            assert_eq!(
+                (value(0), value(1), value(2)),
+                (KEYS, KEYS, 1),
+                "string key {string_key}, {mode:?}"
+            );
+        }
+    }
+    super::super::super::overwrite_postpass::TEST_CHUNK_ROWS.store(0, Ordering::Relaxed);
 }

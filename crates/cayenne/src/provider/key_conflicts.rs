@@ -46,6 +46,9 @@ use hash_index::PrehashedBuildHasher;
 use super::pk_index::pk_digest_bytes;
 use super::pk_validation::null_primary_key_message;
 use super::{Error, Result};
+
+/// Seeds the hash [`KeyResolver::may_repeat_within`] checks a batch's keys by.
+const REPEAT_CHECK_SEED: u64 = 0x6361_7965_6e6e_6502;
 use crate::row_converter::{RowConverter, SortField};
 
 /// The `upsert` refinement a dataset's `on_conflict` selects, which the table's
@@ -91,6 +94,23 @@ impl ConflictPolicy {
     /// (rather than being dropped).
     pub(crate) fn last_batch_wins(self) -> bool {
         !matches!(self, Self::KeepFirst)
+    }
+}
+
+/// Which copy of a repeated key a write keeps: the last (the upsert policies)
+/// or the first (`drop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Survivor {
+    Latest,
+    Earliest,
+}
+
+impl Survivor {
+    pub(crate) fn for_policy(policy: ConflictPolicy) -> Self {
+        match policy {
+            ConflictPolicy::KeepFirst => Self::Earliest,
+            ConflictPolicy::UpsertDropIdentical | ConflictPolicy::UpsertKeepLast => Self::Latest,
+        }
     }
 }
 
@@ -174,12 +194,39 @@ impl KeyResolver {
         }
     }
 
-    pub(crate) fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
     pub(crate) fn policy(&self) -> ConflictPolicy {
         self.policy
+    }
+
+    /// Whether a primary key column of `batch` holds a null.
+    pub(crate) fn has_null_key(&self, batch: &RecordBatch) -> bool {
+        self.primary_key
+            .iter()
+            .any(|&index| batch.column(index).null_count() > 0)
+    }
+
+    /// Whether `batch` may hold a key more than once: two of its rows share a
+    /// 64-bit hash of the key. When it returns `false`, every key of the batch
+    /// is distinct, so [`Self::resolve_batch`] would return it unchanged. A
+    /// shared hash is only a candidate; [`Self::resolve_batch`] decides exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a primary key column cannot be hashed.
+    pub(crate) fn may_repeat_within(&self, batch: &RecordBatch) -> Result<bool> {
+        let state = datafusion_common::hash_utils::RandomState::with_seed(REPEAT_CHECK_SEED);
+        Ok(datafusion_common::hash_utils::with_hashes(
+            self.primary_key.iter().map(|&index| batch.column(index)),
+            &state,
+            |hashes| {
+                let mut seen: std::collections::HashSet<u64, PrehashedBuildHasher> =
+                    std::collections::HashSet::with_capacity_and_hasher(
+                        hashes.len(),
+                        PrehashedBuildHasher,
+                    );
+                Ok(!hashes.iter().all(|hash| seen.insert(*hash)))
+            },
+        )?)
     }
 
     /// Resolve the keys `batch` repeats within itself, per the policy's
