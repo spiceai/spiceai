@@ -596,8 +596,8 @@ impl<'a> ContainerRunner<'a> {
     }
 }
 
-/// Creates a container called `name`, taking the name over from whatever
-/// container still holds it.
+/// Creates a container called `name`, taking the name over from a container
+/// an earlier creation left holding it.
 ///
 /// [`ContainerRunner::wait_for_name_release`] polls the container list, and two
 /// things can hold the name without appearing in it when it looks:
@@ -612,13 +612,16 @@ impl<'a> ContainerRunner<'a> {
 ///   the creation alone answers 409 until the deadline, and so does every nextest
 ///   retry of the test after it.
 ///
-/// So every conflict removes whatever holds the name before retrying. That is
-/// safe because the name is this test's alone: each name is derived from a
-/// constant no other test uses, and each CI job has its own Docker daemon. The
-/// removal is best-effort within the same bound -- a 404 (not registered yet) or
-/// 409 (already being removed) is expected -- and if the name is still taken at
-/// the deadline, the error carries the last removal failure, which is usually
-/// the actual cause (an unkillable container, a daemon that stopped answering).
+/// So on each conflict a holder that was never started is removed before the
+/// retry. That is exactly the orphan above: once a creation succeeds, the
+/// container is in a guard straight away, and the guard removes it on every
+/// path out -- so a container in the `created` state that no guard owns can
+/// only be a creation nobody received the answer to. A holder in any other
+/// state is left alone and waited out as before, because it can be a live
+/// container of another test: a few fixed names are shared by tests that nextest
+/// may run at the same time (`spice_test_azurite`). The removal is best-effort
+/// within the same bound; if the name is still taken at the deadline, the error
+/// carries the last failure to inspect or remove the holder.
 async fn create_taking_over_name(
     docker: &Docker,
     name: &str,
@@ -643,23 +646,48 @@ async fn create_taking_over_name(
             // One message rather than nested contexts: callers format with `{e}`,
             // which prints only the outermost one.
             let removal = removal_failure.map_or_else(
-                || "removing its holder raised no error".to_string(),
-                |e| format!("the last attempt to remove its holder failed: {e:#}"),
+                || "no attempt to inspect or remove its holder failed".to_string(),
+                |e| format!("the last attempt to inspect or remove its holder failed: {e:#}"),
             );
             return Err(anyhow::Error::new(conflict).context(format!(
-                "test container {name} could not be created: Docker still reported the name taken {NAME_RELEASE_TIMEOUT:?} after this test began removing whatever held it, and {removal}"
+                "test container {name} could not be created: Docker still reported the name taken after {NAME_RELEASE_TIMEOUT:?}, and {removal}"
             )));
         }
-        tracing::debug!(
-            "Docker still holds the name {name}; removing its holder and retrying the creation"
-        );
-        match remove(docker, name).await {
-            Err(e) if !is_already_gone(&e) && !is_removal_already_in_progress(&e) => {
-                removal_failure = Some(e);
-            }
-            _ => {}
+        tracing::debug!("Docker still holds the name {name}; retrying the creation");
+        if let Err(e) = remove_if_never_started(docker, name).await {
+            removal_failure = Some(e);
         }
         tokio::time::sleep(NAME_RELEASE_POLL_INTERVAL).await;
+    }
+}
+
+/// Removes the container holding `name` if it was never started, the state a
+/// creation leaves behind when nobody received its answer.
+///
+/// `Ok` covers every case that is not a failure: the name has no registered
+/// holder yet (404 -- a creation the daemon is still finishing), the holder is
+/// in another state and is not this test's to remove, or it is already being
+/// removed (409).
+async fn remove_if_never_started(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
+    let holder = match docker.inspect_container(name, None).await {
+        Ok(holder) => holder,
+        Err(e) => {
+            let e = anyhow::Error::new(e);
+            return if is_already_gone(&e) { Ok(()) } else { Err(e) };
+        }
+    };
+    if !matches!(
+        holder.state,
+        Some(ContainerState {
+            status: Some(ContainerStateStatusEnum::CREATED),
+            ..
+        })
+    ) {
+        return Ok(());
+    }
+    match remove(docker, name).await {
+        Err(e) if !is_already_gone(&e) && !is_removal_already_in_progress(&e) => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -703,7 +731,10 @@ pub async fn wait_for_tcp_port(
 
 #[cfg(test)]
 mod tests {
-    use bollard::container::{Config, CreateContainerOptions};
+    use bollard::{
+        container::{Config, CreateContainerOptions},
+        secret::{ContainerState, ContainerStateStatusEnum},
+    };
 
     use super::{
         ContainerRunnerBuilder, create_taking_over_name, is_already_gone, is_docker_available,
@@ -843,6 +874,70 @@ mod tests {
             holder?.id.as_deref(),
             Some(orphan.as_str()),
             "the orphaned container still holds the name"
+        );
+        Ok(())
+    }
+
+    /// The other side of the rule: a holder that was started can be another
+    /// test's live container, so creation must leave it running and report the
+    /// conflict rather than remove it.
+    #[tokio::test]
+    async fn creation_leaves_a_started_holder_alone() -> Result<(), anyhow::Error> {
+        const NAME: &str = "runtime-integration-test-started-holder";
+        const IMAGE: &str = "docker.io/library/mysql:latest";
+
+        if !is_docker_available().await {
+            eprintln!("skipping: Docker is not available");
+            return Ok(());
+        }
+
+        let runner = ContainerRunnerBuilder::new(NAME)
+            .image(IMAGE.to_string())
+            .build()?;
+        runner.pull_image().await?;
+        runner.wait_for_name_release().await?;
+
+        let config = Config::<&str> {
+            image: Some(IMAGE),
+            cmd: Some(vec!["sleep", "300"]),
+            ..Default::default()
+        };
+        let holder = runner
+            .docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: NAME,
+                    platform: None,
+                }),
+                config.clone(),
+            )
+            .await?
+            .id;
+        runner.docker.start_container::<String>(NAME, None).await?;
+
+        let created = create_taking_over_name(&runner.docker, NAME, config).await;
+        let still_held = runner.docker.inspect_container(NAME, None).await;
+        remove(&runner.docker, NAME).await?;
+
+        let still_held = still_held?;
+        assert_eq!(
+            still_held.id.as_deref(),
+            Some(holder.as_str()),
+            "a started container holding the name was replaced"
+        );
+        assert!(
+            matches!(
+                still_held.state,
+                Some(ContainerState {
+                    status: Some(ContainerStateStatusEnum::RUNNING),
+                    ..
+                })
+            ),
+            "a started container holding the name was stopped"
+        );
+        assert!(
+            created.is_err(),
+            "creation succeeded while another container held the name"
         );
         Ok(())
     }
