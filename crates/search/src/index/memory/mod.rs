@@ -353,6 +353,17 @@ impl Index for MemoryVectorIndex {
         try_join_all(futs).await
     }
 
+    /// Empty the store on a CDC truncate. The default [`Index::truncate`] is a
+    /// no-op (co-located indexes clear with the table); this index keeps its own
+    /// store, so it must empty it. An empty replace window swaps the live contents
+    /// for nothing, clearing the store in one visible step.
+    async fn truncate(&self) -> Result<(), DataFusionError> {
+        let mut store = self.store.write();
+        store.begin_replace_window();
+        store.commit_replace_window();
+        Ok(())
+    }
+
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
         let key_strings =
             write_util::extract_and_format_primary_key(INDEX_NAME, &self.primary_key, &keys)

@@ -171,6 +171,12 @@ pub enum ChangeBatchError {
     DeferredBatchConsumed,
     #[snafu(display("Failed to build deferred change batch: {message}"))]
     DeferredBuild { message: String },
+    #[snafu(display(
+        "Cannot project change batch for index maintenance: unknown change operation '{op}'. \
+         An index cannot tell whether to add or remove the row, so it is not applied. This is a \
+         connector bug — the change stream emitted an operation code outside c/u/d/r/t"
+    ))]
+    UnknownOperation { op: String },
 }
 
 #[derive(Debug)]
@@ -1389,6 +1395,49 @@ impl ChangeBatch {
         Some(record_batch)
     }
 
+    /// Project this change batch into the operations an [`spice_table::Index`]
+    /// maintains: the upsert rows (create/update/read), the delete rows, and
+    /// whether the batch truncates — in original row order.
+    ///
+    /// `op` is the sole authority on what a row is (see [`Self::before_batch`]);
+    /// an unknown op is a typed error rather than a guess, because misclassifying
+    /// it would index a row that should be deleted, or the reverse.
+    ///
+    /// Rows are not coalesced per key: the upsert and delete rows keep their
+    /// original positions so the caller can materialize the upsert data and the
+    /// delete keys, and scatter the augmented output back into the full change
+    /// batch for the accelerator.
+    ///
+    /// # Errors
+    /// Returns [`ChangeBatchError::UnknownOperation`] for an op outside c/u/d/r/t.
+    pub fn index_change_set(&self) -> Result<IndexChangeSet, ChangeBatchError> {
+        let num_rows = self.record.num_rows();
+
+        let pk_columns: Arc<[String]> = if num_rows == 0 {
+            Arc::from(Vec::<String>::new())
+        } else {
+            Arc::from(self.primary_keys(0))
+        };
+
+        let mut truncated = false;
+        let mut upsert_rows: Vec<usize> = Vec::new();
+        let mut delete_rows: Vec<usize> = Vec::new();
+        for row in 0..num_rows {
+            match classify_op(&self.op(row))? {
+                RowClass::Upsert => upsert_rows.push(row),
+                RowClass::Delete => delete_rows.push(row),
+                RowClass::Truncate => truncated = true,
+            }
+        }
+
+        Ok(IndexChangeSet::new(
+            pk_columns,
+            Arc::from(upsert_rows),
+            Arc::from(delete_rows),
+            truncated,
+        ))
+    }
+
     /// Accepts both the base [`changes_schema`] and the before-image-carrying
     /// [`changes_schema_with_before`], so a source that gains before-images does
     /// not break consumers (or sources) that never had them.
@@ -1423,6 +1472,102 @@ impl ChangeBatch {
         }
 
         Ok(())
+    }
+}
+
+/// A CDC change batch split into the operations an `spice_table::Index`
+/// maintains: which rows to (re)index, which rows to delete, and whether to
+/// truncate.
+///
+/// It is pure *metadata*: the row positions of the upserts and the deletes, the
+/// primary-key columns, and the truncate flag. It holds no row data — the caller
+/// owns the change batch and materializes the upsert data and the delete keys
+/// from these indices, so there is one materialization site and upserts and
+/// deletes are described the same way.
+///
+/// Rows are partitioned by `op` — create/update/read are upserts, delete is a
+/// delete, truncate sets the flag — in the change batch's original row order,
+/// *not* coalesced per key: the upsert rows keep their positions so the augmented
+/// output can be scattered back into the full change batch for the accelerator.
+#[derive(Clone, Debug)]
+pub struct IndexChangeSet {
+    primary_key_columns: Arc<[String]>,
+    upsert_rows: Arc<[usize]>,
+    delete_rows: Arc<[usize]>,
+    truncated: bool,
+}
+
+impl IndexChangeSet {
+    /// Construct a change set from already-partitioned parts.
+    /// [`ChangeBatch::index_change_set`] is the sole caller.
+    #[must_use]
+    pub fn new(
+        primary_key_columns: Arc<[String]>,
+        upsert_rows: Arc<[usize]>,
+        delete_rows: Arc<[usize]>,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            primary_key_columns,
+            upsert_rows,
+            delete_rows,
+            truncated,
+        }
+    }
+
+    /// The primary-key column names (uniform for the batch), for projecting the
+    /// delete rows down to the keys `Index::delete_by_keys` expects.
+    #[must_use]
+    pub fn primary_key_columns(&self) -> &Arc<[String]> {
+        &self.primary_key_columns
+    }
+
+    /// Original row indices of the upsert rows. The caller seeds the augmentation
+    /// accumulator by taking these rows from the change batch's data, and scatters
+    /// the augmented result back to these same positions.
+    #[must_use]
+    pub fn upsert_rows(&self) -> &Arc<[usize]> {
+        &self.upsert_rows
+    }
+
+    /// Original row indices of the delete rows. The caller takes these rows,
+    /// projected to [`Self::primary_key_columns`], as the delete keys.
+    #[must_use]
+    pub fn delete_rows(&self) -> &Arc<[usize]> {
+        &self.delete_rows
+    }
+
+    /// Whether the batch truncated the table (clear the index first).
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Whether this change set carries no index work at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.truncated && self.upsert_rows.is_empty() && self.delete_rows.is_empty()
+    }
+}
+
+/// How a change row maps onto the operation classes an index maintains.
+enum RowClass {
+    /// Create / Update / Read (snapshot): the after-image must be (re)indexed.
+    Upsert,
+    /// Delete: the key must be removed from the index.
+    Delete,
+    /// Truncate: the whole index must be cleared.
+    Truncate,
+}
+
+fn classify_op(op: &ChangeOperation) -> Result<RowClass, ChangeBatchError> {
+    match op {
+        ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => {
+            Ok(RowClass::Upsert)
+        }
+        ChangeOperation::Delete => Ok(RowClass::Delete),
+        ChangeOperation::Truncate => Ok(RowClass::Truncate),
+        ChangeOperation::Unknown(op) => UnknownOperationSnafu { op: op.clone() }.fail(),
     }
 }
 
@@ -1946,6 +2091,90 @@ mod tests {
             .expect("data column is StructArray");
         assert_eq!(data_column.len(), 3);
         assert_eq!(data_column.num_columns(), 2);
+    }
+
+    /// A base-schema change batch whose single `id` column is both the primary
+    /// key and the data, one row per `(op, id)`.
+    fn keyed_change_batch(rows: &[(&str, i32)]) -> ChangeBatch {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let wrapper = changes_schema(&table);
+
+        let data = StructArray::from(vec![(
+            Arc::new(Field::new("id", DataType::Int32, true)),
+            Arc::new(Int32Array::from(
+                rows.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            )) as arrow_array::ArrayRef,
+        )]);
+
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        for _ in rows {
+            pk_builder.values().append_value("id");
+            pk_builder.append(true);
+        }
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(op, _)| *op).collect::<Vec<_>>(),
+                )),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+            ],
+        )
+        .expect("keyed change batch must match the base wrapper schema");
+        ChangeBatch::try_new(record).expect("keyed change batch should validate")
+    }
+
+    #[test]
+    fn index_change_set_splits_ops_by_operation() {
+        // create id=1, update id=2, delete id=3, create id=1 again.
+        let batch = keyed_change_batch(&[("c", 1), ("u", 2), ("d", 3), ("c", 1)]);
+        let cs = batch.index_change_set().expect("projection succeeds");
+
+        assert_eq!(
+            cs.primary_key_columns().as_ref(),
+            &["id".to_string()],
+            "primary key columns come from the change batch"
+        );
+
+        // Rows keep their original positions — not coalesced — so the
+        // create/update/create rows are the upserts and the delete row (index 2)
+        // is the delete. The caller materializes data and keys from these indices.
+        assert_eq!(cs.upsert_rows().as_ref(), &[0usize, 1, 3]);
+        assert_eq!(
+            cs.delete_rows().as_ref(),
+            &[2usize],
+            "only id=3 (row 2) deletes"
+        );
+        assert!(!cs.truncated());
+    }
+
+    #[test]
+    fn index_change_set_rejects_unknown_operation() {
+        let batch = keyed_change_batch(&[("x", 1)]);
+        let err = batch
+            .index_change_set()
+            .expect_err("an unknown op cannot be classified");
+        assert!(
+            matches!(err, ChangeBatchError::UnknownOperation { .. }),
+            "unknown op must be a typed error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn index_change_set_projects_before_image_batches() {
+        // `before_image_batch`: row 0 create (id=1), row 1 update (id=2). Both are
+        // upserts; the before-image column does not change the projection.
+        let batch = before_image_batch();
+        let cs = batch.index_change_set().expect("projection succeeds");
+
+        assert_eq!(cs.upsert_rows().as_ref(), &[0usize, 1]);
+        assert!(cs.delete_rows().is_empty(), "no deletes in the batch");
     }
 }
 
