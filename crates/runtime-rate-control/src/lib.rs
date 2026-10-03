@@ -46,6 +46,7 @@ use governor::{
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 mod adaptive;
 mod leased;
@@ -93,6 +94,75 @@ pub enum Error {
         "The rate limiter has insufficient capacity for a request with weight '{weight}'. Reduce the request size, or increase the rate limit, and try again."
     ))]
     InsufficientCapacity { weight: u32 },
+
+    #[snafu(display(
+        "Timed out after {waited:?} waiting for rate-control capacity{target} to admit the request. The configured rate limit could not free a slot in time. Increase the rate limit, raise `rate_control_acquire_timeout`, or lower request concurrency, then try again. See: https://spiceai.org/docs/reference/spicepod/runtime#http-rate-control"
+    ))]
+    AcquireTimeout {
+        target: RateControlTarget,
+        waited: Duration,
+    },
+}
+
+/// The rate-limited upstream named in user-facing errors. HTTP rate control
+/// knows the origin; other callers (models, UDFs) have none to name, so the
+/// type — not the message — decides whether the clause appears.
+///
+/// [`Display`](std::fmt::Display) writes a leading-space clause (` for origin
+/// 'x'`), or nothing when the origin is unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RateControlTarget(Option<String>);
+
+impl RateControlTarget {
+    /// A target with no known origin.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self(None)
+    }
+
+    /// The origin this controller limits, e.g. `https://api.example.com`.
+    #[must_use]
+    pub fn origin(origin: impl Into<String>) -> Self {
+        Self(Some(origin.into()))
+    }
+
+    /// The origin, when one is known.
+    #[must_use]
+    pub fn as_origin(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl std::fmt::Display for RateControlTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(origin) => write!(formatter, " for origin '{origin}'"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Bound one wait for rate-control capacity. `None` waits indefinitely.
+///
+/// The bound is per attempt: one call covers every wait source inside
+/// `future`, and a later attempt gets the full bound again. This is the only
+/// place [`Error::AcquireTimeout`] is built, so the acquire and the retry
+/// re-check report it the same way.
+async fn within<T, F>(bound: Option<Duration>, target: &RateControlTarget, future: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let Some(bound) = bound else {
+        return future.await;
+    };
+
+    match tokio::time::timeout(bound, future).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(Error::AcquireTimeout {
+            target: target.clone(),
+            waited: bound,
+        }),
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -180,7 +250,11 @@ pub struct RateControllerBuilder {
     weighted_quota: Option<QuotaDefinition>,
     metrics: Option<Arc<RateControllerMetrics>>,
     persistence: Option<PersistenceConfig>,
-    adaptive: Option<(AdaptiveRateControl, String)>,
+    adaptive: Option<AdaptiveRateControl>,
+    acquire_timeout: Option<Duration>,
+    /// The single origin this builder knows. It names the target in
+    /// [`Error::AcquireTimeout`] and the adaptive log lines.
+    origin: Option<String>,
 }
 
 impl RateControllerBuilder {
@@ -207,17 +281,38 @@ impl RateControllerBuilder {
         self
     }
 
+    /// Bound how long one acquire attempt may wait for capacity before failing
+    /// with [`Error::AcquireTimeout`]. The bound covers every wait source of
+    /// that attempt — the semaphore, the quotas, the cluster leased buckets and
+    /// jitter. Each attempt gets the bound again, so a caller that retries can
+    /// wait up to the bound per attempt. Unset means wait indefinitely.
+    ///
+    /// Cluster mode: leased-bucket tokens already spent when the bound fires
+    /// are not returned to the window, so the bound is exact for single-node
+    /// (local) rate control and best-effort for cluster rate control.
+    #[must_use]
+    pub fn with_acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.acquire_timeout = Some(timeout);
+        self
+    }
+
+    /// Name the upstream origin this controller limits, so user-facing errors
+    /// can identify it. Cluster mode supplies it from the persistence config.
+    #[must_use]
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
+        self
+    }
+
     /// Attach an adaptive controller that dynamically scales every configured
     /// limit by its admission coefficient. `origin` names the upstream in the
-    /// controller's throttling and recovery log lines.
+    /// controller's throttling and recovery log lines, and becomes the
+    /// controller's origin, exactly as [`Self::with_origin`] sets it.
     #[must_use]
-    pub fn with_adaptive(
-        mut self,
-        control: AdaptiveRateControl,
-        origin: impl Into<String>,
-    ) -> Self {
-        self.adaptive = Some((control, origin.into()));
-        self
+    pub fn with_adaptive(self, control: AdaptiveRateControl, origin: impl Into<String>) -> Self {
+        let mut builder = self.with_origin(origin);
+        builder.adaptive = Some(control);
+        builder
     }
 
     #[must_use]
@@ -369,11 +464,21 @@ impl RateControllerBuilder {
             }
         }
 
-        let persistence_origin = self.persistence.as_ref().map(|p| p.origin.clone());
+        // An explicit origin wins; cluster mode already carries one.
+        let target = self
+            .origin
+            .or_else(|| self.persistence.as_ref().map(|p| p.origin.clone()))
+            .map_or_else(RateControlTarget::unknown, RateControlTarget::origin);
 
-        let adaptive = self
-            .adaptive
-            .map(|(control, origin)| Arc::new(AdaptiveController::new(control, origin)));
+        // The adaptive controller names the same origin in its log lines, so it
+        // takes it from the target. `with_adaptive` always sets an origin, so
+        // the fallback is unreachable.
+        let adaptive = self.adaptive.map(|control| {
+            Arc::new(AdaptiveController::new(
+                control,
+                target.as_origin().unwrap_or_default(),
+            ))
+        });
 
         RateController::new(
             jitter,
@@ -382,9 +487,10 @@ impl RateControllerBuilder {
             weighted_rate_limiter,
             semaphore,
             metrics,
-            persistence_origin,
+            target,
             adaptive,
             resolution,
+            self.acquire_timeout,
         )
     }
 }
@@ -469,8 +575,8 @@ pub struct RateController {
     weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
     semaphore: Option<MaxCapacityLimits<Semaphore>>,
     metrics: Arc<RateControllerMetrics>,
-    /// Origin string used for log/error context when in cluster mode.
-    persistence_origin: Option<String>,
+    /// The upstream this controller limits, named in user-facing errors.
+    target: RateControlTarget,
     /// When present, scales each limit down by an admission coefficient in
     /// `[0, 1.0]` based on recent [`RequestOutcome`]. See [`Self::record_outcome`].
     /// Buckets, semaphores and limits stay static; each request charges an
@@ -482,6 +588,12 @@ pub struct RateController {
     /// is scaled by). [`ADAPTIVE_WEIGHT_RESOLUTION`] with adaptive control, else
     /// `1`. Purely internal — divided back out of any logical metric.
     resolution: u32,
+    /// Upper bound on how long one acquire attempt waits for capacity before
+    /// returning [`Error::AcquireTimeout`]. `None` = wait indefinitely (the
+    /// legacy behaviour). Applied per attempt: each `acquire*` call, and each
+    /// [`Permit::until_ready`] re-check, gets the whole bound for the
+    /// semaphore, the governor quotas, the leased buckets and jitter.
+    acquire_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for RateController {
@@ -497,9 +609,10 @@ impl std::fmt::Debug for RateController {
             )
             .field("semaphore", &self.semaphore.is_some())
             .field("metrics", &self.metrics)
-            .field("persistence_origin", &self.persistence_origin)
+            .field("target", &self.target)
             .field("adaptive", &self.adaptive.is_some())
             .field("resolution", &self.resolution)
+            .field("acquire_timeout", &self.acquire_timeout)
             .finish()
     }
 }
@@ -524,15 +637,22 @@ impl Permit {
     /// Re-check the quotas from an existing permit. The caller retains its
     /// permit but acquires fresh rate-limit budget — used on retry paths.
     ///
+    /// This re-check is its own attempt, so it gets the whole
+    /// `rate_control_acquire_timeout` again rather than what an earlier acquire
+    /// left over.
+    ///
     /// # Errors
     ///
     /// Returns the same errors as [`RateController::acquire`].
     pub async fn until_ready(&self) -> Result<()> {
-        let wait_start = tokio::time::Instant::now();
-        let result = self
-            .rate_controller
-            .wait_for_rate_limiters(self.weight)
-            .await;
+        let controller = &self.rate_controller;
+        let wait_start = Instant::now();
+        let result = within(
+            controller.acquire_timeout,
+            &controller.target,
+            controller.wait_for_rate_limiters(self.weight),
+        )
+        .await;
 
         let wait_duration = wait_start.elapsed();
         match result {
@@ -679,9 +799,10 @@ impl RateController {
         weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
         semaphore: Option<(Arc<Semaphore>, u32)>,
         metrics: Arc<RateControllerMetrics>,
-        persistence_origin: Option<String>,
+        target: RateControlTarget,
         adaptive: Option<Arc<AdaptiveController>>,
         resolution: u32,
+        acquire_timeout: Option<Duration>,
     ) -> Arc<Self> {
         let jitter_config = jitter.unwrap_or(JitterConfig {
             min: Duration::ZERO,
@@ -695,9 +816,10 @@ impl RateController {
             weighted_rate_limiter,
             semaphore,
             metrics,
-            persistence_origin,
+            target,
             adaptive,
             resolution,
+            acquire_timeout,
         })
     }
 
@@ -764,10 +886,36 @@ impl RateController {
     ///
     /// # Errors
     ///
-    /// See [`Self::acquire_weighted`].
+    /// See [`Self::acquire_weighted`]. Additionally returns
+    /// [`Error::AcquireTimeout`] if a bound is configured and the wait for
+    /// capacity exceeds it.
     pub async fn acquire_weighted_opt(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
+        let wait_start = Instant::now();
+        let result = within(
+            self.acquire_timeout,
+            &self.target,
+            self.acquire_inner(weight),
+        )
+        .await;
+
+        // Only the bound above produces `AcquireTimeout`, and it cancels
+        // `acquire_inner` at the await it was parked on, so the inner call
+        // records no outcome — attribute the failure here.
+        //
+        // Cluster mode: each leased-bucket acquire charges exactly one token,
+        // and a token already spent when the bound fires is not returned to the
+        // window. The bound is therefore exact for local (single-node) rate
+        // control and best-effort for cluster rate control.
+        if matches!(&result, Err(Error::AcquireTimeout { .. })) {
+            self.metrics.record_acquire_error(wait_start.elapsed());
+        }
+
+        result
+    }
+
+    async fn acquire_inner(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
         let self_cloned = Arc::clone(self);
-        let wait_start = tokio::time::Instant::now();
+        let wait_start = Instant::now();
 
         // Snapshot the adaptive weight once for this acquire. A rounded charge
         // above the healthy baseline (`resolution` cells) means adaptive is
@@ -1080,5 +1228,62 @@ mod tests {
         assert_eq!(controller.available_permits(), Some(7));
         drop(permit);
         assert_eq!(controller.available_permits(), Some(8));
+    }
+
+    /// The bound is per attempt. A `Permit::until_ready` re-check gets the whole
+    /// bound of its own, however much time the original acquire used: it never
+    /// inherits a shared, already-spent deadline.
+    #[tokio::test(start_paused = true)]
+    async fn until_ready_gets_the_whole_bound_for_its_own_attempt() {
+        let bound = Duration::from_secs(10);
+        let controller = RateControllerBuilder::new()
+            .with_jitter(JitterConfig::zero())
+            // One request per minute: the first passes, the next must wait.
+            .add_quota(Quota::per_minute(NonZeroU32::new(1).expect("non-zero")))
+            .with_acquire_timeout(bound)
+            .with_origin("https://api.example.com")
+            .build();
+
+        let permit = controller
+            .acquire()
+            .await
+            .expect("the first request passes");
+
+        // Spend most of the bound doing the request itself, then retry.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let recheck_start = Instant::now();
+        let error = permit
+            .until_ready()
+            .await
+            .expect_err("the quota is empty, so the re-check must hit the bound");
+
+        assert!(
+            recheck_start.elapsed() >= bound,
+            "the re-check must wait its own full bound, not the remainder of an earlier one"
+        );
+        let message = error.to_string();
+        let Error::AcquireTimeout { target, waited } = &error else {
+            panic!("expected an acquire timeout, got {error:?}");
+        };
+        assert_eq!(target.as_origin(), Some("https://api.example.com"));
+        assert_eq!(*waited, bound);
+        assert!(
+            message.contains("api.example.com"),
+            "the error must name the origin: {message}"
+        );
+    }
+
+    /// Without an origin the message stays grammatical: the clause is dropped.
+    #[test]
+    fn an_unknown_target_leaves_the_message_grammatical() {
+        let message = Error::AcquireTimeout {
+            target: RateControlTarget::unknown(),
+            waited: Duration::from_secs(5),
+        }
+        .to_string();
+        assert!(
+            message.contains("rate-control capacity to admit the request"),
+            "unexpected message: {message}"
+        );
     }
 }

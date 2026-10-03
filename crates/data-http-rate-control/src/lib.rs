@@ -58,6 +58,7 @@ const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
 const RUNTIME_RATE_CONTROL_MODE: &str = "http_rate_control_mode";
 const RUNTIME_RATE_CONTROL_FAILURE_THRESHOLD: &str = "http_rate_control_failure_threshold";
 const RUNTIME_RATE_CONTROL_WINDOW: &str = "http_rate_control_window";
+const RUNTIME_RATE_CONTROL_ACQUIRE_TIMEOUT: &str = "http_rate_control_acquire_timeout";
 
 /// Every `http_*` rate-control key this module reads from `runtime.params`.
 /// Exposed as the authoritative list for this family; the startup unknown-param
@@ -73,6 +74,7 @@ pub const HTTP_RATE_CONTROL_RUNTIME_PARAMS: &[&str] = &[
     RUNTIME_RATE_CONTROL_MODE,
     RUNTIME_RATE_CONTROL_FAILURE_THRESHOLD,
     RUNTIME_RATE_CONTROL_WINDOW,
+    RUNTIME_RATE_CONTROL_ACQUIRE_TIMEOUT,
 ];
 const MIN_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(5);
 
@@ -151,6 +153,10 @@ pub struct HttpRateControlConfig {
     pub jitter_max: Duration,
     /// How the configured limits are applied for this origin.
     pub mode: RateControlMode,
+    /// Upper bound on how long a request waits to acquire rate-control capacity
+    /// before failing instead of waiting indefinitely. `None` = wait
+    /// indefinitely. `Some(ZERO)` is normalized to `None` at build time.
+    pub acquire_timeout: Option<Duration>,
 }
 
 /// How an origin applies its configured rate limits.
@@ -214,6 +220,16 @@ impl HttpRateControlConfig {
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
             mode: RateControlMode::Static,
+            acquire_timeout: None,
+        }
+    }
+
+    /// Fill the acquire-timeout bound from the connector's request timeouts when
+    /// the user set no explicit `rate_control_acquire_timeout`. A parsed explicit
+    /// `0` (`Some(ZERO)`) is left untouched so it still disables the bound.
+    pub fn apply_default_acquire_timeout(&mut self, client_timeout: Duration) {
+        if self.acquire_timeout.is_none() {
+            self.acquire_timeout = Some(default_acquire_timeout(client_timeout));
         }
     }
 
@@ -716,7 +732,7 @@ fn should_observe_metrics(metric_source: Option<&HttpRateControlMetricSource>) -
 }
 
 #[must_use]
-pub fn parameter_specs() -> [ParameterSpec; 8] {
+pub fn parameter_specs() -> [ParameterSpec; 9] {
     [
         ParameterSpec::runtime("max_concurrent_requests")
             .description("Maximum number of concurrent HTTP requests to the same upstream origin. Overrides runtime.params.http_max_concurrent_requests when set. If both are unset, connector-level concurrency limiting is disabled."),
@@ -728,6 +744,8 @@ pub fn parameter_specs() -> [ParameterSpec; 8] {
             .description("Minimum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
         ParameterSpec::runtime("rate_control_jitter_max")
             .description("Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
+        ParameterSpec::runtime("rate_control_acquire_timeout")
+            .description("Maximum time a request waits to acquire HTTP rate-control capacity (a concurrency slot and the per-second/minute quota) before failing instead of waiting indefinitely. Accepts durations such as '30s' or '500ms'. Defaults to the connector's `client_timeout`. '0' disables the bound. Overrides runtime.params.http_rate_control_acquire_timeout when set."),
         ParameterSpec::runtime("rate_control_mode")
             .description("How the configured HTTP rate limits apply. 'static' (default) applies them as they are. 'adaptive' lowers the effective request rate while the upstream origin fails or times out, then raises it again as the origin recovers, always within the configured static limits. Overrides runtime.params.http_rate_control_mode when set."),
         ParameterSpec::runtime("rate_control_failure_threshold")
@@ -788,7 +806,8 @@ pub fn resolve_config_for_component<S: BuildHasher>(
 /// Returns an invalid-configuration error when a `max_concurrent_requests`,
 /// `requests_per_second_limit` or `requests_per_minute_limit` value does not
 /// parse as a non-zero integer, or a `rate_control_jitter_min` /
-/// `rate_control_jitter_max` value does not parse as a duration.
+/// `rate_control_jitter_max` / `rate_control_acquire_timeout` value does not
+/// parse as a duration.
 pub fn resolve_static_config_for_component<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
@@ -823,6 +842,14 @@ pub fn resolve_static_config_for_component<S: BuildHasher>(
         jitter_min: Duration::ZERO,
         jitter_max: Duration::ZERO,
         mode: RateControlMode::Static,
+        acquire_timeout: parse_optional_duration_param(
+            params,
+            runtime_params,
+            connector_component,
+            dataconnector,
+            "rate_control_acquire_timeout",
+            RUNTIME_RATE_CONTROL_ACQUIRE_TIMEOUT,
+        )?,
     };
 
     with_jitter(
@@ -1391,6 +1418,7 @@ fn build_shared_rate_controller(
     }
 
     let mut builder = RateController::builder()
+        .with_origin(origin_key)
         .with_jitter(JitterConfig::new(config.jitter_min, config.jitter_max));
     if let Some(persisted_state) = persisted_state {
         builder = builder.with_object_store_persistence_for_instance(
@@ -1419,6 +1447,13 @@ fn build_shared_rate_controller(
     }
     if let Some(control) = config.mode.adaptive() {
         builder = builder.with_adaptive(control, origin_key);
+    }
+    // A zero timeout means "no bound" (wait indefinitely), matching the param
+    // docs. It is the only spelling for that: parsing rejects 'inf'.
+    if let Some(acquire_timeout) = config.acquire_timeout
+        && !acquire_timeout.is_zero()
+    {
+        builder = builder.with_acquire_timeout(acquire_timeout);
     }
 
     SharedRateController {
@@ -1590,6 +1625,20 @@ fn parse_optional_failure_threshold_param<S: BuildHasher>(
         })
 }
 
+/// Default bound for the permit-acquire wait when `rate_control_acquire_timeout`
+/// is unset: the connector's own `client_timeout`. The acquire happens once per
+/// request attempt, so a queued request should wait for a slot about as long as
+/// one in-flight request can take (a concurrency slot frees, or a governor token
+/// refills, on that timescale); waiting longer means the holder is stuck and
+/// failing fast is correct. Scales automatically when the user raises
+/// `client_timeout` for a slow origin. Bounds the otherwise-unbounded permit
+/// wait (#14348). `client_timeout` already includes the connect phase, so
+/// `connect_timeout` is deliberately not added.
+#[must_use]
+pub fn default_acquire_timeout(client_timeout: Duration) -> Duration {
+    client_timeout
+}
+
 fn parse_optional_duration_param<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
@@ -1618,7 +1667,7 @@ fn parse_optional_duration_param<S: BuildHasher>(
         return Ok(None);
     }
 
-    fundu::parse_duration(trimmed).map(Some).map_err(|source| {
+    let value = fundu::parse_duration(trimmed).map_err(|source| {
         DataConnectorError::InvalidConfiguration {
             dataconnector: dataconnector.to_string(),
             message: format!(
@@ -1627,7 +1676,21 @@ fn parse_optional_duration_param<S: BuildHasher>(
             connector_component: connector_component.clone(),
             source: source.into(),
         }
-    })
+    })?;
+
+    // `fundu` parses 'inf'/'infinity' into a saturated duration. Refuse it, so
+    // '0' stays the one spelling for "no bound".
+    if value == Duration::MAX {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.to_string(),
+            message: format!(
+                "The '{display_name}' parameter must be a finite duration such as '10ms' or '1s'. Use '0' for no limit."
+            ),
+            connector_component: connector_component.clone(),
+        });
+    }
+
+    Ok(Some(value))
 }
 
 fn with_jitter<S: BuildHasher>(
@@ -1774,7 +1837,7 @@ fn conflicting_config_error<T>(
         dataconnector: dataconnector.to_string(),
         connector_component: connector_component.clone(),
         message: format!(
-            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, rate_control_jitter_max, rate_control_mode, rate_control_failure_threshold and rate_control_window values for components sharing an origin."
+            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, rate_control_jitter_max, rate_control_acquire_timeout, rate_control_mode, rate_control_failure_threshold and rate_control_window values for components sharing an origin."
         ),
     })
 }
