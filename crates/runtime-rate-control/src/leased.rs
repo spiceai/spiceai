@@ -93,6 +93,15 @@ pub enum Error {
         "Cluster rate-control budget exhausted for origin {origin}; persisted store is unavailable and last lease has expired"
     ))]
     FailClosed { origin: String },
+
+    #[snafu(display(
+        "The shared rate-control state for origin {origin} was written by a newer Spice version (state version {found}; this version understands {supported}), so this instance does not overwrite it. Upgrade this instance to match the others sharing the rate-control state location."
+    ))]
+    NewerStateVersion {
+        origin: String,
+        found: u32,
+        supported: u32,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -450,8 +459,26 @@ impl LeasedBucket {
                 }
             };
 
-            // If existing schema is not v2, treat as empty (logged once in caller).
-            if state.schema_version != PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION {
+            // State from a newer version holds leases this version cannot interpret;
+            // resetting it would wipe every newer peer's grants, and during a rolling
+            // upgrade the two versions would keep resetting each other and over-admit.
+            if state.schema_version > PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION {
+                self.note_failure();
+                return Err(Error::NewerStateVersion {
+                    origin: self.config.origin.clone(),
+                    found: state.schema_version,
+                    supported: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
+                });
+            }
+            // State from an older version is replaced: its leases use a layout this
+            // version no longer reads.
+            if state.schema_version < PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION {
+                tracing::warn!(
+                    origin = %self.config.origin,
+                    "Replacing shared rate-control state for origin {} written by an older Spice version (state version {}), so leases granted by instances still on that version are reset. Finish upgrading every instance that shares the rate-control state location.",
+                    self.config.origin,
+                    state.schema_version
+                );
                 state = fresh_state(window_ms);
             }
             state.window_ms = window_ms;
@@ -916,6 +943,45 @@ mod tests {
             limiter_key: "rps:burst=10".to_string(),
             burst_per_window: burst,
         }
+    }
+
+    /// State written by a newer version is left alone: resetting it would wipe the
+    /// newer peers' grants, and two versions resetting each other over-admit.
+    #[tokio::test]
+    async fn state_from_a_newer_version_is_not_overwritten() {
+        use object_store::ObjectStoreExt;
+
+        let store = Arc::new(InMemory::new());
+        let mut config = config_for(10, "a", Duration::from_secs(1));
+        config.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let mut newer = fresh_state(1_000);
+        newer.schema_version = PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION + 1;
+        let path = object_store::path::Path::from("test/origin.json");
+        let bytes = serde_json::to_vec(&newer).expect("serialize");
+        store
+            .put(&path, bytes.clone().into())
+            .await
+            .expect("seed newer state");
+
+        let bucket = LeasedBucket::new(config);
+        let err = bucket
+            .refresh_lease()
+            .await
+            .expect_err("a newer state version must not be overwritten");
+        assert!(matches!(err, Error::NewerStateVersion { .. }), "{err}");
+
+        let stored = store
+            .get(&path)
+            .await
+            .expect("state still there")
+            .bytes()
+            .await
+            .expect("body");
+        assert_eq!(
+            stored.as_ref(),
+            bytes.as_slice(),
+            "the newer state is untouched"
+        );
     }
 
     #[tokio::test]

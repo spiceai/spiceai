@@ -51,6 +51,11 @@ pub enum S3ObjectStoreBuilderError {
 
     #[snafu(display("Failed to build S3 object store: {source}"))]
     ObjectStoreBuild { source: object_store::Error },
+
+    #[snafu(display(
+        "'s3_auth' is 'key', but 's3_key' and 's3_secret' are not both set. Set both, or set 's3_auth: iam_role' to use the credentials from the environment."
+    ))]
+    MissingKeyCredentials,
 }
 
 pub type Result<T, E = S3ObjectStoreBuilderError> = std::result::Result<T, E>;
@@ -252,6 +257,17 @@ impl S3ObjectStoreBuilder {
         {
             self.allow_http = Some(value);
         }
+        // `auth: key` promises the explicit keys; without them `build` would silently
+        // fall back to whatever credentials the environment provides.
+        if params
+            .get("auth")
+            .is_some_and(|auth| auth.expose_secret().eq_ignore_ascii_case("key"))
+        {
+            ensure!(
+                self.access_key_id.is_some() && self.secret_access_key.is_some(),
+                MissingKeyCredentialsSnafu
+            );
+        }
         Ok(self)
     }
 
@@ -447,6 +463,50 @@ async fn apply_sdk_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn secret_params(pairs: &[(&str, &str)]) -> HashMap<String, SecretString> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), SecretString::from((*v).to_string())))
+            .collect()
+    }
+
+    /// `auth: key` without both keys would otherwise build a store on whatever
+    /// credentials the environment provides.
+    #[tokio::test]
+    async fn key_auth_without_both_keys_is_an_error() {
+        let url = Url::parse("s3://bucket/state").expect("valid url");
+        for params in [
+            secret_params(&[("auth", "key")]),
+            secret_params(&[("auth", "key"), ("key", "id")]),
+            secret_params(&[("auth", "key"), ("secret", "secret")]),
+        ] {
+            let result = S3ObjectStoreBuilder::from_url(&url, Handle::current())
+                .expect("builder")
+                .with_secret_params(&params);
+            assert!(
+                matches!(
+                    result,
+                    Err(S3ObjectStoreBuilderError::MissingKeyCredentials)
+                ),
+                "{:?}",
+                result.err()
+            );
+        }
+
+        S3ObjectStoreBuilder::from_url(&url, Handle::current())
+            .expect("builder")
+            .with_secret_params(&secret_params(&[
+                ("auth", "key"),
+                ("key", "id"),
+                ("secret", "secret"),
+            ]))
+            .expect("key auth with both keys is valid");
+        S3ObjectStoreBuilder::from_url(&url, Handle::current())
+            .expect("builder")
+            .with_secret_params(&secret_params(&[("auth", "iam_role")]))
+            .expect("iam_role auth needs no keys");
+    }
 
     #[tokio::test]
     async fn test_builder_from_url() {
