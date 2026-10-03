@@ -44,11 +44,9 @@ use tokio::time;
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
-const MYSQL_PORT: u16 = 13327;
-
 #[instrument]
-async fn init_mysql_db() -> Result<(), anyhow::Error> {
-    let pool = get_mysql_conn(MYSQL_PORT)?;
+async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
+    let pool = get_mysql_conn(port)?;
     let mut conn = pool.get_conn().await?;
 
     tracing::debug!("DROP TABLE IF EXISTS lineitem");
@@ -75,18 +73,19 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 }
 
 #[instrument]
-async fn prepare_test_environment() -> Result<RunningContainer<'static>, String> {
+async fn prepare_test_environment() -> Result<RunningContainer, String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = start_mysql_docker_container(MYSQL_PORT)
-        .await
-        .map_err(|e| {
-            tracing::error!("start_mysql_docker_container: {e}");
-            e.to_string()
-        })?;
+    let running_container = start_mysql_docker_container().await.map_err(|e| {
+        tracing::error!("start_mysql_docker_container: {e}");
+        e.to_string()
+    })?;
+    let port = running_container
+        .host_port(3306)
+        .map_err(|e| e.to_string())?;
     tracing::debug!("Container started");
     let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
     retry(retry_strategy, || async {
-        init_mysql_db().await.map_err(RetryError::transient)
+        init_mysql_db(port).await.map_err(RetryError::transient)
     })
     .await
     .map_err(|e| {
@@ -148,10 +147,13 @@ async fn mysql_refresh_retries() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let running_container = prepare_test_environment().await?;
+            let port = running_container
+                .host_port(3306)
+                .map_err(|e| e.to_string())?;
             let running_container = Arc::new(running_container);
 
             let mut ds_no_retries =
-                make_mysql_dataset("lineitem", "lineitem_no_retries", MYSQL_PORT, false);
+                make_mysql_dataset("lineitem", "lineitem_no_retries", port, false);
             ds_no_retries.acceleration = Some(Acceleration {
                 enabled: true,
                 refresh_retry_enabled: false,
@@ -160,7 +162,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
             });
 
             let mut ds_default_retries =
-                make_mysql_dataset("lineitem", "lineitem_retries", MYSQL_PORT, false);
+                make_mysql_dataset("lineitem", "lineitem_retries", port, false);
             ds_default_retries.acceleration = Some(Acceleration {
                 enabled: true,
                 refresh_sql: Some("SELECT * from lineitem_retries limit 1".to_string()),

@@ -33,8 +33,7 @@ use runtime::Runtime;
 use crate::{
     configure_test_datafusion, init_tracing,
     postgres::common::{
-        get_pg_params, get_postgres_connection_pool, get_random_port,
-        start_postgres_docker_container,
+        get_pg_params, get_postgres_connection_pool, start_postgres_docker_container,
     },
     utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
@@ -295,8 +294,8 @@ async fn test_duckdb_append_refresh_preserves_timestamptz() -> Result<(), anyhow
         .scope(async {
             let _tz_guard = TimezoneGuard::new("Asia/Tokyo");
 
-            let port = get_random_port()?;
-            let running_container = start_postgres_docker_container(port).await?;
+            let running_container = start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let pool = get_postgres_connection_pool(port, None).await?;
             let db_conn = pool

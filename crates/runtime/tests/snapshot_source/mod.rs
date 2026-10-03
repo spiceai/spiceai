@@ -61,22 +61,14 @@ const SECRET_KEY: &str = "spiceintegrationsecret";
 const WRITER_BUCKET: &str = "writer";
 const READER_BUCKET: &str = "reader";
 
-/// The rustfs container one test runs against. Each test has its own, on its own port,
-/// so the tests can run in parallel.
+/// The Docker-assigned endpoint of one test's `RustFS` container.
 #[derive(Clone, Copy)]
 struct Rustfs {
-    name: &'static str,
     port: u16,
 }
 
-const REPLICATED: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_replicated",
-    port: 19124,
-};
-const FIRST_SNAPSHOT: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_first",
-    port: 19125,
-};
+const REPLICATED: &str = "spice_test_rustfs_snapshot_source_replicated";
+const FIRST_SNAPSHOT: &str = "spice_test_rustfs_snapshot_source_first";
 
 const INITIAL_CSV: &str = "id,name\n1,alpha\n2,bravo\n3,charlie\n";
 const GROWN_CSV: &str = "id,name\n1,alpha\n2,bravo\n3,charlie\n4,delta\n5,echo\n";
@@ -108,12 +100,12 @@ fn s3_params(rustfs: Rustfs) -> HashMap<String, String> {
     ])
 }
 
-async fn start_rustfs(rustfs: Rustfs) -> Result<RunningContainer<'static>> {
+async fn start_rustfs(name: &str) -> Result<(Rustfs, RunningContainer)> {
     use bollard::secret::HealthConfig;
 
-    let container = ContainerRunnerBuilder::new(rustfs.name)
+    let container = ContainerRunnerBuilder::new(name)
         .image("rustfs/rustfs:latest".to_string())
-        .add_port_binding(9000, rustfs.port)
+        .publish_port(9000)
         .add_env_var("RUSTFS_ACCESS_KEY", ACCESS_KEY)
         .add_env_var("RUSTFS_SECRET_KEY", SECRET_KEY)
         .command(["/data"])
@@ -131,12 +123,15 @@ async fn start_rustfs(rustfs: Rustfs) -> Result<RunningContainer<'static>> {
         .build()?
         .run(Some(Duration::from_mins(1)))
         .await?;
+    let rustfs = Rustfs {
+        port: container.host_port(9000)?,
+    };
     wait_for_tcp_port("127.0.0.1", rustfs.port, Duration::from_secs(30)).await?;
 
     for bucket in [WRITER_BUCKET, READER_BUCKET] {
         create_bucket(rustfs, bucket).await?;
     }
-    Ok(container)
+    Ok((rustfs, container))
 }
 
 async fn create_bucket(rustfs: Rustfs, bucket: &str) -> Result<()> {
@@ -374,8 +369,8 @@ async fn reads_replicated_snapshots_in_the_engine_that_created_them() -> Result<
     let orders = unique("orders");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(REPLICATED).await?;
-            let result = replicated_snapshots_scenario(REPLICATED, &modules, &orders).await;
+            let (rustfs, container) = start_rustfs(REPLICATED).await?;
+            let result = replicated_snapshots_scenario(rustfs, &modules, &orders).await;
             remove_local_copies(&[&modules, &orders]);
             container.remove().await?;
             result
@@ -489,8 +484,8 @@ async fn waits_for_the_first_snapshot_to_be_published() -> Result<()> {
     let modules = unique("modules");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(FIRST_SNAPSHOT).await?;
-            let result = first_snapshot_scenario(FIRST_SNAPSHOT, &modules).await;
+            let (rustfs, container) = start_rustfs(FIRST_SNAPSHOT).await?;
+            let result = first_snapshot_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result
@@ -569,14 +564,8 @@ async fn first_snapshot_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     Ok(())
 }
 
-const RELOAD: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_reload",
-    port: 19126,
-};
-const MOVED: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_moved",
-    port: 19127,
-};
+const RELOAD: &str = "spice_test_rustfs_snapshot_source_reload";
+const MOVED: &str = "spice_test_rustfs_snapshot_source_moved";
 
 /// Publishes a `DuckDB` snapshot of `modules` to `prefix` and copies it to the reader
 /// bucket, returning the writer.
@@ -627,8 +616,8 @@ async fn loads_a_snapshot_dataset_that_a_reload_adds() -> Result<()> {
     let modules = unique("modules");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(RELOAD).await?;
-            let result = reload_scenario(RELOAD, &modules).await;
+            let (rustfs, container) = start_rustfs(RELOAD).await?;
+            let result = reload_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result
@@ -676,8 +665,8 @@ async fn a_moved_dataset_never_serves_the_previous_locations_rows() -> Result<()
     let modules = unique("modules");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(MOVED).await?;
-            let result = moved_scenario(MOVED, &modules).await;
+            let (rustfs, container) = start_rustfs(MOVED).await?;
+            let result = moved_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result
@@ -749,10 +738,7 @@ async fn moved_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     Ok(())
 }
 
-const PROJECTED: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_projected",
-    port: 19128,
-};
+const PROJECTED: &str = "spice_test_rustfs_snapshot_source_projected";
 
 /// A publisher whose `refresh_sql` stores only some of its columns records every column
 /// in its snapshots' metadata, so no schema describes both its stored table and its
@@ -764,8 +750,8 @@ async fn refuses_snapshots_of_a_publisher_that_stores_some_columns() -> Result<(
     let modules = unique("modules");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(PROJECTED).await?;
-            let result = projected_scenario(PROJECTED, &modules).await;
+            let (rustfs, container) = start_rustfs(PROJECTED).await?;
+            let result = projected_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result

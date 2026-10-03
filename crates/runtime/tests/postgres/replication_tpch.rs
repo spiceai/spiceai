@@ -346,10 +346,10 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port)
+            let container = common::start_postgres_docker_container_with_logical_wal()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = usize::from(container.host_port(5432)?);
 
             // -------------------------------------------------------------
             // 1. Create schema + seed on the source.
