@@ -32,7 +32,7 @@ use async_openai::types::chat::{
     ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
     CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject, PromptTokensDetails, ToolChoiceOptions,
+    FunctionObject, PromptTokensDetails, ToolChoiceAllowedMode, ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -470,9 +470,8 @@ impl Chat for ToolUsingChat {
     }
 }
 
-/// Create a new [`CreateChatCompletionRequest`] with new messages.
-///
-/// Remove `tool_choice` if it is named (since it was just used), and set it to `Auto`.
+/// Create the next round's [`CreateChatCompletionRequest`]: the new messages, and
+/// the [`next_round_tool_choice`].
 fn create_new_recursive_req(
     req: &CreateChatCompletionRequest,
     new_msg: Vec<ChatCompletionRequestMessage>,
@@ -480,19 +479,7 @@ fn create_new_recursive_req(
 ) -> CreateChatCompletionRequest {
     let mut new_req = req.clone();
     new_req.messages = new_msg;
-
-    // Remove tool_choice if it is named (since it was just used), and set it to `Auto`.
-    // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does not cause infinite tool use.
-    if matches!(
-        new_req.tool_choice,
-        Some(ChatCompletionToolChoiceOption::Function(_)) | None
-    ) {
-        // Auto is default when tools exist.
-        tracing::debug!("Not recursively using named tool_choice in subsequent calls.");
-        new_req.tool_choice = Some(ChatCompletionToolChoiceOption::Mode(
-            ToolChoiceOptions::Auto,
-        ));
-    }
+    new_req.tool_choice = Some(next_round_tool_choice(new_req.tool_choice.take()));
 
     // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
     if let Some(max_completion_tokens) = new_req.max_completion_tokens
@@ -503,6 +490,43 @@ fn create_new_recursive_req(
     }
 
     new_req
+}
+
+/// The `tool_choice` for the round after one that called tools (issue #14459).
+///
+/// A choice that forces a call — a named function or custom tool, `required`, or
+/// `allowed_tools` in `required` mode — is satisfied once a round has called a tool,
+/// so the next round gets `auto`, and `allowed_tools` keeps its tool list in `auto`
+/// mode. Re-sending it would force a call on every round until
+/// `tool_recursion_limit` runs out, and the turn could never end in an answer.
+///
+/// An unset choice becomes `auto` too: the model's Spicepod `tool_choice` default is
+/// filled into an unset choice on every round, below this loop.
+fn next_round_tool_choice(
+    choice: Option<ChatCompletionToolChoiceOption>,
+) -> ChatCompletionToolChoiceOption {
+    match choice {
+        None => ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
+        Some(
+            ChatCompletionToolChoiceOption::Function(_)
+            | ChatCompletionToolChoiceOption::Custom(_)
+            | ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required),
+        ) => {
+            tracing::debug!("Not forcing a tool call again after a round that made one.");
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)
+        }
+        Some(ChatCompletionToolChoiceOption::AllowedTools(mut allowed)) => {
+            for entry in &mut allowed.allowed_tools {
+                entry.mode = ToolChoiceAllowedMode::Auto;
+            }
+            ChatCompletionToolChoiceOption::AllowedTools(allowed)
+        }
+        Some(
+            choice @ ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto | ToolChoiceOptions::None,
+            ),
+        ) => choice,
+    }
 }
 
 pub fn combine_usage(
@@ -633,6 +657,37 @@ impl Stream for CustomStream {
     }
 }
 
+/// What [`make_a_stream`] does with one choice of an upstream chunk.
+#[derive(Debug, PartialEq, Eq)]
+enum ChoiceDisposition {
+    /// Pass the choice to the caller.
+    Forward,
+    /// The model finished a tool call: run the Spice tools it named and stream the
+    /// follow-up answer in place of this choice.
+    RunTools,
+    /// Nothing in the choice is for the caller: no finish and no content.
+    Drop,
+}
+
+/// Decides each choice exactly once, so a choice is never forwarded twice and a
+/// `tool_calls` finish that Spice acts on is never forwarded at all. Every other
+/// finish is forwarded whether or not the provider sent `content` beside it.
+///
+/// Some providers (`DeepSeek`, for one) put `"content": ""` on every chunk, the
+/// tool-call chunks and the final `tool_calls` finish included. Deciding on
+/// `content.is_some()` alone forwarded that finish after the follow-up answer, so
+/// the stream ended on `finish_reason: tool_calls` although the tool had run and
+/// the answer was complete, and a chunk carrying both content and `stop` was
+/// forwarded twice.
+fn choice_disposition(choice: &ChatChoiceStream) -> ChoiceDisposition {
+    match choice.finish_reason {
+        Some(FinishReason::ToolCalls) => ChoiceDisposition::RunTools,
+        Some(_) => ChoiceDisposition::Forward,
+        None if choice.delta.content.is_some() => ChoiceDisposition::Forward,
+        None => ChoiceDisposition::Drop,
+    }
+}
+
 fn make_a_stream(
     span: Span,
     request_context: Arc<RequestContext>,
@@ -714,85 +769,95 @@ fn make_a_stream(
                                 }
                             }
                         }
-                        if chat_choice.delta.content.is_some() {
-                            finished_choices.push(chat_choice.clone());
+                        match choice_disposition(&chat_choice) {
+                            ChoiceDisposition::Forward => {
+                                finished_choices.push(chat_choice);
+                                continue;
+                            }
+                            ChoiceDisposition::Drop => continue,
+                            ChoiceDisposition::RunTools => {}
                         }
 
-                        // If a tool has finished (i.e. we have all chunks), process them.
-                        if let Some(finish_reason) = &chat_choice.finish_reason {
-                            if matches!(finish_reason, FinishReason::ToolCalls) {
-                                let tool_call_states_clone = Arc::clone(&tool_call_states);
+                        // A tool call has finished (i.e. we have all chunks), process it.
+                        let tool_calls_to_process = match tool_call_states.lock() {
+                            Ok(states_lock) => states_lock.values().cloned().collect(),
+                            Err(e) => {
+                                tracing::error!("Failed to lock tool_call_states: {}", e);
+                                return;
+                            }
+                        };
 
-                                let tool_calls_to_process = {
-                                    match tool_call_states_clone.lock() {
-                                        Ok(states_lock) => states_lock
-                                            .values()
-                                            .cloned()
-                                            .collect(),
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to lock tool_call_states: {}",
-                                                e
-                                            );
-                                            return;
+                        let new_messages = match model
+                            .process_tool_calls_and_run_spice_tools(
+                                req.messages.clone(),
+                                tool_calls_to_process,
+                            )
+                            .await
+                        {
+                            Ok(Some(messages)) => messages,
+                            Ok(None) => {
+                                // No spice tools within returned tools, so return as message in stream.
+                                finished_choices.push(chat_choice);
+                                continue;
+                            }
+                            Err(e) => {
+                                if let Err(e) = sender_clone.send(Err(e)).await
+                                    && !sender_clone.is_closed() {
+                                        tracing::error!("Error sending error: {}", e);
+                                    }
+                                return;
+                            }
+                        };
+
+                        // Text the model wrote alongside the tool call belongs before the answer
+                        // the tool results produce, not after it.
+                        if chat_choice
+                            .delta
+                            .content
+                            .as_deref()
+                            .is_some_and(|text| !text.is_empty())
+                        {
+                            let mut text_only = chat_choice;
+                            text_only.delta.tool_calls = None;
+                            text_only.finish_reason = None;
+                            if let Some(text) = &text_only.delta.content {
+                                chat_output.push_str(text);
+                            }
+                            let mut resp = response.clone();
+                            resp.choices = vec![text_only];
+                            if let Err(e) = sender_clone.send(Ok(resp)).await {
+                                if !sender_clone.is_closed() {
+                                    tracing::error!("Error sending error: {}", e);
+                                }
+                                return;
+                            }
+                        }
+
+                        match model
+                            .chat_stream_inner(create_new_recursive_req(
+                                &req,
+                                new_messages,
+                                response.usage.as_ref(),
+                            ))
+                            .await
+                        {
+                            Ok(mut s) => {
+                                while let Some(resp) = s.next().await {
+                                    // TODO check if this works for choices > 1.
+                                    if let Err(e) = sender_clone.send(resp).await {
+                                        if !sender_clone.is_closed() {
+                                            tracing::error!("Error sending error: {}", e);
                                         }
-                                    }
-                                };
-
-                                let new_messages = match model
-                                    .process_tool_calls_and_run_spice_tools(
-                                        req.messages.clone(),
-                                        tool_calls_to_process,
-                                    )
-                                    .await
-                                {
-                                    Ok(Some(messages)) => messages,
-                                    Ok(None) => {
-                                        // No spice tools within returned tools, so return as message in stream.
-                                        finished_choices.push(chat_choice);
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        if let Err(e) = sender_clone.send(Err(e)).await
-                                            && !sender_clone.is_closed() {
-                                                tracing::error!("Error sending error: {}", e);
-                                            }
-                                        return;
-                                    }
-                                };
-
-                                match model
-                                    .chat_stream_inner(create_new_recursive_req(
-                                        &req,
-                                        new_messages,
-                                        response.usage.as_ref(),
-                                    ))
-                                    .await
-                                {
-                                    Ok(mut s) => {
-                                        while let Some(resp) = s.next().await {
-                                            // TODO check if this works for choices > 1.
-                                            if let Err(e) = sender_clone.send(resp).await {
-                                                if !sender_clone.is_closed() {
-                                                    tracing::error!("Error sending error: {}", e);
-                                                }
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if let Err(e) = sender_clone.send(Err(e)).await
-                                            && !sender_clone.is_closed() {
-                                                tracing::error!("Error sending error: {}", e);
-                                            }
                                         return;
                                     }
                                 }
-                            } else if matches!(finish_reason, FinishReason::Stop)
-                                || matches!(finish_reason, FinishReason::Length)
-                            {
-                                // If complete, return to stream original.
-                                finished_choices.push(chat_choice.clone());
+                            }
+                            Err(e) => {
+                                if let Err(e) = sender_clone.send(Err(e)).await
+                                    && !sender_clone.is_closed() {
+                                        tracing::error!("Error sending error: {}", e);
+                                    }
+                                return;
                             }
                         }
                     }
@@ -870,10 +935,65 @@ impl<S: Stream> Stream for InferenceTrackingStream<S> {
 mod tests {
     use super::*;
     use async_openai::types::chat::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-        ChatCompletionRequestUserMessageArgs, FunctionCall,
+        ChatCompletionAllowedTools, ChatCompletionAllowedToolsChoice,
+        ChatCompletionMessageToolCall, ChatCompletionNamedToolChoiceCustom,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, CustomName,
+        FunctionCall,
     };
+
+    fn stream_choice(json: &str) -> ChatChoiceStream {
+        serde_json::from_str(json).expect("valid stream choice")
+    }
+
+    #[test]
+    fn a_tool_calls_finish_runs_tools_whatever_its_content() {
+        // DeepSeek shape: an empty `content` beside the finish. Regression test for #13309.
+        for choice in [
+            r#"{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}"#,
+            r#"{"index":0,"delta":{},"finish_reason":"tool_calls"}"#,
+            r#"{"index":0,"delta":{"content":"Let me check."},"finish_reason":"tool_calls"}"#,
+        ] {
+            assert_eq!(
+                choice_disposition(&stream_choice(choice)),
+                ChoiceDisposition::RunTools,
+                "{choice}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_finish_is_forwarded_once_whatever_its_content() {
+        for choice in [
+            r#"{"index":0,"delta":{"content":""},"finish_reason":"stop"}"#,
+            r#"{"index":0,"delta":{},"finish_reason":"stop"}"#,
+            r#"{"index":0,"delta":{"content":"done"},"finish_reason":"length"}"#,
+            r#"{"index":0,"delta":{},"finish_reason":"content_filter"}"#,
+            r#"{"index":0,"delta":{"content":""},"finish_reason":"content_filter"}"#,
+        ] {
+            assert_eq!(
+                choice_disposition(&stream_choice(choice)),
+                ChoiceDisposition::Forward,
+                "{choice}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_choice_without_a_finish_is_forwarded_only_when_it_carries_content() {
+        assert_eq!(
+            choice_disposition(&stream_choice(
+                r#"{"index":0,"delta":{"content":"The table has "}}"#
+            )),
+            ChoiceDisposition::Forward
+        );
+        assert_eq!(
+            choice_disposition(&stream_choice(
+                r#"{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}"#
+            )),
+            ChoiceDisposition::Drop
+        );
+    }
 
     fn create_system_message(content: &str) -> ChatCompletionRequestMessage {
         ChatCompletionRequestSystemMessageArgs::default()
@@ -1053,5 +1173,56 @@ mod tests {
             "[].Assistant.tool_calls[].id" => "[tool_call_id]",
             "[].Tool.tool_call_id" => "[tool_call_id]"
         });
+    }
+
+    fn allowed_tools(mode: ToolChoiceAllowedMode) -> ChatCompletionToolChoiceOption {
+        ChatCompletionToolChoiceOption::AllowedTools(ChatCompletionAllowedToolsChoice {
+            allowed_tools: vec![ChatCompletionAllowedTools {
+                mode,
+                tools: vec![serde_json::json!({
+                    "type": "function",
+                    "function": { "name": "list_datasets" }
+                })],
+            }],
+        })
+    }
+
+    // regression test for #14459
+    #[test]
+    fn test_next_round_tool_choice() {
+        let auto = ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto);
+        for forced in [
+            None,
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Required,
+            )),
+            Some(ChatCompletionToolChoiceOption::Function(
+                "list_datasets".into(),
+            )),
+            Some(ChatCompletionToolChoiceOption::Custom(
+                ChatCompletionNamedToolChoiceCustom {
+                    custom: CustomName {
+                        name: "client_tool".to_string(),
+                    },
+                },
+            )),
+        ] {
+            assert_eq!(next_round_tool_choice(forced.clone()), auto, "{forced:?}");
+        }
+
+        // `allowed_tools` keeps its tool list, in `auto` mode.
+        assert_eq!(
+            next_round_tool_choice(Some(allowed_tools(ToolChoiceAllowedMode::Required))),
+            allowed_tools(ToolChoiceAllowedMode::Auto)
+        );
+
+        // Choices that force nothing pass through unchanged.
+        for unforced in [
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None),
+            allowed_tools(ToolChoiceAllowedMode::Auto),
+        ] {
+            assert_eq!(next_round_tool_choice(Some(unforced.clone())), unforced);
+        }
     }
 }

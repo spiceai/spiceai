@@ -2537,14 +2537,8 @@ dependencies = [
 [[package]]
 name = "backoff"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b62ddb9cb1ec0a098ad4bbf9344d0713fa193ae1a80af55febcff2627b6a00c1"
 dependencies = [
- "futures-core",
- "getrandom 0.2.17",
- "instant",
- "pin-project-lite",
- "rand 0.8.6",
+ "rand 0.10.1",
  "tokio",
 ]
 
@@ -3740,6 +3734,7 @@ dependencies = [
  "tokio",
  "tokio-rusqlite",
  "tokio-stream",
+ "tpcdsgen",
  "tpchgen",
  "tracing",
  "turso",
@@ -8251,6 +8246,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "evaluate-chat"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-trait",
+ "chat-api",
+ "evaluate-api",
+ "insta",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "event-listener"
 version = "2.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10897,15 +10906,6 @@ dependencies = [
  "serde",
  "similar",
  "tempfile",
-]
-
-[[package]]
-name = "instant"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
-dependencies = [
- "cfg-if",
 ]
 
 [[package]]
@@ -17251,6 +17251,7 @@ dependencies = [
  "duration-parse",
  "elasticsearch",
  "evaluate-api",
+ "evaluate-chat",
  "event_stream",
  "flight_client",
  "fundu",
@@ -17347,6 +17348,7 @@ dependencies = [
  "runtime-udfs-api",
  "rusqlite",
  "rustls",
+ "s3-event-notifications",
  "s3_vectors",
  "scheduler",
  "schemars 1.2.1",
@@ -17422,9 +17424,11 @@ dependencies = [
  "duckdb",
  "fundu",
  "futures",
+ "gethostname",
  "hex",
  "object_store 0.13.2",
  "opentelemetry",
+ "parking_lot",
  "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-object-store",
@@ -17432,6 +17436,7 @@ dependencies = [
  "runtime-query-engine",
  "runtime-secrets",
  "rusqlite",
+ "s3-event-notifications",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -17772,6 +17777,7 @@ dependencies = [
  "runtime-auth",
  "runtime-rate-control",
  "runtime-request-context",
+ "runtime-status",
  "runtime-udfs-api",
  "serde",
  "serde_json",
@@ -18563,6 +18569,21 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "s3-event-notifications"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-credential-bridge",
+ "aws-sdk-sqs",
+ "percent-encoding",
+ "serde_json",
+ "snafu",
+ "url",
+]
 
 [[package]]
 name = "s3_vectors"
@@ -22109,6 +22130,12 @@ dependencies = [
  "snafu",
  "tracing",
 ]
+
+[[package]]
+name = "tpcdsgen"
+version = "0.1.0-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07cae4643a0296068b425716c22e16e5b639ef8c7f7717a513436b20b0a7924a"
 
 [[package]]
 name = "tpchgen"
