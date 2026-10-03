@@ -50,7 +50,7 @@ use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_checkpoint_api::CheckpointError;
 use runtime_parameters::ParameterSpec;
-use runtime_parameters::Parameters;
+use runtime_parameters::{Diagnostics, Parameters};
 use runtime_secrets::{ExposeSecret, Secrets, get_params_with_secrets};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use snafu::prelude::*;
@@ -457,19 +457,11 @@ impl AcceleratorEngineRegistry {
             .fail()?;
         }
 
-        // No lock is held over the expansion: `Parameters::try_new` below
-        // takes the same lock for its autoload pass, and tokio's `RwLock` is
-        // write-preferring, so nesting the two would deadlock as soon as a
-        // writer queued between them.
-        let params_with_secrets =
-            get_params_with_secrets(Arc::clone(&secrets), &acceleration_settings.params).await;
-
-        let params = Parameters::try_new(
-            &format!("accelerator {}", accelerator.name()),
-            params_with_secrets.into_iter().collect::<Vec<_>>(),
-            accelerator.prefix(),
+        let params = acceleration_parameters(
+            accelerator.as_ref(),
+            acceleration_settings,
             secrets,
-            accelerator.parameters(),
+            Diagnostics::Report,
         )
         .await
         .context(AccelerationCreationFailedSnafu)?;
@@ -1099,6 +1091,43 @@ impl AcceleratorExternalTableBuilder {
 
         Ok(external_table)
     }
+}
+
+/// Resolves an acceleration's `params` into the [`Parameters`] its engine is configured
+/// with: `${secrets:…}` and `${env:…}` references expanded, the engine prefix removed,
+/// secrets autoloaded, and defaults applied.
+///
+/// Anything an engine opens from its acceleration settings — the accelerated table and
+/// its sidecar alike — must resolve them through this, so both connect to the same
+/// place with the same credentials. Only the accelerated table's creation reports
+/// ignored or deprecated parameters; a sidecar resolves them again on every open, so it
+/// passes [`Diagnostics::Suppress`].
+///
+/// # Errors
+///
+/// Returns an error when the parameters do not satisfy the engine's [`ParameterSpec`]s.
+pub async fn acceleration_parameters(
+    accelerator: &dyn DataAccelerator,
+    acceleration: &Acceleration,
+    secrets: Arc<RwLock<Secrets>>,
+    diagnostics: Diagnostics,
+) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
+    // No lock is held over the expansion: `Parameters::try_new` below
+    // takes the same lock for its autoload pass, and tokio's `RwLock` is
+    // write-preferring, so nesting the two would deadlock as soon as a
+    // writer queued between them.
+    let params_with_secrets =
+        get_params_with_secrets(Arc::clone(&secrets), &acceleration.params).await;
+
+    Parameters::try_new_with_diagnostics(
+        &format!("accelerator {}", accelerator.name()),
+        params_with_secrets.into_iter().collect::<Vec<_>>(),
+        accelerator.prefix(),
+        secrets,
+        accelerator.parameters(),
+        diagnostics,
+    )
+    .await
 }
 
 /// Resolves the on-disk file path for a file-based acceleration source.
