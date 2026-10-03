@@ -300,6 +300,14 @@ impl AccelerationSource for Dataset {
         // the publisher's. It also accepts a series published before definitions were
         // recorded — it cannot rebuild from its source, so refusing one would leave it
         // unavailable rather than rebuilt — while still refusing every mismatch.
+        //
+        // A dataset that serves published snapshots (`file_format: snapshot`) has no
+        // definition to compare: its `from` names the snapshot location rather than the
+        // publisher's source, and its rows are whatever that location publishes. Its
+        // selection would never match the publisher's, so it checks none.
+        if self.is_snapshot_source() {
+            return None;
+        }
         let identity = crate::view::dataset_definition_identity_from_spec(&self.spec);
         let selection = crate::view::dataset_selection_identity_from_spec(&self.spec);
         let follows_published_series = self
@@ -552,6 +560,37 @@ mod tests {
             .selection_fingerprint
         };
         assert_ne!(selection(&seconds), selection(&millis));
+    }
+
+    /// A `file_format: snapshot` dataset is rebuilt as a `refresh_mode: snapshot` reader
+    /// whose `from` is the snapshot location, so its own source selection can never
+    /// match the publisher's. It must not carry one, or it refuses every snapshot it
+    /// exists to serve.
+    #[tokio::test]
+    async fn snapshot_file_format_dataset_checks_no_source_identity() {
+        let mut reader = spicepod::component::dataset::Dataset::new(
+            "s3://snapshots/orders/".to_string(),
+            "orders".to_string(),
+        );
+        reader.params = Some(spicepod::param::Params::from_string_map(HashMap::from([
+            ("file_format".to_string(), "snapshot".to_string()),
+            ("s3_region".to_string(), "us-east-1".to_string()),
+        ])));
+        reader.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            refresh_mode: Some(spicepod::acceleration::RefreshMode::Snapshot),
+            ..Default::default()
+        });
+        let reader = dataset_from_spicepod(reader).await;
+
+        assert!(reader.is_snapshot_source());
+        assert!(
+            runtime_acceleration::acceleration_source::AccelerationSource::definition_fingerprint(
+                &reader
+            )
+            .is_none(),
+            "a `file_format: snapshot` dataset serves whatever its location publishes"
+        );
     }
 
     fn orders_dataset(
