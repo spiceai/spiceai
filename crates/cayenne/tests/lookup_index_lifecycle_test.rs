@@ -366,7 +366,7 @@ async fn indexes_follow_each_registration_not_the_stored_table() {
         name,
         i64::try_from(ROWS).expect("fits"),
         Duration::from_secs(30),
-        |c| c.selected > 0,
+        |c| c.full > 0,
     )
     .await;
     assert!(indexed.builds_published >= 1, "{indexed:?}");
@@ -454,7 +454,7 @@ async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
     assert_eq!(first, ids);
     let after_first = counters(&reopened);
     assert!(
-        after_first.unbuilt > 0,
+        after_first.none > 0,
         "first lookup should scan: {after_first:?}"
     );
     assert_eq!(
@@ -472,7 +472,7 @@ async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let selected_before = counters(&reopened).selected;
+    let selected_before = counters(&reopened).full;
     let second = ctx
         .sql(&sql)
         .await
@@ -485,7 +485,7 @@ async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
         ids.len()
     );
     assert_eq!(
-        counters(&reopened).selected,
+        counters(&reopened).full,
         selected_before + 1,
         "the next dynamic lookup should use the rebuilt index"
     );
@@ -532,12 +532,12 @@ async fn a_build_the_pool_cannot_fit_is_not_retried_on_every_lookup() {
     }
     let after = counters(&table);
     assert_eq!(
-        after.selected, 0,
+        after.full, 0,
         "nothing was published to select from: {after:?}"
     );
     assert!(
         after.builds_started >= 1,
-        "the first lookup on an unbuilt index must claim a build: {after:?}"
+        "the first lookup on an index that covers nothing must claim a build: {after:?}"
     );
     assert!(
         after.builds_started <= MAX_BUILDS,
@@ -605,7 +605,7 @@ async fn a_lookup_dropped_mid_build_claim_does_not_strand_the_index() {
             &name,
             i64::try_from(ROWS).expect("fits"),
             Duration::from_secs(30),
-            |c| c.builds_published >= 1 && c.selected > 0,
+            |c| c.builds_published >= 1 && c.full > 0,
         )
         .await;
         println!("polls={polls} completed_before_drop={completed} counters={indexed:?}");
@@ -631,7 +631,7 @@ async fn dropping_an_indexed_table_releases_its_memory() {
         name,
         i64::try_from(ROWS).expect("fits"),
         Duration::from_secs(30),
-        |c| c.selected > 0,
+        |c| c.full > 0,
     )
     .await;
     assert!(used.index_bytes > 0, "{used:?}");
@@ -681,7 +681,7 @@ async fn appends_and_compactions_keep_the_index_current() {
     // Above the inline cap, so each append writes a file, and small.
     let appended_rows: i64 = 3_000;
     lookups_until(&table, name, rows_i64, Duration::from_secs(30), |c| {
-        c.selected > 0
+        c.full > 0
     })
     .await;
     // The table's current data files, indexed or not.
@@ -700,8 +700,8 @@ async fn appends_and_compactions_keep_the_index_current() {
     let check = |label: &str, before: &LookupIndexCounters, after: &LookupIndexCounters| {
         assert_eq!(
             (
-                after.selected - before.selected,
-                after.unbuilt - before.unbuilt,
+                after.full - before.full,
+                after.none - before.none,
                 after.builds_started - before.builds_started,
             ),
             (2, 0, 0),
@@ -1048,10 +1048,7 @@ async fn a_reopened_table_loads_its_persisted_runs() {
     lookup(&reopened, name, rows_i64 * 2 + 7).await;
     let after = counters(&reopened);
     assert_eq!(
-        (
-            after.selected - before.selected,
-            after.unbuilt - before.unbuilt
-        ),
+        (after.full - before.full, after.none - before.none),
         (1, 0),
         "the first lookup after reopening did not use the loaded index: {after:?}"
     );
@@ -1175,7 +1172,7 @@ async fn a_key_column_relaxed_to_nullable_does_not_reuse_its_persisted_runs() {
     let before = counters(&reopened);
     lookup(&reopened, name, 7).await;
     assert_eq!(
-        counters(&reopened).selected - before.selected,
+        counters(&reopened).full - before.full,
         1,
         "a lookup after the rebuild must use the index"
     );
@@ -1287,7 +1284,7 @@ async fn a_key_column_relaxed_to_nullable_on_an_open_table_keeps_lookups_exact()
     let before = counters(&table);
     lookup(&table, name, 7).await;
     assert_eq!(
-        counters(&table).selected - before.selected,
+        counters(&table).full - before.full,
         1,
         "a lookup after the rebuild must use the index"
     );
@@ -1316,7 +1313,7 @@ async fn a_key_spelled_in_another_case_is_used_by_lookups() {
     lookup(&table, name, 7).await;
     let after = counters(&table);
     assert_eq!(
-        after.selected - before.selected,
+        after.full - before.full,
         1,
         "the lookup did not use the index: {before:?} -> {after:?}"
     );

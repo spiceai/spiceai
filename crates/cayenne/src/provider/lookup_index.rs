@@ -135,40 +135,64 @@ const MERGE_ABOVE_RUNS: usize = 8;
 /// Name of the file-local row position column the read-back build projects.
 const READ_BACK_POSITION_COLUMN: &str = "__cayenne_lookup_row_idx";
 
-/// How a probe ended. [`Self::as_str`] is the `outcome` dimension on
-/// `cayenne_lookup_index_probe_total`.
+/// How much of what a lookup reads its index covers: the `coverage` dimension
+/// on `cayenne_lookup_index_probe_total` and `lookup_index_outcome` in
+/// `EXPLAIN`. The counts beside it say how much that is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProbeOutcome {
-    /// A row selection was attached to the scan. Files no run covers yet are
-    /// read in full beside it.
-    Selected,
-    /// Every file the scan reads is covered and none holds the key, so the
-    /// scan reads no file.
-    Empty,
-    /// None of the files the lookup reads is indexed yet, so it read them all
-    /// in full.
-    Unbuilt,
+pub(crate) enum Coverage {
+    /// No file (in memory mode, no batch) the lookup reads is indexed yet, so
+    /// every one is read in full.
+    Unindexed,
+    /// Some are narrowed to their candidate rows by the index, and the rest
+    /// are read in full.
+    Partial,
+    /// Every one the lookup reads is indexed.
+    Full,
+}
+
+impl Coverage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unindexed => "none",
+            Self::Partial => "partial",
+            Self::Full => "full",
+        }
+    }
+
+    /// The coverage of a read that included indexed parts (`indexed`) and
+    /// unindexed ones (`unindexed`). A read of nothing is fully covered.
+    pub(crate) const fn of(indexed: bool, unindexed: bool) -> Self {
+        match (indexed, unindexed) {
+            (false, true) => Self::Unindexed,
+            (true, true) => Self::Partial,
+            _ => Self::Full,
+        }
+    }
+
+    /// The coverage of two reads together.
+    const fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unindexed, Self::Unindexed) => Self::Unindexed,
+            (Self::Full, Self::Full) => Self::Full,
+            _ => Self::Partial,
+        }
+    }
 }
 
 /// The lookup-index decision shown on `CayenneAccelerationExec` in `EXPLAIN`.
-///
-/// This is deliberately separate from [`ProbeOutcome`]: `NotApplicable` is a
-/// planning decision, not a probe, so it must not inflate the probe counters.
+/// `NotApplicable` is a planning decision, not a probe, so it is never counted
+/// as one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LookupIndexExplainOutcome {
     NotApplicable,
-    Selected,
-    Empty,
-    Unbuilt,
+    Probed(Coverage),
 }
 
 impl LookupIndexExplainOutcome {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::NotApplicable => "not_applicable",
-            Self::Selected => "selected",
-            Self::Empty => "empty",
-            Self::Unbuilt => "unbuilt",
+            Self::Probed(coverage) => coverage.as_str(),
         }
     }
 }
@@ -205,9 +229,8 @@ pub(crate) struct LookupIndexExplain {
     pub(crate) shape: Option<String>,
     pub(crate) outcome: LookupIndexExplainOutcome,
     pub(crate) candidate_files: Option<usize>,
-    /// Files the scan reads in full because no run covers them yet. On
-    /// `selected` they are part of `candidate_files`; on `unbuilt` they are
-    /// every file the scan reads.
+    /// Files the scan reads in full because no run covers them yet, which are
+    /// part of `candidate_files`: all of them on `none`, `0` on `full`.
     pub(crate) uncovered_files: Option<usize>,
     pub(crate) candidate_rows: Option<u64>,
     /// Why the lookup scanned, when an indexed table's lookup did.
@@ -215,35 +238,24 @@ pub(crate) struct LookupIndexExplain {
 }
 
 impl LookupIndexExplain {
-    /// One decision for a scan that read several snapshots: selected when any
-    /// snapshot's files held a candidate; else unbuilt when any snapshot's
-    /// files were read in full; else empty. A selected scan's candidate files
-    /// include the files of any snapshot read in full, which are uncovered.
+    /// One decision for a scan that read several snapshots: their coverage
+    /// together (`none` when no snapshot's files were indexed, `full` when all
+    /// were, else `partial`), with their file counts summed. A snapshot the
+    /// index did not apply to leaves the others' decision as it is.
     #[must_use]
     pub(crate) fn merge(self, other: Self) -> Self {
-        use LookupIndexExplainOutcome::{Empty, NotApplicable, Selected, Unbuilt};
-        let rank = |outcome: LookupIndexExplainOutcome| match outcome {
-            NotApplicable => 0,
-            Empty => 1,
-            Unbuilt => 2,
-            Selected => 3,
-        };
-        let (outcome, reason) = if rank(other.outcome) > rank(self.outcome) {
-            (other.outcome, other.reason)
-        } else {
-            (self.outcome, self.reason.or(other.reason))
+        use LookupIndexExplainOutcome::{NotApplicable, Probed};
+        let (outcome, reason) = match (self.outcome, other.outcome) {
+            (Probed(a), Probed(b)) => (Probed(a.and(b)), None),
+            (Probed(_), NotApplicable) => (self.outcome, None),
+            (NotApplicable, Probed(_)) => (other.outcome, None),
+            (NotApplicable, NotApplicable) => (NotApplicable, self.reason.or(other.reason)),
         };
         let sum = |a: Option<usize>, b: Option<usize>| match (a, b) {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
         };
-        let read_in_full = |explain: &Self| {
-            (explain.outcome == Unbuilt).then_some(explain.uncovered_files.unwrap_or(0))
-        };
-        let mut sum_files = sum(self.candidate_files, other.candidate_files);
-        if outcome == Selected {
-            sum_files = sum(sum_files, sum(read_in_full(&self), read_in_full(&other)));
-        }
+        let sum_files = sum(self.candidate_files, other.candidate_files);
         let sum_uncovered = sum(self.uncovered_files, other.uncovered_files);
         // Every snapshot reports the selection's candidate rows, not its own.
         let sum_rows = self.candidate_rows.max(other.candidate_rows);
@@ -253,7 +265,7 @@ impl LookupIndexExplain {
             candidate_files: sum_files,
             uncovered_files: sum_uncovered,
             candidate_rows: sum_rows,
-            reason: (outcome == NotApplicable).then_some(reason).flatten(),
+            reason,
         }
     }
 
@@ -288,11 +300,15 @@ impl LookupIndexExplain {
     }
 
     /// A lookup that read all `files` of its scan in full because none is
-    /// covered.
-    fn unbuilt(shape: String, files: usize) -> Self {
+    /// indexed.
+    fn unindexed(shape: String, files: usize) -> Self {
         Self {
+            candidate_files: Some(files),
             uncovered_files: Some(files),
-            ..Self::fallback(shape, LookupIndexExplainOutcome::Unbuilt)
+            ..Self::fallback(
+                shape,
+                LookupIndexExplainOutcome::Probed(Coverage::Unindexed),
+            )
         }
     }
 
@@ -309,16 +325,6 @@ impl LookupIndexExplain {
             uncovered_files: None,
             candidate_rows: Some(candidate_rows),
             reason: None,
-        }
-    }
-}
-
-impl ProbeOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Selected => "selected",
-            Self::Empty => "empty",
-            Self::Unbuilt => "unbuilt",
         }
     }
 }
@@ -811,38 +817,47 @@ impl LookupSelection {
                 (!files.is_empty()).then(|| FileGroup::new(files))
             })
             .collect();
-        if covered == 0 && uncovered > 0 {
+        let coverage = Coverage::of(covered > 0, uncovered > 0);
+        if coverage == Coverage::Unindexed {
             // Nothing to narrow: every file this scan reads is unindexed.
             if self.record {
-                self.state.record_probe(&self.shape, ProbeOutcome::Unbuilt);
+                self.state.record_probe(&self.shape, coverage);
             }
             return (
                 file_groups,
                 None,
-                LookupIndexExplain::unbuilt(self.shape, uncovered),
+                LookupIndexExplain::unindexed(self.shape, uncovered),
                 true,
             );
         }
         let candidate_files: usize = file_groups.iter().map(FileGroup::len).sum();
         if candidate_files == 0 {
+            // Every file is indexed and none holds the key: nothing is read.
             if self.record {
-                self.state.record_probe(&self.shape, ProbeOutcome::Empty);
+                self.state.record_probe(&self.shape, Coverage::Full);
             }
             return (
                 file_groups,
                 None,
-                LookupIndexExplain::selection(
-                    self.shape,
-                    LookupIndexExplainOutcome::Empty,
-                    Some(0),
-                    0,
-                ),
+                LookupIndexExplain {
+                    uncovered_files: Some(0),
+                    ..LookupIndexExplain::selection(
+                        self.shape,
+                        LookupIndexExplainOutcome::Probed(Coverage::Full),
+                        Some(0),
+                        0,
+                    )
+                },
                 false,
             );
         }
         if self.record {
-            self.state
-                .record_selection(&self.shape, candidate_files as u64, self.rows as u64);
+            self.state.record_selection(
+                &self.shape,
+                coverage,
+                candidate_files as u64,
+                self.rows as u64,
+            );
         }
         let provider = LookupAccessPlanProvider {
             state: self.state,
@@ -857,7 +872,7 @@ impl LookupSelection {
                 uncovered_files: Some(uncovered),
                 ..LookupIndexExplain::selection(
                     self.shape,
-                    LookupIndexExplainOutcome::Selected,
+                    LookupIndexExplainOutcome::Probed(coverage),
                     Some(candidate_files),
                     u64::try_from(self.rows).unwrap_or(u64::MAX),
                 )
@@ -1256,18 +1271,20 @@ impl VortexRuntimeAccessPlanProvider for DynamicLookupAccessPlanProvider {
 /// scanning.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LookupIndexCounters {
-    /// Probes that attached a row selection to the scan.
-    pub selected: u64,
-    /// Probes where every file the scan reads is indexed and none holds the
-    /// key, so no file is read.
-    pub empty: u64,
-    /// Probes where none of the files the scan reads is indexed yet.
-    pub unbuilt: u64,
+    /// Probes where none of the files the scan reads is indexed yet (coverage
+    /// `none`).
+    pub none: u64,
+    /// Probes where some files the scan reads are indexed and the rest are
+    /// read in full (coverage `partial`).
+    pub partial: u64,
+    /// Probes where every file the scan reads is indexed (coverage `full`),
+    /// including those whose key no file holds, which read nothing.
+    pub full: u64,
     /// Runtime key sets declined because their shape or cost cannot be bounded.
     pub runtime_fallback: u64,
-    /// Candidate files summed over selected probes.
+    /// Candidate files summed over probes that narrowed a scan.
     pub candidate_files: u64,
-    /// Candidate row positions summed over selected probes.
+    /// Candidate row positions summed over probes that narrowed a scan.
     pub candidate_rows: u64,
     /// Files that were actually handed a Vortex row selection.
     pub access_plans_attached: u64,
@@ -1285,9 +1302,9 @@ pub struct LookupIndexCounters {
 
 #[derive(Default)]
 pub(crate) struct Counters {
-    selected: AtomicU64,
-    empty: AtomicU64,
-    unbuilt: AtomicU64,
+    none: AtomicU64,
+    partial: AtomicU64,
+    full: AtomicU64,
     runtime_fallback: AtomicU64,
     candidate_files: AtomicU64,
     pub(crate) candidate_rows: AtomicU64,
@@ -1300,9 +1317,9 @@ pub(crate) struct Counters {
 impl Counters {
     pub(crate) fn snapshot(&self, index_bytes: u64) -> LookupIndexCounters {
         LookupIndexCounters {
-            selected: self.selected.load(Ordering::Relaxed),
-            empty: self.empty.load(Ordering::Relaxed),
-            unbuilt: self.unbuilt.load(Ordering::Relaxed),
+            none: self.none.load(Ordering::Relaxed),
+            partial: self.partial.load(Ordering::Relaxed),
+            full: self.full.load(Ordering::Relaxed),
             runtime_fallback: self.runtime_fallback.load(Ordering::Relaxed),
             candidate_files: self.candidate_files.load(Ordering::Relaxed),
             candidate_rows: self.candidate_rows.load(Ordering::Relaxed),
@@ -1314,11 +1331,11 @@ impl Counters {
         }
     }
 
-    fn record(&self, outcome: ProbeOutcome) {
-        let counter = match outcome {
-            ProbeOutcome::Selected => &self.selected,
-            ProbeOutcome::Empty => &self.empty,
-            ProbeOutcome::Unbuilt => &self.unbuilt,
+    fn record(&self, coverage: Coverage) {
+        let counter = match coverage {
+            Coverage::Unindexed => &self.none,
+            Coverage::Partial => &self.partial,
+            Coverage::Full => &self.full,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -2159,7 +2176,7 @@ impl LookupIndexState {
             .filter(|file| index.covers(file.location.as_ref()))
             .count();
         if covered == 0 {
-            self.record_probe(label, ProbeOutcome::Unbuilt);
+            self.record_probe(label, Coverage::Unindexed);
             return RuntimeProbe::IndexUnusable;
         }
         let max_rows = RUNTIME_INDEX_MIN_ROWS
@@ -2169,18 +2186,28 @@ impl LookupIndexState {
             .encode_keys(keys)
             .ok()
             .and_then(|encoded| index.probe_keys(spec, &encoded, Some(max_rows)));
-        let Some(hit) = hit else {
+        let Some(mut hit) = hit else {
             self.record_runtime_fallback();
             return RuntimeProbe::Declined;
         };
+        // The view spans every file of the table; this scan answers only for
+        // its own, so candidates in any other file select nothing here.
+        let read: HashSet<&str> = scan_files
+            .iter()
+            .map(|file| file_name(file.location.as_ref()))
+            .collect();
+        hit.per_file.retain(|file, _| read.contains(file.as_str()));
+        hit.rows = hit.per_file.values().map(Vec::len).sum();
         // An uncovered file is read in full whatever the covered ones hold, so
-        // the probe is `empty` only when every file the scan reads is covered.
+        // a probe reads nothing only when every file the scan reads is covered.
         let uncovered = scan_files.len() - covered;
         if hit.rows == 0 && uncovered == 0 {
-            self.record_probe(&hit.shape, ProbeOutcome::Empty);
+            // Every file is indexed and none holds a key: nothing is read.
+            self.record_probe(&hit.shape, Coverage::Full);
         } else {
             self.record_selection(
                 &hit.shape,
+                Coverage::of(true, uncovered > 0),
                 (hit.per_file.len() + uncovered) as u64,
                 hit.rows as u64,
             );
@@ -2191,18 +2218,18 @@ impl LookupIndexState {
         }
     }
 
-    fn record_probe(&self, shape: &str, outcome: ProbeOutcome) {
-        record_probe_outcome(&self.table_name, &self.counters, shape, outcome);
+    fn record_probe(&self, shape: &str, coverage: Coverage) {
+        record_probe_outcome(&self.table_name, &self.counters, shape, coverage);
     }
 
-    fn record_selection(&self, shape: &str, files: u64, rows: u64) {
+    fn record_selection(&self, shape: &str, coverage: Coverage, files: u64, rows: u64) {
         self.counters
             .candidate_files
             .fetch_add(files, Ordering::Relaxed);
         self.counters
             .candidate_rows
             .fetch_add(rows, Ordering::Relaxed);
-        self.record_probe(shape, ProbeOutcome::Selected);
+        self.record_probe(shape, coverage);
     }
 
     fn record_runtime_fallback(&self) {
@@ -2509,8 +2536,8 @@ pub(crate) struct PersistedRuns {
     /// Whether the persisted runs have been loaded. Until then a sync would
     /// delete them.
     loaded: AtomicBool,
-    /// The latest views to persist, taken by the running sync.
-    /// The latest views to sync, each with its key's directory.
+    /// The latest views to sync, each with its key's directory, taken by the
+    /// running sync.
     pending: Mutex<Option<Vec<(String, IndexView)>>>,
     /// Whether a sync is running.
     syncing: AtomicBool,
@@ -2738,19 +2765,19 @@ fn run_file_name(run: &IndexRun) -> String {
     format!("{:016x}.run", hash_index::hash_key_bytes(&[&descriptor]))
 }
 
-/// Counts one probe's outcome and reports it on
+/// Counts one probe's coverage and reports it on
 /// `cayenne_lookup_index_probe_total`.
 pub(crate) fn record_probe_outcome(
     table_name: &str,
     counters: &Counters,
     shape: &str,
-    outcome: ProbeOutcome,
+    coverage: Coverage,
 ) {
-    counters.record(outcome);
+    counters.record(coverage);
     telemetry::cayenne::track_lookup_index_probe(&[
         telemetry::KeyValue::new("table", table_name.to_string()),
         telemetry::KeyValue::new("shape", shape.to_string()),
-        telemetry::KeyValue::new("outcome", outcome.as_str()),
+        telemetry::KeyValue::new("coverage", coverage.as_str()),
     ]);
 }
 
@@ -3250,7 +3277,7 @@ mod tests {
 
         assert!(provider.resolve(Some(&predicate)).await.is_none());
         assert_eq!(
-            state.counters().unbuilt,
+            state.counters().none,
             0,
             "an unresolved filter is not probed"
         );
@@ -3261,11 +3288,11 @@ mod tests {
             .expect("first update");
         dynamic.mark_complete();
         assert!(provider.resolve(Some(&predicate)).await.is_none());
-        assert_eq!(state.counters().unbuilt, 1);
+        assert_eq!(state.counters().none, 1);
         assert_eq!(builds.count(), 1);
         assert!(provider.resolve(Some(&predicate)).await.is_none());
         assert_eq!(
-            state.counters().unbuilt,
+            state.counters().none,
             1,
             "one generation is probed only once"
         );
@@ -3276,7 +3303,7 @@ mod tests {
             .expect("second update");
         assert!(provider.resolve(Some(&predicate)).await.is_none());
         assert_eq!(
-            state.counters().unbuilt,
+            state.counters().none,
             2,
             "a later generation is resolved independently"
         );
@@ -3532,6 +3559,51 @@ mod tests {
         )
         .expect("indexable")
         .expect("state")
+    }
+
+    /// A join's runtime probe answers for the files its scan reads, and no
+    /// other: a key held only by a file outside the scan selects nothing there,
+    /// so the probe is fully covered and reads nothing, not a selection of a
+    /// file the scan never opens.
+    #[tokio::test]
+    async fn a_runtime_probe_counts_only_the_files_its_scan_reads() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let state = keyed_state(&pool);
+        write(
+            &state,
+            &[("a.vortex", 0, keyed_batch(&[Some(1)], &[Some("x")]))],
+        )
+        .await;
+        write(
+            &state,
+            &[("b.vortex", 0, keyed_batch(&[Some(2)], &[Some("y")]))],
+        )
+        .await;
+        let view = state.published();
+        let scan = [scan_file("table/snapshot/a.vortex")];
+        let before = state.counters();
+        let probed =
+            state.probe_runtime_filter(0, &view, &scan, &[vec![ScalarValue::Int64(Some(2))]]);
+        let after = state.counters();
+        assert!(
+            matches!(
+                probed,
+                RuntimeProbe::Selection {
+                    uncovered: false,
+                    ..
+                }
+            ),
+            "the scan's one file is covered"
+        );
+        assert_eq!(
+            (
+                after.full - before.full,
+                after.partial - before.partial,
+                after.candidate_files - before.candidate_files
+            ),
+            (1, 0, 0),
+            "a key only in a file the scan does not read is a fully covered probe that reads nothing: {before:?} -> {after:?}"
+        );
     }
 
     /// A schema change resets the index of exactly the keys whose encoding it
@@ -4053,7 +4125,10 @@ mod tests {
             selection(state.probe(&view, &tenant_values(&[1])))
                 .restrict(group(&["a.vortex", "b.vortex"]), no_table_plans());
         assert!(uncovered);
-        assert_eq!(explain.outcome, LookupIndexExplainOutcome::Selected);
+        assert_eq!(
+            explain.outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Partial)
+        );
         assert_eq!(
             (explain.candidate_files, explain.uncovered_files),
             (Some(2), Some(1)),
@@ -4075,12 +4150,15 @@ mod tests {
             "an uncovered file is read as the table reads it"
         );
 
-        // A key in no covered file drops `a` but still reads `b`, so it is not
-        // `empty`.
+        // A key in no covered file drops `a` but still reads `b`: the coverage
+        // is partial.
         let (groups, _, explain, uncovered) = selection(state.probe(&view, &tenant_values(&[7])))
             .restrict(group(&["a.vortex", "b.vortex"]), no_table_plans());
         assert!(uncovered);
-        assert_eq!(explain.outcome, LookupIndexExplainOutcome::Selected);
+        assert_eq!(
+            explain.outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Partial)
+        );
         assert_eq!(
             (explain.candidate_files, explain.uncovered_files),
             (Some(1), Some(1))
@@ -4092,48 +4170,67 @@ mod tests {
             .collect();
         assert_eq!(names, vec![path("b.vortex").to_string()]);
 
-        // Only covered files: an empty answer reads nothing.
+        // Only covered files: full coverage, and an answer of no rows reads
+        // nothing.
         let (groups, provider, explain, uncovered) =
             selection(state.probe(&view, &tenant_values(&[7])))
                 .restrict(group(&["a.vortex"]), no_table_plans());
         assert!(!uncovered && groups.is_empty() && provider.is_none());
-        assert_eq!(explain.outcome, LookupIndexExplainOutcome::Empty);
+        assert_eq!(
+            explain.outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Full)
+        );
 
         // Only uncovered files: nothing to narrow.
         let (_, provider, explain, uncovered) = selection(state.probe(&view, &tenant_values(&[1])))
             .restrict(group(&["b.vortex"]), no_table_plans());
         assert!(uncovered && provider.is_none());
-        assert_eq!(explain.outcome, LookupIndexExplainOutcome::Unbuilt);
-        assert_eq!(explain.uncovered_files, Some(1));
+        assert_eq!(
+            explain.outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Unindexed)
+        );
+        assert_eq!(
+            (explain.candidate_files, explain.uncovered_files),
+            (Some(1), Some(1))
+        );
     }
 
-    /// A scan over several snapshots, one of them read in full, is still one
-    /// selection, and the snapshot read in full counts among its candidate and
-    /// uncovered files.
+    /// A scan over several snapshots, one of them read in full, is one
+    /// decision: partly covered, with the snapshot read in full counted among
+    /// its candidate and uncovered files. Two fully covered snapshots stay
+    /// full, and two unindexed ones stay none.
     #[test]
-    fn a_selection_merged_with_an_unbuilt_snapshot_counts_its_files() {
-        let selected = LookupIndexExplain {
-            uncovered_files: Some(1),
+    fn a_selection_merged_with_an_unindexed_snapshot_counts_its_files() {
+        let full = |files: usize| LookupIndexExplain {
+            uncovered_files: Some(0),
             ..LookupIndexExplain::selection(
                 "TenantId".to_string(),
-                LookupIndexExplainOutcome::Selected,
-                Some(2),
+                LookupIndexExplainOutcome::Probed(Coverage::Full),
+                Some(files),
                 4,
             )
         };
-        let unbuilt = LookupIndexExplain::unbuilt("TenantId".to_string(), 3);
-        for merged in [
-            selected.clone().merge(unbuilt.clone()),
-            unbuilt.merge(selected),
-        ] {
-            assert_eq!(merged.outcome, LookupIndexExplainOutcome::Selected);
+        let unindexed = LookupIndexExplain::unindexed("TenantId".to_string(), 3);
+        assert_eq!(
+            full(2).merge(full(1)).outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Full)
+        );
+        assert_eq!(
+            unindexed.clone().merge(unindexed.clone()).outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Unindexed)
+        );
+        for merged in [full(2).merge(unindexed.clone()), unindexed.merge(full(2))] {
+            assert_eq!(
+                merged.outcome,
+                LookupIndexExplainOutcome::Probed(Coverage::Partial)
+            );
             assert_eq!(
                 (
                     merged.candidate_files,
                     merged.uncovered_files,
                     merged.candidate_rows
                 ),
-                (Some(5), Some(4), Some(4)),
+                (Some(5), Some(3), Some(4)),
                 "{merged:?}"
             );
         }
@@ -4276,7 +4373,7 @@ mod tests {
             "the uncovered file is sent to be indexed"
         );
         assert_eq!(
-            state.counters().selected,
+            state.counters().partial,
             1,
             "one probe per filter generation"
         );

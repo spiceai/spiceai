@@ -3189,20 +3189,20 @@ pub mod cayenne {
 
     static LOOKUP_INDEX_PROBE: OnceLock<Counter<u64>> = OnceLock::new();
 
-    /// Counts secondary index probes by outcome, so an indexed run can be told
-    /// apart from one that silently fell back to the ordinary scan. Outcomes (the
-    /// `outcome` dimension): `selected` (row selection attached; files not
-    /// indexed yet are read in full beside it), `empty` (every file read is
-    /// indexed and none holds the key, so no file is read), `unbuilt` (none of
-    /// the files read is indexed yet). `dimensions` carries `table`, `shape`
-    /// (the indexed columns, as the `indexes` entry names them) and `outcome`.
+    /// Counts secondary index probes by how much of what the lookup read the
+    /// index covered, so an indexed run can be told apart from one that fell
+    /// back to the ordinary scan. The `coverage` dimension is `none` (no file
+    /// read is indexed yet, so all are read in full), `partial` (some are
+    /// narrowed to their candidate rows and the rest read in full) or `full`
+    /// (every file read is indexed). `dimensions` carries `table`, `shape` (the
+    /// indexed columns, as the `indexes` entry names them) and `coverage`.
     pub fn track_lookup_index_probe(dimensions: &[KeyValue]) {
         LOOKUP_INDEX_PROBE
             .get_or_init(|| {
                 operational_meter()
                     .u64_counter("cayenne_lookup_index_probe_total")
                     .with_description(
-                        "Cayenne secondary index probes, labelled by table, indexed columns and outcome.",
+                        "Cayenne secondary index probes, labelled by table, indexed columns and how much of what the lookup read the index covered.",
                     )
                     .with_unit("probes")
                     .build()

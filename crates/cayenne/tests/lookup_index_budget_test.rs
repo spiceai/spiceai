@@ -258,7 +258,7 @@ async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
         .lookup_index_counters()
         .expect("table has index state");
     assert_eq!(
-        counters.selected, 0,
+        counters.full, 0,
         "no selection may be attached without a published index: {counters:?}"
     );
     assert_eq!(
@@ -266,8 +266,8 @@ async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
         "no row selection may reach the scan: {counters:?}"
     );
     assert!(
-        counters.unbuilt > 0,
-        "a table the pool refused should record its probes as unbuilt: {counters:?}"
+        counters.none > 0,
+        "a table the pool refused should record its probes' coverage as none: {counters:?}"
     );
 
     // Every row is still reachable.
@@ -344,8 +344,8 @@ async fn a_mixed_type_composite_key_is_indexed() {
         .lookup_index_counters()
         .expect("table has index state");
     assert_eq!(
-        after.selected,
-        before.selected + 1,
+        after.full,
+        before.full + 1,
         "the INT64 composite key did not use the index: {before:?} -> {after:?}"
     );
 }
@@ -361,9 +361,9 @@ fn uncovered_files_of(plan: &str) -> Option<usize> {
 }
 
 /// A write whose index the pool cannot fit is read in full beside the index of
-/// the writes that did fit, and the lookup says so: `selected`, with that file
-/// counted in `uncovered_files`, and never `empty` — even through a join's
-/// runtime filter, when the indexed files hold no candidate.
+/// the writes that did fit, and the lookup says so: coverage `partial`, with
+/// that file counted in `uncovered_files`, and never `full` — even through a
+/// join's runtime filter, when the indexed files hold no candidate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
@@ -406,9 +406,9 @@ async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
             .expect("format plan")
             .to_string();
         assert!(
-            plan.contains("lookup_index_outcome=selected")
+            plan.contains("lookup_index_outcome=partial")
                 && uncovered_files_of(&plan).is_some_and(|files| files > 0),
-            "a key in {what} must be a selection that reads the unindexed file in full:\n{plan}"
+            "a key in {what} must be partly covered, reading the unindexed file in full:\n{plan}"
         );
         let rows = query_on(&table, PARTIAL_TABLE, &sql).await;
         let found: Vec<i64> = rows
@@ -472,9 +472,9 @@ async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
         .lookup_index_counters()
         .expect("table has index state");
     assert_eq!(
-        (after.selected - before.selected, after.empty - before.empty),
+        (after.partial - before.partial, after.full - before.full),
         (1, 0),
-        "a runtime probe that reads an unindexed file must be a selection, not empty: \
+        "a runtime probe that reads an unindexed file is partly covered: \
          {before:?} -> {after:?}"
     );
 }

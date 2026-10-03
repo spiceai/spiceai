@@ -754,10 +754,7 @@ mod tests {
             assert_eq!(lookup(&reader, 24_007).await, 1);
             let after = reader.lookup_index_counters().expect("indexed");
             assert_eq!(
-                (
-                    after.selected - counters.selected,
-                    after.unbuilt - counters.unbuilt
-                ),
+                (after.full - counters.full, after.none - counters.none),
                 (1, 0),
                 "the first lookup after the restore did not use the loaded index: {after:?}"
             );
@@ -858,10 +855,7 @@ mod tests {
             assert_eq!(lookup(&reader, 27_003).await, 1);
             let after = reader.lookup_index_counters().expect("indexed");
             assert_eq!(
-                (
-                    after.selected - before.selected,
-                    after.unbuilt - before.unbuilt
-                ),
+                (after.full - before.full, after.none - before.none),
                 (1, 0),
                 "once caught up, the lookup is answered from the index: {after:?}"
             );
