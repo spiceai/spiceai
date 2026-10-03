@@ -601,8 +601,15 @@ mod tests {
             .insert_into(&ctx.state(), input, InsertOp::Append)
             .await?;
         collect(plan, ctx.task_ctx()).await?;
+        stored(&inner, ctx).await
+    }
 
-        let scan = inner.scan(&ctx.state(), None, &[], None).await?;
+    /// What `table` stores, in storage order.
+    async fn stored(
+        table: &MemTable,
+        ctx: &SessionContext,
+    ) -> datafusion::error::Result<Vec<(Option<i32>, String)>> {
+        let scan = table.scan(&ctx.state(), None, &[], None).await?;
         let mut rows = Vec::new();
         for batch in collect(scan, Arc::new(TaskContext::default())).await? {
             let ids = batch
@@ -879,6 +886,49 @@ mod tests {
         let mut stored = ids(&collect(scan, ctx.task_ctx()).await.expect("read"));
         stored.sort_unstable();
         assert_eq!(stored, vec![0, 1, 2]);
+    }
+
+    /// An ordered `INSERT` keeps the copy its `ORDER BY` puts first: the
+    /// filter keeps its input's order, so the optimizer leaves the sort below
+    /// it in place.
+    #[tokio::test]
+    async fn an_ordered_insert_keeps_the_copy_its_order_puts_first() {
+        let ctx = SessionContext::new();
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let table = wrap_with_keep_first_if_needed(
+            Arc::clone(&inner) as Arc<dyn TableProvider>,
+            &options("do_nothing:id"),
+            &schema(),
+            &pk(),
+        );
+        ctx.register_table("t", table).expect("register t");
+        let src = MemTable::try_new(
+            schema(),
+            vec![vec![batch(&[
+                (Some(1), "a"),
+                (Some(2), "b"),
+                (Some(1), "z"),
+            ])]],
+        )
+        .expect("source");
+        ctx.register_table("src", Arc::new(src))
+            .expect("register src");
+
+        let plan = ctx
+            .sql("INSERT INTO t SELECT * FROM src ORDER BY v DESC")
+            .await
+            .expect("insert plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        collect(plan, ctx.task_ctx()).await.expect("insert runs");
+
+        let mut rows = stored(&inner, &ctx).await.expect("read");
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![(Some(1), "z".to_string()), (Some(2), "b".to_string())]
+        );
     }
 
     #[test]
