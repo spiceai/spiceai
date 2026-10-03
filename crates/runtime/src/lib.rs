@@ -2216,7 +2216,24 @@ impl Runtime {
             })
             .collect();
 
-        join_all(shutdown_futures).await;
+        // A change-data-capture source records how far its accelerations were
+        // advanced on its way out (`data_components::cdc::ShutdownDrainGuard`),
+        // and those writes go into the accelerations DataFusion cleanup closes
+        // below — so they have to land first, and they need the process to still
+        // be here, which signalling alone does not guarantee: a source notices the
+        // signal on its next poll, and this function otherwise finishes in
+        // milliseconds. Waited on alongside the connection drain, under the same
+        // timeout: a source that cannot finish in it costs a rebuild on the next
+        // start, never a hung shutdown.
+        let (unfinished_sources, _) = tokio::join!(
+            data_components::cdc::drain_shutdown(shutdown_timeout),
+            join_all(shutdown_futures),
+        );
+        if unfinished_sources > 0 {
+            tracing::warn!(
+                "Shutdown waited {shutdown_timeout:?} for {unfinished_sources} change-data-capture source(s) to record how far their accelerations were advanced, and gave up; each dataset on those sources will be rebuilt from its source on the next start rather than resumed"
+            );
+        }
 
         // Clean up DataFusion first as there could be datasets loading and accessing registries below.
         self.df.shutdown().await;
