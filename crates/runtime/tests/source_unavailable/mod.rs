@@ -440,6 +440,12 @@ mod served_from_acceleration {
         dataset
     }
 
+    /// `dataset` evolving its acceleration with `on_schema_change: append_new_columns`.
+    fn appending_new_columns(mut dataset: SpicepodDataset) -> SpicepodDataset {
+        dataset.on_schema_change = spicepod::component::dataset::OnSchemaChange::AppendNewColumns;
+        dataset
+    }
+
     /// `dataset` checking for a due refresh only every `interval`.
     fn with_refresh_check_interval(
         mut dataset: SpicepodDataset,
@@ -909,6 +915,40 @@ mod served_from_acceleration {
         assert!(
             rt.status().is_ready(),
             "a served dataset in Error is still ready"
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A dataset whose configuration needs its source to start (here
+    /// `on_schema_change: append_new_columns`, which needs the live schema) waits for
+    /// it even with an acceleration on disk, and its status says it is not served and
+    /// why.
+    #[tokio::test]
+    async fn an_excluded_dataset_says_it_is_not_served_and_why() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("excluded-append").await?;
+        let source = &fixture.source;
+        let spec = || appending_new_columns(fixture.dataset(ReadyState::OnLoad));
+        seed(source, spec()).await?;
+
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
+        let explained = wait_until_true(Duration::from_secs(10), || async {
+            matches!(
+                dataset_status(&rt, "orders"),
+                Some(ComponentStatus::Error(Some(message)))
+                    if message.starts_with("Not served: waits for its source because it uses `on_schema_change: append_new_columns`.")
+            )
+        })
+        .await;
+        assert!(
+            explained,
+            "the status says the dataset is not served and why ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            sum_and_count(&rt).await.is_none(),
+            "an excluded dataset is not served while its source is down"
         );
         stop(rt, loader).await;
         Ok(())

@@ -528,7 +528,7 @@ impl Runtime {
         let ds_name = &ds.name;
         self.status.update_dataset(
             ds_name,
-            status::ComponentStatus::error_with_message(err.to_string()),
+            status::ComponentStatus::error_with_message(load_failure_status(ds, &err.to_string())),
         );
         metrics::datasets::LOAD_ERROR.add(1, &[]);
         if is_permanent_dataset_failure(&err) {
@@ -756,6 +756,14 @@ impl Runtime {
             (ds, bootstrap_status)
         };
 
+        if let Some(reason) = Self::waits_for_source_reason(&ds)
+            && crate::dataconnector::sink::recorded_checkpoint_schema(&ds)
+                .await
+                .is_some()
+        {
+            tracing::info!("{}", waits_for_source_message(&ds.name, &reason));
+        }
+
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let runtime = Arc::clone(&self);
@@ -910,37 +918,59 @@ impl Runtime {
     /// This runs before the connector exists, so the refresh mode is resolved the way
     /// `DataConnector::resolve_refresh_mode` does by default.
     fn may_serve_existing_acceleration(ds: &Dataset) -> bool {
+        ds.acceleration.as_ref().is_some_and(|a| a.enabled)
+            && Self::waits_for_source_reason(ds).is_none()
+    }
+
+    /// The configuration that makes an accelerated dataset wait for its source
+    /// instead of being served from an existing acceleration (see
+    /// [`Self::may_serve_existing_acceleration`]), named the way the user wrote it, or
+    /// `None` when it does not wait or is not accelerated.
+    fn waits_for_source_reason(ds: &Dataset) -> Option<String> {
         use crate::component::dataset::OnSchemaChange;
         use crate::component::dataset::acceleration::Mode;
 
-        let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
-            return false;
-        };
-        if ds.access().allows_write()
-            || ds.has_embeddings()
-            || ds.has_full_text_column()
-            || ds.drasi.as_ref().is_some_and(is_drasi_forwarding)
-            || acceleration.mode == Mode::FileCreate
-            || ds.source() == crate::dataconnector::file::FILE_DATACONNECTOR
-        {
-            return false;
-        }
+        let acceleration = ds.acceleration.as_ref().filter(|a| a.enabled)?;
         let refresh_mode = acceleration.refresh_mode.unwrap_or(RefreshMode::Full);
-        if matches!(refresh_mode, RefreshMode::Changes | RefreshMode::Caching)
-            || (refresh_mode == RefreshMode::Append && ds.time_column.is_none())
-        {
-            return false;
+        let reason = if ds.access().allows_write() {
+            "`access: read_write`".to_string()
+        } else if ds.has_embeddings() {
+            "embedding columns".to_string()
+        } else if ds.has_full_text_column() {
+            "full-text search columns".to_string()
+        } else if ds.drasi.as_ref().is_some_and(is_drasi_forwarding) {
+            "Drasi forwarding".to_string()
+        } else if acceleration.mode == Mode::FileCreate {
+            "`mode: file_create`".to_string()
+        } else if ds.source() == crate::dataconnector::file::FILE_DATACONNECTOR {
+            "the `file` connector".to_string()
+        } else if refresh_mode == RefreshMode::Changes {
+            "`refresh_mode: changes`".to_string()
+        } else if refresh_mode == RefreshMode::Caching {
+            "`refresh_mode: caching`".to_string()
+        } else if refresh_mode == RefreshMode::Append && ds.time_column.is_none() {
+            "`refresh_mode: append` without a `time_column`".to_string()
+        } else if ds.on_schema_change != OnSchemaChange::Block {
+            format!("`on_schema_change: {}`", ds.on_schema_change)
+        } else if crate::schema_evolution::recreates_on_schema_mismatch(
+            acceleration,
+            ds.on_schema_change,
+            refresh_mode,
+        ) {
+            format!("`mode: {}`", acceleration.mode)
+        } else {
+            return None;
+        };
+        Some(reason)
+    }
+
+    /// The reason a file-accelerated dataset that failed to load is not served from
+    /// its acceleration, for its status message.
+    fn not_served_reason(ds: &Dataset) -> Option<String> {
+        if !ds.is_file_accelerated() {
+            return None;
         }
-        if ds.on_schema_change != OnSchemaChange::Block
-            || crate::schema_evolution::recreates_on_schema_mismatch(
-                acceleration,
-                ds.on_schema_change,
-                refresh_mode,
-            )
-        {
-            return false;
-        }
-        true
+        Self::waits_for_source_reason(ds)
     }
 
     /// Registers `ds` against its existing acceleration without waiting for the
@@ -1065,7 +1095,10 @@ impl Runtime {
                 }
                 self.status.update_dataset(
                     &ds.name,
-                    status::ComponentStatus::error_with_message(err.to_string()),
+                    status::ComponentStatus::error_with_message(load_failure_status(
+                        &ds,
+                        &err.to_string(),
+                    )),
                 );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 let spaced_tracer = Arc::clone(&self.spaced_tracer);
@@ -2894,6 +2927,28 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
     }
 }
 
+/// The message logged when an accelerated dataset with data on disk waits for its
+/// source before serving, because of `reason` (see
+/// `Runtime::waits_for_source_reason`).
+fn waits_for_source_message(dataset: &TableReference, reason: &str) -> String {
+    format!(
+        "Dataset '{dataset}' waits for its source before serving because it uses {reason}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+    )
+}
+
+/// The status message of a dataset that failed to load: for a file-accelerated
+/// dataset that waits for its source, it says the dataset is not served and why.
+fn load_failure_status(ds: &Dataset, cause: &str) -> String {
+    match Runtime::not_served_reason(ds) {
+        Some(reason) => not_served_status(&reason, cause),
+        None => cause.to_string(),
+    }
+}
+
+fn not_served_status(reason: &str, cause: &str) -> String {
+    format!("Not served: waits for its source because it uses {reason}. Cause: {cause}")
+}
+
 /// Whether a dataset's `drasi:` block is live.
 fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
@@ -2979,6 +3034,25 @@ fn with_localpod_dependents(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_waits_for_source_message_names_the_dataset_and_its_configuration() {
+        assert_eq!(
+            super::waits_for_source_message(
+                &datafusion::sql::TableReference::bare("orders"),
+                "`refresh_mode: changes`"
+            ),
+            "Dataset 'orders' waits for its source before serving because it uses `refresh_mode: changes`. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+        );
+    }
+
+    #[test]
+    fn the_not_served_status_says_why_and_keeps_the_cause() {
+        assert_eq!(
+            super::not_served_status("`refresh_mode: changes`", "connection refused"),
+            "Not served: waits for its source because it uses `refresh_mode: changes`. Cause: connection refused"
+        );
+    }
+
     use super::*;
 
     /// Every retention setting has to be recognised, whichever one the dataset
