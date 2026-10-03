@@ -284,13 +284,20 @@ impl DataConnector for ReconnectingConnector {
         dataset: &DatasetSpec,
         runtime_env: &Arc<RuntimeEnv>,
     ) -> super::DataConnectorResult<()> {
-        if let Some(inner) = self.built() {
-            inner.register_object_stores(dataset, runtime_env).await
-        } else {
-            self.pending_object_stores
-                .lock()
-                .push((dataset.clone(), Arc::clone(runtime_env)));
-            Ok(())
+        // Checked under the queue's lock, which `connector()` takes after publishing
+        // the built connector: either the store is queued before that drain, or the
+        // connector is already visible here and the store is registered directly.
+        let built = {
+            let mut pending = self.pending_object_stores.lock();
+            let built = self.built().map(Arc::clone);
+            if built.is_none() {
+                pending.push((dataset.clone(), Arc::clone(runtime_env)));
+            }
+            built
+        };
+        match built {
+            Some(inner) => inner.register_object_stores(dataset, runtime_env).await,
+            None => Ok(()),
         }
     }
 
