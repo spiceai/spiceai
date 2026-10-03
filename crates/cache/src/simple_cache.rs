@@ -173,6 +173,34 @@ impl<
         matches!(outcome, moka::ops::compute::CompResult::ReplacedWith(_))
     }
 
+    async fn put_if(
+        &self,
+        key: &u64,
+        value: V,
+        _weight: usize,
+        admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
+    ) -> bool {
+        // Entries are bounded by count, so `weight` is unused. `Op::Put` inserts
+        // when the key is empty and replaces when it is occupied.
+        let outcome = self
+            .cache
+            .entry(*key)
+            .and_compute_with(|current| {
+                let accept = admit(current.as_ref().map(moka::Entry::value));
+                std::future::ready(if accept {
+                    moka::ops::compute::Op::Put(value)
+                } else {
+                    moka::ops::compute::Op::Nop
+                })
+            })
+            .await;
+        matches!(
+            outcome,
+            moka::ops::compute::CompResult::Inserted(_)
+                | moka::ops::compute::CompResult::ReplacedWith(_)
+        )
+    }
+
     async fn invalidate_all(&self) {
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;

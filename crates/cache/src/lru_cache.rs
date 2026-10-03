@@ -320,6 +320,20 @@ impl<
         self.backend.replace_if(*key, value, should_replace).await
     }
 
+    async fn put_if(
+        &self,
+        key: &u64,
+        value: V,
+        weight: usize,
+        admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
+    ) -> bool {
+        let stored = self.backend.insert_if(*key, value, weight, admit);
+        if stored {
+            self.report_metrics_after_put().await;
+        }
+        stored
+    }
+
     async fn invalidate_all(&self) {
         self.backend.clear().await;
 
