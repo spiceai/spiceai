@@ -124,11 +124,13 @@ async def differential(executable, root, artifacts, use_slate, seed, steps):
     db = None
     oracle_store = None
     if use_slate:
-        from slatedb.uniffi import DbBuilder, IsolationLevel, ObjectStore
+        from slatedb.uniffi import DbBuilder, IsolationLevel, ObjectStoreBuilder, ObjectStoreType
 
         oracle_dir = root / f"slate-{seed}"
         oracle_dir.mkdir()
-        oracle_store = ObjectStore.resolve(oracle_dir.resolve().as_uri() + "/")
+        builder = ObjectStoreBuilder(ObjectStoreType.LOCAL)
+        builder.with_config("local_path", str(oracle_dir.resolve()))
+        oracle_store = builder.build()
         db = await DbBuilder("oracle", oracle_store).build()
     directory = root / f"differential-{seed}"
     worker = Worker(executable, directory, artifacts, f"history-{seed}-0")

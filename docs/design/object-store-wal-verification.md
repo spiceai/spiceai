@@ -23,16 +23,17 @@ The independent reviewer did not execute Cargo.
 Command:
 
 ```sh
-cargo test --profile dev -p object_store_occ --lib --test state_store --test transactional_wal
+cargo test --profile dev -p object_store_occ --lib --test state_store --test transactional_wal --test local_cancellation
 ```
 
-Actual output summaries, respectively library, primitive integration and WAL
-integration suites:
+Actual output summaries, respectively library, cancellation, primitive integration
+and WAL integration suites:
 
 ```text
 test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.74s
 test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
-test result: ok. 19 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.75s
+test result: ok. 21 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.82s
 ```
 
 The two ignored entries are the credential-dependent S3 conformance test and the
@@ -40,7 +41,7 @@ subprocess helper. The WAL parent test explicitly invokes that helper twice.
 Local runs exercise real filesystem I/O with independently constructed clients,
 memory-backed concurrent histories, fault wrappers around actual storage writes,
 multi-page checkpoint recovery, boundary values, corruption and deterministic
-model comparisons. Raw session output: `/tmp/spice-wal-tests-local.log`.
+model comparisons. Raw session output: `/tmp/spice-wal-current-suites.log`.
 
 ## Process restart
 
@@ -59,16 +60,16 @@ process exit boundary=7: sequence=0, outcome=Pending
 process exit boundary=8: sequence=1, outcome=Committed { sequence: 1 }
 test process_restart_at_wal_publication_boundaries ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.02s
 ```
 
 An unchanged base remains `Pending`, not falsely rejected, because the protocol
 does not infer a writer's death from a read. This is process-exit evidence, not
-machine-power-loss qualification. Raw output: `/tmp/spice-wal-process.log`.
+machine-power-loss qualification. Raw output: `/tmp/spice-wal-current-restart.log`.
 
 ## OCC test sensitivity
 
-A temporary mutation made `commit` use a freshly read head revision instead of
+At commit `b80ab208`, a temporary mutation made `commit` use a freshly read head revision instead of
 the transaction's original snapshot revision. This deliberately permits a stale
 transaction to overwrite newer work. It was removed before final tests and lint.
 The same command ran with the mutation and after restoring the implementation:
