@@ -243,10 +243,11 @@ pub const DATAFUSION_CAST_BUILTINS: &[&str] = &[
 /// backend can evaluate them faithfully and every [`FunctionSupportBuilder`]
 /// denies them: `arrow_typeof` answers with the plan's Arrow type, `arrow_field`
 /// and `arrow_metadata` with the plan's field and its metadata, and
-/// `with_metadata` attaches metadata to a plan field. No SQL engine defines a
-/// function of these names, so a federated call fails remotely as an unknown
-/// function (issue #14334) — and an engine that happened to define the name
-/// would answer about its own types, not the plan's. Evaluating them locally,
+/// `with_metadata` attaches metadata to a plan field. A backend cannot be
+/// assumed to define functions of these names — most SQL engines do not, so a
+/// federated call fails remotely as an unknown function (issue #14334) — and a
+/// backend that does define them, such as a `DataFusion`-based source, would
+/// answer about or modify its own plan, not this one. Evaluating them locally,
 /// above the federated scan, is the only reading that answers the question
 /// asked.
 pub const PLAN_INTROSPECTION_BUILTINS: &[&str] = &[
