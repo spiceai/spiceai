@@ -842,16 +842,23 @@ mod tests {
     #[tokio::test]
     async fn creation_takes_the_name_over_from_an_orphaned_container() -> Result<(), anyhow::Error>
     {
-        const NAME: &str = "runtime-integration-test-orphaned-name";
         // Already pulled by the integration jobs; only created here, never started.
         const IMAGE: &str = "docker.io/library/mysql:latest";
+        // This module is compiled into more than one test binary, and nextest
+        // can run both copies of this test at once against one daemon, so the
+        // name carries the process ID to keep the copies apart.
+        let name = format!(
+            "runtime-integration-test-orphaned-name-{}",
+            std::process::id()
+        );
+        let name = name.as_str();
 
         if !is_docker_available().await {
             eprintln!("skipping: Docker is not available");
             return Ok(());
         }
 
-        let runner = ContainerRunnerBuilder::new(NAME)
+        let runner = ContainerRunnerBuilder::new(name)
             .image(IMAGE.to_string())
             .build()?;
         runner.pull_image().await?;
@@ -866,7 +873,7 @@ mod tests {
             .docker
             .create_container(
                 Some(CreateContainerOptions {
-                    name: NAME,
+                    name,
                     platform: None,
                 }),
                 config.clone(),
@@ -874,9 +881,9 @@ mod tests {
             .await?
             .id;
 
-        let created = create_taking_over_name(&runner.docker, NAME, config).await;
-        let holder = runner.docker.inspect_container(NAME, None).await;
-        remove(&runner.docker, NAME).await?;
+        let created = create_taking_over_name(&runner.docker, name, config).await;
+        let holder = runner.docker.inspect_container(name, None).await;
+        remove(&runner.docker, name).await?;
 
         created?;
         assert_ne!(
@@ -892,15 +899,22 @@ mod tests {
     /// conflict rather than remove it.
     #[tokio::test]
     async fn creation_leaves_a_started_holder_alone() -> Result<(), anyhow::Error> {
-        const NAME: &str = "runtime-integration-test-started-holder";
         const IMAGE: &str = "docker.io/library/mysql:latest";
+        // This module is compiled into more than one test binary, and nextest
+        // can run both copies of this test at once against one daemon, so the
+        // name carries the process ID to keep the copies apart.
+        let name = format!(
+            "runtime-integration-test-started-holder-{}",
+            std::process::id()
+        );
+        let name = name.as_str();
 
         if !is_docker_available().await {
             eprintln!("skipping: Docker is not available");
             return Ok(());
         }
 
-        let runner = ContainerRunnerBuilder::new(NAME)
+        let runner = ContainerRunnerBuilder::new(name)
             .image(IMAGE.to_string())
             .build()?;
         runner.pull_image().await?;
@@ -915,18 +929,18 @@ mod tests {
             .docker
             .create_container(
                 Some(CreateContainerOptions {
-                    name: NAME,
+                    name,
                     platform: None,
                 }),
                 config.clone(),
             )
             .await?
             .id;
-        runner.docker.start_container::<String>(NAME, None).await?;
+        runner.docker.start_container::<String>(name, None).await?;
 
-        let created = create_taking_over_name(&runner.docker, NAME, config).await;
-        let still_held = runner.docker.inspect_container(NAME, None).await;
-        remove(&runner.docker, NAME).await?;
+        let created = create_taking_over_name(&runner.docker, name, config).await;
+        let still_held = runner.docker.inspect_container(name, None).await;
+        remove(&runner.docker, name).await?;
 
         let still_held = still_held?;
         assert_eq!(
