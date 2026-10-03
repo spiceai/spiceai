@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Resolving the keys a full refresh repeats after it is written, rather than
-//! while it is written.
+//! Resolving the keys a refresh repeats after it is written, rather than while
+//! it is written: a full refresh's new snapshot, and a streaming append's.
 //!
 //! The refresh is written once, straight into its new snapshot, with each batch
 //! resolving the repeats it holds itself ([`super::key_conflicts::KeyResolver`])
@@ -34,13 +34,24 @@ limitations under the License.
 //! The chunks are sized from the rows written, and from the bytes written for
 //! keys too wide for the row estimate; a chunk that still outgrows the memory
 //! pool cuts the key space finer.
+//!
+//! A chunk reads only the files that can hold its keys. Each file's footer
+//! bounds on a key column group the files into clusters whose bounds overlap; a
+//! key's copies all fall in one cluster, so a cluster is checked on its own. A
+//! cluster larger than a chunk is cut into half-open key ranges — equal-width
+//! from an integer column's bounds, or at quantiles of a sample of its rows —
+//! pushed into the file scan, so the scan skips the zones outside a range and
+//! the table's key columns are read about once in all. The ranges tile the
+//! whole domain, and the rows they read must add up to the cluster's: a range
+//! that missed rows would leave their repeats unresolved, so it fails the
+//! write instead. Files whose bounds give no grouping fall back to hash chunks
+//! that each read every file.
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
-use std::time::Instant;
 
 use arrow::array::{ArrayRef, AsArray, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow::compute::filter_record_batch;
@@ -64,7 +75,7 @@ use vortex::layout::layouts::row_idx::row_idx;
 use vortex_session::VortexSession;
 
 use super::key_conflicts::KeyResolver;
-use super::overwrite_layers::Survivor;
+use super::key_conflicts::Survivor;
 use super::table::CayenneTableProvider;
 
 /// The trailing column a refresh resolved after its write carries: each row's
@@ -88,68 +99,27 @@ const CHUNK_HASH_SEED: u64 = 0x6361_7965_6e6e_6501;
 /// tables hold more than this; see the module documentation.
 const CHUNK_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Whether full refreshes resolve their repeats after the write. A prototype
-/// switch for measuring the approach against the layered write.
-pub(crate) fn enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("SPICE_CAYENNE_REFRESH_DEDUP").is_ok_and(|value| value == "postpass")
-    });
-    *ENABLED
-}
-
-/// The bytes of written data one chunk of the duplicate query covers.
-fn chunk_bytes() -> u64 {
-    static OVERRIDE_MB: LazyLock<Option<u64>> = LazyLock::new(|| {
-        std::env::var("SPICE_CAYENNE_REFRESH_DEDUP_CHUNK_MB")
-            .ok()
-            .and_then(|value| value.parse().ok())
-    });
-    match *OVERRIDE_MB {
-        Some(mb) => mb.max(1) * 1024 * 1024,
-        None => CHUNK_BYTES,
-    }
-}
-
 /// Rows each chunk of the duplicate query covers. With a single `Int64` key
 /// the query holds about 70 bytes per row of its chunk at its peak, so a chunk
 /// of this many rows holds a little over 1 GiB.
 const CHUNK_ROWS: u64 = 16 * 1024 * 1024;
 
+/// A smaller [`CHUNK_ROWS`] for tests, so small tables still split into many
+/// key ranges; `0` keeps the default. It changes only how the work is cut, never
+/// the result.
+#[cfg(test)]
+pub(crate) static TEST_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
+
 /// The rows one chunk of the duplicate query covers.
 fn chunk_rows() -> u64 {
-    static OVERRIDE: LazyLock<Option<u64>> = LazyLock::new(|| {
-        std::env::var("SPICE_CAYENNE_REFRESH_DEDUP_CHUNK_ROWS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-    });
-    OVERRIDE.unwrap_or(CHUNK_ROWS).max(1)
-}
-
-/// Whether the duplicate query chunks the key space by key ranges of the
-/// written files (`SPICE_CAYENNE_REFRESH_DEDUP_CHUNKING=range`) rather than by a
-/// hash of the key alone. A prototype switch.
-fn range_chunking() -> bool {
-    static RANGE: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("SPICE_CAYENNE_REFRESH_DEDUP_CHUNKING").is_ok_and(|value| value == "range")
-    });
-    *RANGE
-}
-
-/// Whether a step reading fewer files than the query has partitions splits
-/// them into row ranges (`SPICE_CAYENNE_REFRESH_DEDUP_SPLIT=1`). A prototype
-/// switch; needs the footer row counts the range chunking reads.
-fn split_files() -> bool {
-    static SPLIT: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("SPICE_CAYENNE_REFRESH_DEDUP_SPLIT").is_ok_and(|value| value == "1")
-    });
-    *SPLIT
-}
-
-/// Prototype diagnostics (`SPICE_CAYENNE_POSTPASS_DEBUG=1`).
-fn debug() -> bool {
-    static DEBUG: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("SPICE_CAYENNE_POSTPASS_DEBUG").is_ok_and(|v| v == "1"));
-    *DEBUG
+    #[cfg(test)]
+    {
+        let rows = TEST_CHUNK_ROWS.load(Ordering::Relaxed);
+        if rows > 0 {
+            return rows;
+        }
+    }
+    CHUNK_ROWS
 }
 
 /// One step of the duplicate query: the files it reads, the hash slice
@@ -196,17 +166,6 @@ fn cut_specs(files: &[u32], column: usize, cuts: &[ScalarValue], group: u32) -> 
             }),
         })
         .collect()
-}
-
-/// Whether a cluster of files larger than a chunk is split into key
-/// sub-ranges (`SPICE_CAYENNE_REFRESH_DEDUP_SUBSPLIT=range`) rather than hash
-/// slices that each read the whole cluster. A prototype switch; integer key
-/// columns only.
-fn range_subsplit() -> bool {
-    static SUBSPLIT: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("SPICE_CAYENNE_REFRESH_DEDUP_SUBSPLIT").is_ok_and(|value| value == "range")
-    });
-    *SUBSPLIT
 }
 
 /// An integer key value as `i128`, or `None` for any other type.
@@ -542,9 +501,8 @@ impl RecordBatchStream for ArrivalStream {
     }
 }
 
-/// `(file id, path, row range)` of one file, or part of one, a [`ReadBack`]
-/// reads.
-type ReadBackFile = (u32, String, Option<std::ops::Range<u64>>);
+/// `(file id, path)` of one file a [`ReadBack`] reads.
+type ReadBackFile = (u32, String);
 
 /// Reads one group of written files back: each row's key columns, arrival
 /// ordinal, row position and file, keeping only the rows whose key falls in one
@@ -679,7 +637,7 @@ impl PartitionStream for ReadBack {
         let schema = Arc::clone(&this.schema);
         let files = this.files.clone();
         let stream = futures::stream::iter(files)
-            .then(move |(file, path, row_range)| {
+            .then(move |(file, path)| {
                 let this = Arc::clone(&this);
                 let projection = projection.clone();
                 let range_filter = range_filter.clone();
@@ -693,9 +651,6 @@ impl PartitionStream for ReadBack {
                     let mut scan = vxf
                         .scan()
                         .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
-                    if let Some(row_range) = row_range {
-                        scan = scan.with_row_range(row_range);
-                    }
                     if let Some(Some(filter)) = range_filter {
                         scan = scan.with_filter(filter);
                     }
@@ -882,66 +837,27 @@ impl CayenneTableProvider {
         let schema: SchemaRef = Arc::new(Schema::new(fields));
         let stored = Arc::new(Field::new_struct("", stored_fields, false));
 
-        let started = Instant::now();
         let total_bytes: u64 = files.iter().map(|file| file.size).sum();
         let mut chunks = total_bytes
-            .div_ceil(chunk_bytes())
+            .div_ceil(CHUNK_BYTES)
             .max(rows_written.div_ceil(chunk_rows()))
             .max(1);
         let sizes: Vec<u64> = files.iter().map(|file| file.size).collect();
-        // Each file's footer bounds on every key column, when chunking by key
-        // ranges: every copy of a key holds the same value in each key column, so
-        // only files whose bounds overlap can hold copies of one key.
-        let (bounds, file_rows) = if range_chunking() || debug() {
-            self.written_key_bounds(&state, &store, &files, key_columns)
-                .await
-        } else {
-            (Vec::new(), None)
-        };
-        let bounds_elapsed = started.elapsed();
-        if debug() {
-            for (column, per_file) in key_columns.iter().zip(&bounds) {
-                let Some(per_file) = per_file else {
-                    eprintln!("POSTPASS file_bounds column={column} missing");
-                    continue;
-                };
-                for (file, ((min, max), size)) in per_file.iter().zip(&sizes).enumerate() {
-                    eprintln!(
-                        "POSTPASS file_bounds column={column} file={file} bytes={size} min={min} max={max}"
-                    );
-                }
-            }
-        }
-        let bounds = if range_chunking() { bounds } else { Vec::new() };
-        // Splitting a cluster into key ranges checks the ranges read every row
-        // of it, which needs every file's row count.
-        let footer_rows = file_rows.clone();
-        let file_rows = if split_files() { file_rows } else { None };
-        let started = Instant::now();
-        // Diagnostics: the peak the memory pool reports while the query runs.
-        let pool_peak = Arc::new(AtomicU64::new(0));
-        let sampler = debug().then(|| {
-            let pool = Arc::clone(&ctx.runtime_env().memory_pool);
-            let peak = Arc::clone(&pool_peak);
-            tokio::spawn(async move {
-                loop {
-                    peak.fetch_max(pool.reserved() as u64, Ordering::Relaxed);
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-        });
+        // Each file's footer bounds on every key column, and its row count: every
+        // copy of a key holds the same value in each key column, so only files
+        // whose bounds overlap can hold copies of one key.
+        let (bounds, file_rows) = self
+            .written_key_bounds(&state, &store, &files, key_columns)
+            .await;
         let paths: Vec<String> = files.into_iter().map(|file| file.path).collect();
         let key_names: Arc<[String]> = key_columns.to_vec().into();
-        // A chunk sized from the bytes written can still outgrow a small memory
-        // pool; then the key space is cut finer and the query run again.
+        // A chunk sized from the bytes and rows written can still outgrow a small
+        // memory pool; then the key space is cut finer and the query run again.
         let superseded = loop {
-            let mut plan = plan_chunks(
-                &sizes,
-                &bounds,
-                chunks,
-                range_subsplit() && footer_rows.is_some(),
-            );
-            if let (Some(column), Some(rows)) = (plan.column, footer_rows.as_deref()) {
+            // Splitting a cluster into key ranges checks that the ranges read every
+            // row of it, which needs every file's row count.
+            let mut plan = plan_chunks(&sizes, &bounds, chunks, file_rows.is_some());
+            if let (Some(column), Some(rows)) = (plan.column, file_rows.as_deref()) {
                 self.sample_key_ranges(
                     &mut plan,
                     &store,
@@ -958,7 +874,7 @@ impl CayenneTableProvider {
                 .map(|files| {
                     files
                         .iter()
-                        .map(|&f| footer_rows.as_deref().map_or(0, |rows| rows[f as usize]))
+                        .map(|&f| file_rows.as_deref().map_or(0, |rows| rows[f as usize]))
                         .sum()
                 })
                 .collect();
@@ -971,20 +887,8 @@ impl CayenneTableProvider {
                 schema: &schema,
                 survivor,
                 keys: key_columns.len(),
-                file_rows: file_rows.as_deref(),
                 group_rows,
             };
-            if debug() {
-                eprintln!(
-                    "POSTPASS plan files={} total_bytes={total_bytes} target_chunks={chunks} specs={} column={:?} bytes_read={} amplification_pct={} bounds_ms={}",
-                    paths.len(),
-                    plan.specs.len(),
-                    plan.column.map(|index| key_columns[index].as_str()),
-                    plan.bytes_read,
-                    plan.bytes_read * 100 / total_bytes.max(1),
-                    bounds_elapsed.as_millis(),
-                );
-            }
             match query.run(&plan.specs).await {
                 Ok(superseded) => break superseded,
                 Err(error)
@@ -998,17 +902,6 @@ impl CayenneTableProvider {
                 Err(error) => return Err(error.into()),
             }
         };
-        if let Some(sampler) = sampler {
-            sampler.abort();
-        }
-        if debug() {
-            eprintln!(
-                "POSTPASS query_done query_ms={} pool_peak_mb={} superseded={}",
-                started.elapsed().as_millis(),
-                pool_peak.load(Ordering::Relaxed) / (1024 * 1024),
-                superseded.iter().map(Vec::len).sum::<usize>()
-            );
-        }
         // Sort each file's positions on the blocking pool, files in parallel.
         let sorts = superseded
             .into_iter()
@@ -1044,9 +937,6 @@ struct DuplicateQuery<'a> {
     schema: &'a SchemaRef,
     survivor: Survivor,
     keys: usize,
-    /// Each file's row count, when known: lets a step reading fewer files than
-    /// the query has partitions split them into row ranges.
-    file_rows: Option<&'a [u64]>,
     /// The rows of each cluster split into key ranges, by group: the ranges'
     /// rows must add up to it, or a row was read by no range.
     group_rows: Vec<u64>,
@@ -1064,36 +954,11 @@ impl DuplicateQuery<'_> {
         // since the join's build side holds each repeated key once.
         let mut superseded: Vec<Vec<u32>> = vec![Vec::new(); self.paths.len()];
         let mut group_read: Vec<u64> = vec![0; self.group_rows.len()];
-        for (chunk_index, spec) in specs.iter().enumerate() {
-            let chunk_started = Instant::now();
+        for spec in specs {
             let rows_read = Arc::new(AtomicU64::new(0));
             let mut groups: Vec<Vec<ReadBackFile>> = vec![Vec::new(); partitions];
-            let splits = match self.file_rows {
-                Some(_) if spec.files.len() < partitions => {
-                    partitions.div_ceil(spec.files.len().max(1)) as u64
-                }
-                _ => 1,
-            };
-            let mut slot = 0;
-            for &id in &spec.files {
-                let path = &self.paths[id as usize];
-                match self.file_rows {
-                    Some(rows) if splits > 1 => {
-                        let rows = rows[id as usize];
-                        let step = rows.div_ceil(splits).max(1);
-                        let mut start = 0;
-                        while start < rows {
-                            let end = (start + step).min(rows);
-                            groups[slot % partitions].push((id, path.clone(), Some(start..end)));
-                            slot += 1;
-                            start = end;
-                        }
-                    }
-                    _ => {
-                        groups[slot % partitions].push((id, path.clone(), None));
-                        slot += 1;
-                    }
-                }
+            for (slot, &id) in spec.files.iter().enumerate() {
+                groups[slot % partitions].push((id, self.paths[id as usize].clone()));
             }
             let streams: Vec<Arc<dyn PartitionStream>> = groups
                 .into_iter()
@@ -1138,7 +1003,6 @@ impl DuplicateQuery<'_> {
             // The repeated keys are the join's build side either way; holding them
             // here lets a chunk with none skip reading its rows a second time.
             let repeated_batches = repeated.collect().await?;
-            let aggregate_elapsed = chunk_started.elapsed();
             let aggregate_rows = rows_read.load(Ordering::Relaxed);
             if let Some(range) = &spec.range
                 && let Some(read) = group_read.get_mut(range.group as usize)
@@ -1147,14 +1011,6 @@ impl DuplicateQuery<'_> {
             }
             let repeated_keys: usize = repeated_batches.iter().map(RecordBatch::num_rows).sum();
             if repeated_keys == 0 {
-                if debug() {
-                    eprintln!(
-                        "POSTPASS chunk={chunk_index} files={} hash={:?} rows_read_agg={aggregate_rows} repeated_keys=0 agg_ms={}",
-                        spec.files.len(),
-                        spec.hash,
-                        aggregate_elapsed.as_millis()
-                    );
-                }
                 continue;
             }
             let repeated = ctx.read_batches(repeated_batches)?;
@@ -1188,19 +1044,6 @@ impl DuplicateQuery<'_> {
                     #[expect(clippy::cast_possible_truncation)]
                     superseded[*file as usize].push(*position as u32);
                 }
-            }
-            if debug() {
-                eprintln!(
-                    "POSTPASS chunk={chunk_index} files={} hash={:?} rows_read_agg={aggregate_rows} rows_read_join={} repeated_keys={repeated_keys} agg_ms={} join_ms={}",
-                    spec.files.len(),
-                    spec.hash,
-                    rows_read.load(Ordering::Relaxed) - aggregate_rows,
-                    aggregate_elapsed.as_millis(),
-                    chunk_started
-                        .elapsed()
-                        .saturating_sub(aggregate_elapsed)
-                        .as_millis()
-                );
             }
         }
         // Every row of a split cluster falls in exactly one of its key ranges; a

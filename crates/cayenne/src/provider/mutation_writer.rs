@@ -73,7 +73,6 @@ use arrow_schema::SchemaRef;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_physical_plan::{SendableRecordBatchStream, execute_stream};
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::Mutex as ParkingMutex;
@@ -82,13 +81,9 @@ use tokio::sync::OwnedMutexGuard;
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
-use super::key_conflicts::ConflictPolicy;
+use super::key_conflicts::Survivor;
 use super::mem_tier_budget;
-use super::on_conflict::PreparedOnConflictDeletionPublish;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
-use super::overwrite_layers::{
-    CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter, MAX_LAYER_ROWS, Survivor,
-};
 use super::pk_index::PkDigestSet;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
@@ -1164,43 +1159,15 @@ impl<'a> AppendMutationWriter<'a> {
         } else {
             (data, true)
         };
-        if streaming && let Some(resolver) = self.table.key_resolver()? {
-            if super::overwrite_postpass::enabled()
-                && self.table.metadata().partition_column.is_none()
-            {
-                return self.write_resolving_repeats_after(data, resolver).await;
-            }
-            let reservation =
-                MemoryConsumer::new(format!("CayenneAppendKeys[{}]", self.table.table_name()))
-                    .register(self.task_context.memory_pool());
-            if resolver.policy() == ConflictPolicy::KeepFirst {
-                let data = Box::pin(FirstCopyFilter::new(data, resolver, reservation));
-                let prepared = self.table.prepare_stream_for_insert(data).await?;
-                let post_validation = prepared.post_validation();
-                let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
-                return self
-                    .write_prepared_stream(
-                        prepared.stream,
-                        post_validation,
-                        pending_pk_deletions,
-                        may_have_on_conflict_deletions,
-                    )
-                    .await;
-            }
-            let window_reservation = reservation.new_empty();
-            let splitter =
-                LayerSplitter::for_append(Arc::new(resolver), MAX_LAYER_ROWS, reservation);
-            return self
-                .write_layered_append(LayerSource::new(
-                    data,
-                    splitter,
-                    Some(CollapseWindow::new(
-                        self.table.collapse_window_bytes,
-                        Survivor::Latest,
-                        window_reservation,
-                    )),
-                ))
-                .await;
+        // A streaming append resolves the keys it repeats after the write; a
+        // table with a partition column (a catalog table, written only by user
+        // statements, which resolve nothing) keeps the validation that rejects
+        // a key repeated across batches.
+        if streaming
+            && self.table.metadata().partition_column.is_none()
+            && let Some(resolver) = self.table.key_resolver()?
+        {
+            return self.write_resolving_repeats_after(data, resolver).await;
         }
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         let post_validation = prepared.post_validation();
@@ -1246,7 +1213,7 @@ impl<'a> AppendMutationWriter<'a> {
         let post_validation = prepared.post_validation();
 
         let snapshot_id = uuid::Uuid::now_v7().to_string();
-        let write = super::overwrite::LayerWrite {
+        let write = super::overwrite::WriteShape {
             target_size_bytes: self.context.target_file_size_bytes(),
             target_partitions: self.task_context.session_config().target_partitions(),
             write_policy: crate::provider::delta_encoding::WritePolicy::DELTA,
@@ -1366,135 +1333,6 @@ impl<'a> AppendMutationWriter<'a> {
         } else {
             let record_seq = self.table.sequence_high_water().await;
             self.table.record_file_pk_keys(&validated_keys, record_seq);
-        }
-        Ok(rows)
-    }
-
-    /// Stage each layer privately, then commit and publish every layer together.
-    async fn write_layered_append(&self, mut source: LayerSource) -> Result<u64> {
-        let mut staged: Vec<PreparedOnConflictDeletionPublish> = Vec::new();
-        let mut snapshot_ids = Vec::new();
-        let stats = Arc::new(ColumnStatsAccumulator::new(&self.table.table_schema()));
-        let mut rows = 0_u64;
-        let mut superseded = 0_usize;
-
-        let stage_result: Result<()> = async {
-            while let Some(stream) = source.next_layer() {
-                let prepared = self.table.prepare_stream_for_insert(stream).await?;
-                let post_validation = prepared.post_validation();
-                let snapshot_id = uuid::Uuid::now_v7().to_string();
-                snapshot_ids.push(snapshot_id.clone());
-                let (layer_rows, _, layer_stats) = self
-                    .table
-                    .write_to_snapshot(
-                        prepared.stream,
-                        self.context.target_file_size_bytes(),
-                        &snapshot_id,
-                        self.task_context.session_config().target_partitions(),
-                        None,
-                        crate::provider::delta_encoding::WritePolicy::DELTA,
-                    )
-                    .await?;
-                if layer_rows == 0 {
-                    break;
-                }
-                self.table.sync_local_snapshot_dir(&snapshot_id).await?;
-                stats.merge_from(&layer_stats);
-                rows = rows.saturating_add(layer_rows);
-                let PostValidationState {
-                    on_conflict_deletions,
-                    validated_keys,
-                } = take_post_validation(&post_validation);
-                superseded = superseded.saturating_add(on_conflict_deletions.total_superseded());
-                let mut publish = self
-                    .table
-                    .prepare_on_conflict_deletions_for_staged_snapshot(
-                        on_conflict_deletions,
-                        snapshot_id,
-                        true,
-                    )
-                    .await?;
-                publish.publish_as_protected_snapshot = true;
-                // The next layer validates against these staged keys as file rows.
-                self.table
-                    .record_file_pk_keys(&validated_keys, publish.snapshot_sequence());
-                staged.push(publish);
-            }
-            Ok(())
-        }
-        .await;
-
-        if let Err(error) = stage_result {
-            self.table.clear_cached_pk_keyset();
-            drop(staged);
-            self.cleanup_layered_append_dirs(&snapshot_ids).await;
-            return Err(error);
-        }
-        if staged.is_empty() {
-            self.cleanup_layered_append_dirs(&snapshot_ids).await;
-            return Ok(0);
-        }
-
-        // Hold both locks across the durable commit and process-local publish,
-        // so a scan cannot observe a subset of the committed layers.
-        let _visibility = self.table.visibility_lock_arc().lock_owned().await;
-        let _fence = self.table.lock_listing_fence_write_owned().await;
-        let reserved_delta = self.table.reserve_live_rows_delta();
-        let commit_result: Result<()> = async {
-            let catalog = self
-                .table
-                .catalog()
-                .as_any()
-                .downcast_ref::<crate::CayenneCatalog>()
-                .ok_or_else(|| super::Error::Internal {
-                    table: self.table.table_name().to_string(),
-                    message: "layered append requires a Cayenne catalog".to_string(),
-                })?;
-            let mut txn = catalog.begin_transaction().await?;
-            for publish in &mut staged {
-                if let Err(error) = catalog
-                    .apply_prepared_on_conflict_in_txn(txn.as_mut(), publish)
-                    .await
-                {
-                    let _ = txn.rollback().await;
-                    return Err(error.into());
-                }
-            }
-            txn.commit().await?;
-            Ok(())
-        }
-        .await;
-        if let Err(error) = commit_result {
-            self.table.clear_cached_pk_keyset();
-            drop(staged);
-            self.cleanup_layered_append_dirs(&snapshot_ids).await;
-            return Err(error);
-        }
-
-        let layer_count = staged.len();
-        for publish in &mut staged {
-            publish.mark_catalog_committed();
-        }
-        for publish in staged {
-            self.table.publish_prepared_on_conflict_deletions(publish);
-        }
-        self.table.feed_staged_ivm_under_fence(None);
-        let published_delta = reserved_delta.published();
-        if layer_count > 1 {
-            self.table.taint_persisted_row_count_exactness().await;
-        }
-        let live_rows_delta = i64::try_from(rows)
-            .unwrap_or(i64::MAX)
-            .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
-        self.table.schedule_post_write_maintenance(
-            Some(stats),
-            true,
-            self.table.has_retention_delete_filters(),
-            live_rows_delta,
-            published_delta,
-        );
-        if self.table.has_retention_delete_filters() {
-            self.table.clear_cached_pk_keyset();
         }
         Ok(rows)
     }

@@ -69,14 +69,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion_execution::memory_pool::MemoryConsumer;
 use futures::StreamExt;
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
+use super::key_conflicts::Survivor;
 use super::mutation_writer::InlineBatchBuffer;
-use super::overwrite_layers::{CollapseWindow, LayerSource, LayerSplitter, Survivor};
 use super::table::{
     CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, OverwriteRouting,
     RangePartitioning, serialize_batches_to_ipc,
@@ -113,7 +112,7 @@ pub struct PreparedOverwrite {
     _inline_admission: Option<OwnedSemaphorePermit>,
     /// Position deletion vectors hiding the copies of keys the incoming data
     /// repeated across record batches, on a table that deletes by position; see
-    /// [`super::overwrite_layers`].
+    /// [`super::overwrite_postpass`].
     delete_files: Vec<DeleteFile>,
     /// The file-local positions `delete_files` hide, per data file.
     position_deletions: HashMap<String, Vec<u32>>,
@@ -671,21 +670,15 @@ impl CayenneTableProvider {
         // `warm_inlined_cache_for_overwrite`.
         self.warm_inlined_cache_for_overwrite().await;
 
-        // Resolve the keys the incoming data repeats: the last copy wins under the
-        // upsert policies, the first under `drop`. A later copy is written to a
-        // higher layer, and the layers after the main snapshot are written below;
-        // see `overwrite_layers`. The map of admitted keys is bounded by the
-        // memory pool and spills to the runtime's spill directory.
-        let reservation =
-            MemoryConsumer::new(format!("CayenneOverwriteKeys[{}]", self.table_name()))
-                .register(&self.runtime_env().memory_pool);
-        let mut layer_source = None;
-        // Resolved after the write instead (`overwrite_postpass`): the survivor
-        // the policy keeps, and the key columns the query groups by.
+        // Resolve the keys the incoming data repeats after writing it
+        // (`overwrite_postpass`): each batch resolves its own repeats and stamps
+        // its rows with its arrival sequence, and once the files are written a
+        // query finds every copy other than the one the policy keeps — the last
+        // under the upsert policies, the first under `drop`.
         let mut postpass: Option<(Survivor, Vec<String>)> = None;
         let data: SendableRecordBatchStream = match self.key_resolver()? {
             None => data,
-            Some(resolver) if super::overwrite_postpass::enabled() => {
+            Some(resolver) => {
                 let indices = self.primary_key_indices()?.unwrap_or_default();
                 postpass = Some((
                     Survivor::for_policy(resolver.policy()),
@@ -694,35 +687,6 @@ impl CayenneTableProvider {
                 Box::pin(super::overwrite_postpass::ArrivalStream::new(
                     data, resolver,
                 ))
-            }
-            Some(resolver) => {
-                // Under `drop` the splitter drops a later copy as it admits it, so
-                // only the upsert policies need a window to keep a repeat from
-                // opening a layer.
-                let survivor = Survivor::for_policy(resolver.policy());
-                let window = (survivor == Survivor::Latest).then(|| {
-                    CollapseWindow::new(
-                        self.collapse_window_bytes,
-                        survivor,
-                        reservation.new_empty(),
-                    )
-                });
-                // A refresh usually holds about the keys of the table it replaces;
-                // the pool caps the size.
-                let expected_keys = self
-                    .optimizer_table_statistics()
-                    .and_then(|stats| stats.num_rows.get_value().copied())
-                    .unwrap_or(0);
-                let splitter = LayerSplitter::new(
-                    Arc::new(resolver),
-                    reservation,
-                    Arc::clone(&self.runtime_env().disk_manager),
-                )
-                .with_expected_keys(expected_keys);
-                let mut source = LayerSource::new(data, splitter, window);
-                let main = self.first_layer(&mut source)?;
-                layer_source = Some(source);
-                main
             }
         };
 
@@ -748,31 +712,21 @@ impl CayenneTableProvider {
         // so the index is complete when the write is — no second pass over the
         // finished files, and nothing to rebuild after the flip.
         let lookup_index_observer = self.begin_lookup_index_build(&new_snapshot_id);
-        // A table that deletes by key folds the copies the later layers supersede
-        // out of the snapshot before publishing it, which rewrites the files that
-        // hold them; recording each file's statistics as it is written is what
-        // keeps the table's statistics exact over the files that survive.
-        let file_stats = ((layer_source.is_some() || postpass.is_some())
-            && !self.should_capture_positions())
-        .then(|| {
+        // A table that deletes by key folds the superseded copies out of the
+        // snapshot before publishing it, which rewrites the files that hold them;
+        // recording each file's statistics as it is written is what keeps the
+        // table's statistics exact over the files that survive.
+        let file_stats = (postpass.is_some() && !self.should_capture_positions()).then(|| {
             Arc::new(FileStatsObserver::new(
                 self.table_schema(),
                 lookup_index_observer.as_ref().map(Arc::clone),
             ))
         });
-        // Every layer is written into the main snapshot, so its writes feed the
-        // same observer.
         let write_observer = match &file_stats {
             Some(stats) => {
                 Some(Arc::clone(stats) as Arc<dyn vortex_datafusion::VortexWriteObserver>)
             }
             None => lookup_index_observer,
-        };
-        // A layered write locates every row it admits, so a later copy finds the
-        // earlier one's position.
-        let write_observer = match &layer_source {
-            Some(source) => Some(source.observer(write_observer)),
-            None => write_observer,
         };
         // Overwrite replaces the entire table, and anything that reached here did
         // not fit the inline caps, so it is large by definition; shard across the
@@ -825,14 +779,13 @@ impl CayenneTableProvider {
             }
         };
 
-        // The later layers join the main snapshot, and the write observer has
-        // located every copy they supersede by the time its key is admitted
-        // again, so the refresh publishes one snapshot. A table that deletes by position hides those
-        // copies with position deletes; one that deletes by key rewrites the files
-        // holding them without them, so it publishes no deletes at all. Both are
-        // done before the manifest below, which must list the final files.
-        let (later_rows, position_deletions, write_stats_acc) = match layer_source.take() {
-            None if let Some((survivor, key_columns)) = postpass.take() => {
+        // Hide the copies the refresh repeated before the manifest below, which
+        // must list the final files: a table that deletes by position hides them
+        // with position deletes, one that deletes by key rewrites the files that
+        // hold them without them and so publishes no deletes at all.
+        let (position_deletions, write_stats_acc) = match postpass.take() {
+            None => (HashMap::new(), write_stats_acc),
+            Some((survivor, key_columns)) => {
                 let resolved: Result<_> = async {
                     let superseded = self
                         .find_superseded_by_arrival(
@@ -848,7 +801,7 @@ impl CayenneTableProvider {
                                 .fold_superseded_copies(
                                     &new_snapshot_id,
                                     &superseded,
-                                    LayerWrite {
+                                    WriteShape {
                                         target_size_bytes,
                                         target_partitions,
                                         write_policy,
@@ -857,7 +810,9 @@ impl CayenneTableProvider {
                                     &write_stats_acc,
                                 )
                                 .await?;
-                            // The index build observed the files the fold removed.
+                            // The index build observed the files the fold removed, so
+                            // it cannot describe the snapshot; the published
+                            // snapshot's index is built from its files instead.
                             self.discard_lookup_index_build();
                             Ok((HashMap::new(), stats))
                         }
@@ -866,43 +821,13 @@ impl CayenneTableProvider {
                 }
                 .await;
                 match resolved {
-                    Ok((position_deletions, stats)) => (0, position_deletions, stats),
+                    Ok(resolved) => resolved,
                     Err(error) => {
                         self.abandon_overwrite_snapshot(&new_snapshot_id).await;
                         return Err(error);
                     }
                 }
             }
-            None => (0, HashMap::new(), write_stats_acc),
-            Some(mut source) => match self
-                .write_later_layers(
-                    &mut source,
-                    &new_snapshot_id,
-                    LayerWrite {
-                        target_size_bytes,
-                        target_partitions,
-                        write_policy,
-                    },
-                    write_observer,
-                    write_stats_acc,
-                    file_stats.as_deref(),
-                )
-                .await
-            {
-                Ok(later) => {
-                    if later.folded {
-                        // The index build observed the files the fold removed, so
-                        // it cannot describe the snapshot; the published snapshot's
-                        // index is built from its files instead.
-                        self.discard_lookup_index_build();
-                    }
-                    (later.rows, later.position_deletions, later.stats)
-                }
-                Err(error) => {
-                    self.abandon_overwrite_snapshot(&new_snapshot_id).await;
-                    return Err(error);
-                }
-            },
         };
 
         // Manifest snapshot model: reserve ONE sequence `S` for this overwrite
@@ -969,7 +894,7 @@ impl CayenneTableProvider {
             write_guard: Some(write_guard),
             checkpoint_guard: Some(checkpoint_guard),
             new_snapshot_id,
-            row_count: row_count.saturating_add(later_rows),
+            row_count,
             write_stats_acc,
             inlined: None,
             _inline_admission: None,
@@ -978,47 +903,30 @@ impl CayenneTableProvider {
         })
     }
 
-    /// The first layer of `source`, which every input has, even an empty one.
-    fn first_layer(&self, source: &mut LayerSource) -> Result<SendableRecordBatchStream> {
-        source.next_layer().ok_or_else(|| super::Error::Internal {
-            table: self.table_name().to_string(),
-            message: "a layered write's input yielded no first layer".to_string(),
-        })
-    }
-
-    /// Write every layer of `source` after the first into `snapshot_id`, which
-    /// already holds the first, and locate the copies they supersede. With
-    /// `fold` — the statistics of every file written so far — the copies are
-    /// folded out of the files ([`Self::fold_superseded_copies`]); without it
-    /// they are returned for position deletes to hide.
-    async fn write_later_layers(
+    /// Write position deletion vectors for `position_deletions`, at a fresh
+    /// sequence, for an overwrite to commit with its snapshot.
+    async fn write_position_deletion_vectors(
         &self,
-        source: &mut LayerSource,
-        snapshot_id: &str,
-        write: LayerWrite,
-        observer: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
-        stats: Arc<ColumnStatsAccumulator>,
-        fold: Option<&FileStatsObserver>,
-    ) -> Result<LaterLayers> {
-        let (rows, superseded) = self
-            .write_overwrite_layers_in_place(source, snapshot_id, write, observer, &stats)
-            .await?;
-        match fold {
-            Some(file_stats) if !superseded.is_empty() => Ok(LaterLayers {
-                rows,
-                stats: self
-                    .fold_superseded_copies(snapshot_id, &superseded, write, file_stats, &stats)
-                    .await?,
-                position_deletions: HashMap::new(),
-                folded: true,
-            }),
-            _ => Ok(LaterLayers {
-                rows,
-                stats,
-                position_deletions: superseded,
-                folded: false,
-            }),
-        }
+        position_deletions: &HashMap<String, Vec<u32>>,
+    ) -> Result<Vec<crate::metadata::DeleteFile>> {
+        let sequence = self.reserve_sequences_local(1).await?;
+        let mut metadata = self.metadata().clone();
+        metadata.current_sequence_number = sequence;
+        let specs = position_deletions
+            .iter()
+            .map(|(file, rows)| {
+                super::delete::DeletionVectorWriteSpec::new_position_based_sorted(
+                    file.clone(),
+                    rows.iter().map(|&row| u64::from(row)).collect(),
+                )
+            })
+            .collect();
+        Ok(super::delete::DeletionVectorWriter::new(&metadata)
+            .write(specs)
+            .await?
+            .into_iter()
+            .map(|written| written.delete_file)
+            .collect())
     }
 
     /// Remove an unpublished snapshot's local directory, best-effort: a
@@ -1059,7 +967,7 @@ impl CayenneTableProvider {
         &self,
         snapshot_id: &str,
         superseded: &HashMap<String, Vec<u32>>,
-        write: LayerWrite,
+        write: WriteShape,
         file_stats: &FileStatsObserver,
         written: &ColumnStatsAccumulator,
     ) -> Result<Arc<ColumnStatsAccumulator>> {
@@ -1131,98 +1039,14 @@ impl CayenneTableProvider {
         }
         Ok(Arc::new(folded))
     }
-
-    /// Write every layer after the main snapshot into the main snapshot itself, one
-    /// after another, and return the rows they wrote and the file-local positions
-    /// of the copies they supersede, per data file.
-    ///
-    /// The layers order the copies of a key — a batch repeating a key of the
-    /// current layer starts the next one, and a layer is written only once the
-    /// one before it is — and every layer's write reports to `observer`, which
-    /// must be the source's (see [`LayerSource::observer`]), so each superseded
-    /// copy's position is known by the time its key is admitted again.
-    async fn write_overwrite_layers_in_place(
-        &self,
-        source: &mut LayerSource,
-        snapshot_id: &str,
-        write: LayerWrite,
-        observer: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
-        write_stats_acc: &ColumnStatsAccumulator,
-    ) -> Result<(u64, HashMap<String, Vec<u32>>)> {
-        let mut rows: u64 = 0;
-        loop {
-            // Between layers every admitted key is located, so the map can spill.
-            source.spill_if_pending().await?;
-            let Some(stream) = source.next_layer() else {
-                break;
-            };
-            let (layer_rows, _files, layer_stats) = self
-                .write_to_snapshot_range_partitioned(
-                    stream,
-                    write.target_size_bytes,
-                    snapshot_id,
-                    write.target_partitions,
-                    None,
-                    write.write_policy,
-                    Some(RangePartitioning::hashed_run_sorted()),
-                    observer.as_ref().map(Arc::clone),
-                )
-                .await?;
-            write_stats_acc.merge_from(&layer_stats);
-            rows = rows.saturating_add(layer_rows);
-        }
-        self.sync_local_snapshot_dir(snapshot_id)
-            .await
-            .map_err(|source| super::Error::Catalog { source })?;
-        let superseded = source.take_superseded().await?;
-        Ok((rows, superseded))
-    }
-
-    /// Write position deletion vectors for `position_deletions`, at a fresh
-    /// sequence, for an overwrite to commit with its snapshot.
-    async fn write_position_deletion_vectors(
-        &self,
-        position_deletions: &HashMap<String, Vec<u32>>,
-    ) -> Result<Vec<crate::metadata::DeleteFile>> {
-        let sequence = self.reserve_sequences_local(1).await?;
-        let mut metadata = self.metadata().clone();
-        metadata.current_sequence_number = sequence;
-        let specs = position_deletions
-            .iter()
-            .map(|(file, rows)| {
-                super::delete::DeletionVectorWriteSpec::new_position_based_sorted(
-                    file.clone(),
-                    rows.iter().map(|&row| u64::from(row)).collect(),
-                )
-            })
-            .collect();
-        Ok(super::delete::DeletionVectorWriter::new(&metadata)
-            .write(specs)
-            .await?
-            .into_iter()
-            .map(|written| written.delete_file)
-            .collect())
-    }
 }
 
-/// How a layered write writes each layer after the first.
+/// How a write that rewrites files of an unpublished snapshot shapes them.
 #[derive(Clone, Copy)]
-pub(crate) struct LayerWrite {
+pub(crate) struct WriteShape {
     pub(crate) target_size_bytes: usize,
     pub(crate) target_partitions: usize,
     pub(crate) write_policy: super::delta_encoding::WritePolicy,
-}
-
-/// What [`CayenneTableProvider::write_later_layers`] wrote.
-struct LaterLayers {
-    /// Rows the later layers wrote, before any fold.
-    rows: u64,
-    /// Statistics of every row the snapshot holds.
-    stats: Arc<ColumnStatsAccumulator>,
-    /// Superseded copies left for position deletes to hide; empty after a fold.
-    position_deletions: HashMap<String, Vec<u32>>,
-    /// Whether the superseded copies were folded out of the files.
-    folded: bool,
 }
 
 /// Records the statistics of each file a write produces, by file name, and

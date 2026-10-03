@@ -1328,7 +1328,7 @@ impl CayenneTableProvider {
                     self.table_name()
                 ))
                 .register(&self.runtime_env().memory_pool);
-                Box::pin(super::overwrite_layers::CollapseStream::new(
+                Box::pin(super::collapse_window::CollapseStream::new(
                     data,
                     resolver,
                     self.collapse_window_bytes,

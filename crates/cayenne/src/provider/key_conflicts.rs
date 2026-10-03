@@ -97,6 +97,23 @@ impl ConflictPolicy {
     }
 }
 
+/// Which copy of a repeated key a write keeps: the last (the upsert policies)
+/// or the first (`drop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Survivor {
+    Latest,
+    Earliest,
+}
+
+impl Survivor {
+    pub(crate) fn for_policy(policy: ConflictPolicy) -> Self {
+        match policy {
+            ConflictPolicy::KeepFirst => Self::Earliest,
+            ConflictPolicy::UpsertDropIdentical | ConflictPolicy::UpsertKeepLast => Self::Latest,
+        }
+    }
+}
+
 /// A batch with its repeated keys resolved.
 #[derive(Debug)]
 pub(crate) struct ResolvedBatch {
@@ -175,10 +192,6 @@ impl KeyResolver {
             rows: None,
             ..self
         }
-    }
-
-    pub(crate) fn table_name(&self) -> &str {
-        &self.table_name
     }
 
     pub(crate) fn policy(&self) -> ConflictPolicy {

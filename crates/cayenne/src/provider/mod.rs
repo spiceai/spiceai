@@ -73,6 +73,7 @@ limitations under the License.
 //!   coordinator (feature-gated).
 pub(crate) mod clustering;
 pub(crate) mod cold_partition;
+pub(crate) mod collapse_window;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod compaction_writer;
@@ -99,7 +100,6 @@ pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
-pub(crate) mod overwrite_layers;
 pub(crate) mod overwrite_postpass;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;

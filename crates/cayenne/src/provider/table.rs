@@ -1875,7 +1875,7 @@ pub struct CayenneTableProvider {
     resolves_repeated_keys: bool,
     /// Bytes of input a streaming write that resolves repeated keys collapses in
     /// memory at a time, before it splits them into layers or, for a partition's
-    /// append, writes them; see [`super::overwrite_layers::CollapseWindow`].
+    /// append, writes them; see [`super::collapse_window::CollapseWindow`].
     pub(crate) collapse_window_bytes: usize,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
@@ -5989,7 +5989,7 @@ impl CayenneTableProvider {
         self.clear_all_deletion_caches();
         // The position deletes that hide the copies of keys the overwrite's
         // incoming data repeated, which its catalog transaction wrote after
-        // clearing the previous ones; see `write_overwrite_layers_in_place`.
+        // clearing the previous ones; see `overwrite_postpass`.
         if let Some(position_deletions) = position_deletions {
             self.pk_deletion_strategy
                 .position_cache()
@@ -9178,7 +9178,7 @@ impl CayenneTableProvider {
             scan_view_reuse,
             upsert_dedup,
             resolves_repeated_keys: true,
-            collapse_window_bytes: super::overwrite_layers::COLLAPSE_WINDOW_BYTES,
+            collapse_window_bytes: super::collapse_window::COLLAPSE_WINDOW_BYTES,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -70457,6 +70457,6 @@ mod tests {
         );
     }
 
-    mod layered_overwrite;
     mod layered_upsert_state;
+    mod repeated_keys;
 }
