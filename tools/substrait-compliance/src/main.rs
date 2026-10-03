@@ -400,7 +400,7 @@ mod tests {
             .err()
             .expect("missing expected dir");
         assert!(
-            matches!(err, crate::error::Error::MissingExpectedDir { ref path: p } if *p == path),
+            matches!(err, crate::error::Error::MissingExpectedDir { path: ref p } if *p == path),
             "{err}"
         );
     }
