@@ -114,6 +114,7 @@ result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
+tpcdsgen = { workspace = true }
 tpchgen = { workspace = true }
 vortex-io = { workspace = true }
 # Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
@@ -513,6 +514,14 @@ name = "pk_keyset_present_path"
 [[bench]]
 harness = false
 name = "scan_view_reuse_qps"
+
+# Turso 0.7.2 → 0.8.1 on-disk open. The fixtures were written by
+# `tools/turso-072-fixture-gen` (excluded from the workspace so cargo does not
+# unify `turso` to 0.8.1). Required feature: the test talks to the Turso crate.
+[[test]]
+name = "turso_0_7_2_open_compat_test"
+path = "tests/turso_0_7_2_open_compat_test.rs"
+required-features = ["turso"]
 
 # Result *correctness* (not perf): inventory completeness + pure compare path.
 [[test]]
