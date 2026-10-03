@@ -737,6 +737,49 @@ fn a_run_of_another_encoding_is_not_published() {
     assert_eq!(found, vec![("own".to_string(), 0)]);
 }
 
+/// Each live file is covered by one run, so a lookup returns each of its rows
+/// once. A run over a file another live run already covers (a write's run and
+/// a read-back of the same file, both finishing) is not published, whether
+/// that run was published before or alongside it; a run with any such file is
+/// refused whole, so its other files stay uncovered and are read in full.
+#[test]
+fn a_file_is_covered_by_one_run_only() {
+    let candidates = |index: &TieredIndex, key: i64| {
+        let mut found = Vec::new();
+        index.candidates(&encoded(key), |candidate| {
+            found.push((candidate.file.to_string(), candidate.position));
+        });
+        found
+    };
+    let one = vec![("same".to_string(), 0)];
+
+    let index = TieredIndex::new(encoder());
+    index.publish(vec![run_of("same", &[11])], &[]);
+    index.publish(vec![run_of("same", &[11])], &[]);
+    assert_eq!(candidates(&index, 11), one, "published one after the other");
+    assert_eq!(index.view().runs(), 1);
+
+    let index = TieredIndex::new(encoder());
+    index.publish(vec![run_of("same", &[11]), run_of("same", &[11])], &[]);
+    assert_eq!(candidates(&index, 11), one, "published together");
+
+    let index = TieredIndex::new(encoder());
+    index.publish(vec![run_of("same", &[11])], &[]);
+    let mut overlapping = RunBuilder::new(encoder());
+    overlapping
+        .add_batch("same", 0, &column(&[11]))
+        .expect("add");
+    overlapping
+        .add_batch("other", 0, &column(&[12]))
+        .expect("add");
+    index.publish(vec![overlapping.finish().expect("finish")], &[]);
+    assert_eq!(candidates(&index, 11), one, "a partly overlapping run");
+    assert!(
+        !index.view().covers("other"),
+        "a refused run's other files stay uncovered"
+    );
+}
+
 mod persist {
     use std::collections::BTreeMap;
 

@@ -1282,9 +1282,12 @@ impl TieredIndex {
     /// Publishes `add` in one swap: each published file's state becomes
     /// `retire(file, state)`, dropping a published run none of whose files
     /// stays live, and each new file starts in `initial(file)`. A new run is
-    /// added when `admit` accepts its files' states and it holds this index's
-    /// words ([`IndexRun::encoding`]): a run of another encoding is dropped and
-    /// its files stay uncovered, so they are read in full.
+    /// added when `admit` accepts its files' states, it holds this index's
+    /// words ([`IndexRun::encoding`]), and none of its files is already
+    /// covered by a live run (including one added before it in `add`): each
+    /// live file is covered by one run, so a lookup returns each of its rows
+    /// once. A run that fails either is dropped whole, and those of its files
+    /// no other run covers are read in full.
     fn publish_runs(
         &self,
         add: Vec<IndexRun>,
@@ -1296,12 +1299,37 @@ impl TieredIndex {
         let current = self.layers.load_full();
         let (mut runs, _) = transition_runs(&current.runs, retire);
         let encoding = self.encoder.word_identity();
+        let mut covered: HashSet<Arc<str>> = runs
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .run
+                    .files
+                    .iter()
+                    .zip(entry.files.iter())
+                    .filter(|&(_, state)| state.is_live())
+                    .map(|(file, _)| Arc::clone(file))
+            })
+            .collect();
         let mut admitted: Vec<(IndexRun, Arc<[FileState]>)> = Vec::with_capacity(add.len());
         for run in add.into_iter().filter(|run| run.encoding == encoding) {
             let states: Arc<[FileState]> = run.files.iter().map(|file| initial(file)).collect();
-            if admit(&states) {
-                admitted.push((run, states));
+            let overlaps = run
+                .files
+                .iter()
+                .zip(states.iter())
+                .any(|(file, state)| state.is_live() && covered.contains(file));
+            if overlaps || !admit(&states) {
+                continue;
             }
+            covered.extend(
+                run.files
+                    .iter()
+                    .zip(states.iter())
+                    .filter(|&(_, state)| state.is_live())
+                    .map(|(file, _)| Arc::clone(file)),
+            );
+            admitted.push((run, states));
         }
         let (add, states): (Vec<IndexRun>, Vec<Arc<[FileState]>>) = admitted.into_iter().unzip();
         // Into the filter before the runs are visible, so no reader sees a
