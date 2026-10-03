@@ -111,6 +111,9 @@ pub(crate) struct VortexOpener {
     pub layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
     /// Shared full-file natural split ranges keyed by file path.
     pub natural_split_ranges: Arc<DashMap<Path, Arc<[Range<u64>]>>>,
+    /// Shared file-level pruning verdicts, keyed by file path. Only populated for a
+    /// static pruning predicate, whose verdict is a property of the file alone.
+    pub file_prune_verdicts: Arc<DashMap<Path, bool>>,
     /// Whether the query has output ordering specified
     pub has_output_ordering: bool,
 
@@ -173,6 +176,13 @@ impl FileOpener for VortexOpener {
 
         let expr_convertor = Arc::clone(&self.expression_convertor);
         let projection_pushdown = self.projection_pushdown;
+        let file_prune_verdicts = Arc::clone(&self.file_prune_verdicts);
+        // A dynamic predicate answers differently as build sides publish; a static one
+        // cannot, which is what lets its verdict be cached and its re-check dropped.
+        let pruning_predicate_is_dynamic = self
+            .file_pruning_predicate
+            .as_ref()
+            .is_some_and(is_dynamic_physical_expr);
         let runtime_access_plan_provider =
             self.runtime_access_plan_provider.as_ref().map(Arc::clone);
         let runtime_predicate = self.filter.as_ref().map(Arc::clone);
@@ -263,10 +273,40 @@ impl FileOpener for VortexOpener {
 
             // Check if this file should be pruned based on statistics/partition values.
             // Returns empty stream if file can be skipped entirely.
-            if let Some(file_pruner) = file_pruner.as_mut()
-                && file_pruner.should_prune()?
-            {
-                return Ok(stream::empty().boxed());
+            //
+            // A static predicate prunes on the file's statistics and partition values,
+            // both fixed when the plan was built, so the verdict belongs to the file and
+            // not to the split: decide it once and let every other split of the file read
+            // it. `FilePruner::should_prune` rebuilds a `PruningPredicate` from the
+            // expression on its first call and only then consults the statistics, and
+            // `FilePruner` is constructed per split, so its own memo - which is per
+            // instance - never gets a second call to serve.
+            //
+            // Nothing can change that verdict once the scan is running either, so the
+            // pruner is dropped rather than handed to `PrunableStream`, which would
+            // otherwise re-ask it on every poll for an answer fixed at plan time. A
+            // dynamic predicate keeps both: its generation rises when a build side
+            // publishes, and the stream ends early when it does.
+            if let Some(pruner) = file_pruner.as_mut() {
+                if pruning_predicate_is_dynamic {
+                    if pruner.should_prune()? {
+                        return Ok(stream::empty().boxed());
+                    }
+                } else {
+                    let pruned = match file_prune_verdicts.entry(file.object_meta.location.clone())
+                    {
+                        Entry::Occupied(entry) => *entry.get(),
+                        Entry::Vacant(entry) => {
+                            let pruned = pruner.should_prune()?;
+                            entry.insert(pruned);
+                            pruned
+                        }
+                    };
+                    if pruned {
+                        return Ok(stream::empty().boxed());
+                    }
+                    file_pruner = None;
+                }
             }
 
             let mut open_opts = session
@@ -965,6 +1005,9 @@ mod tests {
     use datafusion::physical_expr::planner::logical2physical;
     use datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
     use datafusion::scalar::ScalarValue;
+    use datafusion_common::ColumnStatistics;
+    use datafusion_common::Statistics;
+    use datafusion_common::stats::Precision;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions as df_expr;
     use datafusion_physical_expr::projection::ProjectionExpr;
@@ -1177,6 +1220,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1239,6 +1283,174 @@ mod tests {
         let num_batches = data.len();
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
         assert_eq!((num_batches, num_rows), (0, 0));
+
+        Ok(())
+    }
+
+    /// Builds a file-level `min`/`max` statistics pair for a single-column,
+    /// all-non-null `Int32` file, the shape [`FilePruner`] needs to decide a
+    /// static predicate without opening the file.
+    fn int32_column_stats(num_rows: usize, min: i32, max: i32) -> Statistics {
+        Statistics {
+            num_rows: Precision::Exact(num_rows),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                min_value: Precision::Exact(ScalarValue::Int32(Some(min))),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(max))),
+                ..ColumnStatistics::default()
+            }],
+        }
+    }
+
+    /// A static predicate's prune verdict is decided once per file and shared by
+    /// every split, keyed by the file's path in `file_prune_verdicts`.
+    ///
+    /// The two splits below carry deliberately contradictory statistics for the
+    /// same path. The first split's statistics correctly rule the predicate out,
+    /// so its verdict — prune — is cached. The second split's own statistics
+    /// would NOT rule the predicate out (its claimed range squarely satisfies
+    /// it): if the verdict were recomputed per split, this split would be
+    /// scanned. Instead it must reuse the first split's cached, file-level
+    /// verdict and also be skipped — the only way to tell the cache from a
+    /// coincidence is to make the two splits disagree.
+    #[tokio::test]
+    async fn static_predicate_prune_verdict_is_cached_per_file() -> anyhow::Result<()> {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "static_prune.vortex";
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)]))
+            .expect("test record batch should build");
+        let data_size =
+            write_arrow_to_vortex(object_store.clone(), file_path, batch.clone()).await?;
+
+        let table_schema = TableSchema::from_file_schema(batch.schema());
+        let predicate = logical2physical(&col("a").gt(lit(1000)), table_schema.table_schema());
+        assert!(
+            !is_dynamic_physical_expr(&predicate),
+            "this predicate must be static for the cached-verdict path to apply"
+        );
+
+        let mut opener = make_opener(object_store.clone(), table_schema, None);
+        opener.file_pruning_predicate = Some(predicate);
+
+        let first_split = PartitionedFile::new(file_path.to_string(), data_size)
+            .with_statistics(Arc::new(int32_column_stats(3, 1, 3)));
+        let rows_first: usize = opener
+            .open(first_split)
+            .expect("opener should open the first split")
+            .await
+            .expect("opening the first split should produce a stream")
+            .try_collect::<Vec<_>>()
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            rows_first, 0,
+            "the first split's own statistics rule the predicate out"
+        );
+        assert_eq!(
+            opener.file_prune_verdicts.len(),
+            1,
+            "a single verdict should be recorded for the file"
+        );
+
+        let second_split = PartitionedFile::new(file_path.to_string(), data_size)
+            .with_statistics(Arc::new(int32_column_stats(3, 5_000, 6_000)));
+        let rows_second: usize = opener
+            .open(second_split)
+            .expect("opener should open the second split")
+            .await
+            .expect("opening the second split should produce a stream")
+            .try_collect::<Vec<_>>()
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            rows_second, 0,
+            "the cached file verdict must apply even though this split's own statistics \
+             would not have pruned it"
+        );
+        assert_eq!(
+            opener.file_prune_verdicts.len(),
+            1,
+            "only one verdict should ever be recorded for the file"
+        );
+
+        Ok(())
+    }
+
+    /// A dynamic predicate's pruner is retained and re-asked on every poll, so a
+    /// build side publishing a narrower predicate mid-stream must end the stream
+    /// early — even though the file has rows left that an unpruned scan would
+    /// still return.
+    #[tokio::test]
+    async fn dynamic_predicate_update_mid_stream_prunes_remaining_rows() -> anyhow::Result<()> {
+        const ROWS: i32 = 20;
+
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "dynamic_prune.vortex";
+        let batch = record_batch!(("a", Int32, (0..ROWS).map(Some).collect::<Vec<_>>()))
+            .expect("test record batch should build");
+        let data_size =
+            write_arrow_to_vortex(object_store.clone(), file_path, batch.clone()).await?;
+
+        let table_schema = TableSchema::from_file_schema(batch.schema());
+
+        let column = Arc::new(df_expr::Column::new("a", 0)) as PhysicalExprRef;
+        let always_true =
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))) as PhysicalExprRef;
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            always_true,
+        ));
+        let predicate = Arc::clone(&dynamic_filter) as PhysicalExprRef;
+        assert!(
+            is_dynamic_physical_expr(&predicate),
+            "this predicate must be dynamic for the retained pruner to apply"
+        );
+
+        let mut opener = make_opener(object_store.clone(), table_schema, None);
+        opener.file_pruning_predicate = Some(predicate);
+        opener.batch_size = 2;
+
+        let file = PartitionedFile::new(file_path.to_string(), data_size)
+            .with_statistics(Arc::new(int32_column_stats(ROWS as usize, 0, ROWS - 1)));
+
+        let mut stream = opener
+            .open(file)
+            .expect("opener should open the file")
+            .await
+            .expect("opening the file should produce a stream");
+
+        let first = stream
+            .next()
+            .await
+            .expect("the stream should produce a first batch before any update")?;
+        assert_eq!(
+            first.num_rows(),
+            2,
+            "the small batch size should keep the first batch from draining the file"
+        );
+
+        // A build side publishes a predicate the file's statistics rule out entirely.
+        let never_matches = Arc::new(df_expr::BinaryExpr::new(
+            column,
+            Operator::Gt,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(1_000_000)))),
+        )) as PhysicalExprRef;
+        dynamic_filter
+            .update(never_matches)
+            .expect("dynamic filter update should succeed");
+
+        let next = stream.next().await;
+        assert!(
+            next.is_none(),
+            "the retained pruner should end the stream once the updated predicate rules out \
+             every remaining row, instead of running the {} rows still unread",
+            ROWS - 2
+        );
 
         Ok(())
     }
@@ -1744,6 +1956,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1835,6 +2048,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1994,6 +2208,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -2058,6 +2273,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -2306,6 +2522,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
