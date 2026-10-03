@@ -39,8 +39,8 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use arrow::array::{ArrayRef, AsArray, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow::compute::filter_record_batch;
@@ -152,12 +152,104 @@ fn debug() -> bool {
     *DEBUG
 }
 
-/// One step of the duplicate query: the files it reads, and the hash slice
-/// `(slices, slice)` of the key space it keeps from them.
+/// One step of the duplicate query: the files it reads, the hash slice
+/// `(slices, slice)` of the key space it keeps from them, and, when it covers
+/// a key sub-range of an integer key column, that range — pushed into the file
+/// scan, so zones outside it are never read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChunkSpec {
     files: Vec<u32>,
     hash: (u64, u64),
+    range: Option<KeyRange>,
+}
+
+/// An inclusive range `[lo, hi]` of an integer key column (by key position).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyRange {
+    column: usize,
+    lo: i128,
+    hi: i128,
+}
+
+/// Whether a cluster of files larger than a chunk is split into key
+/// sub-ranges (`SPICE_CAYENNE_REFRESH_DEDUP_SUBSPLIT=range`) rather than hash
+/// slices that each read the whole cluster. A prototype switch; integer key
+/// columns only.
+fn range_subsplit() -> bool {
+    static SUBSPLIT: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("SPICE_CAYENNE_REFRESH_DEDUP_SUBSPLIT").is_ok_and(|value| value == "range")
+    });
+    *SUBSPLIT
+}
+
+/// An integer key value as `i128`, or `None` for any other type.
+fn integer_value(value: &ScalarValue) -> Option<i128> {
+    Some(match value {
+        ScalarValue::Int8(Some(v)) => i128::from(*v),
+        ScalarValue::Int16(Some(v)) => i128::from(*v),
+        ScalarValue::Int32(Some(v)) => i128::from(*v),
+        ScalarValue::Int64(Some(v)) => i128::from(*v),
+        ScalarValue::UInt8(Some(v)) => i128::from(*v),
+        ScalarValue::UInt16(Some(v)) => i128::from(*v),
+        ScalarValue::UInt32(Some(v)) => i128::from(*v),
+        ScalarValue::UInt64(Some(v)) => i128::from(*v),
+        _ => return None,
+    })
+}
+
+/// `value` as a Vortex literal of the integer type `data_type`, or `None` when
+/// it does not fit or the type is not an integer.
+fn integer_literal(value: i128, data_type: &DataType) -> Option<vortex::expr::Expression> {
+    use vortex::expr::lit;
+    Some(match data_type {
+        DataType::Int8 => lit(i8::try_from(value).ok()?),
+        DataType::Int16 => lit(i16::try_from(value).ok()?),
+        DataType::Int32 => lit(i32::try_from(value).ok()?),
+        DataType::Int64 => lit(i64::try_from(value).ok()?),
+        DataType::UInt8 => lit(u8::try_from(value).ok()?),
+        DataType::UInt16 => lit(u16::try_from(value).ok()?),
+        DataType::UInt32 => lit(u32::try_from(value).ok()?),
+        DataType::UInt64 => lit(u64::try_from(value).ok()?),
+        _ => return None,
+    })
+}
+
+/// `files` split into `slices` equal-width sub-ranges of `column` between the
+/// smallest minimum and the largest maximum their bounds report, or `None`
+/// when the column is not an integer.
+fn range_slices(
+    files: &[u32],
+    bounds: &[(ScalarValue, ScalarValue)],
+    column: usize,
+    slices: u64,
+) -> Option<Vec<ChunkSpec>> {
+    let lo = files
+        .iter()
+        .map(|&f| integer_value(&bounds[f as usize].0))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min()?;
+    let hi = files
+        .iter()
+        .map(|&f| integer_value(&bounds[f as usize].1))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max()?;
+    let width = (hi - lo + 1).max(1);
+    let slices = i128::from(slices).min(width).max(1);
+    Some(
+        (0..slices)
+            .map(|slice| ChunkSpec {
+                files: files.to_vec(),
+                hash: (1, 0),
+                range: Some(KeyRange {
+                    column,
+                    lo: lo + width * slice / slices,
+                    hi: lo + width * (slice + 1) / slices - 1,
+                }),
+            })
+            .collect(),
+    )
 }
 
 /// The steps of the duplicate query, and what they read.
@@ -181,6 +273,7 @@ fn hash_plan(sizes: &[u64], chunks: u64) -> ChunkPlan {
             .map(|chunk| ChunkSpec {
                 files: files.clone(),
                 hash: (chunks, chunk),
+                range: None,
             })
             .collect(),
         column: None,
@@ -239,6 +332,8 @@ fn plan_chunks(
     sizes: &[u64],
     bounds: &[Option<Vec<(ScalarValue, ScalarValue)>>],
     chunks: u64,
+
+    subsplit_by_range: bool,
 ) -> ChunkPlan {
     let mut best = hash_plan(sizes, chunks);
     let total: u64 = sizes.iter().sum();
@@ -266,13 +361,25 @@ fn plan_chunks(
                 specs.push(ChunkSpec {
                     files: files.clone(),
                     hash: (slices, slice),
+                    range: None,
                 });
             }
         };
         for cluster in clusters {
             if bytes(&cluster) >= target {
                 flush(std::mem::take(&mut pending), &mut specs, &mut bytes_read);
-                flush(cluster, &mut specs, &mut bytes_read);
+                let size = bytes(&cluster);
+                let ranged = subsplit_by_range
+                    .then(|| range_slices(&cluster, per_file, column, size.div_ceil(target)))
+                    .flatten();
+                match ranged {
+                    // Each sub-range reads about its share of the cluster.
+                    Some(sub_ranges) => {
+                        bytes_read += size;
+                        specs.extend(sub_ranges);
+                    }
+                    None => flush(cluster, &mut specs, &mut bytes_read),
+                }
                 continue;
             }
             if bytes(&pending) + bytes(&cluster) > target {
@@ -401,6 +508,8 @@ struct ReadBack {
     stored: Arc<Field>,
     schema: SchemaRef,
     chunk: (u64, u64),
+    /// The key sub-range this step reads, pushed into each file's scan.
+    range: Option<KeyRange>,
     /// Rows read back before the chunk filter (diagnostics).
     rows_read: Arc<AtomicU64>,
 }
@@ -469,8 +578,30 @@ impl PartitionStream for ReadBack {
             stored: Arc::clone(&self.stored),
             schema: Arc::clone(&self.schema),
             chunk: self.chunk,
+            range: self.range,
             rows_read: Arc::clone(&self.rows_read),
         });
+        // `key >= lo AND key <= hi` on the stored column, so the scan prunes the
+        // zones outside the step's sub-range.
+        let range_filter = this.range.and_then(|range| {
+            let name = this.key_names.get(range.column)?;
+            let data_type = this.schema.field(range.column).data_type();
+            let column = get_item(name.as_str(), root());
+            Some(vortex::expr::and(
+                vortex::expr::gt_eq(column.clone(), integer_literal(range.lo, data_type)?),
+                vortex::expr::lt_eq(column, integer_literal(range.hi, data_type)?),
+            ))
+        });
+        if this.range.is_some() && range_filter.is_none() {
+            return Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&this.schema),
+                futures::stream::once(async {
+                    Err(datafusion_common::DataFusionError::Internal(
+                        "a key sub-range could not be expressed as a scan filter".to_string(),
+                    ))
+                }),
+            ));
+        }
         let projection = pack(
             this.key_names
                 .iter()
@@ -493,6 +624,7 @@ impl PartitionStream for ReadBack {
             .then(move |(file, path, row_range)| {
                 let this = Arc::clone(&this);
                 let projection = projection.clone();
+                let range_filter = range_filter.clone();
                 async move {
                     let session = VortexSession::default();
                     let vxf = session
@@ -505,6 +637,9 @@ impl PartitionStream for ReadBack {
                         .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
                     if let Some(row_range) = row_range {
                         scan = scan.with_row_range(row_range);
+                    }
+                    if let Some(filter) = range_filter {
+                        scan = scan.with_filter(filter);
                     }
                     let chunks = scan
                         .with_projection(projection)
@@ -549,7 +684,10 @@ impl CayenneTableProvider {
         store: &Arc<dyn ObjectStore>,
         files: &[super::lookup_index::IndexedFile],
         key_columns: &[String],
-    ) -> (Vec<Option<Vec<(ScalarValue, ScalarValue)>>>, Option<Vec<u64>>) {
+    ) -> (
+        Vec<Option<Vec<(ScalarValue, ScalarValue)>>>,
+        Option<Vec<u64>>,
+    ) {
         let table_schema = self.table_schema();
         let mut footers = Vec::with_capacity(files.len());
         for file in files {
@@ -713,7 +851,7 @@ impl CayenneTableProvider {
         // A chunk sized from the bytes written can still outgrow a small memory
         // pool; then the key space is cut finer and the query run again.
         let superseded = loop {
-            let plan = plan_chunks(&sizes, &bounds, chunks);
+            let plan = plan_chunks(&sizes, &bounds, chunks, range_subsplit());
             if debug() {
                 eprintln!(
                     "POSTPASS plan files={} total_bytes={total_bytes} target_chunks={chunks} specs={} column={:?} bytes_read={} amplification_pct={} bounds_ms={}",
@@ -842,6 +980,7 @@ impl DuplicateQuery<'_> {
                         stored: Arc::clone(self.stored),
                         schema: Arc::clone(schema),
                         chunk: spec.hash,
+                        range: spec.range,
                         rows_read: Arc::clone(&rows_read),
                     }) as Arc<dyn PartitionStream>
                 })
@@ -947,6 +1086,48 @@ pub(crate) fn key_column_names(schema: &Schema, indices: &[usize]) -> Vec<String
 
 #[cfg(test)]
 mod tests {
+
+    /// Integer sub-ranges tile the cluster's bounds exactly, so every key —
+    /// and with it every copy of the key — falls in exactly one step.
+    #[test]
+    fn range_slices_tile_the_cluster_bounds() {
+        let bounds = vec![
+            (ScalarValue::Int64(Some(-7)), ScalarValue::Int64(Some(40))),
+            (ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(92))),
+        ];
+        for slices in [1, 2, 3, 7, 200] {
+            let specs = range_slices(&[0, 1], &bounds, 0, slices).expect("integer bounds");
+            let ranges: Vec<(i128, i128)> = specs
+                .iter()
+                .map(|spec| spec.range.map(|r| (r.lo, r.hi)).expect("range"))
+                .collect();
+            assert_eq!(
+                ranges.first().map(|r| r.0),
+                Some(-7),
+                "{slices}: {ranges:?}"
+            );
+            assert_eq!(ranges.last().map(|r| r.1), Some(92), "{slices}: {ranges:?}");
+            for pair in ranges.windows(2) {
+                assert_eq!(pair[0].1 + 1, pair[1].0, "{slices}: {ranges:?}");
+            }
+            assert!(
+                ranges.iter().all(|(lo, hi)| lo <= hi),
+                "{slices}: {ranges:?}"
+            );
+        }
+        assert!(
+            range_slices(
+                &[0],
+                &[(
+                    ScalarValue::Utf8(Some("a".into())),
+                    ScalarValue::Utf8(Some("z".into()))
+                )],
+                0,
+                4
+            )
+            .is_none()
+        );
+    }
     use super::*;
 
     #[test]
@@ -986,7 +1167,7 @@ mod tests {
             (60, 69),
             (70, 79),
         ]))];
-        let plan = plan_chunks(&sizes, &bounds, 4);
+        let plan = plan_chunks(&sizes, &bounds, 4, false);
         assert_eq!(plan.column, Some(0));
         assert_eq!(plan.bytes_read, 800);
         assert_eq!(plan.specs.len(), 4);
@@ -997,10 +1178,30 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_integer_files_split_into_key_sub_ranges() {
+        let sizes = vec![100; 4];
+        let bounds = vec![Some(int_bounds(&[(0, 99), (0, 99), (0, 99), (0, 99)]))];
+        let plan = plan_chunks(&sizes, &bounds, 3, true);
+        assert_eq!(plan.bytes_read, 400, "each sub-range reads its share once");
+        assert_eq!(plan.specs.len(), 3);
+        assert!(
+            plan.specs
+                .iter()
+                .all(|spec| spec.files.len() == 4 && spec.hash == (1, 0))
+        );
+        let ranges: Vec<(i128, i128)> = plan
+            .specs
+            .iter()
+            .map(|spec| spec.range.map(|r| (r.lo, r.hi)).expect("range"))
+            .collect();
+        assert_eq!(ranges, vec![(0, 32), (33, 65), (66, 99)]);
+    }
+
+    #[test]
     fn overlapping_files_fall_back_to_hash_slices() {
         let sizes = vec![100; 4];
         let bounds = vec![Some(int_bounds(&[(0, 99), (0, 99), (0, 99), (0, 99)]))];
-        let plan = plan_chunks(&sizes, &bounds, 3);
+        let plan = plan_chunks(&sizes, &bounds, 3, false);
         assert_eq!(plan.bytes_read, 1200);
         assert_eq!(plan.specs.len(), 3);
         assert!(plan.specs.iter().all(|spec| spec.files.len() == 4));
@@ -1010,7 +1211,7 @@ mod tests {
 
     #[test]
     fn missing_bounds_hash_every_file() {
-        let plan = plan_chunks(&[100, 100], &[None], 2);
+        let plan = plan_chunks(&[100, 100], &[None], 2, false);
         assert_eq!(plan.column, None);
         assert_eq!(plan.bytes_read, 400);
     }

@@ -1285,7 +1285,7 @@ impl<'a> AppendMutationWriter<'a> {
             }
             let superseded = self
                 .table
-                .find_superseded_by_arrival(&snapshot_id, survivor, &key_columns)
+                .find_superseded_by_arrival(&snapshot_id, survivor, &key_columns, rows)
                 .await?;
             match file_stats.as_deref() {
                 Some(file_stats) if !superseded.is_empty() => {
