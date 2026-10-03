@@ -45,6 +45,7 @@ use spicepod::{
     component::{
         dataset::Dataset,
         snapshot::{BootstrapOnFailureBehavior, Snapshots},
+        view::View,
     },
     param::Params,
 };
@@ -834,6 +835,106 @@ async fn projected_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
             "Dataset '{modules}' reads snapshots of a dataset whose `refresh_sql` stores only some of its source's columns (SELECT id FROM {modules})"
         )),
         "the dataset is refused, naming the publisher's projection, got {status:?}"
+    );
+
+    load.abort();
+    reader.shutdown().await;
+    Ok(())
+}
+
+const VIEW_CATALOG: Rustfs = Rustfs {
+    name: "spice_test_rustfs_snapshot_source_view_catalog",
+    port: 19129,
+};
+
+/// A snapshot dataset restored into Cayenne joins the process's Cayenne catalog. An
+/// accelerated view in that catalog that does not restore snapshots cannot share it, which
+/// startup refuses for any other snapshot-restoring dataset, so the snapshot dataset is
+/// refused once its engine is known.
+#[tokio::test]
+async fn refuses_a_cayenne_snapshot_dataset_beside_a_cayenne_view_without_snapshots() -> Result<()>
+{
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    let modules = unique("modules");
+    let view = unique("module_ids");
+    test_request_context()
+        .scope(async {
+            let container = start_rustfs(VIEW_CATALOG).await?;
+            let result = view_catalog_scenario(VIEW_CATALOG, &modules, &view).await;
+            remove_local_copies(&[&modules, &view]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+async fn view_catalog_scenario(rustfs: Rustfs, modules: &str, view: &str) -> Result<()> {
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let modules_csv = dir.path().join("modules.csv");
+    std::fs::write(&modules_csv, INITIAL_CSV)?;
+    let writer = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_view_catalog_writer")
+                    .with_snapshots(writer_snapshots(rustfs, &prefix))
+                    .with_dataset(writer_dataset(modules, &modules_csv, "cayenne", dir.path()))
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&writer).await?;
+    wait_for_writer_snapshot(rustfs, &prefix, modules, 0).await?;
+    replicate_snapshots(rustfs, &prefix).await?;
+    writer.shutdown().await;
+
+    // Accelerated in the default Cayenne catalog, with snapshots left disabled.
+    let mut cayenne_view = View::new(view.to_string());
+    cayenne_view.sql = Some("SELECT 1 AS id".to_string());
+    cayenne_view.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Full),
+        ..Acceleration::default()
+    });
+    let reader = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_view_catalog_reader")
+                    .with_dataset(reader_dataset(rustfs, modules, &prefix))
+                    .with_view(cayenne_view)
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    let load = tokio::spawn(Arc::clone(&reader).load_components());
+
+    let table = datafusion::sql::TableReference::bare(modules);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut status = None;
+    while Instant::now() < deadline {
+        status = reader.status().get_dataset_status(&table);
+        let refused = status
+            .as_ref()
+            .and_then(ComponentStatus::error_message)
+            .is_some_and(|message| message.contains("shares the Cayenne catalog"));
+        if refused || matches!(status, Some(ComponentStatus::Ready)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let message = status
+        .as_ref()
+        .and_then(ComponentStatus::error_message)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        message.contains("shares the Cayenne catalog")
+            && message.contains(&format!("view '{view}'")),
+        "the snapshot dataset is refused, naming the view, got {status:?}"
     );
 
     load.abort();

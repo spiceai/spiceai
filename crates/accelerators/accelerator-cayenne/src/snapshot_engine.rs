@@ -1551,6 +1551,205 @@ mod tests {
         assert_eq!(rows, 50, "the archive restores the refreshed table");
     }
 
+    /// A reload extracts over the acceleration it replaces, so the data directory holds
+    /// the files the table is serving. Refusing the new archive must leave them in place:
+    /// the table keeps reading them until a snapshot is accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_reload_keeps_the_files_the_table_is_serving() {
+        use arrow::array::{Int64Array, RecordBatch};
+        use cayenne::CayenneTableProviderBuilder;
+        use datafusion::datasource::TableProvider;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use runtime_acceleration::snapshot::directory_archive::{
+            ExtractOptions, archive_directories_to_file_with_plan,
+            extract_archive_file_with_options,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let metadata_dir = tmp.path().join("writer").join("metadata");
+        let data_dir = tmp.path().join("writer").join("trips");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let catalog = fresh_catalog(&metadata_dir).await;
+        let ctx = SessionContext::new();
+        let table = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: "trips".to_string(),
+            schema: schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir.to_string_lossy().into_owned(),
+            partition_column: None,
+            vortex_config: cayenne::metadata::VortexConfig {
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                ..cayenne::metadata::VortexConfig::default()
+            },
+        })
+        .await
+        .expect("create table");
+        let write = |ids: Vec<i64>, op: InsertOp| {
+            let table = &table;
+            let ctx = &ctx;
+            async move {
+                let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(ids))])
+                    .expect("batch");
+                let input =
+                    MemorySourceConfig::try_new_exec(&[vec![batch]], schema(), None).expect("exec");
+                let plan = table
+                    .insert_into(&ctx.state(), input, op)
+                    .await
+                    .expect("plan");
+                collect(plan, ctx.task_ctx()).await.expect("write");
+            }
+        };
+        let writer = CayenneSnapshotEngine::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            "trips",
+            data_dir.clone(),
+        );
+        let writer_dirs = vec![
+            (metadata_dir.clone(), "metadata/".to_string()),
+            (data_dir.clone(), "data/".to_string()),
+        ];
+        let archive = |tar: PathBuf, plan: DirectorySnapshotPlan| {
+            let writer_dirs = writer_dirs.clone();
+            async move {
+                let skip: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
+                let extras: Vec<(String, Vec<u8>)> = plan
+                    .extra_entries
+                    .into_iter()
+                    .map(|e| (e.archive_path, e.bytes))
+                    .collect();
+                archive_directories_to_file_with_plan(&writer_dirs, &tar, &skip, &extras)
+                    .await
+                    .expect("archive");
+                tar
+            }
+        };
+
+        let reader_root = tmp.path().join("reader");
+        let reader_metadata = reader_root.join("metadata");
+        let reader_data = reader_root.join("trips");
+        std::fs::create_dir_all(&reader_metadata).expect("mkdir");
+        std::fs::create_dir_all(&reader_data).expect("mkdir");
+        let reader_catalog = fresh_catalog(&reader_metadata).await;
+        let reader = CayenneSnapshotEngine::new(
+            Arc::clone(&reader_catalog) as Arc<dyn MetadataCatalog>,
+            "trips",
+            reader_data.clone(),
+        );
+        let reader_dirs = vec![
+            (reader_metadata.clone(), "metadata/".to_string()),
+            (reader_data.clone(), "data/".to_string()),
+        ];
+        // How `SnapshotManager` extracts a directory snapshot: into the live directories,
+        // skipping every path that already exists.
+        let extract = |tar: PathBuf| {
+            let reader_root = reader_root.clone();
+            let reader_metadata = reader_metadata.clone();
+            let reader_data = reader_data.clone();
+            async move {
+                extract_archive_file_with_options(
+                    &tar,
+                    &reader_root,
+                    ExtractOptions {
+                        prefix_mappings: Some(vec![
+                            ("metadata/".to_string(), reader_metadata),
+                            ("data/".to_string(), reader_data),
+                        ]),
+                        ..ExtractOptions::skip_existing()
+                    },
+                )
+                .await
+                .expect("extract");
+            }
+        };
+        let served_rows = || {
+            let reader_catalog = Arc::clone(&reader_catalog);
+            async move {
+                let table = CayenneTableProviderBuilder::new(
+                    reader_catalog as Arc<dyn MetadataCatalog>,
+                    SessionContext::new().runtime_env(),
+                )
+                .open("trips")
+                .await
+                .expect("open");
+                SessionContext::new()
+                    .read_table(Arc::new(table) as Arc<dyn TableProvider>)
+                    .expect("read")
+                    .collect()
+                    .await
+                    .map(|batches| batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+            }
+        };
+
+        // The reader restores the writer's first snapshot and serves it. An overwrite
+        // records its manifest as it commits; an append leaves that to a later pass.
+        write((1..=100).collect(), InsertOp::Overwrite).await;
+        let plan = writer
+            .prepare_directory_snapshot(&writer_dirs, "trips")
+            .await
+            .expect("prepare the first snapshot");
+        extract(archive(tmp.path().join("first.tar"), plan).await).await;
+        reader
+            .finalize_directory_snapshot(&reader_dirs, "trips")
+            .await
+            .expect("restore the first snapshot");
+        assert_eq!(served_rows().await.expect("read the restored table"), 100);
+        let table_id = reader_catalog.get_table("trips").await.expect("meta").table_id;
+        let served_snapshot = reader_catalog
+            .get_table("trips")
+            .await
+            .expect("meta")
+            .current_snapshot_id;
+
+        // The writer's next snapshot is archived without one of its files, as a build
+        // that cannot check an archive against its slice would publish it.
+        write((1..=50).collect(), InsertOp::Overwrite).await;
+        let plan = writer
+            .prepare_directory_snapshot(&writer_dirs, "trips")
+            .await
+            .expect("prepare the second snapshot");
+        let next_snapshot = catalog.get_table("trips").await.expect("meta").current_snapshot_id;
+        let next_dir = data_dir.join(&table_id).join(&next_snapshot);
+        let dropped = std::fs::read_dir(&next_dir)
+            .expect("list the second snapshot")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+            .expect("the second snapshot wrote a data file");
+        std::fs::remove_file(&dropped).expect("drop a file from the archive");
+        extract(archive(tmp.path().join("second.tar"), plan).await).await;
+
+        let refusal = reader
+            .finalize_directory_snapshot(&reader_dirs, "trips")
+            .await
+            .expect_err("an archive missing a referenced file is refused");
+        assert!(
+            refusal.to_string().contains("is incomplete"),
+            "{refusal}"
+        );
+
+        assert!(
+            reader_data.join(&table_id).join(&served_snapshot).is_dir(),
+            "refusing a reload must not delete the snapshot the table is serving"
+        );
+        assert_eq!(
+            served_rows()
+                .await
+                .expect("the served acceleration is still readable after a refused reload"),
+            100,
+            "the table keeps serving the snapshot it had"
+        );
+    }
+
     #[tokio::test]
     async fn refuses_mismatched_dataset() {
         let tmp = tempfile::tempdir().expect("tmp");
