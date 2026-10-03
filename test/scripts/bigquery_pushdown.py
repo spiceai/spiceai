@@ -64,6 +64,22 @@ DATASET_ID_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,61}[a-z0-9]$")
 
 QUERIES = {
+    # --- #13887: a cast BigQuery renders at lower precision stays local ---
+    # `CAST(<text> AS TIMESTAMP)` targets DataFusion's nanosecond TIMESTAMP.
+    # BigQuery holds six sub-second digits, and the dialect strips the rest
+    # before parsing (`TIMESTAMP(REGEXP_REPLACE(...))`), so federated, the three
+    # texts below collapse to the one instant `.390436`: the filter then selects
+    # no row and the equality holds for every row. Evaluated locally, the digits
+    # past the sixth decide both.
+    "text-to-nanosecond-timestamp-filter-local": """SELECT id
+FROM precision_values
+WHERE CAST(ts_text AS TIMESTAMP) > TIMESTAMP '2026-01-15 10:30:00.390436500'
+ORDER BY id""",
+    "text-to-nanosecond-timestamp-projection-local": """SELECT
+  id,
+  CAST(ts_text AS TIMESTAMP) = TIMESTAMP '2026-01-15 10:30:00.390436170' AS exact
+FROM precision_values
+ORDER BY id""",
     # --- fork PR #212 renderings, one per case ---
     # `date - date` is an Int64 day count in the plan and an INTERVAL in
     # BigQuery, so a bare `-` hands the next operator a duration.
@@ -263,6 +279,12 @@ ORDER BY id""",
 }
 
 EXPECTED_ROWS = {
+    "text-to-nanosecond-timestamp-filter-local": [{"id": 2}],
+    "text-to-nanosecond-timestamp-projection-local": [
+        {"id": 1, "exact": True},
+        {"id": 2, "exact": False},
+        {"id": 3, "exact": False},
+    ],
     "date-difference": [
         {"id": 1, "days": 10},
         {"id": 2, "days": 18},
@@ -545,6 +567,14 @@ FROM UNNEST([
   STRUCT(4, CAST(NULL AS STRING)),
   STRUCT(5, 'under_score')
 ]);
+
+CREATE OR REPLACE TABLE {prefix}.precision_values` AS
+SELECT *
+FROM UNNEST([
+  STRUCT(1 AS id, '2026-01-15T10:30:00.390436170' AS ts_text),
+  STRUCT(2, '2026-01-15T10:30:00.390436999'),
+  STRUCT(3, '2026-01-15T10:30:00.390436000')
+]);
 """
 
 
@@ -579,6 +609,9 @@ datasets:
     params: *bigquery_params
   - from: adbc:ilike_values
     name: ilike_values
+    params: *bigquery_params
+  - from: adbc:precision_values
+    name: precision_values
     params: *bigquery_params
 
 catalogs:
@@ -836,9 +869,38 @@ def assert_generated_sql(name: str, sql: str) -> None:
                 f"the recursive CTE was hoisted more than once, so BigQuery is asked "
                 f"to define the same name twice: {sql}"
             )
+    if name in {
+        "text-to-nanosecond-timestamp-filter-local",
+        "text-to-nanosecond-timestamp-projection-local",
+    }:
+        # The dialect renders a text-to-timestamp cast as
+        # `TIMESTAMP(REGEXP_REPLACE(...))`, which strips the seventh sub-second
+        # digit on; none of it may reach BigQuery.
+        if "REGEXP_REPLACE" in sql or "TIMESTAMP(" in sql.upper():
+            raise HarnessError(
+                f"the text-to-nanosecond-timestamp cast leaked into BigQuery SQL, where "
+                f"it loses the digits past the sixth: {sql}"
+            )
+        if "`ts_text`" not in sql or "`id`" not in sql:
+            raise HarnessError(
+                f"the local cast residual did not fetch both id and ts_text: {sql}"
+            )
 
 
 def assert_physical_plan(name: str, plan: str) -> None:
+    if name in {
+        "text-to-nanosecond-timestamp-filter-local",
+        "text-to-nanosecond-timestamp-projection-local",
+    }:
+        upper = plan.upper()
+        cast_position = upper.find("CAST(")
+        remote_position = upper.find("BASE_SQL=")
+        if cast_position < 0 or remote_position < 0 or cast_position > remote_position:
+            raise HarnessError(
+                f"the text-to-nanosecond-timestamp cast must stay in a local node above "
+                f"the BigQuery scan:\n{plan}"
+            )
+        return
     if name not in {
         "ilike-before-limit-local",
         "not-ilike-local",
