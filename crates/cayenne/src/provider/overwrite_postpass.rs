@@ -156,19 +156,46 @@ fn debug() -> bool {
 /// `(slices, slice)` of the key space it keeps from them, and, when it covers
 /// a key sub-range of an integer key column, that range — pushed into the file
 /// scan, so zones outside it are never read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ChunkSpec {
     files: Vec<u32>,
     hash: (u64, u64),
     range: Option<KeyRange>,
 }
 
-/// An inclusive range `[lo, hi]` of an integer key column (by key position).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A half-open range `[lo, hi)` of one key column (by key position); a missing
+/// bound is unbounded. The ranges a cluster is split into tile the whole
+/// domain, so every row of the cluster falls in exactly one of them, whatever
+/// the cut points. `group` names the split cluster, whose rows the ranges must
+/// add up to.
+#[derive(Debug, Clone, PartialEq)]
 struct KeyRange {
     column: usize,
-    lo: i128,
-    hi: i128,
+    lo: Option<ScalarValue>,
+    hi: Option<ScalarValue>,
+    group: u32,
+}
+
+/// Steps cutting `files` at `cuts` (sorted, distinct) into ranges of `column`
+/// that tile the whole domain.
+fn cut_specs(files: &[u32], column: usize, cuts: &[ScalarValue], group: u32) -> Vec<ChunkSpec> {
+    let mut bounds: Vec<Option<ScalarValue>> = Vec::with_capacity(cuts.len() + 2);
+    bounds.push(None);
+    bounds.extend(cuts.iter().cloned().map(Some));
+    bounds.push(None);
+    bounds
+        .windows(2)
+        .map(|pair| ChunkSpec {
+            files: files.to_vec(),
+            hash: (1, 0),
+            range: Some(KeyRange {
+                column,
+                lo: pair[0].clone(),
+                hi: pair[1].clone(),
+                group,
+            }),
+        })
+        .collect()
 }
 
 /// Whether a cluster of files larger than a chunk is split into key
@@ -197,31 +224,50 @@ fn integer_value(value: &ScalarValue) -> Option<i128> {
     })
 }
 
-/// `value` as a Vortex literal of the integer type `data_type`, or `None` when
-/// it does not fit or the type is not an integer.
-fn integer_literal(value: i128, data_type: &DataType) -> Option<vortex::expr::Expression> {
+/// `value` as a Vortex literal of the same type, for the integer and string
+/// types a key sub-range supports; `None` otherwise.
+fn scalar_literal(value: &ScalarValue) -> Option<vortex::expr::Expression> {
     use vortex::expr::lit;
-    Some(match data_type {
-        DataType::Int8 => lit(i8::try_from(value).ok()?),
-        DataType::Int16 => lit(i16::try_from(value).ok()?),
-        DataType::Int32 => lit(i32::try_from(value).ok()?),
-        DataType::Int64 => lit(i64::try_from(value).ok()?),
-        DataType::UInt8 => lit(u8::try_from(value).ok()?),
-        DataType::UInt16 => lit(u16::try_from(value).ok()?),
-        DataType::UInt32 => lit(u32::try_from(value).ok()?),
-        DataType::UInt64 => lit(u64::try_from(value).ok()?),
+    Some(match value {
+        ScalarValue::Int8(Some(v)) => lit(*v),
+        ScalarValue::Int16(Some(v)) => lit(*v),
+        ScalarValue::Int32(Some(v)) => lit(*v),
+        ScalarValue::Int64(Some(v)) => lit(*v),
+        ScalarValue::UInt8(Some(v)) => lit(*v),
+        ScalarValue::UInt16(Some(v)) => lit(*v),
+        ScalarValue::UInt32(Some(v)) => lit(*v),
+        ScalarValue::UInt64(Some(v)) => lit(*v),
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::LargeUtf8(Some(v))
+        | ScalarValue::Utf8View(Some(v)) => lit(v.clone()),
         _ => return None,
     })
 }
 
-/// `files` split into `slices` equal-width sub-ranges of `column` between the
-/// smallest minimum and the largest maximum their bounds report, or `None`
-/// when the column is not an integer.
+/// `value` as a scalar of the same integer type as `like`.
+fn integer_like(value: i128, like: &ScalarValue) -> Option<ScalarValue> {
+    Some(match like {
+        ScalarValue::Int8(_) => ScalarValue::Int8(Some(i8::try_from(value).ok()?)),
+        ScalarValue::Int16(_) => ScalarValue::Int16(Some(i16::try_from(value).ok()?)),
+        ScalarValue::Int32(_) => ScalarValue::Int32(Some(i32::try_from(value).ok()?)),
+        ScalarValue::Int64(_) => ScalarValue::Int64(Some(i64::try_from(value).ok()?)),
+        ScalarValue::UInt8(_) => ScalarValue::UInt8(Some(u8::try_from(value).ok()?)),
+        ScalarValue::UInt16(_) => ScalarValue::UInt16(Some(u16::try_from(value).ok()?)),
+        ScalarValue::UInt32(_) => ScalarValue::UInt32(Some(u32::try_from(value).ok()?)),
+        ScalarValue::UInt64(_) => ScalarValue::UInt64(Some(u64::try_from(value).ok()?)),
+        _ => return None,
+    })
+}
+
+/// `files` split into `slices` equal-width ranges of an integer `column`,
+/// cut between the smallest minimum and the largest maximum their bounds
+/// report, or `None` when the column is not an integer.
 fn range_slices(
     files: &[u32],
     bounds: &[(ScalarValue, ScalarValue)],
     column: usize,
     slices: u64,
+    group: u32,
 ) -> Option<Vec<ChunkSpec>> {
     let lo = files
         .iter()
@@ -235,21 +281,13 @@ fn range_slices(
         .collect::<Option<Vec<_>>>()?
         .into_iter()
         .max()?;
+    let like = &bounds[*files.first()? as usize].0;
     let width = (hi - lo + 1).max(1);
     let slices = i128::from(slices).min(width).max(1);
-    Some(
-        (0..slices)
-            .map(|slice| ChunkSpec {
-                files: files.to_vec(),
-                hash: (1, 0),
-                range: Some(KeyRange {
-                    column,
-                    lo: lo + width * slice / slices,
-                    hi: lo + width * (slice + 1) / slices - 1,
-                }),
-            })
-            .collect(),
-    )
+    let cuts = (1..slices)
+        .map(|slice| integer_like(lo + width * slice / slices, like))
+        .collect::<Option<Vec<_>>>()?;
+    Some(cut_specs(files, column, &cuts, group))
 }
 
 /// The steps of the duplicate query, and what they read.
@@ -261,6 +299,11 @@ struct ChunkPlan {
     /// Bytes of files the steps read in all (each step reads its files twice
     /// when it finds repeats; this counts them once).
     bytes_read: u64,
+    /// Clusters to split into sampled key ranges, `(files, slices, group)`:
+    /// their column is not an integer, so its bounds give no cut points.
+    to_sample: Vec<(Vec<u32>, u64, u32)>,
+    /// The files of each split cluster, by group.
+    groups: Vec<Vec<u32>>,
 }
 
 /// `chunks` hash slices of the whole key space, each reading every file.
@@ -278,6 +321,8 @@ fn hash_plan(sizes: &[u64], chunks: u64) -> ChunkPlan {
             .collect(),
         column: None,
         bytes_read: sizes.iter().sum::<u64>() * chunks,
+        to_sample: Vec::new(),
+        groups: Vec::new(),
     }
 }
 
@@ -349,6 +394,8 @@ fn plan_chunks(
         let bytes = |files: &[u32]| files.iter().map(|&f| sizes[f as usize]).sum::<u64>();
         let mut specs: Vec<ChunkSpec> = Vec::new();
         let mut bytes_read = 0_u64;
+        let mut to_sample = Vec::new();
+        let mut groups: Vec<Vec<u32>> = Vec::new();
         let mut pending: Vec<u32> = Vec::new();
         let flush = |files: Vec<u32>, specs: &mut Vec<ChunkSpec>, bytes_read: &mut u64| {
             if files.is_empty() {
@@ -369,17 +416,19 @@ fn plan_chunks(
             if bytes(&cluster) >= target {
                 flush(std::mem::take(&mut pending), &mut specs, &mut bytes_read);
                 let size = bytes(&cluster);
-                let ranged = subsplit_by_range
-                    .then(|| range_slices(&cluster, per_file, column, size.div_ceil(target)))
-                    .flatten();
-                match ranged {
-                    // Each sub-range reads about its share of the cluster.
-                    Some(sub_ranges) => {
-                        bytes_read += size;
-                        specs.extend(sub_ranges);
-                    }
-                    None => flush(cluster, &mut specs, &mut bytes_read),
+                if !subsplit_by_range {
+                    flush(cluster, &mut specs, &mut bytes_read);
+                    continue;
                 }
+                // Each key range reads about its share of the cluster.
+                let group = u32::try_from(groups.len()).unwrap_or(u32::MAX);
+                let slices = size.div_ceil(target);
+                bytes_read += size;
+                match range_slices(&cluster, per_file, column, slices, group) {
+                    Some(sub_ranges) => specs.extend(sub_ranges),
+                    None => to_sample.push((cluster.clone(), slices, group)),
+                }
+                groups.push(cluster);
                 continue;
             }
             if bytes(&pending) + bytes(&cluster) > target {
@@ -393,6 +442,8 @@ fn plan_chunks(
                 specs,
                 column: Some(column),
                 bytes_read,
+                to_sample,
+                groups,
             };
         }
     }
@@ -578,19 +629,26 @@ impl PartitionStream for ReadBack {
             stored: Arc::clone(&self.stored),
             schema: Arc::clone(&self.schema),
             chunk: self.chunk,
-            range: self.range,
+            range: self.range.clone(),
             rows_read: Arc::clone(&self.rows_read),
         });
-        // `key >= lo AND key <= hi` on the stored column, so the scan prunes the
-        // zones outside the step's sub-range.
-        let range_filter = this.range.and_then(|range| {
+        // `key >= lo AND key < hi` on the stored column, so the scan prunes the
+        // zones outside the step's key range.
+        let range_filter = this.range.as_ref().and_then(|range| {
             let name = this.key_names.get(range.column)?;
-            let data_type = this.schema.field(range.column).data_type();
             let column = get_item(name.as_str(), root());
-            Some(vortex::expr::and(
-                vortex::expr::gt_eq(column.clone(), integer_literal(range.lo, data_type)?),
-                vortex::expr::lt_eq(column, integer_literal(range.hi, data_type)?),
-            ))
+            let lower = match &range.lo {
+                Some(lo) => Some(vortex::expr::gt_eq(column.clone(), scalar_literal(lo)?)),
+                None => None,
+            };
+            let upper = match &range.hi {
+                Some(hi) => Some(vortex::expr::lt(column, scalar_literal(hi)?)),
+                None => None,
+            };
+            Some(match (lower, upper) {
+                (Some(lower), Some(upper)) => Some(vortex::expr::and(lower, upper)),
+                (one, None) | (None, one) => one,
+            })
         });
         if this.range.is_some() && range_filter.is_none() {
             return Box::pin(RecordBatchStreamAdapter::new(
@@ -638,7 +696,7 @@ impl PartitionStream for ReadBack {
                     if let Some(row_range) = row_range {
                         scan = scan.with_row_range(row_range);
                     }
-                    if let Some(filter) = range_filter {
+                    if let Some(Some(filter)) = range_filter {
                         scan = scan.with_filter(filter);
                     }
                     let chunks = scan
@@ -719,6 +777,40 @@ impl CayenneTableProvider {
             })
             .collect();
         (bounds, rows)
+    }
+}
+
+impl CayenneTableProvider {
+    /// Turns each cluster the plan could not cut from its bounds into key
+    /// ranges cut at quantiles of a sample of its rows, or into hash slices
+    /// when no sample can be read. The ranges tile the domain whatever the
+    /// sample, so a poor one costs only balance.
+    async fn sample_key_ranges(
+        &self,
+        plan: &mut ChunkPlan,
+        store: &Arc<dyn ObjectStore>,
+        paths: &[String],
+        file_rows: &[u64],
+        column_name: &str,
+        column: usize,
+    ) {
+        for (files, slices, group) in std::mem::take(&mut plan.to_sample) {
+            if let Some(cuts) =
+                sample_cut_points(store, paths, &files, file_rows, column_name, slices).await
+            {
+                plan.specs.extend(cut_specs(&files, column, &cuts, group));
+                continue;
+            }
+            // Unsplit by range: no rows to account for under this group.
+            if let Some(group_files) = plan.groups.get_mut(group as usize) {
+                group_files.clear();
+            }
+            plan.specs.extend((0..slices).map(|slice| ChunkSpec {
+                files: files.clone(),
+                hash: (slices, slice),
+                range: None,
+            }));
+        }
     }
 }
 
@@ -821,6 +913,9 @@ impl CayenneTableProvider {
             }
         }
         let bounds = if range_chunking() { bounds } else { Vec::new() };
+        // Splitting a cluster into key ranges checks the ranges read every row
+        // of it, which needs every file's row count.
+        let footer_rows = file_rows.clone();
         let file_rows = if split_files() { file_rows } else { None };
         let started = Instant::now();
         // Diagnostics: the peak the memory pool reports while the query runs.
@@ -837,21 +932,48 @@ impl CayenneTableProvider {
         });
         let paths: Vec<String> = files.into_iter().map(|file| file.path).collect();
         let key_names: Arc<[String]> = key_columns.to_vec().into();
-        let query = DuplicateQuery {
-            ctx: &ctx,
-            store: &store,
-            paths: &paths,
-            key_names: &key_names,
-            stored: &stored,
-            schema: &schema,
-            survivor,
-            keys: key_columns.len(),
-            file_rows: file_rows.as_deref(),
-        };
         // A chunk sized from the bytes written can still outgrow a small memory
         // pool; then the key space is cut finer and the query run again.
         let superseded = loop {
-            let plan = plan_chunks(&sizes, &bounds, chunks, range_subsplit());
+            let mut plan = plan_chunks(
+                &sizes,
+                &bounds,
+                chunks,
+                range_subsplit() && footer_rows.is_some(),
+            );
+            if let (Some(column), Some(rows)) = (plan.column, footer_rows.as_deref()) {
+                self.sample_key_ranges(
+                    &mut plan,
+                    &store,
+                    &paths,
+                    rows,
+                    &key_columns[column],
+                    column,
+                )
+                .await;
+            }
+            let group_rows: Vec<u64> = plan
+                .groups
+                .iter()
+                .map(|files| {
+                    files
+                        .iter()
+                        .map(|&f| footer_rows.as_deref().map_or(0, |rows| rows[f as usize]))
+                        .sum()
+                })
+                .collect();
+            let query = DuplicateQuery {
+                ctx: &ctx,
+                store: &store,
+                paths: &paths,
+                key_names: &key_names,
+                stored: &stored,
+                schema: &schema,
+                survivor,
+                keys: key_columns.len(),
+                file_rows: file_rows.as_deref(),
+                group_rows,
+            };
             if debug() {
                 eprintln!(
                     "POSTPASS plan files={} total_bytes={total_bytes} target_chunks={chunks} specs={} column={:?} bytes_read={} amplification_pct={} bounds_ms={}",
@@ -925,6 +1047,9 @@ struct DuplicateQuery<'a> {
     /// Each file's row count, when known: lets a step reading fewer files than
     /// the query has partitions split them into row ranges.
     file_rows: Option<&'a [u64]>,
+    /// The rows of each cluster split into key ranges, by group: the ranges'
+    /// rows must add up to it, or a row was read by no range.
+    group_rows: Vec<u64>,
 }
 
 impl DuplicateQuery<'_> {
@@ -938,6 +1063,7 @@ impl DuplicateQuery<'_> {
         // Positions of superseded copies, by file id; each copy is emitted once,
         // since the join's build side holds each repeated key once.
         let mut superseded: Vec<Vec<u32>> = vec![Vec::new(); self.paths.len()];
+        let mut group_read: Vec<u64> = vec![0; self.group_rows.len()];
         for (chunk_index, spec) in specs.iter().enumerate() {
             let chunk_started = Instant::now();
             let rows_read = Arc::new(AtomicU64::new(0));
@@ -980,7 +1106,7 @@ impl DuplicateQuery<'_> {
                         stored: Arc::clone(self.stored),
                         schema: Arc::clone(schema),
                         chunk: spec.hash,
-                        range: spec.range,
+                        range: spec.range.clone(),
                         rows_read: Arc::clone(&rows_read),
                     }) as Arc<dyn PartitionStream>
                 })
@@ -1014,6 +1140,11 @@ impl DuplicateQuery<'_> {
             let repeated_batches = repeated.collect().await?;
             let aggregate_elapsed = chunk_started.elapsed();
             let aggregate_rows = rows_read.load(Ordering::Relaxed);
+            if let Some(range) = &spec.range
+                && let Some(read) = group_read.get_mut(range.group as usize)
+            {
+                *read += aggregate_rows;
+            }
             let repeated_keys: usize = repeated_batches.iter().map(RecordBatch::num_rows).sum();
             if repeated_keys == 0 {
                 if debug() {
@@ -1072,8 +1203,88 @@ impl DuplicateQuery<'_> {
                 );
             }
         }
+        // Every row of a split cluster falls in exactly one of its key ranges; a
+        // shortfall means a range missed rows, whose repeats would go unresolved.
+        for (group, (read, expected)) in group_read.iter().zip(&self.group_rows).enumerate() {
+            if read != expected {
+                return Err(datafusion_common::DataFusionError::Internal(format!(
+                    "the key ranges of cluster {group} read {read} of its {expected} rows"
+                )));
+            }
+        }
         Ok(superseded)
     }
+}
+
+/// Rows sampled from each file to cut a cluster into key ranges.
+const SAMPLE_ROWS_PER_FILE: u64 = 1024;
+
+/// Cut points splitting the rows of `files` into about `slices` key ranges of
+/// equal count: quantiles of `column` over evenly spaced rows of each file.
+/// Sorted and distinct; `None` when the sample cannot be read or holds no
+/// usable value.
+async fn sample_cut_points(
+    store: &Arc<dyn ObjectStore>,
+    paths: &[String],
+    files: &[u32],
+    file_rows: &[u64],
+    column: &str,
+    slices: u64,
+) -> Option<Vec<ScalarValue>> {
+    use vortex::expr::{get_item, root};
+    let session = VortexSession::default();
+    let mut sampled: Vec<ArrayRef> = Vec::new();
+    for &file in files {
+        let rows = *file_rows.get(file as usize)?;
+        if rows == 0 {
+            continue;
+        }
+        let take = rows.min(SAMPLE_ROWS_PER_FILE);
+        let indices: vortex::buffer::Buffer<u64> = (0..take).map(|i| i * rows / take).collect();
+        let vxf = session
+            .open_options()
+            .open_object_store(store, &paths[file as usize])
+            .await
+            .ok()?;
+        let mut chunks = vxf
+            .scan()
+            .ok()?
+            .with_row_indices(indices)
+            .with_projection(get_item(column, root()))
+            .into_stream()
+            .ok()?;
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.ok()?;
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut ctx = session.create_execution_ctx();
+            sampled.push(session.arrow().execute_arrow(chunk, None, &mut ctx).ok()?);
+        }
+    }
+    let refs: Vec<&dyn arrow::array::Array> = sampled.iter().map(AsRef::as_ref).collect();
+    let all = arrow::compute::concat(&refs).ok()?;
+    let sorted = arrow::compute::sort(&all, None).ok()?;
+    let len = sorted.len() as u64;
+    if len == 0 {
+        return None;
+    }
+    let mut cuts: Vec<ScalarValue> = Vec::new();
+    for slice in 1..slices.min(len) {
+        #[expect(clippy::cast_possible_truncation)]
+        let at = (len * slice / slices) as usize;
+        let cut = ScalarValue::try_from_array(&sorted, at).ok()?;
+        if cut.is_null() {
+            return None;
+        }
+        if cuts.last() != Some(&cut) {
+            cuts.push(cut);
+        }
+    }
+    // A literal must exist for every cut, or the scan could not filter by it.
+    cuts.iter()
+        .all(|cut| scalar_literal(cut).is_some())
+        .then_some(cuts)
 }
 
 /// The column names of the table's primary key, in key order.
@@ -1086,49 +1297,81 @@ pub(crate) fn key_column_names(schema: &Schema, indices: &[usize]) -> Vec<String
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    /// Integer sub-ranges tile the cluster's bounds exactly, so every key —
-    /// and with it every copy of the key — falls in exactly one step.
+    fn int_bound(value: Option<&ScalarValue>) -> Option<i64> {
+        match value {
+            Some(ScalarValue::Int64(Some(v))) => Some(*v),
+            None => None,
+            other => panic!("unexpected bound {other:?}"),
+        }
+    }
+
+    /// Key ranges are half-open and tile the whole domain: the first is
+    /// unbounded below, the last unbounded above, and each starts where the
+    /// one before ends, so every key — and every copy of it — falls in exactly
+    /// one step.
     #[test]
-    fn range_slices_tile_the_cluster_bounds() {
+    fn range_slices_tile_the_whole_domain() {
         let bounds = vec![
             (ScalarValue::Int64(Some(-7)), ScalarValue::Int64(Some(40))),
             (ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(92))),
         ];
         for slices in [1, 2, 3, 7, 200] {
-            let specs = range_slices(&[0, 1], &bounds, 0, slices).expect("integer bounds");
-            let ranges: Vec<(i128, i128)> = specs
+            let specs = range_slices(&[0, 1], &bounds, 0, slices, 0).expect("integer bounds");
+            let ranges: Vec<(Option<i64>, Option<i64>)> = specs
                 .iter()
-                .map(|spec| spec.range.map(|r| (r.lo, r.hi)).expect("range"))
+                .map(|spec| {
+                    let range = spec.range.as_ref().expect("range");
+                    (int_bound(range.lo.as_ref()), int_bound(range.hi.as_ref()))
+                })
                 .collect();
             assert_eq!(
                 ranges.first().map(|r| r.0),
-                Some(-7),
+                Some(None),
                 "{slices}: {ranges:?}"
             );
-            assert_eq!(ranges.last().map(|r| r.1), Some(92), "{slices}: {ranges:?}");
+            assert_eq!(
+                ranges.last().map(|r| r.1),
+                Some(None),
+                "{slices}: {ranges:?}"
+            );
             for pair in ranges.windows(2) {
-                assert_eq!(pair[0].1 + 1, pair[1].0, "{slices}: {ranges:?}");
+                assert_eq!(pair[0].1, pair[1].0, "{slices}: {ranges:?}");
+                assert!(pair[0].1.is_some(), "{slices}: {ranges:?}");
             }
-            assert!(
-                ranges.iter().all(|(lo, hi)| lo <= hi),
-                "{slices}: {ranges:?}"
-            );
         }
-        assert!(
-            range_slices(
-                &[0],
-                &[(
-                    ScalarValue::Utf8(Some("a".into())),
-                    ScalarValue::Utf8(Some("z".into()))
-                )],
-                0,
-                4
-            )
-            .is_none()
+        let strings = [(
+            ScalarValue::Utf8(Some("a".into())),
+            ScalarValue::Utf8(Some("z".into())),
+        )];
+        assert!(range_slices(&[0], &strings, 0, 4, 0).is_none());
+    }
+
+    #[test]
+    fn cut_specs_tile_the_domain_at_the_cuts() {
+        let cuts = [
+            ScalarValue::Utf8(Some("g".into())),
+            ScalarValue::Utf8(Some("q".into())),
+        ];
+        let specs = cut_specs(&[0, 1], 0, &cuts, 3);
+        let ranges: Vec<_> = specs
+            .iter()
+            .map(|spec| {
+                let range = spec.range.as_ref().expect("range");
+                assert_eq!(range.group, 3);
+                (range.lo.clone(), range.hi.clone())
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                (None, Some(cuts[0].clone())),
+                (Some(cuts[0].clone()), Some(cuts[1].clone())),
+                (Some(cuts[1].clone()), None),
+            ]
         );
     }
-    use super::*;
 
     #[test]
     fn arrival_is_trailing_and_not_null() {
@@ -1189,12 +1432,19 @@ mod tests {
                 .iter()
                 .all(|spec| spec.files.len() == 4 && spec.hash == (1, 0))
         );
-        let ranges: Vec<(i128, i128)> = plan
+        let ranges: Vec<(Option<i64>, Option<i64>)> = plan
             .specs
             .iter()
-            .map(|spec| spec.range.map(|r| (r.lo, r.hi)).expect("range"))
+            .map(|spec| {
+                let range = spec.range.as_ref().expect("range");
+                (int_bound(range.lo.as_ref()), int_bound(range.hi.as_ref()))
+            })
             .collect();
-        assert_eq!(ranges, vec![(0, 32), (33, 65), (66, 99)]);
+        assert_eq!(
+            ranges,
+            vec![(None, Some(33)), (Some(33), Some(66)), (Some(66), None)]
+        );
+        assert_eq!(plan.groups, vec![vec![0, 1, 2, 3]]);
     }
 
     #[test]
