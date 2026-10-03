@@ -540,8 +540,9 @@ mod tests {
         );
     }
 
-    /// The arms that carry text answer with it, so the empty case above is the
-    /// only one that flattens to nothing.
+    /// The assistant arms that carry text answer with it, so the content-less
+    /// case above is the only assistant turn that flattens to nothing - the
+    /// `Function` arm separately defaults a missing body to empty text.
     #[test]
     #[expect(deprecated)]
     fn an_assistant_turn_that_carries_text_still_answers_with_it() {
