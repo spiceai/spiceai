@@ -2217,9 +2217,10 @@ async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
 /// position behind the acknowledged one — which the next start reads as changes
 /// acknowledged but never applied, and answers with a full re-read.
 ///
-/// The flush interval is set far beyond the test's length so only the shutdown
-/// flush can carry the position forward; the assertion is on what was recorded,
-/// not on timing.
+/// The flush interval is set far beyond the test's length, and the drift is
+/// built from WAL that reaches no member, so nothing wakes the position writer
+/// and only the shutdown flush can carry the position forward; the assertion is
+/// on what was recorded, not on timing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_graceful_shutdown_records_the_acknowledged_position_so_a_restart_resumes()
 -> Result<(), anyhow::Error> {
@@ -2251,33 +2252,26 @@ async fn a_graceful_shutdown_records_the_acknowledged_position_so_a_restart_resu
         .recorded_lsn()
         .ok_or_else(|| anyhow::anyhow!("the member must record a position while attached"))?;
 
-    // Drive the slot's acknowledgement past that position with WAL that holds
-    // nothing for the quiet table, the way the test above does.
-    create_table(&source, "noisy", &[(1, "n1")]).await?;
-    let noisy_store = InMemoryAppliedLsnStore::shared();
-    let mut noisy = start_replication_stream(input_with_watermark(port, "noisy", &noisy_store));
-    next_envelope(&mut noisy, "bootstrap noisy")
-        .await?
-        .commit()
-        .await?;
+    // Drive the slot's acknowledgement past that position with WAL from a table
+    // outside the publication. It reaches no member, so no member commits and
+    // nothing wakes the position writer; the slot moves only through keepalive
+    // crediting. A second published table would not do: each of its commits wakes
+    // the writer, every writer pass also carries idle members forward
+    // (`publish_idle_positions`), and the quiet table's recorded position would
+    // follow the slot instead of drifting behind it.
+    create_table(&source, "unpublished", &[]).await?;
 
     let deadline = std::time::Instant::now() + Duration::from_mins(1);
     let mut drifted = false;
-    let mut churn_id = 100;
+    let mut churn_id = 0;
     while std::time::Instant::now() < deadline {
         churn_id += 1;
         source
             .execute(
-                "INSERT INTO public.noisy (id, name) VALUES ($1, 'churn')",
+                "INSERT INTO public.unpublished (id, name) VALUES ($1, 'churn')",
                 &[&churn_id],
             )
             .await?;
-        if let Ok(envelope) = next_envelope(&mut noisy, "noisy churn").await {
-            envelope.commit().await?;
-        }
-        if let Ok(envelope) = next_envelope(&mut quiet, "quiet heartbeat").await {
-            envelope.commit().await?;
-        }
         // Strictly past: an acknowledgement equal to the recorded position is
         // not the `AcknowledgedPast` state this test exists to construct.
         if slot_acked_strictly_past(&source, &lsn_text(recorded)).await? {
@@ -2321,7 +2315,6 @@ async fn a_graceful_shutdown_records_the_acknowledged_position_so_a_restart_resu
     // --- 3. Restart against what was recorded: the slot is acknowledged to it,
     // so there is nothing to rebuild for. ---
     drop(quiet);
-    drop(noisy);
     wait_for_walsender_count(&source, 0).await?;
     let mut restarted = start_replication_stream(input_with_contents(
         port,
