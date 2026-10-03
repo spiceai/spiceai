@@ -463,6 +463,13 @@ async fn widened_keys_return_the_rows_of_an_unindexed_table(mode: Mode) {
     assert!(answered > 0, "the Int32 lookups never used the index");
 
     for table in [&indexed, &plain] {
+        // The first write after a live widening can panic while statistics of
+        // the writes before it are still pending (#14718); persist them first,
+        // so this test exercises the index rather than that.
+        table
+            .flush_pending_maintenance()
+            .await
+            .expect("flush pending statistics");
         table
             .evolve_schema_live(&widening_plan(table))
             .await
@@ -479,6 +486,19 @@ async fn widened_keys_return_the_rows_of_an_unindexed_table(mode: Mode) {
     let mut probes = int_probes.clone();
     probes.extend(float_probes());
     compare("floats written", &indexed, &plain, &truth, &probes).await;
+    // An integer range over the widened column holds the floats between its
+    // bounds, which no enumeration of the integers in it would probe.
+    for sql in [
+        "SELECT \"AutoId\" FROM t WHERE \"K\" BETWEEN 1 AND 3",
+        "SELECT \"AutoId\" FROM t WHERE \"K\" BETWEEN -2 AND 2",
+        "SELECT \"AutoId\" FROM t WHERE \"K\" IN (1, 2, 3)",
+    ] {
+        assert_eq!(
+            ids(&indexed, sql).await,
+            ids(&plain, sql).await,
+            "floats written: {sql}"
+        );
+    }
 
     if matches!(mode, Mode::File) {
         rebuilt(&indexed).await;

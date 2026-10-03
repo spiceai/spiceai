@@ -83,7 +83,7 @@ use std::time::{Duration, Instant};
 
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
 use crate::row_converter::{RowConverter, SortField};
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::UInt64Type;
 use arrow::record_batch::RecordBatch;
@@ -355,14 +355,24 @@ impl KeySpec {
         &self.columns
     }
 
+    /// This key over `columns`, the table's spelling of its columns, keeping
+    /// the label `indexes` gave it.
+    fn with_columns(self, columns: Vec<String>) -> Self {
+        Self {
+            columns,
+            label: self.label,
+        }
+    }
+
     pub(crate) fn label(&self) -> &str {
         &self.label
     }
 }
 
 /// Which file set of a snapshot a listing saw: the table's directory generation
-/// and listing-cache epoch, sampled before listing. One of them moves whenever
-/// files are added to, or rewritten under, the same snapshot.
+/// and listing-cache epoch, sampled before listing, and a digest of the
+/// protected snapshots whose files are part of the set. One of them moves
+/// whenever that set of files changes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FileSetVersion {
     pub(crate) dir_generation: u64,
@@ -375,8 +385,6 @@ pub(crate) struct FileSetVersion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IndexedFile {
     pub(crate) path: String,
-    pub(crate) size: u64,
-    pub(crate) last_modified_ms: i64,
 }
 
 /// One key column, resolved against the table schema.
@@ -453,6 +461,7 @@ pub(crate) fn cast_to(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef
     arrow::compute::cast(array, data_type)
         .map_err(|e| format!("cast {} -> {data_type}: {e}", array.data_type()))
 }
+
 /// A data file's name: its identity across the moves and hardlinks between a
 /// write's staging directory and the snapshot directories, which change its
 /// path but not its name or any row position. See the module's note on file
@@ -627,12 +636,24 @@ pub(crate) struct LookupIndexView {
     /// runs it is looked up in always agree.
     shapes: Shapes,
     views: Vec<IndexView>,
-    labels: Vec<String>,
     /// Rows the runs hold, for the runtime probe's row bound.
     rows: usize,
 }
 
 impl LookupIndexView {
+    /// Every key's current view of `shapes`, taken together.
+    fn of(shapes: Shapes) -> Self {
+        let views: Vec<IndexView> = shapes.iter().map(|shape| shape.index.view()).collect();
+        let rows = views
+            .first()
+            .map_or(0, |view| view.run_list().iter().map(|run| run.len()).sum());
+        Self {
+            shapes,
+            views,
+            rows,
+        }
+    }
+
     /// Whether every key's view covers the file `path` names.
     pub(crate) fn covers(&self, path: &str) -> bool {
         let name = file_name(path);
@@ -670,7 +691,7 @@ impl LookupIndexView {
             rows += positions.len();
         }
         Some(ProbeHit {
-            shape: self.labels[shape].clone(),
+            shape: self.shapes[shape].label.clone(),
             per_file: by_file,
             rows,
         })
@@ -707,6 +728,11 @@ pub(crate) enum LookupProbe {
 }
 
 impl LookupSelection {
+    /// The label of the key it probed.
+    pub(crate) fn shape(&self) -> &str {
+        &self.shape
+    }
+
     /// This selection, for narrowing one more snapshot of the same scan
     /// without recording another probe.
     #[must_use]
@@ -902,7 +928,7 @@ type RuntimeLookupCell = Arc<tokio::sync::OnceCell<Option<Arc<RuntimeLookupSelec
 pub(crate) struct DynamicLookupAccessPlanProvider {
     state: Arc<LookupIndexState>,
     /// The view the scan pinned.
-    index: Option<Arc<LookupIndexView>>,
+    index: Arc<LookupIndexView>,
     /// Every file the scan reads, so the probe's outcome is decided once,
     /// before any file opens.
     scan_files: Arc<[ObjectMeta]>,
@@ -913,7 +939,7 @@ pub(crate) struct DynamicLookupAccessPlanProvider {
 impl DynamicLookupAccessPlanProvider {
     pub(crate) fn new(
         state: Arc<LookupIndexState>,
-        index: Option<Arc<LookupIndexView>>,
+        index: Arc<LookupIndexView>,
         scan_files: Arc<[ObjectMeta]>,
         request_build: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
@@ -979,7 +1005,7 @@ impl DynamicLookupAccessPlanProvider {
             return None;
         }
         let state = Arc::clone(&self.state);
-        let index = self.index.clone();
+        let index = Arc::clone(&self.index);
         let scan_files = Arc::clone(&self.scan_files);
         let probed = tokio::task::spawn_blocking(move || {
             let spec = &state.specs[identity.spec];
@@ -989,7 +1015,7 @@ impl DynamicLookupAccessPlanProvider {
                 state.record_runtime_fallback();
                 return RuntimeProbe::Declined;
             };
-            state.probe_runtime_filter(identity.spec, index.as_ref(), &scan_files, &keys)
+            state.probe_runtime_filter(identity.spec, &index, &scan_files, &keys)
         })
         .await;
         match probed {
@@ -1206,9 +1232,10 @@ impl VortexRuntimeAccessPlanProvider for DynamicLookupAccessPlanProvider {
 pub struct LookupIndexCounters {
     /// Probes that attached a row selection to the scan.
     pub selected: u64,
-    /// Probes whose key has no posting at all, so the file branch reads nothing.
+    /// Probes where every file the scan reads is indexed and none holds the
+    /// key, so no file is read.
     pub empty: u64,
-    /// Probes on an indexed key shape before any index was published.
+    /// Probes where none of the files the scan reads is indexed yet.
     pub unbuilt: u64,
     /// Runtime key sets declined because their shape or cost cannot be bounded.
     pub runtime_fallback: u64,
@@ -1334,7 +1361,7 @@ pub(crate) struct LookupIndexState {
     account: Arc<CayenneMemoryAccount>,
     /// Every key's current view, pinned together. Always set: an empty view
     /// covers no file, so a lookup reads everything and asks for a build.
-    index: ArcSwapOption<LookupIndexView>,
+    index: ArcSwap<LookupIndexView>,
     /// Serializes changing the runs, `index` and `reservation`, so the
     /// published view always matches the runs and their bytes are always
     /// charged. Probes never take it.
@@ -1386,20 +1413,36 @@ impl LookupIndexState {
             .iter()
             .map(|spec| Shape::new(spec, schema, word_bits).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
+        // A key column resolves to its table column whatever case `indexes`
+        // spelled it in; a filter names the table column, so match on that.
+        let specs: Vec<KeySpec> = specs
+            .into_iter()
+            .zip(&shapes)
+            .map(|(spec, shape)| {
+                spec.with_columns(
+                    shape
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                )
+            })
+            .collect();
         let labels: Vec<&str> = specs.iter().map(KeySpec::label).collect();
         tracing::info!(
             table = %table_name,
             "Dataset '{table_name}' (cayenne): maintaining secondary indexes on {}",
             labels.join(", ")
         );
+        let shapes = Arc::new(shapes);
         let state = Arc::new(Self {
+            index: ArcSwap::from_pointee(LookupIndexView::of(Arc::clone(&shapes))),
             table_name: table_name.to_string(),
             specs,
-            shapes: ArcSwap::from_pointee(shapes),
+            shapes: ArcSwap::new(shapes),
             word_bits,
             pool,
             account,
-            index: ArcSwapOption::empty(),
             publish_lock: Mutex::new(()),
             reservation: Mutex::new(None),
             reconciled: Mutex::new(None),
@@ -1411,14 +1454,10 @@ impl LookupIndexState {
             counters: Counters::default(),
             scan_input_version,
         });
-        {
-            let _publishing = state.publish_lock.lock();
-            state.repin();
-        }
         Ok(Some(state))
     }
 
-    pub(crate) fn published(&self) -> Option<Arc<LookupIndexView>> {
+    pub(crate) fn published(&self) -> Arc<LookupIndexView> {
         self.index.load_full()
     }
 
@@ -1441,8 +1480,8 @@ impl LookupIndexState {
     /// schema. A key whose encoding is unchanged keeps its index. A key whose
     /// encoding changed (a key column relaxed to nullable, or widened to
     /// another type) gets an empty index, as if none of the table's files had
-    /// been indexed: its runs no longer match its keys, so they are dropped and
-    /// deleted from disk, every file reads as uncovered, and the next lookup
+    /// been indexed: its runs no longer match its keys, so they are dropped,
+    /// every file reads as uncovered, and the next lookup
     /// rebuilds the index from the files. A run still being built under the old
     /// encoding is refused when it is published.
     pub(crate) fn adopt_shapes(self: &Arc<Self>, shapes: KeyShapes) {
@@ -1491,18 +1530,8 @@ impl LookupIndexState {
     /// Pins every key's current view as the published one. The caller holds
     /// `publish_lock`.
     fn repin(&self) {
-        let shapes = self.shapes.load_full();
-        let views: Vec<IndexView> = shapes.iter().map(|shape| shape.index.view()).collect();
-        let rows = views
-            .first()
-            .map_or(0, |view| view.run_list().iter().map(|run| run.len()).sum());
-        let view = LookupIndexView {
-            labels: shapes.iter().map(|shape| shape.label.clone()).collect(),
-            shapes,
-            views,
-            rows,
-        };
-        self.index.store(Some(Arc::new(view)));
+        self.index
+            .store(Arc::new(LookupIndexView::of(self.shapes.load_full())));
         self.scan_input_version.fetch_add(1, Ordering::Release);
     }
 
@@ -1787,8 +1816,9 @@ impl LookupIndexState {
     /// as a write's run always is, whether or not the write is visible by
     /// then; reconcile retires the files of a write that never becomes
     /// visible.
-    pub(crate) async fn finish_write(self: &Arc<Self>, observer: &RunObserver, replaces: bool) {
+    pub(crate) async fn finish_write(self: &Arc<Self>, observer: &RunObserver) {
         observer.drain().await;
+        let replaces = observer.replaces;
         let observer = &*observer.shared;
         let builders = observer.builders.lock().take();
         let failure = observer.failure.lock().take();
@@ -1919,7 +1949,7 @@ impl LookupIndexState {
 
     /// The index of the key these filters fully pin, if any. `values_for`
     /// gives a column's equality values: one for `=`, several for `IN`.
-    pub(crate) fn matched_shape(
+    fn matched_shape(
         &self,
         values_for: &dyn Fn(&str) -> Option<Vec<ScalarValue>>,
     ) -> Option<usize> {
@@ -1931,7 +1961,7 @@ impl LookupIndexState {
     }
 
     /// The label of key `shape`.
-    pub(crate) fn shape_label(&self, shape: usize) -> &str {
+    fn shape_label(&self, shape: usize) -> &str {
         self.specs[shape].label()
     }
 
@@ -1947,7 +1977,7 @@ impl LookupIndexState {
     /// [`RUNTIME_INDEX_MAX_ROWS`] candidates for several keys, decline.
     pub(crate) fn probe(
         self: &Arc<Self>,
-        index: Option<&Arc<LookupIndexView>>,
+        index: &Arc<LookupIndexView>,
         values_for: &dyn Fn(&str) -> Option<Vec<ScalarValue>>,
     ) -> LookupProbe {
         let Some(shape) = self.matched_shape(values_for) else {
@@ -1957,13 +1987,6 @@ impl LookupIndexState {
             ));
         };
         let label = self.shape_label(shape).to_string();
-        let Some(index) = index else {
-            self.record_probe(&label, ProbeOutcome::Unbuilt);
-            return LookupProbe::Fallback(LookupIndexExplain::fallback(
-                label,
-                LookupIndexExplainOutcome::Unbuilt,
-            ));
-        };
         // `matched_shape` found every column pinned, so a missing product is
         // one past the bound.
         let Some(keys) = key_tuples(&self.specs[shape].columns, values_for) else {
@@ -2008,15 +2031,11 @@ impl LookupIndexState {
     fn probe_runtime_filter(
         &self,
         spec: usize,
-        index: Option<&Arc<LookupIndexView>>,
+        index: &Arc<LookupIndexView>,
         scan_files: &[ObjectMeta],
         keys: &[Vec<ScalarValue>],
     ) -> RuntimeProbe {
         let label = self.shape_label(spec);
-        let Some(index) = index else {
-            self.record_probe(label, ProbeOutcome::Unbuilt);
-            return RuntimeProbe::IndexUnusable;
-        };
         let covered = scan_files
             .iter()
             .filter(|file| index.covers(file.location.as_ref()))
@@ -2405,6 +2424,12 @@ impl BuildClaim {
         self.finish(false);
     }
 
+    /// Settles a build the pool refused, which [`LookupIndexState::report_refusal`]
+    /// has already counted as unpublished.
+    fn refused(mut self) {
+        self.finish(false);
+    }
+
     fn finish(&mut self, published: bool) {
         self.settled = true;
         self.state
@@ -2462,12 +2487,13 @@ pub(crate) fn spawn_build(
                 if state.publish_runs(runs, Some(&live)) {
                     claim.published();
                 } else {
-                    claim.unpublished();
+                    // `publish_runs` reported the pool's refusal, which counts it.
+                    claim.refused();
                 }
             }
             Ok(None) => {
                 state.report_refusal();
-                claim.unpublished();
+                claim.refused();
             }
             Err(error) => {
                 if first_failure {
@@ -2724,10 +2750,10 @@ pub(crate) async fn verify_against_read_back(
             uncovered_files: uncovered.len(),
             ..LookupIndexVerification::default()
         };
-        for ((shape, read), label) in view.views.iter().zip(read).zip(&view.labels) {
+        for ((shape, read), key) in view.views.iter().zip(read).zip(view.shapes.iter()) {
             let published = entries_of(&shape.run_list(), &names);
             let read = entries_of(&[Arc::new(read)], &names);
-            diff_entries(label, &published, &read, &mut report);
+            diff_entries(&key.label, &published, &read, &mut report);
         }
         report
     })
@@ -3203,7 +3229,7 @@ mod tests {
             vec![true, false],
             "only the key whose encoding changed is reset"
         );
-        let view = state.published().expect("published");
+        let view = state.published();
         assert!(
             !view.covers("table/snapshot/a.vortex"),
             "the published view must not cover a file the reset key does not"
@@ -3222,7 +3248,7 @@ mod tests {
         for (file, first, batch) in batches {
             observer.batch_written(&path(file), *first, batch);
         }
-        state.finish_write(&observer, false).await;
+        state.finish_write(&observer).await;
     }
 
     /// With its indexing thread behind and its queue full, an append drops
@@ -3252,14 +3278,10 @@ mod tests {
             }
             go.send(()).expect("release the indexing thread");
             let unpublished = state.counters.builds_unpublished.load(Ordering::Relaxed);
-            state.finish_write(&observer, replaces).await;
+            state.finish_write(&observer).await;
             let covered: Vec<bool> = files
                 .iter()
-                .map(|file| {
-                    state
-                        .published()
-                        .is_some_and(|view| view.covers(&format!("table/snapshot/{file}")))
-                })
+                .map(|file| state.published().covers(&format!("table/snapshot/{file}")))
                 .collect();
             let unpublished =
                 state.counters.builds_unpublished.load(Ordering::Relaxed) - unpublished;
@@ -3317,14 +3339,10 @@ mod tests {
             );
             observer.batch_written(&path("split.vortex"), 3, &unkeyed);
             let unpublished = state.counters.builds_unpublished.load(Ordering::Relaxed);
-            state.finish_write(&observer, replaces).await;
+            state.finish_write(&observer).await;
             let covered: Vec<bool> = ["good.vortex", "split.vortex"]
                 .iter()
-                .map(|file| {
-                    state
-                        .published()
-                        .is_some_and(|view| view.covers(&format!("table/snapshot/{file}")))
-                })
+                .map(|file| state.published().covers(&format!("table/snapshot/{file}")))
                 .collect();
             assert_eq!(
                 (
@@ -3400,15 +3418,13 @@ mod tests {
             0,
             &keyed_batch(&[Some(1); 2], &[Some("a"), Some("b")]),
         );
-        state.finish_write(&observer, false).await;
+        state.finish_write(&observer).await;
         observer.batch_written(
             &path("late.vortex"),
             0,
             &keyed_batch(&[Some(2); 2], &[Some("c"), Some("d")]),
         );
-        let view = state
-            .published()
-            .expect("the finished write published its run");
+        let view = state.published();
         assert!(view.covers("table/snapshot/first.vortex"));
         assert!(
             !view.covers("table/snapshot/late.vortex"),
@@ -3436,12 +3452,10 @@ mod tests {
             );
         }
         let unpublished = state.counters.builds_unpublished.load(Ordering::Relaxed);
-        state.finish_write(&observer, false).await;
+        state.finish_write(&observer).await;
         assert_eq!(
             (
-                state
-                    .published()
-                    .is_some_and(|view| view.covers("table/snapshot/burst.vortex")),
+                state.published().covers("table/snapshot/burst.vortex"),
                 state.counters.builds_unpublished.load(Ordering::Relaxed) - unpublished,
             ),
             (true, 0),
@@ -3467,19 +3481,16 @@ mod tests {
         let observer = state.write_observer(false);
         observer.batch_written(&path("large.vortex"), 0, &keyed_batch(&tenants, &services));
         // No reconcile ever reports the file visible.
-        state.finish_write(&observer, false).await;
+        state.finish_write(&observer).await;
         let deadline = Instant::now() + Duration::from_mins(1);
-        while !state
-            .published()
-            .is_some_and(|view| view.covers("table/snapshot/large.vortex"))
-        {
+        while !state.published().covers("table/snapshot/large.vortex") {
             assert!(
                 Instant::now() < deadline,
                 "a large write's run was never published"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let view = state.published().expect("published");
+        let view = state.published();
         assert_eq!(view.rows, rows, "the run holds every row of the write");
     }
 
@@ -3572,7 +3583,7 @@ mod tests {
                 .collect();
             write(&state, &batches).await;
         }
-        let view = state.published().expect("published");
+        let view = state.published();
         let flatten = |per_file: &HashMap<String, Vec<u64>>| {
             let mut rows: Vec<(String, u64)> = per_file
                 .iter()
@@ -3590,7 +3601,7 @@ mod tests {
             vec![1, 4, 9],
             vec![3, 3, 99],
         ] {
-            let hit = selection(state.probe(Some(&view), &tenant_values(&tenants)));
+            let hit = selection(state.probe(&view, &tenant_values(&tenants)));
             let mut expected: Vec<(String, u64)> = truth
                 .iter()
                 .filter(|((tenant, _), _)| tenants.contains(tenant))
@@ -3633,11 +3644,7 @@ mod tests {
         }
         // A NULL literal matches nothing.
         let null = |column: &str| (column == "tenant").then(|| vec![ScalarValue::Int64(None)]);
-        assert!(
-            selection(state.probe(Some(&view), &null))
-                .per_file
-                .is_empty()
-        );
+        assert!(selection(state.probe(&view, &null)).per_file.is_empty());
     }
 
     #[tokio::test]
@@ -3653,7 +3660,7 @@ mod tests {
             )],
         )
         .await;
-        let view = state.published().expect("published");
+        let view = state.published();
         assert!(view.covers(path("a.vortex").as_ref()));
         assert!(
             view.covers("another/dir/a.vortex"),
@@ -3663,7 +3670,7 @@ mod tests {
 
         // Key 1 is at rows 0 and 2 of `a`; `b` is unindexed, so read whole.
         let (groups, provider, explain, uncovered) =
-            selection(state.probe(Some(&view), &tenant_values(&[1])))
+            selection(state.probe(&view, &tenant_values(&[1])))
                 .restrict(group(&["a.vortex", "b.vortex"]), no_table_plans());
         assert!(uncovered);
         assert_eq!(explain.outcome, LookupIndexExplainOutcome::Selected);
@@ -3690,9 +3697,8 @@ mod tests {
 
         // A key in no covered file drops `a` but still reads `b`, so it is not
         // `empty`.
-        let (groups, _, explain, uncovered) =
-            selection(state.probe(Some(&view), &tenant_values(&[7])))
-                .restrict(group(&["a.vortex", "b.vortex"]), no_table_plans());
+        let (groups, _, explain, uncovered) = selection(state.probe(&view, &tenant_values(&[7])))
+            .restrict(group(&["a.vortex", "b.vortex"]), no_table_plans());
         assert!(uncovered);
         assert_eq!(explain.outcome, LookupIndexExplainOutcome::Selected);
         assert_eq!(
@@ -3708,15 +3714,14 @@ mod tests {
 
         // Only covered files: an empty answer reads nothing.
         let (groups, provider, explain, uncovered) =
-            selection(state.probe(Some(&view), &tenant_values(&[7])))
+            selection(state.probe(&view, &tenant_values(&[7])))
                 .restrict(group(&["a.vortex"]), no_table_plans());
         assert!(!uncovered && groups.is_empty() && provider.is_none());
         assert_eq!(explain.outcome, LookupIndexExplainOutcome::Empty);
 
         // Only uncovered files: nothing to narrow.
-        let (_, provider, explain, uncovered) =
-            selection(state.probe(Some(&view), &tenant_values(&[1])))
-                .restrict(group(&["b.vortex"]), no_table_plans());
+        let (_, provider, explain, uncovered) = selection(state.probe(&view, &tenant_values(&[1])))
+            .restrict(group(&["b.vortex"]), no_table_plans());
         assert!(uncovered && provider.is_none());
         assert_eq!(explain.outcome, LookupIndexExplainOutcome::Unbuilt);
         assert_eq!(explain.uncovered_files, Some(1));
@@ -3786,7 +3791,7 @@ mod tests {
         reconcile(1, &["a.vortex", "b.vortex"]);
         // `a` was compacted away.
         reconcile(2, &["b.vortex"]);
-        let view = state.published().expect("published");
+        let view = state.published();
         assert!(!view.covers("a.vortex") && view.covers("b.vortex"));
         let after = state.counters().index_bytes;
         assert!(
@@ -3806,7 +3811,7 @@ mod tests {
         let tenants: Vec<Option<i64>> = (0..1_000).map(Some).collect();
         let services: Vec<Option<&str>> = vec![Some("s"); 1_000];
         write(&state, &[("a.vortex", 0, keyed_batch(&tenants, &services))]).await;
-        assert!(!state.published().expect("view").covers("a.vortex"));
+        assert!(!state.published().covers("a.vortex"));
         let counters = state.counters();
         assert_eq!(
             (counters.builds_published, counters.builds_unpublished),
@@ -3833,9 +3838,9 @@ mod tests {
         )
         .expect("batch");
         observer.batch_written(&path("a.vortex"), 1, &other);
-        state.finish_write(&observer, false).await;
+        state.finish_write(&observer).await;
         assert!(
-            !state.published().expect("view").covers("a.vortex"),
+            !state.published().covers("a.vortex"),
             "a run missing rows is never published"
         );
     }
