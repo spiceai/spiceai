@@ -194,6 +194,7 @@ mod snapshot_source;
 mod snowflake;
 #[cfg(feature = "snowflake")]
 mod snowflake_catalog;
+mod source_unavailable;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;

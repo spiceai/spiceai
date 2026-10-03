@@ -17351,6 +17351,7 @@ dependencies = [
  "runtime-udfs-api",
  "rusqlite",
  "rustls",
+ "s3-event-notifications",
  "s3_vectors",
  "scheduler",
  "schemars 1.2.1",
@@ -17426,10 +17427,12 @@ dependencies = [
  "duckdb",
  "fundu",
  "futures",
+ "gethostname",
  "hex",
  "object_store 0.13.2",
  "object_store_occ",
  "opentelemetry",
+ "parking_lot",
  "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-object-store",
@@ -17437,6 +17440,7 @@ dependencies = [
  "runtime-query-engine",
  "runtime-secrets",
  "rusqlite",
+ "s3-event-notifications",
  "secrecy",
  "serde",
  "serde_json",
@@ -18570,6 +18574,21 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "s3-event-notifications"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-credential-bridge",
+ "aws-sdk-sqs",
+ "percent-encoding",
+ "serde_json",
+ "snafu",
+ "url",
+]
 
 [[package]]
 name = "s3_vectors"
