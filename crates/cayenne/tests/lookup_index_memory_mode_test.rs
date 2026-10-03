@@ -27,11 +27,12 @@ limitations under the License.
 mod common;
 
 use common::lookup_index::{
-    TableSpec, counters, memory_mode_config, open_table, overwrite, rendered, runtime_with_pool,
+    TableSpec, counters, memory_mode_config, open_table, overwrite, poll_until, rendered,
+    runtime_with_pool,
 };
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -360,8 +361,7 @@ async fn memory_mode_in_lists_over_a_compound_key_use_the_index() {
     );
     let after = counters(&indexed);
     assert_eq!(
-        (after.full, after.full),
-        (before.full, before.full),
+        after.full, before.full,
         "a product past the bound must not be probed: {after:?}"
     );
     let explain = query(&indexed, "indexed", &format!("EXPLAIN {too_many}"))
@@ -451,11 +451,16 @@ async fn memory_mode_index_memory_follows_its_rows() {
 
     drop(table);
     drop(env);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while pool.reserved() > 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(pool.reserved(), 0, "a dropped table must release its index");
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        async || match pool.reserved() {
+            0 => Ok(()),
+            still => Err(still),
+        },
+        |still| format!("a dropped table must release its index: {still} bytes still reserved"),
+    )
+    .await;
 }
 
 /// When the pool cannot fit a batch's index, lookups read that batch in full

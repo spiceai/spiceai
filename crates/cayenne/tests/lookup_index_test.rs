@@ -28,11 +28,12 @@ limitations under the License.
 mod common;
 
 use common::lookup_index::{
-    SplitMix64, TableSpec, counters, open_table, overwrite, query, rendered,
+    SplitMix64, TableSpec, counters, insert, open_table, overwrite, poll_until, query, rendered,
+    uncovered_files,
 };
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -161,53 +162,23 @@ fn service_rows(offset: i64, rows: usize) -> RecordBatch {
     .expect("fixture batch")
 }
 
+/// A table with no primary key, as a serving view has, in file mode (see
+/// `common::lookup_index::file_mode_config`): its small target file size
+/// spreads the table over several Vortex files, so the index has candidate
+/// FILES to prune, not just rows within one file. A table under test and its
+/// control differ only in `index_keys`, which is the whole comparison.
 async fn build_table(
     fixture: &common::TestFixture,
     table_name: &str,
     index_keys: &[&[&str]],
     runtime_env: Arc<RuntimeEnv>,
 ) -> Arc<CayenneTableProvider> {
-    // A small target file size so the table spans several Vortex files and the
-    // index has candidate FILES to prune, not just rows within one file. A table
-    // under test and its control differ only in `index_keys`, which is the whole
-    // comparison.
-    let vortex_config = VortexConfig {
-        target_vortex_file_size_mb: 1,
-        ..VortexConfig::default()
-    };
-    build_table_with(fixture, table_name, index_keys, runtime_env, vortex_config).await
-}
-
-async fn build_table_with(
-    fixture: &common::TestFixture,
-    table_name: &str,
-    index_keys: &[&[&str]],
-    runtime_env: Arc<RuntimeEnv>,
-    vortex_config: VortexConfig,
-) -> Arc<CayenneTableProvider> {
-    // A serving view has no primary key; match that shape.
     open_table(
         fixture,
         runtime_env,
-        TableSpec::new(table_name, service_schema(), index_keys).config(vortex_config),
+        TableSpec::new(table_name, service_schema(), index_keys),
     )
     .await
-}
-
-async fn insert(provider: &Arc<CayenneTableProvider>, table_name: &str, batch: RecordBatch) {
-    let ctx = SessionContext::new();
-    ctx.register_table(table_name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("register target");
-    let mem = datafusion::datasource::MemTable::try_new(service_schema(), vec![vec![batch]])
-        .expect("memtable");
-    ctx.register_table("src", Arc::new(mem))
-        .expect("register src");
-    ctx.sql(&format!("INSERT INTO {table_name} SELECT * FROM src"))
-        .await
-        .expect("insert plan")
-        .collect()
-        .await
-        .expect("insert");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -258,19 +229,21 @@ async fn wait_for_index(provider: &Arc<CayenneTableProvider>, table: &str) {
         "SELECT * FROM {table} WHERE \"TenantId\" = '{DUP_ACCOUNT}' \
          AND \"ServiceId\" = '{DUP_APPLICATION}' AND \"Active\" = 1 LIMIT 1"
     );
-    let deadline = Instant::now() + Duration::from_mins(2);
-    loop {
-        let _ = query(provider, table, &sql).await;
-        if counters(provider).access_plans_attached > 0 {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "point-lookup index was never published: {:?}",
-            counters(provider)
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+    poll_until(
+        Duration::from_mins(2),
+        Duration::from_millis(250),
+        async || {
+            let _ = query(provider, table, &sql).await;
+            let now = counters(provider);
+            if now.access_plans_attached > 0 {
+                Ok(())
+            } else {
+                Err(now)
+            }
+        },
+        |now| format!("point-lookup index was never published: {now:?}"),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -340,13 +313,13 @@ async fn lookup_index_matches_the_ordinary_scan() {
     );
     // A NULL key column is never indexed, so the pool-shape keys the fixture
     // nulls out are fully covered probes that find no row.
-    let selected = after_sample.full - before.full;
+    let full = after_sample.full - before.full;
     assert!(
-        selected >= 30,
+        full >= 30,
         "too few lookups were fully covered: {before:?} -> {after_sample:?}"
     );
     assert!(
-        after_sample.access_plans_attached - before.access_plans_attached >= selected,
+        after_sample.access_plans_attached - before.access_plans_attached >= full,
         "row selections were not attached to the Vortex scan: {after_sample:?}"
     );
     // One candidate file per probe on a unique key is the point of the index;
@@ -1011,12 +984,10 @@ async fn a_large_overwrite_is_covered_when_it_becomes_visible() {
         sort_columns: vec!["AutoId".to_string()],
         ..VortexConfig::default()
     };
-    let table = build_table_with(
+    let table = open_table(
         &fixture,
-        INDEXED_WRITE_TIME,
-        &INDEX_KEYS,
         Arc::clone(&runtime_env),
-        vortex_config,
+        TableSpec::new(INDEXED_WRITE_TIME, service_schema(), &INDEX_KEYS).config(vortex_config),
     )
     .await;
     overwrite(&table, vec![service_rows(0, LARGE)]).await;
@@ -1209,38 +1180,29 @@ async fn a_background_build_indexes_the_files_of_protected_snapshots() {
          AND \"ServiceId\" = 'MG{id:032x}'",
         id % ACCOUNTS
     );
-    let uncovered = |plan: &str| -> usize {
-        plan.split("uncovered_files=")
-            .skip(1)
-            .filter_map(|rest| {
-                rest.split(|c: char| !c.is_ascii_digit())
-                    .next()?
-                    .parse::<usize>()
-                    .ok()
-            })
-            .sum()
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        assert_eq!(
-            rendered(&query(&table, TABLE, &lookup).await),
-            vec!["updated-11".to_string()],
-            "the lookup must return exactly the upserted row"
-        );
-        let plan = arrow::util::pretty::pretty_format_batches(
-            &query(&table, TABLE, &format!("EXPLAIN ANALYZE {lookup}")).await,
-        )
-        .expect("format plan")
-        .to_string();
-        if plan.contains("lookup_index_outcome=full") && uncovered(&plan) == 0 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the background build never indexed every file the lookup reads\n{plan}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        async || {
+            assert_eq!(
+                rendered(&query(&table, TABLE, &lookup).await),
+                vec!["updated-11".to_string()],
+                "the lookup must return exactly the upserted row"
+            );
+            let plan = arrow::util::pretty::pretty_format_batches(
+                &query(&table, TABLE, &format!("EXPLAIN ANALYZE {lookup}")).await,
+            )
+            .expect("format plan")
+            .to_string();
+            if plan.contains("lookup_index_outcome=full") && uncovered_files(&plan) == 0 {
+                Ok(())
+            } else {
+                Err(plan)
+            }
+        },
+        |plan| format!("the background build never indexed every file the lookup reads\n{plan}"),
+    )
+    .await;
 }
 
 /// An `IN` list on an indexed key is answered from the index, as one batched
@@ -1336,8 +1298,8 @@ async fn in_lists_are_answered_from_the_index() {
     );
     let after = counters(&indexed);
     assert_eq!(
-        (after.full, after.full, after.none),
-        (before.full, before.full, before.none),
+        (after.full, after.none),
+        (before.full, before.none),
         "a negated list must not be probed: {after:?}"
     );
 }
@@ -1429,14 +1391,14 @@ async fn keys_sharing_a_word_return_exactly_their_own_rows() {
         }
     }
     let after = counters(&indexed);
-    let selected = after.full - before.full;
+    let full = after.full - before.full;
     let candidates = after.candidate_rows - before.candidate_rows;
     println!(
-        "{lookups} lookups: {selected} answered from the index, {candidates} candidate rows, {result_rows} result rows"
+        "{lookups} lookups: {full} answered from the index, {candidates} candidate rows, {result_rows} result rows"
     );
     assert!(
-        selected >= lookups,
-        "every lookup must use the index: {selected} of {lookups}"
+        full >= lookups,
+        "every lookup must use the index: {full} of {lookups}"
     );
     assert!(
         candidates > 100 * result_rows,
