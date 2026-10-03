@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Process-level WAL qualification. Every request and response is retained as JSONL.
 
-The optional SlateDB oracle runs the same committed histories in a separately
-packaged implementation. Its finer-grained conflict policy is not our oracle:
-multi-process OCC is checked separately against serial histories and invariants.
+SlateDB and Redis can run the same committed histories as independent oracles.
+SlateDB also checks overlays and historical snapshots. Redis checks MULTI/EXEC
+batches and whole-domain WATCH conflicts; it does not emulate MVCC snapshots.
+SlateDB's finer-grained conflict policy is not compared to whole-head WAL OCC.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+from contextlib import nullcontext
 import importlib.metadata
 import json
 import os
@@ -120,7 +122,7 @@ async def slate_rows(reader, prefix=""):
     return result
 
 
-async def differential(executable, root, artifacts, use_slate, seed, steps):
+async def differential(executable, root, artifacts, use_slate, redis, seed, steps):
     db = None
     oracle_store = None
     if use_slate:
@@ -139,13 +141,16 @@ async def differential(executable, root, artifacts, use_slate, seed, steps):
     keys = [f"keys/{n:02}" for n in range(19)] + ["é/雪", "é/a", "keys/\x00", "z" * 1024]
     try:
         for step in range(steps):
+            before = rows(model)
             worker.request(op="begin", name="tx")
             tx = await db.begin(IsolationLevel.SERIALIZABLE_SNAPSHOT) if db else None
             changes = {}
+            mutations = []
             for _ in range(rng.randrange(1, 6)):
                 key = rng.choice(keys)
                 value = None if rng.randrange(4) == 0 else list(rng.randbytes(rng.choice([0, 1, 7, 63, 1024])))
                 changes[key] = value
+                mutations.append((key, value))
                 if value is None:
                     model.pop(key, None)
                     if tx:
@@ -166,6 +171,8 @@ async def differential(executable, root, artifacts, use_slate, seed, steps):
                 if tx:
                     value = await tx.get(key.encode())
                     assert own == (list(value) if value is not None else None), (seed, step, key, "SlateDB point overlay")
+            if redis:
+                assert redis.scan() == before, (seed, step, "Redis before commit")
             receipt = worker.request(op="prepare", name="tx")["receipt"]
             os.fsync(worker.log.fileno())
             result = worker.request(op="commit", name="tx")
@@ -174,10 +181,17 @@ async def differential(executable, root, artifacts, use_slate, seed, steps):
                 handle = await tx.commit()
                 assert handle is not None
                 await handle.await_durable()
+            if redis:
+                redis.commit(mutations)
             actual = worker.read()
             assert actual["rows"] == rows(model), (seed, step, "committed state")
             if db:
                 assert actual["rows"] == await slate_rows(db), (seed, step, "SlateDB committed state")
+            if redis:
+                for prefix in ["", "keys/0", "é/", "absent/"]:
+                    assert worker.read(prefix=prefix)["rows"] == redis.scan(prefix), (seed, step, prefix, "Redis committed scan")
+                for key in [keys[step % len(keys)], next(iter(changes)), "absent/key"]:
+                    assert worker.request(op="get", key=key)["value"] == redis.get(key), (seed, step, key, "Redis committed point")
             assert worker.request(op="resolve", receipt=receipt)["outcome"] == "committed"
             if step % 13 == 0:
                 name = f"snapshot-{step}"
@@ -204,12 +218,36 @@ async def differential(executable, root, artifacts, use_slate, seed, steps):
                     db = await DbBuilder("oracle", oracle_store).build()
                     assert await slate_rows(db) == rows(model), (seed, step, "SlateDB recovery")
                 assert worker.read()["rows"] == rows(model), (seed, step, "WAL recovery")
+                if redis:
+                    redis.reconnect()
+                    assert worker.read()["rows"] == redis.scan(), (seed, step, "Redis client reconnect")
         worker.close()
     finally:
         worker.close(kill=True)
         if db:
             await db.shutdown()
     print(f"history seed={seed}: {steps} transactions; reads, overlays, snapshots, checkpoints, reopen agree", flush=True)
+    if redis:
+        print(f"Redis seed={seed}: {steps} atomic batches; committed point/prefix reads and client reconnect agree", flush=True)
+
+
+def redis_conflicts(executable, root, artifacts, redis):
+    # A whole Redis hash is the same conflict domain as one WAL head. These
+    # writes change data: checkpoints and no-op publications have no Redis analog.
+    with Worker(executable, root / "redis-conflict", artifacts, "redis-conflict-wal") as worker:
+        for winner, loser in [
+            ({"new/key": []}, {"stale/key": [9]}),
+            ({"new/key": [0, 255]}, {"new/key": None, "stale/key": []}),
+            ({"new/key": None}, {"new/key": [1]}),
+        ]:
+            receipt = worker.prepare(loser, name="stale")
+            worker.prepare(winner, name="winner")
+            assert worker.request(op="commit", name="winner")["outcome"] == "committed"
+            result = worker.request(op="commit", name="stale")
+            assert result["outcome"] == redis.conflict(list(winner.items()), list(loser.items()))
+            assert worker.request(op="resolve", receipt=receipt)["outcome"] == "rejected"
+            assert worker.read()["rows"] == redis.scan()
+    print("Redis WATCH: 3 stale batches rejected; insert, overwrite and delete results agree", flush=True)
 
 
 def atomic_state(state):
@@ -334,6 +372,7 @@ def main():
     parser.add_argument("--driver", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--slatedb", action="store_true", help="require the pinned independent oracle")
+    parser.add_argument("--redis-url", help="require a Redis oracle, e.g. redis://127.0.0.1:6379/0")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 17, 5489])
     parser.add_argument("--steps", type=int, default=96)
     args = parser.parse_args()
@@ -346,8 +385,17 @@ def main():
         print(f"independent oracle: SlateDB {version}", flush=True)
     else:
         print("SlateDB differential testing NOT RUN (pass --slatedb)", flush=True)
+    if args.redis_url:
+        from redis_oracle import RedisOracle
+    else:
+        print("Redis differential testing NOT RUN (pass --redis-url)", flush=True)
     for seed in args.seeds:
-        asyncio.run(differential(args.driver.resolve(), root, args.artifacts, args.slatedb, seed, args.steps))
+        oracle = RedisOracle(args.redis_url, args.artifacts, f"redis-{seed}") if args.redis_url else nullcontext()
+        with oracle as redis:
+            asyncio.run(differential(args.driver.resolve(), root, args.artifacts, args.slatedb, redis, seed, args.steps))
+    if args.redis_url:
+        with RedisOracle(args.redis_url, args.artifacts, "redis-conflict") as redis:
+            redis_conflicts(args.driver.resolve(), root, args.artifacts, redis)
     concurrency(args.driver.resolve(), root, args.artifacts)
     crashes(args.driver.resolve(), root, args.artifacts)
     print("PASS: WAL process-level qualification", flush=True)

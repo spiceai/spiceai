@@ -152,6 +152,34 @@ not compare identical abort decisions: SlateDB's finer-grained validation differ
 from this library's whole-head OCC. Concurrent CAS and atomicity are checked by
 separate multi-process histories.
 
+For three independent implementations, start a local Redis service (or use an
+existing one) and add `--redis-url redis://127.0.0.1:6379/0` to the harness command:
+
+```sh
+docker run --rm -d --name spice-wal-redis -p 127.0.0.1:6379:6379 redis:7.4.11-bookworm
+/tmp/wal-oracle/bin/python test/object_store_occ/e2e.py \
+  --driver target/debug/examples/wal_test_driver \
+  --artifacts /tmp/wal-e2e-three-oracles --slatedb \
+  --redis-url redis://127.0.0.1:6379/0
+docker stop spice-wal-redis
+```
+
+Redis receives each batch's original mutation sequence through `MULTI`/`EXEC`.
+Committed binary values, missing versus empty values, deletes, overwrites and
+point reads are compared with WAL and SlateDB. Atomic `HGETALL` reads are sorted
+and filtered for prefix comparisons. Three forced `WATCH` conflicts additionally
+compare stale-batch rejection with WAL's whole-domain OCC for inserts, overwrites
+and deletes. Checkpoints and no-op publications have no Redis counterpart.
+Historical snapshots and uncommitted overlays remain WAL/SlateDB comparisons;
+Redis client reconnect checks do not qualify Redis crash recovery or durability.
+
+The Redis oracle uses pinned redis-py 6.4.0, creates a unique hash per history,
+records version, requests and results in JSONL, and deletes only that hash on
+exit. It never flushes the service or restarts an existing server. Passing
+`--redis-url` requires Redis to be available; a missing oracle fails the run.
+
 `.github/workflows/object_store_wal.yml` runs these suites and the mandatory
 SlateDB oracle on Linux and macOS for changes to this crate and in the merge queue.
+Linux also requires Redis 7.4.11 in a health-checked service container; GitHub
+service containers are unavailable on macOS. Both oracles are test dependencies.
 This qualifies the library path; it is not a Cayenne/runtime integration test.

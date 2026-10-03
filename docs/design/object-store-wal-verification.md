@@ -194,6 +194,24 @@ and runs the full comparison on Linux and macOS. See that check on PR #14732 for
 its captured output and downloadable histories; the local model run above is not
 a substitute for an oracle run. PyPI was unreachable from the local sandbox.
 
+The Linux job also requires a Redis 7.4.11 service container and redis-py 6.4.0.
+Each committed history is compared across WAL, SlateDB and Redis; Redis receives
+the original mutations in an atomic `MULTI`/`EXEC` batch. Its JSONL artifacts
+include server/client versions, mutations, EXEC replies, point reads and full
+hash reads normalized for ordered prefix comparisons. Three forced native
+`WATCH` conflicts compare whole-domain stale-batch rejection for inserts,
+overwrites and deletes. SlateDB remains the independent oracle for historical
+MVCC snapshots and transactional overlays. Redis reconnect checks only reconnect
+the client; they do not simulate Redis crashes or qualify its durability.
+
+For a local service, add `--redis-url redis://127.0.0.1:6379/0` to the harness
+command together with `--slatedb`. Only a uniquely named test hash is mutated and
+deleted; the harness never flushes a database. The Linux CI flag is mandatory,
+so an unavailable Redis service fails the job. macOS keeps the SlateDB comparison
+because GitHub service containers require Linux. The session's local Docker
+socket is denied by the sandbox, so Redis results must come from that CI job;
+the local model output above is not evidence of a Redis run.
+
 
 Cancellation reproduction command, with the same test source on `b80ab208` and
 the worker implementation (an isolated target directory avoids sharing artifacts
