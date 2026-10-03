@@ -1,0 +1,2 @@
+# Independent test oracle only; never linked into Spice.
+slatedb==0.17.0

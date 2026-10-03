@@ -21,6 +21,8 @@ limitations under the License.
 
 pub mod local_conditional_put;
 mod state;
+pub mod store;
+pub mod wal;
 
 use snafu::Snafu;
 
