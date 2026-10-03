@@ -239,6 +239,47 @@ pub enum SnapshotsCreationPolicy {
     OnChange,
 }
 
+/// Whether an accelerated view may publish or restore a snapshot of a
+/// materialization that spans more than one read of its sources.
+///
+/// A view materializes a query, and every table it reads resolves its own read view
+/// independently — so a materialization over two reads captures each source at a
+/// different position, and can store rows that never existed together in the source.
+/// Publishing that as a snapshot makes the discrepancy durable and reusable; a
+/// `bootstrap_only` consumer with the default `consistent_read` is refused rather
+/// than serving that archive without opting in. Each published view archive
+/// records this setting, so a later single-read replan of the same SQL cannot
+/// restore an `independent_reads` archive either.
+///
+/// Only meaningful for views. A dataset that sets a non-default value is refused at
+/// load: a dataset materializes a single source and always reads it once, so the
+/// option cannot apply.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotsConsistency {
+    /// Snapshot only a materialization proven to come from a single read (default).
+    /// A view whose query reads more than once is refused at load with an explanation,
+    /// whether it would publish or only bootstrap. Each later publish consumes the
+    /// read-shape attested from the refresh scan that wrote the rows, bound to that
+    /// materialization's epoch — not a fresh re-plan after the fact. An ordinary
+    /// query does not record, and a later refresh's attestation cannot approve the
+    /// previous generation. Each published archive records this setting so a later
+    /// `consistent_read` bootstrap can refuse an archive published under `independent_reads`
+    /// even if the consumer's current plan happens to read once. A missing stamp is
+    /// refused the same way: it cannot be shown to have come from a single read.
+    #[default]
+    ConsistentRead,
+    /// Publish or restore a materialization whose query reads its sources independently,
+    /// each at its own point in time, so the stored rows may span several source
+    /// positions. Choose this only when the view's consumers tolerate that. Only the
+    /// single-read requirement is waived: a publish is still withheld while a dependency
+    /// the view read was not at its configured definition. Archives published under this
+    /// setting are stamped `independent_reads` and a default `consistent_read` consumer
+    /// will not restore them.
+    IndependentReads,
+}
+
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
     *b == SnapshotBehavior::default()
@@ -257,6 +298,11 @@ fn is_default_snapshots_reset_expiry_on_load(c: &SnapshotsResetExpiryOnLoad) -> 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshots_creation_policy(c: &SnapshotsCreationPolicy) -> bool {
     *c == SnapshotsCreationPolicy::default()
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshots_consistency(c: &SnapshotsConsistency) -> bool {
+    *c == SnapshotsConsistency::default()
 }
 
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -632,6 +678,33 @@ pub struct Acceleration {
 
     #[serde(default, skip_serializing_if = "is_default_snapshots_creation_policy")]
     pub snapshots_creation_policy: SnapshotsCreationPolicy,
+
+    /// For an accelerated view: whether a snapshot may be published or restored
+    /// from a materialization that spans more than one read of the view's sources.
+    ///
+    /// Options: `consistent_read` (default) / `independent_reads`.
+    ///
+    /// Each published view archive records the producing setting. The default
+    /// `consistent_read` restores only archives stamped as a single read, so a
+    /// later single-read replan of the same SQL cannot serve rows captured under
+    /// `independent_reads`.
+    ///
+    /// Only meaningful for views. A dataset that sets `independent_reads` is refused at
+    /// load — a dataset always materializes a single source read, so the option
+    /// cannot apply. Omit the field, or set `consistent_read`, on datasets.
+    ///
+    /// ```yaml
+    /// views:
+    ///   - name: orders_by_region
+    ///     sql: SELECT region, COUNT(*) FROM orders GROUP BY region
+    ///     acceleration:
+    ///       enabled: true
+    ///       engine: duckdb
+    ///       snapshots: enabled
+    ///       snapshots_consistency: independent_reads
+    /// ```
+    #[serde(default, skip_serializing_if = "is_default_snapshots_consistency")]
+    pub snapshots_consistency: SnapshotsConsistency,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -757,6 +830,7 @@ impl Default for Acceleration {
             snapshots_compaction: SnapshotsCompaction::Disabled,
             snapshots_reset_expiry_on_load: SnapshotsResetExpiryOnLoad::Disabled,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
+            snapshots_consistency: SnapshotsConsistency::default(),
         }
     }
 }
@@ -1152,6 +1226,55 @@ mod tests {
         let yaml = "refresh_mode: snapshot";
         let accel: Acceleration = yaml::from_str(yaml).expect("should parse");
         assert_eq!(accel.refresh_mode, Some(RefreshMode::Snapshot));
+    }
+
+    #[test]
+    fn snapshots_consistency_defaults_to_consistent_read() {
+        let acceleration = acceleration_from_yaml("engine: duckdb");
+        assert_eq!(
+            acceleration.snapshots_consistency,
+            SnapshotsConsistency::ConsistentRead
+        );
+    }
+
+    #[test]
+    fn snapshots_consistency_deserializes_each_accepted_value() {
+        for (yaml_value, expected) in [
+            ("consistent_read", SnapshotsConsistency::ConsistentRead),
+            ("independent_reads", SnapshotsConsistency::IndependentReads),
+        ] {
+            let acceleration =
+                acceleration_from_yaml(&format!("snapshots_consistency: {yaml_value}"));
+            assert_eq!(
+                acceleration.snapshots_consistency, expected,
+                "unexpected parse for '{yaml_value}'"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshots_consistency_rejects_an_unknown_value() {
+        let err = yaml::from_str::<Acceleration>("snapshots_consistency: always")
+            .expect_err("an unknown snapshots_consistency value must not parse");
+        let message = err.to_string();
+        assert!(
+            message.contains("independent_reads") || message.contains("consistent_read"),
+            "the parse error should name the accepted values: {message}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_block_reports_independent_reads_as_discarded() {
+        let acceleration = acceleration_from_yaml(
+            r"
+                enabled: false
+                snapshots_consistency: independent_reads
+            ",
+        );
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            vec!["snapshots_consistency".to_string()]
+        );
     }
 
     #[test]

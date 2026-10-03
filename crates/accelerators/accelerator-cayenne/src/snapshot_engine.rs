@@ -49,7 +49,7 @@ limitations under the License.
 //! on import, making the snapshot portable across nodes with different
 //! local layouts.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -81,6 +81,343 @@ fn slice_archive_path(dataset_name: &str) -> String {
 /// archive. Cayenne always opens the metastore in WAL journal mode, so the
 /// `-wal` and `-shm` sidecars may be present alongside `cayenne.db`.
 const METASTORE_FILES: &[&str] = &["cayenne.db", "cayenne.db-wal", "cayenne.db-shm"];
+
+/// Resolve a path a slice declares against the snapshot's data anchor, refusing anything
+/// that lands outside it.
+///
+/// Load-bearing for verification rather than defensive. Verification asks whether the paths
+/// a slice names are present, and a path outside the anchor can be present on THIS host
+/// while never having been in the archive — `export_dataset` deliberately preserves an
+/// absolute path it cannot re-anchor, so a slice can name `/some/other/tree/x.vortex`. Left
+/// unchecked, verification passes because a file happens to exist there, the import then
+/// records metadata pointing at unrelated local files, and a restored query returns rows the
+/// snapshot never contained. Refusing is the only safe answer: an archive cannot contain a
+/// file that was never under the directories it walked.
+fn resolve_under_anchor(anchor: &Path, path: &str, is_relative: bool) -> Result<PathBuf, String> {
+    let candidate = if is_relative {
+        anchor.join(path)
+    } else {
+        PathBuf::from(path)
+    };
+    // Checked before `starts_with`, which a `..` component can otherwise walk straight
+    // through (`<anchor>/../elsewhere` is prefixed by `anchor` lexically).
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "the snapshot references '{path}', which walks out of the snapshot's data directory"
+        ));
+    }
+    if !candidate.starts_with(anchor) {
+        return Err(format!(
+            "the snapshot references '{path}', which is outside the snapshot's data directory {} — the archive cannot have contained it",
+            anchor.display()
+        ));
+    }
+    Ok(candidate)
+}
+
+/// Every data file the slice's **current** snapshot references, resolved to a local path
+/// under `anchor`.
+///
+/// The scan resolves a manifest row as `{table_path}/{table_id}/{snapshot_id}/{file_path}`
+/// (`CayenneTableProvider::snapshot_dir_path`), and `file_path` is a bare file name rather
+/// than a path, which is why it carries no `path_is_relative` flag of its own. Only the
+/// current snapshot matters: rows for retired snapshots describe directories a restore
+/// never reads.
+///
+/// A slice with no current snapshot (a table that has never published) references
+/// nothing, which is a valid answer rather than an error.
+fn referenced_data_files(
+    slice: &DatasetMetastoreSlice,
+    anchor: &std::path::Path,
+) -> Result<Vec<PathBuf>, String> {
+    let table_row = slice
+        .tables
+        .get("cayenne_table")
+        .and_then(|rows| rows.first())
+        .ok_or_else(|| "the slice carries no `cayenne_table` row".to_string())?;
+
+    let idx = |table: &str, column: &str| -> Result<usize, String> {
+        slice_column(table, column)
+            .ok_or_else(|| format!("`{table}` has no `{column}` column in this build"))
+    };
+
+    let table_id = slice_text(table_row, Some(idx("cayenne_table", "table_id")?))
+        .ok_or_else(|| "the slice's `cayenne_table` row has no `table_id`".to_string())?;
+    let table_path = slice_text(table_row, Some(idx("cayenne_table", "path")?))
+        .ok_or_else(|| "the slice's `cayenne_table` row has no `path`".to_string())?;
+    let path_is_relative = matches!(
+        table_row.get(idx("cayenne_table", "path_is_relative")?),
+        Some(SliceValue::Bool(true))
+    );
+    let Some(current_snapshot_id) = slice_text(
+        table_row,
+        Some(idx("cayenne_table", "current_snapshot_id")?),
+    ) else {
+        return Ok(Vec::new());
+    };
+
+    let table_root = resolve_under_anchor(anchor, table_path, path_is_relative)?;
+    let snapshot_dir = resolve_under_anchor(
+        anchor,
+        &table_root
+            .join(table_id)
+            .join(current_snapshot_id)
+            .to_string_lossy(),
+        false,
+    )?;
+
+    let snapshot_id_idx = idx("cayenne_snapshot_file", "snapshot_id")?;
+    let file_path_idx = idx("cayenne_snapshot_file", "file_path")?;
+
+    let mut files: Vec<PathBuf> = slice
+        .tables
+        .get("cayenne_snapshot_file")
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| slice_text(row, Some(snapshot_id_idx)) == Some(current_snapshot_id))
+        .filter_map(|row| slice_text(row, Some(file_path_idx)))
+        .map(|file| {
+            // A manifest entry is a bare file name, but nothing structurally prevents a
+            // crafted or corrupted slice from putting a path there.
+            resolve_under_anchor(anchor, &snapshot_dir.join(file).to_string_lossy(), false)
+        })
+        .collect::<Result<Vec<PathBuf>, String>>()?;
+
+    // Deletion vectors too. A data file that comes back without the deletion vector that
+    // hides its dead rows is worse than a missing data file: a missing KEY-based vector is
+    // *tolerated* by the scan rather than failing it (see
+    // `cayenne::provider::delete::vector_io`), so those deletions silently stop applying and
+    // the deleted rows come back. Unlike the manifest's bare file names, these carry a full
+    // path plus the same `path_is_relative` flag `cayenne_table` uses, so they resolve the
+    // same way.
+    let delete_path_idx = idx("cayenne_delete_file", "path")?;
+    let delete_relative_idx = idx("cayenne_delete_file", "path_is_relative")?;
+    files.extend(
+        slice
+            .tables
+            .get("cayenne_delete_file")
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| slice_text(row, Some(delete_path_idx)).map(|path| (row, path)))
+            .map(|(row, path)| {
+                resolve_under_anchor(
+                    anchor,
+                    path,
+                    matches!(row.get(delete_relative_idx), Some(SliceValue::Bool(true))),
+                )
+            })
+            .collect::<Result<Vec<PathBuf>, String>>()?,
+    );
+
+    Ok(files)
+}
+
+/// Map a local path to the archive path it would be written under, given the
+/// `(directory, archive_prefix)` pairs the archive was built from.
+///
+/// Returns `None` for a path under none of them — which is itself a finding: the archive
+/// cannot contain a file it was never asked to walk.
+fn archive_path_for(path: &Path, dirs: &[(PathBuf, String)]) -> Option<String> {
+    dirs.iter().find_map(|(dir, prefix)| {
+        let relative = path.strip_prefix(dir).ok()?;
+        let relative = relative.to_string_lossy();
+        Some(if prefix.is_empty() {
+            relative.into_owned()
+        } else {
+            format!("{prefix}{relative}")
+        })
+    })
+}
+
+/// The expected files that the finished archive does not contain, by their local paths.
+fn missing_members(
+    expected: &[PathBuf],
+    dirs: &[(PathBuf, String)],
+    members: &HashSet<String>,
+) -> Vec<String> {
+    expected
+        .iter()
+        .filter(|path| {
+            archive_path_for(path, dirs).is_none_or(|archive_path| !members.contains(&archive_path))
+        })
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+/// The subset of `files` not present on disk, capped for a readable message, with the total.
+///
+/// Used on the RESTORE side, where the archive is already gone and the extracted tree is
+/// the only thing to check.
+async fn absent_on_disk(files: &[PathBuf]) -> (Vec<String>, usize) {
+    const MAX_NAMED: usize = 5;
+
+    let mut present_by_dir: HashMap<PathBuf, HashSet<std::ffi::OsString>> = HashMap::new();
+    for dir in files.iter().filter_map(|f| f.parent()) {
+        if present_by_dir.contains_key(dir) {
+            continue;
+        }
+        let dir_owned = dir.to_path_buf();
+        let entries = tokio::task::spawn_blocking(move || {
+            let mut names = HashSet::new();
+            if let Ok(read) = std::fs::read_dir(&dir_owned) {
+                for entry in read.flatten() {
+                    if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+                        continue;
+                    }
+                    names.insert(entry.file_name());
+                }
+            }
+            names
+        })
+        .await
+        .unwrap_or_default();
+        present_by_dir.insert(dir.to_path_buf(), entries);
+    }
+
+    let mut named = Vec::new();
+    let mut total = 0usize;
+    for file in files {
+        let present = match (file.parent(), file.file_name()) {
+            (Some(dir), Some(name)) => present_by_dir
+                .get(dir)
+                .is_some_and(|names| names.contains(name)),
+            _ => false,
+        };
+        if !present {
+            total += 1;
+            if named.len() < MAX_NAMED {
+                named.push(file.display().to_string());
+            }
+        }
+    }
+    (named, total)
+}
+
+/// Whether `anchor` holds a file, a symlink, or an unreadable entry at any depth.
+///
+/// Empty directories are not content. `create_table` always creates
+/// `<table_id>/<snapshot_id>/` before the table has a data file, and the scan's
+/// directory-listing fallback returns only `.vortex` files in that snapshot
+/// directory, so the empty tree cannot be served as rows. A file nested under
+/// those directories still counts: that is the orphan a listing would return.
+/// An unreadable entry counts too, so verification refuses rather than assuming
+/// the tree is empty.
+async fn data_dir_has_entries(anchor: &std::path::Path) -> bool {
+    let anchor = anchor.to_path_buf();
+    tokio::task::spawn_blocking(move || directory_contains_content(&anchor))
+        .await
+        .unwrap_or(true)
+}
+
+/// True when `dir` holds a file, a symlink, or an unreadable entry at any depth.
+///
+/// Directories that contain only other directories are not content. Symlinks are
+/// not followed: a symlink is itself an entry the archiver and the listing treat
+/// differently from an empty directory, and following one could cycle.
+fn directory_contains_content(dir: &std::path::Path) -> bool {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            return true;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                return true;
+            };
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `current_snapshot_id` from the slice's `cayenne_table` row, when set.
+fn current_snapshot_id_of(slice: &DatasetMetastoreSlice) -> Result<Option<&str>, String> {
+    let table_row = slice
+        .tables
+        .get("cayenne_table")
+        .and_then(|rows| rows.first())
+        .ok_or_else(|| "the slice carries no `cayenne_table` row".to_string())?;
+    let idx = slice_column("cayenne_table", "current_snapshot_id").ok_or_else(|| {
+        "`cayenne_table` has no `current_snapshot_id` column in this build".to_string()
+    })?;
+    Ok(slice_text(table_row, Some(idx)))
+}
+
+/// How many `cayenne_snapshot_file` rows name the current snapshot.
+fn manifest_rows_for_current_snapshot(slice: &DatasetMetastoreSlice) -> Result<usize, String> {
+    let Some(current_snapshot_id) = current_snapshot_id_of(slice)? else {
+        return Ok(0);
+    };
+    let snapshot_id_idx =
+        slice_column("cayenne_snapshot_file", "snapshot_id").ok_or_else(|| {
+            "`cayenne_snapshot_file` has no `snapshot_id` column in this build".to_string()
+        })?;
+    Ok(slice
+        .tables
+        .get("cayenne_snapshot_file")
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| slice_text(row, Some(snapshot_id_idx)) == Some(current_snapshot_id))
+        .count())
+}
+
+/// Refuse a slice whose `current_snapshot_id` is set but that snapshot has no manifest
+/// rows, unless `anchor` contains no files.
+///
+/// An empty `referenced_data_files` list makes both archive-member and restore-side
+/// checks succeed vacuously; Cayenne then falls back to directory listing and can serve
+/// unrelated or orphaned files. A genuinely empty published snapshot is fine when the
+/// only entries are directories (`create_table`'s `<table_id>/<snapshot_id>/`). A file
+/// at any depth is not.
+async fn reject_empty_manifest_with_orphans(
+    slice: &DatasetMetastoreSlice,
+    anchor: &std::path::Path,
+) -> Result<(), String> {
+    let Some(current_snapshot_id) = current_snapshot_id_of(slice)? else {
+        return Ok(());
+    };
+    if manifest_rows_for_current_snapshot(slice)? > 0 {
+        return Ok(());
+    }
+    if !data_dir_has_entries(anchor).await {
+        return Ok(());
+    }
+    Err(format!(
+        "current_snapshot_id is '{current_snapshot_id}' but the slice has no manifest rows for that snapshot, and the data directory is not empty — refusing so Cayenne cannot fall back to directory listing of orphaned files"
+    ))
+}
+
+/// Check that every data file `slice`'s current snapshot references was extracted under
+/// `anchor`.
+async fn verify_slice_against_disk(
+    slice: &DatasetMetastoreSlice,
+    anchor: &std::path::Path,
+) -> Result<(), String> {
+    reject_empty_manifest_with_orphans(slice, anchor).await?;
+    let files = referenced_data_files(slice, anchor)?;
+    let (named, total) = absent_on_disk(&files).await;
+    if total == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "{total} of the {} files its current snapshot references are missing (for example: {})",
+        files.len(),
+        named.join(", ")
+    ))
+}
 
 /// Errors raised by the Cayenne snapshot engine.
 #[derive(Debug, Snafu)]
@@ -239,6 +576,14 @@ async fn unreferenced_data_entries(
 pub struct CayenneSnapshotEngine {
     /// Cayenne metastore (sqlite or libsql) the engine talks to.
     catalog: Arc<dyn MetadataCatalog>,
+    /// The data files the most recent `prepare_directory_snapshot` promised the archive
+    /// would contain, for `verify_directory_snapshot` to check the finished archive
+    /// against. Holds the resolved paths rather than the whole slice: the slice carries a
+    /// stats blob per file and is the larger part of a big table's metastore, and nothing
+    /// past this point reads any other part of it. One snapshot of a dataset runs at a
+    /// time (the manager holds the accelerator write lock across both calls), so a single
+    /// slot is enough; `verify` takes the value so nothing is retained afterwards.
+    expected_files: std::sync::Mutex<Option<Vec<PathBuf>>>,
     /// Logical dataset name (the value of `cayenne_table.table_name`).
     dataset_name: String,
     /// Local data directory anchor used to rewrite path columns relative
@@ -256,6 +601,7 @@ impl CayenneSnapshotEngine {
     ) -> Self {
         Self {
             catalog,
+            expected_files: std::sync::Mutex::new(None),
             dataset_name: dataset_name.into(),
             data_dir_anchor,
         }
@@ -344,6 +690,25 @@ impl SnapshotEngine for CayenneSnapshotEngine {
             })
             .map_err(|e| Self::engine_err(&e))?;
 
+        // 2b. Resolve, now, the files this slice promises the archive will contain, so
+        // `verify_directory_snapshot` can check the finished archive against exactly the
+        // metadata it was built to match.
+        {
+            // Same empty-manifest gate as restore: a slice that names a current
+            // snapshot with no files would make `verify_directory_snapshot` pass
+            // vacuously while the directory walker still packs orphan files.
+            reject_empty_manifest_with_orphans(&slice, &self.data_dir_anchor)
+                .await
+                .map_err(SnapshotEngineError::from_display)?;
+            let expected = referenced_data_files(&slice, &self.data_dir_anchor)
+                .map_err(SnapshotEngineError::from_display)?;
+            let mut stash = self
+                .expected_files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *stash = Some(expected);
+        }
+
         // 3. Build a plan: skip the cayenne.db* files and every data entry
         //    the slice does not reference, add the slice as an extra.
         let mut skip: HashSet<PathBuf> = METASTORE_FILES.iter().map(PathBuf::from).collect();
@@ -365,6 +730,55 @@ impl SnapshotEngine for CayenneSnapshotEngine {
             skip_relative_paths: skip,
             extra_entries: extras,
         })
+    }
+
+    async fn verify_directory_snapshot(
+        &self,
+        dirs: &[(PathBuf, String)],
+        members: &HashSet<String>,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        if dataset_name != self.dataset_name {
+            return Err(SnapshotEngineError::from_display(format!(
+                "CayenneSnapshotEngine constructed for dataset '{}' but asked to verify '{}'",
+                self.dataset_name, dataset_name
+            )));
+        }
+
+        let expected = {
+            let mut stash = self
+                .expected_files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            stash.take()
+        };
+        let Some(expected) = expected else {
+            // Nothing was captured, so this archive was not built from a slice and there
+            // is nothing to check it against.
+            return Ok(());
+        };
+
+        // Checked against the archive's own member list, not the filesystem it was built
+        // from. Those answer different questions: a file can be present on disk and absent
+        // from the tar — the walker skips symlinks, a path resolved outside the archived
+        // directories is never visited, and a file recreated after the walk passed it looks
+        // present either way. Only membership proves the archive can be restored.
+        let missing = missing_members(&expected, dirs, members);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(SnapshotEngineError::from_display(format!(
+            "the snapshot archive of '{}' is missing {} of the {} files its current snapshot references (for example: {})",
+            self.dataset_name,
+            missing.len(),
+            expected.len(),
+            missing
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
     }
 
     async fn finalize_directory_snapshot(
@@ -440,6 +854,73 @@ impl SnapshotEngine for CayenneSnapshotEngine {
             })
         })?;
 
+        // Refuse an archive whose data files do not match its metadata BEFORE importing:
+        // the import replaces this dataset's metastore rows wholesale, so letting an
+        // incomplete archive through would leave the local metastore describing files
+        // that are not there. Failing here leaves the metastore untouched, the
+        // acceleration empty, and the next refresh rebuilds it from source.
+        //
+        // Also the backstop for an archive written by a build that could not verify at
+        // creation time.
+        if let Err(reason) = verify_slice_against_disk(&slice, &self.data_dir_anchor).await {
+            // A first restore clears what it extracted before giving up.
+            // `has_existing_acceleration` reads any entry under the data directory as "an
+            // acceleration is already here", so leaving a half-restored tree behind would
+            // make every later cold start skip the bootstrap — turning one bad archive into
+            // a permanently un-restorable volume. A reload extracts over the acceleration it
+            // replaces, so the directory also holds the files the table is serving, and
+            // clearing it would delete them while the table still reads them. The metastore
+            // tells the two apart: a bootstrap runs only while it does not know the table.
+            // Only the data directory is ever cleared; the metadata directory is shared with
+            // every other Cayenne dataset in the pod.
+            let first_restore = match self.catalog.get_table(&self.dataset_name).await {
+                Err(cayenne::CatalogError::TableNotFound { .. }) => true,
+                Ok(_) => false,
+                // Whether the directory holds a live acceleration cannot be told, so it is
+                // left alone: extracted files can be removed by hand, deleted ones cannot be
+                // brought back.
+                Err(err) => {
+                    tracing::warn!(
+                        "Left the files the refused snapshot of '{}' extracted at {} in place, because the Cayenne metastore could not say whether they sit beside a live acceleration: {err}",
+                        self.dataset_name,
+                        self.data_dir_anchor.display()
+                    );
+                    false
+                }
+            };
+            if first_restore && let Err(cleanup) = fs::remove_dir_all(&self.data_dir_anchor).await {
+                tracing::warn!(
+                    "Failed to clear the partially extracted acceleration of '{}' at {} after refusing its snapshot; remove it before restarting or the next start will skip the bootstrap: {cleanup}",
+                    self.dataset_name,
+                    self.data_dir_anchor.display()
+                );
+            }
+            // The slice lives in the metadata directory, which is shared with every other
+            // Cayenne dataset in the pod, so it is removed by name rather than with the
+            // tree. Leaving it would outlast the archive it came from: extraction skips a
+            // path that already exists, so the NEXT archive's slice would not replace it
+            // and a later restore would verify and import this rejected archive's metadata
+            // against those newer files.
+            if let Err(cleanup) = fs::remove_file(&slice_path).await {
+                tracing::warn!(
+                    "Failed to remove the refused snapshot slice of '{}' at {}; delete it before restarting or the next restore will read this rejected archive's metadata instead of its own: {cleanup}",
+                    self.dataset_name,
+                    slice_path.display()
+                );
+            }
+            return Err(SnapshotEngineError::from_display(if first_restore {
+                format!(
+                    "the snapshot of '{}' is incomplete, so it was not restored and the acceleration starts empty: {reason}",
+                    self.dataset_name
+                )
+            } else {
+                format!(
+                    "the snapshot of '{}' is incomplete, so it was not loaded and the acceleration keeps the data it had: {reason}",
+                    self.dataset_name
+                )
+            }));
+        }
+
         self.catalog
             .import_dataset_slice(&slice, &self.data_dir_anchor)
             .await
@@ -477,6 +958,277 @@ mod tests {
             arrow_schema::DataType::Int64,
             false,
         )]))
+    }
+
+    /// Builds the minimal slice shape `referenced_data_files` reads: one `cayenne_table`
+    /// row plus manifest rows, positioned per `EXPECTED_TABLES`.
+    fn slice_with_manifest(
+        table_id: &str,
+        current_snapshot_id: Option<&str>,
+        files: &[(&str, &str)],
+    ) -> DatasetMetastoreSlice {
+        let table_columns = cayenne::metastore::EXPECTED_TABLES
+            .iter()
+            .find(|t| t.name == "cayenne_table")
+            .expect("cayenne_table is a known metastore table");
+        let mut table_row = vec![SliceValue::Null; table_columns.columns.len()];
+        let put = |row: &mut Vec<SliceValue>, column: &str, value: SliceValue| {
+            let idx = slice_column("cayenne_table", column).expect("known column");
+            row[idx] = value;
+        };
+        put(
+            &mut table_row,
+            "table_id",
+            SliceValue::Text(table_id.to_string()),
+        );
+        // Relative to the anchor, which is what `export_dataset` writes for a table
+        // stored under the data directory.
+        put(&mut table_row, "path", SliceValue::Text(String::new()));
+        put(&mut table_row, "path_is_relative", SliceValue::Bool(true));
+        if let Some(id) = current_snapshot_id {
+            put(
+                &mut table_row,
+                "current_snapshot_id",
+                SliceValue::Text(id.to_string()),
+            );
+        }
+
+        let file_columns = cayenne::metastore::EXPECTED_TABLES
+            .iter()
+            .find(|t| t.name == "cayenne_snapshot_file")
+            .expect("cayenne_snapshot_file is a known metastore table");
+        let manifest = files
+            .iter()
+            .map(|(snapshot_id, file_path)| {
+                let mut row = vec![SliceValue::Null; file_columns.columns.len()];
+                let snap_idx =
+                    slice_column("cayenne_snapshot_file", "snapshot_id").expect("known column");
+                let path_idx =
+                    slice_column("cayenne_snapshot_file", "file_path").expect("known column");
+                row[snap_idx] = SliceValue::Text((*snapshot_id).to_string());
+                row[path_idx] = SliceValue::Text((*file_path).to_string());
+                row
+            })
+            .collect();
+
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert("cayenne_table".to_string(), vec![table_row]);
+        tables.insert("cayenne_snapshot_file".to_string(), manifest);
+
+        DatasetMetastoreSlice {
+            format_version: cayenne::metastore::snapshot::SLICE_FORMAT_VERSION,
+            engine: "cayenne".to_string(),
+            dataset_name: "trips".to_string(),
+            exported_at_ms: 0,
+            tables,
+        }
+    }
+
+    /// One `cayenne_delete_file` row whose `path` is relative to the data-dir anchor.
+    fn delete_row(path: &str) -> Vec<SliceValue> {
+        let columns = cayenne::metastore::EXPECTED_TABLES
+            .iter()
+            .find(|t| t.name == "cayenne_delete_file")
+            .expect("cayenne_delete_file is a known metastore table");
+        let mut row = vec![SliceValue::Null; columns.columns.len()];
+        let path_idx = slice_column("cayenne_delete_file", "path").expect("known column");
+        let rel_idx =
+            slice_column("cayenne_delete_file", "path_is_relative").expect("known column");
+        row[path_idx] = SliceValue::Text(path.to_string());
+        row[rel_idx] = SliceValue::Bool(true);
+        row
+    }
+
+    #[tokio::test]
+    async fn verification_passes_when_every_referenced_file_is_present() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        let snapshot_dir = anchor.join("tbl-1").join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot");
+        std::fs::write(snapshot_dir.join("a.vortex"), b"a").expect("write a");
+        std::fs::write(snapshot_dir.join("b.vortex"), b"b").expect("write b");
+
+        let slice = slice_with_manifest(
+            "tbl-1",
+            Some("snap-1"),
+            &[("snap-1", "a.vortex"), ("snap-1", "b.vortex")],
+        );
+        verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect("a complete archive verifies");
+    }
+
+    /// The shape a compaction cleanup produces if it unlinks the exported snapshot's
+    /// files while the archive is still being written.
+    #[tokio::test]
+    async fn verification_fails_when_a_referenced_file_went_missing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        let snapshot_dir = anchor.join("tbl-1").join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot");
+        std::fs::write(snapshot_dir.join("a.vortex"), b"a").expect("write a");
+
+        let slice = slice_with_manifest(
+            "tbl-1",
+            Some("snap-1"),
+            &[("snap-1", "a.vortex"), ("snap-1", "gone.vortex")],
+        );
+        let reason = verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect_err("a missing referenced file must be refused");
+        assert!(reason.contains("gone.vortex"), "{reason}");
+        assert!(reason.contains("1 of the 2"), "{reason}");
+    }
+
+    /// Only the current snapshot is read on restore, so a retired snapshot whose files
+    /// were legitimately swept must not fail verification.
+    #[tokio::test]
+    async fn verification_ignores_retired_snapshots() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        let snapshot_dir = anchor.join("tbl-1").join("snap-2");
+        std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot");
+        std::fs::write(snapshot_dir.join("a.vortex"), b"a").expect("write a");
+
+        let slice = slice_with_manifest(
+            "tbl-1",
+            Some("snap-2"),
+            &[("snap-1", "swept.vortex"), ("snap-2", "a.vortex")],
+        );
+        verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect("rows for a retired snapshot are not consulted");
+    }
+
+    /// A deletion vector missing from a restored archive is the worst shape available: the
+    /// scan TOLERATES a missing key-based vector rather than failing, so those deletions
+    /// stop applying and the rows they hid come back.
+    #[tokio::test]
+    async fn verification_fails_when_a_deletion_vector_went_missing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        let snapshot_dir = anchor.join("tbl-1").join("snap-1");
+        std::fs::create_dir_all(snapshot_dir.join("deletions")).expect("mkdir deletions");
+        std::fs::write(snapshot_dir.join("a.vortex"), b"rows").expect("write data file");
+
+        let mut slice = slice_with_manifest("tbl-1", Some("snap-1"), &[("snap-1", "a.vortex")]);
+        slice.tables.insert(
+            "cayenne_delete_file".to_string(),
+            vec![delete_row("tbl-1/snap-1/deletions/dv-1.arrow")],
+        );
+
+        let reason = verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect_err("a missing deletion vector must be refused");
+        assert!(reason.contains("dv-1.arrow"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn verification_passes_when_the_deletion_vector_is_present() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        let snapshot_dir = anchor.join("tbl-1").join("snap-1");
+        std::fs::create_dir_all(snapshot_dir.join("deletions")).expect("mkdir deletions");
+        std::fs::write(snapshot_dir.join("a.vortex"), b"rows").expect("write data file");
+        std::fs::write(snapshot_dir.join("deletions").join("dv-1.arrow"), b"dv").expect("write dv");
+
+        let mut slice = slice_with_manifest("tbl-1", Some("snap-1"), &[("snap-1", "a.vortex")]);
+        slice.tables.insert(
+            "cayenne_delete_file".to_string(),
+            vec![delete_row("tbl-1/snap-1/deletions/dv-1.arrow")],
+        );
+
+        verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect("a complete archive verifies");
+    }
+
+    /// A symlinked data file is skipped by the archiver, so verification must not count it
+    /// as present — otherwise the check passes for a file the tar does not contain.
+    #[tokio::test]
+    async fn a_symlinked_data_file_counts_as_missing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        let snapshot_dir = anchor.join("tbl-1").join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot");
+        let real = tmp.path().join("elsewhere.vortex");
+        std::fs::write(&real, b"rows").expect("write real file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, snapshot_dir.join("a.vortex")).expect("symlink");
+
+        let slice = slice_with_manifest("tbl-1", Some("snap-1"), &[("snap-1", "a.vortex")]);
+        let reason = verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect_err("a symlink is not archived, so it must not verify");
+        assert!(reason.contains("a.vortex"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_table_that_never_published_references_nothing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let slice = slice_with_manifest("tbl-1", None, &[]);
+        verify_slice_against_disk(&slice, tmp.path())
+            .await
+            .expect("no current snapshot means nothing to verify");
+    }
+
+    /// `current_snapshot_id` with no manifest rows previously verified vacuously and
+    /// let Cayenne fall back to directory listing of whatever sat under the data dir.
+    #[tokio::test]
+    async fn verification_rejects_current_snapshot_with_empty_manifest_and_orphans() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        // Orphan file that is not described by any manifest row.
+        std::fs::write(anchor.join("orphan.vortex"), b"orphan").expect("write orphan");
+
+        let slice = slice_with_manifest("tbl-1", Some("snap-1"), &[]);
+        let reason = verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect_err("empty manifest + non-empty data dir must be refused");
+        assert!(reason.contains("no manifest rows"), "{reason}");
+        assert!(reason.contains("snap-1"), "{reason}");
+    }
+
+    /// A genuinely empty published snapshot (current id, no files, empty tree) is fine.
+    #[tokio::test]
+    async fn verification_allows_current_snapshot_with_empty_manifest_when_data_dir_empty() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let slice = slice_with_manifest("tbl-1", Some("snap-1"), &[]);
+        verify_slice_against_disk(&slice, tmp.path())
+            .await
+            .expect("empty manifest is ok when the restored tree is empty");
+    }
+
+    /// `create_table` leaves `<table_id>/<snapshot_id>/` even when the snapshot has
+    /// no data files. Those directories are not orphans the scan can serve.
+    #[tokio::test]
+    async fn verification_allows_empty_manifest_when_only_empty_directories() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        std::fs::create_dir_all(anchor.join("tbl-1").join("snap-1")).expect("mkdir snapshot");
+
+        let slice = slice_with_manifest("tbl-1", Some("snap-1"), &[]);
+        verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect("empty snapshot directories are not orphaned files");
+    }
+
+    /// A file nested where `create_table` puts the snapshot directory is still an
+    /// orphan: directory listing would return it while the manifest names nothing.
+    #[tokio::test]
+    async fn verification_rejects_empty_manifest_when_nested_orphan_present() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        let snapshot_dir = anchor.join("tbl-1").join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot");
+        std::fs::write(snapshot_dir.join("orphan.vortex"), b"orphan").expect("write orphan");
+
+        let slice = slice_with_manifest("tbl-1", Some("snap-1"), &[]);
+        let reason = verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect_err("a nested orphan file must be refused");
+        assert!(reason.contains("no manifest rows"), "{reason}");
+        assert!(reason.contains("snap-1"), "{reason}");
     }
 
     #[tokio::test]
@@ -823,6 +1575,210 @@ mod tests {
             .map(RecordBatch::num_rows)
             .sum();
         assert_eq!(rows, 50, "the archive restores the refreshed table");
+    }
+
+    /// A reload extracts over the acceleration it replaces, so the data directory holds
+    /// the files the table is serving. Refusing the new archive must leave them in place:
+    /// the table keeps reading them until a snapshot is accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_reload_keeps_the_files_the_table_is_serving() {
+        use arrow::array::{Int64Array, RecordBatch};
+        use cayenne::CayenneTableProviderBuilder;
+        use datafusion::datasource::TableProvider;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use runtime_acceleration::snapshot::directory_archive::{
+            ExtractOptions, archive_directories_to_file_with_plan,
+            extract_archive_file_with_options,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let metadata_dir = tmp.path().join("writer").join("metadata");
+        let data_dir = tmp.path().join("writer").join("trips");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let catalog = fresh_catalog(&metadata_dir).await;
+        let ctx = SessionContext::new();
+        let table = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: "trips".to_string(),
+            schema: schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir.to_string_lossy().into_owned(),
+            partition_column: None,
+            vortex_config: cayenne::metadata::VortexConfig {
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                ..cayenne::metadata::VortexConfig::default()
+            },
+        })
+        .await
+        .expect("create table");
+        let write = |ids: Vec<i64>, op: InsertOp| {
+            let table = &table;
+            let ctx = &ctx;
+            async move {
+                let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(ids))])
+                    .expect("batch");
+                let input =
+                    MemorySourceConfig::try_new_exec(&[vec![batch]], schema(), None).expect("exec");
+                let plan = table
+                    .insert_into(&ctx.state(), input, op)
+                    .await
+                    .expect("plan");
+                collect(plan, ctx.task_ctx()).await.expect("write");
+            }
+        };
+        let writer = CayenneSnapshotEngine::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            "trips",
+            data_dir.clone(),
+        );
+        let writer_dirs = vec![
+            (metadata_dir.clone(), "metadata/".to_string()),
+            (data_dir.clone(), "data/".to_string()),
+        ];
+        let archive = |tar: PathBuf, plan: DirectorySnapshotPlan| {
+            let writer_dirs = writer_dirs.clone();
+            async move {
+                let skip: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
+                let extras: Vec<(String, Vec<u8>)> = plan
+                    .extra_entries
+                    .into_iter()
+                    .map(|e| (e.archive_path, e.bytes))
+                    .collect();
+                archive_directories_to_file_with_plan(&writer_dirs, &tar, &skip, &extras)
+                    .await
+                    .expect("archive");
+                tar
+            }
+        };
+
+        let reader_root = tmp.path().join("reader");
+        let reader_metadata = reader_root.join("metadata");
+        let reader_data = reader_root.join("trips");
+        std::fs::create_dir_all(&reader_metadata).expect("mkdir");
+        std::fs::create_dir_all(&reader_data).expect("mkdir");
+        let reader_catalog = fresh_catalog(&reader_metadata).await;
+        let reader = CayenneSnapshotEngine::new(
+            Arc::clone(&reader_catalog) as Arc<dyn MetadataCatalog>,
+            "trips",
+            reader_data.clone(),
+        );
+        let reader_dirs = vec![
+            (reader_metadata.clone(), "metadata/".to_string()),
+            (reader_data.clone(), "data/".to_string()),
+        ];
+        // How `SnapshotManager` extracts a directory snapshot: into the live directories,
+        // skipping every path that already exists.
+        let extract = |tar: PathBuf| {
+            let reader_root = reader_root.clone();
+            let reader_metadata = reader_metadata.clone();
+            let reader_data = reader_data.clone();
+            async move {
+                extract_archive_file_with_options(
+                    &tar,
+                    &reader_root,
+                    ExtractOptions {
+                        prefix_mappings: Some(vec![
+                            ("metadata/".to_string(), reader_metadata),
+                            ("data/".to_string(), reader_data),
+                        ]),
+                        ..ExtractOptions::skip_existing()
+                    },
+                )
+                .await
+                .expect("extract");
+            }
+        };
+        let served_rows = || {
+            let reader_catalog = Arc::clone(&reader_catalog);
+            async move {
+                let table = CayenneTableProviderBuilder::new(
+                    reader_catalog as Arc<dyn MetadataCatalog>,
+                    SessionContext::new().runtime_env(),
+                )
+                .open("trips")
+                .await
+                .expect("open");
+                SessionContext::new()
+                    .read_table(Arc::new(table) as Arc<dyn TableProvider>)
+                    .expect("read")
+                    .collect()
+                    .await
+                    .map(|batches| batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+            }
+        };
+
+        // The reader restores the writer's first snapshot and serves it. An overwrite
+        // records its manifest as it commits; an append leaves that to a later pass.
+        write((1..=100).collect(), InsertOp::Overwrite).await;
+        let plan = writer
+            .prepare_directory_snapshot(&writer_dirs, "trips")
+            .await
+            .expect("prepare the first snapshot");
+        extract(archive(tmp.path().join("first.tar"), plan).await).await;
+        reader
+            .finalize_directory_snapshot(&reader_dirs, "trips")
+            .await
+            .expect("restore the first snapshot");
+        assert_eq!(served_rows().await.expect("read the restored table"), 100);
+        let table_id = reader_catalog
+            .get_table("trips")
+            .await
+            .expect("meta")
+            .table_id;
+        let served_snapshot = reader_catalog
+            .get_table("trips")
+            .await
+            .expect("meta")
+            .current_snapshot_id;
+
+        // The writer's next snapshot is archived without one of its files, as a build
+        // that cannot check an archive against its slice would publish it.
+        write((1..=50).collect(), InsertOp::Overwrite).await;
+        let plan = writer
+            .prepare_directory_snapshot(&writer_dirs, "trips")
+            .await
+            .expect("prepare the second snapshot");
+        let next_snapshot = catalog
+            .get_table("trips")
+            .await
+            .expect("meta")
+            .current_snapshot_id;
+        let next_dir = data_dir.join(&table_id).join(&next_snapshot);
+        let dropped = std::fs::read_dir(&next_dir)
+            .expect("list the second snapshot")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+            .expect("the second snapshot wrote a data file");
+        std::fs::remove_file(&dropped).expect("drop a file from the archive");
+        extract(archive(tmp.path().join("second.tar"), plan).await).await;
+
+        let refusal = reader
+            .finalize_directory_snapshot(&reader_dirs, "trips")
+            .await
+            .expect_err("an archive missing a referenced file is refused");
+        assert!(refusal.to_string().contains("is incomplete"), "{refusal}");
+
+        assert!(
+            reader_data.join(&table_id).join(&served_snapshot).is_dir(),
+            "refusing a reload must not delete the snapshot the table is serving"
+        );
+        assert_eq!(
+            served_rows()
+                .await
+                .expect("the served acceleration is still readable after a refused reload"),
+            100,
+            "the table keeps serving the snapshot it had"
+        );
     }
 
     #[tokio::test]

@@ -709,7 +709,7 @@ async fn test_duckdb_file_swap_preserves_concurrent_out_of_band_writes() -> Resu
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             while tokio::time::Instant::now() < deadline {
                 checkpoint
-                    .checkpoint(&schema, None)
+                    .checkpoint(&schema, None, None)
                     .await
                     .map_err(|e| anyhow!("checkpoint upsert {upserts} failed during a swap: {e}"))?;
                 upserts += 1;

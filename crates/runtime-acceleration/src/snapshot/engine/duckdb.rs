@@ -11,7 +11,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! DuckDB-specific snapshot engine implementation.
+//! `DuckDB`-specific snapshot engine implementation.
+//!
+//! `DuckDB` buffers committed writes in a `<db>.wal` sidecar. A snapshot copies
+//! the main file alone, so an unclean shutdown — or any path that reaches
+//! `create_file_snapshot` without a prior `CHECKPOINT` — would publish a copy
+//! that omits those rows. `checkpoint_live` folds the log into the main file
+//! before that copy, which is how both `file_create` init and schema-recreate
+//! (`snapshot_before_recreate`) pick the fold up: they share
+//! `create_file_snapshot`, they do not each fold at the call site.
 
 use async_trait::async_trait;
 use snafu::prelude::*;
@@ -262,6 +270,53 @@ mod tests {
             count_rows(&copy),
             2,
             "the copy must carry the write that was still in the log"
+        );
+    }
+
+    /// The unclean-shutdown shape: the connection that wrote the rows is gone and
+    /// left them in the write-ahead log. `file_create` init and schema-recreate
+    /// both publish through `create_file_snapshot`, so a copy taken without the
+    /// fold would omit those rows. Raised by Copilot on #13477.
+    #[tokio::test]
+    async fn checkpoint_live_folds_a_log_left_by_an_unclean_shutdown() {
+        let tmp = TempDir::new().expect("temp dir");
+        let live = tmp.path().join("acceleration.db");
+        {
+            let conn = Connection::open(&live).expect("open live database");
+            conn.execute_batch(
+                "PRAGMA disable_checkpoint_on_shutdown;
+                 PRAGMA checkpoint_threshold='1TB';
+                 CREATE TABLE t(id INTEGER);
+                 CHECKPOINT;",
+            )
+            .expect("persist the empty table to the database file");
+            conn.execute("INSERT INTO t SELECT * FROM generate_series(1, 50)", [])
+                .expect("insert rows that stay in the write-ahead log");
+        }
+        assert!(
+            wal_bytes(&live) > 0,
+            "the rows must still be in the write-ahead log for this test to mean anything"
+        );
+
+        let copy_without_fold = tmp.path().join("copy_without_fold.db");
+        std::fs::copy(&live, &copy_without_fold).expect("copy the database file before folding");
+        assert_eq!(
+            count_rows(&copy_without_fold),
+            0,
+            "copying the database file without folding must omit the logged rows"
+        );
+
+        DuckDBSnapshotEngine::new(false)
+            .checkpoint_live(&live, "orders")
+            .await
+            .expect("fold the write-ahead log into the database file");
+
+        let copy_after_fold = tmp.path().join("copy_after_fold.db");
+        std::fs::copy(&live, &copy_after_fold).expect("copy the database file after folding");
+        assert_eq!(
+            count_rows(&copy_after_fold),
+            50,
+            "a copy taken after checkpoint_live must carry the logged rows"
         );
     }
 

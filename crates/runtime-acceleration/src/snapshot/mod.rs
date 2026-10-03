@@ -16,6 +16,7 @@ limitations under the License.
 use arrow_schema::{Schema, SchemaRef};
 use arrow_tools::map_entries::conforming_schema;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
+use async_trait::async_trait;
 use aws_sdk_credential_bridge::object_store_builder::{
     S3ObjectStoreBuilder, S3ObjectStoreBuilderError,
 };
@@ -119,7 +120,7 @@ pub mod api {
         pub snapshot_id: u64,
     }
 }
-use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy};
+use spicepod::acceleration::{SnapshotsCompaction, SnapshotsConsistency, SnapshotsCreationPolicy};
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -128,6 +129,110 @@ const METADATA_FILE_NAME: &str = "metadata.json";
 const SNAPSHOT_CHECKSUM_ALGORITHM: &str = "SHA256";
 const NETWORK_RETRY_MAX: usize = 3;
 const SNAPSHOTS_DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/snapshots";
+
+/// Metadata property recording the identity of the definition a snapshot series was
+/// materialized from. Written for sources whose stored rows are a function of a
+/// definition that can change underneath them without the schema changing — an
+/// accelerated view, whose rows are the result of its SQL. A bootstrap whose current
+/// definition disagrees with the stored one is refused: the archive holds the previous
+/// definition's results, and serving them under the new definition is a wrong answer,
+/// not a stale one.
+pub const SOURCE_FINGERPRINT_PROPERTY: &str = "spice.source-fingerprint";
+
+/// Metadata property recording the source selection of the most recent publish — which
+/// source rows it kept and how they are shaped, without the publisher's refresh mode or
+/// its write policies. A `refresh_mode: snapshot` dataset follows
+/// a series another deployment publishes and compares this instead of
+/// [`SOURCE_FINGERPRINT_PROPERTY`]; see
+/// [`crate::acceleration_source::DefinitionMatch::SourceSelection`].
+pub const SOURCE_SELECTION_FINGERPRINT_PROPERTY: &str = "spice.source-selection-fingerprint";
+
+/// Docs link carried on the producing-read-shape refusal so a reword cannot drop it.
+const SNAPSHOT_READ_CONSISTENCY_DOCS: &str =
+    "https://spiceai.org/docs/components/data-accelerators/snapshots";
+
+fn independent_reads_snapshot_bootstrap_reason() -> String {
+    format!(
+        "it was published under `snapshots_consistency: independent_reads`, so its rows may span several source positions. Set `snapshots_consistency: independent_reads` on this view to restore it anyway. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
+    )
+}
+
+fn missing_read_consistency_bootstrap_reason() -> String {
+    format!(
+        "it records no `snapshot-read-consistency`, so it cannot be shown to have come from a single consistent read. Set `snapshots_consistency: independent_reads` on this view to restore it anyway. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
+    )
+}
+
+/// Whether an archive recording `stored_definition` and `stored_selection` may be
+/// restored under `definition`, and if not, why.
+///
+/// Shared by the series-level and the per-entry checks so the two cannot disagree. A
+/// [`crate::acceleration_source::DefinitionMatch::SourceSelection`] consumer compares the
+/// recorded source selection.
+///
+/// An archive recording neither stamp follows `accept_unstamped`, but only while its
+/// series records none either (`series_stamped` is false): such a series was published
+/// before definitions were recorded. Once a publisher has stamped the series, an
+/// unstamped entry in it — an older archive a `fallback` bootstrap walks back to, or one
+/// written by a source with no definition — cannot be told apart from an archive of a
+/// different source, and is refused. One that records a definition but no selection was
+/// published by a deployment that could not establish what it read — a snapshot taken
+/// before an acceleration was recreated recovers only the outgoing definition — so a
+/// consumer cannot verify it and refuses it.
+fn definition_stamp_permits(
+    definition: &crate::acceleration_source::SourceDefinition,
+    stored_definition: Option<&str>,
+    stored_selection: Option<&str>,
+    series_stamped: bool,
+) -> Result<(), String> {
+    let accepts_unstamped = definition.accept_unstamped && !series_stamped;
+    match definition.matched_on {
+        crate::acceleration_source::DefinitionMatch::FullDefinition => match stored_definition {
+            Some(stored) if stored == definition.fingerprint => Ok(()),
+            Some(stored) => Err(format!(
+                "the snapshot was materialized from a different definition (recorded `{stored}`, current `{}`)",
+                definition.fingerprint
+            )),
+            None if accepts_unstamped => Ok(()),
+            None => Err(format!(
+                "the snapshot records no `{SOURCE_FINGERPRINT_PROPERTY}`, so it cannot be shown to match the definition now in force (`{}`)",
+                definition.fingerprint
+            )),
+        },
+        crate::acceleration_source::DefinitionMatch::SourceSelection => {
+            let Some(expected) = definition.selection_fingerprint.as_deref() else {
+                return Err(format!(
+                    "this dataset records no source selection to compare with the snapshot's `{SOURCE_SELECTION_FINGERPRINT_PROPERTY}`"
+                ));
+            };
+            match (stored_selection, stored_definition) {
+                (Some(stored), _) if stored == expected => Ok(()),
+                (Some(stored), _) => Err(format!(
+                    "the snapshot was materialized from a different source selection (recorded `{stored}`, current `{expected}`)"
+                )),
+                (None, None) if accepts_unstamped => Ok(()),
+                (None, None) if series_stamped => Err(format!(
+                    "the snapshot records no `{SOURCE_SELECTION_FINGERPRINT_PROPERTY}` although its series does, so it cannot be shown to read the same source as this dataset (`{expected}`)"
+                )),
+                (None, None) => Err(format!(
+                    "the snapshot records no `{SOURCE_SELECTION_FINGERPRINT_PROPERTY}`, so it cannot be shown to read the same source as this dataset (`{expected}`)"
+                )),
+                (None, Some(_)) => Err(format!(
+                    "the snapshot records a definition but no `{SOURCE_SELECTION_FINGERPRINT_PROPERTY}` (a snapshot taken before its acceleration was recreated), so it cannot be shown to read the same source as this dataset (`{expected}`)"
+                )),
+            }
+        }
+    }
+}
+
+/// The warning a `refresh_mode: snapshot` dataset logs when it refuses a snapshot of the
+/// series it follows. Unlike a source that publishes its own series, it cannot rebuild
+/// from its source, so the consequence is that it keeps what it already loaded.
+fn snapshot_refused_by_follower_warning(dataset_name: &str, reason: &str) -> String {
+    format!(
+        "Did not load a snapshot of '{dataset_name}', so it keeps its current contents, or stays unavailable if it has none, until its snapshot series holds a snapshot of the same source: {reason}. A `refresh_mode: snapshot` dataset must declare the same `from`, `params`, `refresh_sql`, `refresh_data_window`, retention, time column, `columns` and `embeddings` as the dataset that publishes its snapshots. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
+    )
+}
 
 // Shared with the other schema-evolution emit sites. `runtime-acceleration` cannot
 // import the `runtime` crate's counters (it is a dependency of `runtime`), so the
@@ -257,6 +362,43 @@ struct SnapshotEntry {
         rename = "snapshot-last-updated-at-ms"
     )]
     snapshot_last_updated_at_ms: Option<i64>,
+    /// Identity of the definition this particular snapshot was materialized from.
+    ///
+    /// Recorded per entry, not just per dataset: the dataset-level property describes only
+    /// the most recent publish, so a `fallback` bootstrap that walks back through older
+    /// entries would check the current definition once and then restore an archive from a
+    /// previous one. Absent for an entry written before this was recorded, or by a source
+    /// with no definition.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "snapshot-source-fingerprint"
+    )]
+    snapshot_source_fingerprint: Option<String>,
+    /// Source selection this particular snapshot was materialized from — what a
+    /// `refresh_mode: snapshot` consumer compares. Recorded per entry for the same
+    /// reason as [`Self::snapshot_source_fingerprint`]. Absent for an entry written
+    /// before this was recorded, by a source with no selection (a view), or by a
+    /// publish that could only recover the outgoing definition (pre-recreation).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "snapshot-source-selection-fingerprint"
+    )]
+    snapshot_source_selection_fingerprint: Option<String>,
+    /// How the producing materialization was allowed to read its sources.
+    ///
+    /// Recorded per entry so a `consistent_read` bootstrap can refuse an archive
+    /// published under `independent_reads` even when the consumer's current plan happens
+    /// to read once — catalog state and pushdown can change that plan without
+    /// changing the SQL. Absent for an entry written before this was recorded, or
+    /// by a source that is not a query (a dataset always reads once).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "snapshot-read-consistency"
+    )]
+    snapshot_read_consistency: Option<SnapshotsConsistency>,
 }
 
 impl SnapshotMetadata {
@@ -282,6 +424,16 @@ impl DatasetMetadata {
         self.schemas
             .iter()
             .find(|schema| schema.schema_id == self.current_schema_id)
+    }
+
+    /// Whether a publisher has recorded a definition on this series. An unstamped entry
+    /// is only accepted from a series that has never been stamped; see
+    /// [`definition_stamp_permits`].
+    fn records_definition_stamps(&self) -> bool {
+        self.properties.contains_key(SOURCE_FINGERPRINT_PROPERTY)
+            || self
+                .properties
+                .contains_key(SOURCE_SELECTION_FINGERPRINT_PROPERTY)
     }
 }
 
@@ -714,6 +866,16 @@ pub enum SnapshotUploadError {
         #[snafu(source(from(engine::SnapshotEngineError, Box::new)))]
         source: Box<engine::SnapshotEngineError>,
     },
+    #[snafu(display(
+        "Refusing to publish the snapshot of '{dataset}': the archive does not match the \
+         metadata captured for it, so restoring it would not reproduce the acceleration. \
+         Cause: {source}"
+    ))]
+    VerifyArchive {
+        dataset: String,
+        #[snafu(source(from(engine::SnapshotEngineError, Box::new)))]
+        source: Box<engine::SnapshotEngineError>,
+    },
     #[snafu(display("Snapshots are disabled for dataset {dataset}"))]
     AdapterDisabled { dataset: String },
     #[snafu(display(
@@ -847,6 +1009,36 @@ enum SnapshotFileStatus {
     NotFound,
 }
 
+/// A veto consulted immediately before every snapshot publish.
+///
+/// A dataset needs none: it materializes one source and reads it once, so a snapshot of
+/// its accelerator is always a snapshot of a single read. A view materializes a query,
+/// and whether that query resolves to a single read is a property of the *compiled
+/// plan* — which follows catalog state, statistics and federation pushdown, none of
+/// which are fixed when the view is registered. The load-time check exists to give the
+/// operator a fast, actionable error; this gate is what makes the decision binding,
+/// because it requires the read-shape attested from the plan that executed the
+/// refresh that produced the rows, not a fresh re-plan at publish time.
+///
+/// Refusal skips the publish and leaves the previous snapshot as the store's current
+/// one. That is deliberately not an error: the accelerated table is still correct and
+/// still serving, it just does not get a new snapshot this cycle.
+#[async_trait]
+pub trait SnapshotPublishGate: Send + Sync {
+    /// `Err(reason)` skips this publish; `reason` is a cause clause worded for an operator log.
+    async fn check_publish(&self) -> Result<(), String>;
+
+    /// Bind the materialization epoch sampled with the rows under the accelerator
+    /// write mutex.
+    ///
+    /// A refresh can retract provenance and record a new plan-shape attestation
+    /// before it takes that mutex. Publication must refuse unless the attestation
+    /// is from this epoch — otherwise the gate can approve old rows using a later
+    /// plan. No default: every impl must say what it does with the bound epoch
+    /// (view gates match it; test fixtures that ignore plan shape no-op).
+    fn bind_materialization_epoch(&self, epoch: u64);
+}
+
 /// Manages snapshots for a specific accelerated dataset.
 #[derive(Clone)]
 pub struct SnapshotManager {
@@ -863,6 +1055,18 @@ pub struct SnapshotManager {
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
     snapshots_creation_policy: SnapshotsCreationPolicy,
     network_retry_strategy: RetryBackoff,
+    /// Consulted before every publish. `None` for a source that needs no veto.
+    publish_gate: Option<Arc<dyn SnapshotPublishGate>>,
+    /// Identity of the definition this series is materialized from, when the source has
+    /// one, and how to treat an archive that records none. See
+    /// [`SOURCE_FINGERPRINT_PROPERTY`].
+    source_definition: Option<crate::acceleration_source::SourceDefinition>,
+    /// Producing-read policy this manager stamps on publish and enforces on bootstrap.
+    ///
+    /// `None` for a source that is not a query (a dataset): no stamp, no check. `Some`
+    /// for a view: every published entry records the value, and a `consistent_read`
+    /// bootstrap refuses an `independent_reads` or unstamped entry.
+    snapshots_consistency: Option<SnapshotsConsistency>,
     writer_lease: WriterLease,
 }
 
@@ -1258,6 +1462,9 @@ impl SnapshotManager {
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
             network_retry_strategy,
+            publish_gate: None,
+            source_definition: None,
+            snapshots_consistency: None,
             writer_lease: WriterLease::default(),
         })
     }
@@ -1335,6 +1542,9 @@ impl SnapshotManager {
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
             network_retry_strategy,
+            publish_gate: None,
+            source_definition: None,
+            snapshots_consistency: None,
             writer_lease: WriterLease::default(),
         })
     }
@@ -1365,6 +1575,203 @@ impl SnapshotManager {
         self
     }
 
+    /// Installs the veto consulted before every publish. See [`SnapshotPublishGate`].
+    #[must_use]
+    pub fn with_publish_gate(mut self, gate: Arc<dyn SnapshotPublishGate>) -> Self {
+        self.publish_gate = Some(gate);
+        self
+    }
+
+    /// Bind the materialization epoch sampled with the rows being archived.
+    ///
+    /// No-op when this manager has no publish gate (datasets). View gates use
+    /// the epoch to refuse a later refresh's attestation.
+    pub fn bind_publish_epoch(&self, epoch: u64) {
+        if let Some(gate) = self.publish_gate.as_ref() {
+            gate.bind_materialization_epoch(epoch);
+        }
+    }
+
+    /// Records the identity of the definition this series materializes, so a bootstrap
+    /// can refuse an archive built from a different one. See
+    /// [`SOURCE_FINGERPRINT_PROPERTY`].
+    #[must_use]
+    pub fn with_source_definition(
+        mut self,
+        definition: crate::acceleration_source::SourceDefinition,
+    ) -> Self {
+        self.source_definition = Some(definition);
+        self
+    }
+
+    /// Records how this series' producing materialization was allowed to read its
+    /// sources, so a `consistent_read` bootstrap can refuse an archive published
+    /// under `independent_reads`.
+    ///
+    /// Call only for a planned-query source (a view). A dataset always reads once
+    /// and does not stamp or check this field.
+    #[must_use]
+    pub fn with_snapshots_consistency(
+        mut self,
+        snapshots_consistency: SnapshotsConsistency,
+    ) -> Self {
+        self.snapshots_consistency = Some(snapshots_consistency);
+        self
+    }
+
+    /// Records definition identity, and for a planned query the producing-read
+    /// consistency a later `consistent_read` bootstrap must enforce.
+    #[must_use]
+    pub fn with_source_identity(
+        self,
+        definition: Option<crate::acceleration_source::SourceDefinition>,
+        snapshots_consistency: SnapshotsConsistency,
+    ) -> Self {
+        let Some(definition) = definition else {
+            return self;
+        };
+        let stamp_read_consistency = matches!(
+            definition.materialization,
+            crate::acceleration_source::MaterializationSource::PlannedQuery
+        );
+        let this = self.with_source_definition(definition);
+        if stamp_read_consistency {
+            this.with_snapshots_consistency(snapshots_consistency)
+        } else {
+            this
+        }
+    }
+
+    /// Apply [`Self::with_source_identity`] from an acceleration source.
+    #[must_use]
+    pub fn with_source(self, source: &dyn crate::acceleration_source::AccelerationSource) -> Self {
+        self.with_source_identity(
+            source.definition_fingerprint(),
+            source
+                .acceleration()
+                .map(|acceleration| acceleration.snapshots_consistency)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The configured definition identity this manager stamps on a publish, if any.
+    #[must_use]
+    pub fn source_definition_fingerprint(&self) -> Option<&str> {
+        self.source_definition
+            .as_ref()
+            .map(|definition| definition.fingerprint.as_str())
+    }
+
+    /// Whether one snapshot entry was materialized from the definition now in force.
+    ///
+    /// A manager with no fingerprint accepts anything. One that has a fingerprint
+    /// accepts an entry carrying the same value, and treats an entry carrying a
+    /// different one — or none at all, unless `accept_unstamped` is set — as
+    /// unverified. Datasets and views both refuse unstamped archives: absence
+    /// cannot be shown to match the definition now in force. A
+    /// `refresh_mode: snapshot` dataset compares the entry's source selection
+    /// instead; see [`definition_stamp_permits`].
+    fn entry_fingerprint_matches(
+        &self,
+        entry: &SnapshotEntry,
+        dataset_metadata: &DatasetMetadata,
+    ) -> bool {
+        self.entry_definition_permits(entry, dataset_metadata)
+            .is_ok()
+    }
+
+    /// [`Self::entry_fingerprint_matches`], with the reason an entry is refused.
+    /// `dataset_metadata` is the series the entry belongs to.
+    fn entry_definition_permits(
+        &self,
+        entry: &SnapshotEntry,
+        dataset_metadata: &DatasetMetadata,
+    ) -> Result<(), String> {
+        let Some(definition) = self.source_definition.as_ref() else {
+            return Ok(());
+        };
+        definition_stamp_permits(
+            definition,
+            entry.snapshot_source_fingerprint.as_deref(),
+            entry.snapshot_source_selection_fingerprint.as_deref(),
+            dataset_metadata.records_definition_stamps(),
+        )
+    }
+
+    /// Whether one snapshot entry's producing-read stamp is admissible for this manager.
+    ///
+    /// A manager with no consistency policy (a dataset) accepts anything. An
+    /// `independent_reads` consumer accepts any stamp, including none: it opted out. A
+    /// `consistent_read` consumer accepts only an entry stamped `consistent_read` —
+    /// an `independent_reads` marker means the rows may already be torn, and a missing
+    /// stamp cannot be shown to have come from a single read.
+    fn entry_read_consistency_permits(&self, entry: &SnapshotEntry) -> Result<(), String> {
+        match self.snapshots_consistency {
+            None | Some(SnapshotsConsistency::IndependentReads) => Ok(()),
+            Some(SnapshotsConsistency::ConsistentRead) => match entry.snapshot_read_consistency {
+                Some(SnapshotsConsistency::ConsistentRead) => Ok(()),
+                Some(SnapshotsConsistency::IndependentReads) => {
+                    Err(independent_reads_snapshot_bootstrap_reason())
+                }
+                None => Err(missing_read_consistency_bootstrap_reason()),
+            },
+        }
+    }
+
+    /// [`Self::source_fingerprint_matches`], with the operator-facing warning attached so the
+    /// two bootstrap entry points cannot word it differently.
+    fn fingerprint_permits_bootstrap(&self, dataset_metadata: &DatasetMetadata) -> bool {
+        match self.source_fingerprint_matches(dataset_metadata) {
+            Ok(()) => true,
+            Err(reason) => {
+                self.warn_snapshot_refused(&reason);
+                false
+            }
+        }
+    }
+
+    /// The operator-facing warning for a snapshot this manager's definition refuses.
+    ///
+    /// The consequence depends on what the source can do without it: a source that
+    /// matches its full definition rebuilds from its own source, while a
+    /// `refresh_mode: snapshot` dataset cannot, and keeps whatever it already loaded.
+    fn warn_snapshot_refused(&self, reason: &str) {
+        let follows_published_series = self.source_definition.as_ref().is_some_and(|definition| {
+            definition.matched_on == crate::acceleration_source::DefinitionMatch::SourceSelection
+        });
+        if follows_published_series {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "{}",
+                snapshot_refused_by_follower_warning(&self.dataset_name, reason)
+            );
+        } else {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "Did not bootstrap '{}' from its snapshot, so it starts empty and its first refresh rebuilds it: {reason}",
+                self.dataset_name
+            );
+        }
+    }
+
+    fn source_fingerprint_matches(&self, dataset_metadata: &DatasetMetadata) -> Result<(), String> {
+        let Some(definition) = self.source_definition.as_ref() else {
+            return Ok(());
+        };
+        definition_stamp_permits(
+            definition,
+            dataset_metadata
+                .properties
+                .get(SOURCE_FINGERPRINT_PROPERTY)
+                .map(String::as_str),
+            dataset_metadata
+                .properties
+                .get(SOURCE_SELECTION_FINGERPRINT_PROPERTY)
+                .map(String::as_str),
+            dataset_metadata.records_definition_stamps(),
+        )
+    }
+
     /// Sets how often this dataset creates snapshots. An instance holding the
     /// dataset's snapshot writer lease is presumed gone once it has not renewed
     /// the lease for twice this interval.
@@ -1383,6 +1790,26 @@ impl SnapshotManager {
         let dataset_entry = handle.metadata.datasets.get(&self.dataset_name)?;
         let schema_meta = dataset_entry.current_schema()?;
         schema_meta.to_schema_ref().ok()
+    }
+
+    /// The source-definition stamp recorded on the current *remote* snapshot, if any.
+    ///
+    /// This is the series pointer, not the identity of the local acceleration.
+    /// Pre-recreation must not use it: after a withheld override the remote
+    /// stamp still names the last published identity, which is not what the
+    /// local rows are.
+    pub async fn current_stored_source_fingerprint(&self) -> Option<String> {
+        let handle = self.load_metadata().await.ok()??;
+        let dataset_entry = handle.metadata.datasets.get(&self.dataset_name)?;
+        dataset_entry
+            .current_snapshot()
+            .and_then(|entry| entry.snapshot_source_fingerprint.clone())
+            .or_else(|| {
+                dataset_entry
+                    .properties
+                    .get(SOURCE_FINGERPRINT_PROPERTY)
+                    .cloned()
+            })
     }
 
     /// Returns the `current_snapshot_id` from the remote snapshot metadata for this
@@ -1798,6 +2225,29 @@ impl SnapshotManager {
             }
         }
 
+        // Asked once every cheaper reason to skip has been ruled out, but before anything is
+        // uploaded — including after the force-create promotion above, which guarantees a
+        // series is non-empty and must not be read as overriding a correctness veto. Placing
+        // it here keeps a no-op cycle (nothing written since the last snapshot) from paying
+        // for a gate evaluation that can be expensive.
+        if let Some(gate) = self.publish_gate.as_ref()
+            && let Err(reason) = gate.check_publish().await
+        {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "Skipped creating a snapshot of '{}', so its snapshot series keeps the previously published contents and a cold start will bootstrap those: {reason}",
+                self.dataset_name
+            );
+            metrics::record_snapshot_skipped(&self.dataset_name);
+            // A holder that cannot publish lets another instance take over, as a failed
+            // attempt does: renewing the lease while refused would keep every other
+            // instance on standby for as long as the refusal lasts.
+            if writer_generation.is_some() {
+                self.release_writer_lease().await;
+            }
+            return Ok(None);
+        }
+
         let start_time = Instant::now();
         let now = Utc::now();
         let layout = SnapshotPathLayout::new(&self.dataset_name, &self.engine);
@@ -1891,7 +2341,10 @@ impl SnapshotManager {
         // Step 0: Engine-specific live checkpoint while the lock is held.
         // For DuckDB/SQLite/Turso this drains the write-ahead log into the main
         // file so that the subsequent `fs::copy` produces a self-contained
-        // snapshot. Engines with nothing to flush return `Ok(())`.
+        // snapshot. Engines with nothing to flush return `Ok(())`. This is also
+        // how `snapshot_before_recreate` (file_create and schema recreate) folds
+        // DuckDB's log: both call `create_snapshot` rather than copying
+        // themselves.
         self.snapshot_engine
             .checkpoint_live(source_local_path, &self.dataset_name)
             .await
@@ -1983,7 +2436,7 @@ impl SnapshotManager {
             uuid::Uuid::now_v7()
         ));
 
-        let total_archived = match archive_directories_to_file_with_plan(
+        let archived = match archive_directories_to_file_with_plan(
             dirs,
             &temp_archive_path,
             &skip_paths,
@@ -1991,7 +2444,7 @@ impl SnapshotManager {
         )
         .await
         {
-            Ok(total) => total,
+            Ok(archived) => archived,
             Err(source) => {
                 // A retry writes a new path, so remove the partial archive now.
                 let _ = fs::remove_file(&temp_archive_path).await;
@@ -2005,8 +2458,27 @@ impl SnapshotManager {
         tracing::debug!(
             "Created tar archive for snapshot. dataset={} archive_size={}",
             self.dataset_name,
-            total_archived
+            archived.bytes
         );
+
+        // Step 1b: Ask the engine whether the archive actually matches the metadata it
+        // handed us in step 0. The metadata is captured before the directory walk, and
+        // nothing pins the files it names for the duration of the walk — a concurrent
+        // compaction can retire a snapshot and a later cleanup can unlink its files while
+        // the tar is still being written. Publishing that archive makes it the store's
+        // current snapshot, and it cannot be restored. Failing here leaves the previous
+        // snapshot in place, which is the correct outcome.
+        if let Err(source) = self
+            .snapshot_engine
+            .verify_directory_snapshot(dirs, &archived.members, &self.dataset_name)
+            .await
+        {
+            let _ = fs::remove_file(&temp_archive_path).await;
+            return Err(SnapshotUploadError::VerifyArchive {
+                dataset: self.dataset_name.clone(),
+                source: Box::new(source),
+            });
+        }
 
         // Step 2: Release the lock - queries can resume
         drop(lock_guard);
@@ -2302,6 +2774,10 @@ impl SnapshotManager {
             return Ok(None);
         };
 
+        if !self.fingerprint_permits_bootstrap(&dataset_metadata) {
+            return Ok(None);
+        }
+
         let Some(current_entry) = dataset_metadata.current_snapshot().cloned() else {
             tracing::debug!(
                 "Dataset metadata missing current snapshot pointer; continuing without bootstrapping. dataset={} metadata={metadata_path_display}",
@@ -2309,6 +2785,20 @@ impl SnapshotManager {
             );
             return Ok(None);
         };
+
+        if let Err(reason) = self.entry_definition_permits(&current_entry, &dataset_metadata) {
+            self.warn_snapshot_refused(&reason);
+            return Ok(None);
+        }
+
+        if let Err(reason) = self.entry_read_consistency_permits(&current_entry) {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "Did not bootstrap '{}' from its snapshot, so it starts empty and its first refresh rebuilds it: {reason}",
+                self.dataset_name
+            );
+            return Ok(None);
+        }
 
         self.download_snapshot_entry(
             &current_entry,
@@ -2344,6 +2834,13 @@ impl SnapshotManager {
             return Ok(None);
         }
 
+        // The fingerprint is a property of the whole series, not of one entry, so a
+        // mismatch rules out every older snapshot too — falling back through them would
+        // only find more archives of the same superseded definition.
+        if !self.fingerprint_permits_bootstrap(&dataset_metadata) {
+            return Ok(None);
+        }
+
         let mut ordered_snapshots = Vec::new();
         if let Some(current) = dataset_metadata.current_snapshot().cloned() {
             ordered_snapshots.push(current);
@@ -2361,6 +2858,27 @@ impl SnapshotManager {
         for snapshot in ordered_snapshots {
             let snapshot_uri = self
                 .snapshot_read_uri(&snapshot.snapshot, Some(&metadata_handle.metadata.location));
+            // Judge each candidate on its OWN recorded definition. The series-level property
+            // checked above describes the most recent publish, so on its own it would let
+            // this walk fall back past a definition change into archives of the previous one.
+            if !self.entry_fingerprint_matches(&snapshot, &dataset_metadata) {
+                tracing::debug!(
+                    "Skipping snapshot materialized from a different definition; attempting next available snapshot. dataset={} snapshot={}",
+                    self.dataset_name,
+                    snapshot_uri,
+                );
+                continue;
+            }
+
+            if let Err(reason) = self.entry_read_consistency_permits(&snapshot) {
+                tracing::debug!(
+                    "Skipping snapshot that a consistent_read bootstrap cannot restore ({reason}); attempting next available snapshot. dataset={} snapshot={}",
+                    self.dataset_name,
+                    snapshot_uri,
+                );
+                continue;
+            }
+
             // Early engine filtering: skip snapshots created by a different engine before
             // attempting any download. This avoids wasting bandwidth on incompatible files
             // (e.g. DuckDB snapshots when the current engine is Cayenne).
@@ -2736,7 +3254,11 @@ impl SnapshotManager {
                 "Bootstrapping dataset checkpoint from snapshot metadata"
             );
             checkpointer
-                .checkpoint(&metadata_schema, None)
+                .checkpoint(
+                    &metadata_schema,
+                    None,
+                    entry.snapshot_source_fingerprint.as_deref(),
+                )
                 .await
                 .map_err(|source| SnapshotDownloadError::CheckpointerBootstrap { source })?;
             metadata_schema
@@ -3156,6 +3678,31 @@ impl SnapshotManager {
                 return Ok(Publication::Superseded);
             }
 
+            // Stamp the definition this series materializes, so a later bootstrap can
+            // refuse an archive built from a different one. The source selection travels
+            // with it for the `refresh_mode: snapshot` datasets that follow this series.
+            // A publish without one removes the previous publish's selection rather than
+            // leaving it to vouch for rows it does not describe.
+            if let Some(definition) = self.source_definition.as_ref() {
+                dataset_entry.properties.insert(
+                    SOURCE_FINGERPRINT_PROPERTY.to_string(),
+                    definition.fingerprint.clone(),
+                );
+                match definition.selection_fingerprint.as_ref() {
+                    Some(selection) => {
+                        dataset_entry.properties.insert(
+                            SOURCE_SELECTION_FINGERPRINT_PROPERTY.to_string(),
+                            selection.clone(),
+                        );
+                    }
+                    None => {
+                        dataset_entry
+                            .properties
+                            .remove(SOURCE_SELECTION_FINGERPRINT_PROPERTY);
+                    }
+                }
+            }
+
             // Metadata written before recorded schemas were conformed keeps the invalid
             // declaration in the *published* JSON. `to_schema_ref` repairs what this process
             // reads, but the repaired form then compares equal to the live accelerator schema,
@@ -3285,6 +3832,15 @@ impl SnapshotManager {
                 snapshot_engine: Some(self.engine.to_string()),
                 snapshot_row_count: row_count,
                 snapshot_last_updated_at_ms: last_updated_at,
+                snapshot_source_fingerprint: self
+                    .source_definition
+                    .as_ref()
+                    .map(|definition| definition.fingerprint.clone()),
+                snapshot_source_selection_fingerprint: self
+                    .source_definition
+                    .as_ref()
+                    .and_then(|definition| definition.selection_fingerprint.clone()),
+                snapshot_read_consistency: self.snapshots_consistency,
             };
 
             dataset_entry.snapshots.push(snapshot_entry);
@@ -3927,7 +4483,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
     use object_store::{memory::InMemory, path::Path};
-    use std::{io::Write, path::PathBuf, sync::Arc, time::SystemTime};
+    use std::{path::PathBuf, sync::Arc, time::SystemTime};
     use tempfile::{NamedTempFile, TempDir};
     use tokio::fs;
     use tokio::sync::Mutex;
@@ -3951,6 +4507,7 @@ mod tests {
             &self,
             _schema: &SchemaRef,
             _refresh_sql: Option<&str>,
+            _source_fingerprint: Option<&str>,
         ) -> DatasetCheckpointResult<()> {
             Ok(())
         }
@@ -3968,6 +4525,10 @@ mod tests {
         }
 
         async fn get_refresh_sql(&self) -> DatasetCheckpointResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn get_source_fingerprint(&self) -> DatasetCheckpointResult<Option<String>> {
             Ok(None)
         }
 
@@ -3990,19 +4551,25 @@ mod tests {
     /// test bytes since no engine-side validation runs against the file pre-snapshot.
     fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
         match engine {
-            #[cfg(feature = "duckdb")]
-            AccelerationEngine::DuckDB => {
-                let conn = duckdb::Connection::open(path).expect("open sample duckdb db");
-                conn.execute_batch("CREATE TABLE sample(id INTEGER)")
-                    .expect("create sample table");
-                drop(conn);
-            }
             #[cfg(any(feature = "sqlite", feature = "turso"))]
             AccelerationEngine::Sqlite | AccelerationEngine::Turso => {
                 let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
                 conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
                     .expect("set wal");
                 conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY)", [])
+                    .expect("create sample table");
+                drop(conn);
+            }
+            #[cfg(feature = "duckdb")]
+            AccelerationEngine::DuckDB => {
+                // `checkpoint_live` opens this file and runs `CHECKPOINT`.
+                // `NamedTempFile` leaves a 0-byte placeholder that DuckDB
+                // will not initialize, so replace it with a real database.
+                if path.exists() {
+                    std::fs::remove_file(path).expect("remove empty placeholder");
+                }
+                let conn = duckdb::Connection::open(path).expect("open sample duckdb db");
+                conn.execute_batch("CREATE TABLE sample(id INTEGER)")
                     .expect("create sample table");
                 drop(conn);
             }
@@ -4047,6 +4614,9 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            publish_gate: None,
+            source_definition: None,
+            snapshots_consistency: None,
             writer_lease: WriterLease::default(),
         }
     }
@@ -4168,6 +4738,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -4267,6 +4840,9 @@ mod tests {
                         snapshot_engine: None,
                         snapshot_row_count: None,
                         snapshot_last_updated_at_ms: None,
+                        snapshot_source_fingerprint: None,
+                        snapshot_source_selection_fingerprint: None,
+                        snapshot_read_consistency: None,
                     }],
                     Some(0),
                 ),
@@ -4315,6 +4891,225 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "duckdb")]
+    async fn download_latest_snapshot_refuses_an_independent_reads_archive_under_consistent_read() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"torn-snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let snapshot_entry = SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum,
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: Some(SnapshotsConsistency::IndependentReads),
+        };
+
+        let schema = sample_schema();
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(&schema, vec![snapshot_entry], Some(0)),
+            )]),
+        };
+
+        let metadata_path = base.join(METADATA_FILE_NAME);
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        )
+        .with_snapshots_consistency(SnapshotsConsistency::ConsistentRead);
+
+        let result = manager
+            .download_latest_snapshot()
+            .await
+            .expect("a refused bootstrap is not a download error");
+        assert!(
+            result.is_none(),
+            "a consistent_read consumer must not restore an independent_reads archive"
+        );
+        assert!(
+            !local_path.exists(),
+            "a refused bootstrap must not write the local acceleration"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn download_latest_snapshot_accepts_a_consistent_read_archive() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"consistent-snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let snapshot_entry = SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum.clone(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: Some(SnapshotsConsistency::ConsistentRead),
+        };
+
+        let schema = sample_schema();
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(&schema, vec![snapshot_entry], Some(0)),
+            )]),
+        };
+
+        let metadata_path = base.join(METADATA_FILE_NAME);
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        )
+        .with_snapshots_consistency(SnapshotsConsistency::ConsistentRead);
+
+        let info = manager
+            .download_latest_snapshot()
+            .await
+            .expect("download should succeed")
+            .expect("a consistent_read archive must bootstrap under consistent_read");
+        assert_eq!(info.checksum, checksum);
+        let downloaded = fs::read(&local_path)
+            .await
+            .expect("read downloaded snapshot");
+        assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn download_latest_snapshot_accepts_an_independent_reads_archive_under_independent_reads()
+    {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"independent-reads-snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let snapshot_entry = SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum.clone(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: Some(SnapshotsConsistency::IndependentReads),
+        };
+
+        let schema = sample_schema();
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(&schema, vec![snapshot_entry], Some(0)),
+            )]),
+        };
+
+        let metadata_path = base.join(METADATA_FILE_NAME);
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        )
+        .with_snapshots_consistency(SnapshotsConsistency::IndependentReads);
+
+        let info = manager
+            .download_latest_snapshot()
+            .await
+            .expect("download should succeed")
+            .expect("an independent_reads consumer must restore an independent_reads archive");
+        assert_eq!(info.checksum, checksum);
+        let downloaded = fs::read(&local_path)
+            .await
+            .expect("read downloaded snapshot");
+        assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
     async fn download_if_newer_returns_none_when_local_id_matches() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
@@ -4339,6 +5134,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let schema = sample_schema();
         let metadata = SnapshotMetadata {
@@ -4479,6 +5277,9 @@ mod tests {
             snapshot_engine: Some(AccelerationEngine::Cayenne.to_string()),
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         }
     }
 
@@ -4778,6 +5579,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = SnapshotMetadata {
             format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
@@ -4918,6 +5722,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let valid_checksum = compute_sha256_hex(second_contents.as_ref());
@@ -4931,6 +5738,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -4973,15 +5783,1007 @@ mod tests {
         assert_eq!(downloaded.as_slice(), second_contents.as_ref());
     }
 
+    /// Manager over a Cayenne-shaped two-directory layout, so the directory create and
+    /// extract paths can be exercised without an accelerator.
+    fn build_directory_manager(
+        store: Arc<InMemory>,
+        metadata_dir: PathBuf,
+        data_dir: PathBuf,
+        schema: &SchemaRef,
+    ) -> SnapshotManager {
+        let schema_for_factory = Arc::clone(schema);
+        let factory: DatasetCheckpointerFactory = Arc::new(move || {
+            let schema = Arc::clone(&schema_for_factory);
+            Box::pin(async move {
+                Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(StaticSchemaCheckpointer { schema }))
+            })
+        });
+
+        SnapshotManager {
+            dataset_name: DATASET_NAME.to_string(),
+            snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
+            snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
+            layout: AccelerationLayout::cayenne(metadata_dir, data_dir),
+            engine: AccelerationEngine::Cayenne,
+            snapshot_engine: create_snapshot_engine(&AccelerationEngine::Cayenne, false),
+            object_store: store,
+            bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
+            checkpointer_factory: Some(factory),
+            snapshots_creation_policy: SnapshotsCreationPolicy::Always,
+            network_retry_strategy: RetryBackoffBuilder::new()
+                .max_retries(Some(NETWORK_RETRY_MAX))
+                .build(),
+            publish_gate: None,
+            source_definition: None,
+            snapshots_consistency: None,
+            writer_lease: WriterLease::default(),
+        }
+    }
+
+    /// The directory-layout path (Cayenne) had no round-trip coverage at all: every
+    /// bootstrap test in this module is single-file.
+    #[tokio::test]
+    async fn directory_snapshot_round_trips_its_files() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+
+        let src = tempfile::tempdir().expect("source dirs");
+        let metadata_dir = src.path().join("metadata");
+        let data_dir = src.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        std::fs::create_dir_all(data_dir.join("tbl").join("snap")).expect("mkdir snapshot");
+        std::fs::write(data_dir.join("tbl").join("snap").join("a.vortex"), b"rows")
+            .expect("write data file");
+
+        let manager = build_directory_manager(Arc::clone(&store), metadata_dir, data_dir, &schema);
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create directory snapshot")
+            .expect("a snapshot is published");
+
+        // Restore into a location that holds nothing, which is the only state a bootstrap
+        // is allowed to restore into.
+        let dst = tempfile::tempdir().expect("restore dirs");
+        let restored_metadata = dst.path().join("metadata");
+        let restored_data = dst.path().join("data");
+        let restore_manager =
+            build_directory_manager(store, restored_metadata, restored_data.clone(), &schema);
+        assert!(
+            !restore_manager.layout.has_existing_acceleration(),
+            "the restore target must start empty"
+        );
+
+        restore_manager
+            .download_latest_snapshot()
+            .await
+            .expect("download")
+            .expect("a snapshot is available");
+
+        let restored_file = restored_data.join("tbl").join("snap").join("a.vortex");
+        assert!(
+            restored_file.exists(),
+            "the archived data file should be back at {}",
+            restored_file.display()
+        );
+        assert_eq!(
+            std::fs::read(&restored_file).expect("read restored file"),
+            b"rows"
+        );
+        assert!(restore_manager.layout.has_existing_acceleration());
+    }
+
+    #[derive(Debug)]
+    struct RefusingVerifyEngine;
+
+    #[async_trait]
+    impl engine::SnapshotEngine for RefusingVerifyEngine {
+        async fn checkpoint_live(
+            &self,
+            _live_path: &std::path::Path,
+            _dataset_name: &str,
+        ) -> Result<(), engine::SnapshotEngineError> {
+            Ok(())
+        }
+
+        async fn prepare_for_upload(
+            &self,
+            source_path: &std::path::Path,
+            _dataset_name: &str,
+        ) -> Result<PathBuf, engine::SnapshotEngineError> {
+            Ok(source_path.to_path_buf())
+        }
+
+        fn supports_compaction(&self) -> bool {
+            false
+        }
+
+        async fn verify_directory_snapshot(
+            &self,
+            _dirs: &[(PathBuf, String)],
+            _members: &std::collections::HashSet<String>,
+            _dataset_name: &str,
+        ) -> Result<(), engine::SnapshotEngineError> {
+            Err(engine::SnapshotEngineError::from_display(
+                "a data file went missing while the archive was written",
+            ))
+        }
+    }
+
+    /// An engine that reports the archive does not match its metadata must stop the
+    /// publish: the alternative is making an unrestorable archive the store's current
+    /// snapshot, which is worse than keeping the previous one.
+    #[tokio::test]
+    async fn directory_snapshot_is_not_published_when_verification_fails() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+
+        let src = tempfile::tempdir().expect("source dirs");
+        let metadata_dir = src.path().join("metadata");
+        let data_dir = src.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        std::fs::write(data_dir.join("a.vortex"), b"rows").expect("write data file");
+
+        let manager = build_directory_manager(Arc::clone(&store), metadata_dir, data_dir, &schema)
+            .with_snapshot_engine(Arc::new(RefusingVerifyEngine));
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        let err = manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect_err("a refused archive must not publish");
+        assert!(
+            err.to_string().contains("went missing"),
+            "the engine's reason should reach the operator: {err}"
+        );
+
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        assert!(
+            store.get(&metadata_path).await.is_err(),
+            "a refused archive must not become the store's current snapshot"
+        );
+    }
+
+    struct FixedGate(Option<&'static str>);
+
+    #[async_trait]
+    impl SnapshotPublishGate for FixedGate {
+        async fn check_publish(&self) -> Result<(), String> {
+            match self.0 {
+                Some(reason) => Err(reason.to_string()),
+                None => Ok(()),
+            }
+        }
+
+        fn bind_materialization_epoch(&self, _epoch: u64) {}
+    }
+
+    fn manager_for_gate_tests(store: &Arc<InMemory>, local_path: PathBuf) -> SnapshotManager {
+        build_manager(
+            Arc::clone(store),
+            local_path,
+            BootstrapOnFailureBehavior::Fallback,
+            &sample_schema(),
+            false,
+        )
+    }
+
+    fn temp_snapshot_file() -> (tempfile::TempPath, PathBuf) {
+        let temp_file = NamedTempFile::new().expect("create temp file");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+        #[cfg(feature = "duckdb")]
+        write_sample_local_db(&local_path, &AccelerationEngine::DuckDB);
+        #[cfg(not(feature = "duckdb"))]
+        std::fs::write(&local_path, b"snapshot-bytes").expect("write temp snapshot");
+        (temp_path, local_path)
+    }
+
+    /// A refused publish must leave the store completely untouched — in particular it
+    /// must not be rescued by the "no existing snapshots, force the first one" promotion,
+    /// which exists to guarantee a series is non-empty, not to override a correctness
+    /// veto.
+    #[tokio::test]
+    async fn publish_gate_refusal_skips_creation_even_for_the_first_snapshot() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let manager = manager_for_gate_tests(&store, local_path)
+            .with_publish_gate(Arc::new(FixedGate(Some("its query reads twice"))));
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+
+        let result = manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("a refusal is not an error");
+        assert!(result.is_none(), "a refused publish uploads nothing");
+
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        assert!(
+            store.get(&metadata_path).await.is_err(),
+            "a refused publish must not write snapshot metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_gate_pass_allows_creation() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let manager =
+            manager_for_gate_tests(&store, local_path).with_publish_gate(Arc::new(FixedGate(None)));
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+
+        let uploaded = manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot");
+        assert!(
+            uploaded.is_some(),
+            "a passing gate does not block the publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_records_the_source_fingerprint_in_metadata() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let manager = manager_for_gate_tests(&store, local_path).with_source_definition(
+            crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:abc123".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
+            },
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+
+        let handle = manager
+            .load_metadata()
+            .await
+            .expect("load metadata")
+            .expect("metadata written");
+        let dataset_entry = handle
+            .metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset recorded");
+        assert_eq!(
+            dataset_entry.properties.get(SOURCE_FINGERPRINT_PROPERTY),
+            Some(&"sha256:abc123".to_string())
+        );
+    }
+
+    /// The series-level and current-entry source-selection stamps, in that order.
+    async fn recorded_source_selection(
+        manager: &SnapshotManager,
+    ) -> (Option<String>, Option<String>) {
+        let handle = manager
+            .load_metadata()
+            .await
+            .expect("load metadata")
+            .expect("metadata written");
+        let dataset_entry = handle
+            .metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset recorded");
+        (
+            dataset_entry
+                .properties
+                .get(SOURCE_SELECTION_FINGERPRINT_PROPERTY)
+                .cloned(),
+            dataset_entry
+                .current_snapshot()
+                .expect("a current snapshot")
+                .snapshot_source_selection_fingerprint
+                .clone(),
+        )
+    }
+
+    /// The selection stamp is what `refresh_mode: snapshot` followers trust. A publish that
+    /// has none — a pre-recreation archive, which recovers only the outgoing definition —
+    /// must remove the previous publish's selection, or the series would vouch for rows it
+    /// does not describe.
+    #[tokio::test]
+    async fn upload_records_the_source_selection_and_a_publish_without_one_clears_it() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let publisher = manager_for_gate_tests(&store, local_path.clone()).with_source_definition(
+            crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:orders-definition".to_string(),
+                selection_fingerprint: Some("sha256:orders-selection".to_string()),
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            },
+        );
+        let mutex = Arc::new(Mutex::new(()));
+        publisher
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+        assert_eq!(
+            recorded_source_selection(&publisher).await,
+            (
+                Some("sha256:orders-selection".to_string()),
+                Some("sha256:orders-selection".to_string())
+            )
+        );
+
+        let pre_recreation = manager_for_gate_tests(&store, local_path).with_source_definition(
+            crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:outgoing-definition".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            },
+        );
+        pre_recreation
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+        assert_eq!(
+            recorded_source_selection(&pre_recreation).await,
+            (None, None),
+            "a publish without a source selection must not inherit the previous one"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_records_the_producing_read_consistency_on_the_entry() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let manager = manager_for_gate_tests(&store, local_path).with_source_identity(
+            Some(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:view".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
+            }),
+            SnapshotsConsistency::IndependentReads,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+
+        let handle = manager
+            .load_metadata()
+            .await
+            .expect("load metadata")
+            .expect("metadata written");
+        let dataset_entry = handle
+            .metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset recorded");
+        let entry = dataset_entry
+            .current_snapshot()
+            .expect("a published archive must be current");
+        assert_eq!(
+            entry.snapshot_read_consistency,
+            Some(SnapshotsConsistency::IndependentReads),
+            "an independent_reads view must stamp the archive so a consistent_read bootstrap can refuse it"
+        );
+        let json = serde_json::to_value(&handle.metadata).expect("serialize metadata");
+        assert_eq!(
+            json[DATASET_NAME]["snapshots"][0]["snapshot-read-consistency"], "independent_reads",
+            "the archive field must serialize under its kebab-case name"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_stamps_consistent_read_on_a_view_that_did_not_opt_out() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let manager = manager_for_gate_tests(&store, local_path).with_source_identity(
+            Some(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:view".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
+            }),
+            SnapshotsConsistency::ConsistentRead,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+
+        let handle = manager
+            .load_metadata()
+            .await
+            .expect("load metadata")
+            .expect("metadata written");
+        let entry = handle
+            .metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset recorded")
+            .current_snapshot()
+            .expect("a published archive must be current");
+        assert_eq!(
+            entry.snapshot_read_consistency,
+            Some(SnapshotsConsistency::ConsistentRead),
+            "a consistent_read view must stamp the archive so a later consumer can restore it"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_does_not_stamp_read_consistency_on_a_dataset_archive() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let manager = manager_for_gate_tests(&store, local_path).with_source_identity(
+            Some(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:dataset".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            }),
+            SnapshotsConsistency::IndependentReads,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+
+        let handle = manager
+            .load_metadata()
+            .await
+            .expect("load metadata")
+            .expect("metadata written");
+        let entry = handle
+            .metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset recorded")
+            .current_snapshot()
+            .expect("a published archive must be current");
+        assert_eq!(
+            entry.snapshot_read_consistency, None,
+            "a dataset archive is always a single source-table read, so it does not carry a view read-shape stamp"
+        );
+        let json = serde_json::to_value(&handle.metadata).expect("serialize metadata");
+        let published = &json[DATASET_NAME]["snapshots"][0];
+        assert!(
+            published.get("snapshot-read-consistency").is_none(),
+            "the optional field must be omitted from dataset archives so older readers still parse them: {published}"
+        );
+    }
+
+    /// The fingerprint decides whether an archive may be *served* under the definition
+    /// now in force, so absence has to be refused as firmly as disagreement: an archive
+    /// that records nothing cannot be shown to match.
+    #[test]
+    fn source_fingerprint_matching_refuses_a_different_or_missing_definition() {
+        let store = Arc::new(InMemory::new());
+        let base = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"));
+
+        let with_fp = |value: Option<&str>| {
+            let mut meta = DatasetMetadata {
+                name: DATASET_NAME.to_string(),
+                ..Default::default()
+            };
+            if let Some(v) = value {
+                meta.properties
+                    .insert(SOURCE_FINGERPRINT_PROPERTY.to_string(), v.to_string());
+            }
+            meta
+        };
+
+        // A manager with no fingerprint of its own cannot verify a series and
+        // does not refuse. Datasets and views both attach a definition today.
+        base.source_fingerprint_matches(&with_fp(None))
+            .expect("a manager with no fingerprint accepts an unstamped series");
+        base.source_fingerprint_matches(&with_fp(Some("sha256:other")))
+            .expect("a manager with no fingerprint accepts any stamp");
+
+        let view_manager = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_definition(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:current".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
+            });
+
+        assert!(
+            view_manager
+                .source_fingerprint_matches(&with_fp(Some("sha256:current")))
+                .is_ok(),
+            "the same definition bootstraps"
+        );
+        let mismatch = view_manager
+            .source_fingerprint_matches(&with_fp(Some("sha256:previous")))
+            .expect_err("a different definition is refused");
+        assert!(mismatch.contains("different definition"), "{mismatch}");
+
+        let missing = view_manager
+            .source_fingerprint_matches(&with_fp(None))
+            .expect_err("an unstamped archive cannot be verified");
+        assert!(missing.contains(SOURCE_FINGERPRINT_PROPERTY), "{missing}");
+
+        // After a same-schema `from:` / parameter change, an unstamped outgoing
+        // archive (the shape `snapshot_before_recreate` used to publish) must
+        // not bootstrap under the new dataset definition — that would serve the
+        // old rows as current. Refuse so the failure mode is a rebuild.
+        let dataset_manager = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_definition(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:new-from".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            });
+        let unstamped_outgoing = dataset_manager
+            .source_fingerprint_matches(&with_fp(None))
+            .expect_err(
+                "an unstamped outgoing dataset archive must not bootstrap under the new definition",
+            );
+        assert!(
+            unstamped_outgoing.contains(SOURCE_FINGERPRINT_PROPERTY),
+            "{unstamped_outgoing}"
+        );
+        let outgoing_stamp = dataset_manager
+            .source_fingerprint_matches(&with_fp(Some("sha256:old-from")))
+            .expect_err("the outgoing definition must not bootstrap under the new one");
+        assert!(
+            outgoing_stamp.contains("different definition"),
+            "{outgoing_stamp}"
+        );
+    }
+
+    /// A `refresh_mode: snapshot` dataset follows a series another deployment publishes.
+    /// Their full definitions always differ — the follower's refresh mode is `snapshot`
+    /// and the publisher's is not — so it must match on the source selection alone, or
+    /// no follower could ever load its publisher's snapshots.
+    #[test]
+    fn snapshot_follower_matches_its_publisher_on_source_selection() {
+        let store = Arc::new(InMemory::new());
+        let follower = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_definition(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:follower-definition".to_string(),
+                selection_fingerprint: Some("sha256:orders-selection".to_string()),
+                matched_on: crate::acceleration_source::DefinitionMatch::SourceSelection,
+                accept_unstamped: true,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            });
+        // Same source selection, but a source that restores its own series: a change to
+        // its refresh mode or write policies is still a different definition to it.
+        let own_series = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_definition(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:changed-definition".to_string(),
+                selection_fingerprint: Some("sha256:orders-selection".to_string()),
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            });
+
+        let series = |definition: Option<&str>, selection: Option<&str>| {
+            let mut meta = DatasetMetadata {
+                name: DATASET_NAME.to_string(),
+                ..Default::default()
+            };
+            if let Some(v) = definition {
+                meta.properties
+                    .insert(SOURCE_FINGERPRINT_PROPERTY.to_string(), v.to_string());
+            }
+            if let Some(v) = selection {
+                meta.properties.insert(
+                    SOURCE_SELECTION_FINGERPRINT_PROPERTY.to_string(),
+                    v.to_string(),
+                );
+            }
+            meta
+        };
+        let entry = |definition: Option<&str>, selection: Option<&str>| {
+            let mut entry = dummy_snapshot_entry(None);
+            entry.snapshot_source_fingerprint = definition.map(ToString::to_string);
+            entry.snapshot_source_selection_fingerprint = selection.map(ToString::to_string);
+            entry
+        };
+
+        let published = (
+            Some("sha256:publisher-definition"),
+            Some("sha256:orders-selection"),
+        );
+        follower
+            .source_fingerprint_matches(&series(published.0, published.1))
+            .expect("the same source selection loads despite a different refresh mode");
+        let published_series = series(published.0, published.1);
+        follower
+            .entry_definition_permits(&entry(published.0, published.1), &published_series)
+            .expect("the same source selection loads despite a different refresh mode");
+        let full_mismatch = own_series
+            .source_fingerprint_matches(&series(published.0, published.1))
+            .expect_err("a source restoring its own series still compares the full definition");
+        assert!(
+            full_mismatch.contains("different definition"),
+            "{full_mismatch}"
+        );
+
+        let other_source = (
+            Some("sha256:publisher-definition"),
+            Some("sha256:eu-orders-selection"),
+        );
+        let refused = follower
+            .source_fingerprint_matches(&series(other_source.0, other_source.1))
+            .expect_err("a series that read a different source is refused");
+        assert!(refused.contains("different source selection"), "{refused}");
+        assert!(
+            !follower.entry_fingerprint_matches(
+                &entry(other_source.0, other_source.1),
+                &published_series
+            ),
+            "an entry that read a different source is refused"
+        );
+
+        // A pre-recreation archive recovers only the outgoing definition, so it carries
+        // no selection: the follower cannot tell what it read and must not load it.
+        let unverifiable = follower
+            .source_fingerprint_matches(&series(Some("sha256:outgoing-definition"), None))
+            .expect_err("a definition without a source selection cannot be verified");
+        assert!(
+            unverifiable.contains(SOURCE_SELECTION_FINGERPRINT_PROPERTY),
+            "{unverifiable}"
+        );
+        assert!(
+            !follower.entry_fingerprint_matches(
+                &entry(Some("sha256:outgoing-definition"), None),
+                &published_series
+            ),
+            "an entry with a definition but no source selection cannot be verified"
+        );
+
+        // A series published before definitions were recorded stays loadable: the follower
+        // cannot rebuild from its source, so refusing it would leave the dataset unavailable.
+        let legacy_series = series(None, None);
+        follower
+            .source_fingerprint_matches(&legacy_series)
+            .expect("a series published before definitions were recorded still loads");
+        assert!(follower.entry_fingerprint_matches(&entry(None, None), &legacy_series));
+
+        // Once a publisher has stamped the series, an unstamped entry in it — an older
+        // archive a `fallback` bootstrap walks back to after the current one fails its
+        // integrity check — cannot be told apart from an archive of a different source.
+        let unstamped_in_stamped_series = follower
+            .entry_definition_permits(&entry(None, None), &published_series)
+            .expect_err("an unstamped entry in a stamped series cannot be verified");
+        assert!(
+            unstamped_in_stamped_series.contains("although its series does"),
+            "{unstamped_in_stamped_series}"
+        );
+    }
+
+    #[test]
+    fn snapshot_follower_refusal_names_the_dataset_the_impact_and_the_fix() {
+        let message = snapshot_refused_by_follower_warning(
+            "orders",
+            "the snapshot was materialized from a different source selection",
+        );
+        assert!(message.contains("'orders'"), "{message}");
+        assert!(message.contains("keeps its current contents"), "{message}");
+        assert!(message.contains("different source selection"), "{message}");
+        assert!(message.contains("`from`"), "{message}");
+        assert!(
+            message.contains(SNAPSHOT_READ_CONSISTENCY_DOCS),
+            "{message}"
+        );
+    }
+
+    fn dummy_snapshot_entry(consistency: Option<SnapshotsConsistency>) -> SnapshotEntry {
+        SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: 0,
+            snapshot: "memory://snapshots/x".to_string(),
+            snapshot_checksum: "abc".to_string(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 1,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: consistency,
+        }
+    }
+
+    /// A `consistent_read` bootstrap cannot trust the consumer's current plan: the
+    /// same SQL can replan from multi-read to single-read. The producing-read stamp
+    /// on the entry is the proof.
+    #[test]
+    fn consistent_read_bootstrap_refuses_an_independent_reads_or_unstamped_archive() {
+        let store = Arc::new(InMemory::new());
+        let consistent = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_snapshots_consistency(SnapshotsConsistency::ConsistentRead);
+
+        let refused = consistent
+            .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
+                SnapshotsConsistency::IndependentReads,
+            )))
+            .expect_err("an independent_reads archive must not bootstrap under consistent_read");
+        assert!(
+            refused.contains("`snapshots_consistency: independent_reads`"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("span several source positions"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains(SNAPSHOT_READ_CONSISTENCY_DOCS),
+            "{refused}"
+        );
+
+        let unstamped = consistent
+            .entry_read_consistency_permits(&dummy_snapshot_entry(None))
+            .expect_err("an unstamped archive cannot be shown to have come from a single read");
+        assert!(
+            unstamped.contains("`snapshot-read-consistency`"),
+            "{unstamped}"
+        );
+        assert!(
+            unstamped.contains(SNAPSHOT_READ_CONSISTENCY_DOCS),
+            "{unstamped}"
+        );
+
+        consistent
+            .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
+                SnapshotsConsistency::ConsistentRead,
+            )))
+            .expect("a consistent_read stamp must bootstrap under consistent_read");
+    }
+
+    #[test]
+    fn independent_reads_bootstrap_admits_any_producing_read_stamp() {
+        let store = Arc::new(InMemory::new());
+        let independent_reads =
+            manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+                .with_snapshots_consistency(SnapshotsConsistency::IndependentReads);
+
+        independent_reads
+            .entry_read_consistency_permits(&dummy_snapshot_entry(None))
+            .expect("independent_reads must admit an unstamped archive");
+        independent_reads
+            .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
+                SnapshotsConsistency::IndependentReads,
+            )))
+            .expect("independent_reads must admit an independent_reads archive");
+        independent_reads
+            .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
+                SnapshotsConsistency::ConsistentRead,
+            )))
+            .expect("independent_reads must admit a consistent_read archive");
+    }
+
+    #[test]
+    fn a_dataset_manager_does_not_enforce_read_consistency() {
+        let store = Arc::new(InMemory::new());
+        let dataset = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"));
+        dataset
+            .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
+                SnapshotsConsistency::IndependentReads,
+            )))
+            .expect("a dataset has no read-consistency policy");
+        dataset
+            .entry_read_consistency_permits(&dummy_snapshot_entry(None))
+            .expect("a dataset accepts an unstamped archive for read consistency");
+    }
+
+    #[test]
+    fn planned_query_identity_stamps_read_consistency_source_table_does_not() {
+        let store = Arc::new(InMemory::new());
+        let view = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_identity(
+                Some(crate::acceleration_source::SourceDefinition {
+                    fingerprint: "sha256:view".to_string(),
+                    selection_fingerprint: None,
+                    matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                    accept_unstamped: false,
+                    materialization:
+                        crate::acceleration_source::MaterializationSource::PlannedQuery,
+                }),
+                SnapshotsConsistency::IndependentReads,
+            );
+        assert_eq!(
+            view.snapshots_consistency,
+            Some(SnapshotsConsistency::IndependentReads),
+            "a view must stamp the producing-read policy it publishes under"
+        );
+
+        let dataset = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_identity(
+                Some(crate::acceleration_source::SourceDefinition {
+                    fingerprint: "sha256:dataset".to_string(),
+                    selection_fingerprint: None,
+                    matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                    accept_unstamped: false,
+                    materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+                }),
+                SnapshotsConsistency::IndependentReads,
+            );
+        assert!(
+            dataset.snapshots_consistency.is_none(),
+            "a dataset always reads once and must not carry a view read-consistency stamp"
+        );
+    }
+
+    #[test]
+    fn producing_read_consistency_refusal_messages_name_the_setting_and_a_way_out() {
+        for expected in [
+            "`snapshots_consistency: independent_reads`",
+            "span several source positions",
+            SNAPSHOT_READ_CONSISTENCY_DOCS,
+        ] {
+            let reason = independent_reads_snapshot_bootstrap_reason();
+            assert!(
+                reason.contains(expected),
+                "the independent_reads bootstrap reason must contain {expected:?}: {reason}"
+            );
+        }
+        for expected in [
+            "`snapshot-read-consistency`",
+            "single consistent read",
+            SNAPSHOT_READ_CONSISTENCY_DOCS,
+        ] {
+            let reason = missing_read_consistency_bootstrap_reason();
+            assert!(
+                reason.contains(expected),
+                "the missing-stamp bootstrap reason must contain {expected:?}: {reason}"
+            );
+        }
+    }
+
+    /// Same-schema `from:` / params change + cold start: the remote series
+    /// stamp is the last published identity. Bootstrap must refuse those
+    /// rows under a newly loaded Spicepod, which is what
+    /// `source_fingerprint_matches` establishes. Pre-recreation itself now
+    /// reads the local checkpoint, not this remote stamp.
+    #[tokio::test]
+    async fn same_schema_recreate_recovers_outgoing_fingerprint_so_cold_start_refuses_old_rows() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let schema = sample_schema();
+
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path,
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+
+        assert!(
+            manager.current_stored_source_fingerprint().await.is_none(),
+            "an unstamped series has no outgoing fingerprint to recover"
+        );
+
+        let mut entry = dataset_metadata(&schema, Vec::new(), None);
+        entry.properties.insert(
+            SOURCE_FINGERPRINT_PROPERTY.to_string(),
+            "sha256:old-from".to_string(),
+        );
+        entry.snapshots.push(SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: 1,
+            snapshot: "memory://snapshots/outgoing".to_string(),
+            snapshot_checksum: "abc".to_string(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 1,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: Some("sha256:old-from".to_string()),
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
+        });
+        entry.current_snapshot_id = Some(0);
+
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: 1,
+            datasets: HashMap::from([(DATASET_NAME.to_string(), entry.clone())]),
+        };
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let recovered = manager
+            .current_stored_source_fingerprint()
+            .await
+            .expect("the outgoing fingerprint was persisted with the materialization");
+        assert_eq!(
+            recovered, "sha256:old-from",
+            "pre-recreation must recover the producing definition, not the incoming Spicepod"
+        );
+        assert_ne!(
+            recovered.as_str(),
+            "sha256:new-from",
+            "old_rows_definition_matches_stamp would be false if the incoming fingerprint were used"
+        );
+
+        let incoming =
+            manager.with_source_definition(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:new-from".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            });
+        let refused = incoming
+            .source_fingerprint_matches(&entry)
+            .expect_err("bootstrap must not accept old rows as current after a same-schema change");
+        assert!(
+            refused.contains("different definition"),
+            "bootstrap_accepts_old_rows_as_current must be false: {refused}"
+        );
+    }
+
     #[tokio::test]
     async fn create_snapshot_streams_file_and_updates_metadata() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-bytes".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -5008,7 +6810,12 @@ mod tests {
             .bytes()
             .await
             .expect("read stored snapshot");
-        assert_eq!(stored_bytes.as_ref(), contents.as_slice());
+        let live_after = std::fs::read(&local_path).expect("read live file after snapshot");
+        assert_eq!(
+            stored_bytes.as_ref(),
+            live_after.as_slice(),
+            "the uploaded snapshot must be a copy of the live file after checkpoint_live"
+        );
 
         let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
@@ -5029,8 +6836,11 @@ mod tests {
         assert_eq!(dataset.current_snapshot_id, Some(0));
 
         let entry = dataset.snapshots.first().expect("snapshot entry");
-        assert_eq!(entry.snapshot_size, contents.len() as u64);
-        assert_eq!(entry.snapshot_checksum, compute_sha256_hex(&contents));
+        assert_eq!(entry.snapshot_size, stored_bytes.len() as u64);
+        assert_eq!(
+            entry.snapshot_checksum,
+            compute_sha256_hex(stored_bytes.as_ref())
+        );
         assert_eq!(
             entry.snapshot_checksum_algorithm,
             SNAPSHOT_CHECKSUM_ALGORITHM
@@ -5068,12 +6878,7 @@ mod tests {
     #[tokio::test]
     async fn create_snapshot_appends_schema_version_on_widening() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-bytes".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -5139,12 +6944,7 @@ mod tests {
     #[tokio::test]
     async fn create_snapshot_rejects_non_widening_schema_change() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-bytes".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -5199,12 +6999,7 @@ mod tests {
     #[tokio::test]
     async fn create_snapshot_stores_timestamp_metadata() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-with-timestamps".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -5261,12 +7056,7 @@ mod tests {
     #[tokio::test]
     async fn create_snapshot_omits_zero_timestamps() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-zero-timestamps".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -5337,6 +7127,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5405,6 +7198,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5473,6 +7269,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5546,6 +7345,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5625,6 +7427,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5701,6 +7506,9 @@ mod tests {
             snapshot_engine: Some("sqlite".to_string()),
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5788,6 +7596,9 @@ mod tests {
             snapshot_engine: Some("sqlite".to_string()),
             snapshot_row_count: Some(50),
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let valid_checksum = compute_sha256_hex(second_contents.as_ref());
@@ -5801,6 +7612,9 @@ mod tests {
             snapshot_engine: Some("duckdb".to_string()),
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -5878,6 +7692,9 @@ mod tests {
             snapshot_engine: Some("cayenne".to_string()),
             snapshot_row_count: Some(10),
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -5968,6 +7785,9 @@ mod tests {
             snapshot_engine: Some("sqlite".to_string()),
             snapshot_row_count: Some(10),
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let good_checksum = compute_sha256_hex(good_contents.as_ref());
@@ -5981,6 +7801,9 @@ mod tests {
             snapshot_engine: Some("duckdb".to_string()),
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -6510,6 +8333,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -7006,12 +8832,7 @@ mod tests {
     #[tokio::test]
     async fn on_change_policy_skips_when_no_writes_occurred() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-on-change-no-writes".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager_with_on_change_policy(&store, local_path.clone(), &schema);
@@ -7050,12 +8871,7 @@ mod tests {
     #[tokio::test]
     async fn on_change_policy_skips_when_timestamp_matches_previous() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-on-change-duplicate".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
 
@@ -7109,12 +8925,7 @@ mod tests {
     #[tokio::test]
     async fn on_change_policy_creates_first_snapshot_with_valid_timestamp() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-on-change-first".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         // Use OnChange policy directly - no previous snapshot exists
@@ -7147,12 +8958,7 @@ mod tests {
     #[tokio::test]
     async fn on_change_policy_creates_snapshot_when_timestamp_differs() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-on-change-new-update".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
 
@@ -7208,12 +9014,7 @@ mod tests {
     #[tokio::test]
     async fn always_policy_creates_snapshot_even_when_no_writes() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-always-no-writes".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -7244,12 +9045,7 @@ mod tests {
     #[tokio::test]
     async fn force_creates_snapshot_when_no_metadata_exists() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-force-no-metadata".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         // Use OnChange policy which would normally skip when last_updated_at is None
@@ -7275,12 +9071,7 @@ mod tests {
     #[tokio::test]
     async fn force_creates_snapshot_when_metadata_exists_but_no_snapshots_for_dataset() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-force-no-dataset-snapshots".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         // Create metadata with a different dataset (not our test dataset)
         let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
@@ -7317,12 +9108,7 @@ mod tests {
     #[tokio::test]
     async fn force_creates_snapshot_when_metadata_has_snapshots_but_no_files_exist() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-force-no-files".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         // Create metadata that claims snapshots exist, but don't actually create the files
         let schema = sample_schema();
@@ -7347,6 +9133,9 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: Some(1_704_153_600_000),
+                    snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 properties: HashMap::default(),
@@ -7395,6 +9184,9 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            publish_gate: None,
+            source_definition: None,
+            snapshots_consistency: None,
             writer_lease: WriterLease::default(),
         }
     }
@@ -7432,6 +9224,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: Some(1_704_153_600_000),
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -7500,6 +9295,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let missing_entry = SnapshotEntry {
@@ -7512,6 +9310,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -7586,6 +9387,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -7653,6 +9457,9 @@ mod tests {
                 snapshot_engine: None,
                 snapshot_row_count: None,
                 snapshot_last_updated_at_ms: None,
+                snapshot_source_fingerprint: None,
+                snapshot_source_selection_fingerprint: None,
+                snapshot_read_consistency: None,
             });
             store
                 .put(&Path::from(filename), Bytes::from_static(b"data").into())
@@ -7713,6 +9520,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -7815,6 +9625,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let snapshot_entry2 = SnapshotEntry {
@@ -7827,6 +9640,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -7916,6 +9732,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -8041,6 +9860,9 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            publish_gate: None,
+            source_definition: None,
+            snapshots_consistency: None,
             writer_lease: WriterLease::default(),
         }
     }
@@ -8105,6 +9927,9 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
+                    snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -8156,6 +9981,9 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
+                    snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -8214,6 +10042,9 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
+                    snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -8236,6 +10067,9 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
+                    snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -8302,6 +10136,9 @@ mod tests {
                     snapshot_engine: None,
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
+                    snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -8359,6 +10196,10 @@ mod tests {
         assert!(
             snapshot.snapshot_row_count.is_none(),
             "snapshot_row_count should default to None"
+        );
+        assert!(
+            snapshot.snapshot_read_consistency.is_none(),
+            "snapshot_read_consistency should default to None"
         );
     }
 
@@ -8426,6 +10267,9 @@ mod tests {
                 snapshot_engine: Some("duckdb".to_string()),
                 snapshot_row_count: Some(100),
                 snapshot_last_updated_at_ms: Some(1_704_240_000_000),
+                snapshot_source_fingerprint: None,
+                snapshot_source_selection_fingerprint: None,
+                snapshot_read_consistency: None,
             });
             dataset.current_snapshot_id = Some(1);
         }
@@ -8583,6 +10427,7 @@ mod tests {
             &self,
             schema: &SchemaRef,
             _refresh_sql: Option<&str>,
+            _source_fingerprint: Option<&str>,
         ) -> DatasetCheckpointResult<()> {
             *self.checkpointed.lock().await = Some(Arc::clone(schema));
             Ok(())
@@ -8605,6 +10450,10 @@ mod tests {
         }
 
         async fn get_refresh_sql(&self) -> DatasetCheckpointResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn get_source_fingerprint(&self) -> DatasetCheckpointResult<Option<String>> {
             Ok(None)
         }
 
@@ -8644,6 +10493,9 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -8824,6 +10676,9 @@ mod tests {
             snapshot_engine: engine.map(str::to_string),
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
+            snapshot_read_consistency: None,
         }
     }
 

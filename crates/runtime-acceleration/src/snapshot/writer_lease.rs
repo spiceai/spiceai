@@ -1085,6 +1085,48 @@ mod tests {
         ));
     }
 
+    struct RefusingGate;
+
+    #[async_trait]
+    impl super::super::SnapshotPublishGate for RefusingGate {
+        async fn check_publish(&self) -> Result<(), String> {
+            Err("its rows are not known to be its configured definition".to_string())
+        }
+
+        fn bind_materialization_epoch(&self, _epoch: u64) {}
+    }
+
+    /// A holder whose publish gate refuses its snapshot cannot publish, so it lets the
+    /// lease go as a failed attempt does. Renewing it instead would keep every other
+    /// instance on standby for as long as the refusal lasts.
+    #[tokio::test]
+    async fn a_holder_refused_by_its_publish_gate_lets_the_next_instance_take_over() {
+        let store = memory();
+        let a = manager(&store, instance("host-a")).with_publish_gate(Arc::new(RefusingGate));
+        let b = manager(&store, instance("host-b"));
+
+        let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let created = a
+            .create_snapshot(
+                &Arc::new(arrow_schema::Schema::empty()),
+                lock,
+                None,
+                None,
+                super::super::ForceCreate(true),
+            )
+            .await
+            .expect("a refused publish is not an error");
+        assert!(created.is_none(), "a refused publish uploads nothing");
+
+        assert!(
+            matches!(
+                b.hold_writer_lease().await.expect("b reads the lease"),
+                WriterPermit::Holder { .. }
+            ),
+            "the next instance takes over the lease a refused holder let go"
+        );
+    }
+
     #[tokio::test]
     async fn a_new_lease_outranks_every_generation_already_published() {
         let store = memory();

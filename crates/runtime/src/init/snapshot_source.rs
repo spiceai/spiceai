@@ -248,9 +248,9 @@ impl Runtime {
     }
 
     /// Refuses a resolved snapshot dataset that would share accelerator state with
-    /// another dataset in a way startup refuses. Startup validates every accelerated
-    /// dataset it initializes, and a snapshot dataset is initialized only here, once its
-    /// engine is known.
+    /// another dataset or view in a way startup refuses. Startup validates every
+    /// accelerated dataset and view it initializes, and a snapshot dataset is initialized
+    /// only here, once its engine is known.
     async fn check_snapshot_source_conflicts(
         self: &Arc<Self>,
         dataset: &Arc<Dataset>,
@@ -258,23 +258,30 @@ impl Runtime {
         let Some(acceleration) = &dataset.acceleration else {
             return Ok(());
         };
-        let datasets = Arc::clone(self).get_valid_datasets(&dataset.app(), LogErrors(false));
+        let app = dataset.app();
+        let datasets = Arc::clone(self).get_valid_datasets(&app, LogErrors(false));
+        let views = Arc::clone(self).get_valid_views(&app, LogErrors(false));
+        // A view carries its own acceleration and joins the same accelerator instances,
+        // so it takes part in both checks below, as it does in startup's.
+        let sources: Vec<Arc<dyn AccelerationSource>> = datasets
+            .iter()
+            .map(|other| other.clone_arc())
+            .chain(views.iter().map(|validated| validated.view.clone_arc()))
+            .collect();
 
-        // Cayenne keeps every dataset of one metadata directory in one catalog, which
-        // must not mix datasets that restore snapshots with datasets that do not.
-        let sources: Vec<Arc<dyn AccelerationSource>> =
-            datasets.iter().map(|other| other.clone_arc()).collect();
+        // Cayenne keeps every acceleration of one metadata directory in one catalog, which
+        // must not mix accelerations that restore snapshots with ones that do not.
         match validate_snapshot_consistency(&sources) {
             Ok(()) => {}
             Err(CayenneSnapshotValidationError::InconsistentSnapshotSettings {
                 metadata_dir,
-                disabled_datasets,
+                disabled_components,
                 ..
             }) => {
                 return Err(cannot_load_snapshot_message(
                     &dataset.name,
                     &format!(
-                        "it shares the Cayenne catalog in '{metadata_dir}' with Cayenne datasets that do not restore snapshots ({disabled_datasets}), and one catalog cannot hold both. Accelerate those datasets with another engine, or serve this dataset from another Spice instance"
+                        "it shares the Cayenne catalog in '{metadata_dir}' with Cayenne accelerations that do not restore snapshots ({disabled_components}), and one catalog cannot hold both. Accelerate those with another engine, or serve this dataset from another Spice instance"
                     ),
                 ));
             }
@@ -287,7 +294,8 @@ impl Runtime {
         }
 
         // Restoring a `DuckDB`, `SQLite` or Turso snapshot replaces the whole file, so a
-        // file two datasets share would serve whichever restored last to both.
+        // file this dataset shares with another dataset or view would serve whichever
+        // restored last to both.
         let param = match acceleration.engine {
             Engine::DuckDB => "duckdb_file",
             Engine::Sqlite => "sqlite_file",
@@ -298,12 +306,11 @@ impl Runtime {
         let Ok(path) = acceleration_file_path(dataset.as_ref(), &registry).await else {
             return Ok(());
         };
-        let others = datasets.iter().filter(|other| {
-            other.name != dataset.name
+        let others = sources.iter().filter(|other| {
+            other.name() != &dataset.name
                 && other.is_file_accelerated()
                 && other
-                    .acceleration
-                    .as_ref()
+                    .acceleration()
                     .is_some_and(|other| other.engine == acceleration.engine)
         });
         for other in others {
@@ -314,10 +321,11 @@ impl Runtime {
                 return Err(cannot_load_snapshot_message(
                     &dataset.name,
                     &format!(
-                        "its local copy '{}' is also the file of dataset '{}', and restoring a snapshot replaces the whole file. Set a different `{param}` for '{}'",
+                        "its local copy '{}' is also the file of {} '{}', and restoring a snapshot replaces the whole file. Set a different `{param}` for '{}'",
                         path.display(),
-                        other.name,
-                        other.name,
+                        other.component_label(),
+                        other.name(),
+                        other.name(),
                     ),
                 ));
             }

@@ -54,6 +54,7 @@ impl DatasetCheckpointer for MockCheckpointer {
         &self,
         _schema: &arrow::datatypes::SchemaRef,
         _refresh_sql: Option<&str>,
+        _source_fingerprint: Option<&str>,
     ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
         Ok(())
     }
@@ -78,6 +79,12 @@ impl DatasetCheckpointer for MockCheckpointer {
     }
 
     async fn get_refresh_sql(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn get_source_fingerprint(
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         Ok(None)
@@ -128,12 +135,15 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     let local_snapshot_file = temp_root.join("acceleration.db");
 
     tokio::fs::create_dir_all(&snapshot_dir).await?;
-    // A real DuckDB database: the snapshot opens the acceleration file to
-    // checkpoint its write-ahead log before copying it, and refuses a file it
-    // cannot open.
-    let db_path = local_snapshot_file.clone();
-    tokio::task::spawn_blocking(move || {
-        duckdb::Connection::open(&db_path)?.execute_batch("CREATE TABLE t(id INTEGER)")
+    // A real database file: the DuckDB snapshot engine folds the write-ahead log into
+    // the file before copying it, and refuses to publish a file that is not a database.
+    let database_path = local_snapshot_file.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let connection = duckdb::Connection::open(&database_path)?;
+        connection.execute_batch(
+            "CREATE TABLE snapshot_mutex_test (id INTEGER); INSERT INTO snapshot_mutex_test VALUES (1);",
+        )?;
+        Ok(())
     })
     .await??;
 

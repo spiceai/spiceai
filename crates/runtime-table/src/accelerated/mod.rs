@@ -71,6 +71,7 @@ pub mod caching_eviction;
 #[cfg(test)]
 mod caching_scan_tests;
 pub mod federation;
+pub mod materialization;
 pub mod refresh;
 pub mod refresh_completion;
 pub mod refresh_task;
@@ -85,6 +86,9 @@ pub mod write_back_worker;
 
 pub(crate) use write::WriteMode;
 
+pub use materialization::{
+    AccelerationAtStart, MaterializationIdentity, MaterializationSample, starts_configured,
+};
 pub use refresh_completion::{
     RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter, RefreshRequestId,
 };
@@ -1544,6 +1548,10 @@ impl AcceleratedTable {
     pub async fn update_refresh_sql(&self, mut refresh_sql: refresh::RefreshSQL) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
+        // Write mutex first, then the `Refresh` lock — same order as
+        // `create_checkpoint_and_snapshot`, so retracting provenance here cannot
+        // race a snapshot that already sampled the previous mark.
+        let _write_guard = self.accelerator_write_mutex.lock().await;
         let mut refresh = self.refresh_params.write().await;
         // Preserve existing partition filters when updating user SQL, including
         // an empty ("no partitions assigned — load no rows") assignment.
@@ -1561,7 +1569,7 @@ impl AcceleratedTable {
                 refresh_sql.display_sql()
             );
         }
-        refresh.sql = Some(refresh_sql);
+        refresh.apply_runtime_refresh_sql(refresh_sql);
 
         Ok(())
     }

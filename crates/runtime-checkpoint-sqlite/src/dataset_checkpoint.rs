@@ -125,6 +125,15 @@ impl SqliteDatasetCheckpointer {
                     )?;
                 }
 
+                if !columns.contains(&"source_fingerprint".to_string()) {
+                    conn.execute(
+                        &format!(
+                            "ALTER TABLE {CHECKPOINT_TABLE_NAME} ADD COLUMN source_fingerprint TEXT"
+                        ),
+                        [],
+                    )?;
+                }
+
                 Ok::<(), rusqlite::Error>(())
             })
             .await
@@ -186,11 +195,13 @@ impl SqliteDatasetCheckpointer {
         &self,
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
+        source_fingerprint: Option<&str>,
     ) -> Result<(), CheckpointError> {
         let pool = &self.pool;
         let dataset_name = self.dataset_name.clone();
         let schema_json = serialize_schema(schema).map_err(store_error)?;
         let refresh_sql_owned = refresh_sql.map(ToString::to_string);
+        let source_fingerprint_owned = source_fingerprint.map(ToString::to_string);
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -200,12 +211,20 @@ impl SqliteDatasetCheckpointer {
         conn.conn
             .call(move |conn| {
                 let upsert = format!(
-                    "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, schema_json, refresh_sql, updated_at)
-                     VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+                    "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, schema_json, refresh_sql, source_fingerprint, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
                      ON CONFLICT (dataset_name) DO UPDATE
-                     SET schema_json = ?2, refresh_sql = ?3, updated_at = CURRENT_TIMESTAMP"
+                     SET schema_json = ?2, refresh_sql = ?3, source_fingerprint = ?4, updated_at = CURRENT_TIMESTAMP"
                 );
-                conn.execute(&upsert, rusqlite::params![&dataset_name, &schema_json, &refresh_sql_owned])?;
+                conn.execute(
+                    &upsert,
+                    rusqlite::params![
+                        &dataset_name,
+                        &schema_json,
+                        &refresh_sql_owned,
+                        &source_fingerprint_owned
+                    ],
+                )?;
 
                 Ok::<(), rusqlite::Error>(())
             })
@@ -251,6 +270,33 @@ impl SqliteDatasetCheckpointer {
             .call(move |conn| {
                 let query = format!(
                     "SELECT refresh_sql FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?"
+                );
+                let mut stmt = conn.prepare(&query)?;
+                let mut rows = stmt.query([dataset_name])?;
+
+                if let Some(row) = rows.next()? {
+                    Ok::<Option<String>, rusqlite::Error>(row.get(0)?)
+                } else {
+                    Ok(None)
+                }
+            })
+            .await
+            .map_err(store_error)
+    }
+
+    async fn get_source_fingerprint_inner(&self) -> Result<Option<String>, CheckpointError> {
+        let pool = &self.pool;
+        let dataset_name = self.dataset_name.clone();
+
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(downcast_failed());
+        };
+
+        conn.conn
+            .call(move |conn| {
+                let query = format!(
+                    "SELECT source_fingerprint FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([dataset_name])?;
@@ -328,8 +374,9 @@ impl DatasetCheckpointer for SqliteDatasetCheckpointer {
         &self,
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
+        source_fingerprint: Option<&str>,
     ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
-        self.checkpoint_inner(schema, refresh_sql)
+        self.checkpoint_inner(schema, refresh_sql, source_fingerprint)
             .await
             .map_err(Into::into)
     }
@@ -350,6 +397,14 @@ impl DatasetCheckpointer for SqliteDatasetCheckpointer {
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         self.get_refresh_sql_inner().await.map_err(Into::into)
+    }
+
+    async fn get_source_fingerprint(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
+        self.get_source_fingerprint_inner()
+            .await
+            .map_err(Into::into)
     }
 
     async fn set_schema(
@@ -450,7 +505,7 @@ mod tests {
         let schema_ref = std::sync::Arc::new(schema.clone());
 
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to save schema after migration");
 
@@ -479,7 +534,7 @@ mod tests {
 
         // Save the schema
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to save schema");
 
@@ -509,7 +564,7 @@ mod tests {
 
         // Create the checkpoint with schema
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to create checkpoint");
 
@@ -535,7 +590,7 @@ mod tests {
 
         // Create the initial checkpoint
         checkpoint
-            .checkpoint(&schema_ref1, None)
+            .checkpoint(&schema_ref1, None, None)
             .await
             .expect("Failed to create initial checkpoint");
 
@@ -551,7 +606,7 @@ mod tests {
 
         // Update the checkpoint with new schema
         checkpoint
-            .checkpoint(&schema_ref2, None)
+            .checkpoint(&schema_ref2, None, None)
             .await
             .expect("Failed to update checkpoint");
 
@@ -604,7 +659,7 @@ mod tests {
 
         // Store a refresh_sql
         checkpoint
-            .checkpoint(&schema_ref, Some("SELECT * FROM source_table"))
+            .checkpoint(&schema_ref, Some("SELECT * FROM source_table"), None)
             .await
             .expect("Failed to store checkpoint with refresh_sql");
 
@@ -620,6 +675,7 @@ mod tests {
             .checkpoint(
                 &schema_ref,
                 Some("SELECT id FROM source_table WHERE id > 10"),
+                None,
             )
             .await
             .expect("Failed to update refresh_sql");
@@ -633,7 +689,7 @@ mod tests {
 
         // Clear refresh_sql by passing None — should overwrite (no COALESCE)
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to clear refresh_sql");
 
@@ -644,6 +700,43 @@ mod tests {
         assert!(
             cleared.is_none(),
             "refresh_sql should be None after passing None (no COALESCE)"
+        );
+    }
+
+    /// The producing identity is written with the local checkpoint so
+    /// pre-recreation can stamp from local provenance. A withheld override
+    /// must retract the previous stamp in the same upsert.
+    #[tokio::test]
+    async fn test_sqlite_source_fingerprint_roundtrip_and_retract() {
+        let checkpoint = create_in_memory_sqlite_checkpoint().await;
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let schema_ref = std::sync::Arc::new(schema);
+
+        checkpoint
+            .checkpoint(&schema_ref, None, Some("sha256:A"))
+            .await
+            .expect("persist configured fingerprint A");
+        assert_eq!(
+            checkpoint
+                .get_source_fingerprint()
+                .await
+                .expect("read fingerprint")
+                .as_deref(),
+            Some("sha256:A")
+        );
+
+        checkpoint
+            .checkpoint(&schema_ref, None, None)
+            .await
+            .expect("retract fingerprint after override B");
+        assert!(
+            checkpoint
+                .get_source_fingerprint()
+                .await
+                .expect("read retracted fingerprint")
+                .is_none(),
+            "override-B rows must not keep stamp A"
         );
     }
 
@@ -669,7 +762,7 @@ mod tests {
 
         // Create the checkpoint
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to create checkpoint");
 
@@ -692,7 +785,7 @@ mod tests {
 
         // Update the checkpoint
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to update checkpoint");
 
@@ -727,7 +820,7 @@ mod tests {
         ]));
 
         checkpoint
-            .checkpoint(&original, Some("SELECT 1"))
+            .checkpoint(&original, Some("SELECT 1"), Some("sha256:A"))
             .await
             .expect("seed checkpoint");
 
@@ -775,6 +868,16 @@ mod tests {
             reader.get_refresh_sql().await.expect("read refresh sql"),
             Some("SELECT 1".to_string()),
             "a schema-only write must preserve the stored refresh SQL"
+        );
+
+        assert_eq!(
+            reader
+                .get_source_fingerprint()
+                .await
+                .expect("read source fingerprint")
+                .as_deref(),
+            Some("sha256:A"),
+            "a schema-only write must preserve the persisted producing identity"
         );
     }
 

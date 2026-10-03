@@ -79,6 +79,7 @@ impl DatasetCheckpointer for DelayedMockCheckpointer {
         &self,
         _schema: &arrow::datatypes::SchemaRef,
         _refresh_sql: Option<&str>,
+        _source_fingerprint: Option<&str>,
     ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
         // Simulate checkpoint work
         tokio::time::sleep(self.checkpoint_delay).await;
@@ -105,6 +106,12 @@ impl DatasetCheckpointer for DelayedMockCheckpointer {
     }
 
     async fn get_refresh_sql(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn get_source_fingerprint(
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         Ok(None)
@@ -396,7 +403,7 @@ async fn run_snapshot_workload(
 
         // Create checkpoint
         if checkpointer
-            .checkpoint(federated_schema, None)
+            .checkpoint(federated_schema, None, None)
             .await
             .is_err()
         {

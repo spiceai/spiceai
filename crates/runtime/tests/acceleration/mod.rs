@@ -79,7 +79,7 @@ mod retention_cayenne;
 mod single_instance_duckdb;
 #[cfg(feature = "snapshots")]
 mod snapshot_lock_contention;
-#[cfg(feature = "snapshots")]
+#[cfg(all(feature = "snapshots", feature = "duckdb"))]
 mod snapshot_mutex;
 #[cfg(feature = "sqlite")]
 mod user_function_pushdown;
