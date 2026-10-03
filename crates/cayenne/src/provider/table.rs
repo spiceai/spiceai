@@ -13086,10 +13086,79 @@ impl CayenneTableProvider {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>> {
-        match self.key_resolver()? {
-            Some(resolver) => resolver.collapse_write(batches),
-            None => Ok(batches),
+        match (self.key_resolver()?, &self.row_versions) {
+            (Some(resolver), Some(versions)) => {
+                self.collapse_buffered_write_by_version(&resolver, versions, batches)
+            }
+            (Some(resolver), None) => resolver.collapse_write(batches),
+            (None, _) => Ok(batches),
         }
+    }
+
+    /// [`Self::collapse_buffered_write`] for a writer that supplies row versions: the
+    /// buffered rows, sorted by version, keep each key's last copy, which is its
+    /// greatest version, and the copies not kept are reported.
+    fn collapse_buffered_write_by_version(
+        &self,
+        resolver: &super::key_conflicts::KeyResolver,
+        versions: &Arc<dyn util::session_state::RowVersions>,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>> {
+        // `DataFusion` errors convert back unchanged, so a refresh error the writer
+        // raises (a NULL time) keeps its type.
+        let external = |source: datafusion_common::DataFusionError| Error::DataFusion { source };
+        let Some(first) = batches.first() else {
+            return Ok(batches);
+        };
+        let batch = arrow::compute::concat_batches(&first.schema(), &batches)
+            .map_err(|e| external(e.into()))?;
+        // A NULL or unreadable time fails the write here, as on the streaming path.
+        let (times, hashes) = versions.versions(&batch).map_err(external)?;
+        let order = arrow::compute::lexsort_to_indices(
+            &[
+                arrow::compute::SortColumn {
+                    values: Arc::new(arrow::array::Int64Array::from(times.clone())),
+                    options: None,
+                },
+                arrow::compute::SortColumn {
+                    values: Arc::new(arrow::array::UInt64Array::from(hashes.clone())),
+                    options: None,
+                },
+            ],
+            None,
+        )
+        .map_err(|e| external(e.into()))?;
+        let sorted =
+            arrow::compute::take_record_batch(&batch, &order).map_err(|e| external(e.into()))?;
+        let digests = resolver.digests(&sorted)?;
+        let mut kept: HashMap<u128, usize> = HashMap::with_capacity(digests.len());
+        for (row, digest) in digests.iter().enumerate() {
+            kept.insert(*digest, row);
+        }
+        let version = |row: usize| {
+            let source = order.value(row) as usize;
+            (times[source], hashes[source])
+        };
+        let mut counts = util::session_state::SupersededCounts::default();
+        for (row, digest) in digests.iter().enumerate() {
+            let winner = kept[digest];
+            if winner != row {
+                let (loser, best) = (version(row), version(winner));
+                if loser.0 < best.0 {
+                    counts.older += 1;
+                } else if loser.1 == best.1 {
+                    counts.unchanged += 1;
+                } else {
+                    counts.equal_time += 1;
+                }
+            }
+        }
+        if let Some(report) = &self.superseded_report
+            && !counts.is_empty()
+        {
+            report.superseded(&counts);
+        }
+        resolver.collapse_write(vec![sorted])
     }
 
     /// Resolve the keys a buffered change-stream write repeats: a later change of

@@ -495,12 +495,6 @@ impl CayenneTableProvider {
         if inline_max_rows == 0 || inline_max_bytes == 0 || !self.inline_overwrite_admissible() {
             return Ok(OverwriteAdmission::Fallback(stream));
         }
-        // The inline path keeps the last copy of a repeated key to arrive; a write
-        // that supplies row versions must keep the greatest version instead, which
-        // the post-pass on the normal path does.
-        if self.row_versions.is_some() {
-            return Ok(OverwriteAdmission::Fallback(stream));
-        }
         let Some(admission) = self.context().try_acquire_overwrite_inline_admission() else {
             self.track_overwrite_inline_fallback("admission_busy");
             return Ok(OverwriteAdmission::Fallback(stream));
