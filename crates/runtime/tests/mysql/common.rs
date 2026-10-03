@@ -55,6 +55,50 @@ pub async fn start_mysql_docker_container(
     start_mysql_docker_container_with_image(port, MYSQL_IMAGE).await
 }
 
+/// How many times [`start_mysql_docker_container_retrying_startup`] tries to
+/// bring the container up before reporting the last failure.
+#[cfg(not(target_os = "windows"))]
+const MYSQL_STARTUP_ATTEMPTS: u32 = 3;
+
+/// Start a `MySQL` container on `port`, retrying only the container startup.
+///
+/// For tests that nextest runs with `retries = 0` (see `.config/nextest.toml`).
+/// They forbid retries so that a lost update cannot be retried into a pass, but
+/// that also turns a Docker daemon stall — a create, inspect or health wait that
+/// times out before the test has run a single statement — into a hard failure
+/// that every retried sibling test in the same run recovers from. Retrying here
+/// keeps the zero-retry guarantee where it matters: nothing after the container
+/// is up is ever repeated.
+///
+/// A failed attempt drops its container guard, and the next attempt's
+/// name-release wait removes anything the daemon created after giving up on the
+/// request, so no attempt inherits state from the one before it.
+#[cfg(not(target_os = "windows"))]
+pub async fn start_mysql_docker_container_retrying_startup(
+    port: u16,
+) -> Result<RunningContainer<'static>, anyhow::Error> {
+    let mut attempt = 1;
+    loop {
+        match start_mysql_docker_container(port).await {
+            Ok(container) => return Ok(container),
+            Err(e) if attempt < MYSQL_STARTUP_ATTEMPTS => {
+                tracing::warn!(
+                    "MySQL container on port {port} failed to start (attempt {attempt}/{MYSQL_STARTUP_ATTEMPTS}), retrying: {e:#}"
+                );
+                attempt += 1;
+            }
+            // The cause goes into the message rather than an anyhow context:
+            // callers format this with `{e}`, which prints only the outermost
+            // context and would hide why the last attempt failed.
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "MySQL container on port {port} failed to start on all {MYSQL_STARTUP_ATTEMPTS} attempts, the last with: {e:#}"
+                ));
+            }
+        }
+    }
+}
+
 /// Start a `MySQL` container on `port` using a specific image tag. Used by the
 /// version matrix to exercise both the `SHOW BINARY LOG STATUS` path (8.2+) and
 /// the `SHOW MASTER STATUS` fallback (8.0).
