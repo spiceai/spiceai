@@ -959,6 +959,33 @@ mod persist {
         );
     }
 
+    /// A run that names one file twice is rejected: its postings could reach
+    /// one row through both names, and a lookup would return the row twice.
+    #[test]
+    fn a_run_naming_a_file_twice_is_rejected() {
+        // Postings 0 and 1 are row 0 of file 0 and row 0 of file 1, both
+        // `same`.
+        let bytes = sealed(
+            &["same", "same"],
+            vec![7],
+            vec![word_proof::offset_slot(0)],
+            varints(&[2, 0, 1]),
+            2,
+        );
+        assert_eq!(IndexRun::from_bytes(&bytes).err(), Some(Error::Corrupt));
+        let distinct = sealed(
+            &["a", "b"],
+            vec![7],
+            vec![word_proof::offset_slot(0)],
+            varints(&[2, 0, 1]),
+            2,
+        );
+        assert!(
+            IndexRun::from_bytes(&distinct).is_ok(),
+            "distinct names load"
+        );
+    }
+
     /// Two words whose slots share one posting stream, leaving the stream of
     /// the second unreferenced, are rejected even when the row count adds
     /// up: the second word's lookups would read the first's rows and miss

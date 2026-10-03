@@ -398,10 +398,16 @@ impl IndexRun {
         let mut reader = crate::persist::open(bytes, crate::persist::KIND_RUN)?;
         let encoding = reader.u64()?;
         let count = reader.u32()? as usize;
-        let mut files = Vec::with_capacity(count.min(1 << 20));
+        let mut files: Vec<Arc<str>> = Vec::with_capacity(count.min(1 << 20));
+        // A run covers each file once, as a builder writes it: a name given
+        // twice would let one row be reached through both, and returned twice.
+        let mut names: HashSet<&str> = HashSet::with_capacity(count.min(1 << 20));
         for _ in 0..count {
             let len = reader.u32()? as usize;
             let name = std::str::from_utf8(reader.bytes(len)?).map_err(|_| Error::Corrupt)?;
+            if !names.insert(name) {
+                return Err(Error::Corrupt);
+            }
             files.push(Arc::from(name));
         }
         let rows = reader.len()?;
