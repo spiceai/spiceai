@@ -369,11 +369,6 @@ impl<'a> ContainerRunner<'a> {
 
         self.pull_image().await?;
 
-        let options = CreateContainerOptions {
-            name: self.name,
-            platform: None,
-        };
-
         let mut port_bindings_map = HashMap::new();
         for (container_port, host_port) in self.port_bindings {
             port_bindings_map.insert(
@@ -438,35 +433,7 @@ impl<'a> ContainerRunner<'a> {
             ..Default::default()
         };
 
-        // `wait_for_name_release` polls the container list, and the daemon drops
-        // a container from that list before it releases the name — so the list
-        // can report the name free while it is still reserved, and creation
-        // answers 409. Retry on exactly that, under the same bound, rather than
-        // failing the test for a window that closes on its own.
-        let create_deadline = std::time::Instant::now() + NAME_RELEASE_TIMEOUT;
-        loop {
-            match self
-                .docker
-                .create_container(Some(options.clone()), config.clone())
-                .await
-            {
-                Ok(_) => break,
-                Err(e) if is_name_still_taken(&e) => {
-                    if std::time::Instant::now() >= create_deadline {
-                        return Err(anyhow::Error::new(e).context(format!(
-                            "the name of test container {} was still reserved {NAME_RELEASE_TIMEOUT:?} after its removal completed",
-                            self.name
-                        )));
-                    }
-                    tracing::debug!(
-                        "Docker still holds the name {}; retrying the creation",
-                        self.name
-                    );
-                    tokio::time::sleep(NAME_RELEASE_POLL_INTERVAL).await;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        create_taking_over_name(&self.docker, self.name, config).await?;
 
         // The container exists from here on, so hold it in the guard before
         // anything else can fail. Starting it, inspecting it, or waiting for it
@@ -629,6 +596,43 @@ impl<'a> ContainerRunner<'a> {
     }
 }
 
+/// Creates a container called `name`.
+///
+/// `wait_for_name_release` polls the container list, and the daemon drops
+/// a container from that list before it releases the name — so the list
+/// can report the name free while it is still reserved, and creation
+/// answers 409. Retry on exactly that, under the same bound, rather than
+/// failing the test for a window that closes on its own.
+async fn create_taking_over_name(
+    docker: &Docker,
+    name: &str,
+    config: Config<&str>,
+) -> Result<(), anyhow::Error> {
+    let options = CreateContainerOptions {
+        name,
+        platform: None,
+    };
+    let create_deadline = std::time::Instant::now() + NAME_RELEASE_TIMEOUT;
+    loop {
+        match docker
+            .create_container(Some(options.clone()), config.clone())
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) if is_name_still_taken(&e) => {
+                if std::time::Instant::now() >= create_deadline {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "the name of test container {name} was still reserved {NAME_RELEASE_TIMEOUT:?} after its removal completed"
+                    )));
+                }
+                tracing::debug!("Docker still holds the name {name}; retrying the creation");
+                tokio::time::sleep(NAME_RELEASE_POLL_INTERVAL).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Check if Docker is available on this system.
 ///
 /// Returns `true` if Docker daemon is accessible, `false` otherwise.
@@ -669,7 +673,12 @@ pub async fn wait_for_tcp_port(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_already_gone, is_name_still_taken, is_removal_already_in_progress};
+    use bollard::container::{Config, CreateContainerOptions};
+
+    use super::{
+        ContainerRunnerBuilder, create_taking_over_name, is_already_gone, is_docker_available,
+        is_name_still_taken, is_removal_already_in_progress, remove,
+    };
 
     fn docker_error(status_code: u16, message: &str) -> anyhow::Error {
         anyhow::Error::new(bollard::errors::Error::DockerResponseServerError {
@@ -753,5 +762,58 @@ mod tests {
                 message: "server error".to_string(),
             }
         ));
+    }
+
+    /// A container left holding a test's name by a creation whose request timed
+    /// out on this side while the daemon went on to finish it (#13712): no guard
+    /// owns it, and it can join the container list only after the name-release
+    /// wait has already looked. Creation has to take the name over from it
+    /// rather than answer 409 until its deadline.
+    #[tokio::test]
+    async fn creation_takes_the_name_over_from_an_orphaned_container() -> Result<(), anyhow::Error>
+    {
+        const NAME: &str = "runtime-integration-test-orphaned-name";
+        // Already pulled by the integration jobs; only created here, never started.
+        const IMAGE: &str = "docker.io/library/mysql:latest";
+
+        if !is_docker_available().await {
+            eprintln!("skipping: Docker is not available");
+            return Ok(());
+        }
+
+        let runner = ContainerRunnerBuilder::new(NAME)
+            .image(IMAGE.to_string())
+            .build()?;
+        runner.pull_image().await?;
+        runner.wait_for_name_release().await?;
+
+        let config = Config::<&str> {
+            image: Some(IMAGE),
+            ..Default::default()
+        };
+        // The orphan: created straight through the API, so no guard owns it.
+        let orphan = runner
+            .docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: NAME,
+                    platform: None,
+                }),
+                config.clone(),
+            )
+            .await?
+            .id;
+
+        let created = create_taking_over_name(&runner.docker, NAME, config).await;
+        let holder = runner.docker.inspect_container(NAME, None).await;
+        remove(&runner.docker, NAME).await?;
+
+        created?;
+        assert_ne!(
+            holder?.id.as_deref(),
+            Some(orphan.as_str()),
+            "the orphaned container still holds the name"
+        );
+        Ok(())
     }
 }
