@@ -27,6 +27,10 @@ limitations under the License.
 
 mod common;
 
+use common::lookup_index::{
+    SplitMix64, TableSpec, counters, open_table, overwrite, query, rendered,
+};
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -84,18 +88,6 @@ const INACTIVE_APPLICATION: &str = "MGiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii";
 /// A key present in no row at all.
 const MISSING_ACCOUNT: &str = "ACzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
 const MISSING_APPLICATION: &str = "MGzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
-
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
 
 fn service_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -193,32 +185,13 @@ async fn build_table_with(
     runtime_env: Arc<RuntimeEnv>,
     vortex_config: VortexConfig,
 ) -> Arc<CayenneTableProvider> {
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), table_name);
-    let options = CreateTableOptions {
-        table_name: table_name.to_string(),
-        // A serving view has no primary key; match that shape.
-        schema: service_schema(),
-        primary_key: vec![],
-        on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
-        partition_column: None,
-        vortex_config,
-    };
-    let catalog = Arc::clone(&fixture.catalog);
-    let catalog: Arc<dyn MetadataCatalog> = catalog;
-    Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .with_context(context)
-            .with_secondary_indexes(
-                index_keys
-                    .iter()
-                    .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
-                    .collect(),
-            )
-            .create(options)
-            .await
-            .expect("create table"),
+    // A serving view has no primary key; match that shape.
+    open_table(
+        fixture,
+        runtime_env,
+        TableSpec::new(table_name, service_schema(), index_keys).config(vortex_config),
     )
+    .await
 }
 
 async fn insert(provider: &Arc<CayenneTableProvider>, table_name: &str, batch: RecordBatch) {
@@ -235,71 +208,6 @@ async fn insert(provider: &Arc<CayenneTableProvider>, table_name: &str, batch: R
         .collect()
         .await
         .expect("insert");
-}
-
-async fn overwrite(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
-    let ctx = SessionContext::new();
-    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-        &[vec![batch]],
-        service_schema(),
-        None,
-    )
-    .expect("overwrite source");
-    let plan = provider
-        .insert_into(
-            &ctx.state(),
-            exec,
-            datafusion_expr::dml::InsertOp::Overwrite,
-        )
-        .await
-        .expect("overwrite plan");
-    datafusion_physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("overwrite");
-}
-
-async fn query(
-    provider: &Arc<CayenneTableProvider>,
-    table_name: &str,
-    sql: &str,
-) -> Vec<RecordBatch> {
-    let ctx = SessionContext::new();
-    ctx.register_table(table_name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("register");
-    ctx.sql(sql)
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("execute")
-}
-
-/// Rows rendered as text so the two arms can be compared exactly, independent
-/// of batch boundaries.
-fn rendered(batches: &[RecordBatch]) -> Vec<String> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        for row in 0..batch.num_rows() {
-            let mut cells = Vec::with_capacity(batch.num_columns());
-            for column in 0..batch.num_columns() {
-                let array = batch.column(column);
-                cells.push(if array.is_null(row) {
-                    "NULL".to_string()
-                } else {
-                    arrow::util::display::array_value_to_string(array, row).expect("render cell")
-                });
-            }
-            rows.push(cells.join("|"));
-        }
-    }
-    rows.sort();
-    rows
-}
-
-fn counters_of(provider: &Arc<CayenneTableProvider>) -> cayenne::lookup_index::LookupIndexCounters {
-    provider
-        .lookup_index_counters()
-        .expect("indexed table has index state")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -353,13 +261,13 @@ async fn wait_for_index(provider: &Arc<CayenneTableProvider>, table: &str) {
     let deadline = Instant::now() + Duration::from_mins(2);
     loop {
         let _ = query(provider, table, &sql).await;
-        if counters_of(provider).access_plans_attached > 0 {
+        if counters(provider).access_plans_attached > 0 {
             return;
         }
         assert!(
             Instant::now() < deadline,
             "point-lookup index was never published: {:?}",
-            counters_of(provider)
+            counters(provider)
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -380,7 +288,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
     insert(&plain, PLAIN, batch).await;
 
     wait_for_index(&indexed, INDEXED).await;
-    let before = counters_of(&indexed);
+    let before = counters(&indexed);
 
     // --- 20 keys of each shape, compared row-for-row without LIMIT so the
     //     comparison does not depend on which of several matches is returned.
@@ -424,7 +332,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
 
     // Both lookup shapes must have gone through file/row selection, not a
     // silent fallback to the ordinary scan.
-    let after_sample = counters_of(&indexed);
+    let after_sample = counters(&indexed);
     let probes = (after_sample.full + after_sample.partial) - (before.full + before.partial);
     assert_eq!(
         probes, 40,
@@ -499,7 +407,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
     );
     assert!(rendered(&query(&plain, PLAIN, &miss_sql.replace("{table}", PLAIN)).await).is_empty());
     assert!(
-        counters_of(&indexed).full > 0,
+        counters(&indexed).full > 0,
         "a complete index miss should be a fully covered probe"
     );
 
@@ -519,7 +427,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
     //     next lookup is still answered by the index. (A write this small is
     //     inlined into the metastore rather than written as a file; the
     //     lifecycle suite covers appends that write files.)
-    let appended_before = counters_of(&indexed);
+    let appended_before = counters(&indexed);
     let new_batch = service_rows(2_000_000, 256);
     insert(&indexed, INDEXED, new_batch.clone()).await;
     insert(&plain, PLAIN, new_batch).await;
@@ -538,10 +446,10 @@ async fn lookup_index_matches_the_ordinary_scan() {
         new_indexed.len(),
         1,
         "a row written after the index build was lost: {:?}",
-        counters_of(&indexed)
+        counters(&indexed)
     );
     assert_eq!(new_indexed, new_plain);
-    let appended_after = counters_of(&indexed);
+    let appended_after = counters(&indexed);
     assert_eq!(
         (
             (appended_after.full + appended_after.partial)
@@ -565,7 +473,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
         rendered(&query(&plain, PLAIN, &format!("SELECT COUNT(*) FROM {PLAIN}")).await);
     assert_eq!(total_indexed, total_plain);
 
-    println!("lookup-index counters: {:?}", counters_of(&indexed));
+    println!("lookup-index counters: {:?}", counters(&indexed));
 }
 
 /// Prints the executed plan for one lookup on each arm. The scan-level metrics
@@ -646,7 +554,7 @@ async fn lookup_index_plan_evidence() {
     println!("=== {INDEXED_EVIDENCE} ===\n{indexed_text}");
     println!("=== {PLAIN_EVIDENCE} ===\n{plain_text}");
     println!("=== fallback ===\n{fallback_text}");
-    println!("lookup-index counters: {:?}", counters_of(&indexed));
+    println!("lookup-index counters: {:?}", counters(&indexed));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -699,7 +607,7 @@ async fn oversized_dynamic_key_sets_fall_back_before_probing() {
         .collect()
         .await
         .expect("plain join");
-    let before = counters_of(&indexed);
+    let before = counters(&indexed);
     let actual = ctx
         .sql(&sql(INDEXED))
         .await
@@ -707,7 +615,7 @@ async fn oversized_dynamic_key_sets_fall_back_before_probing() {
         .collect()
         .await
         .expect("indexed join");
-    let after = counters_of(&indexed);
+    let after = counters(&indexed);
     assert_eq!(rendered(&actual), rendered(&expected));
     assert_eq!(rendered(&actual).len(), 4_098);
     assert_eq!(after.full, before.full);
@@ -774,7 +682,7 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
         "SELECT s.\"AutoId\" FROM keys k INNER JOIN {INDEXED_EVIDENCE} s \
          ON k.key = s.\"AutoId\" ORDER BY s.\"AutoId\""
     );
-    let before = counters_of(&indexed);
+    let before = counters(&indexed);
     let rows = ctx
         .sql(&sql)
         .await
@@ -783,7 +691,7 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
         .await
         .expect("join execution");
     assert_eq!(rendered(&rows), vec!["12345", "39999", "7", "7"]);
-    let after = counters_of(&indexed);
+    let after = counters(&indexed);
     assert_eq!(
         after.full - before.full,
         1,
@@ -849,7 +757,7 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
          ON k.account = s.\"TenantId\" AND k.service = s.\"ServiceId\" \
          ORDER BY s.\"AutoId\""
     );
-    let composite_before = counters_of(&indexed);
+    let composite_before = counters(&indexed);
     let composite_rows = ctx
         .sql(&composite_sql)
         .await
@@ -858,7 +766,7 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
         .await
         .expect("composite join execution");
     assert_eq!(rendered(&composite_rows), vec!["12345", "39999", "7"]);
-    let composite_after = counters_of(&indexed);
+    let composite_after = counters(&indexed);
     assert_eq!(
         composite_after.full - composite_before.full,
         1,
@@ -941,7 +849,7 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
         "the fallback query did not use a partitioned dynamically filtered hash join:\n\
          {partitioned_plan}"
     );
-    let partitioned_before = counters_of(&indexed);
+    let partitioned_before = counters(&indexed);
     let partitioned_rows = partitioned_ctx
         .sql(&partitioned_sql)
         .await
@@ -952,7 +860,7 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
     let mut expected = (0..128).map(|value| value.to_string()).collect::<Vec<_>>();
     expected.sort();
     assert_eq!(rendered(&partitioned_rows), expected);
-    let partitioned_after = counters_of(&indexed);
+    let partitioned_after = counters(&indexed);
     assert_eq!(
         partitioned_after.full, partitioned_before.full,
         "a CASE-partitioned key set must fall back without a partial selection: \
@@ -991,11 +899,11 @@ async fn write_time_index_matches_a_read_back_build() {
     .await;
 
     // A full-refresh overwrite is the write the index is built during.
-    overwrite(&table, service_rows(0, ROWS)).await;
+    overwrite(&table, vec![service_rows(0, ROWS)]).await;
 
     // No query has run yet, so nothing could have triggered a read-back build:
     // an index published at this point can only have come from the write.
-    let after_write = counters_of(&table);
+    let after_write = counters(&table);
     assert_eq!(
         after_write.none, 0,
         "a probe fell back before any query ran: {after_write:?}"
@@ -1033,7 +941,7 @@ async fn write_time_index_matches_a_read_back_build() {
 
     // The index must be usable on the FIRST query after the overwrite — that is
     // the whole point of building it before the snapshot goes visible.
-    let before = counters_of(&table);
+    let before = counters(&table);
     let sql = format!(
         "SELECT * FROM {INDEXED_WRITE_TIME} WHERE \"TenantId\" = '{DUP_ACCOUNT}' \
          AND \"ServiceId\" = '{DUP_APPLICATION}' AND \"Active\" = 1 LIMIT 1"
@@ -1044,7 +952,7 @@ async fn write_time_index_matches_a_read_back_build() {
         1,
         "first post-overwrite lookup returned nothing"
     );
-    let after = counters_of(&table);
+    let after = counters(&table);
     assert_eq!(
         after.full,
         before.full + 1,
@@ -1057,7 +965,7 @@ async fn write_time_index_matches_a_read_back_build() {
 
     // A SECOND overwrite must swap in a fresh index just as seamlessly, with the
     // new rows addressable straight away.
-    overwrite(&table, service_rows(3_000_000, 4_096)).await;
+    overwrite(&table, vec![service_rows(3_000_000, 4_096)]).await;
     let report = table
         .verify_lookup_index_against_read_back()
         .await
@@ -1071,14 +979,14 @@ async fn write_time_index_matches_a_read_back_build() {
     let new_id = 3_000_000i64 + 11;
     let new_account = format!("AC{:032x}", new_id % ACCOUNTS);
     let new_application = format!("MG{new_id:032x}");
-    let before = counters_of(&table);
+    let before = counters(&table);
     let sql = format!(
         "SELECT \"AutoId\" FROM {INDEXED_WRITE_TIME} WHERE \"TenantId\" = '{new_account}' \
          AND \"ServiceId\" = '{new_application}' ORDER BY \"AutoId\""
     );
     let rows = rendered(&query(&table, INDEXED_WRITE_TIME, &sql).await);
     assert_eq!(rows, vec![new_id.to_string()]);
-    let after = counters_of(&table);
+    let after = counters(&table);
     assert_eq!(
         after.full,
         before.full + 1,
@@ -1111,7 +1019,7 @@ async fn a_large_overwrite_is_covered_when_it_becomes_visible() {
         vortex_config,
     )
     .await;
-    overwrite(&table, service_rows(0, LARGE)).await;
+    overwrite(&table, vec![service_rows(0, LARGE)]).await;
 
     let id = 1_000_003_i64;
     let sql = format!(
@@ -1119,12 +1027,12 @@ async fn a_large_overwrite_is_covered_when_it_becomes_visible() {
          AND \"ServiceId\" = 'MG{id:032x}'",
         id % ACCOUNTS
     );
-    let before = counters_of(&table);
+    let before = counters(&table);
     assert_eq!(
         rendered(&query(&table, INDEXED_WRITE_TIME, &sql).await),
         vec![id.to_string()]
     );
-    let after = counters_of(&table);
+    let after = counters(&table);
     assert_eq!(
         after.full,
         before.full + 1,
@@ -1155,9 +1063,6 @@ async fn upsert_table(
     runtime_env: Arc<RuntimeEnv>,
     name: &str,
 ) -> Arc<CayenneTableProvider> {
-    use datafusion_table_providers::util::{
-        column_reference::ColumnReference, on_conflict::OnConflict,
-    };
     // Protected snapshots stay unfolded for the length of the test, and the
     // rewrite layout is pinned, so the only thing under test is the index.
     let vortex_config = VortexConfig {
@@ -1168,32 +1073,14 @@ async fn upsert_table(
         compaction_background_interval_ms: 0,
         ..VortexConfig::default()
     };
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
-    let catalog = Arc::clone(&fixture.catalog);
-    let catalog: Arc<dyn MetadataCatalog> = catalog;
-    Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .with_context(context)
-            .with_secondary_indexes(
-                INDEX_KEYS
-                    .iter()
-                    .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
-                    .collect(),
-            )
-            .create(CreateTableOptions {
-                table_name: name.to_string(),
-                schema: service_schema(),
-                primary_key: vec!["AutoId".to_string()],
-                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                    "AutoId".to_string(),
-                ]))),
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config,
-            })
-            .await
-            .expect("create table"),
+    open_table(
+        fixture,
+        runtime_env,
+        TableSpec::new(name, service_schema(), &INDEX_KEYS)
+            .config(vortex_config)
+            .upsert_key("AutoId"),
     )
+    .await
 }
 
 /// On a primary-key upsert table, an upsert's rows land in a protected
@@ -1370,8 +1257,8 @@ async fn in_lists_are_answered_from_the_index() {
     let indexed = build_table(&fixture, INDEXED_IN, &INDEX_KEYS, Arc::clone(&runtime_env)).await;
     let plain = build_table(&fixture, PLAIN_IN, &[], Arc::clone(&runtime_env)).await;
     let batch = service_rows(0, ROWS);
-    overwrite(&indexed, batch.clone()).await;
-    overwrite(&plain, batch).await;
+    overwrite(&indexed, vec![batch.clone()]).await;
+    overwrite(&plain, vec![batch]).await;
 
     let account = |id: i64| format!("'AC{:032x}'", id % ACCOUNTS);
     let application = |id: i64| format!("'MG{id:032x}'");
@@ -1398,13 +1285,13 @@ async fn in_lists_are_answered_from_the_index() {
         ),
     ];
     for query_sql in &answered {
-        let before = counters_of(&indexed);
+        let before = counters(&indexed);
         let found =
             rendered(&query(&indexed, INDEXED_IN, &query_sql.replace("{t}", INDEXED_IN)).await);
         let expected =
             rendered(&query(&plain, PLAIN_IN, &query_sql.replace("{t}", PLAIN_IN)).await);
         assert_eq!(found, expected, "{query_sql}");
-        let after = counters_of(&indexed);
+        let after = counters(&indexed);
         assert_eq!(
             (after.full + after.partial) - (before.full + before.partial),
             1,
@@ -1442,12 +1329,12 @@ async fn in_lists_are_answered_from_the_index() {
     );
 
     let negated = "SELECT COUNT(*) FROM {t} WHERE \"AutoId\" NOT IN (3, 17)";
-    let before = counters_of(&indexed);
+    let before = counters(&indexed);
     assert_eq!(
         rendered(&query(&indexed, INDEXED_IN, &negated.replace("{t}", INDEXED_IN)).await),
         rendered(&query(&plain, PLAIN_IN, &negated.replace("{t}", PLAIN_IN)).await),
     );
-    let after = counters_of(&indexed);
+    let after = counters(&indexed);
     assert_eq!(
         (after.full, after.full, after.none),
         (before.full, before.full, before.none),
@@ -1501,7 +1388,7 @@ async fn keys_sharing_a_word_return_exactly_their_own_rows() {
     insert(&plain, PLAIN_COLLIDING, batch).await;
     wait_for_index(&indexed, INDEXED_COLLIDING).await;
 
-    let before = counters_of(&indexed);
+    let before = counters(&indexed);
     let mut result_rows = 0_u64;
     let mut lookups = 0_u64;
     for i in 0..15i64 {
@@ -1541,7 +1428,7 @@ async fn keys_sharing_a_word_return_exactly_their_own_rows() {
             lookups += 1;
         }
     }
-    let after = counters_of(&indexed);
+    let after = counters(&indexed);
     let selected = after.full - before.full;
     let candidates = after.candidate_rows - before.candidate_rows;
     println!(

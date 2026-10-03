@@ -26,25 +26,22 @@ limitations under the License.
 
 mod common;
 
+use common::lookup_index::{
+    TableSpec, counters, memory_mode_config, open_table, overwrite, rendered, runtime_with_pool,
+};
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use cayenne::lookup_index::LookupIndexCounters;
-use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::provider::CayenneContext;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::CayenneTableProvider;
 
 use datafusion::datasource::TableProvider;
-use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SessionContext, lit};
-use datafusion_table_providers::util::{
-    column_reference::ColumnReference, on_conflict::OnConflict,
-};
 
 /// A unique key and a heavily repeated one.
 const INDEXES: [&[&str]; 2] = [&["TenantId", "ServiceId"], &["TenantId", "PoolId"]];
@@ -101,73 +98,13 @@ async fn memory_table(
     indexes: &[&[&str]],
     upsert: bool,
 ) -> Arc<CayenneTableProvider> {
-    let vortex_config = VortexConfig {
-        memory_mode: true,
-        cdc_mem_tier_shards: 1,
-        cdc_mem_tier_max_age_ms: 0,
-        cdc_mem_tier_checkpoint_interval_ms: 0,
-        cdc_mem_tier_seal_age_ms: 0,
-        compaction_background_interval_ms: 0,
-        cold_tier_location: None,
-        inline_max_rows: 0,
-        inline_max_bytes: 0,
-        inline_max_buffer_bytes: 0,
-        cdc_mem_tier_max_bytes: 0,
-        cdc_durability: CdcDurability::Memory,
-        deletion_mode: DeletionMode::Key,
-        ..VortexConfig::default()
+    let spec = TableSpec::new(name, schema(), indexes).config(memory_mode_config());
+    let spec = if upsert {
+        spec.upsert_key("AutoId")
+    } else {
+        spec
     };
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
-    let options = CreateTableOptions {
-        table_name: name.to_string(),
-        schema: schema(),
-        primary_key: if upsert {
-            vec!["AutoId".to_string()]
-        } else {
-            vec![]
-        },
-        on_conflict: upsert
-            .then(|| OnConflict::Upsert(ColumnReference::new(vec!["AutoId".to_string()]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
-        partition_column: None,
-        vortex_config,
-    };
-    let catalog = Arc::clone(&fixture.catalog);
-    let catalog: Arc<dyn MetadataCatalog> = catalog;
-    Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .with_context(context)
-            .with_secondary_indexes(
-                indexes
-                    .iter()
-                    .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
-                    .collect(),
-            )
-            .create(options)
-            .await
-            .expect("create memory table"),
-    )
-}
-
-async fn overwrite(provider: &Arc<CayenneTableProvider>, batches: Vec<RecordBatch>) {
-    let ctx = SessionContext::new();
-    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-        &[batches],
-        schema(),
-        None,
-    )
-    .expect("overwrite source");
-    let plan = provider
-        .insert_into(
-            &ctx.state(),
-            exec,
-            datafusion_expr::dml::InsertOp::Overwrite,
-        )
-        .await
-        .expect("overwrite plan");
-    datafusion_physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("overwrite");
+    open_table(fixture, runtime_env, spec).await
 }
 
 async fn append(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
@@ -190,36 +127,9 @@ async fn delete_ids(provider: &Arc<CayenneTableProvider>, ids: &[i64]) {
 }
 
 /// The rows `sql` returns, rendered and sorted so two tables compare exactly.
+/// `sql`, with `{t}` naming the table, run against it and rendered.
 async fn query(provider: &Arc<CayenneTableProvider>, name: &str, sql: &str) -> Vec<String> {
-    let ctx = SessionContext::new();
-    ctx.register_table(name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("register");
-    let batches = ctx
-        .sql(&sql.replace("{t}", name))
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("execute");
-    let mut rendered = Vec::new();
-    for batch in &batches {
-        for row in 0..batch.num_rows() {
-            let cells: Vec<String> = (0..batch.num_columns())
-                .map(|column| {
-                    let array = batch.column(column);
-                    if array.is_null(row) {
-                        "NULL".to_string()
-                    } else {
-                        arrow::util::display::array_value_to_string(array, row)
-                            .expect("render cell")
-                    }
-                })
-                .collect();
-            rendered.push(cells.join("|"));
-        }
-    }
-    rendered.sort();
-    rendered
+    rendered(&common::lookup_index::query(provider, name, &sql.replace("{t}", name)).await)
 }
 
 fn unique_lookup(id: i64) -> String {
@@ -231,12 +141,6 @@ fn unique_lookup(id: i64) -> String {
 
 fn repeated_lookup(tenant: i64, pool: i64) -> String {
     format!("SELECT * FROM {{t}} WHERE \"TenantId\" = {tenant} AND \"PoolId\" = {pool}")
-}
-
-fn counters(provider: &Arc<CayenneTableProvider>) -> LookupIndexCounters {
-    provider
-        .lookup_index_counters()
-        .expect("the table declares indexes")
 }
 
 /// Runs the same lookups on both tables and requires identical rows. Returns
@@ -513,15 +417,6 @@ async fn memory_mode_lookups_never_return_a_superseded_version() {
     let end = counters(&indexed);
     assert!(end.full > 0, "{end:?}");
     assert_eq!(end.none, 0, "{end:?}");
-}
-
-fn runtime_with_pool(bytes: usize) -> (Arc<RuntimeEnv>, Arc<dyn MemoryPool>) {
-    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
-    let runtime_env = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::clone(&pool))
-        .build_arc()
-        .expect("runtime env");
-    (runtime_env, pool)
 }
 
 /// The index's bytes are reserved in the query pool for exactly as long as the

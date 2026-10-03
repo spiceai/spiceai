@@ -23,19 +23,19 @@ limitations under the License.
 
 mod common;
 
+use common::lookup_index::{TableSpec, open_table, overwrite, query, runtime_with_pool};
+
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::provider::CayenneContext;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::CayenneTableProvider;
+use cayenne::metadata::VortexConfig;
 
 use datafusion::datasource::TableProvider;
-use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
 
 const TABLE: &str = "svc_budget";
@@ -59,16 +59,6 @@ const INDEX_KEY: [&str; 2] = ["TenantId", "ServiceId"];
 /// resides in ~55 KiB, while the 40,000-row build accumulates ~2 MiB, twice
 /// this, before it could compress anything.
 const POOL_BYTES: usize = 1024 * 1024;
-
-/// A runtime whose query memory pool holds [`POOL_BYTES`].
-fn bounded_runtime() -> (Arc<RuntimeEnv>, Arc<dyn MemoryPool>) {
-    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(POOL_BYTES));
-    let runtime_env = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::clone(&pool))
-        .build_arc()
-        .expect("runtime env");
-    (runtime_env, pool)
-}
 
 fn service_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -109,96 +99,24 @@ fn service_rows_from(offset: usize, rows: usize) -> RecordBatch {
     .expect("fixture batch")
 }
 
-async fn build_table(
-    fixture: &common::TestFixture,
-    runtime_env: Arc<RuntimeEnv>,
-) -> Arc<CayenneTableProvider> {
-    build_named(fixture, runtime_env, TABLE).await
-}
-
-async fn build_named(
-    fixture: &common::TestFixture,
-    runtime_env: Arc<RuntimeEnv>,
-    name: &str,
-) -> Arc<CayenneTableProvider> {
-    build_with_file_size(fixture, runtime_env, name, 1).await
-}
-
+/// The indexed table `name`, writing files of up to
+/// `target_vortex_file_size_mb`.
 async fn build_with_file_size(
     fixture: &common::TestFixture,
     runtime_env: Arc<RuntimeEnv>,
     name: &str,
     target_vortex_file_size_mb: usize,
 ) -> Arc<CayenneTableProvider> {
-    let vortex_config = VortexConfig {
+    let config = VortexConfig {
         target_vortex_file_size_mb,
         ..VortexConfig::default()
     };
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
-    let options = CreateTableOptions {
-        table_name: name.to_string(),
-        schema: service_schema(),
-        primary_key: vec![],
-        on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
-        partition_column: None,
-        vortex_config,
-    };
-    let catalog = Arc::clone(&fixture.catalog);
-    let catalog: Arc<dyn MetadataCatalog> = catalog;
-    Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .with_context(context)
-            .with_secondary_indexes(vec![INDEX_KEY.iter().map(|c| (*c).to_string()).collect()])
-            .create(options)
-            .await
-            .expect("create table"),
+    open_table(
+        fixture,
+        runtime_env,
+        TableSpec::new(name, service_schema(), &[&INDEX_KEY]).config(config),
     )
-}
-
-async fn overwrite(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
-    write(provider, batch, datafusion_expr::dml::InsertOp::Overwrite).await;
-}
-
-async fn append(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
-    write(provider, batch, datafusion_expr::dml::InsertOp::Append).await;
-}
-
-async fn write(
-    provider: &Arc<CayenneTableProvider>,
-    batch: RecordBatch,
-    op: datafusion_expr::dml::InsertOp,
-) {
-    let ctx = SessionContext::new();
-    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-        &[vec![batch]],
-        service_schema(),
-        None,
-    )
-    .expect("write source");
-    let plan = provider
-        .insert_into(&ctx.state(), exec, op)
-        .await
-        .expect("write plan");
-    datafusion_physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("write");
-}
-
-async fn query(provider: &Arc<CayenneTableProvider>, sql: &str) -> Vec<RecordBatch> {
-    query_on(provider, TABLE, sql).await
-}
-
-async fn query_on(provider: &Arc<CayenneTableProvider>, name: &str, sql: &str) -> Vec<RecordBatch> {
-    let ctx = SessionContext::new();
-    ctx.register_table(name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("register");
-    ctx.sql(sql)
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("execute")
+    .await
 }
 
 fn rows_of(batches: &[RecordBatch]) -> usize {
@@ -216,9 +134,9 @@ async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
-    let (runtime_env, pool) = bounded_runtime();
-    let table = build_table(&fixture, Arc::clone(&runtime_env)).await;
-    overwrite(&table, service_rows(ROWS)).await;
+    let (runtime_env, pool) = runtime_with_pool(POOL_BYTES);
+    let table = build_with_file_size(&fixture, Arc::clone(&runtime_env), TABLE, 1).await;
+    overwrite(&table, vec![service_rows(ROWS)]).await;
 
     // The write's runs were built and refused; no file may be covered.
     let verification = table
@@ -252,7 +170,7 @@ async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
          AND \"ServiceId\" = 'SV{:032x}' ORDER BY \"AutoId\"",
         42
     );
-    assert_eq!(rows_of(&query(&table, &sql).await), 1);
+    assert_eq!(rows_of(&query(&table, TABLE, &sql).await), 1);
 
     let counters = table
         .lookup_index_counters()
@@ -271,7 +189,7 @@ async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
     );
 
     // Every row is still reachable.
-    let total = query(&table, &format!("SELECT COUNT(*) AS n FROM {TABLE}")).await;
+    let total = query(&table, TABLE, &format!("SELECT COUNT(*) AS n FROM {TABLE}")).await;
     let count = total[0]
         .column(0)
         .as_any()
@@ -292,9 +210,9 @@ async fn a_mixed_type_composite_key_is_indexed() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
-    let (runtime_env, pool) = bounded_runtime();
-    let table = build_named(&fixture, Arc::clone(&runtime_env), SMALL_TABLE).await;
-    overwrite(&table, service_rows(SMALL_ROWS)).await;
+    let (runtime_env, pool) = runtime_with_pool(POOL_BYTES);
+    let table = build_with_file_size(&fixture, Arc::clone(&runtime_env), SMALL_TABLE, 1).await;
+    overwrite(&table, vec![service_rows(SMALL_ROWS)]).await;
 
     let report = table
         .verify_lookup_index_against_read_back()
@@ -334,7 +252,7 @@ async fn a_mixed_type_composite_key_is_indexed() {
          AND \"ServiceId\" = 'SV{:032x}' ORDER BY \"AutoId\"",
         42
     );
-    let rows = query_on(&table, SMALL_TABLE, &sql).await;
+    let rows = query(&table, SMALL_TABLE, &sql).await;
     assert_eq!(
         rows_of(&rows),
         1,
@@ -369,11 +287,11 @@ async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
-    let (runtime_env, _pool) = bounded_runtime();
+    let (runtime_env, _pool) = runtime_with_pool(POOL_BYTES);
     // One file per write, so the background build of the append's file needs
     // as much memory as its write did and is refused too.
     let table = build_with_file_size(&fixture, Arc::clone(&runtime_env), PARTIAL_TABLE, 256).await;
-    overwrite(&table, service_rows(SMALL_ROWS)).await;
+    overwrite(&table, vec![service_rows(SMALL_ROWS)]).await;
     let indexed = table
         .lookup_index_counters()
         .expect("table has index state");
@@ -381,7 +299,9 @@ async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
         indexed.index_bytes > 0,
         "the first write's index must fit: {indexed:?}"
     );
-    append(&table, service_rows_from(SMALL_ROWS, ROWS)).await;
+    common::insert_batches(&table, vec![service_rows_from(SMALL_ROWS, ROWS)])
+        .await
+        .expect("append");
     let refused = table
         .lookup_index_counters()
         .expect("table has index state");
@@ -401,7 +321,7 @@ async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
             "SELECT \"AutoId\" FROM {PARTIAL_TABLE} WHERE \"TenantId\" = {tenant} \
              AND \"ServiceId\" = '{service}'"
         );
-        let explain = query_on(&table, PARTIAL_TABLE, &format!("EXPLAIN {sql}")).await;
+        let explain = query(&table, PARTIAL_TABLE, &format!("EXPLAIN {sql}")).await;
         let plan = arrow::util::pretty::pretty_format_batches(&explain)
             .expect("format plan")
             .to_string();
@@ -410,7 +330,7 @@ async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
                 && uncovered_files_of(&plan).is_some_and(|files| files > 0),
             "a key in {what} must be partly covered, reading the unindexed file in full:\n{plan}"
         );
-        let rows = query_on(&table, PARTIAL_TABLE, &sql).await;
+        let rows = query(&table, PARTIAL_TABLE, &sql).await;
         let found: Vec<i64> = rows
             .iter()
             .flat_map(|batch| {

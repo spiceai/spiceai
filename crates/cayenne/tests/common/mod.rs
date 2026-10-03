@@ -21,6 +21,8 @@ limitations under the License.
     reason = "Shared test helper module compiled into multiple test crates; not every item is used by every crate"
 )]
 
+pub mod lookup_index;
+
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;

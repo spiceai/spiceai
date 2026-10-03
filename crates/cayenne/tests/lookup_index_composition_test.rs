@@ -24,10 +24,12 @@ limitations under the License.
 
 mod common;
 
+use common::lookup_index::{TableSpec, counters, open_table, overwrite, query, rendered};
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -50,94 +52,8 @@ async fn build_table(
     schema: Arc<Schema>,
     index_keys: Option<&[&str]>,
 ) -> Arc<CayenneTableProvider> {
-    let vortex_config = VortexConfig {
-        target_vortex_file_size_mb: 1,
-        ..VortexConfig::default()
-    };
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
-    let options = CreateTableOptions {
-        table_name: name.to_string(),
-        schema,
-        primary_key: vec![],
-        on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
-        partition_column: None,
-        vortex_config,
-    };
-    let catalog = Arc::clone(&fixture.catalog);
-    let catalog: Arc<dyn MetadataCatalog> = catalog;
-    Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .with_context(context)
-            .with_secondary_indexes(
-                index_keys
-                    .map(|columns| vec![columns.iter().map(|c| (*c).to_string()).collect()])
-                    .unwrap_or_default(),
-            )
-            .create(options)
-            .await
-            .expect("create table"),
-    )
-}
-
-async fn overwrite(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
-    let ctx = SessionContext::new();
-    let schema = batch.schema();
-    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-        &[vec![batch]],
-        schema,
-        None,
-    )
-    .expect("overwrite source");
-    let plan = provider
-        .insert_into(
-            &ctx.state(),
-            exec,
-            datafusion_expr::dml::InsertOp::Overwrite,
-        )
-        .await
-        .expect("overwrite plan");
-    datafusion_physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("overwrite");
-}
-
-async fn sql(provider: &Arc<CayenneTableProvider>, name: &str, sql: &str) -> Vec<RecordBatch> {
-    let ctx = SessionContext::new();
-    ctx.register_table(name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("register");
-    ctx.sql(sql)
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("execute")
-}
-
-fn rendered(batches: &[RecordBatch]) -> Vec<String> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        for row in 0..batch.num_rows() {
-            let mut cells = Vec::with_capacity(batch.num_columns());
-            for column in 0..batch.num_columns() {
-                let array = batch.column(column);
-                cells.push(if array.is_null(row) {
-                    "NULL".to_string()
-                } else {
-                    arrow::util::display::array_value_to_string(array, row).expect("render cell")
-                });
-            }
-            rows.push(cells.join("|"));
-        }
-    }
-    rows.sort();
-    rows
-}
-
-fn counters(provider: &Arc<CayenneTableProvider>) -> cayenne::lookup_index::LookupIndexCounters {
-    provider
-        .lookup_index_counters()
-        .expect("indexed table has index state")
+    let indexes: Vec<&[&str]> = index_keys.into_iter().collect();
+    open_table(fixture, runtime_env, TableSpec::new(name, schema, &indexes)).await
 }
 
 fn scored_schema() -> Arc<Schema> {
@@ -240,16 +156,16 @@ async fn a_column_side_cast_is_never_answered_from_the_index() {
         ],
     )
     .expect("batch");
-    overwrite(&indexed, batch.clone()).await;
-    overwrite(&plain, batch).await;
+    overwrite(&indexed, vec![batch.clone()]).await;
+    overwrite(&plain, vec![batch]).await;
 
     // The index is in place: a bare equality on both key columns uses it.
     let before = counters(&indexed);
     let bare = "SELECT \"AutoId\" FROM {t} WHERE \"TenantId\" = 'PLANTED' \
                 AND \"Score\" = 9007199254740992";
     assert_eq!(
-        rendered(&sql(&indexed, INDEXED, &bare.replace("{t}", INDEXED)).await),
-        rendered(&sql(&plain, PLAIN, &bare.replace("{t}", PLAIN)).await)
+        rendered(&query(&indexed, INDEXED, &bare.replace("{t}", INDEXED)).await),
+        rendered(&query(&plain, PLAIN, &bare.replace("{t}", PLAIN)).await)
     );
     assert_eq!(
         counters(&indexed).full,
@@ -260,13 +176,13 @@ async fn a_column_side_cast_is_never_answered_from_the_index() {
     let casted = "SELECT \"AutoId\" FROM {t} WHERE \"TenantId\" = 'PLANTED' \
                   AND CAST(\"Score\" AS DOUBLE) = CAST(9007199254740992 AS DOUBLE) \
                   ORDER BY \"AutoId\"";
-    let expected = rendered(&sql(&plain, PLAIN, &casted.replace("{t}", PLAIN)).await);
+    let expected = rendered(&query(&plain, PLAIN, &casted.replace("{t}", PLAIN)).await);
     assert_eq!(
         expected.len(),
         2,
         "control table: both adjacent integers round to the same double"
     );
-    let actual = rendered(&sql(&indexed, INDEXED, &casted.replace("{t}", INDEXED)).await);
+    let actual = rendered(&query(&indexed, INDEXED, &casted.replace("{t}", INDEXED)).await);
     assert_eq!(
         actual, expected,
         "a column-side cast was answered from the index and dropped rows"
@@ -330,8 +246,8 @@ async fn position_deletes_compose_with_the_index() {
     .await;
     let plain = build_table(&fixture, runtime_env, PLAIN, service_schema(), None).await;
     let batch = service_rows(ROWS);
-    overwrite(&indexed, batch.clone()).await;
-    overwrite(&plain, batch).await;
+    overwrite(&indexed, vec![batch.clone()]).await;
+    overwrite(&plain, vec![batch]).await;
 
     // Keys whose rows were deleted, keys with a deleted and a live row, keys that
     // were never touched, and keys no row holds.
@@ -353,7 +269,7 @@ async fn position_deletes_compose_with_the_index() {
 
     // Delete through the ordinary DML path on both tables.
     for (provider, name) in [(&indexed, INDEXED), (&plain, PLAIN)] {
-        sql(
+        query(
             provider,
             name,
             &format!("DELETE FROM {name} WHERE \"AutoId\" IN ({deleted})"),
@@ -362,17 +278,17 @@ async fn position_deletes_compose_with_the_index() {
     }
     assert_eq!(
         rendered(
-            &sql(
+            &query(
                 &indexed,
                 INDEXED,
                 &format!("SELECT COUNT(*) FROM {INDEXED}")
             )
             .await
         ),
-        rendered(&sql(&plain, PLAIN, &format!("SELECT COUNT(*) FROM {PLAIN}")).await)
+        rendered(&query(&plain, PLAIN, &format!("SELECT COUNT(*) FROM {PLAIN}")).await)
     );
     assert_eq!(
-        rendered(&sql(&plain, PLAIN, &format!("SELECT COUNT(*) FROM {PLAIN}")).await),
+        rendered(&query(&plain, PLAIN, &format!("SELECT COUNT(*) FROM {PLAIN}")).await),
         vec![(ROWS - deleted.split(", ").count()).to_string()],
         "the control table did not apply the delete"
     );
@@ -391,7 +307,7 @@ async fn position_deletes_compose_with_the_index() {
     let mut served = false;
     while !served && Instant::now() < deadline {
         let before = counters(&indexed).full;
-        let _ = sql(
+        let _ = query(
             &indexed,
             INDEXED,
             &query_for(keys[1]).replace("{t}", INDEXED),
@@ -405,10 +321,10 @@ async fn position_deletes_compose_with_the_index() {
 
     let before = counters(&indexed);
     for &id in &keys {
-        let query = query_for(id);
+        let lookup = query_for(id);
         assert_eq!(
-            rendered(&sql(&indexed, INDEXED, &query.replace("{t}", INDEXED)).await),
-            rendered(&sql(&plain, PLAIN, &query.replace("{t}", PLAIN)).await),
+            rendered(&query(&indexed, INDEXED, &lookup.replace("{t}", INDEXED)).await),
+            rendered(&query(&plain, PLAIN, &lookup.replace("{t}", PLAIN)).await),
             "lookup {id} diverged from the control table after deletes"
         );
     }
@@ -483,4 +399,116 @@ async fn position_deletes_compose_with_the_index() {
         selected_before + 1,
         "the dynamic join did not compose its index selection with position deletes"
     );
+}
+
+/// At every float width, a lookup on an indexed float column returns exactly
+/// the rows an unindexed table returns: for both zeros, NaN, infinities, the
+/// width's extremes, values held by many rows, and values no row holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn float_key_lookups_return_the_rows_of_an_unindexed_table() {
+    use arrow::array::{ArrayRef, Float32Array, PrimitiveArray};
+    use arrow::datatypes::Float16Type;
+    type F16 = <Float16Type as arrow::datatypes::ArrowPrimitiveType>::Native;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    // Enough rows to be written to files, repeating each value many times.
+    let values: Vec<Option<f64>> = [
+        Some(0.0),
+        Some(-0.0),
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        Some(1.5),
+        Some(-2.5),
+        Some(0.1),
+        Some(65_504.0),
+        Some(-65_504.0),
+        Some(f64::from(f32::MAX)),
+        Some(6.0e-8),
+        None,
+    ]
+    .into_iter()
+    .cycle()
+    .take(ROWS)
+    .collect();
+    for (suffix, data_type) in [("f16", DataType::Float16), ("f32", DataType::Float32)] {
+        let keys: ArrayRef = match data_type {
+            DataType::Float16 => Arc::new(
+                values
+                    .iter()
+                    .map(|v| v.map(F16::from_f64))
+                    .collect::<PrimitiveArray<Float16Type>>(),
+            ),
+            #[expect(clippy::cast_possible_truncation, reason = "narrowed on purpose")]
+            _ => Arc::new(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v as f32))
+                    .collect::<Float32Array>(),
+            ),
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("AutoId", DataType::Int64, false),
+            Field::new("K", data_type.clone(), true),
+        ]));
+        let ids = Int64Array::from_iter_values(0..i64::try_from(ROWS).expect("fits"));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), keys]).expect("batch");
+        let (indexed_name, plain_name) = (format!("float_{suffix}"), format!("plain_{suffix}"));
+        let indexed = build_table(
+            &fixture,
+            Arc::clone(&runtime_env),
+            &indexed_name,
+            Arc::clone(&schema),
+            Some(&["K"]),
+        )
+        .await;
+        let plain = build_table(
+            &fixture,
+            Arc::clone(&runtime_env),
+            &plain_name,
+            schema,
+            None,
+        )
+        .await;
+        overwrite(&indexed, vec![batch.clone()]).await;
+        overwrite(&plain, vec![batch]).await;
+
+        let mut probes: Vec<String> = [
+            "0.0", "-0.0", "1.5", "-2.5", "0.1", "65504.0", "-65504.0", "6.0e-8", "2.5", "7.0",
+        ]
+        .iter()
+        .map(|v| format!("arrow_cast({v}, '{data_type}')"))
+        .collect();
+        probes.extend(
+            ["NaN", "Infinity", "-Infinity"]
+                .iter()
+                .map(|v| format!("arrow_cast('{v}', '{data_type}')")),
+        );
+        let before = counters(&indexed);
+        for probe in &probes {
+            let lookup = format!("SELECT \"AutoId\" FROM {{t}} WHERE \"K\" = {probe}");
+            assert_eq!(
+                rendered(
+                    &query(
+                        &indexed,
+                        &indexed_name,
+                        &lookup.replace("{t}", &indexed_name)
+                    )
+                    .await
+                ),
+                rendered(&query(&plain, &plain_name, &lookup.replace("{t}", &plain_name)).await),
+                "{data_type}: {lookup}"
+            );
+        }
+        let after = counters(&indexed);
+        let answered = (after.full - before.full) + (after.partial - before.partial);
+        assert_eq!(
+            answered,
+            probes.len() as u64,
+            "{data_type}: every lookup must be answered from the index: {before:?} -> {after:?}"
+        );
+    }
 }

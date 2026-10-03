@@ -242,9 +242,25 @@ fn main() {
         for arm in [&indexed, &plain] {
             write(arm, rows(0, initial), InsertOp::Overwrite).await;
         }
-        // Let the initial load's index be in place, however it gets built.
-        for i in 0..50 {
+        // Start once the initial load is indexed, however the index gets
+        // built: lookups request a background build of any file it does not
+        // cover yet.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut i = 0_i64;
+        loop {
             lookup(&indexed, (i * 7919) % initial as i64).await;
+            i += 1;
+            let verification = indexed
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify the index");
+            if verification.uncovered_files == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the initial load was not indexed within 60s: {verification:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
