@@ -231,9 +231,9 @@ aws-smithy-runtime-api = "1.11.6"
 aws-smithy-types = "1.4.5"
 axum = { version = "0.8", features = ["macros"] }
 backoff = { path = "crates/backoff" }
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "7c4d54c2cefe27336fb9f70c67b2301ea7773920" } # branch: spiceai-55-patches-2
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "7c4d54c2cefe27336fb9f70c67b2301ea7773920" }
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "7c4d54c2cefe27336fb9f70c67b2301ea7773920" }
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "557ae4ea07501f7a6f0d73f719c8efabf9b90aa6" } # branch: spiceai-55-patches-2
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "557ae4ea07501f7a6f0d73f719c8efabf9b90aa6" }
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "557ae4ea07501f7a6f0d73f719c8efabf9b90aa6" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
@@ -281,7 +281,7 @@ datafusion-proto-common = "55.1.0"
 datafusion-pruning = "55.1.0"
 datafusion-spark = "55.1.0"
 datafusion-substrait = "55.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "3045960a3affcc12661539ba0327eaac770508ff" } # branch: spiceai-55-patches-2
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "5f50cfd5b8fab41c217b2639c4b537277c2e45e9" } # branch: spiceai-55-patches-2
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
@@ -605,12 +605,12 @@ duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "8ee430737cb6
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0284be3d66ea8dd91e6fa450bf73ccd85699a9dd" } # branch: spiceai-0.10.1-df-55-patches
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0284be3d66ea8dd91e6fa450bf73ccd85699a9dd" } # branch: spiceai-0.10.1-df-55-patches
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0284be3d66ea8dd91e6fa450bf73ccd85699a9dd" } # branch: spiceai-0.10.1-df-55-patches
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0284be3d66ea8dd91e6fa450bf73ccd85699a9dd" } # branch: spiceai-0.10.1-df-55-patches
-iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0284be3d66ea8dd91e6fa450bf73ccd85699a9dd" } # branch: spiceai-0.10.1-df-55-patches
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0284be3d66ea8dd91e6fa450bf73ccd85699a9dd" } # branch: spiceai-0.10.1-df-55-patches
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a0bd6b04cf11ad34dfc103043bba4cfce072bf45" } # branch: spiceai-0.10.1-df-55-patches
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a0bd6b04cf11ad34dfc103043bba4cfce072bf45" } # branch: spiceai-0.10.1-df-55-patches
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a0bd6b04cf11ad34dfc103043bba4cfce072bf45" } # branch: spiceai-0.10.1-df-55-patches
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a0bd6b04cf11ad34dfc103043bba4cfce072bf45" } # branch: spiceai-0.10.1-df-55-patches
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a0bd6b04cf11ad34dfc103043bba4cfce072bf45" } # branch: spiceai-0.10.1-df-55-patches
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a0bd6b04cf11ad34dfc103043bba4cfce072bf45" } # branch: spiceai-0.10.1-df-55-patches
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be
