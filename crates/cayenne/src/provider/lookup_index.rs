@@ -398,6 +398,14 @@ pub(crate) struct KeyColumn {
 }
 
 impl KeyColumn {
+    /// This column, encoded in `data_type` instead of its stored type.
+    pub(crate) fn encoded_as(&self, data_type: DataType) -> Self {
+        Self {
+            data_type,
+            ..self.clone()
+        }
+    }
+
     /// Resolves a configured key column: an exact name wins, then a unique
     /// case-insensitive match. Two case-insensitive candidates are an error
     /// rather than a guess, because building from one column and probing with

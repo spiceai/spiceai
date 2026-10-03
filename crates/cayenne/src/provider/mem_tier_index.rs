@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
+use arrow::datatypes::DataType;
 use datafusion_common::ScalarValue;
 
 use super::lookup_index::{
@@ -54,7 +55,21 @@ const BYTES_PER_ENTRY: usize = size_of::<u64>() + size_of::<u32>();
 struct ResolvedKey {
     label: String,
     columns: Vec<KeyColumn>,
+    /// Per column, the type `converter` encodes it in (see [`row_type`]).
+    row_types: Vec<DataType>,
     converter: RowConverter,
+}
+
+/// The type a key column of `data_type` is row-encoded in: its own, except
+/// `Float16`, which the row encoding lacks and which widens to `Float32`
+/// exactly, so distinct values stay distinct. Build and probe both cast a
+/// value to the column's own type first, then to this one, so they encode it
+/// identically.
+fn row_type(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::Float16 => DataType::Float32,
+        other => other.clone(),
+    }
 }
 
 /// A memory-mode table's secondary indexes: its keys, and the account every
@@ -97,8 +112,13 @@ impl MemTierIndexer {
                 .map(|column| KeyColumn::resolve(schema, column))
                 .collect::<Result<Vec<_>, String>>()
                 .and_then(|columns| {
-                    key_converter(&columns).map(|converter| ResolvedKey {
+                    let encoded: Vec<KeyColumn> = columns
+                        .iter()
+                        .map(|column| column.encoded_as(row_type(&column.data_type)))
+                        .collect();
+                    key_converter(&encoded).map(|converter| ResolvedKey {
                         label: spec.label().to_string(),
+                        row_types: encoded.into_iter().map(|column| column.data_type).collect(),
                         columns,
                         converter,
                     })
@@ -142,9 +162,11 @@ impl MemTierIndexer {
             let columns = key
                 .columns
                 .iter()
-                .map(|column| {
+                .zip(&key.row_types)
+                .map(|(column, row_type)| {
                     let array = batch.column_by_name(&column.name)?;
-                    cast_to(array, &column.data_type).ok()
+                    let array = cast_to(array, &column.data_type).ok()?;
+                    cast_to(&array, row_type).ok()
                 })
                 .collect::<Option<Vec<ArrayRef>>>()?;
             let encoded = key.converter.convert_columns(&columns).ok()?;
@@ -253,11 +275,17 @@ impl MemTierIndexer {
         let columns = key
             .columns
             .iter()
+            .zip(&key.row_types)
             .enumerate()
-            .map(|(at, column)| {
+            .map(|(at, (column, row_type))| {
                 let values = tuples
                     .iter()
-                    .map(|tuple| tuple[at].cast_to(&column.data_type).ok())
+                    .map(|tuple| {
+                        tuple[at]
+                            .cast_to(&column.data_type)
+                            .and_then(|value| value.cast_to(row_type))
+                            .ok()
+                    })
                     .collect::<Option<Vec<_>>>()?;
                 ScalarValue::iter_to_array(values).ok()
             })

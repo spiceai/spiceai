@@ -25,7 +25,8 @@ limitations under the License.
 mod common;
 
 use common::lookup_index::{
-    TableSpec, counters, open_table, overwrite, poll_until, query, rendered,
+    TableSpec, counters, file_mode_config, memory_mode_config, open_table, overwrite, poll_until,
+    query, rendered,
 };
 
 use std::sync::Arc;
@@ -408,12 +409,13 @@ async fn position_deletes_compose_with_the_index() {
     );
 }
 
-/// At every float width, a lookup on an indexed float column returns exactly
-/// the rows an unindexed table returns: for both zeros, NaN, infinities, the
-/// width's extremes, values held by many rows, and values no row holds.
+/// At every float width, in file and memory mode, a lookup on an indexed float
+/// column is answered from the index and returns exactly the rows an unindexed
+/// table returns: for both zeros, NaN, infinities, the width's extremes,
+/// values held by many rows, and values no row holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn float_key_lookups_return_the_rows_of_an_unindexed_table() {
-    use arrow::array::{ArrayRef, Float32Array, PrimitiveArray};
+    use arrow::array::{ArrayRef, Float32Array, Float64Array, PrimitiveArray};
     use arrow::datatypes::Float16Type;
     type F16 = <Float16Type as arrow::datatypes::ArrowPrimitiveType>::Native;
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
@@ -440,7 +442,19 @@ async fn float_key_lookups_return_the_rows_of_an_unindexed_table() {
     .cycle()
     .take(ROWS)
     .collect();
-    for (suffix, data_type) in [("f16", DataType::Float16), ("f32", DataType::Float32)] {
+    for ((suffix, data_type), (mode, config)) in [
+        ("f16", DataType::Float16),
+        ("f32", DataType::Float32),
+        ("f64", DataType::Float64),
+    ]
+    .into_iter()
+    .flat_map(|width| {
+        [
+            ("file", file_mode_config()),
+            ("memory", memory_mode_config()),
+        ]
+        .map(|mode| (width.clone(), mode))
+    }) {
         let keys: ArrayRef = match data_type {
             DataType::Float16 => Arc::new(
                 values
@@ -448,6 +462,7 @@ async fn float_key_lookups_return_the_rows_of_an_unindexed_table() {
                     .map(|v| v.map(F16::from_f64))
                     .collect::<PrimitiveArray<Float16Type>>(),
             ),
+            DataType::Float64 => Arc::new(values.iter().copied().collect::<Float64Array>()),
             #[expect(clippy::cast_possible_truncation, reason = "narrowed on purpose")]
             _ => Arc::new(
                 values
@@ -463,21 +478,20 @@ async fn float_key_lookups_return_the_rows_of_an_unindexed_table() {
         let ids = Int64Array::from_iter_values(0..i64::try_from(ROWS).expect("fits"));
         let batch =
             RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), keys]).expect("batch");
-        let (indexed_name, plain_name) = (format!("float_{suffix}"), format!("plain_{suffix}"));
-        let indexed = build_table(
+        let (indexed_name, plain_name) = (
+            format!("float_{suffix}_{mode}"),
+            format!("plain_{suffix}_{mode}"),
+        );
+        let indexed = open_table(
             &fixture,
             Arc::clone(&runtime_env),
-            &indexed_name,
-            Arc::clone(&schema),
-            Some(&["K"]),
+            TableSpec::new(&indexed_name, Arc::clone(&schema), &[&["K"]]).config(config.clone()),
         )
         .await;
-        let plain = build_table(
+        let plain = open_table(
             &fixture,
             Arc::clone(&runtime_env),
-            &plain_name,
-            schema,
-            None,
+            TableSpec::new(&plain_name, schema, &[]).config(config),
         )
         .await;
         overwrite(&indexed, vec![batch.clone()]).await;
@@ -507,7 +521,7 @@ async fn float_key_lookups_return_the_rows_of_an_unindexed_table() {
                     .await
                 ),
                 rendered(&query(&plain, &plain_name, &lookup.replace("{t}", &plain_name)).await),
-                "{data_type}: {lookup}"
+                "{data_type}, {mode} mode: {lookup}"
             );
         }
         let after = counters(&indexed);
@@ -515,7 +529,7 @@ async fn float_key_lookups_return_the_rows_of_an_unindexed_table() {
         assert_eq!(
             answered,
             probes.len() as u64,
-            "{data_type}: every lookup must be answered from the index: {before:?} -> {after:?}"
+            "{data_type}, {mode} mode: every lookup must be answered from the index: {before:?} -> {after:?}"
         );
     }
 }
