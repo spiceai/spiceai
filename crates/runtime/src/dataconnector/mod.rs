@@ -69,6 +69,7 @@ pub mod s3;
 // connector outside the runtime depends on that crate directly.
 pub(crate) mod schema_projection;
 pub mod sink;
+pub(crate) mod snapshot_source;
 // spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
 pub mod spiceai;
 

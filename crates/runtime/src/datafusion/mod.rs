@@ -624,7 +624,7 @@ fn validate_distributed_engine(
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
 /// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
-fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
+pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => Some(AccelerationEngine::DuckDB),
@@ -3148,10 +3148,16 @@ impl DataFusion {
             // snapshotting enabled, we delay readiness until the first refresh completes so that
             // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
             // Additionally, for CDC we let connector/stream to decide when dataset is ready.
+            //
+            // A dataset that reads snapshots (`file_format: snapshot`) is ready only once it
+            // has restored a snapshot in this process: a copy left from an earlier run can be
+            // arbitrarily old, or from a location the dataset no longer reads.
             let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
                 && dataset.time_column.is_some()
                 && acceleration_settings.snapshot_behavior.bootstrap_enabled()
-                || matches!(refresh_mode, RefreshMode::Changes);
+                || matches!(refresh_mode, RefreshMode::Changes)
+                || (dataset.is_snapshot_source()
+                    && bootstrap_status.loaded_snapshot_id().is_none());
 
             if !delay_initial_ready {
                 self.runtime_status
@@ -5780,6 +5786,17 @@ async fn build_snapshot_creation_config(
         tracing::warn!(
             dataset = %dataset.name,
             "Snapshot creation is disabled for this dataset: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
+        );
+        return Ok(None);
+    }
+
+    // Same gate as `snapshot_before_recreate`.
+    if acceleration_settings.uses_cayenne_datalake() {
+        tracing::warn!(
+            dataset = %dataset.name,
+            "Snapshot creation is disabled for dataset '{}': {}",
+            dataset.name,
+            runtime_acceleration::acceleration::CAYENNE_DATALAKE_SNAPSHOT_REASON
         );
         return Ok(None);
     }
