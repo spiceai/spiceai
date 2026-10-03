@@ -366,6 +366,73 @@ async fn snapshot_bootstrap_keeps_serving_during_path_change() {
     runtime.shutdown().await;
 }
 
+fn app_with_reader_path(fixture: &Fixture, file: &str) -> App {
+    let mut app = fixture.app(true, false);
+    app.datasets
+        .iter_mut()
+        .find(|dataset| dataset.name == "orders")
+        .expect("reader")
+        .acceleration
+        .as_mut()
+        .expect("acceleration")
+        .params = Some(Params::from_string_map(HashMap::from([(
+        "duckdb_file".to_string(),
+        fixture
+            .directory
+            .path()
+            .join(file)
+            .to_string_lossy()
+            .into_owned(),
+    )])));
+    app
+}
+
+/// A second path change arrives while the first replacement is still waiting for
+/// its snapshot. The reader that was serving before either change must keep
+/// serving until a replacement is restored.
+#[tokio::test]
+async fn snapshot_bootstrap_keeps_serving_during_consecutive_path_changes() {
+    let fixture = Fixture::new(BootstrapOnFailureBehavior::Warn);
+    let runtime = Arc::new(
+        Runtime::builder()
+            .with_app(fixture.app(true, false))
+            .build()
+            .await,
+    );
+    fixture.publish(&runtime).await;
+    Arc::clone(&runtime).load_datasets().await;
+    wait_for_count(&runtime, "orders", 1).await;
+    let snapshots = fixture.directory.path().join("snapshots");
+    let offline = fixture.directory.path().join("offline");
+    tokio::fs::rename(&snapshots, &offline)
+        .await
+        .expect("snapshot store unavailable");
+
+    for file in ["replacement.db", "replacement2.db"] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&runtime).apply_app(Arc::new(app_with_reader_path(&fixture, file))),
+        )
+        .await
+        .expect("path change must not wait for snapshot storage");
+        wait_for_count(&runtime, "orders", 1).await;
+    }
+    assert!(!fixture.directory.path().join("replacement2.db").exists());
+
+    tokio::fs::rename(&offline, &snapshots)
+        .await
+        .expect("snapshot store recovers");
+    assert!(
+        test_framework::utils::wait_until_true(Duration::from_secs(15), || async {
+            fixture.directory.path().join("replacement2.db").exists()
+        })
+        .await,
+        "the latest replacement must restore after storage recovers"
+    );
+    wait_for_count(&runtime, "orders", 1).await;
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn snapshot_bootstrap_removed_reader_does_not_register_after_publication() {
     let fixture = Fixture::new(BootstrapOnFailureBehavior::Warn);

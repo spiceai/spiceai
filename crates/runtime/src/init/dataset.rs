@@ -2329,7 +2329,12 @@ impl Runtime {
                 // restored and its provider can be registered in place.
             }
 
-            let serving = if still_loading.contains(&ds.name) {
+            // A snapshot reader keeps serving its table until the replacement snapshot
+            // has been restored, including when an earlier replacement was still
+            // waiting for its own: the superseded wait never registered anything, so
+            // the table is still the one that was serving before either change.
+            let pending = matches!(bootstrap_status, BootstrapStatus::Pending { .. });
+            let serving = if still_loading.contains(&ds.name) && !pending {
                 // A superseded attempt can be dropped after it registered the table
                 // and before its load completed.
                 if self.df.table_exists(&ds.name) {
@@ -2369,7 +2374,6 @@ impl Runtime {
             let runtime = Arc::clone(&self);
             let ds_clone = Arc::clone(ds);
             let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
-            let pending = matches!(bootstrap_status, BootstrapStatus::Pending { .. });
             let load = self.dataset_loads.begin(&ds.name);
             let load_future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
                 runtime
