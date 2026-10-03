@@ -17,7 +17,7 @@ limitations under the License.
 //! Which functions a remote backend must not be asked to evaluate.
 //!
 //! Federating a filter to a data source is only safe if that source can evaluate
-//! every function in it. Three sets of names are unsafe to push down:
+//! every function in it. Four sets of names are unsafe to push down:
 //!
 //! 1. **Spice functions** — the UDFs Spice defines (`bucket`, `cosine_distance`,
 //!    `rerank`, …) plus any the user registers. No remote source knows them, so
@@ -28,7 +28,13 @@ limitations under the License.
 //!    nested array/list/map functions relative to `PostgreSQL`. These are
 //!    allowed by default; only the backend knows which subset it lacks, so it
 //!    supplies them via [`FunctionSupportBuilder::deny_also`].
-//! 3. **`DataFusion` built-ins that describe the plan** — the
+//! 3. **The `DataFusion` cast built-ins** — [`DATAFUSION_CAST_BUILTINS`]
+//!    (`arrow_cast`, `cast_to_type`, …). The exception to set 2's default: they
+//!    are denied for every backend, because no source can be assumed to answer
+//!    them as `DataFusion` does. A source that is itself `DataFusion` (a
+//!    `FlightSQL` server, say) could, but nothing tells the connector that it is
+//!    talking to one, so these are kept local there too.
+//! 4. **`DataFusion` built-ins that describe the plan** — the
 //!    [`PLAN_INTROSPECTION_BUILTINS`] (`arrow_typeof`, …). No backend can
 //!    answer them, so every policy denies them and no carve-out re-admits them.
 //!
@@ -214,6 +220,25 @@ pub fn datafusion_nested_function_names() -> &'static [String] {
     &NAMES
 }
 
+/// `DataFusion`'s own cast built-ins: `arrow_cast(expr, 'LargeUtf8')` and
+/// `arrow_try_cast` cast to an Arrow type named by a string, `cast_to_type` and
+/// `try_cast_to_type` to the type of their second argument, and the `try_`
+/// forms answer NULL where the cast fails. Every [`FunctionSupportBuilder`]
+/// denies them, and no backend's native carve-out re-admits them, so they are
+/// evaluated above the federated scan by `DataFusion`'s cast kernel.
+///
+/// Most SQL engines define none of these names, so a federated call failed
+/// remotely as an unknown function (issue #14444). `DuckDB` does define a
+/// `cast_to_type`, but it casts by `DuckDB`'s rules rather than Arrow's —
+/// `cast_to_type(1.5, 1)` is `2` there and `1` locally — so federating it is not
+/// faithful either.
+pub const DATAFUSION_CAST_BUILTINS: &[&str] = &[
+    "arrow_cast",
+    "arrow_try_cast",
+    "cast_to_type",
+    "try_cast_to_type",
+];
+
 /// `DataFusion` built-ins that describe the *plan* rather than the data, so no
 /// backend can evaluate them faithfully and every [`FunctionSupportBuilder`]
 /// denies them: `arrow_typeof` answers with the plan's Arrow type, `arrow_field`
@@ -246,8 +271,9 @@ fn excluding_native(names: impl IntoIterator<Item = String>, native: &[&str]) ->
 /// Builds the [`FunctionSupport`] for one backend.
 ///
 /// Defaults to denying every Spice function (link-time set plus user-registered)
-/// and the [`PLAN_INTROSPECTION_BUILTINS`], and nothing else — correct for a
-/// source whose dialect rewrites none of the Spice functions.
+/// the [`DATAFUSION_CAST_BUILTINS`] and the [`PLAN_INTROSPECTION_BUILTINS`], and
+/// nothing else — correct for a source whose dialect rewrites none of the Spice
+/// functions.
 #[derive(Default)]
 pub struct FunctionSupportBuilder<'a> {
     native: &'a [&'a str],
@@ -297,24 +323,24 @@ impl<'a> FunctionSupportBuilder<'a> {
 
     /// The denied scalar-function names, in the order the deny-list is built:
     /// Spice functions minus the native carve-out, then user functions, then
-    /// any backend-specific additions, then the [`PLAN_INTROSPECTION_BUILTINS`],
-    /// which no carve-out reaches because no backend can evaluate them.
+    /// any backend-specific additions, then the [`DATAFUSION_CAST_BUILTINS`] and
+    /// the [`PLAN_INTROSPECTION_BUILTINS`], which no carve-out reaches because no
+    /// backend can evaluate them.
     #[must_use]
     pub fn denied_names(self) -> Vec<String> {
         let spice = excluding_native(spice_function_names(), self.native);
         let user = user_function_names();
-        let mut denied = Vec::with_capacity(
-            spice.len() + user.len() + self.deny_also.len() + PLAN_INTROSPECTION_BUILTINS.len(),
-        );
-        denied.extend(spice);
-        denied.extend(user);
-        denied.extend(self.deny_also);
-        denied.extend(
-            PLAN_INTROSPECTION_BUILTINS
-                .iter()
-                .map(|name| (*name).to_string()),
-        );
-        denied
+        spice
+            .into_iter()
+            .chain(user)
+            .chain(self.deny_also)
+            .chain(
+                DATAFUSION_CAST_BUILTINS
+                    .iter()
+                    .chain(PLAN_INTROSPECTION_BUILTINS)
+                    .map(|name| (*name).to_string()),
+            )
+            .collect()
     }
 
     /// The [`FunctionSupport`] to hand a federated provider or table-provider
@@ -360,16 +386,16 @@ impl<'a> FunctionSupportBuilder<'a> {
 }
 
 /// The [`FunctionSupport`] for a backend that evaluates no Spice function and
-/// every `DataFusion` built-in except the [`PLAN_INTROSPECTION_BUILTINS`] — the
-/// conservative default.
+/// every `DataFusion` built-in except the [`DATAFUSION_CAST_BUILTINS`] and the
+/// [`PLAN_INTROSPECTION_BUILTINS`] — the conservative default.
 #[must_use]
 pub fn function_support() -> FunctionSupport {
     FunctionSupportBuilder::new().build()
 }
 
 /// The functions no remote source may be asked to evaluate: every Spice
-/// function, every user-registered one, and the
-/// [`PLAN_INTROSPECTION_BUILTINS`]. Safe to call from per-query filter
+/// function, every user-registered one, the [`DATAFUSION_CAST_BUILTINS`], and
+/// the [`PLAN_INTROSPECTION_BUILTINS`]. Safe to call from per-query filter
 /// pushdown paths.
 #[must_use]
 pub fn deny_spice_specific_functions() -> std::sync::Arc<FunctionSupport> {
@@ -377,7 +403,8 @@ pub fn deny_spice_specific_functions() -> std::sync::Arc<FunctionSupport> {
 }
 
 /// As [`deny_spice_specific_functions`], but allowing the functions the target
-/// backend evaluates itself.
+/// backend evaluates itself. The [`DATAFUSION_CAST_BUILTINS`] and the
+/// [`PLAN_INTROSPECTION_BUILTINS`] stay denied.
 ///
 /// `native` is normally that backend's unparser dialect's native-function names,
 /// which is how the deny-list becomes backend-aware: a Spice function the
@@ -389,8 +416,10 @@ pub fn deny_spice_specific_functions_excluding(native: &[&str]) -> std::sync::Ar
     std::sync::Arc::new(FunctionSupportBuilder::new().native(native).build())
 }
 
-/// Full deny-list as a value, for any SQL connector whose unparser dialect has
-/// no Spice-function carve-out. See issue #10703.
+/// Full deny-list as a value — every Spice function, every user-registered one,
+/// the [`DATAFUSION_CAST_BUILTINS`] and the [`PLAN_INTROSPECTION_BUILTINS`] — for
+/// any SQL connector whose unparser dialect has no Spice-function carve-out. See
+/// issue #10703.
 #[must_use]
 pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new().build()
@@ -488,6 +517,42 @@ mod tests {
             support.supports(&call("some_remote_fn_udfs_api", 1), None),
             "the deny-list must not refuse a name it has no reason to"
         );
+    }
+
+    /// Regression test for #14444: each name in [`DATAFUSION_CAST_BUILTINS`] is
+    /// the canonical name of a `DataFusion` built-in whose every alias is listed
+    /// too — so a rename cannot leave the real function federating — and a call
+    /// of it is refused even by a backend that claims the name as native.
+    #[test]
+    fn a_datafusion_cast_builtin_is_denied_whatever_the_backend_carves_out() {
+        let state = util::session_state::session_context().state();
+        let support = FunctionSupportBuilder::new()
+            .native(DATAFUSION_CAST_BUILTINS)
+            .build();
+
+        for name in DATAFUSION_CAST_BUILTINS {
+            let builtin = state
+                .scalar_functions()
+                .get(*name)
+                .unwrap_or_else(|| panic!("{name} must be a DataFusion built-in"));
+            for alias in builtin.aliases() {
+                assert!(
+                    DATAFUSION_CAST_BUILTINS.contains(&alias.as_str()),
+                    "{name}'s alias {alias} must be denied alongside it"
+                );
+            }
+            let cast = Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::clone(builtin),
+                vec![
+                    Expr::Literal(ScalarValue::from(1_i64), None),
+                    Expr::Literal(ScalarValue::from("LargeUtf8"), None),
+                ],
+            ));
+            assert!(
+                !support.supports(&cast, None),
+                "{name} must not federate, whatever the backend carves out"
+            );
+        }
     }
 
     /// A built-in that describes the plan is denied by every builder, and a

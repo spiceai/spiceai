@@ -109,7 +109,11 @@ Omitting `mode` on a Cayenne dataset therefore selects fully in-RAM Cayenne. Set
   configuration error). A per-table hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`;
   default unbounded) is enforced as a structured error during buffering; peak checks
   count **resident + incoming** even for overwrite, because the old tier stays live
-  until the atomic replace. S3 Express / `cayenne_file_path` params are ignored in
+  until the atomic replace. Bytes are the batches' resident memory with each Arrow
+  allocation counted once (`RetainedBytes`), not `get_array_memory_size()`, which
+  bills a batch decoded from Arrow IPC once per buffer sharing its message body — a
+  multiple of its real size equal to its buffer count. The per-table cap, the process-global `MemTierBudget` and its query-pool mirror all
+  charge this figure. S3 Express / `cayenne_file_path` params are ignored in
   this mode (no object store is built).
 
 Source: acceleration `mode` → `!is_file_accelerated()` in
@@ -1084,7 +1088,7 @@ Compaction bounds read amplification by consolidating small Vortex files into ta
 
 ```mermaid
 flowchart TB
-    TRIG{"Trigger"} -->|"post-write (best-effort, AcqRel dedup)"| PICK
+    TRIG{"Trigger"} -->|"post-write (one pass per table; a mid-pass request re-runs it)"| PICK
     TRIG -->|"per-table background compactor (shared semaphore)"| PICK
     TRIG -->|"inline flush (cumulative gate)"| FLUSH["drain cayenne_inlined_data → Vortex file"]
 
@@ -1096,6 +1100,8 @@ flowchart TB
     REWRITE --> COMMIT["atomic snapshot-pointer flip (commit_compaction, subset: set_current_snapshot)<br/>old dir retired + swept"]
     FLUSH --> FPUB["under listing fence: publish new protected snapshot (PK) / write current dir (no PK), clear inline rows"]
 ```
+
+**A post-write request raised during a pass is recorded, not dropped.** At most one post-write pass runs per table. A write that asks for one while it runs marks the pass dirty, and the pass re-checks its trigger before it exits (spiceai/spiceai#13906). That write is usually the append that made the running pass abort on a concurrent change; dropping it left the aborted seed unconsolidated until the next write or background tick, and permanently on a table whose `compaction_background_interval_ms` is 0.
 
 Compaction runs only for tables that accumulate files. A **bulk-overwrite** table (`refresh_mode: full`) gets `compaction_background_interval_ms = 0` and so never spawns a background compactor at all: its refresh publishes a fresh snapshot and `update_current_snapshot_id` resets the small-file counter, it never creates a protected snapshot, and its deletion index stays empty — so every trigger would early-out anyway. An operator who mixes in-place writes with full refreshes can set the interval explicitly to turn it back on. That is also why such a table has to establish its own order. Compaction is the only other path that sorts, so with it off a configured `cayenne_sort_columns` would never reach the data: the snapshot would keep arrival order however the column is set, every file's zone maps would span the whole key range, and a selective scan would prune nothing. `begin_overwrite` therefore orders the replacement stream before writing it and pins the encode to one writer, which costs a single-writer sort of the whole table on every refresh — the price of the pruning it buys, and paid only by a table that asks for the order.
 
@@ -1707,7 +1713,7 @@ The three are only interpretable together. Bytes alone cannot distinguish an **e
   Both are emitted on every tick whose `try_lock` on the cache succeeds (a busy cache skips them along with its shape) and **zeroed when that cache holds no bloom**, not skipped. A skipped gauge keeps its last value, so a cache that rebuilt an exact index would go on reporting the density of a filter that no longer exists — and a stale over-allocation reads exactly like a live one. A live bloom always allocates bits, so zero here unambiguously means "no bloom", which `cayenne_pk_index_format` states independently.
 - `cayenne_pk_bloom_split_rows_total{table, result}` — apply rows the filter split: `miss` rows skip on-conflict validation entirely, `hit` rows are validated. This is the filter's return on its resident bytes, stated directly.
 
-`cayenne_write_shape_shards{table, decision}` reports the encode fan-out a write resolved to together with the branch that chose it — `serial_sort_columns`, `serial_required`, `size_bounded`, `concurrency_bounded`. The shard count alone cannot be acted on: a fan-out of 1 from a configured write concurrency is a knob to raise, while one from a sort order is structural and no knob reaches it.
+`cayenne_write_shape_shards{table, decision}` reports the encode fan-out a write resolved to together with the branch that chose it — `serial_sort_columns`, `serial_required`, `size_bounded`, `concurrency_bounded`. The shard count alone cannot be acted on: a fan-out of 1 from a configured write concurrency is a knob to raise, while one from a sort order is structural and no knob reaches it. The size the `size_bounded` branch divides is the write's **resident** Arrow bytes, each physical allocation counted once (`RetainedBytes`). A checkpoint's corpus can arrive as Arrow IPC, where every buffer of a message points into one body allocation: the inline memtable always does (it is decoded out of the metastore's blobs), and so does an unsharded RAM CDC tier fed over Flight, which retains the batches as the source handed them. A sharded tier (`cdc_mem_tier_shards` > 1) does not: the PK-shard split rebuilds every column into fresh allocations, so only its inline corpus carries the shared body. Billing that allocation once per buffer over-counts a flush by its buffer count and fans a write smaller than one target file out to the concurrency ceiling, leaving compaction that many files to fold.
 
 ## A note on resolution
 

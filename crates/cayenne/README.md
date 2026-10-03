@@ -396,7 +396,7 @@ pub struct CayenneTableProvider {
     new_files_since_last_compaction: Arc<AtomicUsize>,
     staging_wal_present: Arc<AtomicBool>,
     staging_may_have_files: Arc<AtomicBool>,
-    post_write_compaction_scheduled: Arc<AtomicBool>,
+    post_write_compaction_state: Arc<AtomicU8>,
     post_write_maintenance: Arc<PostWriteMaintenance>,
     background_compactor: Arc<OnceLock<BackgroundCompactor>>,
 }
@@ -469,7 +469,7 @@ Snapshots of a Cayenne dataset are taken using a **per-dataset metastore slice**
 
 `import_dataset` runs inside a single `BEGIN IMMEDIATE` transaction; FK `ON DELETE CASCADE` clears any prior dependent rows when the existing `cayenne_table` row is deleted.
 
-The runtime engine (`CayenneSnapshotEngine`) excludes `cayenne.db`, `cayenne.db-wal`, and `cayenne.db-shm` from the tar; it inserts the slice at the well-known archive path `metadata/<dataset_name>.slice.json`. This avoids the path-portability, multi-dataset clobbering, and init-race / sidecar problems that motivated the design.
+The runtime engine (`CayenneSnapshotEngine`) excludes `cayenne.db`, `cayenne.db-wal`, and `cayenne.db-shm` from the tar; it inserts the slice at the well-known archive path `metadata/<dataset_name>.slice.json`. This avoids the path-portability, multi-dataset clobbering, and init-race / sidecar problems that motivated the design. Of the data directory it archives only what the slice references — the current and protected snapshot directories and the `deletions/` directories they use. Retired snapshot directories, staging state, and the `deletions/` directories of unreferenced snapshots are skipped: maintenance removes them while the archive is being written, and the reader never needs them.
 
 ### 9. Catalog provider (`catalog_provider.rs`)
 
