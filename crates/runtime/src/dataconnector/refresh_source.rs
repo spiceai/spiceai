@@ -100,15 +100,22 @@ const SOURCE_RETRY_REPORT_INTERVAL: std::time::Duration = std::time::Duration::f
 
 /// A [`RefreshSource`] for a dataset served from its existing acceleration while
 /// its source is unavailable, which reports the failed attempts to reach the
-/// source: a warning at most every [`SOURCE_RETRY_REPORT_INTERVAL`], and for a
-/// configuration error (rejected credentials, TLS), which no retry clears, an
-/// error and the dataset's status set to `Error`. Queries keep being served from
-/// the acceleration either way.
+/// source: the dataset's status is `Error`, with a message saying it is still
+/// served, until an attempt succeeds, and each failure is logged at most every
+/// [`SOURCE_RETRY_REPORT_INTERVAL`] — as an error for a configuration error
+/// (rejected credentials, TLS), which no retry clears, and a warning otherwise.
+/// Queries keep being served from the acceleration either way.
+///
+/// The status is set on every failure, not only when a report is due, so a status
+/// written over it (such as registration's) is restored by the next attempt.
 pub(crate) struct ReportingRefreshSource {
     inner: Arc<dyn RefreshSource>,
     dataset: Arc<Dataset>,
     status: Arc<crate::status::RuntimeStatus>,
     last_report: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Whether the dataset's status is an `Error` this source set, to clear once the
+    /// source is reached.
+    status_is_error: std::sync::atomic::AtomicBool,
 }
 
 impl ReportingRefreshSource {
@@ -126,6 +133,7 @@ impl ReportingRefreshSource {
             dataset,
             status,
             last_report: parking_lot::Mutex::new(already_reported.then(std::time::Instant::now)),
+            status_is_error: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -133,23 +141,34 @@ impl ReportingRefreshSource {
         let configuration_error = err
             .downcast_ref::<crate::dataconnector::DataConnectorError>()
             .is_some_and(|err| !err.is_retriable());
-        if configuration_error {
-            let message = source_configuration_error(&self.dataset.name, &err.to_string());
-            self.status.update_dataset(
-                &self.dataset.name,
-                crate::status::ComponentStatus::error_with_message(message.clone()),
-            );
-            if self.due() {
+        let message = if configuration_error {
+            source_configuration_error(&self.dataset.name, &err.to_string())
+        } else {
+            super::reconnecting::unreachable_source_warning(&self.dataset.name, &err.to_string())
+        };
+        self.status.update_dataset(
+            &self.dataset.name,
+            crate::status::ComponentStatus::error_with_message(message.clone()),
+        );
+        self.status_is_error
+            .store(true, std::sync::atomic::Ordering::Release);
+        if self.due() {
+            if configuration_error {
                 tracing::error!("{message}");
+            } else {
+                tracing::warn!("{message}");
             }
-        } else if self.due() {
-            tracing::warn!(
-                "{}",
-                super::reconnecting::unreachable_source_warning(
-                    &self.dataset.name,
-                    &err.to_string()
-                )
-            );
+        }
+    }
+
+    /// Clears the `Error` this source set once the source has been reached.
+    fn reached(&self) {
+        if self
+            .status_is_error
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.status
+                .update_dataset(&self.dataset.name, crate::status::ComponentStatus::Ready);
         }
     }
 
@@ -180,8 +199,9 @@ impl RefreshSource for ReportingRefreshSource {
 
     async fn read_provider(&self) -> Result<Arc<dyn TableProvider>, RefreshSourceError> {
         let result = self.inner.read_provider().await;
-        if let Err(err) = &result {
-            self.report(err);
+        match &result {
+            Ok(_) => self.reached(),
+            Err(err) => self.report(err),
         }
         result
     }

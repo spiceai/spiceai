@@ -569,6 +569,21 @@ mod served_from_acceleration {
         wait_until_true(within, || async { sum_and_count(rt).await == Some((3, 3)) }).await
     }
 
+    /// Whether the dataset reports `Error` while saying it is still served from its
+    /// acceleration.
+    async fn reports_served_error(rt: &Arc<Runtime>) -> bool {
+        wait_until_true(Duration::from_secs(10), || async {
+            matches!(
+                dataset_status(rt, "orders"),
+                Some(ComponentStatus::Error(message))
+                    if message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("Serving data from the existing acceleration"))
+            )
+        })
+        .await
+    }
+
     async fn refreshed_from_source(rt: &Arc<Runtime>) -> bool {
         wait_until_true(Duration::from_secs(30), || async {
             sum_and_count(rt).await == Some((6, 3))
@@ -601,12 +616,29 @@ mod served_from_acceleration {
             rt.status().is_ready(),
             "on_load is ready once the existing acceleration can serve"
         );
+        assert!(
+            reports_served_error(&rt).await,
+            "a source that cannot be reached sets Error, saying the dataset is still served ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            rt.status().is_ready(),
+            "a served dataset in Error stays ready"
+        );
 
         source.bring_up();
         assert!(
             refreshed_from_source(&rt).await,
             "the refresh must bring the data up to date once the source is back, got {:?} ({:?})",
             sum_and_count(&rt).await,
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            !matches!(
+                dataset_status(&rt, "orders"),
+                Some(ComponentStatus::Error(_))
+            ),
+            "the Error clears once the source is reached ({:?})",
             dataset_status(&rt, "orders")
         );
         stop(rt, loader).await;
@@ -767,11 +799,11 @@ mod served_from_acceleration {
         Ok(())
     }
 
-    /// Under `ready_state: on_schema_resolved` with no refresh due, the dataset
-    /// reports `Initializing` while its source is down, not `Refreshing`: it is
-    /// served from its acceleration, and nothing is refreshing.
+    /// Under `ready_state: on_schema_resolved` with no refresh due, a source that cannot
+    /// be reached sets `Error`, saying the dataset is still served, not `Refreshing`
+    /// (nothing is refreshing), and the dataset is `Ready` once its source is reached.
     #[tokio::test]
-    async fn on_schema_resolved_reports_initializing_until_the_source_is_reached()
+    async fn on_schema_resolved_reports_error_until_the_source_is_reached()
     -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));
         let fixture = Fixture::new("initializing-while-down").await?;
@@ -787,10 +819,14 @@ mod served_from_acceleration {
             "queries must be answered from the existing acceleration, got {:?}",
             sum_and_count(&rt).await
         );
-        assert_eq!(
-            dataset_status(&rt, "orders"),
-            Some(ComponentStatus::Initializing),
-            "with no refresh due, the dataset is initializing until its source is reached"
+        assert!(
+            reports_served_error(&rt).await,
+            "with no refresh due, a source that cannot be reached sets Error, not Refreshing ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            !rt.status().is_ready(),
+            "on_schema_resolved waits for the source"
         );
 
         source.bring_up();
