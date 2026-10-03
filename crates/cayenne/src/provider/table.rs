@@ -9430,14 +9430,25 @@ impl CayenneTableProvider {
         let Ok(store) = self.context.runtime_env().object_store(&url) else {
             return;
         };
-        let live = {
+        // The files a reader sees: the current snapshot's and the protected
+        // snapshots', whose runs persist like any other.
+        let live: Vec<String> = {
             let _fence = self.listing_fence.read().await;
             let snapshot_id = self.get_current_snapshot_id();
-            match self.capture_warm_files(&snapshot_id).await {
-                Ok(files) => files
+            let protected_map = self.protected_snapshots.load_full();
+            let listed = match self.capture_warm_files(&snapshot_id).await {
+                Ok(files) => self
+                    .lookup_index_protected_files(&protected_map)
+                    .await
+                    .map(|(_, protected)| (files, protected)),
+                Err(error) => Err(error),
+            };
+            match listed {
+                Ok((files, protected)) => files
                     .files
                     .iter()
                     .map(|file| file.object_meta.location.to_string())
+                    .chain(protected)
                     .collect(),
                 Err(error) => {
                     tracing::debug!(table = %self.table_metadata.table_name, %error, "Persisted secondary index runs were not loaded: the table's files could not be listed");
