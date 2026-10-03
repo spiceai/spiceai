@@ -56,6 +56,20 @@ pub struct DatasetInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 
+    /// When the dataset's last successful refresh completed (RFC 3339), read from its
+    /// acceleration's checkpoint at startup. Only included when `status=true`, for an
+    /// accelerated dataset that has been refreshed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_refresh: Option<String>,
+
+    /// When the dataset's next scheduled refresh is due (RFC 3339): `last_refresh` plus
+    /// `refresh_check_interval` (and jitter), or the first `refresh_cron` time after
+    /// `last_refresh`. It stays at that time, in the past, until a refresh completes.
+    /// Only included when `status=true`, for an accelerated dataset with a refresh
+    /// schedule.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub next_refresh: Option<String>,
+
     /// Custom properties for the dataset
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub properties: HashMap<String, serde_json::Value>,
