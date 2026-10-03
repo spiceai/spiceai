@@ -1158,3 +1158,33 @@ async fn a_refresh_cut_into_many_key_ranges_keeps_the_last_copy_of_every_key() {
     }
     super::super::super::overwrite_postpass::TEST_CHUNK_ROWS.store(0, Ordering::Relaxed);
 }
+
+/// A staged append — the path dual-write takes for a user's `INSERT` — refuses a
+/// table with a primary key in either deletion mode, so it never reaches the
+/// repeated-key resolution a refresh runs: a user statement through dual-write
+/// cannot take refresh semantics. A staged append that started accepting keyed
+/// tables would need to keep statement semantics; this test would fail first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_append_refuses_a_keyed_table() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        assert!(provider.key_resolver().expect("resolver").is_some());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema(),
+            futures::stream::iter(
+                vec![batch(&[(1, "a"), (2, "a")]), batch(&[(1, "b")])]
+                    .into_iter()
+                    .map(Ok),
+            ),
+        ));
+        let Err(error) = provider.begin_staged_append(stream, 1).await else {
+            panic!("{mode:?}: a staged append into a keyed table must be refused");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("staged append for Cayenne tables with primary-key deletion handling"),
+            "{mode:?}: {error}"
+        );
+    }
+}
