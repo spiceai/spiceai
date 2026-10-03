@@ -96,7 +96,7 @@ pub use session::SessionStore;
 /// keepalive heartbeat. Write-through forwarding tasks send these periodically
 /// to prevent the executor's `DoPut` idle timeout from firing on streams that
 /// receive data in bursts with long idle gaps between them.
-pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout};
+pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout, keepalive};
 
 pub struct Service {
     data_update_broadcaster: DataUpdateBroadcaster,
@@ -1059,7 +1059,11 @@ pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to register parquet file: {source}"))]
-    RegisterParquet { source: crate::datafusion::Error },
+    RegisterParquet {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(crate::datafusion::Error, Box::new)))]
+        source: Box<crate::datafusion::Error>,
+    },
 
     #[snafu(display("{source}"))]
     DataFusion {

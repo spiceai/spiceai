@@ -15,6 +15,14 @@ name: Verus Verification
 # hit. Prefix-unambiguity of `[tag][id.len() LE][id]` is a Verus postcondition
 # discharged for every `(tag, id, payload)` triple.
 #
+# `crates/key-index/src/escape_proof.rs`: each column's key encoding is
+# prefix-free for every input, so concatenating a compound key's columns adds
+# no collisions: key tuples whose columns encode differently never encode to
+# the same bytes. Which values one column's encoding tells apart is the
+# encoder's choice (floats give `-0.0` and `0.0`, and every NaN, one encoding
+# each). A lookup can still return another key's rows, because a wide key is
+# indexed by a 64-bit hash of those bytes; the query's own filter drops them.
+#
 # `crates/sharded-cache/src/layout.rs`: both array indices the results cache
 # derives from a key — the shard, and the `TinyLFU` counter cell — subscript
 # fixed-size arrays under the shard lock, so an out-of-range result is a panic
@@ -81,13 +89,13 @@ env:
   # The verifier and its specification library ship together and are versioned
   # together, so these move as a set. VERUS_VSTD_VERSION must match the `vstd`
   # pin in every crate that opted into verification (`crates/hash-index`,
-  # `crates/cache` and `crates/sharded-cache` today), and VERUS_SHA256 pins the
-  # exact bytes of the archive: a release tag names an asset, it does not fix
+  # `crates/cache`, `crates/key-index` and `crates/sharded-cache` today), and
+  # VERUS_SHA256 pins the exact bytes of the archive: a release tag names an asset, it does not fix
   # its contents, and this job executes what it downloads.
-  VERUS_RELEASE: release/0.2026.08.30.b432e82
-  VERUS_ASSET: verus-0.2026.08.30.b432e82-x86-linux.zip
-  VERUS_SHA256: 067f5f72a457fe66b77c0c10b180f2a919a9c7481a8baa024ffc716aa931a41b
-  VERUS_VSTD_VERSION: 0.0.0-2026-08-30-0159
+  VERUS_RELEASE: release/0.2026.09.27.3cf1832
+  VERUS_ASSET: verus-0.2026.09.27.3cf1832-x86-linux.zip
+  VERUS_SHA256: 43814031e10df043221d83c7fa842e3ebd662cb7b0090fc1eb4d7a8673226978
+  VERUS_VSTD_VERSION: 0.0.0-2026-09-20-0158
 
 jobs:
   verus-verify:
@@ -131,6 +139,7 @@ jobs:
             code_changes:
               - 'crates/hash-index/**'
               - 'crates/cache/**'
+              - 'crates/key-index/**'
               - 'crates/sharded-cache/**'
               # The verifier is a rustc driver bound to one toolchain, so a
               # workspace toolchain bump can invalidate this gate without
@@ -189,7 +198,7 @@ jobs:
         run: |
           set -euo pipefail
           for manifest in crates/hash-index/Cargo.toml crates/cache/Cargo.toml \
-                          crates/sharded-cache/Cargo.toml; do
+                          crates/key-index/Cargo.toml crates/sharded-cache/Cargo.toml; do
             pinned=$(grep -oP 'vstd = "=\K[^"]+' "$manifest")
             if [ "$pinned" != "$VERUS_VSTD_VERSION" ]; then
               echo "::error::vstd pin in $manifest is '$pinned'," \
@@ -282,7 +291,7 @@ jobs:
           # checked here, in this one job. A crate missing from this loop is
           # a proof CI never sees. A second job per crate would be a second
           # required check — do not split the loop out.
-          for crate_dir in crates/hash-index crates/cache crates/sharded-cache; do
+          for crate_dir in crates/hash-index crates/cache crates/key-index crates/sharded-cache; do
             crate_name=$(basename "$crate_dir")
             (
               cd "$crate_dir"

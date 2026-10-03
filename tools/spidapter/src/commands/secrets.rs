@@ -97,7 +97,7 @@ fn include_scheduler_state_location_aws_secrets(
     spicepod_yaml: &str,
     secret_refs: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
-    if !scheduler_state_location_uses_s3(spicepod_yaml) {
+    if !runtime_state_uses_s3(spicepod_yaml) {
         return;
     }
 
@@ -118,19 +118,33 @@ fn include_scheduler_state_location_aws_secrets(
     }
 }
 
-fn scheduler_state_location_uses_s3(spicepod_yaml: &str) -> bool {
+fn runtime_state_uses_s3(spicepod_yaml: &str) -> bool {
     let spicepod: SpicepodDefinition = match yaml::from_str(spicepod_yaml) {
         Ok(spicepod) => spicepod,
         Err(_) => return false,
     };
 
-    spicepod.runtime.scheduler.is_some_and(|scheduler| {
-        let state_location = scheduler.state_location.trim();
-        if state_location.is_empty() {
-            return false;
-        }
-
-        Url::parse(state_location).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("s3"))
+    let locations = [
+        spicepod
+            .runtime
+            .state
+            .as_ref()
+            .map(|state| state.location.as_str()),
+        spicepod
+            .runtime
+            .scheduler
+            .as_ref()
+            .and_then(|scheduler| scheduler.state_location.as_deref()),
+        spicepod
+            .runtime
+            .source_rate_control
+            .as_ref()
+            .and_then(|rate_control| rate_control.state_location.as_deref()),
+    ];
+    locations.into_iter().flatten().any(|location| {
+        let location = location.trim();
+        !location.is_empty()
+            && Url::parse(location).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("s3"))
     })
 }
 
@@ -160,6 +174,15 @@ kind: Spicepod
 runtime:
     scheduler:
         state_location: file:///tmp/state
+";
+
+    const RUNTIME_STATE_SPICEPOD_YAML: &str = "
+name: test
+version: v2
+kind: Spicepod
+runtime:
+  state:
+    location: s3://bucket/spice-state
 ";
 
     fn env_set() -> BTreeSet<String> {
@@ -195,6 +218,16 @@ runtime:
         );
 
         assert!(secret_refs.is_empty());
+    }
+
+    #[test]
+    fn includes_required_aws_secrets_when_runtime_state_location_is_s3() {
+        let mut secret_refs = BTreeMap::new();
+
+        include_scheduler_state_location_aws_secrets(RUNTIME_STATE_SPICEPOD_YAML, &mut secret_refs);
+
+        assert_eq!(secret_refs.get(AWS_ACCESS_KEY_ID), Some(&env_set()));
+        assert_eq!(secret_refs.get(AWS_SECRET_ACCESS_KEY), Some(&env_set()));
     }
 
     #[test]

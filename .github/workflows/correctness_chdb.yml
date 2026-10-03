@@ -34,26 +34,23 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
-  # Report the required job name on pull requests without running the lane; the
-  # real check runs against the merge-group commit, as the other engine lanes do.
+  # On a pull request both jobs are skipped at the job level, so the check is
+  # published under its name as `skipped` rather than a `success` nothing ran
+  # for (#13841); the merge-group commit is what runs the lane, as the other
+  # engine lanes do.
   check_changes:
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: spiceai-dev-runners
     timeout-minutes: 45
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - name: Pull request passthrough
-        if: ${{ github.event_name == 'pull_request' }}
-        run: echo "chDB result-correctness runs on the merge-group commit"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ github.event_name != 'pull_request' }}
         with:
           persist-credentials: false
           fetch-depth: 0
 
       - name: Check for code changes
-        if: ${{ github.event_name != 'pull_request' }}
         id: check
         uses: ./.github/actions/check-code-changes
 
@@ -61,12 +58,9 @@ jobs:
     name: chDB Result Correctness
     needs: check_changes
     timeout-minutes: 90
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: spiceai-dev-runners
     steps:
-      - name: Pull request passthrough
-        if: ${{ github.event_name == 'pull_request' }}
-        run: echo "chDB result-correctness runs on the merge-group commit"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:

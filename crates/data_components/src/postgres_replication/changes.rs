@@ -1976,7 +1976,7 @@ fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, String> {
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
     let bytes = hex.as_bytes();
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let h = hex_digit(pair[0])?;
         let l = hex_digit(pair[1])?;
         out.push((h << 4) | l);
