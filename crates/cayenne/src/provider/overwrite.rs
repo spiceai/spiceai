@@ -811,11 +811,7 @@ impl CayenneTableProvider {
                     if let Some(within) = &batch_superseded {
                         counts.add(&within.lock());
                     }
-                    if let Some(report) = &self.superseded_report
-                        && !counts.is_empty()
-                    {
-                        report.superseded(&counts);
-                    }
+                    self.report_superseded(&counts);
                     match file_stats.as_deref() {
                         Some(file_stats) if !superseded.is_empty() => {
                             let stats = self

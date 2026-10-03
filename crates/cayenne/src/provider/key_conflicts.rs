@@ -122,6 +122,34 @@ pub(crate) struct ResolvedBatch {
     pub(crate) digests: Vec<u128>,
 }
 
+/// A batch with each row's version: its time (UTC nanoseconds) and content hash.
+pub(crate) struct VersionedBatch {
+    pub(crate) batch: RecordBatch,
+    pub(crate) times: arrow::array::Int64Array,
+    pub(crate) hashes: arrow::array::UInt64Array,
+}
+
+impl VersionedBatch {
+    /// This batch and its versions, keeping the rows `keep` selects.
+    fn filter(self, keep: &BooleanArray) -> Result<Self> {
+        if keep.true_count() == keep.len() {
+            return Ok(self);
+        }
+        let filter = |array: &dyn arrow::array::Array| arrow::compute::filter(array, keep);
+        Ok(Self {
+            batch: filter_record_batch(&self.batch, keep)?,
+            times: arrow::array::AsArray::as_primitive::<arrow::datatypes::Int64Type>(
+                filter(&self.times)?.as_ref(),
+            )
+            .clone(),
+            hashes: arrow::array::AsArray::as_primitive::<arrow::datatypes::UInt64Type>(
+                filter(&self.hashes)?.as_ref(),
+            )
+            .clone(),
+        })
+    }
+}
+
 /// Resolves repeated primary keys for one table under one [`ConflictPolicy`].
 pub(crate) struct KeyResolver {
     table_name: Arc<str>,
@@ -359,6 +387,81 @@ impl KeyResolver {
             .map(|&index| Arc::clone(batch.column(index)))
             .collect();
         Ok(self.keys.convert_columns(&columns)?)
+    }
+
+    /// Resolve the keys `batches` repeat by row version rather than arrival: each key
+    /// keeps its copy with the greatest `(time, hash)` (each batch's own `times` and
+    /// `hashes`), the later copy on an equal one, and every other copy is counted.
+    /// Every batch comes back, filtered to its kept rows in their order, with its
+    /// versions filtered alike. Only for the upsert policies, where a later version
+    /// replaces an earlier one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a primary key is null, or under `drop`.
+    pub(crate) fn resolve_by_version(
+        &self,
+        batches: Vec<VersionedBatch>,
+    ) -> Result<(Vec<VersionedBatch>, util::session_state::SupersededCounts)> {
+        if !self.policy.last_batch_wins() {
+            return Err(Error::Internal {
+                table: self.table_name.to_string(),
+                message: "row versions order the copies of a key only under upsert".to_string(),
+            });
+        }
+        let mut digests = Vec::with_capacity(batches.len());
+        for versioned in &batches {
+            if self.has_null_key(&versioned.batch) {
+                return Err(Error::DataValidation {
+                    table: self.table_name.to_string(),
+                    message: null_primary_key_message(&versioned.batch, &self.primary_key),
+                });
+            }
+            digests.push(self.digests(&versioned.batch)?);
+        }
+        let rows: usize = digests.iter().map(Vec::len).sum();
+        let version = |(index, row): (usize, usize)| {
+            let versioned = &batches[index];
+            (versioned.times.value(row), versioned.hashes.value(row))
+        };
+        let mut kept: HashMap<u128, (usize, usize), PrehashedBuildHasher> =
+            HashMap::with_capacity_and_hasher(rows, PrehashedBuildHasher);
+        let mut counts = util::session_state::SupersededCounts::default();
+        for (index, batch_digests) in digests.iter().enumerate() {
+            for (row, &digest) in batch_digests.iter().enumerate() {
+                match kept.entry(digest) {
+                    Entry::Vacant(entry) => {
+                        entry.insert((index, row));
+                    }
+                    Entry::Occupied(mut entry) => {
+                        let (copy, current) = (version((index, row)), version(*entry.get()));
+                        if copy >= current {
+                            counts.count(current, copy);
+                            entry.insert((index, row));
+                        } else {
+                            counts.count(copy, current);
+                        }
+                    }
+                }
+            }
+        }
+        if counts.is_empty() {
+            return Ok((batches, counts));
+        }
+        let resolved = batches
+            .into_iter()
+            .zip(&digests)
+            .enumerate()
+            .map(|(index, (versioned, batch_digests))| {
+                let keep: BooleanArray = batch_digests
+                    .iter()
+                    .enumerate()
+                    .map(|(row, digest)| Some(kept.get(digest) == Some(&(index, row))))
+                    .collect();
+                versioned.filter(&keep)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((resolved, counts))
     }
 
     pub(crate) fn digests(&self, batch: &RecordBatch) -> Result<Vec<u128>> {

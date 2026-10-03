@@ -26,7 +26,10 @@ use crate::accelerated::snapshots::SnapshotRefreshState;
 use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
-use crate::accelerated::{AcceleratedTable, Retention, refresh::Refresh};
+use crate::accelerated::{
+    AcceleratedTable, Retention,
+    refresh::{Refresh, UpsertDedupByTimeColumn},
+};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
@@ -3178,15 +3181,20 @@ impl DataFusion {
             refresh = refresh.append_overlap(append_overlap);
         }
         refresh = refresh.upsert_dedup_by_time_column(
-            acceleration_settings.upsert_dedup_by_time_column.is_some(),
-        );
-        // An unpartitioned file-mode Cayenne table resolves a full refresh's
-        // repeated keys after writing them, ordered by the row versions the refresh
-        // supplies.
-        refresh = refresh.versions_resolved_after_write(
-            acceleration_settings.engine == Engine::Cayenne
-                && acceleration_settings.mode == Mode::File
-                && acceleration_settings.partition_by.is_empty(),
+            acceleration_settings
+                .upsert_dedup_by_time_column
+                .is_some()
+                .then(|| UpsertDedupByTimeColumn {
+                    // An unpartitioned file-mode Cayenne table resolves a full refresh's
+                    // repeated keys after writing them, ordered by the row versions the
+                    // refresh supplies.
+                    versions_resolved_after_write: acceleration_settings.engine == Engine::Cayenne
+                        && acceleration_settings.mode == Mode::File
+                        && acceleration_settings.partition_by.is_empty(),
+                    // SQLite stores `-0.0` as `0.0` and `NaN` as NULL, so a stored row is
+                    // hashed with its floats read that way to match the row it came from.
+                    floats_as_stored: acceleration_settings.engine == Engine::Sqlite,
+                }),
         );
         if let Some(caching_ttl) = acceleration_settings.caching_ttl {
             refresh = refresh.caching_ttl(caching_ttl);

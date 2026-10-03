@@ -89,14 +89,23 @@ impl AccelerationSink {
         }
     }
 
+    /// Write a refresh's rows; `refresh` travels to the accelerator in the write's
+    /// session ([`util::session_state::mark_refresh_write`]).
     pub async fn insert_into(
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
+        refresh: &util::session_state::RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
         match self {
-            AccelerationSink::Table(sink) => sink.insert_into(record_batch_stream, overwrite).await,
-            AccelerationSink::Multi(sink) => sink.insert_into(record_batch_stream, overwrite).await,
+            AccelerationSink::Table(sink) => {
+                sink.insert_into(record_batch_stream, overwrite, refresh)
+                    .await
+            }
+            AccelerationSink::Multi(sink) => {
+                sink.insert_into(record_batch_stream, overwrite, refresh)
+                    .await
+            }
         }
     }
 }

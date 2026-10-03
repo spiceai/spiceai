@@ -97,9 +97,9 @@ impl MultiSink {
                 })
             })?;
 
-        let _ = collect(insertion_plan, ctx_state.task_ctx())
+        collect(insertion_plan, ctx_state.task_ctx())
             .await
-            .map_err(retry_from_df_error);
+            .map_err(retry_from_df_error)?;
         Ok(())
     }
 
@@ -140,7 +140,21 @@ impl MultiSink {
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
+        refresh: &util::session_state::RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
+        // Row versions let one accelerator resolve repeated keys as it writes, but every
+        // table here receives the rows and not every one reads them. The refresh resolves
+        // them before writing to a table with synchronized children, so one attached since
+        // then fails the write, and the next attempt resolves them first.
+        if refresh.row_versions.is_some() {
+            return Err(RetryError::transient(
+                crate::accelerated::Error::FailedToWriteData {
+                    source: DataFusionError::Execution(
+                        "a synchronized dataset attached during this refresh, so it was not applied; the next refresh writes the same rows to both".to_string(),
+                    ),
+                },
+            ));
+        }
         let schema = record_batch_stream.schema();
         let (tx, _) = broadcast::channel::<RecordBatch>(32);
         let mut join_set = JoinSet::new();
@@ -168,7 +182,7 @@ impl MultiSink {
         let primary_provider = Arc::clone(&self.original_table_provider);
         join_set.spawn(Self::spawn_parent_task(
             primary_provider,
-            ctx.state(),
+            util::session_state::mark_refresh_write(ctx.state(), refresh),
             tx.subscribe(),
             Arc::clone(&schema),
             parent_complete_tx,
@@ -181,6 +195,7 @@ impl MultiSink {
             .iter()
             .map(SynchronizedTable::child_accelerator)
         {
+            // A child reports nothing superseded: the parent's report already counts it.
             join_set.spawn(Self::spawn_child_task(
                 provider,
                 ctx.state(),

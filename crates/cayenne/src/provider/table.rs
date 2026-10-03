@@ -13095,70 +13095,45 @@ impl CayenneTableProvider {
         }
     }
 
-    /// [`Self::collapse_buffered_write`] for a writer that supplies row versions: the
-    /// buffered rows, sorted by version, keep each key's last copy, which is its
-    /// greatest version, and the copies not kept are reported.
+    /// [`Self::collapse_buffered_write`] for a writer that supplies row versions: each
+    /// key keeps its greatest version, and the copies not kept are reported.
     fn collapse_buffered_write_by_version(
         &self,
         resolver: &super::key_conflicts::KeyResolver,
         versions: &Arc<dyn util::session_state::RowVersions>,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>> {
-        // `DataFusion` errors convert back unchanged, so a refresh error the writer
-        // raises (a NULL time) keeps its type.
-        let external = |source: datafusion_common::DataFusionError| Error::DataFusion { source };
-        let Some(first) = batches.first() else {
-            return Ok(batches);
-        };
-        let batch = arrow::compute::concat_batches(&first.schema(), &batches)
-            .map_err(|e| external(e.into()))?;
-        // A NULL or unreadable time fails the write here, as on the streaming path.
-        let (times, hashes) = versions.versions(&batch).map_err(external)?;
-        let order = arrow::compute::lexsort_to_indices(
-            &[
-                arrow::compute::SortColumn {
-                    values: Arc::new(arrow::array::Int64Array::from(times.clone())),
-                    options: None,
-                },
-                arrow::compute::SortColumn {
-                    values: Arc::new(arrow::array::UInt64Array::from(hashes.clone())),
-                    options: None,
-                },
-            ],
-            None,
-        )
-        .map_err(|e| external(e.into()))?;
-        let sorted =
-            arrow::compute::take_record_batch(&batch, &order).map_err(|e| external(e.into()))?;
-        let digests = resolver.digests(&sorted)?;
-        let mut kept: HashMap<u128, usize> = HashMap::with_capacity(digests.len());
-        for (row, digest) in digests.iter().enumerate() {
-            kept.insert(*digest, row);
-        }
-        let version = |row: usize| {
-            let source = order.value(row) as usize;
-            (times[source], hashes[source])
-        };
-        let mut counts = util::session_state::SupersededCounts::default();
-        for (row, digest) in digests.iter().enumerate() {
-            let winner = kept[digest];
-            if winner != row {
-                let (loser, best) = (version(row), version(winner));
-                if loser.0 < best.0 {
-                    counts.older += 1;
-                } else if loser.1 == best.1 {
-                    counts.unchanged += 1;
-                } else {
-                    counts.equal_time += 1;
-                }
-            }
-        }
+        let versioned = batches
+            .into_iter()
+            .map(|batch| {
+                // A NULL or unreadable time fails the write here, as on the streaming
+                // path. `DataFusion` errors convert back unchanged, so it keeps its type.
+                let (times, hashes) = versions
+                    .versions(&batch)
+                    .map_err(|source| Error::DataFusion { source })?;
+                Ok(super::key_conflicts::VersionedBatch {
+                    batch,
+                    times,
+                    hashes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (kept, counts) = resolver.resolve_by_version(versioned)?;
+        self.report_superseded(&counts);
+        Ok(kept
+            .into_iter()
+            .map(|versioned| versioned.batch)
+            .filter(|batch| batch.num_rows() > 0)
+            .collect())
+    }
+
+    /// Report the copies of repeated keys a refresh's write did not keep, when it asks.
+    pub(crate) fn report_superseded(&self, counts: &util::session_state::SupersededCounts) {
         if let Some(report) = &self.superseded_report
             && !counts.is_empty()
         {
-            report.superseded(&counts);
+            report.superseded(counts);
         }
-        resolver.collapse_write(vec![sorted])
     }
 
     /// Resolve the keys a buffered change-stream write repeats: a later change of

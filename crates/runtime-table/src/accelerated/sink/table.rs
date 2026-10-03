@@ -238,6 +238,7 @@ impl TableSink {
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
+        refresh: &util::session_state::RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
         let start = std::time::Instant::now();
         tracing::debug!(
@@ -246,9 +247,7 @@ impl TableSink {
         );
 
         let ctx = util::session_state::session_context();
-        // A refresh marks the write's session with its context (row versions, and
-        // where to report superseded copies).
-        let state = util::session_state::mark_refresh_write(ctx.state());
+        let state = util::session_state::mark_refresh_write(ctx.state(), refresh);
         let target_schema = self.table_provider.schema();
         warn_on_narrowing_schema_cast(
             &self.dataset_name,

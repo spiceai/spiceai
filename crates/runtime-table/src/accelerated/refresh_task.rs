@@ -114,22 +114,28 @@ mod latest_by_time;
 #[derive(Debug)]
 struct RecordSuperseded {
     /// The dataset's label set.
-    dataset: Vec<KeyValue>,
+    labels: DatasetMetricLabels,
 }
 
 impl util::session_state::SupersededReport for RecordSuperseded {
     fn superseded(&self, counts: &util::session_state::SupersededCounts) {
-        for (count, reason) in [
-            (counts.repeated, "repeated"),
-            (counts.older, "older"),
-            (counts.equal_time, "equal_time"),
-            (counts.unchanged, "unchanged"),
-        ] {
-            if count > 0 {
-                let mut labels = self.dataset.clone();
-                labels.push(KeyValue::new("reason", reason));
-                metrics::REFRESH_ROWS_SUPERSEDED.add(count, &labels);
-            }
+        record_superseded(&self.labels, counts);
+    }
+}
+
+/// Adds `counts` to `dataset_acceleration_refresh_rows_superseded`, by reason.
+pub(crate) fn record_superseded(
+    labels: &DatasetMetricLabels,
+    counts: &util::session_state::SupersededCounts,
+) {
+    for (count, reason) in [
+        (counts.repeated, "repeated"),
+        (counts.older, "older"),
+        (counts.equal_time, "equal_time"),
+        (counts.unchanged, "unchanged"),
+    ] {
+        if count > 0 {
+            metrics::REFRESH_ROWS_SUPERSEDED.add(count, &labels.tagged("reason", reason));
         }
     }
 }
@@ -543,9 +549,12 @@ pub(crate) struct DatasetMetricLabels {
 
 impl DatasetMetricLabels {
     pub(crate) fn new(dataset_name: &TableReference) -> Self {
-        let name: Arc<str> = Arc::from(dataset_name.to_string());
+        Self::from_name(&dataset_name.to_string())
+    }
+
+    pub(crate) fn from_name(dataset_name: &str) -> Self {
         Self {
-            dataset_only: [KeyValue::new("dataset", name)],
+            dataset_only: [KeyValue::new("dataset", Arc::<str>::from(dataset_name))],
         }
     }
 
@@ -842,7 +851,7 @@ impl RefreshTask {
                     .get_full_or_incremental_append_update(refresh, None)
                     .await
                 {
-                    Ok(update) if refresh.upsert_dedup_by_time_column => {
+                    Ok(update) if refresh.upsert_dedup_by_time_column.is_some() => {
                         self.select_latest_by_time(refresh, update, None).await
                     }
                     other => other,
@@ -1140,15 +1149,13 @@ impl RefreshTask {
             row_versions,
             superseded: engine_reports_superseded.then(|| {
                 Arc::new(RecordSuperseded {
-                    dataset: self.dataset_metric_labels.dataset().to_vec(),
+                    labels: self.dataset_metric_labels.clone(),
                 }) as Arc<dyn util::session_state::SupersededReport>
             }),
         };
-        let written = util::session_state::with_refresh_write(
-            refresh_write,
-            sink.insert_into(record_batch_stream, overwrite),
-        )
-        .await;
+        let written = sink
+            .insert_into(record_batch_stream, overwrite, &refresh_write)
+            .await;
         if let Err(e) = written {
             let error_message = format_datafusion_error(&e);
             self.set_refresh_status(
@@ -1300,7 +1307,7 @@ impl RefreshTask {
                 {
                     // `upsert_dedup_by_time_column` replaces the exact-row dedupe: it is
                     // seeded with the stored keys and times from the same window start.
-                    Ok(data) if refresh.upsert_dedup_by_time_column => {
+                    Ok(data) if refresh.upsert_dedup_by_time_column.is_some() => {
                         self.select_latest_by_time(refresh, data, timestamp).await
                     }
                     // Reuse `timestamp`: the dedupe must compare against the same mark the
@@ -1362,6 +1369,27 @@ impl RefreshTask {
                 "'acceleration.on_conflict: upsert_dedup_by_time_column' requires 'acceleration.primary_key'. Set it to the column(s) that identify a row.",
             )));
         }
+        // A synchronized child writes the same rows but cannot read their versions, so
+        // a dataset with one resolves them here, before the rows reach either table.
+        let dedup = refresh.upsert_dedup_by_time_column.unwrap_or_default();
+        if dedup.versions_resolved_after_write
+            && window_start.is_none()
+            && self.sink.read().await.synchronized_tables().is_empty()
+        {
+            // The accelerator reads each row's version once as it writes it, fails
+            // the write on a NULL or unreadable time, and keeps each key's greatest
+            // version, so the rows go to it untouched.
+            let row_versions = latest_by_time::row_versions(
+                &dataset,
+                &update.data.schema(),
+                &key_columns,
+                time_column,
+                refresh.time_format,
+            )
+            .map_err(|e| not_applied(&e))?;
+            latest_by_time::publish_zero(&self.dataset_metric_labels);
+            return Ok(update.with_row_versions(Some(row_versions)));
+        }
         let mut selector = latest_by_time::LatestByTime::try_new(
             &dataset,
             &update.data.schema(),
@@ -1370,10 +1398,11 @@ impl RefreshTask {
             refresh.time_format,
         )
         .map_err(|e| not_applied(&e))?;
+        selector = selector.with_floats_as_stored(dedup.floats_as_stored);
         if let Some(runtime_env) = &self.query_runtime_env {
             selector = selector.with_runtime_env(Arc::clone(runtime_env));
         }
-        selector.publish_zero();
+        latest_by_time::publish_zero(&self.dataset_metric_labels);
 
         if let Some(value) = window_start
             && let Some(filter_converter) = self.get_accelerator_filter_converter(refresh)
@@ -1396,7 +1425,10 @@ impl RefreshTask {
                 .collect();
             // A string time column is filtered by comparing strings, which misorders values
             // with different UTC offsets; starting the read 14 hours (the largest offset)
-            // earlier can only add rows, which the selector then compares as instants.
+            // earlier can only add rows, which the selector then compares as instants. A
+            // window within 14 hours of 1970 has no earlier start (`value` cannot go below
+            // it), and a time such as `1969-12-31T23:30:00-01:00` sorts before any start
+            // string while being later than it, so every stored row is read instead.
             let string_time = accelerator_schema
                 .field_with_name(&time_column)
                 .is_ok_and(|f| {
@@ -1406,12 +1438,15 @@ impl RefreshTask {
                     )
                 });
             let start = if string_time {
-                value.saturating_sub(MAX_UTC_OFFSET_NANOS)
+                value.checked_sub(MAX_UTC_OFFSET_NANOS)
             } else {
-                value
+                Some(value)
             };
             let mut stored = accelerator_df(&Arc::clone(&self.accelerator), &ctx)
-                .and_then(|df| df.filter(filter_converter.convert_high_water_mark(start)))
+                .and_then(|df| match start {
+                    Some(start) => df.filter(filter_converter.convert_high_water_mark(start)),
+                    None => Ok(df),
+                })
                 .and_then(|df| df.select_columns(&columns))
                 .map_err(find_datafusion_root)
                 .context(super::UnableToScanTableProviderSnafu)?
@@ -1435,15 +1470,6 @@ impl RefreshTask {
             }
         }
 
-        // A full refresh of an accelerator that resolves repeated keys after writing
-        // them hands it each row's version instead of resolving across batches here.
-        if refresh.versions_resolved_after_write && window_start.is_none() {
-            // The accelerator reads each row's version once as it writes it, fails
-            // the write on a NULL or unreadable time, and keeps each key's greatest
-            // version, so the rows go to it untouched.
-            let row_versions = selector.row_versions();
-            return Ok(update.with_row_versions(Some(row_versions)));
-        }
         Ok(latest_by_time::select_latest(selector, update))
     }
 

@@ -1247,16 +1247,9 @@ impl<'a> AppendMutationWriter<'a> {
                 )
                 .await?;
             self.table.sync_local_snapshot_dir(&snapshot_id).await?;
-            let report = |counts: &util::session_state::SupersededCounts| {
-                if let Some(report) = &self.table.superseded_report
-                    && !counts.is_empty()
-                {
-                    report.superseded(counts);
-                }
-            };
             // One batch, its own repeats resolved, repeats no key.
             if rows == 0 || stamped_batches.load(Ordering::Relaxed) <= 1 {
-                report(&batch_superseded.lock());
+                self.table.report_superseded(&batch_superseded.lock());
                 return Ok((rows, stats, HashMap::new()));
             }
             let (superseded, mut counts) = self
@@ -1269,7 +1262,7 @@ impl<'a> AppendMutationWriter<'a> {
                 )
                 .await?;
             counts.add(&batch_superseded.lock());
-            report(&counts);
+            self.table.report_superseded(&counts);
             match file_stats.as_deref() {
                 Some(file_stats) if !superseded.is_empty() => {
                     let dropped: u64 = superseded.values().map(|rows| rows.len() as u64).sum();

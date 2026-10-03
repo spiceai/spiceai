@@ -82,8 +82,9 @@ pub fn is_user_statement(config: &SessionConfig) -> bool {
 /// `time_column`); read by an accelerator that resolves repeated keys after
 /// writing them.
 pub trait RowVersions: Send + Sync + std::fmt::Debug {
-    /// Each row of `batch`'s time, as UTC nanoseconds, and content hash. A row
-    /// whose time cannot be read fails the write.
+    /// Each row of `batch`'s time, as UTC nanoseconds, and content hash. The hash
+    /// is 63 bits: its lowest bit is always clear. A row whose time cannot be read
+    /// fails the write.
     ///
     /// # Errors
     ///
@@ -91,7 +92,7 @@ pub trait RowVersions: Send + Sync + std::fmt::Debug {
     fn versions(
         &self,
         batch: &arrow::array::RecordBatch,
-    ) -> datafusion::error::Result<(Vec<i64>, Vec<u64>)>;
+    ) -> datafusion::error::Result<(arrow::array::Int64Array, arrow::array::UInt64Array)>;
 }
 
 /// The copies of a repeated key a write did not keep, by why.
@@ -122,6 +123,18 @@ impl SupersededCounts {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Count a copy with version `loser` that lost to `winner`, each a
+    /// `(time, content hash)`.
+    pub fn count(&mut self, loser: (i64, u64), winner: (i64, u64)) {
+        if loser.0 < winner.0 {
+            self.older += 1;
+        } else if loser.1 == winner.1 {
+            self.unchanged += 1;
+        } else {
+            self.equal_time += 1;
+        }
+    }
 }
 
 /// Receives what an accelerator's write superseded, so the writer can record it.
@@ -130,38 +143,19 @@ pub trait SupersededReport: Send + Sync + std::fmt::Debug {
 }
 
 /// What a refresh's write carries to the accelerator: how to order a key's copies,
-/// and where to report the ones it does not keep. See [`with_refresh_write`].
+/// and where to report the ones it does not keep. See [`mark_refresh_write`].
 #[derive(Debug, Clone, Default)]
 pub struct RefreshWrite {
     pub row_versions: Option<Arc<dyn RowVersions>>,
     pub superseded: Option<Arc<dyn SupersededReport>>,
 }
 
-tokio::task_local! {
-    static REFRESH_WRITE: RefreshWrite;
-}
-
-/// Run `write` with `refresh` as the context of the writes it makes; a sink marks
-/// its session from it with [`mark_refresh_write`].
-pub async fn with_refresh_write<F: std::future::Future>(
-    refresh: RefreshWrite,
-    write: F,
-) -> F::Output {
-    REFRESH_WRITE.scope(refresh, write).await
-}
-
-/// `state` carrying the current task's [`RefreshWrite`], or `state` unchanged when
-/// it has none.
+/// `state` carrying `refresh`, so the accelerator's write can read it.
 #[must_use]
-pub fn mark_refresh_write(state: SessionState) -> SessionState {
-    match REFRESH_WRITE.try_with(Clone::clone) {
-        Ok(refresh) => {
-            let mut state = state;
-            state.config_mut().set_extension(Arc::new(refresh));
-            state
-        }
-        Err(_) => state,
-    }
+pub fn mark_refresh_write(state: SessionState, refresh: &RefreshWrite) -> SessionState {
+    let mut state = state;
+    state.config_mut().set_extension(Arc::new(refresh.clone()));
+    state
 }
 
 /// The [`RowVersions`] a write's `config` carries, if any.

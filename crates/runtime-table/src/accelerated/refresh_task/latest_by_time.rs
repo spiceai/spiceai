@@ -28,8 +28,10 @@ limitations under the License.
 //! row never replaces a newer stored version. Within a refresh, the rows passed for a key
 //! arrive in increasing `(time, hash)` order, so the last one written for a key wins.
 
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+
+use datafusion::common::HashMap;
+use datafusion::common::hash_map::Entry;
 use std::fmt;
 use std::sync::Arc;
 
@@ -50,7 +52,6 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{SessionConfig, SessionContext, col};
 use futures::TryStreamExt;
-use opentelemetry::KeyValue;
 use runtime_acceleration::dataupdate::StreamingDataUpdate;
 use runtime_component::dataset::TimeFormat;
 use runtime_metrics::acceleration as metrics;
@@ -108,12 +109,10 @@ fn time_format_name(time_format: Option<TimeFormat>) -> &'static str {
     }
 }
 
-/// Rows a batch did not pass on, by `reason`.
+/// Rows a selection did not keep, by `reason`.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Superseded {
-    older: u64,
-    equal_time: u64,
-    unchanged: u64,
+    counts: util::session_state::SupersededCounts,
     /// How many of them were never passed on to the write (the rest were, and the
     /// engine replaces them).
     not_written: u64,
@@ -122,13 +121,7 @@ struct Superseded {
 impl Superseded {
     /// Count `version`, which lost to `winner`.
     fn count(&mut self, version: Kept, winner: Kept) {
-        if version.time < winner.time {
-            self.older += 1;
-        } else if version.order() == winner.order() {
-            self.unchanged += 1;
-        } else {
-            self.equal_time += 1;
-        }
+        self.counts.count(version.order(), winner.order());
     }
 }
 
@@ -208,6 +201,8 @@ pub(crate) struct LatestByTime {
     reader: Arc<VersionReader>,
     encoding: KeyEncoding,
     latest: HashMap<u128, Kept>,
+    /// The row each key last kept in the batch being selected; reused across batches.
+    last_kept: HashMap<u128, usize>,
     /// The share of the query memory pool `latest` is charged to; `None` without a pool.
     reservation: Option<MemoryReservation>,
     /// Where the map spills when the pool refuses to grow it.
@@ -218,9 +213,7 @@ pub(crate) struct LatestByTime {
     /// Once the map has spilled it no longer knows every key, so every later row is
     /// written here and decided after the last one, against every run.
     deferred: Option<DeferredRows>,
-    older_labels: [KeyValue; 2],
-    equal_time_labels: [KeyValue; 2],
-    unchanged_labels: [KeyValue; 2],
+    labels: super::DatasetMetricLabels,
 }
 
 impl LatestByTime {
@@ -237,24 +230,7 @@ impl LatestByTime {
         time_column: String,
         time_format: Option<TimeFormat>,
     ) -> Result<Self, DataFusionError> {
-        let key_types = key_columns
-            .iter()
-            .map(|name| {
-                schema
-                    .field_with_name(name)
-                    .map(|f| f.data_type().clone())
-                    .map_err(|_| {
-                        not_applied(&format!(
-                            "primary key column '{name}' is not in the rows the refresh reads, so versions of a key cannot be matched. Include it in 'acceleration.refresh_sql', or remove it from 'acceleration.primary_key'."
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if schema.field_with_name(&time_column).is_err() {
-            return Err(not_applied(&format!(
-                "'time_column' '{time_column}' is not in the rows the refresh reads, so versions of a key cannot be ordered. Include it in 'acceleration.refresh_sql'."
-            )));
-        }
+        let key_types = checked_key_types(schema, &key_columns, &time_column)?;
         let widths: Option<Vec<u32>> = key_types
             .iter()
             .map(|t| inline_width(t).map(|(width, _)| width))
@@ -270,16 +246,8 @@ impl LatestByTime {
                     .collect(),
             )?),
         };
-        let labels = |reason: &'static str| {
-            [
-                KeyValue::new("dataset", dataset.to_string()),
-                KeyValue::new("reason", reason),
-            ]
-        };
         Ok(Self {
-            older_labels: labels("older"),
-            equal_time_labels: labels("equal_time"),
-            unchanged_labels: labels("unchanged"),
+            labels: super::DatasetMetricLabels::from_name(dataset),
             dataset: dataset.to_string(),
             key_columns,
             key_types,
@@ -288,9 +256,11 @@ impl LatestByTime {
                 time_column,
                 time_format,
                 hashed: Arc::clone(schema),
+                floats_as_stored: false,
             }),
             encoding,
             latest: HashMap::new(),
+            last_kept: HashMap::new(),
             reservation: None,
             disk: None,
             runtime_env: None,
@@ -299,14 +269,16 @@ impl LatestByTime {
         })
     }
 
-    /// The reader of each row's version, for an accelerator that resolves repeated keys
-    /// after writing them.
-    pub(crate) fn row_versions(&self) -> Arc<dyn util::session_state::RowVersions> {
-        Arc::clone(&self.reader) as Arc<dyn util::session_state::RowVersions>
-    }
-
     /// Charge the map to `runtime_env`'s memory pool, spilling to its disk manager when
     /// the pool refuses to grow it.
+    /// Hash floats as an accelerator that stores `-0.0` as `0.0` and `NaN` as NULL
+    /// (SQLite) reads them back, so a stored row hashes like the row it came from.
+    #[must_use]
+    pub(crate) fn with_floats_as_stored(mut self, floats_as_stored: bool) -> Self {
+        Arc::make_mut(&mut self.reader).floats_as_stored = floats_as_stored;
+        self
+    }
+
     #[must_use]
     pub(crate) fn with_runtime_env(mut self, runtime_env: Arc<RuntimeEnv>) -> Self {
         self.reservation = Some(
@@ -364,18 +336,6 @@ impl LatestByTime {
             .as_ref()
             .map(Arc::clone)
             .ok_or_else(|| spill_failed(&"no spill directory is configured"))
-    }
-
-    /// Publish every `reason` series at `0`, so a dashboard sees the series before the
-    /// first superseded row and an alert can fire on its rise.
-    pub(crate) fn publish_zero(&self) {
-        for labels in [
-            &self.older_labels,
-            &self.equal_time_labels,
-            &self.unchanged_labels,
-        ] {
-            metrics::REFRESH_ROWS_SUPERSEDED.add(0, labels);
-        }
     }
 
     /// Record the keys and times already stored. Rows with a NULL stored time are
@@ -469,14 +429,7 @@ impl LatestByTime {
     }
 
     fn record(&self, superseded: &Superseded) {
-        record_superseded(
-            superseded,
-            &[
-                self.older_labels.clone(),
-                self.equal_time_labels.clone(),
-                self.unchanged_labels.clone(),
-            ],
-        );
+        record_selection(&self.labels, superseded);
     }
 
     /// After the last row: decide every deferred row against every run, and return the
@@ -535,12 +488,7 @@ impl LatestByTime {
             superseded: Superseded::default(),
             _file: file,
         };
-        let labels = [
-            self.older_labels.clone(),
-            self.equal_time_labels.clone(),
-            self.unchanged_labels.clone(),
-        ];
-        Ok(Some(resolver.into_stream(labels)))
+        Ok(Some(resolver.into_stream(self.labels.clone())))
     }
 
     /// [`Self::select`], returning the rows it did not pass on by reason instead of
@@ -588,12 +536,12 @@ impl LatestByTime {
         }
         // A key kept more than once in this batch: only its last (newest) row is written.
         // The earlier ones were counted when it replaced them.
-        let mut last_kept: HashMap<u128, usize> = HashMap::new();
+        self.last_kept.clear();
         for (row, _) in keep.iter().enumerate().filter(|(_, keep_row)| **keep_row) {
-            last_kept.insert(keys[row], row);
+            self.last_kept.insert(keys[row], row);
         }
         for (row, keep_row) in keep.iter_mut().enumerate() {
-            if *keep_row && last_kept.get(&keys[row]) != Some(&row) {
+            if *keep_row && self.last_kept.get(&keys[row]) != Some(&row) {
                 *keep_row = false;
                 superseded.not_written += 1;
             }
@@ -651,10 +599,62 @@ impl LatestByTime {
     }
 }
 
+/// The type of each of `key_columns` in `schema`, after checking that every key column
+/// and `time_column` is among the rows a refresh reads.
+fn checked_key_types(
+    schema: &SchemaRef,
+    key_columns: &[String],
+    time_column: &str,
+) -> Result<Vec<DataType>, DataFusionError> {
+    let key_types = key_columns
+        .iter()
+        .map(|name| {
+            schema
+                .field_with_name(name)
+                .map(|f| f.data_type().clone())
+                .map_err(|_| {
+                    not_applied(&format!(
+                        "primary key column '{name}' is not in the rows the refresh reads, so versions of a key cannot be matched. Include it in 'acceleration.refresh_sql', or remove it from 'acceleration.primary_key'."
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if schema.field_with_name(time_column).is_err() {
+        return Err(not_applied(&format!(
+            "'time_column' '{time_column}' is not in the rows the refresh reads, so versions of a key cannot be ordered. Include it in 'acceleration.refresh_sql'."
+        )));
+    }
+    Ok(key_types)
+}
+
+/// The reader of each row's version for an accelerator that resolves a refresh's
+/// repeated keys after writing them, after checking the columns it needs are read.
+///
+/// # Errors
+///
+/// Returns a [`RefreshNotApplied`] error if a key column or the time column is missing
+/// from `schema`.
+pub(crate) fn row_versions(
+    dataset: &str,
+    schema: &SchemaRef,
+    key_columns: &[String],
+    time_column: String,
+    time_format: Option<TimeFormat>,
+) -> Result<Arc<dyn util::session_state::RowVersions>, DataFusionError> {
+    checked_key_types(schema, key_columns, &time_column)?;
+    Ok(Arc::new(VersionReader {
+        dataset: dataset.to_string(),
+        time_column,
+        time_format,
+        hashed: Arc::clone(schema),
+        floats_as_stored: false,
+    }))
+}
+
 /// Reads each row's version — its `time_column` as UTC nanoseconds and its content
 /// hash — the same way for the selector and for an accelerator that resolves
 /// repeated keys after writing them ([`RowVersions`]).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct VersionReader {
     dataset: String,
     time_column: String,
@@ -662,12 +662,16 @@ pub(crate) struct VersionReader {
     /// The incoming rows' columns: a row's content hash is over these, cast to these
     /// types, so a stored copy of a row hashes like the incoming one.
     hashed: SchemaRef,
+    /// The accelerator stores `-0.0` as `0.0` and `NaN` as NULL (SQLite), so hashes read
+    /// floats the same way. Elsewhere rows that differ only there hash differently, so
+    /// an equal hash means the same row and either copy may be kept.
+    floats_as_stored: bool,
 }
 
 impl VersionReader {
     /// Each row's content hash: every incoming column, cast to its incoming type, with
-    /// floats normalized as an engine may store them (`-0.0` as `0.0`, `NaN` as NULL), so
-    /// a stored copy of a row hashes like the row it came from.
+    /// floats read as the accelerator stores them, so a stored copy of a row hashes like
+    /// the row it came from.
     fn content_hashes(&self, batch: &RecordBatch) -> Result<Vec<u64>, DataFusionError> {
         let columns = self
             .hashed
@@ -686,7 +690,11 @@ impl VersionReader {
                 } else {
                     cast_with_options(column, field.data_type(), &CastOptions::default())?
                 };
-                Ok(normalize_floats(&column))
+                Ok(if self.floats_as_stored {
+                    normalize_floats(&column)
+                } else {
+                    column
+                })
             })
             .collect::<Result<Vec<ArrayRef>, DataFusionError>>()?;
         let mut hashes = vec![0_u64; batch.num_rows()];
@@ -713,7 +721,7 @@ impl VersionReader {
 
     /// The time column as UTC nanoseconds, interpreted per `time_format`. Values without
     /// a zone are read as UTC; strings are parsed, so offsets compare by instant.
-    fn times(&self, batch: &RecordBatch) -> Result<arrow::array::Int64Array, DataFusionError> {
+    fn times(&self, batch: &RecordBatch) -> Result<Int64Array, DataFusionError> {
         let column = self.time_column_of(batch)?;
         let nulls = column.null_count();
         if nulls > 0 {
@@ -736,28 +744,27 @@ impl VersionReader {
 }
 
 impl util::session_state::RowVersions for VersionReader {
-    fn versions(&self, batch: &RecordBatch) -> Result<(Vec<i64>, Vec<u64>), DataFusionError> {
+    fn versions(&self, batch: &RecordBatch) -> Result<(Int64Array, UInt64Array), DataFusionError> {
         let times = self.times(batch)?;
-        Ok((times.values().to_vec(), self.content_hashes(batch)?))
+        Ok((times, UInt64Array::from(self.content_hashes(batch)?)))
     }
 }
 
-/// Record the rows a selection did not pass on: in `rows_superseded` by reason, and in
-/// `rows_written`, which counts every row a refresh receives. `labels` holds the
-/// `older`, `equal_time` and `unchanged` label sets, each the dataset's then `reason`.
-fn record_superseded(superseded: &Superseded, labels: &[[KeyValue; 2]; 3]) {
-    for (count, labels) in [
-        (superseded.older, &labels[0]),
-        (superseded.equal_time, &labels[1]),
-        (superseded.unchanged, &labels[2]),
-    ] {
-        if count > 0 {
-            metrics::REFRESH_ROWS_SUPERSEDED.add(count, labels);
-        }
-    }
+/// Record the rows a selection did not keep: in `rows_superseded` by reason, and in
+/// `rows_written`, which counts every row a refresh receives.
+fn record_selection(labels: &super::DatasetMetricLabels, superseded: &Superseded) {
+    super::record_superseded(labels, &superseded.counts);
     // Rows passed on are counted as the write receives them; the rest only here.
     if superseded.not_written > 0 {
-        metrics::REFRESH_ROWS_WRITTEN.add(superseded.not_written, &labels[0][..1]);
+        metrics::REFRESH_ROWS_WRITTEN.add(superseded.not_written, labels.dataset());
+    }
+}
+
+/// Publish this mode's `reason` series at `0`, so a dashboard sees them before the
+/// first superseded row and an alert can fire on their rise.
+pub(crate) fn publish_zero(labels: &super::DatasetMetricLabels) {
+    for reason in ["older", "equal_time", "unchanged"] {
+        metrics::REFRESH_ROWS_SUPERSEDED.add(0, &labels.tagged("reason", reason));
     }
 }
 
@@ -794,14 +801,20 @@ fn write_run(
     {
         let mut out = std::io::BufWriter::new(file.inner().as_file());
         for (key, kept) in &entries {
-            out.write_all(&key.to_le_bytes())?;
-            out.write_all(&kept.time.to_le_bytes())?;
-            out.write_all(&kept.hash.to_le_bytes())?;
+            write_entry(&mut out, *key, *kept)?;
         }
         out.flush()?;
     }
     file.update_disk_usage()?;
     Ok(file)
+}
+
+/// Write one run entry: its key, time and hash ([`RUN_ENTRY_BYTES`]), as
+/// [`RunReader::next_entry`] reads them.
+fn write_entry(out: &mut impl std::io::Write, key: u128, kept: Kept) -> std::io::Result<()> {
+    out.write_all(&key.to_le_bytes())?;
+    out.write_all(&kept.time.to_le_bytes())?;
+    out.write_all(&kept.hash.to_le_bytes())
 }
 
 /// Reads a run back in key order.
@@ -878,18 +891,14 @@ fn merge_runs(
                     Some((key, if later { entry } else { kept }))
                 }
                 Some((current_key, kept)) => {
-                    out.write_all(&current_key.to_le_bytes())?;
-                    out.write_all(&kept.time.to_le_bytes())?;
-                    out.write_all(&kept.hash.to_le_bytes())?;
+                    write_entry(&mut out, current_key, kept)?;
                     Some((key, entry))
                 }
                 None => Some((key, entry)),
             };
         }
         if let Some((key, kept)) = current {
-            out.write_all(&key.to_le_bytes())?;
-            out.write_all(&kept.time.to_le_bytes())?;
-            out.write_all(&kept.hash.to_le_bytes())?;
+            write_entry(&mut out, key, kept)?;
         }
         out.flush()?;
     }
@@ -1172,22 +1181,19 @@ impl DeferredResolver {
         )?)?))
     }
 
-    fn into_stream(self, labels: [[KeyValue; 2]; 3]) -> SendableRecordBatchStream {
+    fn into_stream(self, labels: super::DatasetMetricLabels) -> SendableRecordBatchStream {
         let schema = self.sorted.schema();
         let fields = &schema.fields()[..schema.fields().len() - HELPERS];
         let out_schema = Arc::new(Schema::new(fields.to_vec()));
-        let stream = futures::stream::try_unfold(Some(self), move |state| {
-            let labels = labels.clone();
-            async move {
-                let Some(mut resolver) = state else {
-                    return Ok(None);
-                };
-                if let Some(batch) = resolver.next_batch().await? {
-                    Ok(Some((batch, Some(resolver))))
-                } else {
-                    record_superseded(&resolver.superseded, &labels);
-                    Ok(None)
-                }
+        let stream = futures::stream::try_unfold(Some((self, labels)), |state| async move {
+            let Some((mut resolver, labels)) = state else {
+                return Ok(None);
+            };
+            if let Some(batch) = resolver.next_batch().await? {
+                Ok(Some((batch, Some((resolver, labels)))))
+            } else {
+                record_selection(&labels, &resolver.superseded);
+                Ok(None)
             }
         });
         Box::pin(RecordBatchStreamAdapter::new(out_schema, stream))
@@ -1213,6 +1219,24 @@ fn strip_helpers(batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
 /// `column` with `-0.0` read as `0.0` and `NaN` as NULL, as engines that do not keep them
 /// store them; other columns unchanged.
 fn normalize_floats(column: &ArrayRef) -> ArrayRef {
+    // Most float columns hold neither; they are hashed as they are.
+    let needs = |nan: bool, negative_zero: bool| nan || negative_zero;
+    let clean = match column.data_type() {
+        DataType::Float32 => !column
+            .as_primitive::<arrow::datatypes::Float32Type>()
+            .values()
+            .iter()
+            .any(|v| needs(v.is_nan(), *v == 0.0 && v.is_sign_negative())),
+        DataType::Float64 => !column
+            .as_primitive::<arrow::datatypes::Float64Type>()
+            .values()
+            .iter()
+            .any(|v| needs(v.is_nan(), *v == 0.0 && v.is_sign_negative())),
+        _ => true,
+    };
+    if clean {
+        return Arc::clone(column);
+    }
     match column.data_type() {
         DataType::Float32 => {
             let normalized: arrow::array::Float32Array = column
@@ -1620,9 +1644,11 @@ mod tests {
         assert_eq!(
             superseded,
             Superseded {
-                older: 1,
-                equal_time: 0,
-                unchanged: 1,
+                counts: util::session_state::SupersededCounts {
+                    older: 1,
+                    unchanged: 1,
+                    ..Default::default()
+                },
                 not_written: 2,
             }
         );
@@ -1643,9 +1669,7 @@ mod tests {
             if let Some(v) = values(&out).last() {
                 last.clone_from(v);
             }
-            total.older += superseded.older;
-            total.equal_time += superseded.equal_time;
-            total.unchanged += superseded.unchanged;
+            total.counts.add(&superseded.counts);
         }
         (last, total)
     }
@@ -1672,9 +1696,9 @@ mod tests {
         }
         // Either order supersedes the loser once: not passed on, or passed on and then
         // replaced by the winner.
-        assert_eq!(sup_ab.equal_time, 1);
-        assert_eq!(sup_ba.equal_time, 1);
-        assert_eq!(sup_ab.unchanged + sup_ba.unchanged, 0);
+        assert_eq!(sup_ab.counts.equal_time, 1);
+        assert_eq!(sup_ba.counts.equal_time, 1);
+        assert_eq!(sup_ab.counts.unchanged + sup_ba.counts.unchanged, 0);
     }
 
     #[test]
@@ -1703,6 +1727,18 @@ mod tests {
             Some(TimeFormat::UnixSeconds),
         )
         .expect("selector");
+        let plain = s
+            .reader
+            .content_hashes(&rows(vec![Some(-0.0), Some(f64::NAN), Some(1.5)]))
+            .expect("hashes");
+        assert_ne!(
+            plain,
+            s.reader
+                .content_hashes(&rows(vec![Some(0.0), None, Some(1.5)]))
+                .expect("hashes"),
+            "an engine that keeps -0.0 and NaN tells them apart"
+        );
+        let s = s.with_floats_as_stored(true);
         let incoming = s
             .reader
             .content_hashes(&rows(vec![Some(-0.0), Some(f64::NAN), Some(1.5)]))
@@ -1726,7 +1762,7 @@ mod tests {
             .expect("selects");
         assert_eq!(values(&out), ["a3"]);
         // a2 is older than a3 when read; a1 was kept and then superseded within the batch.
-        assert_eq!(superseded.older, 2);
+        assert_eq!(superseded.counts.older, 2);
     }
 
     #[test]
