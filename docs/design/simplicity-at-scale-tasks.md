@@ -107,12 +107,14 @@ embedded Turso qualification is a separate path and does not require a cloud tes
 
 ### Open Questions / Risks
 
-Unverified, code inspection only: LocalConditionalPut holds its lock in the async
-put_opts frame while LocalFileSystem delegates writes to blocking work. Whether
-cancellation can release the lock before that work finishes needs a targeted run.
-No reproduction was attempted in the initial primitive pass; local power-loss and
-cancellation qualification is explicitly outside that pass. Do not report this
-hypothesis as an existing defect without the artifact.
+The filesystem cancellation experiment reproduced a lost update on `b80ab208`:
+a cancelled 262,144-byte upload overwrote a contender's acknowledged 12-byte value.
+With the dedicated publication worker, the same command rejects the stale
+contender with `Precondition`. The worker owns lock acquisition, comparison and
+publication through cancellation and Tokio shutdown. See the [command, before/after
+output and timing-sensitive negative rerun](object-store-wal-verification.md#process-level-hardening).
+This evidence exercises real filesystem I/O and process lifetime; local power-loss
+durability and cloud-provider qualification remain unverified.
 
 ## Conditional WAL and OCC transactions
 

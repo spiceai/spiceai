@@ -212,6 +212,36 @@ because GitHub service containers require Linux. The session's local Docker
 socket is denied by the sandbox, so Redis results must come from that CI job;
 the local model output above is not evidence of a Redis run.
 
+On `952d1fdab2`, the [Linux three-implementation job](https://github.com/spiceai/spiceai/actions/runs/37152317578/job/111288548327)
+ran the following command against its real Redis service container:
+
+```sh
+python test/object_store_occ/e2e.py --driver target/debug/examples/wal_test_driver --artifacts wal-e2e-artifacts --slatedb --redis-url "redis://127.0.0.1:${REDIS_PORT}/0"
+```
+
+Observed output (repeated version banners omitted):
+
+```text
+independent oracle: SlateDB 0.17.0
+independent oracle: Redis 7.4.11 (redis-py 6.4.0)
+history seed=0: 96 transactions; reads, overlays, snapshots, checkpoints, reopen agree
+Redis seed=0: 96 atomic batches; committed point/prefix reads and client reconnect agree
+history seed=1: 96 transactions; reads, overlays, snapshots, checkpoints, reopen agree
+Redis seed=1: 96 atomic batches; committed point/prefix reads and client reconnect agree
+history seed=17: 96 transactions; reads, overlays, snapshots, checkpoints, reopen agree
+Redis seed=17: 96 atomic batches; committed point/prefix reads and client reconnect agree
+history seed=5489: 96 transactions; reads, overlays, snapshots, checkpoints, reopen agree
+Redis seed=5489: 96 atomic batches; committed point/prefix reads and client reconnect agree
+Redis WATCH: 3 stale batches rejected; insert, overwrite and delete results agree
+concurrency: 80 acknowledged transfers, 89 reader snapshots, 39 competing checkpoints
+PASS: WAL process-level qualification
+```
+
+The same job ran all 63 Rust tests and all seven SIGKILL cases. The [retained
+artifact](https://github.com/spiceai/spiceai/actions/runs/37152317578/artifacts/11284910879)
+contains the per-oracle JSONL results and WAL/SlateDB backing stores. Redis deletes
+its test hashes on exit; its observed results are in the JSONL files.
+
 
 Cancellation reproduction command, with the same test source on `b80ab208` and
 the worker implementation (an isolated target directory avoids sharing artifacts
