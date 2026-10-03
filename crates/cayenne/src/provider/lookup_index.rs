@@ -30,7 +30,11 @@ limitations under the License.
 //! A file no run covers — written before a restart, or by a write whose run
 //! could not be built — is read in full, and a lookup that meets one asks for
 //! a background build that reads back only the files not yet covered, paced
-//! so it takes a bounded share of a core. Nothing is persisted.
+//! so it takes a bounded share of a core. With the hidden
+//! `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled` switch (for testing), each run also
+//! persists as a file under the table's `_lookup_index` directory, registered
+//! in the metastore, so a reopened table loads its runs instead of reading its
+//! files back; otherwise nothing is persisted.
 //!
 //! Declared with the acceleration's `indexes`, one key per entry:
 //!
@@ -82,6 +86,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
+use crate::catalog::MetadataCatalog;
+use crate::metadata::IndexRunRecord;
 use crate::row_converter::{RowConverter, SortField};
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, AsArray};
@@ -100,7 +106,7 @@ use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use futures::StreamExt;
 use key_index::tiered::{Candidate, IndexRun, IndexView, RunBuilder, TieredIndex};
 use key_index::{KeyEncoder, KeyField};
-use object_store::{ObjectMeta, ObjectStore};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use parking_lot::Mutex;
 use vortex::VortexSessionDefault;
 use vortex::array::VortexSessionExecute;
@@ -540,6 +546,28 @@ impl Shape {
             index: Arc::new(TieredIndex::new(encoder.clone())),
             encoder,
         })
+    }
+
+    /// Identifies this key's persisted runs: its label, the words its encoder
+    /// gives keys (its encoded types, their nullability and how keys become
+    /// words) and the persisted format. A reopened table therefore reads back
+    /// only runs written by the same key, encoding and format, and deletes the
+    /// rest: a key column relaxed to nullable in place changes every key's word.
+    /// The hash is the identity, so it is 128 bits (see
+    /// [`hash_index::hash_key_128`]).
+    fn persisted_key(&self) -> u128 {
+        let descriptor = format!(
+            "{}|{}|{:016x}",
+            self.label,
+            key_index::persist::VERSION,
+            self.encoder.word_identity()
+        );
+        hash_index::hash_key_128(descriptor.as_bytes())
+    }
+
+    /// The directory this key's persisted runs live in.
+    fn persisted_dir(&self) -> String {
+        format!("{:032x}", self.persisted_key())
     }
 
     /// A builder for one run of this key.
@@ -1384,6 +1412,8 @@ pub(crate) struct LookupIndexState {
     published_once: AtomicBool,
     /// The pool's refusal of runs, reported once until runs fit again.
     refusal: WarnOnce,
+    /// Where the runs persist, when they do.
+    persisted_runs: std::sync::OnceLock<Arc<PersistedRuns>>,
     /// A write that could not be indexed, reported once until runs publish
     /// again.
     write_failure: WarnOnce,
@@ -1440,6 +1470,7 @@ impl LookupIndexState {
             schedule: Mutex::new(BuildSchedule::default()),
             published_once: AtomicBool::new(false),
             refusal: WarnOnce::default(),
+            persisted_runs: std::sync::OnceLock::new(),
             write_failure: WarnOnce::default(),
             counters: Counters::default(),
             scan_input_version,
@@ -1520,14 +1551,108 @@ impl LookupIndexState {
     /// Pins every key's current view as the published one. The caller holds
     /// `publish_lock`.
     fn repin(&self) {
-        self.index
-            .store(Arc::new(LookupIndexView::of(self.shapes.load_full())));
+        let view = LookupIndexView::of(self.shapes.load_full());
+        if let Some(persisted_runs) = self.persisted_runs.get() {
+            persisted_runs.schedule(
+                view.shapes
+                    .iter()
+                    .map(|shape| shape.persisted_dir())
+                    .zip(view.views.iter().cloned())
+                    .collect(),
+            );
+        }
+        self.index.store(Arc::new(view));
         self.scan_input_version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Persists every key's runs as run files under `root`, registered in
+    /// the table's metastore, and loads the registered ones, so a reopened
+    /// table reads back only the files no persisted run covers. `live` lists the
+    /// files a reader can see now. A persisted run that cannot be read is deleted
+    /// and its files are indexed again.
+    pub(crate) async fn open_persisted_runs(
+        self: &Arc<Self>,
+        store: Arc<dyn ObjectStore>,
+        catalog: Arc<dyn MetadataCatalog>,
+        table_id: String,
+        root: &object_store::path::Path,
+        live: Vec<String>,
+    ) {
+        let keys: Vec<String> = self
+            .shapes
+            .load()
+            .iter()
+            .map(|shape| shape.persisted_dir())
+            .collect();
+        if !distinct_dirs(&keys) {
+            tracing::debug!(table = %self.table_name, "Secondary index runs are not persisted: two keys share a run directory");
+            return;
+        }
+        let persisted_runs = Arc::new(PersistedRuns {
+            table_name: self.table_name.clone(),
+            store,
+            catalog,
+            table_id,
+            root: root.clone(),
+            keys,
+            loaded: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            syncing: AtomicBool::new(false),
+        });
+        if self
+            .persisted_runs
+            .set(Arc::clone(&persisted_runs))
+            .is_err()
+        {
+            return;
+        }
+        let (runs, bytes) = persisted_runs.load().await;
+        let live: HashSet<&str> = live.iter().map(|path| file_name(path)).collect();
+        *self.live_files.lock() = Some(Arc::new(
+            live.iter().map(|&name| name.to_string()).collect(),
+        ));
+        let added: usize = runs.iter().flatten().map(IndexRun::heap_bytes).sum();
+        let loaded: usize = runs.iter().map(Vec::len).sum();
+        {
+            let publishing = self.publish_lock.lock();
+            let fits = self.charge(self.run_bytes().saturating_add(added));
+            if fits {
+                for (shape, runs) in self.shapes.load().iter().zip(runs) {
+                    shape.index.publish_visible(runs, &live);
+                }
+                self.charge(self.run_bytes());
+            }
+            // From here every change to the runs is persisted, and the first
+            // sync removes the persisted runs of files that are gone.
+            persisted_runs.loaded.store(true, Ordering::Release);
+            self.repin();
+            drop(publishing);
+            // Coverage is known from here, so publish it even when the pool
+            // refused the loaded runs: every file then reads as uncovered.
+            self.report_coverage();
+            if !fits {
+                self.report_refusal();
+                return;
+            }
+        }
+        if loaded > 0 {
+            // A file counts as covered once every key's runs hold it.
+            let covered = self
+                .coverage()
+                .and_then(|keys| keys.iter().map(|&(_, covered, _)| covered).min())
+                .unwrap_or(0);
+            tracing::info!(
+                table = %self.table_name,
+                "{}",
+                persisted_runs_loaded_message(&self.table_name, bytes, covered, live.len())
+            );
+        }
     }
 
     /// Reports, per key, how many of the table's current data files its runs
     /// cover and how many they do not yet, on `cayenne_lookup_index_files`.
-    /// Nothing is reported until a scan has listed the table's files.
+    /// Nothing is reported until the table's files are known: at open, when
+    /// it loads persisted runs, or else at the first scan.
     fn report_coverage(&self) {
         for (label, covered, uncovered) in self.coverage().unwrap_or_default() {
             for (coverage, files) in [("covered", covered), ("uncovered", uncovered)] {
@@ -2378,6 +2503,270 @@ impl vortex_datafusion::VortexWriteObserver for RunObserver {
 /// measured in `spiced`.
 const DEFER_FINISH_ROWS: usize = 1 << 20;
 
+/// Whether a table's secondary index runs persist as run files. Hidden,
+/// for testing: `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled`.
+pub(crate) const PERSISTENCE_ENV: &str = "SPICE_CAYENNE_INDEX_PERSISTENCE";
+
+/// Every key's runs, persisted one file per run under the table's
+/// `_lookup_index` directory, which snapshot cleanup never sweeps.
+///
+/// A persisted run is named after the run's content, so persisting is a stateless
+/// sync of the directory against the live runs: write the missing, delete the
+/// rest. It holds file names only, which the module's note on file names makes
+/// safe to trust: at load a run covers only the files still live.
+pub(crate) struct PersistedRuns {
+    table_name: String,
+    store: Arc<dyn ObjectStore>,
+    /// Records which runs are persisted. A run is registered only once its
+    /// file is written, and unregistered before its file is deleted, so every
+    /// registered run has a complete file.
+    catalog: Arc<dyn MetadataCatalog>,
+    table_id: String,
+    /// The directory every key's run directory sits in.
+    root: object_store::path::Path,
+    /// Per key, the name of the directory its runs persist in.
+    keys: Vec<String>,
+    /// Whether the persisted runs have been loaded. Until then a sync would
+    /// delete them.
+    loaded: AtomicBool,
+    /// The latest views to sync, each with its key's directory, taken by the
+    /// running sync.
+    pending: Mutex<Option<Vec<(String, IndexView)>>>,
+    /// Whether a sync is running.
+    syncing: AtomicBool,
+}
+
+impl PersistedRuns {
+    /// Persists `views`' runs in the background, coalescing with any sync
+    /// already running.
+    fn schedule(self: &Arc<Self>, views: Vec<(String, IndexView)>) {
+        let dirs: Vec<String> = views.iter().map(|(dir, _)| dir.clone()).collect();
+        if !self.loaded.load(Ordering::Acquire) || !distinct_dirs(&dirs) {
+            return;
+        }
+        *self.pending.lock() = Some(views);
+        if self.syncing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.syncing.store(false, Ordering::Release);
+            return;
+        };
+        let persisted_runs = Arc::clone(self);
+        runtime.spawn(async move { persisted_runs.sync().await });
+    }
+
+    async fn sync(&self) {
+        loop {
+            let views = self.pending.lock().take();
+            let Some(views) = views else {
+                self.syncing.store(false, Ordering::Release);
+                // Views scheduled after the take above found a sync running.
+                if self.pending.lock().is_some() && !self.syncing.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                return;
+            };
+            if let Err(error) = self.sync_views(&views).await {
+                tracing::debug!(table = %self.table_name, %error, "Persisted secondary index runs were not synced; the next change retries");
+            }
+        }
+    }
+
+    fn path(&self, key: &str, run_name: &str) -> object_store::path::Path {
+        self.root.clone().join(key).join(run_name)
+    }
+
+    async fn sync_views(&self, views: &[(String, IndexView)]) -> Result<(), String> {
+        let registered = self
+            .catalog
+            .list_index_runs(&self.table_id)
+            .await
+            .map_err(|e| format!("list persisted runs: {e}"))?;
+        let mut existing: HashSet<(String, String)> = registered
+            .into_iter()
+            .map(|record| (record.index_key, record.run_name))
+            .collect();
+        for (key, view) in views {
+            for run in view.run_list() {
+                let name = run_file_name(&run);
+                if existing.remove(&(key.clone(), name.clone())) {
+                    continue;
+                }
+                let row_count = run.len() as u64;
+                let bytes = tokio::task::spawn_blocking(move || run.to_bytes())
+                    .await
+                    .map_err(|e| format!("encode persisted run: {e}"))?;
+                let record = IndexRunRecord {
+                    table_id: self.table_id.clone(),
+                    index_key: key.clone(),
+                    run_name: name.clone(),
+                    row_count,
+                    size_bytes: bytes.len() as u64,
+                };
+                let path = self.path(key, &name);
+                self.store
+                    .put(&path, bytes.into())
+                    .await
+                    .map_err(|e| format!("write {path}: {e}"))?;
+                self.catalog
+                    .register_index_run(&record)
+                    .await
+                    .map_err(|e| format!("register {path}: {e}"))?;
+            }
+        }
+        // What is left is registered but no longer wanted: runs merged or
+        // retired since, and runs of a key the table no longer has.
+        for (key, name) in existing {
+            self.remove(&key, &name).await?;
+        }
+        Ok(())
+    }
+
+    /// Unregisters a run, then deletes its file.
+    async fn remove(&self, key: &str, name: &str) -> Result<(), String> {
+        let path = self.path(key, name);
+        self.catalog
+            .remove_index_run(&self.table_id, key, name)
+            .await
+            .map_err(|e| format!("unregister {path}: {e}"))?;
+        match self.store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(format!("delete {path}: {e}")),
+        }
+    }
+
+    /// Every key's persisted runs. A registered run whose file cannot be read
+    /// is unregistered and deleted, and a file no run is registered for, left
+    /// by a write that stopped before registering it, is deleted.
+    async fn load(&self) -> (Vec<Vec<IndexRun>>, u64) {
+        let mut all: Vec<Vec<IndexRun>> = self.keys.iter().map(|_| Vec::new()).collect();
+        let mut bytes = 0_u64;
+        let registered = match self.catalog.list_index_runs(&self.table_id).await {
+            Ok(registered) => registered,
+            Err(error) => {
+                tracing::debug!(table = %self.table_name, %error, "Secondary index runs were not loaded: the persisted runs could not be listed");
+                return (all, bytes);
+            }
+        };
+        let mut kept: HashSet<object_store::path::Path> = HashSet::new();
+        for record in registered {
+            let path = self.path(&record.index_key, &record.run_name);
+            let Some(slot) = self.keys.iter().position(|key| *key == record.index_key) else {
+                // Persisted for a key the table no longer has.
+                if let Err(error) = self.remove(&record.index_key, &record.run_name).await {
+                    tracing::debug!(table = %self.table_name, run_file = %path, %error, "A persisted secondary index run of a removed index was not deleted; the next sync retries");
+                }
+                continue;
+            };
+            match self.read(&path).await {
+                Ok(run) => {
+                    kept.insert(path);
+                    bytes = bytes.saturating_add(record.size_bytes);
+                    all[slot].push(run);
+                }
+                Err(error) => {
+                    tracing::debug!(table = %self.table_name, run_file = %path, %error, "Deleting a persisted secondary index run that cannot be read; its files are indexed again");
+                    if let Err(error) = self.remove(&record.index_key, &record.run_name).await {
+                        tracing::debug!(table = %self.table_name, run_file = %path, %error, "An unreadable persisted secondary index run was not deleted; the next sync retries");
+                    }
+                }
+            }
+        }
+        self.delete_unregistered(&kept).await;
+        (all, bytes)
+    }
+
+    async fn read(&self, path: &object_store::path::Path) -> Result<IndexRun, String> {
+        let bytes = self
+            .store
+            .get(path)
+            .await
+            .map_err(|e| e.to_string())?
+            .bytes()
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::task::spawn_blocking(move || IndexRun::from_bytes(&bytes).map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    /// Deletes every file under the root that `kept` does not list. Runs only
+    /// before the first sync, so no write is in flight.
+    async fn delete_unregistered(&self, kept: &HashSet<object_store::path::Path>) {
+        use futures::TryStreamExt;
+        let listed: Vec<ObjectMeta> = match self.store.list(Some(&self.root)).try_collect().await {
+            Ok(listed) => listed,
+            Err(error) => {
+                tracing::debug!(table = %self.table_name, %error, "Unregistered persisted secondary index runs were not listed; the next open retries");
+                return;
+            }
+        };
+        for meta in listed {
+            if kept.contains(&meta.location) {
+                continue;
+            }
+            if let Err(error) = self.store.delete(&meta.location).await {
+                tracing::debug!(table = %self.table_name, run_file = %meta.location, %error, "An unregistered persisted secondary index run was not deleted; the next open retries");
+            }
+        }
+    }
+}
+
+/// The line a table logs when a schema change alters the encoding of the keys
+/// `labels` name, so their indexes are rebuilt.
+fn rebuilt_index_message(table_name: &str, labels: &[String]) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): the schema change altered the key columns of its secondary index on {}, so the index is rebuilt from the table's files as lookups need it; until then those lookups read every file",
+        labels.join(", ")
+    )
+}
+
+/// The line a reopened table logs once it has loaded its persisted index.
+fn persisted_runs_loaded_message(
+    table_name: &str,
+    bytes: u64,
+    covered: usize,
+    files: usize,
+) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a size shown to one decimal place of a MiB"
+    )]
+    let mib = bytes as f64 / f64::from(1_u32 << 20);
+    let coverage = if covered >= files {
+        format!("covering all {files} of its files")
+    } else {
+        format!(
+            "covering {covered} of its {files} files; the other {} are indexed in the background",
+            files - covered
+        )
+    };
+    format!(
+        "Dataset '{table_name}' (cayenne): loaded its secondary index from disk ({mib:.1} MiB), {coverage}"
+    )
+}
+
+/// Whether every key has a run directory of its own. Keys sharing one would
+/// load each other's runs, and a lookup on one could then miss rows the
+/// other's runs hold, so a table whose keys collide persists nothing.
+fn distinct_dirs(dirs: &[String]) -> bool {
+    let unique: HashSet<&str> = dirs.iter().map(String::as_str).collect();
+    unique.len() == dirs.len()
+}
+
+/// A persisted run's name: a digest of the run's files and size, so the same run
+/// always has the same name.
+fn run_file_name(run: &IndexRun) -> String {
+    let mut descriptor = Vec::new();
+    for file in run.files() {
+        descriptor.extend_from_slice(&(file.len() as u64).to_le_bytes());
+        descriptor.extend_from_slice(file.as_bytes());
+    }
+    descriptor.extend_from_slice(&(run.len() as u64).to_le_bytes());
+    format!("{:016x}.run", hash_index::hash_key_bytes(&[&descriptor]))
+}
+
 /// Counts one probe's coverage, and reports the probe on
 /// `cayenne_lookup_index_probe_total`.
 pub(crate) fn record_probe_outcome(
@@ -2391,15 +2780,6 @@ pub(crate) fn record_probe_outcome(
         telemetry::KeyValue::new("table", table_name.to_string()),
         telemetry::KeyValue::new("shape", shape.to_string()),
     ]);
-}
-
-/// The line a table logs when a schema change alters the encoding of the keys
-/// `labels` name, so their indexes are rebuilt.
-fn rebuilt_index_message(table_name: &str, labels: &[String]) -> String {
-    format!(
-        "Dataset '{table_name}' (cayenne): the schema change altered the key columns of its secondary index on {}, so the index is rebuilt from the table's files as lookups need it; until then those lookups read every file",
-        labels.join(", ")
-    )
 }
 
 /// What the warning says when the memory pool refuses to fit an index.
@@ -3484,6 +3864,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_loaded_runs_message_names_the_table_its_size_and_its_coverage() {
+        assert_eq!(
+            persisted_runs_loaded_message("orders", 5 << 20, 20, 20),
+            "Dataset 'orders' (cayenne): loaded its secondary index from disk (5.0 MiB), covering all 20 of its files"
+        );
+        assert_eq!(
+            persisted_runs_loaded_message("orders", 3 << 19, 18, 20),
+            "Dataset 'orders' (cayenne): loaded its secondary index from disk (1.5 MiB), covering 18 of its 20 files; the other 2 are indexed in the background"
+        );
+        assert_eq!(
+            persisted_runs_loaded_message("orders", 5 << 20, 4, 4),
+            "Dataset 'orders' (cayenne): loaded its secondary index from disk (5.0 MiB), covering all 4 of its files"
+        );
+    }
+
     /// A batch that arrives after its write's index was finished has no run
     /// to join: its file stays uncovered while the finished run still covers
     /// the files it holds in full.
@@ -3725,6 +4121,33 @@ mod tests {
         // A NULL literal matches nothing.
         let null = |column: &str| (column == "tenant").then(|| vec![ScalarValue::Int64(None)]);
         assert!(selection(state.probe(&view, &null)).per_file.is_empty());
+    }
+
+    /// Every key persists its runs in a directory of its own, named by a
+    /// 128-bit digest; keys that shared one would load each other's runs, so
+    /// a set of directories with a repeat is refused.
+    #[test]
+    fn every_key_persists_in_a_directory_of_its_own() {
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        let dirs: Vec<String> = state
+            .shapes
+            .load()
+            .iter()
+            .map(|shape| shape.persisted_dir())
+            .collect();
+        assert_eq!(dirs.len(), 2);
+        assert!(
+            dirs.iter()
+                .all(|dir| dir.len() == 32 && dir.chars().all(|c| c.is_ascii_hexdigit())),
+            "{dirs:?}"
+        );
+        assert!(distinct_dirs(&dirs), "{dirs:?}");
+        assert!(!distinct_dirs(&[
+            dirs[0].clone(),
+            dirs[1].clone(),
+            dirs[0].clone()
+        ]));
     }
 
     #[tokio::test]

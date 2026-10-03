@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
-use cayenne::lookup_index::{LookupIndexCounters, LookupIndexVerification};
+use cayenne::lookup_index::{IndexPersistence, LookupIndexCounters, LookupIndexVerification};
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::provider::CayenneContext;
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
@@ -69,13 +69,15 @@ pub fn memory_mode_config() -> VortexConfig {
 }
 
 /// The table a test opens: its name, schema, `indexes` entries and
-/// configuration, and the column it upserts on, if any.
+/// configuration, the column it upserts on, if any, and whether its index runs
+/// persist, when the test decides rather than the environment.
 pub struct TableSpec<'a> {
     pub name: &'a str,
     pub schema: SchemaRef,
     pub indexes: &'a [&'a [&'a str]],
     pub config: VortexConfig,
     pub upsert_key: Option<&'a str>,
+    pub persistence: Option<IndexPersistence>,
 }
 
 impl<'a> TableSpec<'a> {
@@ -87,6 +89,7 @@ impl<'a> TableSpec<'a> {
             indexes,
             config: file_mode_config(),
             upsert_key: None,
+            persistence: None,
         }
     }
 
@@ -97,6 +100,11 @@ impl<'a> TableSpec<'a> {
 
     pub fn upsert_key(mut self, column: &'a str) -> Self {
         self.upsert_key = Some(column);
+        self
+    }
+
+    pub fn persistence(mut self, persistence: IndexPersistence) -> Self {
+        self.persistence = Some(persistence);
         self
     }
 }
@@ -126,9 +134,13 @@ pub async fn open_table(
     };
     let catalog = Arc::clone(&fixture.catalog);
     let catalog: Arc<dyn MetadataCatalog> = catalog;
+    let builder = CayenneTableProviderBuilder::new(catalog, runtime_env).with_context(context);
+    let builder = match spec.persistence {
+        Some(persistence) => builder.with_index_persistence(persistence),
+        None => builder,
+    };
     Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .with_context(context)
+        builder
             .with_secondary_indexes(
                 spec.indexes
                     .iter()

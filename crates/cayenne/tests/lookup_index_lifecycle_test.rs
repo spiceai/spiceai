@@ -39,9 +39,9 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use cayenne::CayenneTableProvider;
-use cayenne::lookup_index::LookupIndexCounters;
-use cayenne::metadata::VortexConfig;
+use cayenne::lookup_index::{IndexPersistence, LookupIndexCounters};
+use cayenne::metadata::{IndexRunRecord, VortexConfig};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -105,6 +105,25 @@ async fn open(
         fixture,
         runtime_env,
         TableSpec::new(name, schema(), indexes),
+    )
+    .await
+}
+
+/// [`open`], with a table config and index persistence of the test's choosing.
+async fn open_configured(
+    fixture: &common::TestFixture,
+    runtime_env: Arc<RuntimeEnv>,
+    name: &str,
+    indexes: &[&[&str]],
+    vortex_config: VortexConfig,
+    persistence: IndexPersistence,
+) -> Arc<CayenneTableProvider> {
+    open_table(
+        fixture,
+        runtime_env,
+        TableSpec::new(name, schema(), indexes)
+            .config(vortex_config)
+            .persistence(persistence),
     )
     .await
 }
@@ -609,6 +628,375 @@ fn vortex_files(
             by_name.entry(name).or_default().push(path);
         }
     }
+}
+
+/// Run files persisted under `dir`.
+fn run_file_count(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .map(|entry| entry.expect("dir entry").path())
+        .map(|path| {
+            if path.is_dir() {
+                run_file_count(&path)
+            } else {
+                usize::from(path.extension().is_some_and(|ext| ext == "run"))
+            }
+        })
+        .sum()
+}
+
+/// The runs the metastore records as persisted for table `name`.
+async fn registered_runs(fixture: &common::TestFixture, name: &str) -> Vec<IndexRunRecord> {
+    let table_id = fixture
+        .catalog
+        .get_table(name)
+        .await
+        .expect("table metadata")
+        .table_id;
+    fixture
+        .catalog
+        .list_index_runs(&table_id)
+        .await
+        .expect("list persisted runs")
+}
+
+/// Waits until at least `runs` runs are registered and every run file on
+/// disk is a registered one.
+async fn wait_for_persisted_runs(fixture: &common::TestFixture, name: &str, runs: usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let registered = registered_runs(fixture, name).await.len();
+        let files = run_file_count(&fixture.data_path);
+        if registered >= runs && files == registered {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runs were not persisted: {registered} registered, {files} run files"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Every run file under `dir`.
+fn run_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            run_files(&path, found);
+        } else if path.extension().is_some_and(|ext| ext == "run") {
+            found.push(path);
+        }
+    }
+}
+
+/// The metastore, not a directory listing, decides which persisted runs a reopened
+/// table loads. A run file with no registered run (a write that stopped
+/// before registering it) is deleted; a registered run whose file cannot be
+/// read, or is missing, is unregistered and its files are indexed again. The
+/// loaded index still agrees with a read-back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_metastore_decides_which_persisted_runs_a_reopened_table_loads() {
+    const ROWS: usize = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "registered";
+    let config = || VortexConfig {
+        target_vortex_file_size_mb: 1,
+        ..VortexConfig::default()
+    };
+    let table = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
+    let rows_i64 = i64::try_from(ROWS).expect("fits");
+    insert(&table, name, rows(rows_i64, 3_000)).await;
+    insert(&table, name, rows(rows_i64 * 2, 3_000)).await;
+    wait_for_persisted_runs(&fixture, name, 3).await;
+    drop(table);
+
+    let registered = registered_runs(&fixture, name).await;
+    let mut files = Vec::new();
+    run_files(&fixture.data_path, &mut files);
+    let file_of = |record: &IndexRunRecord| {
+        files
+            .iter()
+            .find(|path| {
+                path.file_name().is_some_and(|n| *n == *record.run_name)
+                    && path
+                        .parent()
+                        .and_then(|dir| dir.file_name())
+                        .is_some_and(|n| *n == *record.index_key)
+            })
+            .cloned()
+            .expect("every registered run has its file")
+    };
+    // A registered run whose file is corrupt.
+    let corrupt = registered[0].clone();
+    let corrupt_file = file_of(&corrupt);
+    std::fs::write(&corrupt_file, b"not a run").expect("corrupt a persisted run");
+    // A run file no run is registered for.
+    let orphan_file = corrupt_file.with_file_name("00000000deadbeef.run");
+    std::fs::copy(file_of(&registered[1]), &orphan_file).expect("write an orphan persisted run");
+    // A registered run with no file.
+    let phantom = IndexRunRecord {
+        run_name: "00000000feedface.run".to_string(),
+        ..registered[1].clone()
+    };
+    fixture
+        .catalog
+        .register_index_run(&phantom)
+        .await
+        .expect("register a run with no file");
+
+    let reopened = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    let after: Vec<String> = registered_runs(&fixture, name)
+        .await
+        .into_iter()
+        .map(|record| record.run_name)
+        .collect();
+    assert!(
+        !orphan_file.exists(),
+        "a run file with no registered run must be deleted at open"
+    );
+    assert!(
+        !after.contains(&corrupt.run_name) && !corrupt_file.exists(),
+        "a registered run that cannot be read must be unregistered and deleted: {after:?}"
+    );
+    assert!(
+        !after.contains(&phantom.run_name),
+        "a registered run with no file must be unregistered: {after:?}"
+    );
+    assert_eq!(
+        after.len(),
+        registered.len() - 1,
+        "the readable runs stay registered: {after:?}"
+    );
+    let verification = reopened
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    println!(
+        "after reopening with a corrupt, an orphan and a phantom persisted run: {verification:?}"
+    );
+    assert!(verification.agrees(), "{verification:?}");
+    assert!(
+        verification.uncovered_files > 0,
+        "the corrupt run's files are no longer covered by a loaded run: {verification:?}"
+    );
+    let ids = [3, rows_i64 + 5, rows_i64 * 2 + 7];
+    assert_eq!(dynamic_lookup(&reopened, name, &ids).await, ids);
+}
+
+/// With persisted runs, a reopened table loads its index runs instead of reading
+/// its files back: on reopen every file is covered before any build runs, and
+/// the loaded runs agree row for row with a read-back. Without them the same
+/// reopen starts uncovered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reopened_table_loads_its_persisted_runs() {
+    const ROWS: usize = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "persisted_runs";
+    let config = || VortexConfig {
+        target_vortex_file_size_mb: 1,
+        ..VortexConfig::default()
+    };
+    let table = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
+    let rows_i64 = i64::try_from(ROWS).expect("fits");
+    insert(&table, name, rows(rows_i64, 3_000)).await;
+    insert(&table, name, rows(rows_i64 * 2, 3_000)).await;
+    // One run per write, each persisted in the background.
+    wait_for_persisted_runs(&fixture, name, 3).await;
+    drop(table);
+
+    let reopened = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    let verification = reopened
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    println!("after reopening with persisted runs: {verification:?}");
+    assert!(verification.agrees(), "{verification:?}");
+    assert_eq!(
+        (
+            verification.uncovered_files,
+            counters(&reopened).builds_started
+        ),
+        (0, 0),
+        "a reopened table must be covered by its persisted runs, not by a build: {verification:?}"
+    );
+    let before = counters(&reopened);
+    lookup(&reopened, name, rows_i64 * 2 + 7).await;
+    let after = counters(&reopened);
+    assert_eq!(
+        (after.full - before.full, after.none - before.none),
+        (1, 0),
+        "the first lookup after reopening did not use the loaded index: {after:?}"
+    );
+    drop(reopened);
+
+    let without = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Disabled,
+    )
+    .await;
+    let verification = without
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    assert!(
+        verification.files == 0 && verification.uncovered_files > 0,
+        "without persisted runs a reopened table starts uncovered: {verification:?}"
+    );
+}
+
+/// Relaxing a key column from `NOT NULL` to nullable is an in-place schema
+/// evolution: the table keeps its id and its persisted runs. A nullable column
+/// encodes each value behind a validity byte, so a run built while the column
+/// was `NOT NULL` holds other words for the same keys. A reopened table must not
+/// answer lookups from those runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_column_relaxed_to_nullable_does_not_reuse_its_persisted_runs() {
+    const ROWS: usize = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "relaxed";
+    let config = || VortexConfig {
+        target_vortex_file_size_mb: 1,
+        ..VortexConfig::default()
+    };
+    let table = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
+    wait_for_persisted_runs(&fixture, name, 1).await;
+    drop(table);
+
+    let stored = fixture
+        .catalog
+        .get_table(name)
+        .await
+        .expect("table metadata");
+    let relaxed = Arc::new(Schema::new(
+        stored
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let field = field.as_ref().clone();
+                if field.name() == "ServiceId" {
+                    field.with_nullable(true)
+                } else {
+                    field
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    fixture
+        .catalog
+        .update_table_schema(&stored.table_id, &relaxed)
+        .await
+        .expect("relax ServiceId to nullable");
+    let stale: Vec<String> = registered_runs(&fixture, name)
+        .await
+        .into_iter()
+        .map(|record| record.index_key)
+        .collect();
+
+    let reopened = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    let verification = reopened
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    println!("after relaxing a key column to nullable: {verification:?}");
+    assert!(verification.agrees(), "{verification:?}");
+    assert_eq!(
+        verification.files, 0,
+        "no run built before the column became nullable may cover a file: {verification:?}"
+    );
+    let kept: Vec<String> = registered_runs(&fixture, name)
+        .await
+        .into_iter()
+        .map(|record| record.index_key)
+        .filter(|key| stale.contains(key))
+        .collect();
+    assert!(
+        kept.is_empty(),
+        "the runs built before the column became nullable must be deleted: {kept:?}"
+    );
+    lookup(&reopened, name, 7).await;
+    // The index heals: a lookup over the uncovered files rebuilds it, after
+    // which every file is covered again and lookups use it.
+    let healed = until_covered(&reopened, async || lookup(&reopened, name, 7).await).await;
+    println!("after the rebuild: {healed:?}");
+    assert!(healed.agrees(), "{healed:?}");
+    let before = counters(&reopened);
+    lookup(&reopened, name, 7).await;
+    assert_eq!(
+        counters(&reopened).full - before.full,
+        1,
+        "a lookup after the rebuild must use the index"
+    );
 }
 
 /// A key column relaxed to nullable on an open table: rows written after it,

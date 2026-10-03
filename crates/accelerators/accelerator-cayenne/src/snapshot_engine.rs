@@ -215,11 +215,14 @@ async fn unreferenced_data_entries(
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().into_owned();
         if Some(&name) == table_id.as_ref() {
-            // `<table_id>/<snapshot_id>/`: keep the referenced snapshots.
+            // `<table_id>/<snapshot_id>/`: keep the referenced snapshots, and
+            // the persisted secondary index runs the slice registers (a file
+            // no run is registered for is deleted when the table opens).
             let mut children = tokio::fs::read_dir(entry.path()).await?;
             while let Some(child) = children.next_entry().await? {
                 let child_name = child.file_name().to_string_lossy().into_owned();
-                if !referenced.contains(&child_name) {
+                if child_name != cayenne::LOOKUP_INDEX_DIR_NAME && !referenced.contains(&child_name)
+                {
                     skip.insert(PathBuf::from(&name).join(child_name));
                 }
             }
@@ -871,5 +874,403 @@ mod tests {
             "msg={msg}"
         );
         assert!(msg.contains("older Spice"), "msg={msg}");
+    }
+
+    mod persisted_runs {
+        //! Persisted secondary index runs across an acceleration snapshot,
+        //! written and restored the way the runtime does it: the engine's plan
+        //! applied to the layout's two directories, archived, and extracted
+        //! into a reader's own directories.
+
+        use super::*;
+        use arrow::array::{Int64Array, RecordBatch, StringArray};
+        use cayenne::lookup_index::IndexPersistence;
+        use cayenne::metadata::VortexConfig;
+        use cayenne::provider::CayenneContext;
+        use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder};
+        use datafusion::datasource::TableProvider;
+        use datafusion::execution::runtime_env::RuntimeEnv;
+        use datafusion::prelude::SessionContext;
+        use runtime_acceleration::snapshot::directory_archive::{
+            ExtractOptions, archive_directories_to_file_with_plan,
+            extract_archive_file_with_options,
+        };
+        use std::path::Path;
+        use std::time::{Duration, Instant};
+
+        const NAME: &str = "orders";
+
+        fn orders_schema() -> Arc<arrow_schema::Schema> {
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+                arrow_schema::Field::new("tenant", arrow_schema::DataType::Int64, false),
+                arrow_schema::Field::new("service", arrow_schema::DataType::Utf8, false),
+            ]))
+        }
+
+        fn rows(offset: i64, count: i64) -> RecordBatch {
+            let ids: Vec<i64> = (offset..offset + count).collect();
+            RecordBatch::try_new(
+                orders_schema(),
+                vec![
+                    Arc::new(Int64Array::from(ids.clone())),
+                    Arc::new(Int64Array::from(
+                        ids.iter().map(|id| id % 97).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        ids.iter().map(|id| format!("sv-{id}")).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("batch")
+        }
+
+        async fn open(
+            env: &Arc<RuntimeEnv>,
+            catalog: Arc<CayenneCatalog>,
+            data_dir: &Path,
+            persistence: IndexPersistence,
+        ) -> Arc<CayenneTableProvider> {
+            let config = VortexConfig {
+                target_vortex_file_size_mb: 1,
+                ..VortexConfig::default()
+            };
+            let context = CayenneContext::new(&config, Arc::clone(env), NAME);
+            let catalog: Arc<dyn MetadataCatalog> = catalog;
+            Arc::new(
+                CayenneTableProviderBuilder::new(catalog, Arc::clone(env))
+                    .with_context(context)
+                    .with_index_persistence(persistence)
+                    .with_secondary_indexes(vec![vec!["tenant".to_string(), "service".to_string()]])
+                    .create(CreateTableOptions {
+                        table_name: NAME.to_string(),
+                        schema: orders_schema(),
+                        primary_key: vec![],
+                        on_conflict: None,
+                        base_path: data_dir.to_string_lossy().into_owned(),
+                        partition_column: None,
+                        vortex_config: config,
+                    })
+                    .await
+                    .expect("create or reopen table"),
+            )
+        }
+
+        async fn append(table: &Arc<CayenneTableProvider>, batch: RecordBatch) {
+            let ctx = SessionContext::new();
+            ctx.register_table(NAME, Arc::clone(table) as Arc<dyn TableProvider>)
+                .expect("register");
+            ctx.register_batch("src", batch).expect("source");
+            ctx.sql(&format!("INSERT INTO {NAME} SELECT * FROM src"))
+                .await
+                .expect("plan insert")
+                .collect()
+                .await
+                .expect("insert");
+        }
+
+        /// Rows returned by an index lookup of row `id`'s key.
+        async fn lookup(table: &Arc<CayenneTableProvider>, id: i64) -> usize {
+            let ctx = SessionContext::new();
+            ctx.register_table(NAME, Arc::clone(table) as Arc<dyn TableProvider>)
+                .expect("register");
+            ctx.sql(&format!(
+                "SELECT id FROM {NAME} WHERE tenant = {} AND service = 'sv-{id}'",
+                id % 97
+            ))
+            .await
+            .expect("plan lookup")
+            .collect()
+            .await
+            .expect("lookup")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+        }
+
+        fn run_files(dir: &Path) -> usize {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            entries
+                .map(|entry| entry.expect("dir entry").path())
+                .map(|path| {
+                    if path.is_dir() {
+                        run_files(&path)
+                    } else {
+                        usize::from(path.extension().is_some_and(|ext| ext == "run"))
+                    }
+                })
+                .sum()
+        }
+
+        /// The table's registered runs once at least `runs` are registered and
+        /// every run file on disk is a registered one.
+        async fn persisted(
+            catalog: &Arc<CayenneCatalog>,
+            data_dir: &Path,
+            runs: usize,
+        ) -> Vec<(String, String)> {
+            let table_id = catalog.get_table(NAME).await.expect("table").table_id;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let registered = catalog.list_index_runs(&table_id).await.expect("list runs");
+                if registered.len() >= runs && run_files(data_dir) == registered.len() {
+                    let mut names: Vec<(String, String)> = registered
+                        .into_iter()
+                        .map(|run| (run.index_key, run.run_name))
+                        .collect();
+                    names.sort();
+                    return names;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the runs were not persisted: {} registered and {} run files, expected at least {runs}",
+                    registered.len(),
+                    run_files(data_dir)
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Archives the writer's two directories as an acceleration snapshot.
+        async fn snapshot(catalog: &Arc<CayenneCatalog>, meta: &Path, data: &Path, archive: &Path) {
+            let dirs = vec![
+                (meta.to_path_buf(), "metadata/".to_string()),
+                (data.to_path_buf(), "data/".to_string()),
+            ];
+            let plan = CayenneSnapshotEngine::new(
+                Arc::clone(catalog) as Arc<dyn MetadataCatalog>,
+                NAME,
+                data.to_path_buf(),
+            )
+            .prepare_directory_snapshot(&dirs, NAME)
+            .await
+            .expect("prepare snapshot");
+            let extras: Vec<(String, Vec<u8>)> = plan
+                .extra_entries
+                .iter()
+                .map(|extra| (extra.archive_path.clone(), extra.bytes.clone()))
+                .collect();
+            archive_directories_to_file_with_plan(
+                &dirs,
+                archive,
+                &plan.skip_relative_paths.iter().cloned().collect::<Vec<_>>(),
+                &extras,
+            )
+            .await
+            .expect("archive");
+        }
+
+        /// Bootstraps a reader from `archive` into `root`'s own directories.
+        async fn restore(archive: &Path, root: &Path) -> (Arc<CayenneCatalog>, PathBuf) {
+            let (meta, data) = (root.join("metadata"), root.join("data"));
+            std::fs::create_dir_all(&meta).expect("mkdir");
+            std::fs::create_dir_all(&data).expect("mkdir");
+            let catalog = fresh_catalog(&meta).await;
+            extract_archive_file_with_options(
+                archive,
+                &meta,
+                ExtractOptions {
+                    prefix_mappings: Some(vec![
+                        ("metadata/".to_string(), meta.clone()),
+                        ("data/".to_string(), data.clone()),
+                    ]),
+                    ..ExtractOptions::skip_existing()
+                },
+            )
+            .await
+            .expect("extract");
+            CayenneSnapshotEngine::new(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                NAME,
+                data.clone(),
+            )
+            .finalize_directory_snapshot(
+                &[
+                    (meta.clone(), "metadata/".to_string()),
+                    (data.clone(), "data/".to_string()),
+                ],
+                NAME,
+            )
+            .await
+            .expect("finalize snapshot");
+            (catalog, data)
+        }
+
+        /// A writer with two persisted runs; returns its catalog and data dir.
+        async fn writer(
+            env: &Arc<RuntimeEnv>,
+            root: &Path,
+        ) -> (Arc<CayenneCatalog>, PathBuf, PathBuf) {
+            let (meta, data) = (root.join("metadata"), root.join("data"));
+            std::fs::create_dir_all(&meta).expect("mkdir");
+            std::fs::create_dir_all(&data).expect("mkdir");
+            let catalog = fresh_catalog(&meta).await;
+            let table = open(env, Arc::clone(&catalog), &data, IndexPersistence::Enabled).await;
+            append(&table, rows(0, 20_000)).await;
+            append(&table, rows(20_000, 5_000)).await;
+            persisted(&catalog, &data, 2).await;
+            (catalog, meta, data)
+        }
+
+        /// A table's persisted secondary index runs travel with its
+        /// acceleration snapshot: the run files are archived with the data
+        /// directory, their registrations with the metastore slice, and a
+        /// reader that bootstraps into directories of its own reopens covered
+        /// by them — no build, and a first lookup answered from the index. The
+        /// same restore without persistence starts uncovered.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn persisted_index_runs_travel_with_a_snapshot() {
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let table_id = catalog.get_table(NAME).await.expect("table").table_id;
+            let expected = persisted(&catalog, &data, 2).await;
+            let archive = tmp.path().join("snapshot.tar");
+            snapshot(&catalog, &meta, &data, &archive).await;
+
+            let (reader_catalog, reader_data) = restore(&archive, &tmp.path().join("r")).await;
+            assert_eq!(
+                reader_catalog
+                    .get_table(NAME)
+                    .await
+                    .expect("table")
+                    .table_id,
+                table_id,
+                "the restore keeps the table's id, which its run files are filed under"
+            );
+            assert_eq!(
+                persisted(&reader_catalog, &reader_data, expected.len()).await,
+                expected,
+                "the snapshot carries every run, registered and on disk"
+            );
+            let reader = open(
+                &env,
+                reader_catalog,
+                &reader_data,
+                IndexPersistence::Enabled,
+            )
+            .await;
+            let verification = reader
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            assert!(verification.agrees(), "{verification:?}");
+            let counters = reader.lookup_index_counters().expect("indexed");
+            assert_eq!(
+                (verification.uncovered_files, counters.builds_started),
+                (0, 0),
+                "a restored table must be covered by its persisted runs, not by a build: {verification:?}"
+            );
+            assert_eq!(lookup(&reader, 24_007).await, 1);
+            let after = reader.lookup_index_counters().expect("indexed");
+            assert_eq!(
+                (after.full - counters.full, after.none - counters.none),
+                (1, 0),
+                "the first lookup after the restore did not use the loaded index: {after:?}"
+            );
+            drop(reader);
+
+            let (control_catalog, control_data) = restore(&archive, &tmp.path().join("c")).await;
+            let control = open(
+                &env,
+                control_catalog,
+                &control_data,
+                IndexPersistence::Disabled,
+            )
+            .await;
+            let verification = control
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            assert!(
+                verification.files == 0 && verification.uncovered_files > 0,
+                "without persistence a restored table starts uncovered: {verification:?}"
+            );
+        }
+
+        /// A snapshot taken while the index is behind — a write whose run was
+        /// not persisted yet — restores with that write's files uncovered.
+        /// Lookups stay correct by reading them in full, and the first lookup
+        /// that meets them starts the background build that indexes them, so
+        /// the restored table catches up with no step of its own.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_snapshot_taken_behind_the_index_catches_up_after_restore() {
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, meta, data) = writer(&env, &tmp.path().join("w")).await;
+            // A third write whose run is never persisted: the writer reopened
+            // without persistence leaves the other two runs where they are.
+            let behind = open(
+                &env,
+                Arc::clone(&catalog),
+                &data,
+                IndexPersistence::Disabled,
+            )
+            .await;
+            append(&behind, rows(25_000, 5_000)).await;
+            drop(behind);
+            assert_eq!(
+                persisted(&catalog, &data, 2).await.len(),
+                2,
+                "the third run is not persisted"
+            );
+            let archive = tmp.path().join("snapshot.tar");
+            snapshot(&catalog, &meta, &data, &archive).await;
+
+            let (reader_catalog, reader_data) = restore(&archive, &tmp.path().join("r")).await;
+            let reader = open(
+                &env,
+                reader_catalog,
+                &reader_data,
+                IndexPersistence::Enabled,
+            )
+            .await;
+            let restored = reader
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            assert!(
+                restored.files > 0 && restored.uncovered_files > 0,
+                "the restored runs cover the persisted writes only: {restored:?}"
+            );
+
+            // A key the unpersisted write holds: found by reading its files in
+            // full, and the lookup that did so asks for them to be indexed.
+            // Two queries meet the uncovered files at once: each is correct,
+            // and only one background build starts between them.
+            let (first, second) = tokio::join!(lookup(&reader, 27_003), lookup(&reader, 28_004));
+            assert_eq!((first, second), (1, 1), "lookups are correct while behind");
+            let deadline = Instant::now() + Duration::from_mins(1);
+            let caught_up = loop {
+                let verification = reader
+                    .verify_lookup_index_against_read_back()
+                    .await
+                    .expect("verify");
+                if verification.uncovered_files == 0 {
+                    break verification;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the restored index never caught up: {verification:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            assert!(caught_up.agrees(), "{caught_up:?}");
+            let counters = reader.lookup_index_counters().expect("indexed");
+            assert_eq!(
+                counters.builds_started, 1,
+                "two concurrent lookups started exactly one background build: {counters:?}"
+            );
+            let before = counters;
+            assert_eq!(lookup(&reader, 27_003).await, 1);
+            let after = reader.lookup_index_counters().expect("indexed");
+            assert_eq!(
+                (after.full - before.full, after.none - before.none),
+                (1, 0),
+                "once caught up, the lookup is answered from the index: {after:?}"
+            );
+        }
     }
 }
