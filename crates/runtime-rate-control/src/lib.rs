@@ -722,12 +722,16 @@ mod tests {
             .await
             .expect("acquire all");
 
-        // The cap is reached: no slot is left, so a sixth acquire cannot
-        // complete on its first poll.
+        // The cap is reached: no slot is left, so a sixth acquire waits for one.
+        // Bounded by time rather than checked on its first poll: the
+        // controller's acquire ends in its jitter sleep, and even a zero-length
+        // sleep is pending on its first poll, so a first-poll check would pass
+        // whether or not the cap held. Nothing frees a slot while it waits.
         assert_eq!(rate_controller.available_permits(), Some(0));
-        let blocked = rate_controller.acquire().now_or_never();
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(50), rate_controller.acquire()).await;
         assert!(
-            blocked.is_none(),
+            blocked.is_err(),
             "semaphore should have blocked, got {blocked:?}"
         );
 
@@ -843,8 +847,11 @@ mod tests {
         controller.acquire().await.expect("acquire within lease");
 
         // With the lease drained, the next acquire cannot complete on its
-        // first poll: it has to wait for the next window.
-        let blocked = controller.acquire().now_or_never();
+        // first poll: it has to wait for the next window. The bucket is polled
+        // directly because the controller's acquire ends in its jitter sleep,
+        // and even a zero-length sleep is pending on its first poll, so a
+        // controller-level poll would read as blocked whatever the lease said.
+        let blocked = controller.leased_buckets[0].acquire().now_or_never();
         assert!(
             blocked.is_none(),
             "should have blocked, lease was {granted}, got {blocked:?}"
