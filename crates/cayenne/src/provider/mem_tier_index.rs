@@ -35,12 +35,13 @@ limitations under the License.
 //! lacks a key column — is read whole.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
 use datafusion_common::ScalarValue;
 
 use super::lookup_index::{
+    WarnOnce,
     Counters, Coverage, KeyColumn, KeySpec, LookupIndexCounters, LookupIndexScanReason, cast_to,
     key_converter, key_tuples, record_probe_outcome,
 };
@@ -63,9 +64,9 @@ pub(crate) struct MemTierIndexer {
     table_name: String,
     keys: Vec<ResolvedKey>,
     account: Arc<CayenneMemoryAccount>,
-    /// Whether a refused batch has been reported yet, so the warning is logged
-    /// once per table rather than once per batch.
-    refusal_reported: AtomicBool,
+    /// A refused batch, reported at `warn` once per table rather than once
+    /// per batch.
+    refusal: WarnOnce,
     counters: Counters,
 }
 
@@ -125,7 +126,7 @@ impl MemTierIndexer {
             table_name: table_name.to_string(),
             keys,
             account,
-            refusal_reported: AtomicBool::new(false),
+            refusal: WarnOnce::default(),
             counters: Counters::default(),
         }))
     }
@@ -176,13 +177,13 @@ impl MemTierIndexer {
             self.counters
                 .builds_unpublished
                 .fetch_add(1, Ordering::Relaxed);
-            if !self.refusal_reported.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    table = %self.table_name,
+            self.refusal.report(
+                &self.table_name,
+                &format!(
                     "Dataset '{}' (cayenne): part of its secondary index was not built because the query memory pool cannot fit it, so lookups read those rows in full. Raise `runtime.query.memory_limit` or remove the entry from `indexes`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
                     self.table_name
-                );
-            }
+                ),
+            );
             return None;
         };
         self.counters

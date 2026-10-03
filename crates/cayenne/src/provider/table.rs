@@ -2752,8 +2752,10 @@ pub struct CayenneTableProviderBuilder {
     index_word_bits: Option<u32>,
 }
 
-/// Resolves every configured lookup-index column before table creation/open.
-/// Returning the resolved specs lets `create` fail before it mutates the
+/// Resolves every configured lookup-index column before table creation/open,
+/// and returns the keys over the table's spelling of their columns: a key
+/// column resolves whatever case `indexes` spelled it in, and a filter names
+/// the table column. Resolving first lets `create` fail before it mutates the
 /// catalog, while `open` repeats the check against the persisted schema. A
 /// file-mode table's index also needs a column type it can encode.
 fn validated_lookup_index_keys(
@@ -2766,8 +2768,9 @@ fn validated_lookup_index_keys(
         table: table_name.to_string(),
         message,
     };
-    let keys = super::lookup_index::KeySpec::from_indexes(indexes);
-    for key in &keys {
+    let mut keys: Vec<super::lookup_index::KeySpec> = Vec::new();
+    for key in super::lookup_index::KeySpec::from_indexes(indexes) {
+        let mut columns = Vec::with_capacity(key.columns().len());
         for column in key.columns() {
             let column =
                 super::lookup_index::KeyColumn::resolve(schema, column).map_err(invalid)?;
@@ -2779,6 +2782,11 @@ fn validated_lookup_index_keys(
                     ))
                 })?;
             }
+            columns.push(column.name);
+        }
+        // Two entries spelling one key's columns in different case are one key.
+        if !keys.iter().any(|existing| existing.columns() == columns) {
+            keys.push(key.with_columns(columns));
         }
     }
     Ok(keys)
@@ -35764,7 +35772,8 @@ impl CayenneTableProvider {
     }
 
     /// Diffs the published secondary index runs against a read-back of the
-    /// current snapshot's files they cover.
+    /// files they cover that a lookup reads: the current snapshot's and the
+    /// protected snapshots'.
     ///
     /// A write's runs take their positions from the writer, which is only
     /// correct while the writer appends batches in the order it reports them.
@@ -35789,10 +35798,20 @@ impl CayenneTableProvider {
         let (snapshot_id, store, files, view) = {
             let _fence = self.listing_fence.read().await;
             let snapshot_id = self.get_current_snapshot_id();
-            let (store, files) = self
+            let (store, mut files) = self
                 .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
                 .await
                 .ok_or_else(|| "could not list the current snapshot's files".to_string())?;
+            // A lookup reads the protected snapshots' files too.
+            let (_, protected_files) = self
+                .lookup_index_protected_files(&self.protected_snapshots.load_full())
+                .await
+                .map_err(|error| format!("could not list the protected snapshots' files: {error}"))?;
+            files.extend(
+                protected_files
+                    .into_iter()
+                    .map(|path| super::lookup_index::IndexedFile { path }),
+            );
             let view = state.published();
             (snapshot_id, store, files, view)
         };
@@ -35973,9 +35992,9 @@ impl CayenneTableProvider {
         });
     }
 
-    /// Lists the current snapshot's files and starts the background build
-    /// `claim` holds over the ones no run covers, or frees the claim when the
-    /// files cannot be listed.
+    /// Lists the files a lookup reads, the current snapshot's and the protected
+    /// snapshots', and starts the background build `claim` holds over the ones
+    /// no run covers, or frees the claim when the files cannot be listed.
     async fn start_lookup_index_build(self: &Arc<Self>, claim: super::lookup_index::BuildClaim) {
         let Some(index_state) = &self.lookup_index else {
             return;
@@ -36076,16 +36095,7 @@ impl CayenneTableProvider {
                 ));
                 (Some(selection), explain)
             }
-            super::lookup_index::LookupProbe::Fallback(explain) => {
-                if explain.outcome
-                    == super::lookup_index::LookupIndexExplainOutcome::Probed(
-                        super::lookup_index::Coverage::Unindexed,
-                    )
-                {
-                    self.shared_handle().request_runtime_lookup_index_build();
-                }
-                (None, explain)
-            }
+            super::lookup_index::LookupProbe::Fallback(explain) => (None, explain),
         };
         Some((selection, explain))
     }
@@ -37015,9 +37025,7 @@ impl TableProvider for CayenneTableProvider {
         // schema-evolution, and joins plan on view arrays. See `viewify_read_schema`.
         // Protected snapshots are narrowed by the same selection, against their
         // own files.
-        let protected_lookup_selection = lookup_selection
-            .as_ref()
-            .map(super::lookup_index::LookupSelection::unrecorded);
+        let protected_lookup_selection = lookup_selection.clone();
         let protected_pinned_lookup_index = pinned_lookup_index.clone();
         let listing_scan_start = Instant::now();
         let main_plan_result = self
@@ -37065,14 +37073,16 @@ impl TableProvider for CayenneTableProvider {
                 pinned_lookup_index: protected_pinned_lookup_index,
             })
             .await?;
-        // One decision for the whole scan: a key found only in a protected
-        // snapshot is still a selection.
+        // One decision for the whole scan, recorded once: a key found only in
+        // a protected snapshot is still a selection.
         if let Some(main) = lookup_index_explain.take() {
-            lookup_index_explain = Some(
-                protected_explains
-                    .into_iter()
-                    .fold(main, super::lookup_index::LookupIndexExplain::merge),
-            );
+            let explain = protected_explains
+                .into_iter()
+                .fold(main, super::lookup_index::LookupIndexExplain::merge);
+            if let Some(state) = &self.lookup_index {
+                state.record_lookup(&explain);
+            }
+            lookup_index_explain = Some(explain);
         }
 
         // Build the COLD object-store tier branch (storage-cascade bottom tier) from
