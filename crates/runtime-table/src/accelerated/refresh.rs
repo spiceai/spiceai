@@ -856,8 +856,14 @@ impl Refresher {
         };
 
         // The acceleration's last refresh, as its checkpoint records it, is reported
-        // from startup rather than only after the first refresh in this process.
-        if let Some(checkpointer) = &self.checkpointer
+        // from startup rather than only after the first refresh in this process. Only
+        // a refresh writes the checkpoint of a dataset that neither creates snapshots
+        // (whose interval checkpoints without refreshing) nor was restored from one
+        // (whose checkpoint is the snapshot's); for those, the last refresh is
+        // reported once one completes.
+        if self.snapshot_config.is_none()
+            && !self.bootstrap_status.is_bootstrapped()
+            && let Some(checkpointer) = &self.checkpointer
             && let Ok(Some(last_refresh)) = checkpointer.last_checkpoint_time().await
         {
             self.runtime_status
