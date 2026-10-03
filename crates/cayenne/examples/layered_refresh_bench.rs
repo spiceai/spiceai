@@ -112,12 +112,18 @@ fn source(keys: usize, passes: usize, progress_rows: usize) -> SendableRecordBat
     let started = Instant::now();
     let mut mark = (0_usize, started);
     let total = total_rows(keys, passes);
+    // `--key-order sorted` emits each pass in key order instead, which the first
+    // load cannot cut split points from, so it hashes its key.
+    let sorted = arg("--key-order", "scrambled") == "sorted";
     let batches = (0..total.div_ceil(BATCH)).map(move |b| {
         let start = b * BATCH;
         let end = (start + BATCH).min(total);
         let scrambled: Vec<u64> = (start..end)
             .map(|row| {
                 let k = (row % keys) as u64;
+                if sorted {
+                    return k;
+                }
                 // A bijection on 0..keys when keys is odd-coprime; spreads keys
                 // across the key space so every batch spans the range.
                 (k.wrapping_mul(2_654_435_761)) % keys as u64

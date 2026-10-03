@@ -36167,6 +36167,29 @@ impl CayenneTableProvider {
         Some((store, files))
     }
 
+    /// The footer statistics of one file a refresh just wrote, indexed by the
+    /// table schema. Read straight from the footer: nothing is cached against
+    /// the snapshot or persisted, since the snapshot is not yet published.
+    pub(crate) async fn written_file_statistics(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        file: &super::lookup_index::IndexedFile,
+    ) -> datafusion_common::Result<Statistics> {
+        let object = ObjectMeta {
+            location: ObjectStorePath::from(file.path.as_str()),
+            last_modified: chrono::DateTime::from_timestamp_millis(file.last_modified_ms)
+                .unwrap_or_default(),
+            size: file.size,
+            e_tag: None,
+            version: None,
+        };
+        self.context
+            .file_format()
+            .infer_stats(state, store, self.table_schema(), &object)
+            .await
+    }
+
     /// Digest of the single primary-key point this scan's filters constrain, for
     /// transaction read-footprint capture. Returns `None` unless the filters pin
     /// every PK column to an equality literal (a partial-key or unbounded read),
