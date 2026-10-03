@@ -57,8 +57,8 @@ use super::on_conflict::{
     PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
     PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
-    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
-    pk_deletion_snapshot_for_strategy,
+    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
+    ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
@@ -2524,13 +2524,16 @@ pub struct CayenneTableProvider {
     /// Runs claimed by in-flight subset merges, which keeps concurrent merges
     /// on disjoint inputs. See [`ProtectedMergeClaims`].
     protected_merge_claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
-    /// Coalesces write-driven compaction notifications so a high-ingest table
-    /// does not spawn one background compaction task per append while a prior
-    /// notification is still pending.
-    post_write_compaction_scheduled: Arc<AtomicBool>,
+    /// Coalescing state of write-driven compaction — one of
+    /// [`COALESCED_TASK_IDLE`], [`COALESCED_TASK_RUNNING`],
+    /// [`COALESCED_TASK_RUNNING_DIRTY`] — so a high-ingest table does not spawn
+    /// one background compaction task per append, and a request raised while a
+    /// pass runs is re-evaluated once it ends
+    /// (see [`coalesced_task_state_after_signal`]).
+    post_write_compaction_state: Arc<AtomicU8>,
     /// Coalescing state of the orphaned-deletion-vector cleanup sweep — one of
-    /// [`ORPHAN_DV_SWEEP_IDLE`], [`ORPHAN_DV_SWEEP_RUNNING`],
-    /// [`ORPHAN_DV_SWEEP_RUNNING_DIRTY`]. Signalled by every publication that can
+    /// [`COALESCED_TASK_IDLE`], [`COALESCED_TASK_RUNNING`],
+    /// [`COALESCED_TASK_RUNNING_DIRTY`]. Signalled by every publication that can
     /// raise the surviving-sequence floor and so orphan key DVs, and once at open
     /// to drain a backlog an earlier process left behind. At most one sweep runs
     /// on the dedicated compaction runtime; a signal raised while it runs marks
@@ -3629,30 +3632,105 @@ static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// backlog larger than one batch still drains without a further signal.
 const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 4096;
 
-/// `orphan_dv_sweep_state`: no sweep scheduled or running.
-const ORPHAN_DV_SWEEP_IDLE: u8 = 0;
-/// `orphan_dv_sweep_state`: exactly one worker is running and no later signal is
-/// outstanding.
-const ORPHAN_DV_SWEEP_RUNNING: u8 = 1;
-/// `orphan_dv_sweep_state`: a worker is running AND a signal arrived after it
-/// began, so the floor it captured may already be stale. The worker takes another
-/// pass before it may return to [`ORPHAN_DV_SWEEP_IDLE`].
-const ORPHAN_DV_SWEEP_RUNNING_DIRTY: u8 = 2;
+/// State of a coalesced background task — the orphaned-DV sweep
+/// (`orphan_dv_sweep_state`) and the post-write compaction pass
+/// (`post_write_compaction_state`): no task scheduled or running.
+const COALESCED_TASK_IDLE: u8 = 0;
+/// Exactly one task is running and no later signal is outstanding.
+const COALESCED_TASK_RUNNING: u8 = 1;
+/// A task is running AND a signal arrived after it began, so what it observed
+/// may already be stale. The task takes another pass before it may return to
+/// [`COALESCED_TASK_IDLE`].
+const COALESCED_TASK_RUNNING_DIRTY: u8 = 2;
 
-/// State an orphaned-DV sweep signal moves `orphan_dv_sweep_state` to, or `None`
-/// when the signal needs no change because a dirty worker will already re-run.
+/// State a signal moves a coalesced task's state to, or `None` when the signal
+/// needs no change because a dirty task will already re-run.
 ///
-/// A plain "is scheduled" flag loses the edge: a signal raised while a sweep runs
-/// is dropped and the running sweep never re-reads the floor, so a table that goes
-/// idle right after that signal keeps its orphan backlog forever. Recording the
-/// signal as [`ORPHAN_DV_SWEEP_RUNNING_DIRTY`] keeps the at-most-one-worker
-/// property while guaranteeing that some pass observes the newest floor.
-/// [`ORPHAN_DV_SWEEP_IDLE`] is the only state whose signaller owns the worker.
-const fn orphan_dv_sweep_state_after_signal(state: u8) -> Option<u8> {
+/// A plain "is scheduled" flag loses the edge: a signal raised while the task
+/// runs is dropped and the running pass never re-reads what the signal changed,
+/// so a table that goes idle right after that signal keeps the backlog forever —
+/// an orphan backlog for the sweep, an unconsolidated small-file seed for a
+/// compaction pass that a concurrent append aborted. Recording the signal as
+/// [`COALESCED_TASK_RUNNING_DIRTY`] keeps the at-most-one-task property while
+/// guaranteeing that some pass observes the newest state.
+/// [`COALESCED_TASK_IDLE`] is the only state whose signaller owns the task.
+const fn coalesced_task_state_after_signal(state: u8) -> Option<u8> {
     match state {
-        ORPHAN_DV_SWEEP_IDLE => Some(ORPHAN_DV_SWEEP_RUNNING),
-        ORPHAN_DV_SWEEP_RUNNING => Some(ORPHAN_DV_SWEEP_RUNNING_DIRTY),
+        COALESCED_TASK_IDLE => Some(COALESCED_TASK_RUNNING),
+        COALESCED_TASK_RUNNING => Some(COALESCED_TASK_RUNNING_DIRTY),
         _ => None,
+    }
+}
+
+/// Signal a coalesced task: `true` when this caller moved its state from idle to
+/// running and so owns the task it must now spawn; otherwise the signal was
+/// recorded on the task already running.
+fn coalesced_task_try_claim(state: &AtomicU8) -> bool {
+    state.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        coalesced_task_state_after_signal,
+    ) == Ok(COALESCED_TASK_IDLE)
+}
+
+/// One claimed episode of a coalesced task, from the claim to the task's exit.
+///
+/// A task that ends abnormally — a panic during unwind, or the task being dropped
+/// on abort — never reaches [`Self::try_finish`], so dropping an unfinished
+/// episode republishes idle; a stuck state would otherwise permanently suppress
+/// future signals AND hang `drain_in_flight_maintenance`. A clean finish disarms
+/// that reset, so it cannot stomp a state a LATER task already owns.
+///
+/// The abnormal exit deliberately drops a signal that arrived before it rather
+/// than re-arming a task from `Drop`: the abort case IS runtime shutdown, where
+/// spawning panics inside an unwind. Losing one edge is bounded — the next signal
+/// or open replays it — whereas leaving the state dirty with no task wedges it.
+struct CoalescedTaskEpisode {
+    state: Arc<AtomicU8>,
+    armed: bool,
+}
+
+impl CoalescedTaskEpisode {
+    fn new(state: &Arc<AtomicU8>) -> Self {
+        Self {
+            state: Arc::clone(state),
+            armed: true,
+        }
+    }
+
+    /// End the episode if no signal arrived since the pass began, or consume
+    /// the signal and return `false` so the caller takes another pass.
+    ///
+    /// The episode ends only by atomically claiming a CLEAN running state. A
+    /// signal raised anywhere up to this point has already flipped the state to
+    /// dirty, so the exchange fails — the edge cannot be lost in the gap between
+    /// the last pass and the task exiting. A signal that lands between the
+    /// failed exchange and the store finds the state already dirty and adds
+    /// nothing: the pass it wants starts after it, which is what it asked for.
+    fn try_finish(&mut self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                COALESCED_TASK_RUNNING,
+                COALESCED_TASK_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.armed = false;
+            return true;
+        }
+        self.state.store(COALESCED_TASK_RUNNING, Ordering::Release);
+        false
+    }
+}
+
+impl Drop for CoalescedTaskEpisode {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.store(COALESCED_TASK_IDLE, Ordering::Release);
+        }
     }
 }
 
@@ -3769,31 +3847,38 @@ fn select_protected_snapshot_merge_tier(
     max_pass_bytes: Option<u64>,
     below_tier: Option<u32>,
 ) -> ProtectedMergeSelection {
-    if inputs.len() < 2 || min_runs < 2 {
-        // A merge needs at least two runs, and a floor below 2 is meaningless.
-        return ProtectedMergeSelection::NoQualifyingTier;
-    }
-
     // Group input indices by tier, preserving oldest-first order within a tier.
     let mut tiers: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
     for (idx, (_, _, bytes)) in inputs.iter().enumerate() {
         let tier = protected_snapshot_size_tier(*bytes, base_bytes, growth);
         tiers.entry(tier).or_default().push(idx);
     }
+    let no_qualifying_tier = || ProtectedMergeSelection::NoQualifyingTier {
+        runs_per_tier: tiers
+            .iter()
+            .map(|(tier, indices)| (*tier, indices.len()))
+            .collect(),
+    };
+
+    if min_runs < 2 {
+        // A floor below 2 is meaningless: a merge needs at least two runs. Fewer than
+        // two inputs needs no guard, since no tier can then reach `min_runs`.
+        return no_qualifying_tier();
+    }
 
     // BTreeMap iterates tiers in ascending order, so the first qualifying tier
     // is the lowest one.
-    let tiers = tiers
-        .into_iter()
-        .take_while(|(tier, _)| below_tier.is_none_or(|below| *tier < below));
-    for (_tier, indices) in tiers {
+    let eligible = tiers
+        .iter()
+        .take_while(|(tier, _)| below_tier.is_none_or(|below| **tier < below));
+    for (_tier, indices) in eligible {
         if indices.len() < min_runs {
             continue;
         }
         let width = max_width.max(2);
         let mut selected: Vec<(String, i64)> = Vec::with_capacity(width.min(indices.len()));
         let mut selected_bytes: u64 = 0;
-        for &idx in &indices {
+        for &idx in indices {
             if selected.len() == width {
                 break;
             }
@@ -3827,7 +3912,7 @@ fn select_protected_snapshot_merge_tier(
         };
     }
 
-    ProtectedMergeSelection::NoQualifyingTier
+    no_qualifying_tier()
 }
 
 /// Outcome of [`select_protected_snapshot_merge_tier`], distinguishing "nothing
@@ -3837,8 +3922,13 @@ fn select_protected_snapshot_merge_tier(
 enum ProtectedMergeSelection {
     /// Consolidate these runs: always at least 2, oldest-first.
     Merge(Vec<(String, i64)>),
-    /// No size tier has accumulated `min_runs` same-size runs yet.
-    NoQualifyingTier,
+    /// No size tier this pass may merge has accumulated `min_runs` same-size runs.
+    NoQualifyingTier {
+        /// Runs per size tier (`tier -> runs`) across every input, including tiers
+        /// at or above a running merge's tier, which this pass may not select.
+        /// `min_runs` applies to each tier on its own, never to the total.
+        runs_per_tier: std::collections::BTreeMap<u32, usize>,
+    },
     /// A tier has enough runs, but its two OLDEST do not fit `max_pass_bytes`, so
     /// the oldest-first walk cannot form a pair and the pass declines.
     ///
@@ -3855,12 +3945,13 @@ enum ProtectedMergeSelection {
     },
 }
 
+#[cfg(test)]
 impl ProtectedMergeSelection {
     /// The runs to merge, or empty for either declining outcome.
     fn into_inputs(self) -> Vec<(String, i64)> {
         match self {
             Self::Merge(inputs) => inputs,
-            Self::NoQualifyingTier | Self::OverPassBudget { .. } => Vec::new(),
+            Self::NoQualifyingTier { .. } | Self::OverPassBudget { .. } => Vec::new(),
         }
     }
 }
@@ -9203,8 +9294,8 @@ impl CayenneTableProvider {
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::RwLock::new(())),
             protected_merge_claims: Arc::new(ParkingMutex::new(ProtectedMergeClaims::default())),
-            post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
-            orphan_dv_sweep_state: Arc::new(AtomicU8::new(ORPHAN_DV_SWEEP_IDLE)),
+            post_write_compaction_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
+            orphan_dv_sweep_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
             footprint_sample_gate: Arc::new(SampleGate::default()),
             data_dir_sample_gate: Arc::new(SampleGate::default()),
             in_memory_sample_gate: Arc::new(SampleGate::default()),
@@ -10110,10 +10201,16 @@ impl CayenneTableProvider {
             let snapshot_id = snapshot_id.to_string();
             let schema = Arc::clone(schema);
             handles.push(tokio::spawn(async move {
-                let unit_bytes = unit
-                    .iter()
-                    .map(|b| b.get_array_memory_size() as u64)
-                    .fold(0u64, u64::saturating_add);
+                // The unit is fully materialized, so its size is the resident
+                // memory of its batches with each Arrow allocation counted once.
+                // A PK-shard unit was rebuilt by the shard split
+                // (`filter_record_batch` allocates), so it shares nothing and the
+                // count matches its per-reference sum. The inline-corpus unit comes
+                // straight out of the metastore's IPC blobs, where every buffer of an
+                // entry points into one body allocation: a per-reference sum bills
+                // that allocation once per buffer and fans the unit out into ~its
+                // buffer count in files.
+                let unit_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&unit);
                 let estimated_bytes = Some(unit_bytes);
                 let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                     &[unit],
@@ -10161,13 +10258,14 @@ impl CayenneTableProvider {
     }
 
     /// The per-shard encode fan-out for the concurrent checkpoint encode: how many
-    /// files a shard of `unit_bytes` (uncompressed Arrow) must split into so no
-    /// output file exceeds the target Vortex file size — `ceil(unit_bytes / target)`,
-    /// min 1. A shard no larger than one target file stays a single file; a larger
-    /// shard rolls into just enough files to honor the target. Arrow over-counts vs
-    /// the compressed on-disk size, the safe direction (files land under the target
-    /// with margin). `write_to_snapshot` further clamps the result to the write
-    /// budget. `target_size_bytes == 0` means size rolling is DISABLED (one file per
+    /// files a shard of `unit_bytes` (resident Arrow bytes, each allocation counted
+    /// once) must split into so no output file exceeds the target Vortex file size
+    /// — `ceil(unit_bytes / target)`, min 1. A shard no larger than one target file
+    /// stays a single file; a larger shard rolls into just enough files to honor the
+    /// target. Resident Arrow still over-counts vs the compressed on-disk size, the
+    /// safe direction (files land under the target with margin).
+    /// `write_to_snapshot` further clamps the result to the write budget.
+    /// `target_size_bytes == 0` means size rolling is DISABLED (one file per
     /// write is intended — see the config warning), so the shard stays a single
     /// file, matching the pre-roll behavior.
     fn shard_encode_target_partitions(unit_bytes: u64, target_size_bytes: usize) -> usize {
@@ -10207,15 +10305,20 @@ impl CayenneTableProvider {
     ///   lower bound on it) supply a real estimate; only genuinely-unsized
     ///   streams fall back here.
     ///
-    /// **Units (deliberately asymmetric).** `estimated_bytes` is *uncompressed
-    /// in-memory Arrow* size (`RecordBatch::get_array_memory_size`), while
-    /// `target_size_bytes` is the target *on-disk Vortex* file size. Vortex
-    /// compresses, so `arrow_bytes / vortex_target` over-counts the files a write
-    /// will actually produce — i.e. it biases toward *more* shards. That is the
-    /// intended, safe direction: the surplus is bounded by `write_concurrency`,
-    /// extra encode parallelism is free on a multi-core host, and the transient
-    /// sub-target files it emits are merged by compaction (which is pinned to a
-    /// single output shard). The opposite error — discounting for compression and
+    /// **Units (deliberately asymmetric).** `estimated_bytes` is the *uncompressed
+    /// resident Arrow* size — what the batches hold in memory, each physical
+    /// allocation counted once
+    /// ([`RetainedBytes`](arrow_tools::batch_bytes::RetainedBytes)) rather than
+    /// once per buffer referencing it — while `target_size_bytes` is the target
+    /// *on-disk Vortex* file size. Vortex compresses, so `arrow_bytes /
+    /// vortex_target` over-counts the files a write will actually produce — i.e. it
+    /// biases toward *more* shards. That is the intended, safe direction: the
+    /// surplus is bounded by `write_concurrency`, extra encode parallelism is free
+    /// on a multi-core host, and the transient sub-target files it emits are merged
+    /// by compaction (which is pinned to a single output shard). Counting one
+    /// allocation once per buffer referencing it would be a different error
+    /// entirely — not a bias but a multiple, so a sub-target write fans out to the
+    /// concurrency ceiling. The opposite error — discounting for compression and
     /// then *under*-sharding a genuinely large, incompressible write into one
     /// oversized, serially-encoded file — is the costly one, so we do not apply a
     /// compression factor here. A faithful on-disk count would require an
@@ -11237,7 +11340,7 @@ impl CayenneTableProvider {
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
             protected_merge_claims: Arc::clone(&self.protected_merge_claims),
-            post_write_compaction_scheduled: Arc::clone(&self.post_write_compaction_scheduled),
+            post_write_compaction_state: Arc::clone(&self.post_write_compaction_state),
             orphan_dv_sweep_state: Arc::clone(&self.orphan_dv_sweep_state),
             footprint_sample_gate: Arc::clone(&self.footprint_sample_gate),
             data_dir_sample_gate: Arc::clone(&self.data_dir_sample_gate),
@@ -15028,41 +15131,61 @@ impl CayenneTableProvider {
         ))
     }
 
-    pub(crate) async fn validate_and_append_sharded(
+    /// Split every raw batch of an apply into the tier's N per-shard sub-batches
+    /// (order-preserving Arrow filter on the `OwnedRow` shard hash), and measure
+    /// what each shard will hold.
+    ///
+    /// `per_shard_batches[s]` accumulates shard s's sub-batches in apply order;
+    /// empty sub-batches are dropped (an empty append is a no-op). At N>1 the
+    /// filter copies every column into fresh allocations, so the shards share
+    /// nothing with the raw batches or with each other, and each carries its own
+    /// buffer padding and array bookkeeping: their bytes can sum to more than the
+    /// raw batches'. The returned total is therefore what the caller must budget
+    /// and reserve — the same figure the shard segments record and a checkpoint
+    /// later releases, so reservation and release net to zero.
+    pub(crate) fn split_apply_by_pk_shard(
         &self,
-        batches: Vec<RecordBatch>,
-        mut sharded_index: Option<CheckedOutShardedPkIndex>,
+        batches: &[RecordBatch],
         pk_indices: &[usize],
         converter: &RowConverter,
-        on_conflict: &OnConflict,
-        total_incoming_bytes: u64,
-    ) -> Result<ShardedApplyResult> {
+    ) -> Result<ShardedApplyBatches> {
         let n = self.mem_tier.shard_count().max(1);
-
-        // 1. Split every raw batch into N per-shard sub-batches (order-preserving
-        //    Arrow filter on the OwnedRow shard hash).
-        //    `per_shard_batches[s]` accumulates shard s's sub-batches in apply
-        //    order. Empty sub-batches are dropped (an empty append is a no-op).
         let mut per_shard_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
-        let mut per_shard_bytes: Vec<u64> = vec![0; n];
-        for batch in &batches {
+        for batch in batches {
             let shards = Self::split_batch_by_pk_shard(batch, pk_indices, converter, n)?;
             for (s, sub) in shards.into_iter().enumerate() {
                 if sub.num_rows() == 0 {
                     continue;
                 }
-                per_shard_bytes[s] =
-                    per_shard_bytes[s].saturating_add(sub.get_array_memory_size() as u64);
                 per_shard_batches[s].push(sub);
             }
         }
-        // Guard against rounding loss: ensure the byte reservation accounting sums
-        // back to the whole-apply figure the caller reserved (assign any remainder
-        // to shard 0). At N=1 `per_shard_bytes[0]` is the whole apply.
-        let assigned: u64 = per_shard_bytes.iter().fold(0, |a, b| a.saturating_add(*b));
-        if assigned < total_incoming_bytes && !per_shard_bytes.is_empty() {
-            per_shard_bytes[0] = per_shard_bytes[0].saturating_add(total_incoming_bytes - assigned);
-        }
+        let per_shard_bytes = per_shard_batches
+            .iter()
+            .map(|shard| arrow_tools::batch_bytes::RetainedBytes::of(shard))
+            .collect();
+        Ok(ShardedApplyBatches {
+            per_shard_batches,
+            per_shard_bytes,
+        })
+    }
+
+    /// Validate and append an apply already split by
+    /// [`Self::split_apply_by_pk_shard`], whose
+    /// [`ShardedApplyBatches::total_bytes`] the caller has reserved against the
+    /// global budget.
+    pub(crate) async fn validate_and_append_sharded(
+        &self,
+        split: ShardedApplyBatches,
+        mut sharded_index: Option<CheckedOutShardedPkIndex>,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        on_conflict: &OnConflict,
+    ) -> Result<ShardedApplyResult> {
+        let ShardedApplyBatches {
+            per_shard_batches,
+            per_shard_bytes,
+        } = split;
 
         // 2. Validate each shard CONCURRENTLY against ITS existence view, building
         //    that shard's `OnConflictDeletions`. The shards are independent — a key
@@ -15108,9 +15231,12 @@ impl CayenneTableProvider {
             let index_ref = sharded_index.as_ref().map(CheckedOutShardedPkIndex::index);
             let non_empty_shards = per_shard_batches.iter().filter(|b| !b.is_empty()).count();
             // Total rows in this apply. Split preserves every row (only empty
-            // sub-batches are dropped), so the incoming batches sum to the same
-            // count the shards do — computed here without re-touching the data.
-            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            // sub-batches are dropped), so the shards sum to the incoming count.
+            let total_rows: usize = per_shard_batches
+                .iter()
+                .flatten()
+                .map(RecordBatch::num_rows)
+                .sum();
             if non_empty_shards <= 1 || total_rows <= SMALL_APPLY_INLINE_ROWS {
                 // INLINE: either ≤1 non-empty shard (no cross-shard parallelism to
                 // exploit) or a small enough apply that the per-shard OS-thread
@@ -15154,7 +15280,7 @@ impl CayenneTableProvider {
                     // a lazy spawn-then-join iterator chain would start each thread
                     // only as the join step pulled it, validating the shards one at a
                     // time instead of together.
-                    let mut handles: Vec<Option<_>> = Vec::with_capacity(n);
+                    let mut handles: Vec<Option<_>> = Vec::with_capacity(per_shard_batches.len());
                     for (s, shard_batches) in per_shard_batches.into_iter().enumerate() {
                         if shard_batches.is_empty() {
                             handles.push(None);
@@ -15262,6 +15388,19 @@ impl CayenneTableProvider {
         // this apply is about to hide/supersede. The serial feed after
         // `try_join_all` reuses this epoch (dense applier chain).
         let ivm_epoch = self.pre_bump_maintained_aggregate_epoch_for_concurrent_apply();
+        // A shard that validation left with neither rows nor deletions (a
+        // `DoNothing` apply whose keys all exist) appends no segment, so nothing
+        // would ever record — or a checkpoint release — the bytes reserved for it;
+        // they are handed back once the appends land. Memory mode reserves nothing
+        // globally.
+        let unappended_bytes = per_shard_validated
+            .iter()
+            .zip(&per_shard_bytes)
+            .filter(|((filtered_batches, deletions, _), _)| {
+                !filtered_batches.iter().any(|b| b.num_rows() > 0)
+                    && deletions.total_superseded() == 0
+            })
+            .fold(0u64, |total, (_, bytes)| total.saturating_add(*bytes));
         let append_futures = per_shard_validated.iter().enumerate().filter_map(
             |(s, (filtered_batches, deletions, kept))| {
                 let has_rows = filtered_batches.iter().any(|b| b.num_rows() > 0);
@@ -15289,6 +15428,11 @@ impl CayenneTableProvider {
         // The per-shard `MemTier::epoch`s returned here are NOT the slot-ack axis at
         // N>1 (incommensurable); they are drained to surface append errors only.
         futures::future::try_join_all(append_futures).await?;
+        // Only after every append succeeded: on an append error the caller
+        // releases the whole reservation itself.
+        if unappended_bytes > 0 && !self.is_memory_resident_mode() {
+            crate::provider::mem_tier_budget::release_bytes(unappended_bytes);
+        }
         // The relation and published epoch now agree. Registry maintenance can
         // remain asynchronous: scans at the new epoch fall back until it catches up.
         drop(ivm_visibility_guard);
@@ -19242,18 +19386,19 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    pub(crate) fn schedule_post_write_compaction(&self) {
+    /// Whether a write-driven compaction pass is owed: enough new files since
+    /// the last compaction, or a protected-snapshot count/age trigger.
+    fn post_write_compaction_due(&self) -> bool {
         let cfg = self.context.compaction_picker_config();
-        let maintenance_trigger = self.protected_snapshot_maintenance_trigger();
-        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
-            && maintenance_trigger.is_none()
-        {
-            return;
-        }
+        self.new_files_since_last_compaction.load(Ordering::Relaxed) >= cfg.trigger_files
+            || self.protected_snapshot_maintenance_trigger().is_some()
+    }
 
-        if self
-            .post_write_compaction_scheduled
-            .swap(true, Ordering::AcqRel)
+    pub(crate) fn schedule_post_write_compaction(&self) {
+        // A request raised while a pass runs is recorded on it rather than
+        // dropped: it is usually the append that aborts that pass.
+        if !self.post_write_compaction_due()
+            || !coalesced_task_try_claim(&self.post_write_compaction_state)
         {
             return;
         }
@@ -19263,35 +19408,35 @@ impl CayenneTableProvider {
         // full snapshot rewrite) on the dedicated compaction runtime, isolated
         // from the query (compute) and CDC (refresh) runtimes.
         super::compaction::spawn_compaction(async move {
-            // Clear the coalescing flag on ANY exit — normal completion, early
-            // return, a panic during unwind, or the task being dropped on abort —
-            // so a stuck flag can never permanently suppress future compaction
-            // scheduling or hang `drain_in_flight_maintenance`.
-            struct ClearOnDrop(Arc<AtomicBool>);
-            impl Drop for ClearOnDrop {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
-                }
-            }
-            let _clear = ClearOnDrop(Arc::clone(&table.post_write_compaction_scheduled));
+            let mut episode = CoalescedTaskEpisode::new(&table.post_write_compaction_state);
 
             tokio::task::yield_now().await;
-            let result = super::compaction::CompactionRunner::run_compaction_trigger(&table).await;
-
-            match result {
-                Ok(true) => {
-                    tracing::debug!(
-                        table = table.table_metadata.table_name.as_str(),
-                        "Post-write compaction pass completed"
-                    );
+            let mut due = true;
+            loop {
+                if due {
+                    match super::compaction::CompactionRunner::run_compaction_trigger(&table).await
+                    {
+                        Ok(true) => {
+                            tracing::debug!(
+                                table = table.table_metadata.table_name.as_str(),
+                                "Post-write compaction pass completed"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                table = table.table_metadata.table_name.as_str(),
+                                "Post-write compaction trigger failed: {e}"
+                            );
+                        }
+                    }
                 }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        table = table.table_metadata.table_name.as_str(),
-                        "Post-write compaction trigger failed: {e}"
-                    );
+                if episode.try_finish() {
+                    break;
                 }
+                // A pass that committed has reset the file credit, so a request
+                // it already served runs nothing.
+                due = table.post_write_compaction_due();
             }
         });
     }
@@ -19304,7 +19449,7 @@ impl CayenneTableProvider {
     /// per table on the dedicated compaction runtime — mirroring
     /// [`Self::schedule_post_write_compaction`]. A signal raised while that worker
     /// runs is RECORDED rather than dropped
-    /// ([`orphan_dv_sweep_state_after_signal`]): the worker consumes it and takes
+    /// ([`coalesced_task_state_after_signal`]): the worker consumes it and takes
     /// another pass, so the newest floor is always swept even if the table then
     /// goes idle.
     ///
@@ -19314,14 +19459,9 @@ impl CayenneTableProvider {
     /// publisher's `listing_fence` write guard anyway) and misreports when cleanup
     /// became due.
     pub(crate) fn schedule_orphan_dv_sweep(&self) {
-        let previous = self.orphan_dv_sweep_state.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            orphan_dv_sweep_state_after_signal,
-        );
         // Only the idle -> running winner owns the worker; every other signal has
         // been recorded on the worker that is already running.
-        if previous != Ok(ORPHAN_DV_SWEEP_IDLE) {
+        if !coalesced_task_try_claim(&self.orphan_dv_sweep_state) {
             maintenance_metrics::track_maintenance(
                 self.table_metadata.table_name.as_str(),
                 MaintenanceOp::OrphanDvSweep,
@@ -19332,35 +19472,7 @@ impl CayenneTableProvider {
 
         let table = self.clone_for_write();
         super::compaction::spawn_compaction(async move {
-            // A worker that ends abnormally — a panic during unwind, or the task
-            // being dropped on abort — never reaches the exchange below, so
-            // republish idle here or a stuck state would permanently suppress
-            // future sweeps on a long-lived provider AND hang
-            // `drain_in_flight_maintenance`. Disarmed on the clean exit path so
-            // this cannot stomp a state a LATER worker already owns.
-            //
-            // This deliberately drops a signal that arrived before the abnormal
-            // exit rather than re-arming a worker from `Drop`: the abort case IS
-            // runtime shutdown, where spawning panics inside an unwind. Losing one
-            // edge is bounded — the startup pass replays it on the next open, which
-            // is the same repair a crash between a publication and its signal
-            // needs — whereas leaving the state dirty with no worker wedges the
-            // sweep permanently.
-            struct ResetOnAbnormalExit {
-                state: Arc<AtomicU8>,
-                armed: bool,
-            }
-            impl Drop for ResetOnAbnormalExit {
-                fn drop(&mut self) {
-                    if self.armed {
-                        self.state.store(ORPHAN_DV_SWEEP_IDLE, Ordering::Release);
-                    }
-                }
-            }
-            let mut reset = ResetOnAbnormalExit {
-                state: Arc::clone(&table.orphan_dv_sweep_state),
-                armed: true,
-            };
+            let mut episode = CoalescedTaskEpisode::new(&table.orphan_dv_sweep_state);
 
             tokio::task::yield_now().await;
             loop {
@@ -19370,31 +19482,9 @@ impl CayenneTableProvider {
                         ORPHAN_DV_SWEEP_MAX_BATCH,
                     )
                     .await;
-                // End the episode only by atomically claiming a CLEAN running
-                // state. A signal raised anywhere up to this point has already
-                // flipped the state to dirty, so the exchange fails and the worker
-                // sweeps again — the edge cannot be lost in the gap between the
-                // last pass and the worker exiting.
-                if table
-                    .orphan_dv_sweep_state
-                    .compare_exchange(
-                        ORPHAN_DV_SWEEP_RUNNING,
-                        ORPHAN_DV_SWEEP_IDLE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    reset.armed = false;
+                if episode.try_finish() {
                     break;
                 }
-                // Dirty: consume the signal and sweep again. A signal that lands
-                // between the failed exchange and this store finds the state
-                // already dirty and adds nothing — the pass it wants starts after
-                // it, which is exactly what it asked for.
-                table
-                    .orphan_dv_sweep_state
-                    .store(ORPHAN_DV_SWEEP_RUNNING, Ordering::Release);
             }
         });
     }
@@ -19448,8 +19538,8 @@ impl CayenneTableProvider {
             // each mark themselves scheduled BEFORE spawning and clear that mark
             // when done, so spin until all are clear — no scheduled-or-running
             // detached pass remains.
-            while self.post_write_compaction_scheduled.load(Ordering::Acquire)
-                || self.orphan_dv_sweep_state.load(Ordering::Acquire) != ORPHAN_DV_SWEEP_IDLE
+            while self.post_write_compaction_state.load(Ordering::Acquire) != COALESCED_TASK_IDLE
+                || self.orphan_dv_sweep_state.load(Ordering::Acquire) != COALESCED_TASK_IDLE
                 || self.snapshot_cleanup_scheduled.load(Ordering::Acquire)
                 || self.inline_checkpoint_scheduled.load(Ordering::Acquire)
             {
@@ -24124,57 +24214,62 @@ impl CayenneTableProvider {
             in_flight.min_tier(),
         );
 
-        if let ProtectedMergeSelection::OverPassBudget {
-            tier_runs,
-            oldest_pair_bytes,
-        } = &selection
-        {
-            // Declining here costs less than it appears. A merge's benefit is one fewer
-            // scan branch, which is the same whether the runs are 8 MiB or 8 GiB; its
-            // cost is the bytes it rewrites. So a large-run tier is the worst-value work
-            // this pass can do, and leaving it settled is the same call the
-            // current-snapshot picker makes for files at or above the target size.
-            //
-            // The alarm for the read amplification that remains belongs to the read
-            // path, which already WARNs at `8 x compaction_trigger_protected_snapshots`
-            // protected snapshots (`scan_protected_snapshots`) — on the harm itself
-            // rather than on this proxy for it. This line is the cause, for whoever
-            // investigates that warning.
-            maintenance_metrics::track_compaction(
-                table_name,
-                CompactionKind::ProtectedSubset,
-                CompactionOutcome::DeclinedOverPassBudget,
-            );
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
+        let inputs = match selection {
+            ProtectedMergeSelection::Merge(inputs) => inputs,
+            ProtectedMergeSelection::OverPassBudget {
                 tier_runs,
                 oldest_pair_bytes,
-                max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
-                "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
-                 runs exceed the pass memory budget"
-            );
-            return Ok(false);
-        }
-
-        let inputs = selection.into_inputs();
-        if inputs.len() < 2 {
-            maintenance_metrics::track_compaction(
-                table_name,
-                CompactionKind::ProtectedSubset,
-                CompactionOutcome::DeclinedNoQualifyingTier,
-            );
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                candidates = sized_candidates.len(),
-                min_runs,
-                tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
-                max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
-                "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
-            );
-            return Ok(false);
-        }
+            } => {
+                // Declining here costs less than it appears. A merge's benefit is one fewer
+                // scan branch, which is the same whether the runs are 8 MiB or 8 GiB; its
+                // cost is the bytes it rewrites. So a large-run tier is the worst-value work
+                // this pass can do, and leaving it settled is the same call the
+                // current-snapshot picker makes for files at or above the target size.
+                //
+                // The alarm for the read amplification that remains belongs to the read
+                // path, which already WARNs at `8 x compaction_trigger_protected_snapshots`
+                // protected snapshots (`scan_protected_snapshots`) — on the harm itself
+                // rather than on this proxy for it. This line is the cause, for whoever
+                // investigates that warning.
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::ProtectedSubset,
+                    CompactionOutcome::DeclinedOverPassBudget,
+                );
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    tier_runs,
+                    oldest_pair_bytes,
+                    max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
+                    "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
+                     runs exceed the pass memory budget"
+                );
+                return Ok(false);
+            }
+            ProtectedMergeSelection::NoQualifyingTier { runs_per_tier } => {
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::ProtectedSubset,
+                    CompactionOutcome::DeclinedNoQualifyingTier,
+                );
+                // `min_runs` is a per-tier threshold, so `runs_per_tier` is what to read it
+                // against: 4 candidates split {0: 3, 1: 1} decline under `min_runs=4` (#13622).
+                // Tiers at or above `running_merge_min_tier` are not eligible this pass.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    runs_per_tier = ?runs_per_tier,
+                    min_runs,
+                    running_merge_min_tier = ?in_flight.min_tier(),
+                    candidates = sized_candidates.len(),
+                    tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
+                    max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
+                    "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
+                );
+                return Ok(false);
+            }
+        };
 
         // Diagnostics over the SELECTED (single-tier) input set.
         let selected_ids: std::collections::HashSet<&str> =
@@ -31463,10 +31558,12 @@ impl CayenneTableProvider {
         }
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let estimated_flushed_bytes = batches
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .fold(0u64, u64::saturating_add);
+        // Resident memory of the captured corpus, each Arrow allocation counted
+        // once: the tier retains the batches an apply handed it, and one fed over
+        // Arrow IPC (Flight, Flight SQL) points every buffer at one message body,
+        // which a per-reference sum bills once per buffer. It sizes the encode
+        // fan-out, so that over-count is files on disk, not just a number.
+        let estimated_flushed_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
         let estimated_bytes = Some(estimated_flushed_bytes);
         tracing::debug!(
             table = %self.table_metadata.table_name,
@@ -32861,16 +32958,14 @@ impl CayenneTableProvider {
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         // The inline memtable is fully materialized here, so we can size the
-        // checkpoint write exactly (sum of in-memory Arrow bytes). This lets the
-        // write shard count scale with the actual flush size instead of always
+        // checkpoint write exactly: the resident memory of the batches, each Arrow
+        // allocation counted once. The corpus is decoded from the metastore's IPC
+        // blobs, so every buffer of an entry points into that entry's one body
+        // allocation and a per-reference sum bills it once per buffer. This lets
+        // the write shard count scale with the actual flush size instead of always
         // fanning out — a small inline flush stays a single file. Computed before
         // `batches` is moved into the MemorySource below.
-        let estimated_bytes = Some(
-            batches
-                .iter()
-                .map(|b| b.get_array_memory_size() as u64)
-                .fold(0u64, u64::saturating_add),
-        );
+        let estimated_bytes = Some(arrow_tools::batch_bytes::RetainedBytes::of(&batches));
 
         // Extract Int64 PKs from the batches before they're moved into the
         // `MemorySource` below. After the flush, these PKs live in the new
@@ -39015,20 +39110,64 @@ mod tests {
     #[test]
     fn orphan_dv_sweep_signal_records_an_edge_raised_during_a_pass() {
         assert_eq!(
-            orphan_dv_sweep_state_after_signal(ORPHAN_DV_SWEEP_IDLE),
-            Some(ORPHAN_DV_SWEEP_RUNNING),
+            coalesced_task_state_after_signal(COALESCED_TASK_IDLE),
+            Some(COALESCED_TASK_RUNNING),
             "an idle table starts a worker"
         );
         assert_eq!(
-            orphan_dv_sweep_state_after_signal(ORPHAN_DV_SWEEP_RUNNING),
-            Some(ORPHAN_DV_SWEEP_RUNNING_DIRTY),
+            coalesced_task_state_after_signal(COALESCED_TASK_RUNNING),
+            Some(COALESCED_TASK_RUNNING_DIRTY),
             "a signal during a pass must be recorded, not coalesced away"
         );
         assert_eq!(
-            orphan_dv_sweep_state_after_signal(ORPHAN_DV_SWEEP_RUNNING_DIRTY),
+            coalesced_task_state_after_signal(COALESCED_TASK_RUNNING_DIRTY),
             None,
             "a second signal during a pass adds nothing: the worker already re-runs"
         );
+    }
+
+    /// A write that asks for compaction while a post-write pass runs must be
+    /// recorded on that pass rather than coalesced away. The request is usually
+    /// the append that makes the running pass abort on a concurrent change, so
+    /// dropping it left a finished seed unconsolidated until the next write or
+    /// background tick. The state IS the spawn decision, so asserting it checks
+    /// both halves: no second task, and a re-evaluation owed. Regression test
+    /// for #13906.
+    #[tokio::test]
+    async fn post_write_compaction_records_a_request_raised_during_a_pass() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "post_write_compaction_records_request",
+            ctx.runtime_env(),
+            &[10, 20, 30],
+        )
+        .await;
+        provider.new_files_since_last_compaction.store(
+            provider.context.compaction_picker_config().trigger_files,
+            Ordering::Relaxed,
+        );
+
+        // Stand in for a pass mid-flight.
+        provider
+            .post_write_compaction_state
+            .store(COALESCED_TASK_RUNNING, Ordering::Release);
+
+        provider.schedule_post_write_compaction();
+        assert_eq!(
+            provider.post_write_compaction_state.load(Ordering::Acquire),
+            COALESCED_TASK_RUNNING_DIRTY,
+            "a request during a pass must be recorded on it, not dropped"
+        );
+        provider.schedule_post_write_compaction();
+        assert_eq!(
+            provider.post_write_compaction_state.load(Ordering::Acquire),
+            COALESCED_TASK_RUNNING_DIRTY,
+            "a further request leaves the state dirty"
+        );
+
+        provider
+            .post_write_compaction_state
+            .store(COALESCED_TASK_IDLE, Ordering::Release);
     }
 
     /// Signalling a table whose worker is already running must record the signal
@@ -39051,24 +39190,24 @@ mod tests {
         // Stand in for a worker mid-pass.
         provider
             .orphan_dv_sweep_state
-            .store(ORPHAN_DV_SWEEP_RUNNING, Ordering::Release);
+            .store(COALESCED_TASK_RUNNING, Ordering::Release);
 
         provider.schedule_orphan_dv_sweep();
         assert_eq!(
             provider.orphan_dv_sweep_state.load(Ordering::Acquire),
-            ORPHAN_DV_SWEEP_RUNNING_DIRTY,
+            COALESCED_TASK_RUNNING_DIRTY,
             "the signal must be recorded on the running worker"
         );
         provider.schedule_orphan_dv_sweep();
         assert_eq!(
             provider.orphan_dv_sweep_state.load(Ordering::Acquire),
-            ORPHAN_DV_SWEEP_RUNNING_DIRTY,
+            COALESCED_TASK_RUNNING_DIRTY,
             "a further signal leaves the state dirty"
         );
 
         provider
             .orphan_dv_sweep_state
-            .store(ORPHAN_DV_SWEEP_IDLE, Ordering::Release);
+            .store(COALESCED_TASK_IDLE, Ordering::Release);
     }
 
     /// A signal raised while a sweep is mid-pass — after it captured its
@@ -39132,7 +39271,7 @@ mod tests {
         );
         assert_eq!(
             provider.orphan_dv_sweep_state.load(Ordering::Acquire),
-            ORPHAN_DV_SWEEP_IDLE,
+            COALESCED_TASK_IDLE,
             "the episode ends idle once no signal is outstanding"
         );
     }
@@ -40382,8 +40521,11 @@ mod tests {
         );
         assert_eq!(
             select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, Some(1)),
-            ProtectedMergeSelection::NoQualifyingTier,
-            "tier 1 must not merge alongside a running tier-1 merge"
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1), (1, 2)].into(),
+            },
+            "tier 1 must not merge alongside a running tier-1 merge, and the decline still \
+             reports the ineligible tier's runs"
         );
     }
 
@@ -40395,7 +40537,30 @@ mod tests {
         let inputs = vec![sized("a", 1024), sized("b", base * 4)];
         assert_eq!(
             select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, None),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1), (1, 1)].into(),
+            }
+        );
+    }
+
+    /// Regression test for #13622: four candidates under `min_runs = 4` decline when
+    /// they are split across tiers, and the decline carries the per-tier split that
+    /// explains it rather than only the total.
+    #[test]
+    fn select_merge_tier_reports_runs_per_tier_when_the_total_reaches_min_runs() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        let inputs = vec![
+            sized("merged", base * 2), // tier 1
+            sized("a", 1024),          // tier 0
+            sized("b", 2048),          // tier 0
+            sized("c", 4096),          // tier 0
+        ];
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&inputs, 4, 32, base, growth, None, None),
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 3), (1, 1)].into(),
+            }
         );
     }
 
@@ -40424,7 +40589,9 @@ mod tests {
         // Fewer than two inputs, or a sub-2 floor, can never merge.
         assert_eq!(
             select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth, None, None),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1)].into(),
+            }
         );
         assert_eq!(
             select_protected_snapshot_merge_tier(
@@ -40436,7 +40603,9 @@ mod tests {
                 None,
                 None
             ),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 2)].into(),
+            }
         );
     }
 
@@ -40645,13 +40814,15 @@ mod tests {
     /// caller is arranging. `drain_in_flight_maintenance` cannot be used here:
     /// it ends by taking the same lock.
     ///
-    /// The flag is set before the task spawns and cleared on any exit, so once
-    /// it reads false with the lock still held, no scheduled pass remains.
+    /// The state leaves idle before the task spawns and returns to it on any
+    /// exit, so once it reads idle with the lock still held, no scheduled pass
+    /// remains.
     async fn park_post_write_compaction(provider: &CayenneTableProvider) {
         for _ in 0..1_000 {
-            if !provider
-                .post_write_compaction_scheduled
+            if provider
+                .post_write_compaction_state
                 .load(std::sync::atomic::Ordering::Acquire)
+                == COALESCED_TASK_IDLE
             {
                 return;
             }

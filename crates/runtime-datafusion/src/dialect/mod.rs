@@ -231,10 +231,10 @@ pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> 
 }
 
 /// Whether `DuckDB` evaluates this non-function expression node the way
-/// `DataFusion` does — today, two casts it does not: one into text over a
-/// binary operand (see `duckdb::cast_is_renderable`), and one from a fractional
-/// value into an integer, which `DuckDB` rounds where `DataFusion` truncates
-/// (see [`integer_cast_is_renderable`]).
+/// `DataFusion` does. Only casts are checked: `duckdb::cast_is_renderable` says
+/// which casts into text or binary are refused, and why, and
+/// [`integer_cast_is_renderable`] refuses one from a fractional value into an
+/// integer, which `DuckDB` rounds where `DataFusion` truncates.
 #[must_use]
 pub fn duckdb_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     duckdb::cast_is_renderable(expr, scope) && integer_cast_is_renderable(expr, scope)
@@ -623,11 +623,44 @@ mod tests {
         }
     }
 
-    /// The complement of the test above: only text casts of a binary operand
-    /// are refused. Casting binary into a number is unsupported on both
-    /// engines, so both refuse the query and that shape federates as before;
-    /// a text cast of a string or a number is the common case and federates;
-    /// and a node that is not a cast has no opinion here.
+    /// Regression test for #14397: no cast into a binary type has a `DuckDB`
+    /// rendering that answers what `DataFusion` does — the unparser renders no
+    /// binary type, and a string literal it sends bare is converted under
+    /// `DuckDB`'s own escape rules — so every one stays local, whatever its
+    /// operand and with or without a scope.
+    #[test]
+    fn duckdb_declines_a_cast_into_binary() {
+        let scope = scope_of(&[
+            ("a", DataType::Binary),
+            ("s", DataType::Utf8),
+            ("n", DataType::Int64),
+        ]);
+        for binary in [
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            DataType::FixedSizeBinary(4),
+        ] {
+            for operand in [col("s"), col("a"), col("n"), lit("\\xFF")] {
+                for expr in [
+                    cast(operand.clone(), binary.clone()),
+                    try_cast(operand.clone(), binary.clone()),
+                ] {
+                    for scope in [Some(&scope), None] {
+                        assert!(
+                            !duckdb_can_evaluate_expression(&expr, scope),
+                            "{expr} must stay local"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The complement of the tests above. Casting binary into a number is
+    /// unsupported on both engines, so both refuse the query and that shape
+    /// federates as before; a text cast of a string or a number is the common
+    /// case and federates; and a node that is not a cast has no opinion here.
     #[test]
     fn duckdb_federates_every_other_cast() {
         let scope = scope_of(&[

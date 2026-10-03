@@ -90,6 +90,40 @@ use util::{error_spaced, warn_spaced};
 /// bound once per dataset.
 const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// What a caller of [`Runtime::invalidate_cached_results_because`] is doing to the
+/// dataset, which decides what the operator is told they will observe when the
+/// invalidation itself fails.
+#[derive(Clone, Copy, Debug)]
+enum CacheInvalidation {
+    /// The dataset stays configured and will be queryable again, though its contents
+    /// may change. It may be unregistered while its replacement is registered, so this
+    /// says nothing about whether the table stays in place.
+    Reload,
+    /// The dataset is being unloaded and stops being queryable.
+    Unload,
+}
+
+/// The warning for a cached-results invalidation that failed — a degrade-and-continue
+/// path, so this line is the only account an operator gets of why a removed or reloaded
+/// dataset keeps answering.
+///
+/// A pure function so the wording is asserted rather than assumed: see
+/// `a_failed_unload_invalidation_says_the_dataset_keeps_answering`.
+fn cache_invalidation_warning(
+    dataset: &TableReference,
+    cause: CacheInvalidation,
+    source: &dyn std::fmt::Display,
+) -> String {
+    match cause {
+        CacheInvalidation::Reload => format!(
+            "Dataset '{dataset}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {source}"
+        ),
+        CacheInvalidation::Unload => format!(
+            "Dataset '{dataset}' was unloaded, but the results cached from it could not be invalidated, so queries may keep being answered from the dataset that is no longer there until they expire. Cause: {source}"
+        ),
+    }
+}
+
 /// Warn an operator about what their dataset's or view's acceleration block asks for and
 /// the runtime will not do as written: settings that `enabled: false` discards (#13514), and
 /// the deprecated `acceleration.ready_state`, honoured but superseded by the component's own
@@ -224,6 +258,25 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
         let startup_datasets = valid_datasets;
 
+        if let Some(snapshots) = app.snapshots.as_deref() {
+            let any_snapshot_mode_dataset = startup_datasets.iter().any(|ds| {
+                ds.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.enabled
+                        && acceleration
+                            .refresh_mode
+                            .is_some_and(|mode| mode.is_snapshot_only())
+                })
+            });
+            if let Some(warning) =
+                runtime_acceleration::snapshot::notifications::unread_queue_warning(
+                    snapshots,
+                    any_snapshot_mode_dataset,
+                )
+            {
+                tracing::warn!("{warning}");
+            }
+        }
+
         // Validate Cayenne snapshot consistency before initializing accelerators.
         // All Cayenne datasets sharing the same metadata directory must have the same
         // snapshot configuration (either all enabled or all disabled).
@@ -251,11 +304,20 @@ impl Runtime {
             return;
         }
 
-        // Create a map of dataset names to their futures
-        let mut dataset_futures = HashMap::new();
-        let mut localpod_datasets = Vec::new();
+        // Keyed by resolved name, so a `localpod` path of `source`, `public.source`, or
+        // `spice.public.source` finds the same parent. The value carries the dataset's own name
+        // for the log line its task writes.
+        let mut dataset_futures: HashMap<
+            ResolvedTableReference,
+            (TableReference, PendingDatasetLoad),
+        > = HashMap::new();
+        // Keyed by parent so several `localpod` datasets reading from one dataset all chain
+        // behind the same load, rather than the first one consuming it.
+        let mut localpod_by_parent: HashMap<
+            ResolvedTableReference,
+            Vec<(Arc<Dataset>, BootstrapStatus)>,
+        > = HashMap::new();
 
-        // First create futures for non-localpod datasets
         for ds in &startup_datasets {
             let bootstrap_status = match init_results.get(&ds.name) {
                 Some(Ok(status)) => status.clone(),
@@ -269,13 +331,17 @@ impl Runtime {
                 }
             };
 
-            if ds.source() == LOCALPOD_DATACONNECTOR {
-                localpod_datasets.push((Arc::clone(ds), bootstrap_status));
+            self.status
+                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+
+            if let Some(parent) = localpod_parent(ds) {
+                localpod_by_parent
+                    .entry(parent)
+                    .or_default()
+                    .push((Arc::clone(ds), bootstrap_status));
                 continue;
             }
 
-            self.status
-                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
             let load_semaphore = Arc::clone(&semaphore);
@@ -284,59 +350,62 @@ impl Runtime {
                 cloned_self
                     .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
                     .await;
-            })
-                as Pin<Box<dyn Future<Output = ()> + Send>>;
-            dataset_futures.insert(ds.name.clone(), future);
+            });
+            dataset_futures.insert(
+                resolve_table_reference(ds.name.clone()),
+                (ds.name.clone(), future),
+            );
         }
 
-        // For each localpod dataset, chain it after its parent's future
-        for (ds, bootstrap_status) in localpod_datasets {
-            self.status
-                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-
-            // Get the parent dataset path from the localpod dataset
-            let path = ds.path();
-            let path_table_ref = TableReference::parse_str(path);
-
-            // Find and remove the parent dataset's future
-            if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
-                let ds_clone = Arc::clone(&ds);
-                let cloned_self = Arc::clone(&self);
-                let load_semaphore = Arc::clone(&semaphore);
-                // Registered now rather than once the parent has loaded, so a
-                // Spicepod change can supersede the load while it waits.
-                let load = self.dataset_loads.begin(&ds.name);
-                // Chain the localpod dataset load after its parent
-                let chained_future = Box::pin(async move {
-                    parent_future.await;
-                    cloned_self
-                        .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
-                        .await;
-                }) as Pin<Box<dyn Future<Output = ()> + Send>>;
-
-                // Replace parent future with the chained future
-                dataset_futures.insert(ds.name.clone(), chained_future);
-            } else {
-                // Parent doesn't exist, provide an error message to the user
-                tracing::error!(
-                    "Failed to load localpod dataset '{}': Parent dataset '{}' doesn't exist. \
-                    Ensure the '{}' dataset is configured in the Spicepod.",
-                    ds.name,
-                    path_table_ref,
-                    path_table_ref
-                );
-                self.status.update_dataset(
-                    &ds.name,
-                    status::ComponentStatus::error_with_message(format!(
-                        "Parent dataset '{path_table_ref}' doesn't exist"
-                    )),
-                );
+        // Each `localpod` dataset loads after the dataset it reads from, and a `localpod`
+        // dataset reading from another `localpod` dataset loads after that one, so every chain
+        // hangs off the load of a non-`localpod` dataset.
+        let roots: Vec<_> = localpod_by_parent
+            .extract_if(|parent, _| dataset_futures.contains_key(parent))
+            .collect();
+        for (parent, children) in roots {
+            let chains: Vec<_> = children
+                .into_iter()
+                .map(|(ds, bootstrap_status)| {
+                    Arc::clone(&self).localpod_load_chain(
+                        ds,
+                        bootstrap_status,
+                        &mut localpod_by_parent,
+                        ReplacesRegistration::No,
+                    )
+                })
+                .collect();
+            if let Some((_, parent_future)) = dataset_futures.get_mut(&parent) {
+                let parent_load = std::mem::replace(parent_future, Box::pin(async {}));
+                *parent_future = Box::pin(async move {
+                    parent_load.await;
+                    join_all(chains).await;
+                });
             }
+        }
+
+        // Whatever is still queued has no chain to a dataset that is loading: its parent is
+        // not configured, failed to initialize, or is part of a `localpod` cycle.
+        for (ds, _) in localpod_by_parent.into_values().flatten() {
+            let path_table_ref = TableReference::parse_str(ds.path());
+            tracing::error!(
+                "Failed to load localpod dataset '{}': Parent dataset '{}' doesn't exist. \
+                Ensure the '{}' dataset is configured in the Spicepod.",
+                ds.name,
+                path_table_ref,
+                path_table_ref
+            );
+            self.status.update_dataset(
+                &ds.name,
+                status::ComponentStatus::error_with_message(format!(
+                    "Parent dataset '{path_table_ref}' doesn't exist"
+                )),
+            );
         }
 
         let mut spawned_tasks = vec![];
 
-        for (ds, dataset_load_future) in dataset_futures {
+        for (ds, dataset_load_future) in dataset_futures.into_values() {
             let handle = tokio::spawn(async move {
                 tracing::info!("Dataset {ds} initializing...");
                 dataset_load_future.await;
@@ -1210,10 +1279,17 @@ impl Runtime {
         }
     }
 
+    /// Unregisters `ds_name` and discards what is cached over it.
+    ///
+    /// `cause` is the caller's intent, which this cannot infer: most callers
+    /// unregister the dataset only to register a replacement, and telling the
+    /// results cache those were unloads would deny them the stale-serving window
+    /// their reload is exactly what revalidates.
     async fn remove_dataset(
         self: Arc<Self>,
         ds_name: TableReference,
         ds_acceleration: Option<&Acceleration>,
+        cause: CacheInvalidation,
     ) {
         if self.df.table_exists(&ds_name) {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
@@ -1231,6 +1307,24 @@ impl Runtime {
         // Drop the dataset's CDC schema-evolution settings; a reload re-installs
         // them at registration before the changes stream starts.
         crate::accelerated::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
+
+        // Deregistering the table is not enough to stop it being read: a cached
+        // logical plan holds the `TableSource` it was planned against, so a query
+        // executed before this point keeps executing against the retired provider,
+        // answering rows from a dataset the catalog no longer lists (#14251). A
+        // cached result reads the same way. Both discards happen *here*, after the
+        // deregistration, rather than in the callers that used to do them before it:
+        // a query planning in the window between a caller's discard and the
+        // deregistration would otherwise cache a plan over the provider being retired.
+        //
+        // The plan discard is deliberately the blanket one, as `update_dataset` and
+        // `remove_view` both use. `invalidate_for_table` would reach this dataset's own
+        // plans, but a dataset leaves the app at human timescale and the cost of being
+        // wrong about which plans reach it is the defect above, so the price paid is a
+        // replan of everything else.
+        self.df.clear_cached_plans().await;
+        self.invalidate_cached_results_because(&ds_name, cause)
+            .await;
 
         tracing::info!("Unloaded dataset {}", &ds_name);
         let engine = ds_acceleration.map_or_else(
@@ -1319,7 +1413,11 @@ impl Runtime {
                 }
 
                 Arc::clone(&self)
-                    .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                    .remove_dataset(
+                        ds.name.clone(),
+                        ds.acceleration.as_ref(),
+                        CacheInvalidation::Reload,
+                    )
                     .await;
 
                 let initialized = DatasetInitialization::plan_eager(
@@ -1365,15 +1463,32 @@ impl Runtime {
     /// an operator learns that queries may keep being answered from the previous
     /// contents until `item_ttl` expires.
     async fn invalidate_cached_results_for(&self, dataset: &TableReference) {
-        if let Err(e) = self
-            .df
-            .caching()
-            .invalidate_for_table(dataset.clone())
-            .await
-        {
-            tracing::warn!(
-                "Dataset '{dataset}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {e}"
-            );
+        self.invalidate_cached_results_because(dataset, CacheInvalidation::Reload)
+            .await;
+    }
+
+    /// [`Self::invalidate_cached_results_for`], for a caller that is unloading the
+    /// dataset rather than reloading it — which is what the warning on the degrade
+    /// path has to say, because the two leave the operator observing different
+    /// things: a reload keeps answering from the previous contents, an unload keeps
+    /// answering at all.
+    async fn invalidate_cached_results_because(
+        &self,
+        dataset: &TableReference,
+        cause: CacheInvalidation,
+    ) {
+        let caching = self.df.caching();
+        // An unload takes the evicting path, which a `cache_key_type: sql` hit needs
+        // because such a hit is answered before planning and the plan cache therefore
+        // never reaches it. See [`cache::QueryResultsCacheProvider::evict_for_table`]
+        // for why the stale-serving window must not absorb an unload.
+        let outcome = match cause {
+            CacheInvalidation::Reload => caching.invalidate_for_table(dataset.clone()).await,
+            CacheInvalidation::Unload => caching.evict_for_table(dataset.clone()).await,
+        };
+
+        if let Err(e) = outcome {
+            tracing::warn!("{}", cache_invalidation_warning(dataset, cause, &e));
         }
     }
 
@@ -1997,14 +2112,17 @@ impl Runtime {
                     && (added_futures.contains_key(&parent)
                         || is_queued_localpod(&localpod_by_parent, &parent))
                 {
-                    // What `update_dataset` does around its own swap: a plan or result cached
-                    // over the table being unloaded must not answer once the chain below
-                    // registers its replacement. An accelerated dataset's initial refresh
-                    // invalidates again on completion; a pass-through one has only this.
-                    self.df.clear_cached_plans().await;
-                    self.invalidate_cached_results_for(&ds.name).await;
+                    // A plan or result cached over the table being unloaded must not
+                    // answer once the chain below registers its replacement;
+                    // `remove_dataset` discards both, after the deregistration. An
+                    // accelerated dataset's initial refresh invalidates again on
+                    // completion; a pass-through one has only this.
                     Arc::clone(&self)
-                        .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                        .remove_dataset(
+                            ds.name.clone(),
+                            ds.acceleration.as_ref(),
+                            CacheInvalidation::Reload,
+                        )
                         .await;
                     self.status
                         .update_dataset(&ds.name, status::ComponentStatus::Initializing);
@@ -2027,7 +2145,11 @@ impl Runtime {
                         .find(|current| current.name == ds.name)
                         .and_then(|current| current.acceleration.clone());
                     Arc::clone(&self)
-                        .remove_dataset(ds.name.clone(), current_acceleration.as_ref())
+                        .remove_dataset(
+                            ds.name.clone(),
+                            current_acceleration.as_ref(),
+                            CacheInvalidation::Reload,
+                        )
                         .await;
                     self.status
                         .update_dataset(&ds.name, status::ComponentStatus::Initializing);
@@ -2054,7 +2176,11 @@ impl Runtime {
             // and before its load completed.
             if still_loading.contains(&ds.name) && self.df.table_exists(&ds.name) {
                 Arc::clone(&self)
-                    .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                    .remove_dataset(
+                        ds.name.clone(),
+                        ds.acceleration.as_ref(),
+                        CacheInvalidation::Reload,
+                    )
                     .await;
             }
 
@@ -2106,6 +2232,7 @@ impl Runtime {
                         ds,
                         bootstrap_status,
                         &mut localpod_by_parent,
+                        ReplacesRegistration::Yes,
                     )
                 })
                 .collect();
@@ -2155,7 +2282,7 @@ impl Runtime {
                 // after it is removed; one added again reads its snapshots' metadata afresh.
                 self.snapshot_sources().forget(&ds_name);
                 Arc::clone(&self)
-                    .remove_dataset(ds_name, ds_acceleration.as_ref())
+                    .remove_dataset(ds_name, ds_acceleration.as_ref(), CacheInvalidation::Unload)
                     .await;
             }
         }
@@ -2173,13 +2300,19 @@ impl Runtime {
             ResolvedTableReference,
             Vec<(Arc<Dataset>, BootstrapStatus)>,
         >,
+        replaces_registration: ReplacesRegistration,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let children: Vec<_> = localpod_by_parent
             .remove(&resolve_table_reference(ds.name.clone()))
             .unwrap_or_default()
             .into_iter()
             .map(|(child, child_status)| {
-                Arc::clone(&self).localpod_load_chain(child, child_status, localpod_by_parent)
+                Arc::clone(&self).localpod_load_chain(
+                    child,
+                    child_status,
+                    localpod_by_parent,
+                    replaces_registration,
+                )
             })
             .collect();
         let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
@@ -2194,8 +2327,11 @@ impl Runtime {
             // The registration this dataset reads through has just been replaced, so mark its
             // results-cache clock again, as `update_dataset` does after its swap: a result read
             // from the previous registration after the mark above must not be stored as fresh.
-            // For a dataset new to this apply the mark is a no-op.
-            self.invalidate_cached_results_for(&name).await;
+            // For a dataset new to this apply the mark is a no-op; at startup there is no previous
+            // registration, so it is skipped.
+            if replaces_registration == ReplacesRegistration::Yes {
+                self.invalidate_cached_results_for(&name).await;
+            }
             join_all(children).await;
         })
     }
@@ -2703,6 +2839,18 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 /// Whether a dataset's `drasi:` block is live.
 fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
+}
+
+/// A dataset's pending load, as startup queues it before spawning.
+type PendingDatasetLoad = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Whether a `localpod` load chain runs over registrations a spicepod apply is replacing, whose
+/// cached results must be invalidated once each dataset reloads, or at startup, where nothing was
+/// registered before.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplacesRegistration {
+    Yes,
+    No,
 }
 
 /// The dataset a `localpod` dataset reads through, resolved as the query engine resolves it (so
@@ -3360,14 +3508,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             _context: &dyn crate::dataconnector::ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-            let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                "id",
-                arrow_schema::DataType::Int64,
-                false,
-            )]));
-            let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
-                .expect("empty MemTable with a single column");
-            Ok(Arc::new(table) as Arc<dyn TableProvider>)
+            Ok(empty_table())
         }
     }
 
@@ -3407,6 +3548,21 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 
     fn spicepod_dataset(from: &str, name: &str) -> spicepod::component::dataset::Dataset {
         spicepod::component::dataset::Dataset::new(from, name)
+    }
+
+    /// An empty single-column table: a schema for a connector to answer with, and a real
+    /// registration for the removal path to deregister rather than passing over a name
+    /// that was never there.
+    fn empty_table() -> Arc<dyn TableProvider> {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        Arc::new(
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
+                .expect("empty MemTable with a single column"),
+        )
     }
 
     /// Regression test for #12862: `apply_dataset_diff` awaited each added
@@ -4180,6 +4336,55 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             is_permanent_dataset_failure(&err),
             "an out-of-vocabulary parameter value is a pure function of the Spicepod"
         );
+    }
+
+    /// Regression test for #14609: a source that is down when the dataset loads
+    /// reports `UnableToConnectInvalidHostOrPort`, which must not be a permanent
+    /// failure, so the dataset keeps retrying and recovers once the source is
+    /// reachable. Rejected credentials and TLS failures are configuration errors and
+    /// stay permanent.
+    #[test]
+    fn an_unreachable_source_stays_retriable_but_rejected_credentials_do_not() {
+        let component = crate::dataconnector::ConnectorComponent::Dataset(Arc::new(
+            crate::component::dataset::DatasetSpec::new(
+                "postgres:public.orders",
+                TableReference::bare("orders"),
+            ),
+        ));
+        let boxed =
+            |source: dataconnector::DataConnectorError| Error::UnableToInitializeDataConnector {
+                source: Box::new(source),
+            };
+
+        let unreachable = boxed(
+            dataconnector::DataConnectorError::UnableToConnectInvalidHostOrPort {
+                dataconnector: "postgres".to_string(),
+                connector_component: component.clone(),
+                host: "db".to_string(),
+                port: "5432".to_string(),
+            },
+        );
+        assert!(
+            !is_permanent_dataset_failure(&unreachable),
+            "a source that cannot be reached right now must be retried: {unreachable}"
+        );
+
+        for configuration_error in [
+            dataconnector::DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                dataconnector: "postgres".to_string(),
+                connector_component: component.clone(),
+            },
+            dataconnector::DataConnectorError::UnableToConnectTlsError {
+                dataconnector: "postgres".to_string(),
+                connector_component: component,
+            },
+        ] {
+            let err = boxed(configuration_error);
+            assert!(
+                is_permanent_dataset_failure(&err),
+                "a credential or TLS misconfiguration must not be retried: {err}"
+            );
+        }
     }
 
     /// An error type neither downcast recognises must not be assumed permanent —
@@ -4971,5 +5176,127 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             2,
             "both datasets of the cycle are selected"
         );
+    }
+
+    /// #14251: deregistering the table is not what stops it being read. A cached logical
+    /// plan holds the `TableSource` it was planned against, so a query executed before the
+    /// removal keeps answering from the retired provider, while a *new* query correctly
+    /// fails to plan and `information_schema.tables` no longer lists the dataset.
+    ///
+    /// Scope: this asserts the cached plan, and nothing about memory. The reproduction on
+    /// #14251 shows a query-pool reservation still held after both caches are cleared, so
+    /// some other holder keeps it; this test's empty `MemTable` reserves nothing and could
+    /// not tell either way.
+    ///
+    /// Before the fix this read `Some(1)`: `update_dataset` and `remove_view` both discard
+    /// cached plans, and the removal arm was the one that did not.
+    #[tokio::test]
+    async fn removing_a_dataset_discards_cached_plans() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let name = TableReference::bare("removed_ds");
+        runtime
+            .df
+            .ctx
+            .register_table(name.clone(), empty_table())
+            .expect("the table registers");
+
+        runtime
+            .df
+            .cache_one_plan("SELECT id FROM removed_ds")
+            .await
+            .expect("the query plans while the dataset is registered");
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+
+        Arc::clone(&runtime)
+            .apply_dataset_diff(&app_with_datasets(&["removed_ds"]), &app_with_datasets(&[]))
+            .await;
+
+        assert!(
+            !runtime.df.table_exists(&name),
+            "the premise: the dataset really was unloaded"
+        );
+        assert_eq!(
+            runtime.df.cached_plan_count().await,
+            Some(0),
+            "a plan cached over the removed dataset still resolves through its retired provider, so an already-executed query keeps answering from a dataset the catalog no longer lists"
+        );
+
+        // What the operator actually observes. Going back through the same cache key is the
+        // whole defect: on `trunk` this returns the stale plan and the query answers rows,
+        // which is why asserting only on the count above would be a weaker claim than the
+        // issue makes.
+        let replanned = runtime.df.cache_one_plan("SELECT id FROM removed_ds").await;
+        let err = replanned.expect_err(
+            "the previously executed SQL must be replanned against the catalog, which no longer has the dataset",
+        );
+        assert!(
+            err.to_string().contains("removed_ds"),
+            "and it must fail for the reason a new query fails — table not found: {err}"
+        );
+    }
+
+    /// The premise the test above rests on: the discard belongs to the *removal*, not to
+    /// applying a diff. Were `apply_dataset_diff` to clear unconditionally, the assertion
+    /// above would hold for a reason that has nothing to do with `remove_dataset`.
+    #[tokio::test]
+    async fn an_apply_that_removes_no_dataset_keeps_cached_plans() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
+
+        Arc::clone(&runtime)
+            .apply_dataset_diff(&app_with_datasets(&[]), &app_with_datasets(&[]))
+            .await;
+
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+    }
+
+    /// The warning is the only account an operator gets of why a dataset that is gone keeps
+    /// answering, so it has to say *that*, not that the dataset "is updating" — which is what
+    /// the one shared message said before the unload path had its own.
+    #[test]
+    fn a_failed_unload_invalidation_says_the_dataset_keeps_answering() {
+        let dataset = TableReference::partial("public", "orders");
+        let unload = cache_invalidation_warning(
+            &dataset,
+            CacheInvalidation::Unload,
+            &"cache backend unavailable",
+        );
+        assert!(
+            unload.contains("'public.orders'"),
+            "the dataset is named, and quoted so an empty or word-like name survives: {unload}"
+        );
+        assert!(
+            unload.contains("unloaded"),
+            "an operator reading this must not be told the dataset is updating: {unload}"
+        );
+        assert!(
+            unload.contains("cache backend unavailable"),
+            "the cause is carried: {unload}"
+        );
+        assert!(!unload.contains('\n'), "one log line: {unload}");
+
+        let reload = cache_invalidation_warning(
+            &dataset,
+            CacheInvalidation::Reload,
+            &"cache backend unavailable",
+        );
+        assert!(
+            reload.contains("is updating") && reload.contains("previous contents"),
+            "the reload wording is unchanged, so an operator's existing alert keeps matching: {reload}"
+        );
+    }
+
+    /// An app declaring `names` as `file:` datasets. The `from` never has to resolve: the
+    /// removal arm reads only which names left the app.
+    fn app_with_datasets(names: &[&str]) -> Arc<App> {
+        let mut builder = app::AppBuilder::new("dataset_removal");
+        for name in names {
+            builder = builder.with_dataset(spicepod_dataset("file:data.csv", name));
+        }
+        Arc::new(builder.build())
     }
 }

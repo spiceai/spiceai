@@ -184,7 +184,8 @@ files the gate itself reads**:
 - `.config/nextest.toml` — retries, slow-test timeouts, test groups
 - `layers.toml`, `scripts/check_crate_layers.py`,
   `scripts/check_rust_gate_paths.py`, and
-  `scripts/check_module_reachability.py` — the no-compile guards it runs
+  `scripts/check_module_reachability.py` — the no-compile guards it runs — and
+  `scripts/rust_guard_common.py`, the helpers those guards import
 - the root `Makefile` — it holds every `-Dclippy::…` flag the gate enforces
 
 The merge queue still runs the full suite on the merged result — its
@@ -197,9 +198,10 @@ paths), and the `code_changes` filter in `.github/actions/check-code-changes`
 also gates integration and E2E, and it only has to *cover* the set). A path
 missing from all three lands on trunk having never been linted, built, or
 tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
-what must be gated from what the `lint-rust` recipe reads, from the tracked
-config-file names, and from every tracked `.rs` file — rather than from a list
-someone has to remember — and fails when the three drift. Change them together.
+what must be gated from what the `lint-rust` recipe reads (including the
+`scripts/` modules its guards import), from the tracked config-file names, and
+from every tracked `.rs` file — rather than from a list someone has to remember
+— and fails when the three drift. Change them together.
 
 Deriving from the tracked sources is what catches a whole source *tree* going
 ungated, which the config-file derivation cannot see: top-level `vendor/` holds
