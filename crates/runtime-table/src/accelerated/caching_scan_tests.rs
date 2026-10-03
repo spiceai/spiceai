@@ -212,7 +212,7 @@ impl Fixture {
         let mut table = builder.build().await.expect("accelerated table");
         // Keep write-side scans out of the read-plan counter. The channel still
         // exercises real enqueueing and the in-flight claim stays held by it.
-        for handler in table.handlers.drain(..) {
+        for handler in table.handlers.get_mut().drain(..) {
             handler.abort();
             let _ = handler.await;
         }

@@ -542,6 +542,7 @@ pub struct Refresher {
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
     change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    cache_write_sender: Option<super::caching::CacheWriteSender>,
     // `Weak` reference to `Caching` is used to prevent blocking cache cleanup during runtime termination.
     caching: Option<Weak<Caching>>,
     /// The caching accelerator's claim set, forwarded to the refresh task so
@@ -617,6 +618,7 @@ impl Refresher {
             refresh,
             accelerator,
             change_sink: None,
+            cache_write_sender: None,
             caching: None,
             in_flight_revalidations: None,
             refresh_task_runner: None,
@@ -657,6 +659,14 @@ impl Refresher {
         sink: Option<runtime_acceleration::change_sink::ChangeSink>,
     ) -> &mut Self {
         self.change_sink = sink;
+        self
+    }
+
+    pub fn with_cache_write_sender(
+        &mut self,
+        sender: Option<super::caching::CacheWriteSender>,
+    ) -> &mut Self {
+        self.cache_write_sender = sender;
         self
     }
 
@@ -959,7 +969,8 @@ impl Refresher {
 
         refresh_task_runner = refresh_task_runner
             .with_metrics(self.metrics.clone())
-            .with_change_sink(self.change_sink.clone());
+            .with_change_sink(self.change_sink.clone())
+            .with_cache_write_sender(self.cache_write_sender.clone());
 
         refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
 
@@ -1255,6 +1266,22 @@ impl Refresher {
         }
     }
 
+    /// Transfer every nested worker to the table generation's drain owner.
+    pub(crate) fn take_background_tasks(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut tasks = Vec::with_capacity(2);
+        if let Some(task) = self
+            .refresh_task_runner
+            .as_mut()
+            .and_then(RefreshTaskRunner::take_task)
+        {
+            tasks.push(task);
+        }
+        if let Some(task) = self.snapshot_interval_task.take() {
+            tasks.push(task);
+        }
+        tasks
+    }
+
     fn start_changes_stream(
         &mut self,
         changes_stream: ChangesStream,
@@ -1278,7 +1305,8 @@ impl Refresher {
         .with_engine_type_rewrites(self.engine_type_rewrites)
         .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
         .with_cdc_param_overrides(self.cdc_param_overrides.clone())
-        .with_change_sink(self.change_sink.clone());
+        .with_change_sink(self.change_sink.clone())
+        .with_cache_write_sender(self.cache_write_sender.clone());
 
         let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);

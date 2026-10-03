@@ -233,6 +233,7 @@ pub struct RefreshTaskBuilder {
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
     change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    cache_write_sender: Option<super::caching::CacheWriteSender>,
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
@@ -285,6 +286,7 @@ impl RefreshTaskBuilder {
             federated_source,
             accelerator,
             change_sink: None,
+            cache_write_sender: None,
             disable_federation: false,
             semaphore: None,
             metrics: None,
@@ -311,6 +313,15 @@ impl RefreshTaskBuilder {
         sink: Option<runtime_acceleration::change_sink::ChangeSink>,
     ) -> Self {
         self.change_sink = sink;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache_write_sender(
+        mut self,
+        sender: Option<super::caching::CacheWriteSender>,
+    ) -> Self {
+        self.cache_write_sender = sender;
         self
     }
 
@@ -486,6 +497,7 @@ impl RefreshTaskBuilder {
             engine_type_rewrites: self.engine_type_rewrites,
             snapshot_refresh_state: self.snapshot_refresh_state,
             change_sink: tokio::sync::OnceCell::new_with(self.change_sink),
+            cache_write_sender: self.cache_write_sender,
             cdc_param_overrides: self.cdc_param_overrides,
             in_flight_revalidations: self.in_flight_revalidations,
             session_state,
@@ -564,6 +576,7 @@ pub struct RefreshTask {
     /// other refresh modes.
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
     change_sink: tokio::sync::OnceCell<runtime_acceleration::change_sink::ChangeSink>,
+    cache_write_sender: Option<super::caching::CacheWriteSender>,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
@@ -1293,6 +1306,13 @@ impl RefreshTask {
 
         // Use the CacheRefreshHelper to identify and refresh all stale rows
         let federated_provider = self.federated.table_provider().await;
+        let cache_write_sender = self.cache_write_sender.clone().ok_or_else(|| {
+            RetryError::permanent(super::Error::FailedToRefreshDataset {
+                source: datafusion::error::DataFusionError::Internal(
+                    "Caching refresh requires a bound table-generation writer".into(),
+                ),
+            })
+        })?;
         let refreshed_count = CacheRefreshHelper::refresh_all_stale_rows(
             federated_provider,
             Arc::clone(&self.accelerator),
@@ -1301,6 +1321,7 @@ impl RefreshTask {
             ttl,
             Arc::clone(&self.accelerator_write_mutex),
             Arc::clone(&self.in_flight_revalidations),
+            cache_write_sender,
         )
         .await
         .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;

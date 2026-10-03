@@ -14,13 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 use crate::accelerated::AcceleratedTable;
+use crate::accelerated::caching::{
+    CacheRefreshHelper, InFlightRevalidations, SynchronizedCacheTarget, SynchronizedChildren,
+};
 use crate::accelerated::refresh::Refresher;
 
 #[derive(Clone)]
@@ -30,9 +36,12 @@ pub struct SynchronizedTable {
     child_accelerator: Arc<dyn TableProvider>,
     refresher: Arc<Refresher>,
     /// Reference to parent's synchronized children list (for caching mode registration)
-    parent_synchronized_children: Arc<RwLock<Vec<Arc<dyn TableProvider>>>>,
+    parent_synchronized_children: SynchronizedChildren,
+    parent_cache_children_closed: Arc<AtomicBool>,
     /// Reference to parent's accelerator (for initializing child from existing data)
     parent_accelerator: Arc<dyn TableProvider>,
+    parent_write_mutex: Arc<Mutex<()>>,
+    parent_change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
 }
 
 impl std::fmt::Debug for SynchronizedTable {
@@ -57,7 +66,10 @@ impl SynchronizedTable {
             child_accelerator,
             refresher: accelerated_table.refresher(),
             parent_synchronized_children: accelerated_table.synchronized_children(),
+            parent_cache_children_closed: Arc::clone(&accelerated_table.cache_children_closed),
             parent_accelerator: accelerated_table.get_accelerator(),
+            parent_write_mutex: Arc::clone(&accelerated_table.accelerator_write_mutex),
+            parent_change_sink: accelerated_table.change_sink().cloned(),
         }
     }
 
@@ -86,12 +98,47 @@ impl SynchronizedTable {
         Arc::clone(&self.refresher)
     }
 
-    /// Register the child accelerator with the parent for caching mode synchronization.
-    /// This allows the parent to propagate cached data to the child.
-    pub async fn register_child_with_parent(&self) {
+    /// Remove only the retiring child's generation after its writes drain.
+    /// Waiting for the registry also orders this removal after parent jobs that
+    /// already selected the child. No storage lock may be held while waiting.
+    pub(crate) async fn unregister_cache_child(&self, claims: &InFlightRevalidations) {
         self.parent_synchronized_children
             .write()
             .await
-            .push(Arc::clone(&self.child_accelerator));
+            .retain(|child| !Arc::ptr_eq(&child.in_flight, claims));
+    }
+
+    /// Initialize an unpublished child and attach it to parent propagation.
+    /// The registry fence precedes the write fence: earlier parent writes are
+    /// included in the snapshot, and later fanout sees the registered child.
+    pub async fn initialize_cache_child(
+        &self,
+        child: SynchronizedCacheTarget,
+    ) -> datafusion::error::Result<usize> {
+        let mut children = self.parent_synchronized_children.write().await;
+        self.ensure_parent_accepts_children()?;
+        if let Some(sink) = &self.parent_change_sink {
+            sink.flush().await?;
+        }
+        let _write_guard = self.parent_write_mutex.lock().await;
+        let rows = CacheRefreshHelper::initialize_child_from_parent(
+            &self.parent_accelerator,
+            &child,
+            &self.child_dataset_name.to_string(),
+        )
+        .await?;
+        self.ensure_parent_accepts_children()?;
+        children.push(child);
+        Ok(rows)
+    }
+
+    fn ensure_parent_accepts_children(&self) -> datafusion::error::Result<()> {
+        if self.parent_cache_children_closed.load(Ordering::Acquire) {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "Cannot initialize cache dataset '{}' because parent '{}' is stopping",
+                self.child_dataset_name, self.parent_dataset_name,
+            )));
+        }
+        Ok(())
     }
 }

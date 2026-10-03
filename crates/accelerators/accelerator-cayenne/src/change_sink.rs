@@ -333,6 +333,31 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                 batches,
                 append_validations,
             } => {
+                let batches = if self.table.is_memory_resident_mode()
+                    && self.table.constraints().is_none_or(|keys| keys.is_empty())
+                    && batches.iter().any(|batch| batch.num_rows() > 0)
+                {
+                    let target = self.context.table.schema();
+                    let batches = batches
+                        .into_iter()
+                        .map(|batch| try_cast_to(batch, Arc::clone(&target)).map_err(Into::into))
+                        .collect::<Result<Vec<_>>>()
+                        .map_err(before_mutation)?;
+                    let incoming_bytes = batches
+                        .iter()
+                        .map(|batch| {
+                            u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX)
+                        })
+                        .fold(0_u64, u64::saturating_add);
+                    let filters = scope.as_ref().map(|scope| scope.filters());
+                    self.table
+                        .preflight_memory_append(incoming_bytes, filters.as_deref())
+                        .await
+                        .map_err(|error| before_mutation(error.into()))?;
+                    batches
+                } else {
+                    batches
+                };
                 // Rebuildable input has no replay position. Use the composed
                 // provider's delete-then-append path without arming RAM writes.
                 self.select_recovery_path(false).await?;
