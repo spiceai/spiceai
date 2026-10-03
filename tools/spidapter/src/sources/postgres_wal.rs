@@ -629,11 +629,14 @@ mod tests {
         let ddl =
             pg_create_table_ddl("tpch_abc12345", "orders", &dataset).expect("ddl should generate");
 
-        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS tpch_abc12345.orders ("));
-        assert!(ddl.contains("id BIGINT NOT NULL"));
-        assert!(ddl.contains("name TEXT"));
-        assert!(ddl.contains("price DOUBLE PRECISION"));
-        assert!(ddl.contains("PRIMARY KEY (id)"));
+        assert!(
+            ddl.starts_with(r#"CREATE TABLE IF NOT EXISTS "tpch_abc12345"."orders" ("#),
+            "every identifier is double-quoted: {ddl}"
+        );
+        assert!(ddl.contains(r#""id" BIGINT NOT NULL"#), "{ddl}");
+        assert!(ddl.contains(r#""name" TEXT"#), "{ddl}");
+        assert!(ddl.contains(r#""price" DOUBLE PRECISION"#), "{ddl}");
+        assert!(ddl.contains(r#"PRIMARY KEY ("id")"#), "{ddl}");
     }
 
     #[test]
@@ -647,7 +650,7 @@ mod tests {
         );
         let ddl =
             pg_create_table_ddl("myschema", "mytable", &dataset).expect("ddl should generate");
-        assert!(ddl.contains("PRIMARY KEY (pk1, pk2)"));
+        assert!(ddl.contains(r#"PRIMARY KEY ("pk1", "pk2")"#), "{ddl}");
     }
 
     #[test]
@@ -812,9 +815,11 @@ mod tests {
         let spicepod = generate_postgres_wal_spicepod(&run_id, &pg, &datasets, "duckdb");
         let yaml = yaml::to_string(&spicepod).expect("serialize");
 
+        // One publication per table, named after the run's schema so two runs
+        // on one server never share a publication.
         assert!(
-            yaml.contains("spicebench_pub_orders"),
-            "publication name should include table name: {yaml}"
+            yaml.contains("tpch_abc12345_pub_orders"),
+            "publication name should carry the schema and the table name: {yaml}"
         );
     }
 

@@ -1000,6 +1000,7 @@ impl PreparedStagedAppend {
     /// implementation never returns an error.
     #[expect(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "API symmetry / forward-compat — see body"
     )]
     pub async fn apply_in_txn(&self, _txn: &mut dyn MetastoreTransaction) -> Result<()> {
@@ -1023,6 +1024,7 @@ impl PreparedStagedAppend {
     /// and for forward-compatibility with the cross-partition coordinator.
     #[expect(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "API symmetry / forward-compat — see body"
     )]
     pub async fn finish(self) -> Result<u64> {

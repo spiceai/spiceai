@@ -18,6 +18,7 @@ use datafusion_datasource::TableSchema;
 use datafusion_datasource::file_stream::FileOpenFuture;
 use datafusion_datasource::file_stream::FileOpener;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
+use datafusion_expr::Operator;
 use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
@@ -33,14 +34,23 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
+use futures::stream::BoxStream;
 use itertools::Itertools;
 use object_store::path::Path;
 use tracing::Instrument;
+use vortex::array::MaskFuture;
 use vortex::array::VortexSessionExecute;
+use vortex::array::expr::Expression;
+use vortex::array::expr::forms::conjuncts;
+use vortex::array::expr::root;
+use vortex::array::expr::transform::replace_root_fields;
 use vortex::arrow::ArrowSessionExt;
+use vortex::dtype::DType;
 use vortex::dtype::FieldMask;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
+use vortex::error::VortexResult;
+use vortex::error::vortex_err;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::io::InstrumentedReadAt;
 use vortex::layout::LayoutReader;
@@ -54,6 +64,7 @@ use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
 
 use crate::VortexAccessPlan;
+use crate::VortexRuntimeAccessPlanProvider;
 use crate::convert::exprs::ExpressionConvertor;
 use crate::convert::exprs::ProcessedProjection;
 use crate::convert::exprs::make_vortex_predicate;
@@ -62,6 +73,7 @@ use crate::metrics::PARTITION_LABEL;
 use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
 use crate::persistent::deferred_projection::DeferredProjectionReader;
+use crate::persistent::key_blocks;
 use crate::persistent::reader::VortexReaderFactory;
 use crate::persistent::segment_cache::SharedSegmentCache;
 use crate::persistent::stream::PrunableStream;
@@ -112,7 +124,19 @@ pub(crate) struct VortexOpener {
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
+    /// Provider consulted after runtime dynamic filters have been populated.
+    pub runtime_access_plan_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>>,
+    /// Column whose equality predicates a whole-file scan answers from the file's
+    /// key blocks (see [`key_blocks`]).
+    pub key_column: Option<Arc<str>>,
 }
+
+/// Most candidate ranges a point read serves; more fall back to a scan.
+const POINT_READ_MAX_RANGES: usize = 4;
+
+/// Most candidate rows a point read serves. A point read evaluates each range in
+/// one piece rather than streaming it in splits, so this bounds what it decodes.
+const POINT_READ_MAX_ROWS: u64 = 16 * key_blocks::BLOCK_ROWS;
 
 impl FileOpener for VortexOpener {
     fn open(&self, file: PartitionedFile) -> DFResult<FileOpenFuture> {
@@ -149,6 +173,10 @@ impl FileOpener for VortexOpener {
 
         let expr_convertor = Arc::clone(&self.expression_convertor);
         let projection_pushdown = self.projection_pushdown;
+        let runtime_access_plan_provider =
+            self.runtime_access_plan_provider.as_ref().map(Arc::clone);
+        let runtime_predicate = self.filter.as_ref().map(Arc::clone);
+        let key_column = self.key_column.as_ref().map(Arc::clone);
 
         // Replace column access for partition columns with literals
         let literal_value_cols: std::collections::HashMap<String, ScalarValue> = self
@@ -170,12 +198,55 @@ impl FileOpener for VortexOpener {
         }
 
         Ok(async move {
+            let runtime_access_plan = match runtime_access_plan_provider.as_ref() {
+                Some(provider) => {
+                    provider
+                        .runtime_access_plan_for_file(&file, runtime_predicate.as_ref())
+                        .await
+                }
+                None => None,
+            };
+
+            // A runtime index may prove that this file has no candidate rows. Return
+            // before opening the Vortex footer or constructing its layout reader.
+            if runtime_access_plan
+                .as_deref()
+                .is_some_and(VortexAccessPlan::is_empty)
+            {
+                return Ok(stream::empty().boxed());
+            }
+
+            // A key lookup on a file whose key blocks are already cached is decided
+            // here, before the file is opened. A file with no block that can hold the
+            // key is skipped. Otherwise the file pruner is not built: its statistics
+            // cannot rule out a key the blocks hold, and a predicate that is not
+            // dynamic gives it nothing to re-check while the file is read.
+            let early_key_ranges = match (key_column.as_ref(), filter.as_ref(), &file.range) {
+                (Some(column), Some(predicate), None) if !is_dynamic_physical_expr(predicate) => {
+                    match key_equality(predicate, column, &unified_file_schema) {
+                        Some(key) => key_blocks::cached_key_blocks(
+                            &object_store_url,
+                            &file.object_meta,
+                            column,
+                        )
+                        .await
+                        .map(|blocks| blocks.candidate_ranges(key)),
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            if early_key_ranges.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(stream::empty().boxed());
+            }
+
             // Create FilePruner when we have a predicate and either dynamic expressions
             // or file statistics available. The pruner can eliminate files without
             // opening them based on:
             // - Partition column values (e.g., date=2024-01-01)
             // - File-level statistics (min/max values per column)
             let mut file_pruner = file_pruning_predicate
+                .filter(|_| early_key_ranges.is_none())
                 .filter(|p| {
                     // Only create pruner if we have dynamic expressions or file statistics
                     // to work with. Static predicates without stats won't benefit from pruning.
@@ -325,17 +396,16 @@ impl FileOpener for VortexOpener {
                 }
             };
 
-            let natural_split_ranges = natural_split_ranges_for_file(
-                natural_split_ranges.as_ref(),
-                &file.object_meta.location,
-                &layout_reader,
-            )?;
-
             // Resolved before the filter below so that a split whose byte range covers no
             // whole row group still short-circuits to an empty stream, rather than
             // reporting a pushdown failure it will never act on.
             let row_range = match file.range {
                 Some(file_range) => {
+                    let natural_split_ranges = natural_split_ranges_for_file(
+                        natural_split_ranges.as_ref(),
+                        &file.object_meta.location,
+                        &layout_reader,
+                    )?;
                     let byte_range = Range {
                         start: u64::try_from(file_range.start).map_err(|_| {
                             exec_datafusion_err!("Vortex file range start is negative")
@@ -357,6 +427,32 @@ impl FileOpener for VortexOpener {
                 }
                 None => None,
             };
+
+            // An equality on the key column of a whole-file scan can only match inside
+            // the file's key blocks that hold the key: none means the file has no match,
+            // and a few are read directly below instead of scanned. A dynamic filter
+            // changes after the file opens, so it keeps the scan.
+            let key_ranges = match (key_column.as_ref(), filter.as_ref(), &row_range) {
+                _ if early_key_ranges.is_some() => early_key_ranges,
+                (Some(column), Some(predicate), None) if !is_dynamic_physical_expr(predicate) => {
+                    match key_equality(predicate, column, &this_file_schema) {
+                        Some(key) => key_blocks::key_blocks(
+                            &layout_reader,
+                            &session,
+                            &object_store_url,
+                            &file.object_meta,
+                            column,
+                        )
+                        .await
+                        .map(|blocks| blocks.candidate_ranges(key)),
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            if key_ranges.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(stream::empty().boxed());
+            }
 
             // Stats-layout pruning chain (Vortex 0.74 `FileStatsLayoutReader` / zoned
             // `StatFn`). The conjuncts collected here are translated to a Vortex
@@ -410,97 +506,139 @@ impl FileOpener for VortexOpener {
                 })
                 .transpose()?;
 
-            // Drop a split whose zones cannot satisfy the filter before the scan is
-            // built. Vortex prunes these same zones inside the scan, but only after
-            // `ScanBuilder::build` has optimized the projection and the filter
-            // against the file's dtype — work a split that will read nothing should
-            // not pay for, and which is repeated for every split the file is divided
-            // into. A file is split by byte range for parallelism and each split
-            // inherits the whole file's statistics, so `FilePruner` above cannot
-            // separate them; only the zone map can.
-            //
-            // `pruning_evaluation` returns a mask whose false lanes are *proven*
-            // false for the expression, so an all-false mask is a sound skip. The
-            // zone map it reads is memoized on the layout reader, which
-            // `layout_readers` shares with every other split of this file, so the
-            // read happens once per file rather than once per split.
-            if let Some(predicate) = filter.as_ref() {
-                let prune_range = row_range
-                    .clone()
-                    .unwrap_or_else(|| 0..layout_reader.row_count());
-                let prune_len = usize::try_from(prune_range.end - prune_range.start)
-                    .map_err(|_| exec_datafusion_err!("Vortex split row range exceeds usize"))?;
-                let pruned = layout_reader
-                    .pruning_evaluation(&prune_range, predicate, Mask::new_true(prune_len))
-                    .map_err(|e| {
-                        exec_datafusion_err!("Failed to build Vortex zone pruning: {e}")
-                    })?
-                    .await
-                    .map_err(|e| {
-                        exec_datafusion_err!("Failed to evaluate Vortex zone pruning: {e}")
-                    })?;
-                if pruned.all_false() {
-                    return Ok(stream::empty().boxed());
-                }
-            }
-
-            // Built after the filter so we know whether there is one: a filtered scan
-            // discards splits whose mask comes back empty, and deferring projection setup
-            // keeps those splits from registering reads for the output columns. An
-            // unfiltered scan has nothing to wait on, and its eager registration is what
-            // lets the read driver coalesce adjacent splits, so it keeps the plain reader.
-            let layout_reader: Arc<dyn LayoutReader> = if filter.is_some() {
-                Arc::new(DeferredProjectionReader::new(layout_reader))
-            } else {
-                layout_reader
-            };
-            #[cfg(test)]
-            tests::record_scan_built();
-
-            let mut scan_builder = ScanBuilder::new(session.clone(), layout_reader);
-
-            if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
-                scan_builder = vortex_plan.apply_to_builder(scan_builder);
-            }
-
-            if let Some(row_range) = row_range {
-                scan_builder = scan_builder.with_row_range(row_range);
-            }
-
-            if let Some(limit) = limit
-                && filter.is_none()
-            {
-                scan_builder = scan_builder.with_limit(limit);
-            }
-
-            if let Some(concurrency) = scan_concurrency {
-                // Absolute, not per-worker: this count is charged to the query
-                // memory pool one decoded batch at a time, and it is capped
-                // against the process's CPU entitlement. The per-worker form
-                // multiplies by `available_parallelism`, which reports the
-                // machine's cores rather than the share a cgroup granted, so
-                // neither the charge nor the cap would mean what it says.
-                scan_builder = scan_builder.with_absolute_concurrency(concurrency);
-            }
+            // A point read needs the whole filter in Vortex form and no row selection: a
+            // planning-time or runtime access plan (deleted rows, say) is applied by the
+            // scan builder, which a point read does not use.
+            let point_read = key_ranges.filter(|ranges| {
+                filter.is_some()
+                    && ranges.len() <= POINT_READ_MAX_RANGES
+                    && ranges.iter().map(|range| range.end - range.start).sum::<u64>()
+                        <= POINT_READ_MAX_ROWS
+                    && file.extensions.get::<VortexAccessPlan>().is_none()
+                    && runtime_access_plan.is_none()
+            });
 
             let stream_target_field = Field::new_struct("", stream_schema.fields().clone(), false);
-            let stream = scan_builder
-                .with_metrics_registry(metrics_registry)
-                .with_projection(scan_projection)
-                .with_some_filter(filter)
-                .with_ordered(has_output_ordering)
-                .map(move |chunk| {
-                    let mut ctx = session.create_execution_ctx();
-                    let arrow_session = ctx.session().clone();
-                    let arrow = arrow_session.arrow().execute_arrow(
-                        chunk,
-                        Some(&stream_target_field),
-                        &mut ctx,
-                    )?;
-                    Ok(RecordBatch::from(arrow.as_struct().clone()))
-                })
-                .into_stream()
-                .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
+            let batches = if let Some(ranges) = point_read
+                && let Some(predicate) = filter.as_ref()
+            {
+                #[cfg(test)]
+                tests::record_point_read();
+                point_read_stream(
+                    layout_reader,
+                    session,
+                    ranges,
+                    predicate,
+                    &scan_projection,
+                    stream_target_field,
+                )
+                .map_err(|e| exec_datafusion_err!("Failed to create Vortex point read: {e}"))?
+            } else {
+                // Drop a split whose zones cannot satisfy the filter before the scan is
+                // built. Vortex prunes these same zones inside the scan, but only after
+                // `ScanBuilder::build` has optimized the projection and the filter
+                // against the file's dtype — work a split that will read nothing should
+                // not pay for, and which is repeated for every split the file is divided
+                // into. A file is split by byte range for parallelism and each split
+                // inherits the whole file's statistics, so `FilePruner` above cannot
+                // separate them; only the zone map can.
+                //
+                // `pruning_evaluation` returns a mask whose false lanes are *proven*
+                // false for the expression, so an all-false mask is a sound skip. The
+                // zone map it reads is memoized on the layout reader, which
+                // `layout_readers` shares with every other split of this file, so the
+                // read happens once per file rather than once per split.
+                if let Some(predicate) = filter.as_ref() {
+                    let prune_range = row_range
+                        .clone()
+                        .unwrap_or_else(|| 0..layout_reader.row_count());
+                    let prune_len = usize::try_from(prune_range.end - prune_range.start)
+                        .map_err(|_| exec_datafusion_err!("Vortex split row range exceeds usize"))?;
+                    let pruned = layout_reader
+                        .pruning_evaluation(&prune_range, predicate, Mask::new_true(prune_len))
+                        .map_err(|e| {
+                            exec_datafusion_err!("Failed to build Vortex zone pruning: {e}")
+                        })?
+                        .await
+                        .map_err(|e| {
+                            exec_datafusion_err!("Failed to evaluate Vortex zone pruning: {e}")
+                        })?;
+                    if pruned.all_false() {
+                        return Ok(stream::empty().boxed());
+                    }
+                }
+
+                // Built after the filter so we know whether there is one: a filtered scan
+                // discards splits whose mask comes back empty, and deferring projection setup
+                // keeps those splits from registering reads for the output columns. An
+                // unfiltered scan has nothing to wait on, and its eager registration is what
+                // lets the read driver coalesce adjacent splits, so it keeps the plain reader.
+                let layout_reader: Arc<dyn LayoutReader> = if filter.is_some() {
+                    Arc::new(DeferredProjectionReader::new(layout_reader))
+                } else {
+                    layout_reader
+                };
+                #[cfg(test)]
+                tests::record_scan_built();
+
+                let mut scan_builder = ScanBuilder::new(session.clone(), layout_reader);
+
+                // A runtime plan narrows the planning-time plan rather than replacing
+                // it, so rows the planning-time plan excludes (deleted rows, say) stay
+                // excluded whatever the runtime provider returns.
+                match (
+                    file.extensions.get::<VortexAccessPlan>(),
+                    runtime_access_plan.as_deref(),
+                ) {
+                    (Some(planned), Some(runtime)) => {
+                        scan_builder = planned.intersect(runtime).apply_to_builder(scan_builder);
+                    }
+                    (Some(plan), None) | (None, Some(plan)) => {
+                        scan_builder = plan.apply_to_builder(scan_builder);
+                    }
+                    (None, None) => {}
+                }
+
+                if let Some(row_range) = row_range {
+                    scan_builder = scan_builder.with_row_range(row_range);
+                }
+
+                if let Some(limit) = limit
+                    && filter.is_none()
+                {
+                    scan_builder = scan_builder.with_limit(limit);
+                }
+
+                if let Some(concurrency) = scan_concurrency {
+                    // Absolute, not per-worker: this count is charged to the query
+                    // memory pool one decoded batch at a time, and it is capped
+                    // against the process's CPU entitlement. The per-worker form
+                    // multiplies by `available_parallelism`, which reports the
+                    // machine's cores rather than the share a cgroup granted, so
+                    // neither the charge nor the cap would mean what it says.
+                    scan_builder = scan_builder.with_absolute_concurrency(concurrency);
+                }
+
+                scan_builder
+                    .with_metrics_registry(metrics_registry)
+                    .with_projection(scan_projection)
+                    .with_some_filter(filter)
+                    .with_ordered(has_output_ordering)
+                    .map(move |chunk| {
+                        let mut ctx = session.create_execution_ctx();
+                        let arrow_session = ctx.session().clone();
+                        let arrow = arrow_session.arrow().execute_arrow(
+                            chunk,
+                            Some(&stream_target_field),
+                            &mut ctx,
+                        )?;
+                        Ok(RecordBatch::from(arrow.as_struct().clone()))
+                    })
+                    .into_stream()
+                    .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
+                    .boxed()
+            };
+            let stream = batches
                 .map_ok(move |rb| {
                     // We try and slice the stream into respecting datafusion's configured batch size.
                     stream::iter(
@@ -547,6 +685,126 @@ impl FileOpener for VortexOpener {
         .in_current_span()
         .boxed())
     }
+}
+
+/// The integer `column` must equal for `predicate` to hold: the literal of the first
+/// conjunct comparing `column` for equality with an integer literal, on a column
+/// whose type in `schema` has key blocks. `None` for any other predicate.
+fn key_equality(predicate: &PhysicalExprRef, column: &str, schema: &Schema) -> Option<i64> {
+    let data_type = schema.field_with_name(column).ok()?.data_type();
+    if !key_blocks::is_indexable(data_type) {
+        return None;
+    }
+    split_conjunction(predicate)
+        .into_iter()
+        .find_map(|conjunct| {
+            let binary = conjunct.downcast_ref::<df_expr::BinaryExpr>()?;
+            if *binary.op() != Operator::Eq {
+                return None;
+            }
+            let (left, right) = (binary.left(), binary.right());
+            let (key, literal) = match (
+                left.downcast_ref::<df_expr::Column>(),
+                right.downcast_ref::<df_expr::Literal>(),
+            ) {
+                (Some(key), Some(literal)) => (key, literal),
+                _ => (
+                    right.downcast_ref::<df_expr::Column>()?,
+                    left.downcast_ref::<df_expr::Literal>()?,
+                ),
+            };
+            if key.name() != column {
+                return None;
+            }
+            key_blocks::integer_literal(literal.value())
+        })
+}
+
+/// Reads the rows of `ranges` that satisfy `filter` straight from `reader`, one
+/// range at a time and in row order.
+///
+/// Each range is evaluated the way a scan split is — every filter conjunct over
+/// the range, then the projection of the rows that pass — without the work a
+/// `ScanBuilder` does first: zone-map pruning across the whole file, split
+/// planning, and preparing the scan on the blocking pool. That work is sized to
+/// the file, and a key lookup has only a few blocks left to read.
+fn point_read_stream(
+    reader: Arc<dyn LayoutReader>,
+    session: VortexSession,
+    ranges: Vec<Range<u64>>,
+    filter: &Expression,
+    projection: &Expression,
+    target: Field,
+) -> VortexResult<BoxStream<'static, VortexResult<RecordBatch>>> {
+    let conjuncts: Arc<[Expression]> =
+        conjuncts(&filter.optimize_recursive(reader.dtype())?).into();
+    // A projection of every field in file order is the root itself. The struct
+    // reader rewrites a projection against its own expansion of the root before
+    // partitioning it by field, and for that `pack` the rewrite nests the
+    // expansion once per field; handed `root()`, it has nothing to rewrite.
+    let projection = if is_identity_projection(projection, reader.dtype()) {
+        root()
+    } else {
+        projection.optimize_recursive(reader.dtype())?
+    };
+    let reads = ranges.into_iter().map(move |range| {
+        read_range(
+            Arc::clone(&reader),
+            session.clone(),
+            range,
+            Arc::clone(&conjuncts),
+            projection.clone(),
+            target.clone(),
+        )
+    });
+    Ok(stream::iter(reads)
+        .buffered(POINT_READ_MAX_RANGES)
+        .try_filter_map(|batch| async move { Ok(batch) })
+        .boxed())
+}
+
+/// Whether `projection` selects every field of the non-nullable struct `dtype`,
+/// in order and under its own name — the expansion of `root()` a struct reader
+/// builds for `dtype`.
+fn is_identity_projection(projection: &Expression, dtype: &DType) -> bool {
+    !dtype.is_nullable()
+        && dtype
+            .as_struct_fields_opt()
+            .is_some_and(|fields| *projection == replace_root_fields(root(), fields))
+}
+
+async fn read_range(
+    reader: Arc<dyn LayoutReader>,
+    session: VortexSession,
+    range: Range<u64>,
+    conjuncts: Arc<[Expression]>,
+    projection: Expression,
+    target: Field,
+) -> VortexResult<Option<RecordBatch>> {
+    let rows = usize::try_from(range.end - range.start)
+        .map_err(|_| vortex_err!("Vortex point read range exceeds usize"))?;
+    // Each evaluation returns its input mask narrowed to the rows that pass.
+    let mut mask = Mask::new_true(rows);
+    for conjunct in conjuncts.iter() {
+        mask = reader
+            .filter_evaluation(&range, conjunct, MaskFuture::ready(mask))?
+            .await?;
+        if mask.all_false() {
+            return Ok(None);
+        }
+    }
+    let array = reader
+        .projection_evaluation(&range, &projection, MaskFuture::ready(mask))?
+        .await?;
+    let mut ctx = session.create_execution_ctx();
+    let arrow_session = ctx.session().clone();
+    let arrow = arrow_session
+        .arrow()
+        .execute_arrow(array, Some(&target), &mut ctx)?;
+    let batch = arrow
+        .as_struct_opt()
+        .ok_or_else(|| vortex_err!("Vortex point read did not produce a struct array"))?;
+    Ok(Some(RecordBatch::from(batch.clone())))
 }
 
 struct PushdownConjuncts {
@@ -880,6 +1138,21 @@ mod tests {
         SCANS_BUILT.with(|built| built.set(built.get() + 1));
     }
 
+    thread_local! {
+        /// Files this thread read with a point read instead of a scan.
+        static POINT_READS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Called from `VortexOpener::open` when a file is read with a point read.
+    pub(super) fn record_point_read() {
+        POINT_READS.with(|reads| reads.set(reads.get() + 1));
+    }
+
+    /// Point reads since the last call, resetting the count.
+    fn take_point_reads() -> usize {
+        POINT_READS.with(|reads| reads.replace(0))
+    }
+
     /// Scans built since the last call, resetting the count.
     fn take_scans_built() -> usize {
         SCANS_BUILT.with(|built| built.replace(0))
@@ -911,6 +1184,8 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
+            key_column: None,
         }
     }
 
@@ -1101,6 +1376,302 @@ mod tests {
 
         Ok(())
     }
+    /// Writes `keys` as a nullable `Int64` column `a`, plus a column `p` naming
+    /// each row by its position, and returns the file's schema and size.
+    async fn write_keyed(
+        object_store: Arc<dyn ObjectStore>,
+        path: &str,
+        keys: Vec<Option<i64>>,
+    ) -> anyhow::Result<(SchemaRef, u64)> {
+        use datafusion::arrow::array::Int64Array;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("p", DataType::Utf8, false),
+        ]));
+        let positions: Vec<String> = (0..keys.len()).map(|row| format!("row-{row}")).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(StringArray::from(positions)),
+            ],
+        )?;
+        let size = write_arrow_to_vortex(object_store, path, batch).await?;
+        Ok((schema, size))
+    }
+
+    /// Reads `file` with `predicate`, projecting both columns, and returns the rows
+    /// as sorted `(a, p)` pairs: an unordered scan may return its splits in any
+    /// order.
+    async fn read_keyed(
+        object_store: &Arc<dyn ObjectStore>,
+        schema: &SchemaRef,
+        file: &PartitionedFile,
+        predicate: &datafusion::logical_expr::Expr,
+        key_column: Option<&str>,
+    ) -> anyhow::Result<Vec<(Option<i64>, String)>> {
+        use datafusion::arrow::array::Array;
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+
+        let table_schema = TableSchema::from_file_schema(Arc::clone(schema));
+        let filter = logical2physical(predicate, table_schema.table_schema());
+        let mut opener = make_opener(Arc::clone(object_store), table_schema, Some(filter));
+        opener.projection = ProjectionExprs::from_indices(&[0, 1], schema);
+        opener.key_column = key_column.map(Arc::from);
+        let batches = opener
+            .open(file.clone())?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let keys = batch.column(0).as_primitive::<Int64Type>();
+            let positions = batch.column(1).as_string_view_opt().map_or_else(
+                || {
+                    batch
+                        .column(1)
+                        .as_string::<i32>()
+                        .iter()
+                        .map(|p| p.expect("p is not null").to_string())
+                        .collect::<Vec<_>>()
+                },
+                |view| {
+                    view.iter()
+                        .map(|p| p.expect("p is not null").to_string())
+                        .collect()
+                },
+            );
+            for (row, position) in positions.into_iter().enumerate() {
+                let key = (!keys.is_null(row)).then(|| keys.value(row));
+                rows.push((key, position));
+            }
+        }
+        rows.sort();
+        Ok(rows)
+    }
+
+    /// Reads `file` with `predicate`, projecting only `p`, and returns its values.
+    async fn read_positions(
+        object_store: &Arc<dyn ObjectStore>,
+        schema: &SchemaRef,
+        file: &PartitionedFile,
+        predicate: &datafusion::logical_expr::Expr,
+        key_column: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        use datafusion::arrow::util::display::ArrayFormatter;
+
+        let table_schema = TableSchema::from_file_schema(Arc::clone(schema));
+        let filter = logical2physical(predicate, table_schema.table_schema());
+        let mut opener = make_opener(Arc::clone(object_store), table_schema, Some(filter));
+        opener.projection = ProjectionExprs::from_indices(&[1], schema);
+        opener.key_column = key_column.map(Arc::from);
+        let batches = opener
+            .open(file.clone())?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut values = Vec::new();
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 1, "only `p` is projected");
+            let formatter = ArrayFormatter::try_new(batch.column(0), &FormatOptions::default())?;
+            values.extend((0..batch.num_rows()).map(|row| formatter.value(row).to_string()));
+        }
+        values.sort();
+        Ok(values)
+    }
+
+    /// A key lookup over a whole file reads only the blocks whose bounds hold the
+    /// key, and must return exactly what the scan returns — for keys at block
+    /// edges, a key stored twice, keys inside an all-null block, and keys the
+    /// file cannot hold. The path counters are what show the point read ran:
+    /// the rows alone would match even if every lookup fell back to the scan.
+    #[tokio::test]
+    async fn key_lookups_read_the_rows_the_scan_reads() -> anyhow::Result<()> {
+        const BLOCK: i64 = 8_192;
+        const ROWS: i64 = 5 * BLOCK + 100;
+
+        // `a = row`, except: every 1000th key is null, block 1 is entirely null,
+        // and row 30,000 (block 3) repeats key 24,000 (block 2).
+        let keys: Vec<Option<i64>> = (0..ROWS)
+            .map(|row| match row {
+                30_000 => Some(24_000),
+                _ if (BLOCK..2 * BLOCK).contains(&row) || row % 1_000 == 999 => None,
+                _ => Some(row),
+            })
+            .collect();
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = "key_lookups_read_the_rows_the_scan_reads.vortex";
+        let (schema, size) = write_keyed(Arc::clone(&object_store), path, keys).await?;
+        let file = PartitionedFile::new(path.to_string(), size);
+
+        // (key, rows expected, whether any block can hold it)
+        let cases = [
+            (0, 1, true),
+            (24_000, 2, true),
+            (999, 0, true),
+            (BLOCK - 1, 1, true),
+            // Only the all-null block spans 10,000.
+            (10_000, 0, false),
+            (2 * BLOCK, 1, true),
+            // Row 30,000 holds 24,000, but block 3's bounds still hold 30,000.
+            (30_000, 0, true),
+            (ROWS - 1, 1, true),
+            (ROWS, 0, false),
+            (-1, 0, false),
+        ];
+        for (key, expected, candidate) in cases {
+            let predicate = col("a").eq(lit(key));
+            let scanned = read_keyed(&object_store, &schema, &file, &predicate, None).await?;
+            take_scans_built();
+            take_point_reads();
+            let looked_up =
+                read_keyed(&object_store, &schema, &file, &predicate, Some("a")).await?;
+            assert_eq!(
+                looked_up, scanned,
+                "key {key}: point read and scan disagree"
+            );
+            assert_eq!(looked_up.len(), expected, "key {key}: {looked_up:?}");
+            assert_eq!(
+                (take_point_reads(), take_scans_built()),
+                (usize::from(candidate), 0),
+                "key {key}: a key some block can hold is read with a point read, and one \
+                 no block can hold skips the file"
+            );
+        }
+
+        // Every conjunct still applies: key 24,000 is stored twice, one row passes.
+        let predicate = col("a")
+            .eq(lit(24_000_i64))
+            .and(col("p").eq(lit("row-30000")));
+        let scanned = read_keyed(&object_store, &schema, &file, &predicate, None).await?;
+        take_point_reads();
+        let looked_up = read_keyed(&object_store, &schema, &file, &predicate, Some("a")).await?;
+        assert_eq!(looked_up, scanned);
+        assert_eq!(looked_up, vec![(Some(24_000), "row-30000".to_string())]);
+        assert_eq!(take_point_reads(), 1);
+
+        // A projection of some of the columns reads the same rows.
+        for key in [0, ROWS - 1] {
+            let predicate = col("a").eq(lit(key));
+            let scanned = read_positions(&object_store, &schema, &file, &predicate, None).await?;
+            take_point_reads();
+            let looked_up =
+                read_positions(&object_store, &schema, &file, &predicate, Some("a")).await?;
+            assert_eq!(looked_up, scanned);
+            assert_eq!(looked_up, vec![format!("row-{key}")]);
+            assert_eq!(take_point_reads(), 1);
+        }
+
+        // Anything but an equality on the key keeps the scan.
+        let predicate = col("a").gt_eq(lit(ROWS - 3));
+        take_scans_built();
+        take_point_reads();
+        let looked_up = read_keyed(&object_store, &schema, &file, &predicate, Some("a")).await?;
+        assert_eq!(looked_up.len(), 3, "{looked_up:?}");
+        assert_eq!((take_point_reads(), take_scans_built()), (0, 1));
+
+        Ok(())
+    }
+
+    /// Once a file's key blocks are cached, a key no block can hold skips the file
+    /// before it is opened. The object is deleted after the blocks are built: a key
+    /// outside every block is still answered, and one a block holds has to open the
+    /// file and fails.
+    #[tokio::test]
+    async fn cached_key_blocks_skip_a_file_without_opening_it() -> anyhow::Result<()> {
+        use object_store::ObjectStoreExt;
+
+        let keys = (0..3 * 8_192).map(Some).collect();
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = "cached_key_blocks_skip_a_file_without_opening_it.vortex";
+        let (schema, size) = write_keyed(Arc::clone(&object_store), path, keys).await?;
+        let file = PartitionedFile::new(path.to_string(), size);
+
+        let warm = col("a").eq(lit(5_i64));
+        let rows = read_keyed(&object_store, &schema, &file, &warm, Some("a")).await?;
+        assert_eq!(rows, vec![(Some(5), "row-5".to_string())]);
+
+        object_store.delete(&Path::from(path)).await?;
+
+        let absent = col("a").eq(lit(-1_i64));
+        let rows = read_keyed(&object_store, &schema, &file, &absent, Some("a")).await?;
+        assert!(rows.is_empty(), "{rows:?}");
+
+        let present = col("a").eq(lit(6_i64));
+        assert!(
+            read_keyed(&object_store, &schema, &file, &present, Some("a"))
+                .await
+                .is_err(),
+            "a key a block holds must open the deleted file"
+        );
+        Ok(())
+    }
+
+    /// A point read does not apply row selections, so a file carrying one (deleted
+    /// rows, say) must keep the scan; so must a key more blocks can hold than a
+    /// point read serves.
+    #[tokio::test]
+    async fn key_lookups_leave_selections_and_wide_keys_to_the_scan() -> anyhow::Result<()> {
+        use vortex::buffer::Buffer;
+        use vortex::scan::selection::Selection;
+
+        const BLOCK: i64 = 8_192;
+
+        // Even blocks hold keys 0..BLOCK and odd blocks BLOCK..2*BLOCK, so a key
+        // below BLOCK is in five separate blocks.
+        let keys: Vec<Option<i64>> = (0..9 * BLOCK)
+            .map(|row| Some(row % BLOCK + (row / BLOCK % 2) * BLOCK))
+            .collect();
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = "key_lookups_leave_selections_and_wide_keys_to_the_scan.vortex";
+        let (schema, size) = write_keyed(Arc::clone(&object_store), path, keys).await?;
+        let file = PartitionedFile::new(path.to_string(), size);
+
+        let predicate = col("a").eq(lit(5_i64));
+        let scanned = read_keyed(&object_store, &schema, &file, &predicate, None).await?;
+        take_scans_built();
+        take_point_reads();
+        let looked_up = read_keyed(&object_store, &schema, &file, &predicate, Some("a")).await?;
+        assert_eq!(looked_up, scanned);
+        assert_eq!(looked_up.len(), 5, "{looked_up:?}");
+        assert_eq!(
+            (take_point_reads(), take_scans_built()),
+            (0, 1),
+            "five candidate ranges exceed what a point read serves"
+        );
+
+        // Key BLOCK + 5 is in the four odd blocks, which a point read serves —
+        // unless the file carries a selection, here dropping the first match.
+        let predicate = col("a").eq(lit(BLOCK + 5));
+        let mut selected = file.clone();
+        let keep: Vec<u64> = (0..9 * 8_192_u64).filter(|row| *row != 8_197).collect();
+        selected.extensions.insert(
+            VortexAccessPlan::default()
+                .with_selection(Selection::IncludeByIndex(Buffer::from_iter(keep))),
+        );
+        let scanned = read_keyed(&object_store, &schema, &selected, &predicate, None).await?;
+        take_scans_built();
+        take_point_reads();
+        let looked_up =
+            read_keyed(&object_store, &schema, &selected, &predicate, Some("a")).await?;
+        assert_eq!(looked_up, scanned);
+        assert_eq!(
+            looked_up.len(),
+            3,
+            "the selection drops row 8197: {looked_up:?}"
+        );
+        assert_eq!((take_point_reads(), take_scans_built()), (0, 1));
+
+        take_point_reads();
+        let looked_up = read_keyed(&object_store, &schema, &file, &predicate, Some("a")).await?;
+        assert_eq!(looked_up.len(), 4, "{looked_up:?}");
+        assert_eq!(take_point_reads(), 1);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_open_empty_file() -> anyhow::Result<()> {
         use futures::TryStreamExt;
@@ -1180,6 +1751,8 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
+            key_column: None,
         };
 
         let filter = col("a").lt(lit(100_i32));
@@ -1269,6 +1842,8 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
+            key_column: None,
         };
 
         let stream = opener.open(file)?.await?;
@@ -1426,6 +2001,8 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
+            key_column: None,
         };
 
         // This should succeed and return the correctly projected and cast data
@@ -1488,7 +2065,46 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
+            key_column: None,
         }
+    }
+
+    #[derive(Debug)]
+    struct EmptyRuntimeAccessPlanProvider;
+
+    #[async_trait::async_trait]
+    impl VortexRuntimeAccessPlanProvider for EmptyRuntimeAccessPlanProvider {
+        async fn runtime_access_plan_for_file(
+            &self,
+            _file: &PartitionedFile,
+            _predicate: Option<&PhysicalExprRef>,
+        ) -> Option<Arc<VortexAccessPlan>> {
+            Some(Arc::new(
+                VortexAccessPlan::default()
+                    .with_selection(Selection::IncludeByIndex(Buffer::empty())),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_selection_skips_file_open() -> anyhow::Result<()> {
+        let _ = take_scans_built();
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let schema = make_test_batch_with_10_rows().schema();
+        let file = PartitionedFile::new("/path/does-not-exist.vortex".to_string(), 100);
+        let mut opener = make_test_opener(
+            object_store,
+            Arc::clone(&schema),
+            ProjectionExprs::from_indices(&[0], &schema),
+        );
+        opener.runtime_access_plan_provider = Some(Arc::new(EmptyRuntimeAccessPlanProvider));
+
+        let data = opener.open(file)?.await?.try_collect::<Vec<_>>().await?;
+
+        assert!(data.is_empty());
+        assert_eq!(take_scans_built(), 0);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1697,6 +2313,8 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
+            key_column: None,
         };
 
         let file = PartitionedFile::new(file_path.to_string(), data_size);

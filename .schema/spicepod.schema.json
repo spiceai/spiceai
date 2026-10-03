@@ -687,6 +687,17 @@
             }
           ]
         },
+        "state": {
+          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, source rate-control, and distributed query state when those sections do not set their own `state_location`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "scheduler": {
           "anyOf": [
             {
@@ -899,12 +910,36 @@
           "$ref": "#/$defs/Encoding",
           "default": "none"
         },
+        "warmup": {
+          "description": "Replay recorded query plans into the results cache after the first full/append refresh. Datasets stay not ready until warmup completes. Requires `enabled`. Default: `disabled`.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/ResultsCacheWarmup"
+            }
+          ],
+          "default": "disabled"
+        },
         "eviction_policy": {
           "$ref": "#/$defs/CachingPolicy",
           "default": "lru"
         }
       },
       "additionalProperties": false
+    },
+    "ResultsCacheWarmup": {
+      "description": "Whether the SQL results cache records query plans and replays them after the first full/append refresh.",
+      "oneOf": [
+        {
+          "description": "Do not record query plans or replay them after a refresh.",
+          "type": "string",
+          "const": "disabled"
+        },
+        {
+          "description": "After the first full/append refresh, replay the first 10 distinct query plans (equality-filter values taken from distinct keys in the dataset) until the cache is full. Datasets stay not ready until that warmup completes. Later refreshes do not re-warm.",
+          "type": "string",
+          "const": "on_first_refresh"
+        }
+      ]
     },
     "Encoding": {
       "type": "string",
@@ -1663,11 +1698,36 @@
         "name"
       ]
     },
+    "RuntimeState": {
+      "description": "Shared object-store location for runtime state.",
+      "type": "object",
+      "required": [
+        "location"
+      ],
+      "properties": {
+        "location": {
+          "description": "Root URI (`file://`, `s3://`, `abfs://`, `abfss://`).",
+          "type": "string"
+        },
+        "params": {
+          "description": "Optional object store params (for example S3 `s3_region` / `s3_auth`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "Scheduler": {
       "type": "object",
       "properties": {
         "state_location": {
-          "description": "Root URI for shared cluster state.",
+          "description": "Root URI for shared cluster state. Optional when runtime.state provides the location via field-level fallback.",
           "type": "string"
         },
         "params": {
@@ -1706,10 +1766,7 @@
           "default": "60s"
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "state_location"
-      ]
+      "additionalProperties": false
     },
     "SourceRateControl": {
       "type": "object",
@@ -8274,6 +8331,46 @@
           "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "default": "enabled"
+        },
+        "s3_changes_queue_url": {
+          "description": "SQS queue URL subscribed to S3 event notifications for `refresh_mode: changes`. Must be a queue URL, not an ARN. The queue must be exclusive to this dataset.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "https://sqs.us-east-1.amazonaws.com/123456789012/s3-events"
+          ],
+          "x-secret": true
+        },
+        "s3_changes_region": {
+          "description": "AWS region of the SQS queue. Defaults to the region in `s3_changes_queue_url`, then `s3_region`.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "us-east-1"
+          ]
+        },
+        "s3_changes_key_prefix": {
+          "description": "Object-key prefix to apply from the SQS queue and listing backfill. Defaults to the dataset `from` prefix. Must be equal to or nested under the dataset path.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "events/year=2026/"
+          ]
+        },
+        "s3_changes_backfill_interval": {
+          "description": "How often to list the dataset prefix and apply objects not yet reflected, so SQS downtime does not permanently miss objects. Must be greater than 0.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "default": "1h",
+          "examples": [
+            "1h",
+            "30m"
+          ]
+        },
+        "s3_on_object_removed": {
+          "description": "What to do with `s3:ObjectRemoved:*` notifications. `ignore` leaves deleted objects in the accelerator. `rebuild` replaces the accelerator from the listing prefix (`history_unavailable`); this is not a row-level delete.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "default": "ignore",
+          "enum": [
+            "ignore",
+            "rebuild"
+          ]
         },
         "client_timeout": {
           "description": "The timeout setting for S3 client.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",

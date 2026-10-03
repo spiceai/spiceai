@@ -644,9 +644,9 @@ mod tests {
 ///   v2 uses `runtime.query.memory_limit`/`runtime.query.temp_directory`
 /// - v2 adds `runtime.ready_state`, `runtime.flight.do_put_rate_limit_enabled`,
 ///   `runtime.flight.ipc_compression`, `runtime.flight.batch_size`,
-///   `runtime.scheduler` partition assignment fields
+///   `runtime.scheduler` partition assignment fields, `runtime.state`
 /// - v2 adds `read_write_create` access mode
-/// - v2 adds `stale_while_revalidate_ttl` and `encoding` to `SQLResultsCacheConfig`
+/// - v2 adds `stale_while_revalidate_ttl`, `encoding`, and `warmup` to `SQLResultsCacheConfig`
 #[cfg(test)]
 mod version_tests {
     use super::*;
@@ -1133,7 +1133,10 @@ mod version_tests {
             .scheduler
             .as_ref()
             .expect("scheduler should be present");
-        assert_eq!(scheduler.state_location, "s3://my-bucket/scheduler-state");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://my-bucket/scheduler-state")
+        );
         assert_eq!(scheduler.partition_assignment_interval, "15s");
         assert_eq!(scheduler.max_partition_assignments_per_interval, 50);
         assert_eq!(scheduler.max_partitions_per_executor, 500);
@@ -1258,6 +1261,74 @@ mod version_tests {
         assert!(source_rate_control.params.is_some());
     }
 
+    #[test]
+    fn test_runtime_state_deserializes() {
+        let yaml = r"
+            state:
+              location: s3://my-bucket/spice-state
+              params:
+                s3_region: us-east-1
+                s3_auth: iam_role
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let state = runtime.state.as_ref().expect("state section should exist");
+        assert_eq!(state.location, "s3://my-bucket/spice-state");
+        assert!(state.params.is_some());
+        let scheduler = runtime
+            .resolved_scheduler()
+            .expect("runtime.state should fill scheduler state");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://my-bucket/spice-state")
+        );
+    }
+
+    #[test]
+    fn test_runtime_scheduler_state_location_overrides_shared_state() {
+        let yaml = r"
+            state:
+              location: s3://shared/spice-state
+            scheduler:
+              state_location: s3://cluster/scheduler-state
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let scheduler = runtime
+            .resolved_scheduler()
+            .expect("scheduler section should exist");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://cluster/scheduler-state")
+        );
+    }
+
+    #[test]
+    fn test_runtime_scheduler_inherits_state_location_field_level() {
+        let yaml = r"
+            state:
+              location: s3://shared/spice-state
+              params:
+                s3_region: us-east-1
+            scheduler:
+              partition_assignment_interval: 15s
+              max_partitions_per_executor: 42
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let scheduler = runtime
+            .resolved_scheduler()
+            .expect("scheduler section should exist");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://shared/spice-state"),
+            "omitted scheduler.state_location must fall back to runtime.state.location"
+        );
+        assert_eq!(scheduler.partition_assignment_interval, "15s");
+        assert_eq!(scheduler.max_partitions_per_executor, 42);
+        assert!(
+            scheduler.params.is_some(),
+            "omitted scheduler.params must fall back to runtime.state.params"
+        );
+    }
+
     /// `read_write_create` access mode deserializes.
     #[test]
     fn test_access_mode_read_write_create() {
@@ -1299,6 +1370,24 @@ mod version_tests {
         assert_eq!(config.item_ttl, Some("30s".to_string()));
         assert_eq!(config.stale_while_revalidate_ttl, Some("60s".to_string()));
         assert_eq!(config.encoding, Encoding::Zstd);
+        assert_eq!(
+            config.warmup,
+            component::caching::ResultsCacheWarmup::Disabled
+        );
+    }
+
+    #[test]
+    fn test_sql_results_cache_warmup_on_first_refresh() {
+        let yaml = r"
+            enabled: true
+            warmup: on_first_refresh
+        ";
+        let config: component::caching::SQLResultsCacheConfig =
+            yaml::from_str(yaml).expect("Should parse SQLResultsCacheConfig");
+        assert_eq!(
+            config.warmup,
+            component::caching::ResultsCacheWarmup::OnFirstRefresh
+        );
     }
 
     /// `Query` struct with `spill_compression`.
@@ -1799,7 +1888,10 @@ mod version_tests {
         ";
         let scheduler: component::runtime::Scheduler =
             yaml::from_str(yaml).expect("Should parse Scheduler");
-        assert_eq!(scheduler.state_location, "s3://bucket/state");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://bucket/state")
+        );
         assert_eq!(
             scheduler.max_partitions_per_executor, 1000,
             "partition assignment fields should default when not specified"

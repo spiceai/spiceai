@@ -497,6 +497,7 @@ pub(crate) fn routes(
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(rt.completion_llms()))
             .layer(Extension(rt.evaluate_models()))
+            .layer(Extension(rt.responses_api_support()))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
@@ -581,6 +582,9 @@ pub(crate) fn routes(
 
     authenticated_router = authenticated_router
         .layer(Extension(Arc::clone(rt)))
+        // Handlers that report a model's load state take the status on its own, so they can be
+        // exercised without building a `Runtime`.
+        .layer(Extension(rt.status()))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(v1::status::MetricsTlsEnabled(metrics_tls)))
         .layer(Extension(config));

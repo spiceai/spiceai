@@ -8,6 +8,7 @@ mod write_observer;
 pub use cache::synthetic_object_meta;
 mod deferred_projection;
 mod format;
+mod key_blocks;
 pub mod metrics;
 mod opener;
 mod reader;
@@ -16,7 +17,9 @@ mod sink;
 mod source;
 mod stream;
 
-pub use access_plan::{VortexAccessPlan, VortexAccessPlanProvider};
+pub use access_plan::{
+    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider,
+};
 pub use format::ProjectionPushdown;
 pub use format::ScanConcurrency;
 pub use format::VortexFormat;
