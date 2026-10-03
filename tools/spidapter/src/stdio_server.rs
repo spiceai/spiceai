@@ -2099,7 +2099,7 @@ async fn generate_initial_spicepod(
         let state_location = format!("{path}/{run_id}");
         if !path.is_empty() {
             let mut sched = Scheduler {
-                state_location,
+                state_location: Some(state_location),
                 params: Some(Params::from_string_map(HashMap::from([
                     ("s3_auth".to_string(), "key".to_string()),
                     (
