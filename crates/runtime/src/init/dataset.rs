@@ -801,7 +801,7 @@ impl Runtime {
         let (ds, bootstrap_status) = if ds.is_pending_snapshot_source() {
             let shutdown_token = self.status.shutdown_token();
             let resolved = tokio::select! {
-                resolved = self.resolve_snapshot_source(&ds, &load_semaphore) => resolved,
+                resolved = self.resolve_snapshot_source(&ds, &load_semaphore, &load) => resolved,
                 () = shutdown_token.cancelled() => None,
             };
             let Some(resolved) = resolved else {

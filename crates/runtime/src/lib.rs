@@ -113,6 +113,8 @@ pub mod http_types {
 }
 
 mod init;
+#[doc(hidden)]
+pub use init::snapshot_source::SnapshotRestoreHold;
 pub mod internal_table;
 pub mod jobs;
 mod management;
