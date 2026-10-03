@@ -34302,7 +34302,7 @@ impl CayenneTableProvider {
         // then.
         pinned_lookup_index: Option<Arc<super::lookup_index::LookupIndexView>>,
         // Scan-local lookup-index evidence. The file listing below finalizes a
-        // provisional selection as selected, empty, or unbuilt.
+        // provisional selection's coverage: none, partial or full.
         lookup_index_explain: Option<&mut super::lookup_index::LookupIndexExplain>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let allow_runtime_lookup = lookup_index_explain.is_some();
@@ -35760,27 +35760,12 @@ impl CayenneTableProvider {
                 }
             }
         }
-        // As in file mode: `unbuilt` when no batch read was indexed, `empty`
-        // when every batch was and none holds the key, else `selected`.
-        let outcome = if read_whole && !narrowed {
-            super::lookup_index::ProbeOutcome::Unbuilt
-        } else if !read_whole && segments.is_empty() {
-            super::lookup_index::ProbeOutcome::Empty
-        } else {
-            super::lookup_index::ProbeOutcome::Selected
-        };
-        indexer.record(probe.label, outcome, candidate_rows);
-        let explain_outcome = match outcome {
-            super::lookup_index::ProbeOutcome::Selected => {
-                super::lookup_index::LookupIndexExplainOutcome::Selected
-            }
-            super::lookup_index::ProbeOutcome::Empty => {
-                super::lookup_index::LookupIndexExplainOutcome::Empty
-            }
-            super::lookup_index::ProbeOutcome::Unbuilt => {
-                super::lookup_index::LookupIndexExplainOutcome::Unbuilt
-            }
-        };
+        // As in file mode, over the batches read: `none` when no batch read
+        // was indexed, `partial` when some were and the rest were read whole,
+        // else `full`.
+        let coverage = super::lookup_index::Coverage::of(narrowed, read_whole);
+        indexer.record(probe.label, coverage, candidate_rows);
+        let explain_outcome = super::lookup_index::LookupIndexExplainOutcome::Probed(coverage);
         Ok(Some((
             Some(segments),
             super::lookup_index::LookupIndexExplain::selection(
@@ -35934,7 +35919,11 @@ impl CayenneTableProvider {
                 (Some(selection), explain)
             }
             super::lookup_index::LookupProbe::Fallback(explain) => {
-                if explain.outcome == super::lookup_index::LookupIndexExplainOutcome::Unbuilt {
+                if explain.outcome
+                    == super::lookup_index::LookupIndexExplainOutcome::Probed(
+                        super::lookup_index::Coverage::Unindexed,
+                    )
+                {
                     self.shared_handle().request_runtime_lookup_index_build();
                 }
                 (None, explain)

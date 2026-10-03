@@ -21,7 +21,7 @@ use std::{
 };
 
 use crate::maintained_aggregate::MaintainedAggregateRegistry;
-use crate::provider::lookup_index::{LookupIndexExplain, LookupIndexExplainOutcome};
+use crate::provider::lookup_index::LookupIndexExplain;
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
@@ -992,9 +992,7 @@ impl DisplayAs for CayenneAccelerationExec {
             if let Some(candidate_files) = lookup.candidate_files {
                 write!(f, ", candidate_files={candidate_files}")?;
             }
-            if lookup.outcome == LookupIndexExplainOutcome::Selected
-                && let Some(uncovered_files) = lookup.uncovered_files
-            {
+            if let Some(uncovered_files) = lookup.uncovered_files {
                 write!(f, ", uncovered_files={uncovered_files}")?;
             }
             if let Some(candidate_rows) = lookup.candidate_rows {

@@ -252,8 +252,8 @@ async fn a_column_side_cast_is_never_answered_from_the_index() {
         rendered(&sql(&plain, PLAIN, &bare.replace("{t}", PLAIN)).await)
     );
     assert_eq!(
-        counters(&indexed).selected,
-        before.selected + 1,
+        counters(&indexed).full,
+        before.full + 1,
         "a bare equality on both key columns should use the index"
     );
 
@@ -390,14 +390,14 @@ async fn position_deletes_compose_with_the_index() {
     let deadline = Instant::now() + Duration::from_mins(2);
     let mut served = false;
     while !served && Instant::now() < deadline {
-        let before = counters(&indexed).selected;
+        let before = counters(&indexed).full;
         let _ = sql(
             &indexed,
             INDEXED,
             &query_for(keys[1]).replace("{t}", INDEXED),
         )
         .await;
-        served = counters(&indexed).selected > before;
+        served = counters(&indexed).full > before;
         if !served {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -413,14 +413,14 @@ async fn position_deletes_compose_with_the_index() {
         );
     }
     let after = counters(&indexed);
-    // Every lookup is answered by the index: a selection for a key some row
-    // holds, an empty probe for a key none does. None falls back to a scan.
-    let answered = (after.selected - before.selected) + (after.empty - before.empty);
+    // Every lookup is answered by the index, whether or not a row holds its
+    // key. None falls back to a scan.
+    let answered = (after.full - before.full) + (after.partial - before.partial);
     assert!(
         served
             && answered == u64::try_from(keys.len()).expect("fits")
-            && after.selected > before.selected
-            && after.unbuilt == before.unbuilt,
+            && after.full > before.full
+            && after.none == before.none,
         "lookups on a table with position deletes were not served from the index: {before:?} -> {after:?}"
     );
 
@@ -472,14 +472,14 @@ async fn position_deletes_compose_with_the_index() {
         }
     };
     let expected = rendered(&run_join(Arc::clone(&plain), PLAIN).await);
-    let selected_before = counters(&indexed).selected;
+    let selected_before = counters(&indexed).full;
     let actual = rendered(&run_join(Arc::clone(&indexed), INDEXED).await);
     assert_eq!(
         actual, expected,
         "dynamic indexed join exposed position-deleted rows"
     );
     assert_eq!(
-        counters(&indexed).selected,
+        counters(&indexed).full,
         selected_before + 1,
         "the dynamic join did not compose its index selection with position deletes"
     );

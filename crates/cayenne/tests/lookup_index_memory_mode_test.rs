@@ -285,9 +285,9 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     );
 
     let after_refresh = counters(&indexed);
-    assert!(after_refresh.selected > 0, "{after_refresh:?}");
+    assert!(after_refresh.full > 0, "{after_refresh:?}");
     assert_eq!(
-        after_refresh.unbuilt, 0,
+        after_refresh.none, 0,
         "every batch fits an unbounded pool: {after_refresh:?}"
     );
     assert!(after_refresh.index_bytes > 0, "{after_refresh:?}");
@@ -307,7 +307,7 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     .join("\n");
     assert!(
         explain.contains("lookup_index=(TenantId, ServiceId)")
-            && explain.contains("lookup_index_outcome=selected")
+            && explain.contains("lookup_index_outcome=full")
             && explain.contains("candidate_rows=")
             && !explain.contains("candidate_files="),
         "memory-mode plan did not expose its lookup decision:\n{explain}"
@@ -335,7 +335,7 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
         assert_eq!(query(&indexed, "indexed", sql).await, Vec::<String>::new());
         assert_eq!(query(&plain, "plain", sql).await, Vec::<String>::new());
     }
-    assert!(counters(&indexed).empty > 0);
+    assert!(counters(&indexed).full > 0);
 
     let rows_i64 = i64::try_from(ROWS).expect("fits");
     append(&indexed, rows(rows_i64, 5_000, "v1")).await;
@@ -376,7 +376,7 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     )
     .await;
     let end = counters(&indexed);
-    assert_eq!(end.unbuilt, 0, "{end:?}");
+    assert_eq!(end.none, 0, "{end:?}");
     println!("memory-mode index counters: {end:?}");
 }
 
@@ -423,16 +423,16 @@ async fn memory_mode_in_lists_over_a_compound_key_use_the_index() {
         found_rows += found.len();
         let after = counters(&indexed);
         assert_eq!(
-            (after.selected + after.empty) - (before.selected + before.empty),
+            (after.full + after.partial) - (before.full + before.partial),
             1,
             "{sql} was not answered from the index: {before:?} -> {after:?}"
         );
-        assert_eq!(after.unbuilt, before.unbuilt, "{sql}: {after:?}");
+        assert_eq!(after.none, before.none, "{sql}: {after:?}");
         let explain = query(&indexed, "indexed", &format!("EXPLAIN {sql}"))
             .await
             .join("\n");
         assert!(
-            explain.contains("lookup_index_outcome=selected"),
+            explain.contains("lookup_index_outcome=full"),
             "{sql} did not plan an index lookup:\n{explain}"
         );
     }
@@ -456,8 +456,8 @@ async fn memory_mode_in_lists_over_a_compound_key_use_the_index() {
     );
     let after = counters(&indexed);
     assert_eq!(
-        (after.selected, after.empty),
-        (before.selected, before.empty),
+        (after.full, after.full),
+        (before.full, before.full),
         "a product past the bound must not be probed: {after:?}"
     );
     let explain = query(&indexed, "indexed", &format!("EXPLAIN {too_many}"))
@@ -511,8 +511,8 @@ async fn memory_mode_lookups_never_return_a_superseded_version() {
     )
     .await;
     let end = counters(&indexed);
-    assert!(end.selected > 0, "{end:?}");
-    assert_eq!(end.unbuilt, 0, "{end:?}");
+    assert!(end.full > 0, "{end:?}");
+    assert_eq!(end.none, 0, "{end:?}");
 }
 
 fn runtime_with_pool(bytes: usize) -> (Arc<RuntimeEnv>, Arc<dyn MemoryPool>) {
@@ -589,17 +589,16 @@ async fn memory_mode_batches_the_pool_cannot_fit_are_read_whole() {
     let end = counters(&indexed);
     assert!(end.builds_unpublished > 0, "{end:?}");
     assert!(
-        end.unbuilt > 0,
+        end.none > 0,
         "lookups must report reading unindexed rows: {end:?}"
     );
 }
 
 /// When the pool fits the index of some batches but not others, a lookup
-/// narrows the indexed batches and reads the rest in full: partial coverage is
-/// `selected`, as it is in file mode, and `unbuilt` means no batch read was
-/// indexed.
+/// narrows the indexed batches and reads the rest in full: its coverage is
+/// `partial`, as in file mode, and `none` means no batch read was indexed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn memory_mode_partly_indexed_lookups_report_selected() {
+async fn memory_mode_partly_indexed_lookups_report_partial() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
@@ -626,7 +625,7 @@ async fn memory_mode_partly_indexed_lookups_report_selected() {
     compare(&indexed, &plain, (0..20).map(|i| i * 1_931), "partial").await;
     let end = counters(&indexed);
     assert!(
-        end.selected > 0 && end.unbuilt == 0,
-        "a lookup over partly indexed rows is selected, not unbuilt: {end:?}"
+        end.partial > 0 && end.none == 0,
+        "a lookup over partly indexed rows is partial, not none: {end:?}"
     );
 }

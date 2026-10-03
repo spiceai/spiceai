@@ -425,17 +425,17 @@ async fn lookup_index_matches_the_ordinary_scan() {
     // Both lookup shapes must have gone through file/row selection, not a
     // silent fallback to the ordinary scan.
     let after_sample = counters_of(&indexed);
-    let probes = (after_sample.selected + after_sample.empty) - (before.selected + before.empty);
+    let probes = (after_sample.full + after_sample.partial) - (before.full + before.partial);
     assert_eq!(
         probes, 40,
         "every sampled lookup must reach the index: {before:?} -> {after_sample:?}"
     );
     // A NULL key column is never indexed, so the pool-shape keys the fixture
-    // nulls out are legitimate empty probes rather than selections.
-    let selected = after_sample.selected - before.selected;
+    // nulls out are fully covered probes that find no row.
+    let selected = after_sample.full - before.full;
     assert!(
         selected >= 30,
-        "too few lookups attached a selection: {before:?} -> {after_sample:?}"
+        "too few lookups were fully covered: {before:?} -> {after_sample:?}"
     );
     assert!(
         after_sample.access_plans_attached - before.access_plans_attached >= selected,
@@ -444,12 +444,12 @@ async fn lookup_index_matches_the_ordinary_scan() {
     // One candidate file per probe on a unique key is the point of the index;
     // allow slack for the non-unique pool shape but not a whole-table fan-out.
     assert!(
-        after_sample.candidate_files < after_sample.selected * 4,
+        after_sample.candidate_files < after_sample.full * 4,
         "index pruned too few files: {after_sample:?}"
     );
     assert!(
-        after_sample.candidate_rows >= after_sample.selected,
-        "a selected probe must carry at least one candidate row: {after_sample:?}"
+        after_sample.candidate_rows >= after_sample.full,
+        "the probes must carry candidate rows: {after_sample:?}"
     );
 
     // --- An inactive first candidate must not hide the later active match.
@@ -499,8 +499,8 @@ async fn lookup_index_matches_the_ordinary_scan() {
     );
     assert!(rendered(&query(&plain, PLAIN, &miss_sql.replace("{table}", PLAIN)).await).is_empty());
     assert!(
-        counters_of(&indexed).empty > 0,
-        "a complete index miss should be recorded as an empty probe"
+        counters_of(&indexed).full > 0,
+        "a complete index miss should be a fully covered probe"
     );
 
     // --- A NULL key column is never indexed, and the predicate never matches
@@ -544,9 +544,9 @@ async fn lookup_index_matches_the_ordinary_scan() {
     let appended_after = counters_of(&indexed);
     assert_eq!(
         (
-            (appended_after.selected + appended_after.empty)
-                - (appended_before.selected + appended_before.empty),
-            appended_after.unbuilt - appended_before.unbuilt,
+            (appended_after.full + appended_after.partial)
+                - (appended_before.full + appended_before.partial),
+            appended_after.none - appended_before.none,
         ),
         (1, 0),
         "the lookup right after an append did not use the index: {appended_before:?} -> {appended_after:?}"
@@ -610,7 +610,7 @@ async fn lookup_index_plan_evidence() {
         .to_string();
     assert!(
         indexed_text.contains("lookup_index=(TenantId, ServiceId)")
-            && indexed_text.contains("lookup_index_outcome=selected")
+            && indexed_text.contains("lookup_index_outcome=full")
             && indexed_text.contains("candidate_files=")
             && indexed_text.contains("candidate_rows="),
         "indexed plan did not expose its lookup decision:\n{indexed_text}"
@@ -710,7 +710,7 @@ async fn oversized_dynamic_key_sets_fall_back_before_probing() {
     let after = counters_of(&indexed);
     assert_eq!(rendered(&actual), rendered(&expected));
     assert_eq!(rendered(&actual).len(), 4_098);
-    assert_eq!(after.selected, before.selected);
+    assert_eq!(after.full, before.full);
     assert_eq!(after.access_plans_attached, before.access_plans_attached);
     assert_eq!(
         after.runtime_fallback,
@@ -785,7 +785,7 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
     assert_eq!(rendered(&rows), vec!["12345", "39999", "7", "7"]);
     let after = counters_of(&indexed);
     assert_eq!(
-        after.selected - before.selected,
+        after.full - before.full,
         1,
         "four build rows should be one batched index probe: {before:?} -> {after:?}"
     );
@@ -860,7 +860,7 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
     assert_eq!(rendered(&composite_rows), vec!["12345", "39999", "7"]);
     let composite_after = counters_of(&indexed);
     assert_eq!(
-        composite_after.selected - composite_before.selected,
+        composite_after.full - composite_before.full,
         1,
         "the correlated dynamic tuples should be one batched composite index probe: \
          {composite_before:?} -> {composite_after:?}"
@@ -954,7 +954,7 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
     assert_eq!(rendered(&partitioned_rows), expected);
     let partitioned_after = counters_of(&indexed);
     assert_eq!(
-        partitioned_after.selected, partitioned_before.selected,
+        partitioned_after.full, partitioned_before.full,
         "a CASE-partitioned key set must fall back without a partial selection: \
          {partitioned_before:?} -> {partitioned_after:?}"
     );
@@ -997,7 +997,7 @@ async fn write_time_index_matches_a_read_back_build() {
     // an index published at this point can only have come from the write.
     let after_write = counters_of(&table);
     assert_eq!(
-        after_write.unbuilt, 0,
+        after_write.none, 0,
         "a probe fell back before any query ran: {after_write:?}"
     );
 
@@ -1046,13 +1046,13 @@ async fn write_time_index_matches_a_read_back_build() {
     );
     let after = counters_of(&table);
     assert_eq!(
-        after.selected,
-        before.selected + 1,
+        after.full,
+        before.full + 1,
         "the first query after the overwrite did not use the index: {before:?} -> {after:?}"
     );
     assert_eq!(
-        after.unbuilt, before.unbuilt,
-        "the first query after the overwrite saw an unbuilt index: {after:?}"
+        after.none, before.none,
+        "the first query after the overwrite saw an index that covers nothing: {after:?}"
     );
 
     // A SECOND overwrite must swap in a fresh index just as seamlessly, with the
@@ -1080,8 +1080,8 @@ async fn write_time_index_matches_a_read_back_build() {
     assert_eq!(rows, vec![new_id.to_string()]);
     let after = counters_of(&table);
     assert_eq!(
-        after.selected,
-        before.selected + 1,
+        after.full,
+        before.full + 1,
         "the first query after the second overwrite did not use the index"
     );
 }
@@ -1126,8 +1126,8 @@ async fn a_large_overwrite_is_covered_when_it_becomes_visible() {
     );
     let after = counters_of(&table);
     assert_eq!(
-        after.selected,
-        before.selected + 1,
+        after.full,
+        before.full + 1,
         "the first lookup after a large overwrite did not use the index: {after:?}"
     );
     assert_eq!(after.builds_started, 0, "a read-back build ran: {after:?}");
@@ -1272,7 +1272,7 @@ async fn upserted_rows_are_found_through_the_index() {
         .and_then(|digits| digits.parse().ok())
         .expect("the plan reports snapshots_scanned");
     assert!(
-        plan.contains("lookup_index_outcome=selected"),
+        plan.contains("lookup_index_outcome=full"),
         "a lookup answered from a protected snapshot must report the selection\n{plan}"
     );
     assert!(
@@ -1345,7 +1345,7 @@ async fn a_background_build_indexes_the_files_of_protected_snapshots() {
         )
         .expect("format plan")
         .to_string();
-        if plan.contains("lookup_index_outcome=selected") && uncovered(&plan) == 0 {
+        if plan.contains("lookup_index_outcome=full") && uncovered(&plan) == 0 {
             break;
         }
         assert!(
@@ -1406,11 +1406,11 @@ async fn in_lists_are_answered_from_the_index() {
         assert_eq!(found, expected, "{query_sql}");
         let after = counters_of(&indexed);
         assert_eq!(
-            (after.selected + after.empty) - (before.selected + before.empty),
+            (after.full + after.partial) - (before.full + before.partial),
             1,
             "{query_sql} was not answered from the index: {before:?} -> {after:?}"
         );
-        assert_eq!(after.unbuilt, before.unbuilt, "{query_sql}: {after:?}");
+        assert_eq!(after.none, before.none, "{query_sql}: {after:?}");
     }
 
     // 60 accounts by 40 services is 2,400 tuples, past the 2,048 a lookup
@@ -1449,8 +1449,8 @@ async fn in_lists_are_answered_from_the_index() {
     );
     let after = counters_of(&indexed);
     assert_eq!(
-        (after.selected, after.empty, after.unbuilt),
-        (before.selected, before.empty, before.unbuilt),
+        (after.full, after.full, after.none),
+        (before.full, before.full, before.none),
         "a negated list must not be probed: {after:?}"
     );
 }
@@ -1542,7 +1542,7 @@ async fn keys_sharing_a_word_return_exactly_their_own_rows() {
         }
     }
     let after = counters_of(&indexed);
-    let selected = after.selected - before.selected;
+    let selected = after.full - before.full;
     let candidates = after.candidate_rows - before.candidate_rows;
     println!(
         "{lookups} lookups: {selected} answered from the index, {candidates} candidate rows, {result_rows} result rows"

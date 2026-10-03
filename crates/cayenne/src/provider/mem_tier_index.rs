@@ -41,8 +41,8 @@ use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
 use datafusion_common::ScalarValue;
 
 use super::lookup_index::{
-    Counters, KeyColumn, KeySpec, LookupIndexCounters, LookupIndexScanReason, ProbeOutcome,
-    cast_to, key_converter, key_tuples, record_probe_outcome,
+    Counters, Coverage, KeyColumn, KeySpec, LookupIndexCounters, LookupIndexScanReason, cast_to,
+    key_converter, key_tuples, record_probe_outcome,
 };
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
 use crate::row_converter::RowConverter;
@@ -273,11 +273,11 @@ impl MemTierIndexer {
     }
 
     /// Records how a lookup ended and how many rows it read.
-    pub(crate) fn record(&self, label: &str, outcome: ProbeOutcome, candidate_rows: u64) {
+    pub(crate) fn record(&self, label: &str, coverage: Coverage, candidate_rows: u64) {
         self.counters
             .candidate_rows
             .fetch_add(candidate_rows, Ordering::Relaxed);
-        record_probe_outcome(&self.table_name, &self.counters, label, outcome);
+        record_probe_outcome(&self.table_name, &self.counters, label, coverage);
     }
 
     pub(crate) fn counters(&self) -> LookupIndexCounters {

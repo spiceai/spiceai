@@ -366,7 +366,7 @@ async fn compare(
         rows += expected.len();
     }
     let after = counters(indexed);
-    let answered = (after.selected - before.selected) + (after.empty - before.empty);
+    let answered = (after.full - before.full) + (after.partial - before.partial);
     println!(
         "{stage}: {} lookups returned {rows} rows, {answered} answered by the index",
         lookups(probes).len()
