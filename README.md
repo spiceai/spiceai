@@ -123,7 +123,7 @@ Connect to any Iceberg catalog (REST, AWS Glue, Hadoop), query tables with full 
 
 ### Petabyte-scale hybrid search
 
-Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus DuckDB HNSW and Elasticsearch kNN as `.vectors.engine` backends. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, Google Vertex AI, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. Vector and full-text indexes serve from a warm in-memory tier by default, and full-text search pushes SQL filters down into the Tantivy index. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
+Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus DuckDB HNSW, Elasticsearch kNN, and Qdrant HNSW as `.vectors.engine` backends. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, Google Vertex AI, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. Vector and full-text indexes serve from a warm in-memory tier by default, and full-text search pushes SQL filters down into the Tantivy index. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
 
 ```sql
 SELECT * FROM rerank(
@@ -337,6 +337,7 @@ Configured as `.vectors.engine` on a column-level embedding.
 | `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying     | Alpha  |
 | `duckdb`        | DuckDB with HNSW vector index                                        | Alpha  |
 | `elasticsearch`<sup>†</sup> | Elasticsearch with kNN                                  | Alpha  |
+| `qdrant`        | Qdrant with HNSW vector index                                        | Alpha  |
 
 <sup>†</sup> Available in Spice.ai Enterprise; not included in the open-source release binaries. To use it with the open-source runtime, build with `make install SPICED_NON_DEFAULT_FEATURES=elasticsearch`.
 

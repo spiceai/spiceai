@@ -26,6 +26,8 @@ limitations under the License.
 pub mod duckdb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
+#[cfg(feature = "qdrant")]
+pub mod qdrant;
 #[cfg(feature = "s3_vectors")]
 pub mod s3;
 
