@@ -1243,6 +1243,11 @@ pub(crate) struct OnConflictContext<'a> {
     /// this checkout — the common case.
     pub(crate) pending: Option<&'a PendingPkExistence>,
     pub(crate) incoming_keys: &'a HashSet<u128, PrehashedBuildHasher>,
+    /// Whether a key the write repeats across record batches is left for the
+    /// write to resolve after it is written (see
+    /// [`super::overwrite_postpass`]) rather than rejected. Every copy is then
+    /// kept here; only the first records the stored copy it supersedes.
+    pub(crate) repeats_resolved_after_write: bool,
 }
 
 pub(crate) struct OnConflictValidationStream {
@@ -1276,6 +1281,8 @@ pub(crate) struct OnConflictValidationStream {
     /// records that distinction, so there is no separate flag to fall out of step
     /// with it.
     pk_checkout: Option<PkCheckoutGuard>,
+    /// See [`OnConflictContext::repeats_resolved_after_write`].
+    repeats_resolved_after_write: bool,
     finalized: bool,
 }
 
@@ -1315,8 +1322,16 @@ impl OnConflictValidationStream {
             reinserted_over_tombstone: 0,
             post_validation,
             pk_checkout,
+            repeats_resolved_after_write: false,
             finalized: false,
         }
+    }
+
+    /// Keep the keys this write repeats across record batches for the write to
+    /// resolve after it is written, instead of rejecting them.
+    pub(crate) fn with_repeats_resolved_after_write(mut self) -> Self {
+        self.repeats_resolved_after_write = true;
+        self
     }
 
     fn process_batch(
@@ -1357,6 +1372,7 @@ impl OnConflictValidationStream {
             existing,
             pending: pending.as_ref(),
             incoming_keys: &self.incoming_keys,
+            repeats_resolved_after_write: self.repeats_resolved_after_write,
         };
 
         let validation_start = Instant::now();

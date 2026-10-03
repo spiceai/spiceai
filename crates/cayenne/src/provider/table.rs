@@ -14232,7 +14232,20 @@ impl CayenneTableProvider {
         &self,
         stream: SendableRecordBatchStream,
     ) -> Result<PreparedInsertStream> {
-        self.prepare_stream_for_insert_inner(stream, false).await
+        self.prepare_stream_for_insert_inner(stream, false, false)
+            .await
+    }
+
+    /// [`Self::prepare_stream_for_insert`] for a write that resolves the keys it
+    /// repeats across record batches after it is written
+    /// ([`super::overwrite_postpass`]): such a key is kept rather than rejected,
+    /// and only its first copy records the stored copy it supersedes.
+    pub(crate) async fn prepare_stream_for_insert_resolving_repeats(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> Result<PreparedInsertStream> {
+        self.prepare_stream_for_insert_inner(stream, false, true)
+            .await
     }
 
     /// Off-lock variant for conditional-commit staging: validates against a
@@ -14245,13 +14258,15 @@ impl CayenneTableProvider {
         &self,
         stream: SendableRecordBatchStream,
     ) -> Result<PreparedInsertStream> {
-        self.prepare_stream_for_insert_inner(stream, true).await
+        self.prepare_stream_for_insert_inner(stream, true, false)
+            .await
     }
 
     async fn prepare_stream_for_insert_inner(
         &self,
         stream: SendableRecordBatchStream,
         offlock: bool,
+        repeats_resolved_after_write: bool,
     ) -> Result<PreparedInsertStream> {
         let Some(pk_indices) = self.primary_key_indices()? else {
             return Ok(PreparedInsertStream::immediate(stream));
@@ -14322,6 +14337,11 @@ impl CayenneTableProvider {
             Arc::clone(&post_validation),
             pk_checkout,
         );
+        let validation_stream = if repeats_resolved_after_write {
+            validation_stream.with_repeats_resolved_after_write()
+        } else {
+            validation_stream
+        };
 
         Ok(PreparedInsertStream::deferred(
             Box::pin(validation_stream) as SendableRecordBatchStream,
@@ -14831,6 +14851,15 @@ impl CayenneTableProvider {
             }
 
             if ctx.incoming_keys.contains(&digest) {
+                if ctx.repeats_resolved_after_write {
+                    // An earlier copy of this write already recorded the stored
+                    // copy the key supersedes (or, under `drop`, found none), and
+                    // the write resolves its own copies after it is written.
+                    // Recording the stored copy again would hide nothing more but
+                    // count it superseded twice, under-counting the live rows.
+                    keep_mask.push(true);
+                    continue;
+                }
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Incoming data contains duplicate primary key across batches"
@@ -15278,6 +15307,7 @@ impl CayenneTableProvider {
                 existing: index.existence_ref(s),
                 pending: pending_existence.as_ref(),
                 incoming_keys: &incoming_keys,
+                repeats_resolved_after_write: false,
             };
             let result = self.apply_on_conflict_to_batch(hit_batch, &mut ctx)?;
             for (file_path, rows) in result.delete_specs {
@@ -69786,6 +69816,7 @@ mod tests {
             existing,
             pending: pending.as_ref(),
             incoming_keys: &incoming_keys,
+            repeats_resolved_after_write: false,
         };
 
         let result = provider

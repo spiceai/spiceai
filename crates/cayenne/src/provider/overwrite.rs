@@ -1055,7 +1055,7 @@ impl CayenneTableProvider {
     ///
     /// `written` describes every row written to the snapshot; a rewrite that
     /// leaves anything but those rows less the superseded copies is an error.
-    async fn fold_superseded_copies(
+    pub(crate) async fn fold_superseded_copies(
         &self,
         snapshot_id: &str,
         superseded: &HashMap<String, Vec<u32>>,
@@ -1207,10 +1207,10 @@ impl CayenneTableProvider {
 
 /// How a layered write writes each layer after the first.
 #[derive(Clone, Copy)]
-struct LayerWrite {
-    target_size_bytes: usize,
-    target_partitions: usize,
-    write_policy: super::delta_encoding::WritePolicy,
+pub(crate) struct LayerWrite {
+    pub(crate) target_size_bytes: usize,
+    pub(crate) target_partitions: usize,
+    pub(crate) write_policy: super::delta_encoding::WritePolicy,
 }
 
 /// What [`CayenneTableProvider::write_later_layers`] wrote.
@@ -1228,14 +1228,14 @@ struct LaterLayers {
 /// Records the statistics of each file a write produces, by file name, and
 /// forwards every batch to `inner`.
 #[derive(Debug)]
-struct FileStatsObserver {
+pub(crate) struct FileStatsObserver {
     schema: arrow_schema::SchemaRef,
     inner: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
     files: parking_lot::Mutex<HashMap<String, Arc<ColumnStatsAccumulator>>>,
 }
 
 impl FileStatsObserver {
-    fn new(
+    pub(crate) fn new(
         schema: arrow_schema::SchemaRef,
         inner: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
     ) -> Self {
