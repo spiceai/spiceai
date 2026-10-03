@@ -98,9 +98,9 @@ serde_json.workspace = true
 snafu.workspace = true
 spice-table = { path = "../spice-table" }
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "715b92c4f707baf3a030700559cc7247b2de3c09", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "18ae9bd3ac5c447612f292e41bf348a5c6ed9b50", features = [
     "tls",
-], optional = true } # branch: spiceai-59-patches-2
+], optional = true } # branch: spiceai-59-2
 telemetry = { path = "../telemetry" }
 tempfile.workspace = true
 tiberius = { workspace = true, optional = true }
