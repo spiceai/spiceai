@@ -57,7 +57,8 @@ use std::time::Duration;
 pub enum Error {
     #[snafu(display("Failed to connect to ScyllaDB: {source}"))]
     UnableToCreateSession {
-        source: scylla::errors::NewSessionError,
+        #[snafu(source(from(scylla::errors::NewSessionError, Box::new)))]
+        source: Box<scylla::errors::NewSessionError>,
     },
 
     #[snafu(display(
@@ -439,7 +440,9 @@ async fn create_scylladb_connector(params: Parameters) -> Result<(Arc<Session>, 
         if error_str.contains("authentication") || error_str.contains("auth") {
             Error::AuthenticationError
         } else {
-            Error::UnableToCreateSession { source: e }
+            Error::UnableToCreateSession {
+                source: Box::new(e),
+            }
         }
     })?;
 

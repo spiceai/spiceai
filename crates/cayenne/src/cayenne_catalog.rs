@@ -722,6 +722,120 @@ impl CayenneCatalog {
         validate_existing_delete_file_record(delete_file, &existing_record)
     }
 
+    /// Fail with [`CatalogError::SnapshotReplaced`] unless `table_id` still points
+    /// at `replaced_snapshot_id`. Read inside the caller's transaction, so the
+    /// check and the pointer swap after it commit together: a replacement that
+    /// commits in between conflicts with this transaction instead of being
+    /// overwritten by it.
+    async fn ensure_current_snapshot_in_txn(
+        txn: &dyn MetastoreTransaction,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        let values = txn
+            .query_row_values(QueryRowParams {
+                sql: "SELECT current_snapshot_id FROM cayenne_table WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await?;
+        let current = String::from_value(metastore_value_at(&values, 0)?)?;
+        if current != replaced_snapshot_id {
+            return Err(CatalogError::SnapshotReplaced {
+                table_id: table_id.to_string(),
+                replaced: replaced_snapshot_id.to_string(),
+                current,
+            });
+        }
+        Ok(())
+    }
+
+    /// The statements of one [`MetadataCatalog::set_current_snapshot`] attempt:
+    /// fail with [`CatalogError::SnapshotReplaced`] unless `table_id` still points
+    /// at `replaced_snapshot_id`, then point it at `new_snapshot_id`.
+    async fn swap_current_snapshot_in_txn(
+        txn: &dyn MetastoreTransaction,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        Self::ensure_current_snapshot_in_txn(txn, table_id, replaced_snapshot_id).await?;
+        txn.execute(ExecuteParams {
+            sql: "UPDATE cayenne_table SET current_snapshot_id = ?1 WHERE table_id = ?2",
+            params: vec![
+                MetastoreValue::Text(new_snapshot_id.to_string()),
+                MetastoreValue::Text(table_id.to_string()),
+            ],
+        })
+        .await
+        .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
+            source: Box::new(e),
+        })
+    }
+
+    /// The statements of one [`MetadataCatalog::commit_inlined_mutation`]
+    /// attempt: rewrite `updated_data`, delete `deleted_inlined_ids`, and insert
+    /// `data` stamped with `assigned_sequence`.
+    async fn apply_inlined_mutation_in_txn(
+        txn: &dyn MetastoreTransaction,
+        table_id: &str,
+        updated_data: &[InlinedData],
+        deleted_inlined_ids: &[String],
+        data: &[InlinedData],
+        assigned_sequence: i64,
+    ) -> CatalogResult<()> {
+        for updated in updated_data {
+            txn.execute(ExecuteParams {
+                sql: r"
+                UPDATE cayenne_inlined_data
+                SET data_ipc = ?1, record_count = ?2
+                WHERE table_id = ?3 AND inlined_id = ?4
+                ",
+                params: vec![
+                    MetastoreValue::Blob(updated.data_ipc.clone()),
+                    MetastoreValue::Integer(updated.record_count),
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(updated.inlined_id.clone()),
+                ],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to execute inline mutation transaction".to_string(),
+                source: Box::new(e),
+            })?;
+        }
+
+        for inlined_id in deleted_inlined_ids {
+            txn.execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1 AND inlined_id = ?2",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(inlined_id.clone()),
+                ],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to execute inline mutation transaction".to_string(),
+                source: Box::new(e),
+            })?;
+        }
+
+        for data_entry in data {
+            // Lever B2: stamp the caller-allocated sequence directly, replacing
+            // the prior correlated subquery read of the DB counter (which no
+            // longer moves inside this txn). Cloned per attempt so a retry
+            // re-binds the same row against the unchanged pre-state.
+            let (_inlined_id, insert) =
+                inlined_data_insert(data_entry.clone(), table_id, assigned_sequence);
+            txn.execute(insert)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to execute inline mutation transaction".to_string(),
+                    source: Box::new(e),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Apply a compaction commit's catalog mutations inside the caller's
     /// `MetastoreTransaction`, without opening a new transaction.
     ///
@@ -756,6 +870,7 @@ impl CayenneCatalog {
         &self,
         txn: &mut dyn MetastoreTransaction,
         table_id: &str,
+        replaced_snapshot_id: &str,
         new_snapshot_id: &str,
     ) -> CatalogResult<()> {
         // Validate that IDs are well-formed UUIDs to prevent SQL injection.
@@ -769,6 +884,7 @@ impl CayenneCatalog {
                 });
             }
         }
+        Self::ensure_current_snapshot_in_txn(&*txn, table_id, replaced_snapshot_id).await?;
 
         let table_id_literal = sql_text_literal(table_id);
         // `cayenne_insert_record.table_id` is a raw-UUID-bytes BLOB, so it must
@@ -808,6 +924,7 @@ impl CayenneCatalog {
         &self,
         txn: &mut dyn MetastoreTransaction,
         table_id: &str,
+        replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         cutoff: i64,
         protected_snapshot_ids_to_clear: &[String],
@@ -829,6 +946,7 @@ impl CayenneCatalog {
                 });
             }
         }
+        Self::ensure_current_snapshot_in_txn(&*txn, table_id, replaced_snapshot_id).await?;
 
         let table_id_literal = sql_text_literal(table_id);
         let insert_record_table_id_literal = insert_record_table_id_blob_literal(table_id);
@@ -2305,18 +2423,35 @@ impl MetadataCatalog for CayenneCatalog {
 
         validate_create_table_options(&options)?;
 
-        // Check if table already exists first (read-only check)
+        // Check if table already exists first (read-only check).
+        //
+        // A row set, not a single-row query: `query_row_helper` reports "no rows" as an
+        // error indistinguishable from a failed read, so treating any error as "absent"
+        // lets a transient metastore failure — a busy lock, an I/O error, a full disk —
+        // read as "this table has never existed". The create below would then mint a
+        // second table over the first one's data, orphaning every file the stored table
+        // still references, and report nothing. An empty `Vec` means absent; an error
+        // stays an error.
+        //
+        // `init` creates `cayenne_table` before this catalog is handed out, so a missing
+        // table is not a case this has to tolerate.
         let existing_table_id: Option<String> = self
             .metastore
-            .query_row_helper(
-                QueryRowParams {
+            .query_helper(
+                QueryParams {
                     sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?1",
                     params: vec![MetastoreValue::Text(table_name.clone())],
                 },
                 |row| row.get_string(0),
             )
             .await
-            .ok();
+            .map_err(|source| CatalogError::Database {
+                message: format!(
+                    "Failed to look up table '{table_name}' in the Cayenne metastore, so its existing acceleration cannot be opened and creating a new table would orphan the data it already holds. Cause: {source}"
+                ),
+            })?
+            .into_iter()
+            .next();
 
         if let Some(ref existing_id) = existing_table_id {
             return match self
@@ -2574,19 +2709,74 @@ impl MetadataCatalog for CayenneCatalog {
         self.persist_table_schema(table_id, schema, true).await
     }
 
-    async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "UPDATE cayenne_table SET current_snapshot_id = ?1 WHERE table_id = ?2",
-                params: vec![
-                    MetastoreValue::Text(snapshot_id.to_string()),
-                    MetastoreValue::Text(table_id.to_string()),
-                ],
-            })
-            .await
-            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
-                source: Box::new(e),
-            })
+    async fn set_current_snapshot(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        // Same transaction/retry envelope as `commit_compaction`: the pointer is
+        // read inside the transaction that swaps it, so a replacement committing
+        // in between conflicts with this transaction instead of being overwritten.
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "set_current_snapshot requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let tx = self.begin_transaction().await.map_err(|e| {
+                CatalogError::FailedToSetCurrentSnapshot {
+                    source: Box::new(e),
+                }
+            })?;
+            let swapped = Self::swap_current_snapshot_in_txn(
+                &*tx,
+                table_id,
+                replaced_snapshot_id,
+                new_snapshot_id,
+            )
+            .await;
+            if let Err(e) = swapped {
+                if is_retryable_write_conflict(&e)
+                    && end_conflicted_attempt(
+                        tx,
+                        attempt,
+                        max_attempts,
+                        "swap the current snapshot pointer",
+                    )
+                    .await
+                {
+                    continue;
+                }
+                return Err(e);
+            }
+            match tx.commit().await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                    let delay = retry_backoff_delay(attempt);
+                    tracing::debug!(
+                        attempt,
+                        max_attempts,
+                        ?delay,
+                        "Retrying snapshot pointer swap after commit conflict"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    return Err(CatalogError::FailedToSetCurrentSnapshot {
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "set_current_snapshot exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
     }
 
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<String> {
@@ -3227,7 +3417,12 @@ impl MetadataCatalog for CayenneCatalog {
             })
     }
 
-    async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
+    async fn commit_compaction(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()> {
         // Execute all operations atomically using a proper transaction.
         //
         // Order matters for crash safety (enforced by `commit_compaction_in_txn`):
@@ -3259,9 +3454,10 @@ impl MetadataCatalog for CayenneCatalog {
         // transaction is even attempted, so a crash before the pointer move leaves
         // an orphaned (but harmless) new snapshot directory.
         //
-        // The transaction may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at
-        // commit time (especially with Turso's BEGIN CONCURRENT). Retry a few
-        // times with backoff.
+        // A concurrent write can fail the transaction with SQLITE_BUSY/SQLITE_LOCKED
+        // or, under Turso's BEGIN CONCURRENT, a write-write conflict raised by a
+        // statement or by the COMMIT. Either way the attempt is rolled back, so
+        // retry it a few times with backoff.
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
             return Err(CatalogError::InvalidOperationNoSource {
@@ -3277,7 +3473,7 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
             match self
-                .commit_compaction_in_txn(&mut *tx, table_id, new_snapshot_id)
+                .commit_compaction_in_txn(&mut *tx, table_id, replaced_snapshot_id, new_snapshot_id)
                 .await
             {
                 Ok(()) => match tx.commit().await {
@@ -3298,6 +3494,12 @@ impl MetadataCatalog for CayenneCatalog {
                         });
                     }
                 },
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(tx, attempt, max_attempts, "commit compaction").await
+                    {
+                        return Err(e);
+                    }
+                }
                 Err(e) => {
                     // Transaction auto-rolls-back on drop.
                     return Err(e);
@@ -3315,6 +3517,7 @@ impl MetadataCatalog for CayenneCatalog {
     async fn commit_compaction_fenced(
         &self,
         table_id: &str,
+        replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         cutoff: i64,
         protected_snapshot_ids_to_clear: &[String],
@@ -3339,6 +3542,7 @@ impl MetadataCatalog for CayenneCatalog {
                 .commit_compaction_fenced_in_txn(
                     &mut *tx,
                     table_id,
+                    replaced_snapshot_id,
                     new_snapshot_id,
                     cutoff,
                     protected_snapshot_ids_to_clear,
@@ -3363,6 +3567,18 @@ impl MetadataCatalog for CayenneCatalog {
                         });
                     }
                 },
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(
+                        tx,
+                        attempt,
+                        max_attempts,
+                        "commit fenced compaction",
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -3426,6 +3642,18 @@ impl MetadataCatalog for CayenneCatalog {
                         });
                     }
                 },
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(
+                        tx,
+                        attempt,
+                        max_attempts,
+                        "swap protected snapshots",
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
+                }
                 Err(e) => {
                     // Transaction auto-rolls-back on drop.
                     return Err(e);
@@ -3488,6 +3716,12 @@ impl MetadataCatalog for CayenneCatalog {
                         });
                     }
                 },
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(tx, attempt, max_attempts, "commit overwrite").await
+                    {
+                        return Err(e);
+                    }
+                }
                 Err(e) => {
                     return Err(e);
                 }
@@ -4048,6 +4282,18 @@ impl MetadataCatalog for CayenneCatalog {
                         });
                     }
                 },
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(
+                        tx,
+                        attempt,
+                        max_attempts,
+                        "commit datalake data move",
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
+                }
                 // Drop `tx` → automatic rollback; leaves the catalog unchanged.
                 Err(e) => return Err(e),
             }
@@ -4602,58 +4848,25 @@ impl MetadataCatalog for CayenneCatalog {
             // Lever B2: NO counter mutation here. Allocation moved to the
             // in-memory `SeqAllocator` on the provider; the DB high-water is kept
             // at-or-ahead by the allocator's reserve-ahead refill, so the
-            // appended row is stamped directly from `assigned_sequence` below
+            // appended row is stamped directly from `assigned_sequence`
             // (a bound parameter) instead of bumping + reading back the counter.
-
-            for updated in &updated_data {
-                tx.execute(ExecuteParams {
-                    sql: r"
-                    UPDATE cayenne_inlined_data
-                    SET data_ipc = ?1, record_count = ?2
-                    WHERE table_id = ?3 AND inlined_id = ?4
-                    ",
-                    params: vec![
-                        MetastoreValue::Blob(updated.data_ipc.clone()),
-                        MetastoreValue::Integer(updated.record_count),
-                        MetastoreValue::Text(table_id.to_string()),
-                        MetastoreValue::Text(updated.inlined_id.clone()),
-                    ],
-                })
-                .await
-                .map_err(|e| CatalogError::InvalidOperation {
-                    message: "Failed to execute inline mutation transaction".to_string(),
-                    source: Box::new(e),
-                })?;
-            }
-
-            for inlined_id in &deleted_inlined_ids {
-                tx.execute(ExecuteParams {
-                    sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1 AND inlined_id = ?2",
-                    params: vec![
-                        MetastoreValue::Text(table_id.to_string()),
-                        MetastoreValue::Text(inlined_id.clone()),
-                    ],
-                })
-                .await
-                .map_err(|e| CatalogError::InvalidOperation {
-                    message: "Failed to execute inline mutation transaction".to_string(),
-                    source: Box::new(e),
-                })?;
-            }
-
-            for data_entry in &data {
-                // Lever B2: stamp the caller-allocated sequence directly, replacing
-                // the prior correlated subquery read of the DB counter (which no
-                // longer moves inside this txn). Cloned per attempt so a retry
-                // re-binds the same row against the unchanged pre-state.
-                let (_inlined_id, insert) =
-                    inlined_data_insert(data_entry.clone(), table_id, assigned_sequence);
-                tx.execute(insert)
-                    .await
-                    .map_err(|e| CatalogError::InvalidOperation {
-                        message: "Failed to execute inline mutation transaction".to_string(),
-                        source: Box::new(e),
-                    })?;
+            let applied = Self::apply_inlined_mutation_in_txn(
+                &*tx,
+                table_id,
+                &updated_data,
+                &deleted_inlined_ids,
+                &data,
+                assigned_sequence,
+            )
+            .await;
+            if let Err(e) = applied {
+                if is_retryable_write_conflict(&e)
+                    && end_conflicted_attempt(tx, attempt, max_attempts, "commit inline mutation")
+                        .await
+                {
+                    continue;
+                }
+                return Err(e);
             }
 
             match tx.commit().await {
@@ -5189,8 +5402,13 @@ impl MetadataCatalog for CayenneCatalog {
 }
 
 /// Returns `true` if the given catalog error looks like a transient write
-/// conflict (`SQLITE_BUSY`, `SQLITE_LOCKED`, or the equivalent Turso
-/// `BEGIN CONCURRENT` write-conflict at commit time).
+/// conflict: `SQLITE_BUSY`, `SQLITE_LOCKED`, or a Turso `BEGIN CONCURRENT`
+/// write-write conflict. Turso raises the last from the statement that writes a
+/// row another transaction has changed, as well as from `COMMIT`.
+///
+/// Looks through the errors a commit step wraps its statement failures in
+/// (`InvalidOperation`, `FailedToSetCurrentSnapshot`), so a conflict raised
+/// inside a transaction reads the same as one raised by its `COMMIT`.
 ///
 /// Used by `commit_compaction` / `commit_compaction_in_txn` to drive their
 /// internal retry loops, and by the cross-partition coordinator
@@ -5208,6 +5426,7 @@ pub fn is_retryable_write_conflict(error: &CatalogError) -> bool {
                     .downcast_ref::<rusqlite::Error>()
                     .is_some_and(is_retryable_sqlite_error)
         }
+        CatalogError::FailedToSetCurrentSnapshot { source } => is_retryable_write_conflict(source),
         CatalogError::Sqlite { source } => is_retryable_sqlite_error(source),
         _ => false,
     }
@@ -5273,6 +5492,35 @@ async fn sleep_before_metastore_write_retry(
         "Retrying metastore transaction after retryable write conflict"
     );
     tokio::time::sleep(delay).await;
+}
+
+/// End a transaction attempt that a statement's retryable write conflict
+/// failed and, when attempts remain, back off before the next one. Returns
+/// whether to retry; on `false` the caller returns the conflict.
+///
+/// The attempt is rolled back explicitly, the last one included, rather than
+/// dropped: a dropped transaction rolls back from a detached task, so its
+/// connection, and under `SQLite` the write lock, could still be held when the
+/// next attempt begins. Under Turso the conflict has already ended the
+/// transaction, and the rollback only returns the connection to the pool.
+async fn end_conflicted_attempt(
+    tx: Box<dyn MetastoreTransaction>,
+    attempt: u32,
+    max_attempts: u32,
+    operation: &'static str,
+) -> bool {
+    if let Err(error) = tx.rollback().await {
+        tracing::debug!(
+            operation,
+            %error,
+            "Rolling back a metastore transaction attempt after a write conflict reported an error"
+        );
+    }
+    if attempt >= max_attempts {
+        return false;
+    }
+    sleep_before_metastore_write_retry(attempt, max_attempts, operation).await;
+    true
 }
 
 fn validate_existing_delete_file_record(
@@ -5788,6 +6036,31 @@ mod tests {
     use super::*;
     use crate::metadata::DeletionType;
     use std::sync::Arc;
+
+    /// The snapshot `table_id` points at, read inside `tx` the way a compaction
+    /// commit reads it.
+    async fn current_snapshot_id_in(tx: &dyn MetastoreTransaction, table_id: &str) -> String {
+        let values = tx
+            .query_row_values(QueryRowParams {
+                sql: "SELECT current_snapshot_id FROM cayenne_table WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .expect("read the table's current snapshot");
+        String::from_value(metastore_value_at(&values, 0).expect("one column"))
+            .expect("current_snapshot_id is text")
+    }
+
+    /// [`current_snapshot_id_in`] outside any caller transaction.
+    async fn current_snapshot_id(catalog: &CayenneCatalog, table_id: &str) -> String {
+        let tx = catalog
+            .begin_transaction()
+            .await
+            .expect("begin a read transaction");
+        let current = current_snapshot_id_in(&*tx, table_id).await;
+        tx.rollback().await.expect("end the read transaction");
+        current
+    }
 
     /// A table root of this test's own, and the `base_path` string to hand to
     /// [`CreateTableOptions`].
@@ -8816,8 +9089,9 @@ mod tests {
 
         // Commit compaction with a new snapshot ID.
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let replaced = current_snapshot_id(&catalog, &table_id).await;
         catalog
-            .commit_compaction(&table_id, &new_snapshot_id)
+            .commit_compaction(&table_id, &replaced, &new_snapshot_id)
             .await
             .expect("commit_compaction failed");
 
@@ -8848,6 +9122,368 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
+    /// A compaction is built from one snapshot of its table. If a replacement moved
+    /// the table to another snapshot while the compaction ran, committing the
+    /// compaction would point the table back at the replaced rows, so every commit
+    /// form refuses, and the table keeps the replacement.
+    #[tokio::test]
+    async fn commit_compaction_refuses_a_snapshot_the_table_moved_off() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_commit_compaction_moved_off_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let table_id =
+            setup_table_with_delete_file(&catalog, "compaction_moved_off", &base_path).await;
+
+        let compacted_from = current_snapshot_id(&catalog, &table_id).await;
+        let replacement = uuid::Uuid::now_v7().to_string();
+        catalog
+            .commit_compaction(&table_id, &compacted_from, &replacement)
+            .await
+            .expect("the replacement commits");
+
+        let wholesale = catalog
+            .commit_compaction(
+                &table_id,
+                &compacted_from,
+                &uuid::Uuid::now_v7().to_string(),
+            )
+            .await;
+        let fenced = catalog
+            .commit_compaction_fenced(
+                &table_id,
+                &compacted_from,
+                &uuid::Uuid::now_v7().to_string(),
+                i64::MAX,
+                &[],
+            )
+            .await;
+        let pointer_only = catalog
+            .set_current_snapshot(
+                &table_id,
+                &compacted_from,
+                &uuid::Uuid::now_v7().to_string(),
+            )
+            .await;
+        for (form, result) in [
+            ("wholesale", wholesale),
+            ("fenced", fenced),
+            ("pointer-only", pointer_only),
+        ] {
+            assert!(
+                matches!(
+                    &result,
+                    Err(CatalogError::SnapshotReplaced { current, .. })
+                        if current == &replacement
+                ),
+                "{form}: a compaction of a replaced snapshot must be refused, got {result:?}"
+            );
+        }
+        assert_eq!(
+            current_snapshot_id(&catalog, &table_id).await,
+            replacement,
+            "the table keeps the replacement"
+        );
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// The write a conflicting transaction holds open on a table's control row,
+    /// which every snapshot-pointer swap also writes.
+    #[cfg(feature = "turso")]
+    const CONTROL_ROW_WRITE: &str = "UPDATE cayenne_table \
+        SET current_sequence_number = current_sequence_number + 1 WHERE table_id = ?1";
+
+    /// Open a metastore transaction that writes the rows `sql` selects for
+    /// `table_id`, and leave it open: until it ends, any other transaction that
+    /// writes those rows conflicts with it.
+    #[cfg(feature = "turso")]
+    async fn hold_conflicting_write(
+        catalog: &CayenneCatalog,
+        sql: &str,
+        table_id: &str,
+    ) -> Box<dyn MetastoreTransaction> {
+        let tx = catalog
+            .begin_transaction()
+            .await
+            .expect("begin the conflicting transaction");
+        tx.execute(ExecuteParams {
+            sql,
+            params: vec![MetastoreValue::Text(table_id.to_string())],
+        })
+        .await
+        .expect("write the rows the operation under test also writes");
+        tx
+    }
+
+    /// `None` when a commit envelope that ran while [`hold_conflicting_write`]
+    /// held its rows spent every attempt and failed with an error a caller still
+    /// recognises as a retryable write conflict. Otherwise, what it did instead.
+    #[cfg(feature = "turso")]
+    fn statement_conflict_violation<T: std::fmt::Debug>(
+        operation: &str,
+        attempts: u64,
+        result: &CatalogResult<T>,
+    ) -> Option<String> {
+        let expected = u64::from(DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS);
+        match result {
+            Err(error) if attempts == expected && is_retryable_write_conflict(error) => None,
+            Err(error) => Some(format!(
+                "{operation}: made {attempts} of {expected} attempts, then returned {error:?} \
+                 (retryable: {})",
+                is_retryable_write_conflict(error)
+            )),
+            Ok(value) => Some(format!(
+                "{operation}: returned {value:?} while a conflicting transaction was open"
+            )),
+        }
+    }
+
+    /// Under Turso's `BEGIN CONCURRENT`, writing a row that another open
+    /// transaction has changed fails the statement itself with a write-write
+    /// conflict, not only the `COMMIT`. Every commit envelope has to treat that
+    /// the way it treats a conflicted `COMMIT` — roll the attempt back and retry
+    /// it — and, once it gives up, return the conflict in a form a coordinator
+    /// above it still recognises as retryable. With the conflicting transaction
+    /// held open, each envelope therefore spends all its attempts, one `BEGIN`
+    /// each; once that transaction ends, the same write succeeds.
+    ///
+    /// The rows here are still in the MVCC store, where Turso already failed the
+    /// conflicting statement before 0.8.
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_statement_write_conflicts_are_retried_by_every_commit_envelope() {
+        assert_every_commit_envelope_retries_a_statement_write_conflict(false).await;
+    }
+
+    /// [`turso_statement_write_conflicts_are_retried_by_every_commit_envelope`] on
+    /// rows checkpointed into the B-tree, whose write-write conflict Turso 0.8 moved
+    /// from `COMMIT` to the conflicting statement (tursodatabase/turso#8961).
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_statement_write_conflicts_on_checkpointed_rows_are_retried_by_every_commit_envelope()
+     {
+        assert_every_commit_envelope_retries_a_statement_write_conflict(true).await;
+    }
+
+    /// The body of the statement-write-conflict tests above. With
+    /// `checkpoint_every_commit`, the metastore checkpoints after every commit, so
+    /// every row the conflicting transactions write lives in the B-tree rather than
+    /// the MVCC store.
+    #[cfg(feature = "turso")]
+    async fn assert_every_commit_envelope_retries_a_statement_write_conflict(
+        checkpoint_every_commit: bool,
+    ) {
+        let (_table_root, base_path) = test_table_root();
+        let metastore_dir = tempfile::tempdir().expect("create a temporary metastore directory");
+        let catalog = CayenneCatalog::new(format!(
+            "libsql://{}",
+            metastore_dir.path().join("cayenne.db").display()
+        ))
+        .expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        if checkpoint_every_commit {
+            catalog
+                .metastore
+                .execute_helper(ExecuteParams {
+                    sql: "PRAGMA mvcc_checkpoint_threshold = 0",
+                    params: vec![],
+                })
+                .await
+                .expect("checkpoint the metastore after every commit");
+        }
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "statement_conflicts".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path,
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+        let mut violations = Vec::new();
+
+        // Every envelope that swaps the snapshot pointer writes the control row.
+        let blocker = hold_conflicting_write(&catalog, CONTROL_ROW_WRITE, &table_id).await;
+        let current = current_snapshot_id(&catalog, &table_id).await;
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .set_current_snapshot(&table_id, &current, &uuid::Uuid::now_v7().to_string())
+            .await;
+        violations.extend(statement_conflict_violation(
+            "set_current_snapshot",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .commit_compaction(&table_id, &current, &uuid::Uuid::now_v7().to_string())
+            .await;
+        violations.extend(statement_conflict_violation(
+            "commit_compaction",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .commit_compaction_fenced(
+                &table_id,
+                &current,
+                &uuid::Uuid::now_v7().to_string(),
+                i64::MAX,
+                &[],
+            )
+            .await;
+        violations.extend(statement_conflict_violation(
+            "commit_compaction_fenced",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None)
+            .await;
+        violations.extend(statement_conflict_violation(
+            "commit_overwrite",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .commit_overwrite_to_cold(&table_id, &uuid::Uuid::now_v7().to_string(), &[])
+            .await;
+        violations.extend(statement_conflict_violation(
+            "commit_overwrite_to_cold",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        blocker
+            .rollback()
+            .await
+            .expect("end the transaction holding the control row");
+        let compacted_to = uuid::Uuid::now_v7().to_string();
+        catalog
+            .commit_compaction(&table_id, &current, &compacted_to)
+            .await
+            .expect("commit_compaction succeeds once the conflicting transaction ends");
+        assert_eq!(
+            current_snapshot_id(&catalog, &table_id).await,
+            compacted_to,
+            "the compaction moved the snapshot pointer"
+        );
+
+        // A protected-snapshot swap writes the protected snapshots' roster rows.
+        let merged_away_first = uuid::Uuid::now_v7().to_string();
+        let merged_away_second = uuid::Uuid::now_v7().to_string();
+        for (snapshot_id, sequence_number) in [(&merged_away_first, 1), (&merged_away_second, 2)] {
+            catalog
+                .set_snapshot_sequence(&table_id, snapshot_id, sequence_number)
+                .await
+                .expect("protect a snapshot");
+        }
+        let merged_away = [merged_away_first, merged_away_second];
+        let merged_into = uuid::Uuid::now_v7().to_string();
+        let blocker = hold_conflicting_write(
+            &catalog,
+            "UPDATE cayenne_snapshot_sequence SET sequence_number = sequence_number + 1 \
+             WHERE table_id = ?1",
+            &table_id,
+        )
+        .await;
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .swap_protected_snapshots(&table_id, &merged_away, &merged_into, 3)
+            .await;
+        violations.extend(statement_conflict_violation(
+            "swap_protected_snapshots",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        blocker
+            .rollback()
+            .await
+            .expect("end the transaction holding the roster rows");
+        assert!(
+            catalog
+                .swap_protected_snapshots(&table_id, &merged_away, &merged_into, 3)
+                .await
+                .expect("swap_protected_snapshots succeeds once the conflicting transaction ends"),
+            "both merged-away snapshots are still protected, so the swap commits"
+        );
+
+        // An inline mutation writes the inline rows it rewrites.
+        let inlined = InlinedData {
+            inlined_id: uuid::Uuid::now_v7().to_string(),
+            table_id: table_id.clone(),
+            partition_key: None,
+            data_ipc: vec![1, 2, 3],
+            record_count: 1,
+            sequence_number: 1,
+            created_at: "2026-10-01T00:00:00Z".to_string(),
+        };
+        catalog
+            .commit_inlined_mutation(&table_id, vec![], vec![], vec![inlined.clone()], 1)
+            .await
+            .expect("inline a row");
+        let rewritten = InlinedData {
+            data_ipc: vec![4, 5, 6],
+            ..inlined
+        };
+        let blocker = hold_conflicting_write(
+            &catalog,
+            "UPDATE cayenne_inlined_data SET record_count = record_count + 1 WHERE table_id = ?1",
+            &table_id,
+        )
+        .await;
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .commit_inlined_mutation(&table_id, vec![rewritten.clone()], vec![], vec![], 2)
+            .await;
+        violations.extend(statement_conflict_violation(
+            "commit_inlined_mutation",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        blocker
+            .rollback()
+            .await
+            .expect("end the transaction holding the inline rows");
+        catalog
+            .commit_inlined_mutation(&table_id, vec![rewritten], vec![], vec![], 2)
+            .await
+            .expect("commit_inlined_mutation succeeds once the conflicting transaction ends");
+
+        assert!(
+            violations.is_empty(),
+            "a write conflict raised by a statement was not retried like a conflicted COMMIT: \
+             {violations:#?}"
+        );
+    }
+
     /// Test that `commit_compaction` rejects non-UUID identifiers.
     #[tokio::test]
     async fn test_commit_compaction_rejects_invalid_uuid() {
@@ -8862,12 +9498,14 @@ mod tests {
 
         // Invalid table_id should fail.
         let result = catalog
-            .commit_compaction("'; DROP TABLE cayenne_table;--", &valid_uuid)
+            .commit_compaction("'; DROP TABLE cayenne_table;--", &valid_uuid, &valid_uuid)
             .await;
         assert!(result.is_err(), "Should reject non-UUID table_id");
 
         // Invalid new_snapshot_id should fail.
-        let result = catalog.commit_compaction(&valid_uuid, "not-a-uuid").await;
+        let result = catalog
+            .commit_compaction(&valid_uuid, &valid_uuid, "not-a-uuid")
+            .await;
         assert!(result.is_err(), "Should reject non-UUID new_snapshot_id");
 
         // Cleanup.
@@ -9835,8 +10473,9 @@ mod tests {
             .begin_transaction()
             .await
             .expect("Failed to begin transaction");
+        let replaced = current_snapshot_id_in(&*tx, &table_id).await;
         catalog
-            .commit_compaction_in_txn(&mut *tx, &table_id, &new_snapshot_id)
+            .commit_compaction_in_txn(&mut *tx, &table_id, &replaced, &new_snapshot_id)
             .await
             .expect("commit_compaction_in_txn failed");
         tx.commit()
@@ -9913,10 +10552,12 @@ mod tests {
             .begin_transaction()
             .await
             .expect("Failed to begin transaction");
+        let replaced = current_snapshot_id_in(&*tx, &table_id).await;
         catalog
             .commit_compaction_fenced_in_txn(
                 &mut *tx,
                 &table_id,
+                &replaced,
                 &new_snapshot_id,
                 i64::MAX,
                 &folded,
@@ -10005,12 +10646,14 @@ mod tests {
             .begin_transaction()
             .await
             .expect("Failed to begin transaction");
+        let replaced_a = current_snapshot_id_in(&*tx, &table_a).await;
+        let replaced_b = current_snapshot_id_in(&*tx, &table_b).await;
         catalog
-            .commit_compaction_in_txn(&mut *tx, &table_a, &snap_a)
+            .commit_compaction_in_txn(&mut *tx, &table_a, &replaced_a, &snap_a)
             .await
             .expect("partition A in_txn failed");
         catalog
-            .commit_compaction_in_txn(&mut *tx, &table_b, &snap_b)
+            .commit_compaction_in_txn(&mut *tx, &table_b, &replaced_b, &snap_b)
             .await
             .expect("partition B in_txn failed");
         tx.commit().await.expect("Failed to commit transaction");
@@ -10060,7 +10703,12 @@ mod tests {
                 .await
                 .expect("Failed to begin transaction");
             catalog
-                .commit_compaction_in_txn(&mut *tx, &table_id, &attempted_snapshot_id)
+                .commit_compaction_in_txn(
+                    &mut *tx,
+                    &table_id,
+                    &original_snapshot_id,
+                    &attempted_snapshot_id,
+                )
                 .await
                 .expect("in_txn variant succeeded inside tx");
             // Drop tx without committing — auto-rollback.
@@ -10112,13 +10760,18 @@ mod tests {
 
         // Invalid table_id should fail.
         let result = catalog
-            .commit_compaction_in_txn(&mut *tx, "'; DROP TABLE cayenne_table;--", &valid_uuid)
+            .commit_compaction_in_txn(
+                &mut *tx,
+                "'; DROP TABLE cayenne_table;--",
+                &valid_uuid,
+                &valid_uuid,
+            )
             .await;
         assert!(result.is_err(), "Should reject non-UUID table_id");
 
         // Invalid new_snapshot_id should fail.
         let result = catalog
-            .commit_compaction_in_txn(&mut *tx, &valid_uuid, "not-a-uuid")
+            .commit_compaction_in_txn(&mut *tx, &valid_uuid, &valid_uuid, "not-a-uuid")
             .await;
         assert!(result.is_err(), "Should reject non-UUID new_snapshot_id");
 

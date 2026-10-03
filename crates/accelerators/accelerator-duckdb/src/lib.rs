@@ -34,7 +34,7 @@ use datafusion::{
     catalog::{Session, TableProviderFactory},
     common::{Constraints, Statistics},
     datasource::{TableProvider, TableType},
-    execution::{SendableRecordBatchStream, context::SessionContext},
+    execution::SendableRecordBatchStream,
     logical_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
@@ -51,11 +51,12 @@ use datafusion_table_providers::{
         DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory,
         write::{DuckDBTableWriter, WriteCompletionHandler},
     },
+    sql::arrow_sql_gen::statement::IndexBuilder,
     sql::db_connection_pool::{
         self as db_connection_pool,
         duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
     },
-    util::indexes::IndexType,
+    util::{column_reference::ColumnReference, indexes::IndexType},
 };
 use duckdb::AccessMode;
 use futures::StreamExt;
@@ -183,6 +184,63 @@ impl DuckDBAccelerator {
     /// be resolved to a `DuckDB` file.
     pub fn duckdb_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         duckdb_file_path(&self.duckdb_factory, source, "accelerated_duckdb")
+    }
+
+    /// Drops the source indexes an earlier schema inference copied onto this change-stream
+    /// acceleration's stored table, before the table is opened for writing: the writer
+    /// rejects every write to a table holding an index its definition does not declare, and
+    /// the index itself is what `apply_inferred_schema` stopped inferring for `DuckDB` (#13929).
+    async fn drop_superseded_inferred_indexes(
+        &self,
+        cmd: &CreateExternalTable,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let declared = declared_indexes(cmd);
+        let superseded = superseded_inferred_indexes(cmd, &declared);
+        if superseded.is_empty() {
+            return Ok(());
+        }
+        // A file that does not exist yet holds no index, and opening a pool would create it.
+        let duckdb_file = cmd
+            .options
+            .get("open")
+            .cloned()
+            .map_or_else(|| self.duckdb_file_path(source), Ok)
+            .boxed()?;
+        if !tokio::fs::try_exists(&duckdb_file).await.unwrap_or(false) {
+            return Ok(());
+        }
+
+        let pool = Arc::new(self.get_shared_pool(source).await?);
+        let table_name = cmd.name.to_string();
+        let dataset_name = source.name().to_string();
+        tokio::task::spawn_blocking(
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let write_gate = pool.write_gate();
+                let _write_guard = write_gate
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+                let mut conn = pool.connect_sync()?;
+                let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
+                let tx = duckdb_conn
+                    .get_underlying_conn_mut()
+                    .transaction()
+                    .boxed()?;
+                let dropped = drop_indexes_named(&tx, &table_name, &superseded, &declared)?;
+                tx.commit().boxed()?;
+                if !dropped.is_empty() {
+                    tracing::debug!(
+                        dataset = %dataset_name,
+                        indexes = ?dropped,
+                        "Dropped inferred source indexes from the DuckDB acceleration"
+                    );
+                }
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
     }
 
     /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
@@ -916,10 +974,18 @@ impl DataAccelerator for DuckDBAccelerator {
             .fail()?,
         }
 
-        let is_changes_refresh = source
-            .and_then(|src| src.acceleration())
-            .and_then(|acceleration| acceleration.refresh_mode)
-            .is_some_and(|refresh_mode| refresh_mode == RefreshMode::Changes);
+        // The mode this dataset actually runs with, not the literal `refresh_mode`
+        // field. `cdc:` and `debezium:` resolve an omitted mode to `Changes` and
+        // never write it back (see `resolved_refresh_mode`), and schema inference
+        // classifies with that resolved mode — so reading the raw field here would
+        // disagree with the code that inferred the indexes this function cleans up,
+        // leaving them on an upgraded file for exactly the datasets that must not
+        // carry them.
+        let is_changes_refresh = source.is_some_and(|src| {
+            src.acceleration().is_some_and(|acceleration| {
+                resolved_refresh_mode(src, acceleration) == RefreshMode::Changes
+            })
+        });
         apply_changes_refresh_write_defaults(&mut cmd, is_changes_refresh);
 
         // Modify the `cmd` by adding options to attach other databases
@@ -1062,6 +1128,13 @@ impl DataAccelerator for DuckDBAccelerator {
             if !has_explicit_sibling {
                 cmd.options.insert("memory_limit".to_string(), auto_limit);
             }
+        }
+
+        if is_changes_refresh
+            && let Some(src) = source
+            && src.is_file_accelerated()
+        {
+            self.drop_superseded_inferred_indexes(&cmd, src).await?;
         }
 
         Ok(create_table_provider(&self.duckdb_factory, &cmd, write_completion_handler).await?)
@@ -1333,6 +1406,102 @@ fn list_internal_data_tables(
     Ok(tables)
 }
 
+/// The column sets of the indexes the acceleration declares in its `indexes` option.
+fn declared_indexes(cmd: &CreateExternalTable) -> HashSet<ColumnReference> {
+    cmd.options
+        .get("indexes")
+        .map(|indexes| {
+            datafusion_table_providers::util::hashmap_from_option_string::<String, IndexType>(
+                indexes,
+            )
+            .into_keys()
+            .filter_map(|columns| util::column_reference::parse(&columns).ok())
+            .map(ColumnReference::new)
+            .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The source indexes that schema inference reports for `cmd` but that the acceleration
+/// does not declare: the ones an earlier inference copied onto a stored table (see
+/// `apply_inferred_schema`).
+fn superseded_inferred_indexes(
+    cmd: &CreateExternalTable,
+    declared: &HashSet<ColumnReference>,
+) -> HashSet<ColumnReference> {
+    let inferred = data_components::inferred_schema::InferredSchema::from_metadata(
+        cmd.schema.as_arrow().metadata(),
+    );
+    inferred
+        .indexes
+        .iter()
+        .map(|index| ColumnReference::new(index.columns.clone()))
+        .filter(|columns| !declared.contains(columns))
+        .collect()
+}
+
+/// Drops every index the `DuckDB` writer created for one of `superseded` on `table_name` or
+/// one of its internal `__data_{table_name}_{unix_ms}` tables, never one whose name a
+/// `declared` index also generates. Returns the dropped names.
+fn drop_indexes_named(
+    tx: &duckdb::Transaction<'_>,
+    table_name: &str,
+    superseded: &HashSet<ColumnReference>,
+    declared: &HashSet<ColumnReference>,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut tables = vec![table_name.to_string()];
+    tables.extend(
+        list_internal_data_tables(tx, table_name)?
+            .into_iter()
+            .map(|(name, _)| name),
+    );
+    // Keyed by the owning table as well as the name, and never a name a declared index
+    // also generates: the writer joins table and column names with `_`, so
+    // `orders (customer_id)` and `orders_customer (id)` share `i_orders_customer_id`, and
+    // on one table `(a, b)` and a column `a_b` share `i_t_a_b`.
+    let writer_names = |columns: &HashSet<ColumnReference>| -> HashSet<(String, String)> {
+        tables
+            .iter()
+            .cartesian_product(columns)
+            .map(|(table, columns)| {
+                (
+                    table.clone(),
+                    IndexBuilder::new(table, columns.iter().collect()).index_name(),
+                )
+            })
+            .collect()
+    };
+    let writer_indexes: HashSet<(String, String)> = writer_names(superseded)
+        .difference(&writer_names(declared))
+        .cloned()
+        .collect();
+
+    let mut stmt = tx
+        .prepare(
+            "SELECT table_name, index_name FROM duckdb_indexes() \
+             WHERE database_name = current_database() AND schema_name = current_schema()",
+        )
+        .boxed()?;
+    let dropped: Vec<String> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<usize, String>(0)?, row.get::<usize, String>(1)?))
+        })
+        .boxed()?
+        .filter(|index| match index {
+            Ok(index) => writer_indexes.contains(index),
+            Err(_) => true,
+        })
+        .map(|index| index.map(|(_, name)| name))
+        .collect::<Result<_, _>>()
+        .boxed()?;
+    for name in &dropped {
+        let escaped = name.replace('"', "\"\"");
+        tx.execute(&format!("DROP INDEX IF EXISTS \"{escaped}\""), [])
+            .boxed()?;
+    }
+    Ok(dropped)
+}
+
 /// Applies the widening plan to a single live `DuckDB` table: `ADD COLUMN` for missing
 /// added columns, `ALTER COLUMN SET DATA TYPE` for type widenings, and
 /// `ALTER COLUMN DROP NOT NULL` for relaxed nullability. Idempotent: existing columns
@@ -1530,7 +1699,7 @@ pub(crate) async fn create_table_provider(
     cmd: &CreateExternalTable,
     on_data_written: Option<WriteCompletionHandler>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
 
     let table_provider = duckdb_factory
         .create(&ctx.state(), cmd)
@@ -2953,6 +3122,139 @@ mod tests {
         assert_eq!(total_rows, 3, "should have 3 rows");
     }
 
+    /// Regression test for #14482 through a real `DuckDB`: a fractional value
+    /// cast into an integer answers as `DataFusion` evaluates it — `1.5`
+    /// truncates to `1` — whether the projection is federated whole into the
+    /// accelerated store or the filter over it is pushed down by the table's
+    /// own scan. Without the gate `DuckDB` rounds on both paths: the projection
+    /// answers `2, 3, 5` for `1.5, 3.0, 4.5`, and a filter selecting `1` or `4`
+    /// matches no row where the plan matches one.
+    #[tokio::test]
+    async fn a_fractional_to_integer_cast_answers_as_datafusion_does_on_a_duckdb_table() {
+        use arrow::array::Float64Array;
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use runtime_datafusion::analyzer_rule::correlated_filter_push_down::federation_analyzer_rule;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("cast_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let table = DuckDBAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("DuckDB table should be created");
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Float64Array::from(vec![1.5, 3.0, 4.5])),
+            ],
+        )
+        .expect("record batch");
+        let write_ctx = SessionContext::new();
+        let insertion = table
+            .insert_into(
+                &write_ctx.state(),
+                Arc::new(MockExec::new(vec![Ok(data)], Arc::clone(&schema))),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insertion should plan");
+        collect(insertion, write_ctx.task_ctx())
+            .await
+            .expect("insertion should succeed");
+
+        // The federated path: the analyzer pushes a whole plan into the
+        // accelerated store where the deny-list lets it.
+        let federated = SessionContext::new_with_state(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_analyzer_rule(Arc::new(federation_analyzer_rule()))
+                .build(),
+        );
+        federated
+            .register_table("cast_test", Arc::clone(&table))
+            .expect("register the table for federation");
+        // The scan path: no federation analyzer, so only the table's own
+        // filter pushdown decides what DuckDB evaluates.
+        let scanned = SessionContext::new();
+        scanned
+            .register_table("cast_test", table)
+            .expect("register the table for scanning");
+
+        let rows =
+            |batches: &[RecordBatch]| pretty_format_batches(batches).expect("format").to_string();
+        for (path, ctx) in [("federated", &federated), ("scan", &scanned)] {
+            let projected = ctx
+                .sql("SELECT id, CAST(f AS INT) AS n, TRY_CAST(f AS BIGINT) AS t FROM cast_test ORDER BY id")
+                .await
+                .expect("the projection should plan")
+                .collect()
+                .await
+                .expect("the projection should run");
+            assert_eq!(
+                rows(&projected),
+                [
+                    "+----+---+---+",
+                    "| id | n | t |",
+                    "+----+---+---+",
+                    "| 1  | 1 | 1 |",
+                    "| 2  | 3 | 3 |",
+                    "| 3  | 4 | 4 |",
+                    "+----+---+---+",
+                ]
+                .join("\n"),
+                "{path}: the cast must truncate as DataFusion does"
+            );
+            for (predicate, expected_id) in
+                [("CAST(f AS INT) = 1", 1_i64), ("CAST(f AS INT) = 4", 3)]
+            {
+                let filtered = ctx
+                    .sql(&format!("SELECT id FROM cast_test WHERE {predicate}"))
+                    .await
+                    .expect("the filter should plan")
+                    .collect()
+                    .await
+                    .expect("the filter should run");
+                let ids: Vec<i64> = filtered
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("id column")
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                assert_eq!(
+                    ids,
+                    vec![expected_id],
+                    "{path}: `{predicate}` must select the row the truncating cast matches"
+                );
+            }
+        }
+    }
+
     /// Tests that the DROP TABLE SQL used by `drop_table` correctly removes a table.
     #[tokio::test]
     async fn test_drop_table_sql_removes_table() {
@@ -4016,5 +4318,197 @@ mod tests {
                 "DuckDB `{sql}` and the registered Spark concat must agree ({label})"
             );
         }
+    }
+
+    fn cmd_with_inferred_indexes(
+        indexes: &[(&[&str], bool)],
+        declared: Option<&str>,
+    ) -> CreateExternalTable {
+        use data_components::inferred_schema::{InferredIndex, InferredSchema};
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            indexes: indexes
+                .iter()
+                .map(|(columns, unique)| InferredIndex {
+                    columns: columns.iter().map(ToString::to_string).collect(),
+                    unique: *unique,
+                })
+                .collect(),
+            ..InferredSchema::default()
+        };
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("last", DataType::Utf8, false),
+            Field::new("first", DataType::Utf8, false),
+            Field::new("email", DataType::Utf8, false),
+        ])
+        .with_metadata(inferred.to_metadata());
+        let mut cmd = cmd_with_schema(Arc::new(schema));
+        if let Some(declared) = declared {
+            cmd.options
+                .insert("indexes".to_string(), declared.to_string());
+        }
+        cmd
+    }
+
+    #[test]
+    fn superseded_inferred_indexes_are_the_undeclared_inferred_ones() {
+        let cmd = cmd_with_inferred_indexes(&[(&["last", "first"], false)], None);
+        assert_eq!(
+            super::superseded_inferred_indexes(&cmd, &super::declared_indexes(&cmd)),
+            std::collections::HashSet::from([
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "first".to_string(),
+                    "last".to_string()
+                ])
+            ])
+        );
+    }
+
+    #[test]
+    fn superseded_inferred_indexes_exclude_declared_indexes() {
+        let cmd = cmd_with_inferred_indexes(
+            &[(&["last", "first"], false), (&["email"], true)],
+            Some("email:unique;(first, last):enabled"),
+        );
+        assert!(
+            super::superseded_inferred_indexes(&cmd, &super::declared_indexes(&cmd)).is_empty(),
+            "a declared index is configuration, not a superseded inference: {:?}",
+            super::superseded_inferred_indexes(&cmd, &super::declared_indexes(&cmd))
+        );
+    }
+
+    // Regression test for #13929: a file written while inference still copied source
+    // indexes onto the acceleration must lose them, and only them.
+    #[test]
+    fn drop_indexes_named_drops_only_the_superseded_indexes() {
+        let mut conn =
+            duckdb::Connection::open_in_memory().expect("in-memory DuckDB connection opens");
+        conn.execute_batch(
+            r#"CREATE TABLE t (id BIGINT PRIMARY KEY, "first" VARCHAR, "last" VARCHAR, email VARCHAR);
+               CREATE INDEX i_t_first_last ON t ("first", "last");
+               CREATE UNIQUE INDEX i_t_email ON t (email);
+               CREATE TABLE __data_t_1700000000000 (id BIGINT, "first" VARCHAR, "last" VARCHAR);
+               CREATE INDEX i___data_t_1700000000000_first_last ON __data_t_1700000000000 ("first", "last");
+               CREATE TABLE tt (id BIGINT, "first" VARCHAR, "last" VARCHAR);
+               CREATE INDEX i_tt_first_last ON tt ("first", "last");"#,
+        )
+        .expect("fixture tables and indexes are created");
+
+        let tx = conn.transaction().expect("transaction begins");
+        let superseded = std::collections::HashSet::from([
+            datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                "last".to_string(),
+                "first".to_string(),
+            ]),
+        ]);
+        let mut dropped =
+            super::drop_indexes_named(&tx, "t", &superseded, &std::collections::HashSet::new())
+                .expect("drop succeeds");
+        tx.commit().expect("transaction commits");
+        dropped.sort();
+
+        assert_eq!(
+            dropped,
+            vec![
+                "i___data_t_1700000000000_first_last".to_string(),
+                "i_t_first_last".to_string()
+            ]
+        );
+        let mut remaining: Vec<String> = conn
+            .prepare("SELECT index_name FROM duckdb_indexes() ORDER BY index_name")
+            .expect("index listing prepares")
+            .query_map([], |row| row.get::<usize, String>(0))
+            .expect("index listing runs")
+            .collect::<Result<_, _>>()
+            .expect("index names read");
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["i_t_email".to_string(), "i_tt_first_last".to_string()],
+            "a declared index and another table's index must survive"
+        );
+    }
+
+    // The writer joins table and column names with `_`, so `orders (customer_id)` and
+    // `orders_customer (id)` generate the same index name; only the owning table's may go.
+    #[test]
+    fn drop_indexes_named_keeps_another_tables_index_with_the_same_name() {
+        let mut conn =
+            duckdb::Connection::open_in_memory().expect("in-memory DuckDB connection opens");
+        conn.execute_batch(
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_id BIGINT);
+             CREATE TABLE orders_customer (id BIGINT);
+             CREATE UNIQUE INDEX i_orders_customer_id ON orders_customer (id);",
+        )
+        .expect("fixture tables and index are created");
+
+        let tx = conn.transaction().expect("transaction begins");
+        let superseded = std::collections::HashSet::from([
+            datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                "customer_id".to_string(),
+            ]),
+        ]);
+        let dropped = super::drop_indexes_named(
+            &tx,
+            "orders",
+            &superseded,
+            &std::collections::HashSet::new(),
+        )
+        .expect("drop succeeds");
+        tx.commit().expect("transaction commits");
+
+        assert!(
+            dropped.is_empty(),
+            "dropped another table's index: {dropped:?}"
+        );
+        let remaining: Vec<(String, String)> = conn
+            .prepare("SELECT table_name, index_name FROM duckdb_indexes()")
+            .expect("index listing prepares")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("index listing runs")
+            .collect::<Result<_, _>>()
+            .expect("index names read");
+        assert_eq!(
+            remaining,
+            vec![(
+                "orders_customer".to_string(),
+                "i_orders_customer_id".to_string()
+            )]
+        );
+    }
+
+    // On one table an inferred `(a, b)` and a declared column `a_b` both generate
+    // `i_t_a_b`; the declared index owns the name.
+    #[test]
+    fn drop_indexes_named_keeps_a_declared_index_with_the_same_name() {
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+        let mut conn =
+            duckdb::Connection::open_in_memory().expect("in-memory DuckDB connection opens");
+        conn.execute_batch(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, a_b BIGINT);
+             CREATE UNIQUE INDEX i_t_a_b ON t (a_b);",
+        )
+        .expect("fixture table and index are created");
+
+        let tx = conn.transaction().expect("transaction begins");
+        let superseded = std::collections::HashSet::from([ColumnReference::new(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ])]);
+        let declared =
+            std::collections::HashSet::from([ColumnReference::new(vec!["a_b".to_string()])]);
+        let dropped =
+            super::drop_indexes_named(&tx, "t", &superseded, &declared).expect("drop succeeds");
+        tx.commit().expect("transaction commits");
+
+        assert!(dropped.is_empty(), "dropped a declared index: {dropped:?}");
+        conn.execute_batch("INSERT INTO t VALUES (1, 1, 1, 30);")
+            .expect("first row inserts");
+        assert!(
+            conn.execute_batch("INSERT INTO t VALUES (2, 2, 2, 30);")
+                .is_err(),
+            "the declared unique index must still reject a duplicate"
+        );
     }
 }

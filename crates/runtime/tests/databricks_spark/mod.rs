@@ -109,18 +109,11 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_spark_connector")
-                .with_catalog(make_catalog(
-                    "catalog-dash-test",
-                    "db_uc",
-                ))
+                .with_catalog(make_catalog("catalog-dash-test", "db_uc"))
                 .build();
 
             configure_test_datafusion();
-            let mut rt =
-                Runtime::builder()
-                    .with_app(app)
-                    .build()
-                    .await;
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
             // Set a timeout for the test
@@ -144,11 +137,11 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks (mode: spark_connect) Integration Test Results"),
+                        description => "Databricks (mode: spark_connect) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("databricks_spark_connect_select"), results);
+                        insta::assert_snapshot!("databricks_spark_connect_select", results);
                     });
                 })),
             )];

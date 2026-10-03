@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
@@ -131,11 +132,20 @@ def lint_recipe() -> str:
     """The recipe lines of the Makefile's `lint-rust` target (tab-indented)."""
     after_target = MAKEFILE.read_text(encoding="utf-8").split("\nlint-rust:", 1)[-1]
     # Drop the rest of the target line (its prerequisites) before reading the recipe.
+    # The recipe ends where make ends it, not at the first line without a tab: a
+    # line continuing a `\`-terminated one belongs to it however it is indented,
+    # and blank lines and column-0 comments may sit between recipe lines without
+    # ending the recipe. Stopping early would drop every guard after that point.
     lines = []
+    continued = False
     for line in after_target.split("\n", 1)[-1].splitlines():
-        if not line.startswith("\t"):
+        if continued or line.startswith("\t"):
+            lines.append(line)
+            continued = line.endswith("\\")
+        elif not line.strip() or line.startswith("#"):
+            continue
+        else:
             break
-        lines.append(line)
     return "\n".join(lines)
 
 
@@ -154,12 +164,61 @@ def tracked_files() -> tuple[list[str], list[str]]:
     return [p for p in listing.split("\0") if p], []
 
 
-def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
+def read_script(path: str) -> str | None:
+    """A repo file's text, or None when there is no such file."""
+    try:
+        return (REPO / path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def imported_modules(source: str) -> set[str]:
+    """Top-level names of every absolute import in a Python source."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # The guard itself fails when `lint-rust` runs it, which reports this.
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.add(node.module.split(".")[0])
+    return names
+
+
+def sibling_imports(guards: list[str], read=read_script) -> set[str]:
+    """The `scripts/` modules the guards import, followed transitively.
+
+    A guard's behavior lives in every module it imports, so a helper shared by
+    several guards is as much a gate input as the guards are — yet nothing in the
+    `lint-rust` recipe names it. An imported name with no `scripts/<name>.py`
+    behind it (the standard library) is skipped.
+    """
+    found: set[str] = set()
+    pending = [text for text in map(read, guards) if text is not None]
+    while pending:
+        for name in imported_modules(pending.pop()):
+            module = f"scripts/{name}.py"
+            if module in found:
+                continue
+            text = read(module)
+            if text is not None:
+                found.add(module)
+                pending.append(text)
+    return found
+
+
+def derived_gate_paths(
+    tracked: list[str], imports=sibling_imports
+) -> tuple[list[str], list[str]]:
     """Paths the Rust gate reads, plus notes on anything that could not be derived.
 
     Derived from the `lint-rust` recipe (the clippy config directory it points
-    at, and every `$(PYTHON) scripts/…` guard it runs) plus the tracked files whose
-    basename marks them as lint/test config.
+    at, every `$(PYTHON) scripts/…` guard it runs, and the `scripts/` modules those
+    guards import) plus the tracked files whose basename marks them as lint/test
+    config.
     """
     paths: set[str] = set(RUST_SOURCE_PATHS)
     notes: list[str] = []
@@ -174,16 +233,19 @@ def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
         paths.add(f"{conf_dir.rstrip('/')}/clippy.toml")
     # The recipe invokes the guards through $(PYTHON) — the Makefile variable
     # that resolves a Python 3.11+ interpreter. Both make spellings and a literal
-    # `python3` are accepted, with any run of spaces between, so a recipe line
-    # written any of those ways still derives. The two directions are not
-    # symmetric: over-matching only adds a path to the "must be gated" set, which
-    # fails closed, while under-matching silently drops a guard from it and is the
-    # exact failure this script exists to catch. So the accepted spellings are
-    # deliberately broad, and only a spelling that would drop a guard — a
-    # different variable, or a bare `python` — is left unmatched.
-    paths.update(
-        re.findall(r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3) +(scripts/[\w./-]+\.py)", recipe)
+    # `python3` are accepted, and so is every separator make hands the shell as
+    # one: spaces, tabs, and a `\`-continuation onto the next line. The two
+    # directions are not symmetric: over-matching only adds a path to the "must be
+    # gated" set, which fails closed, while under-matching silently drops a guard
+    # from it and is the exact failure this script exists to catch. So the
+    # accepted spellings are deliberately broad, and only a spelling that would
+    # drop a guard — a different variable, or a bare `python` — is left unmatched.
+    guards = re.findall(
+        r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3)(?:\\\n|[ \t])+(scripts/[\w./-]+\.py)",
+        recipe,
     )
+    paths.update(guards)
+    paths.update(imports(guards))
 
     paths.update(p for p in tracked if Path(p).name in GATE_CONFIG_BASENAMES)
 

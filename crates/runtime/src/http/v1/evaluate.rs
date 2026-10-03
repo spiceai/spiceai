@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `POST /v1/evaluate` — System One evaluation (`TypeSafe` Jev and similar).
+//! `POST /v1/evaluate` — System One evaluation, by a System One model (`TypeSafe` Jev
+//! and similar) or by any chat model.
 //!
 //! Not a chat-completions endpoint. Request carries `model`, `state`, and a
 //! map of typed `questions`; response returns typed `answers` with confidence.
 
 use std::sync::Arc;
 
-use crate::model::metrics::{handle_metrics, handle_token_metrics};
 use axum::{
     Extension, Json,
     http::StatusCode,
@@ -30,8 +30,6 @@ use axum::{
 #[cfg(feature = "openapi")]
 use evaluate_api::EvaluateResponse;
 use evaluate_api::{Error as EvaluateError, EvaluateRequest};
-use opentelemetry::{Key, KeyValue, Value};
-use std::time::Instant;
 use tokio::sync::RwLock;
 
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -42,9 +40,10 @@ use crate::model::EvaluateModelStore;
 /// Evaluate
 ///
 /// Evaluate unstructured `state` against a map of typed System One questions
-/// (noul / choice / score). Returns structured answers with calibrated
-/// probabilities and confidence. Chat completions are not supported for these
-/// models — use this endpoint instead of `/v1/chat/completions`.
+/// (noul / choice / score). Returns structured answers with probabilities and
+/// confidence. `model` names either a System One model (`TypeSafe` Jev), whose
+/// probabilities are calibrated, or any chat model, whose probabilities are the
+/// model's own estimates. System One models do not support chat completions.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/evaluate",
@@ -53,7 +52,7 @@ use crate::model::EvaluateModelStore;
     request_body = EvaluateRequest,
     responses(
         (status = 200, description = "Evaluation succeeded", body = EvaluateResponse),
-        (status = 404, description = "Model not found"),
+        (status = 404, description = "No System One or chat model with this name"),
         (status = 400, description = "Invalid request"),
         (status = 422, description = "Malformed JSON request body (Axum Json extractor)"),
         (status = 401, description = "Upstream authentication failed"),
@@ -99,33 +98,17 @@ pub(crate) async fn post(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": format!(
-                    "Evaluation model '{model_id}' not found. Configure a System One model (e.g. `from: typesafe:jev`) in your Spicepod."
+                    "Model '{model_id}' not found. Evaluate with a model under `models` in your Spicepod: a chat model, or a System One model such as `from: typesafe:jev`. See: https://spiceai.org/docs/components/models"
                 )
             })),
         )
             .into_response();
     };
 
-    // Evaluations are inference: they belong in the same request, failure, duration and
-    // token series as the chat and responses paths rather than a family of their own.
-    let labels = [KeyValue::new(
-        Key::new("model"),
-        Value::String(model_id.clone().into()),
-    )];
-    let start = Instant::now();
-
-    let result = model.evaluate(req).await;
-    handle_metrics(start.elapsed(), result.is_err(), &labels);
-
-    match result {
+    // Request, duration and token metrics are recorded by the model itself, where the
+    // inference happens (`ChatWrapper`, or the System One model's wrapper).
+    match model.evaluate(req).await {
         Ok(response) => {
-            if let Some(usage) = response.usage.as_ref() {
-                handle_token_metrics(
-                    u32::try_from(usage.input_tokens).unwrap_or(u32::MAX),
-                    u32::try_from(usage.output_tokens).unwrap_or(u32::MAX),
-                    &labels,
-                );
-            }
             // The exporter reads `captured_output` for the row's result and derives
             // `error_message` only from ERROR events, so both are emitted here.
             tracing::info!(
@@ -208,6 +191,10 @@ mod tests {
                     output_tokens: 2,
                 }),
             })
+        }
+
+        async fn health(&self) -> evaluate_api::Result<()> {
+            Ok(())
         }
     }
 
@@ -311,6 +298,10 @@ mod tests {
             }
             .fail()
         }
+
+        async fn health(&self) -> evaluate_api::Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -328,5 +319,68 @@ mod tests {
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(json["error"], "upstream 503");
+    }
+
+    /// A chat model that replies with a fixed `answers` object.
+    struct AnsweringChat;
+
+    #[async_trait]
+    impl llms::chat::Chat for AnsweringChat {
+        fn as_sql(&self) -> Option<&dyn llms::chat::SqlGeneration> {
+            None
+        }
+
+        async fn chat_request(
+            &self,
+            _req: async_openai::types::chat::CreateChatCompletionRequest,
+        ) -> Result<
+            async_openai::types::chat::CreateChatCompletionResponse,
+            async_openai::error::OpenAIError,
+        > {
+            Ok(serde_json::from_value(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "judge",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "{\"answers\": {\"is_urgent\": 0.75}}"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 9, "total_tokens": 59}
+            }))
+            .expect("chat completion"))
+        }
+    }
+
+    /// A chat model answers `/v1/evaluate` through its evaluator.
+    #[tokio::test]
+    async fn evaluate_answers_with_a_chat_model() {
+        let mut evaluators = EvaluateModelStore::new();
+        evaluators.insert(
+            "judge".into(),
+            Arc::new(evaluate_chat::ChatEvaluator::new(
+                "judge",
+                Arc::new(AnsweringChat),
+            )),
+        );
+
+        let response = post(
+            Extension(Arc::new(RwLock::new(evaluators))),
+            Json(request_with_question("judge")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["model"], "judge");
+        assert_eq!(json["answers"]["is_urgent"]["noul"], 0.75);
+        assert_eq!(json["usage"]["input_tokens"], 50);
     }
 }

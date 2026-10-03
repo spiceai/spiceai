@@ -516,7 +516,7 @@ mod tests {
     }
 
     /// Two decimals holding the SAME number at different scales must compare
-    /// equal, even though casting each to `f64` does not produce the same value.
+    /// equal, on their rescaled mantissas rather than through `f64`.
     ///
     /// Regression: the fingerprint gate compared exact columns via `f64` and
     /// demanded bit equality, so a `NUMERIC` the source reported at one scale and
@@ -526,17 +526,19 @@ mod tests {
     /// fingerprint happened to round identically on both sides.
     #[test]
     fn the_same_decimal_at_two_scales_is_not_a_divergence() {
-        // 9290582224.69 at scale 20 against the same number at money scale. Scale 20
-        // is where Arrow's decimal-to-f64 cast starts to disagree with itself: both
-        // the mantissa and the 10^20 divisor stop being exactly representable, so the
-        // quotient is no longer correctly rounded. It reproduces the SF1000 gate's
-        // `sum_d_ytd` rejection to the digit -- 9290582224.689999 against
-        // 9290582224.69.
+        // 9290582224.69 at scale 20 against the same number at money scale: the
+        // SF1000 gate's `sum_d_ytd` shape, rejected to the digit as 9290582224.689999
+        // against 9290582224.69 by a comparator that cast both sides to `f64`.
         //
-        // At scales 2 through 18 the two conversions ROUND TO THE SAME `f64` -- not
-        // because .69 is exactly representable in binary (it is not), but because
-        // both operands of the division are, so each side lands on the same nearest
-        // double. That is why this failed intermittently rather than always.
+        // The two `f64` casts are not asserted to differ: the workspace's `arrow-rs`
+        // fork rounds a decimal into a float from its exact digits
+        // (`docs/dev/fork_patches.md`), so both sides land on the same double and
+        // an f64 disagreement cannot serve as this test's premise. What is pinned
+        // is that the comparator never consults `f64` for an exact column: it
+        // compares the rescaled mantissas (`exact_decimals`), which
+        // `a_one_ulp_decimal_difference_still_diverges` and
+        // `wide_decimals_that_f64_cannot_distinguish_are_not_called_equal` hold to
+        // the digit.
         let expected = batch_of(
             "sum_d_ytd",
             Arc::new(
@@ -554,23 +556,6 @@ mod tests {
                     .expect("scale 2"),
             ),
         );
-
-        // Guard the premise: if the two casts ever agree, this test would pass for
-        // the wrong reason and stop covering the bug.
-        let (e_f64, a_f64) =
-            cast_pair_to_f64(expected.column(0).as_ref(), actual.column(0).as_ref())
-                .expect("both cast to f64");
-        #[expect(
-            clippy::float_cmp,
-            reason = "bit-exact f64 inequality IS the premise being guarded"
-        )]
-        {
-            assert_ne!(
-                e_f64.value(0),
-                a_f64.value(0),
-                "premise: the f64 casts must disagree, or this test proves nothing"
-            );
-        }
 
         let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
         assert!(

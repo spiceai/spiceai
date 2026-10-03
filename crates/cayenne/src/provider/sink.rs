@@ -176,7 +176,7 @@ impl DataSink for CayenneDataSink {
         if self.table.is_memory_resident_mode() {
             let overwrite = self.overwrite == InsertOp::Overwrite;
             let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
-            let mut incoming_bytes: u64 = 0;
+            let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
             // Acquire the write lock BEFORE draining so memory-mode writes are
             // serialized during buffering: two concurrent writes must not each buffer
             // a large payload while both pass `enforce_memory_limit` against the same
@@ -214,8 +214,8 @@ impl DataSink for CayenneDataSink {
 
             while let Some(batch) = data.next().await {
                 let batch = batch?;
-                incoming_bytes =
-                    incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+                incoming.add(&batch);
+                let incoming_bytes = incoming.total();
                 // Enforce the hard RAM bound while buffering so an oversized refresh
                 // fails fast with a structured error instead of OOMing during
                 // collection (memory mode never spills). Always count resident +
@@ -241,7 +241,7 @@ impl DataSink for CayenneDataSink {
 
             let rows = self
                 .table
-                .write_batches_memory_mode(batches, incoming_bytes, overwrite, &deletions)
+                .write_batches_memory_mode(batches, incoming.total(), overwrite, &deletions)
                 .await
                 .map_err(datafusion_common::DataFusionError::from)?;
 
@@ -250,7 +250,7 @@ impl DataSink for CayenneDataSink {
             // bookkeeping the in-memory CDC append does after its append.
             if let Some(keys) = validated_keys {
                 let record_seq = self.table.sequence_high_water().await;
-                self.table.record_inlined_pk_keys(&keys, record_seq);
+                self.table.record_mem_tier_pk_keys(&keys, record_seq);
             }
             drop(write_guard);
             // Memory mode arms retention here — see the method's own doc for why nowhere
@@ -525,11 +525,21 @@ impl CayenneDataSink {
     ) -> super::Result<u64> {
         let target_partitions = context.session_config().target_partitions();
         let prepared = self.table.begin_overwrite(data, target_partitions).await?;
-        prepared
-            .apply_owned_txn()
-            .await
-            .map_err(super::Error::from)?;
-        prepared.finish().await
+        // The durable commit and the publish run on one task that owns the
+        // prepared overwrite. A caller dropped while `COMMIT` is in flight drops
+        // only this handle: the metastore may still commit, and the task still
+        // publishes the snapshot the catalog then points at, instead of leaving the
+        // in-memory state, the in-memory CDC tier included, on the replaced one.
+        let table = self.table.table_name().to_string();
+        tokio::spawn(async move {
+            prepared
+                .apply_owned_txn()
+                .await
+                .map_err(super::Error::from)?;
+            prepared.finish().await
+        })
+        .await
+        .map_err(|source| super::Error::TaskPanicked { table, source })?
     }
 }
 

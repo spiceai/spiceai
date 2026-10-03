@@ -51,11 +51,14 @@ env:
   INTEGRATION_TESTS_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-tests-archive/integration_tests.tar.zst
 
 jobs:
-  # Required merge-queue checks must also report on the PR head before GitHub
-  # will enqueue it. On pull requests these jobs run lightweight passthrough
-  # steps on GitHub-hosted runners; the full suite runs only on non-PR events.
+  # The suite runs on `push`, `merge_group` and `workflow_dispatch`. On a pull
+  # request every job is skipped at the job level, so each required check is
+  # published under its name with conclusion `skipped` rather than a `success`
+  # nothing ran for (#13841). Queue entry is gated by the approval rules and
+  # `Attestation`; the merge-group commit is what runs the suite.
   check_changes:
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: spiceai-dev-runners
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Measured at
     # 1.8 min at most across the 880 successful `push` and `merge_group` runs
     # from 2026-08-20 to 2026-09-25 (UTC) (p99 1.1), all on warm self-hosted
@@ -69,25 +72,20 @@ jobs:
       # tests run even when no relevant files changed.
       relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
-      - name: Pull request passthrough
-        if: ${{ github.event_name == 'pull_request' }}
-        run: echo "Integration tests run on the merge-group commit"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ github.event_name != 'pull_request' }}
         with:
           persist-credentials: false
           fetch-depth: 0
 
       - name: Check for code changes
-        if: ${{ github.event_name != 'pull_request' }}
         id: check
         uses: ./.github/actions/check-code-changes
 
   build:
     name: Build Test Binary
     needs: check_changes
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: spiceai-dev-runners
     # Slowest successful run from 2026-08-20 to 2026-09-25 (UTC), after the archive
     # step was consolidated to one `nextest archive` invocation: 151.4 min
     # (run 34988348747, merge_group, 2026-09-15), p99 115 min over 880 `push`
@@ -97,10 +95,6 @@ jobs:
     # is what fires on a wedged build and this one stays the backstop.
     timeout-minutes: 200
     steps:
-      - name: Pull request passthrough
-        if: ${{ github.event_name == 'pull_request' }}
-        run: echo "Integration test binaries build on the merge-group commit"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
@@ -260,9 +254,10 @@ jobs:
   test-partitions:
     name: Run Integration Tests (part ${{ matrix.label }})
     needs: [build, check_changes]
+    if: ${{ github.event_name != 'pull_request' }}
     permissions:
       contents: write
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    runs-on: spiceai-dev-runners
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 30.7 min (run
     # 34948795744, merge_group, 2026-09-15), p99 27.8 min. The two bounded steps
     # below sum to 60, and everything else in the job (image pulls, the archive
@@ -280,10 +275,6 @@ jobs:
           - label: 3
             partition: 'count:3/3'
     steps:
-      - name: Pull request passthrough
-        if: ${{ github.event_name == 'pull_request' }}
-        run: echo "Integration test part ${{ matrix.label }} runs on the merge-group commit"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
@@ -417,6 +408,22 @@ jobs:
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/)'
           fi
 
+      - name: Configure apt mirrors for the retention OOM test
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        uses: ./.github/actions/configure-apt
+
+      # The retention OOM test packages its own debug test binary as the Docker build context
+      # and runs `strip --strip-debug` on it first. This job installs no C toolchain, so without
+      # binutils the test stages the unstripped binary (several GiB), and every attempt spends
+      # its 360s ceiling transferring and exporting that context before the workload starts.
+      - name: Install binutils for the retention OOM test
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils
+          strip --version | head -1
+
       - name: Run retention OOM regression test
         if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
         # Sized to hold the test's whole retry budget, not one pass of it: nextest
@@ -457,16 +464,58 @@ jobs:
           retention-days: 1
 
   # Preserve the required check names and make the isolated GitHub lane part
-  # of each result. A failed dependency must produce a failure, not a skipped gate.
-  test:
-    name: Integration Tests (part ${{ matrix.label }})
+  # of each result. A failed dependency must produce a failure, not a skipped
+  # gate, hence `always()`; on a pull request the gate is skipped instead, so
+  # the check reports `skipped` rather than a success it did not establish.
+  # Three jobs rather than a matrix: a skipped matrix job publishes one check
+  # under its unexpanded template name (`Integration Tests (part ${{ matrix.label }})`),
+  # and the ruleset requires the three expanded names on the pull request head.
+  test-part-1:
+    name: Integration Tests (part 1)
     needs: [check_changes, test-partitions, test-github]
-    if: always()
+    if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    strategy:
-      matrix:
-        label: [1, 2, 3]
+    steps:
+      - name: Require integration and GitHub results
+        env:
+          CHANGE_CHECK_RESULT: ${{ needs.check_changes.result }}
+          RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
+          PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
+          GITHUB_RESULT: ${{ needs.test-github.result }}
+        run: |
+          test "$CHANGE_CHECK_RESULT" = success
+          if [ "$RELEVANT_CHANGES" = true ]; then
+            test "$PARTITIONS_RESULT" = success
+            test "$GITHUB_RESULT" = success
+          fi
+
+  test-part-2:
+    name: Integration Tests (part 2)
+    needs: [check_changes, test-partitions, test-github]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require integration and GitHub results
+        env:
+          CHANGE_CHECK_RESULT: ${{ needs.check_changes.result }}
+          RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
+          PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
+          GITHUB_RESULT: ${{ needs.test-github.result }}
+        run: |
+          test "$CHANGE_CHECK_RESULT" = success
+          if [ "$RELEVANT_CHANGES" = true ]; then
+            test "$PARTITIONS_RESULT" = success
+            test "$GITHUB_RESULT" = success
+          fi
+
+  test-part-3:
+    name: Integration Tests (part 3)
+    needs: [check_changes, test-partitions, test-github]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Require integration and GitHub results
         env:
@@ -487,7 +536,9 @@ jobs:
     # A checkout, a commit and a push.
     timeout-minutes: 60
     needs:
-      - test
+      - test-part-1
+      - test-part-2
+      - test-part-3
       - test-github
     permissions:
       contents: write
