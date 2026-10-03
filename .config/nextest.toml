@@ -51,6 +51,15 @@ result-correctness = { max-threads = 1 }
 # Keep this group for local nextest runs too.
 github-api-tests = { max-threads = 1 }
 
+# Both `abfs::` tests start their Azurite container under the one name
+# `spice_test_azurite`, bound to host ports 10000 and 10001, so two of them
+# running at once collide on the name and on the ports. Serializing them also
+# keeps every test container name owned by one running test at a time, which
+# the integration harness relies on to reclaim a container that a timed-out
+# creation left behind (`create_taking_over_name` in
+# `crates/runtime/tests/docker/mod.rs`).
+azurite = { max-threads = 1 }
+
 # Correctness/convergence property tests: the accelerated table MUST converge to
 # the reference model on every run. These are deterministic correctness checks,
 # not best-effort work — so a retry that happens to pass only HIDES a real bug
@@ -156,6 +165,12 @@ test-group = 'github-api-tests'
 # Transport retries belong to the connector. A failed row assertion must not
 # be retried into a pass against changing live data.
 retries = 0
+
+# Hold both Azurite-backed tests to the `azurite` group -- see its definition
+# above.
+[[profile.default.overrides]]
+filter = 'test(/^abfs::/)'
+test-group = 'azurite'
 
 # Same reasoning for the MySQL CDC convergence tests: a retry that passes hides a lost update.
 #

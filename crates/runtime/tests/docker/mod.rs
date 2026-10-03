@@ -617,11 +617,17 @@ impl<'a> ContainerRunner<'a> {
 /// container is in a guard straight away, and the guard removes it on every
 /// path out -- so a container in the `created` state that no guard owns can
 /// only be a creation nobody received the answer to. A holder in any other
-/// state is left alone and waited out as before, because it can be a live
-/// container of another test: a few fixed names are shared by tests that nextest
-/// may run at the same time (`spice_test_azurite`). The removal is best-effort
-/// within the same bound; if the name is still taken at the deadline, the error
-/// carries the last failure to inspect or remove the holder.
+/// state is left alone and waited out as before.
+///
+/// This relies on one running test owning each name at a time, so that a
+/// `created` holder cannot be another test's container between its creation and
+/// its start. Names derive from per-test constants, and the one fixed name two
+/// tests share (`spice_test_azurite`) is serialized by the `azurite` test group
+/// in `.config/nextest.toml`. The holder is removed by the ID it was inspected
+/// under, so a name that changes hands in between is never acted on. The
+/// removal is best-effort within the same bound; if the name is still taken at
+/// the deadline, the error carries the last failure to inspect or remove the
+/// holder.
 async fn create_taking_over_name(
     docker: &Docker,
     name: &str,
@@ -685,7 +691,10 @@ async fn remove_if_never_started(docker: &Docker, name: &str) -> Result<(), anyh
     ) {
         return Ok(());
     }
-    match remove(docker, name).await {
+    let Some(id) = holder.id else {
+        return Ok(());
+    };
+    match remove(docker, &id).await {
         Err(e) if !is_already_gone(&e) && !is_removal_already_in_progress(&e) => Err(e),
         _ => Ok(()),
     }
