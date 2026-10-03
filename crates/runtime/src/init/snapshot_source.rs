@@ -25,6 +25,7 @@ use app::App;
 use datafusion::sql::TableReference;
 use parking_lot::Mutex;
 use runtime_acceleration::Engine;
+use runtime_acceleration::acceleration::DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL;
 use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotManager};
 use runtime_metrics as metrics;
 use snafu::prelude::*;
@@ -39,14 +40,11 @@ use crate::component::dataset::{
         waiting_for_snapshot_message,
     },
 };
-use crate::dataaccelerator::{
-    AccelerationSource, BootstrapStatus, CayenneSnapshotValidationError, acceleration_file_path,
-    validate_snapshot_consistency,
-};
+use crate::dataaccelerator::{BootstrapStatus, acceleration_file_path};
 use crate::dataconnector::snapshot_source::{
     projected_publisher_message, publisher_column_projection,
 };
-use crate::datafusion::{DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL, engine_to_acceleration_engine};
+use crate::datafusion::engine_to_acceleration_engine;
 use crate::init::dataset_loads::DatasetLoad;
 use crate::{LogErrors, Runtime, UnableToBuildDatasetSnafu, status};
 
@@ -371,32 +369,6 @@ impl Runtime {
             return Ok(());
         };
         let datasets = Arc::clone(self).get_valid_datasets(&dataset.app(), LogErrors(false));
-
-        // Cayenne keeps every dataset of one metadata directory in one catalog, which
-        // must not mix datasets that restore snapshots with datasets that do not.
-        let sources: Vec<Arc<dyn AccelerationSource>> =
-            datasets.iter().map(|other| other.clone_arc()).collect();
-        match validate_snapshot_consistency(&sources) {
-            Ok(()) => {}
-            Err(CayenneSnapshotValidationError::InconsistentSnapshotSettings {
-                metadata_dir,
-                disabled_datasets,
-                ..
-            }) => {
-                return Err(cannot_load_snapshot_message(
-                    &dataset.name,
-                    &format!(
-                        "it shares the Cayenne catalog in '{metadata_dir}' with Cayenne datasets that do not restore snapshots ({disabled_datasets}), and one catalog cannot hold both. Accelerate those datasets with another engine, or serve this dataset from another Spice instance"
-                    ),
-                ));
-            }
-            Err(err) => {
-                return Err(cannot_load_snapshot_message(
-                    &dataset.name,
-                    &err.to_string(),
-                ));
-            }
-        }
 
         // Restoring a `DuckDB`, `SQLite` or Turso snapshot replaces the whole file, so a
         // file two datasets share would serve whichever restored last to both.
