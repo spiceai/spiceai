@@ -3017,9 +3017,9 @@ fn decide_goal(
         // background compactor already schedules, not a new resource. Never below
         // the level the last bake showed it can reach (`futile_bake_step`'s target):
         // under that, every tick re-bakes without shrinking the index a probe walks.
-        let futility_floor = s
-            .bake_residual
-            .map_or(0, |residual| residual.saturating_mul(BAKE_TRIGGER_RESIDUAL_HEADROOM));
+        let futility_floor = s.bake_residual.map_or(0, |residual| {
+            residual.saturating_mul(BAKE_TRIGGER_RESIDUAL_HEADROOM)
+        });
         if s.read_amp > READ_AMP_LOW
             && let Some(v) = clamp_move_usize(
                 cur.bake_deletion_index_trigger,
