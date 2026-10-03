@@ -1,0 +1,81 @@
+version: v1
+kind: Spicepod
+name: http-cache-ratelimit-sie
+
+# Phase 1: one origin, one caching dataset, stale-if-error ON. Rate control
+# OFF and the SQL results cache OFF, so the acceleration (refresh_mode:
+# caching) cache is the only cache in front of the origin and the two
+# caches cannot mask each other.
+#
+# `caching_stale_if_error: enabled` = unbounded stale-if-error: once an
+# entry is past max-age + stale-while-revalidate, the last cached copy is
+# served whenever a source fetch fails, for as long as the origin keeps
+# failing. The prebuilt spiced v2.3.1 accepts only `enabled` / `disabled`
+# here; the duration form (e.g. `60s`) that bounds the SIE window is a
+# newer feature (#14126) and is rejected by this binary, so the
+# fail-closed `caching-sie-expiry` scenario is PENDING that build.
+
+runtime:
+  telemetry:
+    enabled: true
+  caching:
+    sql_results:
+      enabled: false
+
+datasets:
+  - from: http://127.0.0.1:9001/data
+    name: d1
+    params:
+      file_format: json
+      # client_timeout must be shorter than the `hang` fault duration so a
+      # hang forces a Spice-side timeout, which the connector records as a
+      # failed fetch and which triggers stale-if-error.
+      #
+      # IMPORTANT: use a BARE integer of seconds. On prebuilt spiced v2.3.1
+      # a suffixed duration (`"2s"`, `"500ms"`) is NOT enforced — a hang
+      # then waits the full hang and returns 200, so no timeout fires. A
+      # bare `"1"` (= 1 second) does enforce the timeout. Verified with the
+      # hang fault mode of this harness.
+      client_timeout: "1"
+      connect_timeout: "1"
+      allowed_request_paths: "/data"
+      # Each distinct `request_query` value is its own upstream request /
+      # cache entry, so many keys are exercised per origin.
+      request_query_filters: enabled
+    columns:
+      # HTTP metadata column (passed through, not JSON-shredded). Declaring it
+      # puts `request_query` in the schema so `WHERE request_query = '...'`
+      # plans instead of being rejected as an unknown column.
+      - name: request_query
+        type: text
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: caching
+      params:
+        caching_ttl: "3s"
+        caching_stale_while_revalidate_ttl: "6s"
+        # Serve the last cached copy while the origin is failing.
+        caching_stale_if_error: enabled
+        # A budget bounds the accelerator so `enabled` (which keeps expired
+        # entries as fallback) cannot grow without limit. Far above the one
+        # entry a single-filter scenario produces, so it never evicts the
+        # fallback copy mid-run.
+        caching_max_items: "1000"
+      # Retention keeps entries around long enough for the SWR / SIE
+      # windows to use them.
+      retention_period: "10m"
