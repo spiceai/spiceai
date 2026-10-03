@@ -6201,7 +6201,6 @@ dependencies = [
 name = "data-accelerator-api"
 version = "2.4.0-unstable"
 dependencies = [
- "ahash 0.8.12",
  "app",
  "arrow",
  "arrow-schema",

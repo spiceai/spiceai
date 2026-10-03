@@ -25,7 +25,7 @@ limitations under the License.
 //! first one here, in arrival order, leaves the engine only conflicts with rows
 //! that were already stored, which it resolves as documented.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, hash::BuildHasher, sync::Arc};
 
 use arrow::{
     array::{ArrayRef, BooleanArray, RecordBatch},
@@ -53,46 +53,43 @@ use datafusion::{
 };
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::StreamExt;
-use hashbrown::HashTable;
+use hashbrown::{DefaultHashBuilder, HashTable};
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
 /// Layers [`KeepFirst`] over `provider` when `on_conflict` resolves conflicts
-/// by dropping the incoming row, so every write keeps only the first copy of
-/// each key.
+/// by dropping the incoming row, so a write keeps only the first copy of each
+/// key. An append under several `drop` targets is left to the table; see
+/// [`KeepFirst`]'s `insert_into`.
 ///
 /// Returns `provider` unchanged for any other `on_conflict` (or none).
 #[must_use]
-pub fn wrap_with_keep_first_if_needed<S: std::hash::BuildHasher>(
+pub fn wrap_with_keep_first_if_needed<S: BuildHasher>(
     provider: Arc<dyn TableProvider>,
     options: &HashMap<String, String, S>,
     schema: &Schema,
     constraints: &Constraints,
 ) -> Arc<dyn TableProvider> {
-    let key_sets = drop_key_sets(options, schema, constraints);
+    let key_sets = drop_key_sets(
+        options.get("on_conflict").map(String::as_str),
+        schema,
+        constraints,
+    );
     if key_sets.is_empty() {
         provider
     } else {
-        SpiceTable::over(
-            Arc::new(KeepFirst {
-                key_sets: Arc::from(key_sets),
-            }),
-            provider,
-        )
+        SpiceTable::over(Arc::new(KeepFirst { key_sets }), provider)
     }
 }
 
 /// The column sets `on_conflict` drops repeats of: the configured target for a
 /// single `drop`, or every primary-key and unique constraint when each target
 /// is `drop`.
-fn drop_key_sets<S: std::hash::BuildHasher>(
-    options: &HashMap<String, String, S>,
+fn drop_key_sets(
+    on_conflict: Option<&str>,
     schema: &Schema,
     constraints: &Constraints,
 ) -> Vec<Vec<String>> {
-    let Some(Ok(on_conflict)) = options
-        .get("on_conflict")
-        .map(|value| OnConflict::try_from(value.as_str()))
-    else {
+    let Some(Ok(on_conflict)) = on_conflict.map(OnConflict::try_from) else {
         return Vec::new();
     };
 
@@ -141,7 +138,7 @@ fn field_name(schema: &Schema, column: &str) -> Option<String> {
 /// Keeps the first copy of each key a write repeats; see the module docs.
 #[derive(Debug)]
 pub struct KeepFirst {
-    key_sets: Arc<[Vec<String>]>,
+    key_sets: Vec<Vec<String>>,
 }
 
 #[async_trait]
@@ -186,9 +183,9 @@ impl TableLayer for KeepFirst {
     }
 }
 
-/// Drops every row whose key an earlier row of the same write already
-/// carried. Runs as one partition, so "earlier" is arrival order across the
-/// whole write rather than within one input partition.
+/// Drops every row whose key an earlier kept row of the same write carried.
+/// Runs as one partition, so "earlier" is arrival order across the whole
+/// write rather than within one input partition.
 #[derive(Debug)]
 struct KeepFirstExec {
     input: Arc<dyn ExecutionPlan>,
@@ -207,11 +204,11 @@ impl KeepFirstExec {
             .map(|columns| {
                 columns
                     .iter()
-                    .map(|column| schema.index_of(column).map_err(DataFusionError::from))
-                    .collect::<datafusion::error::Result<Vec<_>>>()
+                    .map(|column| schema.index_of(column))
+                    .collect::<Result<Vec<_>, _>>()
             })
-            .collect::<datafusion::error::Result<Vec<_>>>()?;
-        Ok(Self::with_indices(input, Arc::from(key_indices)))
+            .collect::<Result<Arc<[_]>, _>>()?;
+        Ok(Self::with_indices(input, key_indices))
     }
 
     fn with_indices(input: Arc<dyn ExecutionPlan>, key_indices: Arc<[Vec<usize>]>) -> Self {
@@ -270,10 +267,6 @@ impl ExecutionPlan for KeepFirstExec {
         vec![Distribution::SinglePartition]
     }
 
-    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
-    }
-
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
     }
@@ -324,7 +317,7 @@ struct KeyColumns {
     admitted: AdmittedKeys,
     /// Each admitted key's index in `admitted`, by the key's hash.
     table: HashTable<usize>,
-    hasher: ahash::RandomState,
+    hasher: DefaultHashBuilder,
 }
 
 impl KeyColumns {
@@ -336,13 +329,9 @@ impl KeyColumns {
 
     fn insert(&mut self, hash: u64, key: &[u8]) {
         let index = self.admitted.push(key);
-        let Self {
-            table,
-            admitted,
-            hasher,
-            ..
-        } = self;
-        table.insert_unique(hash, index, |&index| hasher.hash_one(admitted.get(index)));
+        self.table.insert_unique(hash, index, |&index| {
+            self.hasher.hash_one(self.admitted.get(index))
+        });
     }
 
     fn allocated_size(&self) -> usize {
@@ -429,7 +418,7 @@ impl SeenKeys {
                     converter: RowConverter::new(fields)?,
                     admitted: AdmittedKeys::default(),
                     table: HashTable::new(),
-                    hasher: ahash::RandomState::new(),
+                    hasher: DefaultHashBuilder::default(),
                 })
             })
             .collect::<datafusion::error::Result<Vec<_>>>()?;
@@ -460,7 +449,6 @@ impl SeenKeys {
         }
 
         let mut keep = Vec::with_capacity(num_rows);
-        let mut dropped = 0;
         let mut hashes = vec![None; self.keys.len()];
         for row in 0..num_rows {
             let mut repeated = false;
@@ -474,9 +462,7 @@ impl SeenKeys {
                 *hash = Some(value_hash);
                 repeated = repeated || key.contains(value_hash, value.as_ref());
             }
-            if repeated {
-                dropped += 1;
-            } else {
+            if !repeated {
                 for ((key, (rows, _)), hash) in self.keys.iter_mut().zip(&encoded).zip(&hashes) {
                     if let Some(hash) = *hash {
                         key.insert(hash, rows.row(row).as_ref());
@@ -493,7 +479,7 @@ impl SeenKeys {
                 .sum::<usize>(),
         )?;
 
-        if dropped == 0 {
+        if keep.iter().all(|&kept| kept) {
             return Ok(batch);
         }
         Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)
@@ -502,8 +488,10 @@ impl SeenKeys {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdmittedKeys, KeepFirst, KeepFirstExec, SeenKeys, wrap_with_keep_first_if_needed};
-    use spice_table::SpiceTable;
+    use super::{
+        AdmittedKeys, KeepFirst, KeepFirstExec, KeyLayout, SeenKeys, wrap_with_keep_first_if_needed,
+    };
+    use spice_table::{LayerWalk, find_layer};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -560,16 +548,33 @@ mod tests {
             .collect()
     }
 
+    /// The ids `KeepFirstExec` keeps from `input`, filtering on `key_sets`.
+    async fn filter_ids(input: Arc<dyn ExecutionPlan>, key_sets: &[Vec<String>]) -> Vec<i32> {
+        let exec = KeepFirstExec::try_new(input, key_sets).expect("plan");
+        let batches = collect(Arc::new(exec), Arc::new(TaskContext::default()))
+            .await
+            .expect("filter runs");
+        ids(&batches)
+    }
+
+    /// A key set over the columns at `key_indices`, charged to an unbounded pool.
+    fn seen_keys(key_indices: &[Vec<usize>]) -> SeenKeys {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        SeenKeys::try_new(
+            &schema(),
+            key_indices,
+            MemoryConsumer::new("test").register(&pool),
+        )
+        .expect("key set")
+    }
+
     fn find_keep_first(plan: &Arc<dyn ExecutionPlan>) -> Option<&KeepFirstExec> {
         plan.downcast_ref::<KeepFirstExec>()
             .or_else(|| plan.children().into_iter().find_map(find_keep_first))
     }
 
     fn has_keep_first(table: &Arc<dyn TableProvider>) -> bool {
-        table
-            .downcast_ref::<SpiceTable>()
-            .and_then(SpiceTable::layer_as::<KeepFirst>)
-            .is_some()
+        find_layer::<KeepFirst>(table.as_ref(), LayerWalk::Write).is_some()
     }
 
     fn pk() -> Constraints {
@@ -582,6 +587,21 @@ mod tests {
             .collect()
     }
 
+    /// An empty `MemTable`, and that table with `options` applied.
+    fn wrapped(
+        options: &HashMap<String, String>,
+        constraints: &Constraints,
+    ) -> (Arc<MemTable>, Arc<dyn TableProvider>) {
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let table = wrap_with_keep_first_if_needed(
+            Arc::clone(&inner) as Arc<dyn TableProvider>,
+            options,
+            &schema(),
+            constraints,
+        );
+        (inner, table)
+    }
+
     /// Writes `input` through a `drop`-wrapped `MemTable` and returns what was
     /// stored, in storage order.
     async fn write_and_read(
@@ -590,13 +610,7 @@ mod tests {
         input: Arc<dyn ExecutionPlan>,
         ctx: &SessionContext,
     ) -> datafusion::error::Result<Vec<(Option<i32>, String)>> {
-        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
-        let table = wrap_with_keep_first_if_needed(
-            Arc::clone(&inner) as Arc<dyn TableProvider>,
-            &options(on_conflict),
-            &schema(),
-            constraints,
-        );
+        let (inner, table) = wrapped(&options(on_conflict), constraints);
         let plan = table
             .insert_into(&ctx.state(), input, InsertOp::Append)
             .await?;
@@ -628,6 +642,29 @@ mod tests {
             }
         }
         Ok(rows)
+    }
+
+    /// Registers a `do_nothing:id` table `t` and a source `src` holding
+    /// `partitions`, and plans `sql` against them as a user statement is
+    /// planned, through the physical optimizer.
+    async fn plan_insert(
+        ctx: &SessionContext,
+        partitions: Vec<Vec<RecordBatch>>,
+        sql: &str,
+    ) -> (Arc<MemTable>, Arc<dyn ExecutionPlan>) {
+        let (inner, table) = wrapped(&options("do_nothing:id"), &pk());
+        ctx.register_table("t", table).expect("register t");
+        let src = MemTable::try_new(schema(), partitions).expect("source");
+        ctx.register_table("src", Arc::new(src))
+            .expect("register src");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("insert plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        (inner, plan)
     }
 
     #[tokio::test]
@@ -702,15 +739,10 @@ mod tests {
             (Some(2), "a"),
             (Some(3), "b"),
         ])]]);
-        let key_sets: Arc<[Vec<String>]> =
-            Arc::from(vec![vec!["id".to_string()], vec!["v".to_string()]]);
-        let exec = KeepFirstExec::try_new(input, &key_sets).expect("plan");
-        let batches = collect(Arc::new(exec), Arc::new(TaskContext::default()))
-            .await
-            .expect("filter runs");
+        let kept = filter_ids(input, &[vec!["id".to_string()], vec!["v".to_string()]]).await;
         // (1, b) repeats id 1; (2, a) repeats v 'a'; (3, b) is new on both,
         // because the dropped (1, b) admitted neither of its keys.
-        assert_eq!(ids(&batches), vec![1, 3]);
+        assert_eq!(kept, vec![1, 3]);
     }
 
     /// An append under several `drop` targets is passed through untouched: the
@@ -766,20 +798,29 @@ mod tests {
         assert!(error.to_string().contains("Resources exhausted"), "{error}");
     }
 
-    /// A key of a variable-width type is matched on its full value, whatever
-    /// width the keys before it had.
-    #[tokio::test]
-    async fn the_filter_matches_keys_of_varying_width() {
-        let input = source(&[vec![
-            batch(&[(Some(1), "a"), (Some(2), "bb"), (Some(3), "a")]),
-            batch(&[(Some(4), "ccc"), (Some(5), "bb"), (Some(6), "b")]),
-        ]]);
-        let key_sets: Arc<[Vec<String>]> = Arc::from(vec![vec!["v".to_string()]]);
-        let exec = KeepFirstExec::try_new(input, &key_sets).expect("plan");
-        let batches = collect(Arc::new(exec), Arc::new(TaskContext::default()))
-            .await
-            .expect("filter runs");
-        assert_eq!(ids(&batches), vec![1, 2, 4, 6]);
+    /// A key is matched on its full value whatever the width of the keys
+    /// before it. Arrow encodes every string of up to eight bytes to one width,
+    /// so the longer value here is the first key of another width.
+    #[test]
+    fn the_filter_matches_keys_of_varying_width() {
+        let mut seen = seen_keys(&[vec![1]]);
+        let long = "a value longer than eight bytes";
+        let first = seen
+            .keep_first(batch(&[(Some(1), "a"), (Some(2), "bb"), (Some(3), "a")]))
+            .expect("filter");
+        let second = seen
+            .keep_first(batch(&[
+                (Some(4), long),
+                (Some(5), "bb"),
+                (Some(6), "b"),
+                (Some(7), long),
+            ]))
+            .expect("filter");
+        assert_eq!(ids(&[first, second]), vec![1, 2, 4, 6]);
+        assert!(matches!(
+            seen.keys[0].admitted.layout,
+            KeyLayout::Variable(_)
+        ));
     }
 
     #[test]
@@ -797,13 +838,7 @@ mod tests {
     /// NULL key leaves nothing behind once its batch is written.
     #[test]
     fn only_admitted_keys_are_held() {
-        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-        let mut seen = SeenKeys::try_new(
-            &schema(),
-            &[vec![0]],
-            MemoryConsumer::new("test").register(&pool),
-        )
-        .expect("key set");
+        let mut seen = seen_keys(&[vec![0]]);
         let rows: Vec<(Option<i32>, &str)> = (0..10_000)
             .map(|n| ((n % 4 != 3).then_some(n % 4), "v"))
             .collect();
@@ -817,11 +852,6 @@ mod tests {
     /// ignoring case, so the filter does too.
     #[tokio::test]
     async fn a_target_spelled_in_another_case_names_its_column() {
-        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
-        let table =
-            wrap_with_keep_first_if_needed(inner, &options("do_nothing:ID"), &schema(), &pk());
-        assert!(has_keep_first(&table));
-
         let input = source(&[vec![batch(&[(Some(1), "a"), (Some(1), "b")])]]);
         let rows = write_and_read("do_nothing:ID", &pk(), input, &SessionContext::new())
             .await
@@ -833,9 +863,7 @@ mod tests {
     /// as it would without the filter.
     #[test]
     fn a_target_naming_no_column_installs_nothing() {
-        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
-        let table =
-            wrap_with_keep_first_if_needed(inner, &options("do_nothing:missing"), &schema(), &pk());
+        let (_, table) = wrapped(&options("do_nothing:missing"), &pk());
         assert!(!has_keep_first(&table));
     }
 
@@ -844,32 +872,15 @@ mod tests {
     #[tokio::test]
     async fn an_optimized_insert_runs_the_filter_over_one_partition() {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
-        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
-        let table = wrap_with_keep_first_if_needed(
-            Arc::clone(&inner) as Arc<dyn TableProvider>,
-            &options("do_nothing:id"),
-            &schema(),
-            &pk(),
-        );
-        ctx.register_table("t", table).expect("register t");
-        let src = MemTable::try_new(
-            schema(),
+        let (inner, plan) = plan_insert(
+            &ctx,
             vec![
                 vec![batch(&[(Some(0), "p0"), (Some(1), "p0")])],
                 vec![batch(&[(Some(0), "p1"), (Some(2), "p1")])],
             ],
+            "INSERT INTO t SELECT * FROM src",
         )
-        .expect("source");
-        ctx.register_table("src", Arc::new(src))
-            .expect("register src");
-
-        let plan = ctx
-            .sql("INSERT INTO t SELECT * FROM src")
-            .await
-            .expect("insert plans")
-            .create_physical_plan()
-            .await
-            .expect("physical plan");
+        .await;
         let keep_first = find_keep_first(&plan).expect("the plan runs the filter");
         assert_eq!(
             keep_first.children()[0]
@@ -879,13 +890,10 @@ mod tests {
         );
         collect(plan, ctx.task_ctx()).await.expect("insert runs");
 
-        let scan = inner
-            .scan(&ctx.state(), None, &[], None)
-            .await
-            .expect("scan");
-        let mut stored = ids(&collect(scan, ctx.task_ctx()).await.expect("read"));
-        stored.sort_unstable();
-        assert_eq!(stored, vec![0, 1, 2]);
+        let mut rows = stored(&inner, &ctx).await.expect("read");
+        rows.sort_unstable();
+        let ids: Vec<Option<i32>> = rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![Some(0), Some(1), Some(2)]);
     }
 
     /// An ordered `INSERT` keeps the copy its `ORDER BY` puts first: the
@@ -894,33 +902,16 @@ mod tests {
     #[tokio::test]
     async fn an_ordered_insert_keeps_the_copy_its_order_puts_first() {
         let ctx = SessionContext::new();
-        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
-        let table = wrap_with_keep_first_if_needed(
-            Arc::clone(&inner) as Arc<dyn TableProvider>,
-            &options("do_nothing:id"),
-            &schema(),
-            &pk(),
-        );
-        ctx.register_table("t", table).expect("register t");
-        let src = MemTable::try_new(
-            schema(),
+        let (inner, plan) = plan_insert(
+            &ctx,
             vec![vec![batch(&[
                 (Some(1), "a"),
                 (Some(2), "b"),
                 (Some(1), "z"),
             ])]],
+            "INSERT INTO t SELECT * FROM src ORDER BY v DESC",
         )
-        .expect("source");
-        ctx.register_table("src", Arc::new(src))
-            .expect("register src");
-
-        let plan = ctx
-            .sql("INSERT INTO t SELECT * FROM src ORDER BY v DESC")
-            .await
-            .expect("insert plans")
-            .create_physical_plan()
-            .await
-            .expect("physical plan");
+        .await;
         collect(plan, ctx.task_ctx()).await.expect("insert runs");
 
         let mut rows = stored(&inner, &ctx).await.expect("read");
@@ -933,20 +924,15 @@ mod tests {
 
     #[test]
     fn only_drop_installs_the_wrapper() {
-        for (on_conflict, wrapped) in [
-            ("do_nothing:id", true),
-            ("do_nothing_all", true),
-            ("upsert:id", false),
-            ("not a policy", false),
+        for (on_conflict, installed) in [
+            (options("do_nothing:id"), true),
+            (options("do_nothing_all"), true),
+            (options("upsert:id"), false),
+            (options("not a policy"), false),
+            (HashMap::new(), false),
         ] {
-            let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
-            let table =
-                wrap_with_keep_first_if_needed(inner, &options(on_conflict), &schema(), &pk());
-            assert_eq!(has_keep_first(&table), wrapped, "{on_conflict}");
+            let (_, table) = wrapped(&on_conflict, &pk());
+            assert_eq!(has_keep_first(&table), installed, "{on_conflict:?}");
         }
-
-        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
-        let table = wrap_with_keep_first_if_needed(inner, &HashMap::new(), &schema(), &pk());
-        assert!(!has_keep_first(&table), "no on_conflict");
     }
 }

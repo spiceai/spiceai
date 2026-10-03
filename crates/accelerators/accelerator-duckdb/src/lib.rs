@@ -2690,14 +2690,16 @@ mod tests {
             .await
     }
 
-    /// An `(id, v)` table with `on_conflict: { id: drop }` and the given extra
-    /// options and constraints.
+    /// An `(id, v)` table with the given options and constraints, and
+    /// `on_conflict: { id: drop }` unless the options set another target.
     async fn drop_on_conflict_table_with(
         name: &str,
         mut options: HashMap<String, String>,
         constraints: Vec<Constraint>,
     ) -> Arc<dyn TableProvider> {
-        options.insert("on_conflict".to_string(), "do_nothing:id".to_string());
+        options
+            .entry("on_conflict".to_string())
+            .or_insert_with(|| "do_nothing:id".to_string());
         let external_table = CreateExternalTable {
             schema: ToDFSchema::to_dfschema_ref(id_v_schema())
                 .expect("to convert Arrow schema to DataFusion schema"),
@@ -2835,6 +2837,33 @@ mod tests {
         )
         .await
         .expect("a repeated key must not fail a drop overwrite");
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
+    /// `DuckDB` matches an `on_conflict` target to its column ignoring case,
+    /// so `do_nothing:ID` over a column `id` keeps the first copy of an `id`
+    /// rather than failing the write on a column it cannot find.
+    #[tokio::test]
+    async fn drop_resolves_a_target_spelled_in_another_case() {
+        let table = drop_on_conflict_table_with(
+            "drop_target_case",
+            [("on_conflict".to_string(), "do_nothing:ID".to_string())]
+                .into_iter()
+                .collect(),
+            vec![Constraint::PrimaryKey(vec![0])],
+        )
+        .await;
+        write_batches(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (2, "b"), (1, "c")])],
+            InsertOp::Overwrite,
+        )
+        .await
+        .expect("a target spelled in another case must not fail the write");
 
         assert_eq!(
             id_v_rows(&table).await,

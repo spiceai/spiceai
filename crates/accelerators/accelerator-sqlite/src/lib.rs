@@ -1042,6 +1042,29 @@ mod tests {
         );
     }
 
+    /// `SQLite` matches an `on_conflict` target to its column ignoring case, so
+    /// `do_nothing:ID` over a column `id` keeps the first copy of an `id`.
+    #[tokio::test]
+    async fn drop_resolves_a_target_spelled_in_another_case() {
+        let table = id_v_table(
+            "drop_target_case",
+            "do_nothing:ID",
+            vec![Constraint::PrimaryKey(vec![0])],
+        )
+        .await;
+        write_id_v(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (2, "b"), (1, "c")])],
+            InsertOp::Overwrite,
+        )
+        .await;
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
     /// With `drop` on two constraints, an append must not drop a row because of
     /// a key carried by an earlier incoming row that the table itself rejects:
     /// `(1, 'b')` conflicts with the stored `(1, 'a')`, so it is never written,
