@@ -407,6 +407,9 @@ impl PartitionCreator for CayennePartitionCreator {
             let partition_key = partition_meta.composite_key();
             let partition_table_name = self.partition_table_name(&partition_key);
 
+            // Current name first, legacy only when it is not found. The snapshot
+            // slice validator predicts the child each partition opens by this same
+            // order, so changing it changes which restored slices are safe to accept.
             let cayenne_table = match self
                 .partition_table_builder()
                 .open(&partition_table_name)
