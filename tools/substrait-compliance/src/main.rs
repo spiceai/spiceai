@@ -118,7 +118,7 @@ struct Args {
     /// TPC-H scale factor. Omit to run the suite's own SF 0.01 CSVs against
     /// its goldens; set, Mode A generates the tables in memory with `tpchgen`
     /// at this scale and compares against `--expected`.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     scale_factor: Option<f64>,
 
     /// Directory of goldens (`q01.csv` … `q22.csv` in the suite's typed CSV
@@ -377,8 +377,7 @@ mod tests {
     fn invalid_scale_factor_is_rejected_before_the_expected_dir_is_resolved() {
         for scale_factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let err = super::resolve_expected_dir(Some(scale_factor), None)
-                .err()
-                .expect("invalid scale factor");
+                .expect_err("invalid scale factor");
             assert!(
                 matches!(err, crate::error::Error::InvalidScaleFactor { .. }),
                 "{scale_factor}: {err}"
@@ -393,12 +392,25 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_minus_on_scale_factor_is_a_value_not_a_flag() {
+        use clap::Parser as _;
+        let args =
+            super::Args::try_parse_from(["spice-substrait-compliance", "--scale-factor", "-1"])
+                .expect("clap accepts -1 as the scale factor");
+        assert_eq!(args.scale_factor, Some(-1.0));
+        let err = super::require_scale_factor(args.scale_factor).expect_err("invalid scale factor");
+        assert!(
+            matches!(err, crate::error::Error::InvalidScaleFactor { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn a_missing_expected_dir_is_still_reported_when_the_scale_factor_is_valid() {
         let path =
             std::path::PathBuf::from("tools/substrait-compliance/expected/sf-does-not-exist");
         let err = super::resolve_expected_dir(Some(1.0), Some(path.clone()))
-            .err()
-            .expect("missing expected dir");
+            .expect_err("missing expected dir");
         assert!(
             matches!(err, crate::error::Error::MissingExpectedDir { path: ref p } if *p == path),
             "{err}"
