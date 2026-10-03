@@ -256,7 +256,7 @@ impl GraphQL {
         )?;
         let rate_limiter = self
             .rate_control_registry
-            .shared_rate_limiter(&endpoint)
+            .shared_rate_limiter_for_config(&endpoint, &rate_control)
             .await;
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;

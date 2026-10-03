@@ -1341,7 +1341,7 @@ impl Https {
 
         let rate_limiter = self
             .rate_control_registry
-            .shared_rate_limiter(&base_url)
+            .shared_rate_limiter_for_config(&base_url, &rate_control)
             .await;
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
