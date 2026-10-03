@@ -553,19 +553,21 @@ impl Shape {
     /// words) and the persisted format. A reopened table therefore reads back
     /// only runs written by the same key, encoding and format, and deletes the
     /// rest: a key column relaxed to nullable in place changes every key's word.
-    fn persisted_key(&self) -> u64 {
+    /// The hash is the identity, so it is 128 bits (see
+    /// [`hash_index::hash_key_128`]).
+    fn persisted_key(&self) -> u128 {
         let descriptor = format!(
             "{}|{}|{:016x}",
             self.label,
             key_index::persist::VERSION,
             self.encoder.word_identity()
         );
-        hash_index::hash_key_bytes(&[descriptor.as_bytes()])
+        hash_index::hash_key_128(descriptor.as_bytes())
     }
 
     /// The directory this key's persisted runs live in.
     fn persisted_dir(&self) -> String {
-        format!("{:016x}", self.persisted_key())
+        format!("{:032x}", self.persisted_key())
     }
 
     /// A builder for one run of this key.
@@ -1576,18 +1578,23 @@ impl LookupIndexState {
         root: &object_store::path::Path,
         live: Vec<String>,
     ) {
+        let keys: Vec<String> = self
+            .shapes
+            .load()
+            .iter()
+            .map(|shape| shape.persisted_dir())
+            .collect();
+        if !distinct_dirs(&keys) {
+            tracing::debug!(table = %self.table_name, "Secondary index runs are not persisted: two keys share a run directory");
+            return;
+        }
         let persisted_runs = Arc::new(PersistedRuns {
             table_name: self.table_name.clone(),
             store,
             catalog,
             table_id,
             root: root.clone(),
-            keys: self
-                .shapes
-                .load()
-                .iter()
-                .map(|shape| shape.persisted_dir())
-                .collect(),
+            keys,
             loaded: AtomicBool::new(false),
             pending: Mutex::new(None),
             syncing: AtomicBool::new(false),
@@ -2533,7 +2540,8 @@ impl PersistedRuns {
     /// Persists `views`' runs in the background, coalescing with any sync
     /// already running.
     fn schedule(self: &Arc<Self>, views: Vec<(String, IndexView)>) {
-        if !self.loaded.load(Ordering::Acquire) {
+        let dirs: Vec<String> = views.iter().map(|(dir, _)| dir.clone()).collect();
+        if !self.loaded.load(Ordering::Acquire) || !distinct_dirs(&dirs) {
             return;
         }
         *self.pending.lock() = Some(views);
@@ -2737,6 +2745,14 @@ fn persisted_runs_loaded_message(
     format!(
         "Dataset '{table_name}' (cayenne): loaded its secondary index from disk ({mib:.1} MiB), {coverage}"
     )
+}
+
+/// Whether every key has a run directory of its own. Keys sharing one would
+/// load each other's runs, and a lookup on one could then miss rows the
+/// other's runs hold, so a table whose keys collide persists nothing.
+fn distinct_dirs(dirs: &[String]) -> bool {
+    let unique: HashSet<&str> = dirs.iter().map(String::as_str).collect();
+    unique.len() == dirs.len()
 }
 
 /// A persisted run's name: a digest of the run's files and size, so the same run
@@ -4105,6 +4121,33 @@ mod tests {
         // A NULL literal matches nothing.
         let null = |column: &str| (column == "tenant").then(|| vec![ScalarValue::Int64(None)]);
         assert!(selection(state.probe(&view, &null)).per_file.is_empty());
+    }
+
+    /// Every key persists its runs in a directory of its own, named by a
+    /// 128-bit digest; keys that shared one would load each other's runs, so
+    /// a set of directories with a repeat is refused.
+    #[test]
+    fn every_key_persists_in_a_directory_of_its_own() {
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        let dirs: Vec<String> = state
+            .shapes
+            .load()
+            .iter()
+            .map(|shape| shape.persisted_dir())
+            .collect();
+        assert_eq!(dirs.len(), 2);
+        assert!(
+            dirs.iter()
+                .all(|dir| dir.len() == 32 && dir.chars().all(|c| c.is_ascii_hexdigit())),
+            "{dirs:?}"
+        );
+        assert!(distinct_dirs(&dirs), "{dirs:?}");
+        assert!(!distinct_dirs(&[
+            dirs[0].clone(),
+            dirs[1].clone(),
+            dirs[0].clone()
+        ]));
     }
 
     #[tokio::test]
