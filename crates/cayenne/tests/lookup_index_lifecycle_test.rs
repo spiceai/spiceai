@@ -544,6 +544,10 @@ async fn a_build_the_pool_cannot_fit_is_not_retried_on_every_lookup() {
         "{lookups} lookups in {window:?} started {} background builds; a refused build must back off: {after:?}",
         after.builds_started
     );
+    assert!(
+        after.builds_unpublished <= after.builds_started,
+        "each refused build is counted once as unpublished: {after:?}"
+    );
     // How often the loop got to run is not the subject, so the floor stays well
     // clear of what a loaded runner can deliver: an absolute floor high enough
     // to double as a throughput assert fails there 6/6 (#14219).
@@ -1286,5 +1290,34 @@ async fn a_key_column_relaxed_to_nullable_on_an_open_table_keeps_lookups_exact()
         counters(&table).selected - before.selected,
         1,
         "a lookup after the rebuild must use the index"
+    );
+}
+
+/// An `indexes` entry may spell a column in another case than the table does;
+/// the key resolves to the table's column, and a lookup filtering on it uses
+/// the index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_spelled_in_another_case_is_used_by_lookups() {
+    const ROWS: usize = 4_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "cased";
+    let table = open(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&["tenantid", "SERVICEID"]],
+    )
+    .await;
+    overwrite(&table, rows(0, ROWS)).await;
+    let before = counters(&table);
+    lookup(&table, name, 7).await;
+    let after = counters(&table);
+    assert_eq!(
+        after.selected - before.selected,
+        1,
+        "the lookup did not use the index: {before:?} -> {after:?}"
     );
 }

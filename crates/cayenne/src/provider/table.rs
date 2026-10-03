@@ -10212,12 +10212,7 @@ impl CayenneTableProvider {
         // The write's files are complete; its caller makes them visible next.
         if let Some((state, observer)) = index_observer {
             // A rewrite replaces files: it is covered before its caller swaps it in.
-            state
-                .finish_write(
-                    &observer,
-                    matches!(write_class, super::delta_encoding::WriteClass::Maintenance),
-                )
-                .await;
+            state.finish_write(&observer).await;
         }
 
         Ok((total_rows, writer_ops, stats_accumulator))
@@ -27155,19 +27150,9 @@ impl CayenneTableProvider {
                 Err(error) => Err(error),
             };
             match listed {
-                Ok((files, (protected, protected_files))) => state.reconcile(
-                    &snapshot_id,
-                    super::lookup_index::FileSetVersion {
-                        dir_generation: files.dir_generation,
-                        listing_epoch: files.listing_epoch,
-                        protected,
-                    },
-                    files
-                        .files
-                        .iter()
-                        .map(|file| file.object_meta.location.as_ref())
-                        .chain(protected_files.iter().map(String::as_str)),
-                ),
+                Ok((files, (protected, protected_files))) => {
+                    reconcile_lookup_index(state, &snapshot_id, &files, protected, &protected_files);
+                }
                 Err(error) => {
                     tracing::debug!(table = %provider.table_metadata.table_name, %error, "Secondary index runs were not reconciled after a snapshot change; the next scan does it");
                 }
@@ -29398,20 +29383,14 @@ impl CayenneTableProvider {
             Some(state) => {
                 let (protected, protected_files) =
                     self.lookup_index_protected_files(&protected_map).await?;
-                state.reconcile(
+                reconcile_lookup_index(
+                    state,
                     &current_snapshot_id,
-                    super::lookup_index::FileSetVersion {
-                        dir_generation: warm_files.dir_generation,
-                        listing_epoch: warm_files.listing_epoch,
-                        protected,
-                    },
-                    warm_files
-                        .files
-                        .iter()
-                        .map(|file| file.object_meta.location.as_ref())
-                        .chain(protected_files.iter().map(String::as_str)),
+                    &warm_files,
+                    protected,
+                    &protected_files,
                 );
-                state.published()
+                Some(state.published())
             }
             None => None,
         };
@@ -34664,7 +34643,8 @@ impl CayenneTableProvider {
             .lookup_index
             .as_ref()
             .filter(|_| allow_runtime_lookup && lookup_plan_provider.is_none())
-            .map(|index| {
+            .zip(pinned_lookup_index.clone())
+            .map(|(index, pinned)| {
                 let request_build = self.weak_self.get().cloned().map(|weak| {
                     Arc::new(move || {
                         if let Some(provider) = weak.upgrade() {
@@ -34674,7 +34654,7 @@ impl CayenneTableProvider {
                 });
                 Arc::new(super::lookup_index::DynamicLookupAccessPlanProvider::new(
                     Arc::clone(index),
-                    pinned_lookup_index.clone(),
+                    pinned,
                     partitioned_file_lists
                         .iter()
                         .flat_map(FileGroup::iter)
@@ -35751,9 +35731,7 @@ impl CayenneTableProvider {
                 .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
                 .await
                 .ok_or_else(|| "could not list the current snapshot's files".to_string())?;
-            let view = state
-                .published()
-                .ok_or_else(|| "no published index to verify".to_string())?;
+            let view = state.published();
             (snapshot_id, store, files, view)
         };
         super::lookup_index::verify_against_read_back(state, view, snapshot_id, &store, files).await
@@ -35818,13 +35796,7 @@ impl CayenneTableProvider {
         let Some(indexer) = &self.mem_tier_index else {
             return Ok(None);
         };
-        let column_type = |column: &str| {
-            self.table_metadata
-                .schema
-                .field_with_name(column)
-                .ok()
-                .map(|field| field.data_type().clone())
-        };
+        let column_type = |column: &str| self.lookup_column_type(column);
         let values_for = |column: &str| {
             filters
                 .iter()
@@ -35910,6 +35882,15 @@ impl CayenneTableProvider {
         )))
     }
 
+    /// The type of the table column `column` in the table's current schema,
+    /// which a live schema change may have widened since the table opened.
+    fn lookup_column_type(&self, column: &str) -> Option<DataType> {
+        self.table_schema()
+            .field_with_name(column)
+            .ok()
+            .map(|field| field.data_type().clone())
+    }
+
     /// This provider as an `Arc` a background task can hold: the one it is
     /// registered as, or a clone sharing all of its state when it was never
     /// `Arc`-wrapped.
@@ -35960,7 +35941,7 @@ impl CayenneTableProvider {
         let view = index_state.published();
         let uncovered: Vec<super::lookup_index::IndexedFile> = files
             .into_iter()
-            .filter(|file| !view.as_ref().is_some_and(|view| view.covers(&file.path)))
+            .filter(|file| !view.covers(&file.path))
             .collect();
         super::lookup_index::spawn_build(claim, store, uncovered, self.lookup_index_list_live());
     }
@@ -36005,34 +35986,21 @@ impl CayenneTableProvider {
         super::lookup_index::LookupIndexExplain,
     )> {
         let index_state = self.lookup_index.as_ref()?;
-        let column_type = |column: &str| {
-            self.table_metadata
-                .schema
-                .field_with_name(column)
-                .ok()
-                .map(|field| field.data_type().clone())
-        };
+        // An indexed table's scan always pins its published view.
+        let pinned_index = pinned_index?;
+        let column_type = |column: &str| self.lookup_column_type(column);
         let values_for = |column: &str| {
             filters
                 .iter()
                 .find_map(|filter| bare_column_values_for(filter, column, column_type(column)))
         };
-        let Some(shape) = index_state.matched_shape(&values_for) else {
-            return Some((
-                None,
-                super::lookup_index::LookupIndexExplain::scanned(
-                    None,
-                    super::lookup_index::LookupIndexScanReason::NoKeyPinned,
-                ),
-            ));
-        };
         let (selection, explain) = match index_state.probe(pinned_index, &values_for) {
-            super::lookup_index::LookupProbe::Selection(selection) => (
-                Some(selection),
-                super::lookup_index::LookupIndexExplain::not_applicable(Some(
-                    index_state.shape_label(shape).to_string(),
-                )),
-            ),
+            super::lookup_index::LookupProbe::Selection(selection) => {
+                let explain = super::lookup_index::LookupIndexExplain::not_applicable(Some(
+                    selection.shape().to_string(),
+                ));
+                (Some(selection), explain)
+            }
             super::lookup_index::LookupProbe::Fallback(explain) => {
                 if explain.outcome == super::lookup_index::LookupIndexExplainOutcome::Unbuilt {
                     self.shared_handle().request_runtime_lookup_index_build();
@@ -36090,8 +36058,6 @@ impl CayenneTableProvider {
             .flat_map(FileGroup::iter)
             .map(|file| super::lookup_index::IndexedFile {
                 path: file.object_meta.location.to_string(),
-                size: file.object_meta.size,
-                last_modified_ms: file.object_meta.last_modified.timestamp_millis(),
             })
             .collect();
         // A snapshot with no files — a refresh small enough to be inlined into the
@@ -36317,6 +36283,30 @@ fn bare_column_scalar_for(expr: &Expr, name: &str) -> Option<ScalarValue> {
         &|e| matches!(e, Expr::Column(col) if col.name == name),
         &evaluated_literal,
     )
+}
+
+/// Retires the secondary index's runs over files that have left the file set
+/// a reader of `snapshot_id` sees: its warm files `warm` and the files of the
+/// protected snapshots (`protected` digests them).
+fn reconcile_lookup_index(
+    state: &Arc<super::lookup_index::LookupIndexState>,
+    snapshot_id: &str,
+    warm: &CapturedSnapshotFiles,
+    protected: u64,
+    protected_files: &[String],
+) {
+    state.reconcile(
+        snapshot_id,
+        super::lookup_index::FileSetVersion {
+            dir_generation: warm.dir_generation,
+            listing_epoch: warm.listing_epoch,
+            protected,
+        },
+        warm.files
+            .iter()
+            .map(|file| file.object_meta.location.as_ref())
+            .chain(protected_files.iter().map(String::as_str)),
+    );
 }
 
 /// The values a filter pins the BARE column `name` to, for the point-lookup
