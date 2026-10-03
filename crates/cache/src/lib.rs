@@ -1092,6 +1092,99 @@ impl QueryResultsCacheProvider {
         Ok(())
     }
 
+    /// Whether a result read at `read_started_at` could be served if stored
+    /// now, fresh or stale. Same ruling as a hit ([`Self::entry_validity`]).
+    #[must_use]
+    pub fn is_servable<S: std::hash::BuildHasher>(
+        &self,
+        tables: &HashSet<TableReference, S>,
+        read_started_at: std::time::Instant,
+    ) -> bool {
+        self.entry_validity(tables, read_started_at, std::time::Instant::now())
+            != EntryValidity::Invalidated
+    }
+
+    /// Stores `result`, ruled the way a hit is. Returns `false` only when no
+    /// lookup could serve it; keeping an entry that read later counts as stored.
+    ///
+    /// A result whose tables changed while it ran is stored only inside a
+    /// `stale_while_revalidate_ttl` window, to be served stale, and never over
+    /// an entry whose read began later. `weight` is
+    /// `result.get_memory_size()` when already computed.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to access the cache
+    pub async fn store_raw_key(
+        &self,
+        raw_key: &RawCacheKey,
+        result: CachedQueryResult,
+        weight: Option<usize>,
+    ) -> Result<bool> {
+        let validity = self.entry_validity(
+            &result.input_tables,
+            result.read_started_at,
+            std::time::Instant::now(),
+        );
+        match validity {
+            EntryValidity::Invalidated => {
+                tracing::debug!(
+                    "A table read by this query changed while it ran and no stale-while-revalidate window could serve the result, skipping cache storage"
+                );
+                Ok(false)
+            }
+            EntryValidity::Valid => {
+                self.put_with_optional_weight(raw_key, result, weight)
+                    .await?;
+                Ok(true)
+            }
+            EntryValidity::StaleWhileRevalidate => {
+                let read_started_at = result.read_started_at;
+                // The predicate runs only for a resident entry, so not running
+                // it means the key is empty.
+                let resident_seen = std::sync::atomic::AtomicBool::new(false);
+                let replaced = self
+                    .cache
+                    .replace_if(
+                        &raw_key.as_u64(),
+                        result.clone(),
+                        &|current: &CachedQueryResult| {
+                            resident_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                            current.read_started_at < read_started_at
+                        },
+                    )
+                    .await;
+                if replaced {
+                    return Ok(true);
+                }
+                if resident_seen.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::debug!(
+                        "A result from a query that began later is already cached under this key, keeping it"
+                    );
+                    return Ok(true);
+                }
+                // A concurrent store landing before this write is overwritten.
+                // Every hit re-rules the entry left behind, so this costs
+                // freshness, not correctness.
+                self.put_with_optional_weight(raw_key, result, weight)
+                    .await?;
+                Ok(true)
+            }
+        }
+    }
+
+    async fn put_with_optional_weight(
+        &self,
+        raw_key: &RawCacheKey,
+        result: CachedQueryResult,
+        weight: Option<usize>,
+    ) -> Result<()> {
+        match weight {
+            Some(weight) => self.put_raw_key_with_weight(raw_key, result, weight).await,
+            None => self.put_raw_key(raw_key, result).await,
+        }
+    }
+
     /// Decode `result` for serving. The first successful decode of an encoded
     /// entry leaves it encoded, so a one-shot key does not inflate to Raw. The
     /// second successful decode replaces the stored value with
@@ -1360,10 +1453,8 @@ impl QueryResultsCacheProvider {
     /// meaning a result read at that point may predate the change and so cannot
     /// be stored as a fresh cache entry.
     ///
-    /// This is the coarse form of [`Self::entry_validity`], for the write side:
-    /// a result already known not to be storable as fresh is not worth encoding
-    /// and storing. The read side wants `entry_validity`, which additionally
-    /// says whether the entry can still be served stale.
+    /// This is the coarse form of [`Self::entry_validity`]; stores use
+    /// [`Self::is_servable`].
     ///
     /// Note this concerns *reusing* a result, never producing one: a query that
     /// read the committed state and returns it to its own caller is correct
@@ -1383,10 +1474,9 @@ impl QueryResultsCacheProvider {
     ///
     /// Tightening it would mean threading the true snapshot-acquisition instant
     /// out of every `TableProvider` scan and back up to the cache write — a
-    /// large amount of plumbing for a marginal hit-rate gain. The imprecision
-    /// spans planning plus execution startup (typically milliseconds) against
-    /// invalidations arriving on a refresh interval (typically minutes), so it
-    /// should rarely fire at all.
+    /// large amount of plumbing. Under CDC, where changes arrive faster than a
+    /// query runs, nearly every read is overtaken; a stale window keeps such
+    /// results cacheable.
     #[must_use]
     pub fn tables_changed_since<S: std::hash::BuildHasher>(
         &self,
@@ -1952,7 +2042,9 @@ mod tests {
         );
     }
 
-    fn config_with_stale_window(stale_while_revalidate_ttl: &str) -> SQLResultsCacheConfig {
+    pub(crate) fn config_with_stale_window(
+        stale_while_revalidate_ttl: &str,
+    ) -> SQLResultsCacheConfig {
         SQLResultsCacheConfig {
             // Long enough that nothing in these tests expires on the ordinary
             // TTL, so the only thing under test is the invalidation clock.
@@ -3121,6 +3213,301 @@ mod tests {
                 .expect("get after original ttl")
                 .is_none(),
             "promotion must not restart item_ttl"
+        );
+    }
+
+    /// Keeps two instants a test orders distinct: a tie counts as changed.
+    pub(crate) async fn tick() {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    /// The resident entry's read start, bypassing the validity ruling.
+    async fn resident_read_started_at(
+        provider: &QueryResultsCacheProvider,
+        key: &RawCacheKey,
+    ) -> Option<Instant> {
+        provider
+            .cache
+            .get_raw_key(&key.as_u64())
+            .await
+            .map(|entry| entry.read_started_at)
+    }
+
+    /// An untouched result is stored and served fresh, with or without a window.
+    #[tokio::test]
+    async fn store_raw_key_stores_a_result_no_change_overtook() {
+        for config in [
+            SQLResultsCacheConfig::default(),
+            config_with_stale_window("5m"),
+        ] {
+            let provider =
+                QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("valid provider");
+            let key = RawCacheKey::new(1);
+            let read_started_at = Instant::now();
+
+            assert!(
+                provider
+                    .store_raw_key(
+                        &key,
+                        cached_result_for("customer", read_started_at).await,
+                        None
+                    )
+                    .await
+                    .expect("cache access should succeed")
+            );
+            assert!(
+                provider
+                    .get_raw_key(&key)
+                    .await
+                    .expect("cache access should succeed")
+                    .is_some(),
+                "an untouched result must be served fresh"
+            );
+        }
+    }
+
+    /// Without a stale window, an overtaken result is not stored.
+    #[tokio::test]
+    async fn store_raw_key_drops_a_result_overtaken_by_a_change_without_a_stale_window() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(2);
+        let read_started_at = Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+
+        assert!(
+            !provider
+                .store_raw_key(
+                    &key,
+                    cached_result_for("customer", read_started_at).await,
+                    None
+                )
+                .await
+                .expect("cache access should succeed")
+        );
+        assert!(
+            resident_read_started_at(&provider, &key).await.is_none(),
+            "an unservable result must not be resident"
+        );
+    }
+
+    /// Regression test for #14686: inside a stale window, an overtaken result is
+    /// stored and served stale, never fresh.
+    #[tokio::test]
+    async fn store_raw_key_keeps_a_result_overtaken_by_a_change_as_stale_inside_the_window() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(3);
+        let read_started_at = Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+
+        assert!(
+            provider
+                .store_raw_key(
+                    &key,
+                    cached_result_for("customer", read_started_at).await,
+                    None
+                )
+                .await
+                .expect("cache access should succeed")
+        );
+
+        let (_, validity) = provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("the result must be servable inside the window");
+        assert_eq!(validity, EntryValidity::StaleWhileRevalidate);
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "a result overtaken by a change must never be served as fresh"
+        );
+    }
+
+    /// Once the window after the change has closed, the result is not stored.
+    #[tokio::test]
+    async fn store_raw_key_drops_a_result_once_the_stale_window_has_closed() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("20ms"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(4);
+        let read_started_at = Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        // Time is under test: the window is measured from the change.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        assert!(!provider.is_servable(
+            &HashSet::from([TableReference::bare("customer")]),
+            read_started_at
+        ));
+        assert!(
+            !provider
+                .store_raw_key(
+                    &key,
+                    cached_result_for("customer", read_started_at).await,
+                    None
+                )
+                .await
+                .expect("cache access should succeed")
+        );
+        assert!(resident_read_started_at(&provider, &key).await.is_none());
+    }
+
+    /// An older stale result must not replace a newer one.
+    #[tokio::test]
+    async fn store_raw_key_keeps_a_newer_resident_over_an_older_stale_result() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(5);
+
+        let older_read = Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        tick().await;
+        let newer_read = Instant::now();
+
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", newer_read).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", older_read).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+
+        assert_eq!(
+            resident_read_started_at(&provider, &key).await,
+            Some(newer_read),
+            "the newer result must stay resident"
+        );
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_some(),
+            "the newer result read after the change and is still served fresh"
+        );
+    }
+
+    /// The table changes during every read, as under CDC; each result still
+    /// replaces the older entry.
+    #[tokio::test]
+    async fn store_raw_key_advances_the_entry_under_continuous_changes() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(6);
+        let customer = TableReference::bare("customer");
+
+        let mut previous_read = None;
+        for _ in 0..3 {
+            tick().await;
+            let read_started_at = Instant::now();
+            // A change lands while this query runs.
+            provider
+                .invalidate_for_table(customer.clone())
+                .await
+                .expect("invalidation should succeed");
+
+            assert!(
+                provider
+                    .store_raw_key(
+                        &key,
+                        cached_result_for("customer", read_started_at).await,
+                        None
+                    )
+                    .await
+                    .expect("cache access should succeed")
+            );
+            let resident = resident_read_started_at(&provider, &key)
+                .await
+                .expect("an entry must be resident");
+            assert_eq!(resident, read_started_at);
+            if let Some(previous) = previous_read {
+                assert!(resident > previous, "the entry must move forward");
+            }
+            previous_read = Some(read_started_at);
+
+            let (_, validity) = provider
+                .get_raw_key_with_validity(&key)
+                .await
+                .expect("cache access should succeed")
+                .expect("servable inside the window");
+            assert_eq!(validity, EntryValidity::StaleWhileRevalidate);
+        }
+    }
+
+    /// `is_servable` matches the hit-time ruling.
+    #[tokio::test]
+    async fn is_servable_matches_the_hit_time_ruling() {
+        let customer = HashSet::from([TableReference::bare("customer")]);
+        let orders = HashSet::from([TableReference::bare("orders")]);
+
+        let hard =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid provider");
+        let windowed =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+
+        for provider in [&hard, &windowed] {
+            let read_started_at = Instant::now();
+            provider
+                .invalidate_for_table(TableReference::bare("customer"))
+                .await
+                .expect("invalidation should succeed");
+            assert!(
+                provider.is_servable(&orders, read_started_at),
+                "an unrelated table's change must not affect the result"
+            );
+            assert!(
+                provider.is_servable(&HashSet::new(), read_started_at),
+                "a table-less result is always servable"
+            );
+            tick().await;
+            assert!(
+                provider.is_servable(&customer, Instant::now()),
+                "a read that began after the change is servable"
+            );
+        }
+
+        let read_started_at = Instant::now();
+        for provider in [&hard, &windowed] {
+            provider
+                .invalidate_for_table(TableReference::bare("customer"))
+                .await
+                .expect("invalidation should succeed");
+        }
+        assert!(
+            !hard.is_servable(&customer, read_started_at),
+            "without a window, a result overtaken by a change is unservable"
+        );
+        assert!(
+            windowed.is_servable(&customer, read_started_at),
+            "inside a window, a result overtaken by a change is servable stale"
         );
     }
 }

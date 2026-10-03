@@ -840,7 +840,9 @@ impl Runtime {
             // A dataset that reads snapshots has no acceleration to load them into until
             // the engine that created them is known, which only their metadata says.
             let (ds, bootstrap_status) = if ds.is_pending_snapshot_source() {
-                let Some(resolved) = self.resolve_snapshot_source(&ds, &load_semaphore).await
+                let Some(resolved) = self
+                    .resolve_snapshot_source(&ds, &load_semaphore, &load)
+                    .await
                 else {
                     return;
                 };
