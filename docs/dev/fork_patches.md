@@ -314,8 +314,8 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in
 ## datafusion-ballista
 
 Upstream [apache/datafusion-ballista](https://github.com/apache/datafusion-ballista),
-branch `spiceai-55-patches` (upstream `main` at its DataFusion 55 merge, merged into
-the previous line). The fork carries its own inventory, `SPICE_FORK_CHANGES.md`.
+branch `spiceai-55` (upstream's `55.0.0-rc1` tag, merged into the previous line through
+spiceai/datafusion-ballista#73 and #68). The fork carries its own inventory, `SPICE_FORK_CHANGES.md`.
 Upstream adopted several of the patches below in that merge; those rows are kept,
 marked upstreamed, because the guard still pins the behaviour and a later upstream
 change could move it.
