@@ -9079,8 +9079,11 @@ mod tests {
 
         // The warning claims a row is being recorded. `extract_response` treats a broken
         // read as transient and the request is retried, so a warning emitted before it
-        // would make that claim on every attempt while producing no row at all.
-        let (base_url, request_count) = start_truncated_body_server(503).await;
+        // would make that claim on every attempt while producing no row at all. A 404,
+        // because `warn` reaches the body read only for a status it may record: a 5xx is
+        // refused before that, which would leave this test passing whatever the
+        // warning's placement.
+        let (base_url, request_count) = start_truncated_body_server(404).await;
         let url = base_url.clone();
 
         let warnings = warnings_emitted_during(async move {
