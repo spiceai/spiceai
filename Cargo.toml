@@ -310,6 +310,7 @@ globset = "0.4.16"
 governor = "0.10.4"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "25bc483efc3200df7a4f5426c176cddb18a84ad9" } # branch: spiceai (merged PR #8)
 graphql-parser = "0.4.0"
+hashbrown = "0.17.1"
 hex = "0.4.3"
 hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"

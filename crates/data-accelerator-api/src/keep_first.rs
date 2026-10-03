@@ -32,7 +32,7 @@ use arrow::{
     buffer::NullBuffer,
     compute::filter_record_batch,
     datatypes::{Schema, SchemaRef},
-    row::{RowConverter, Rows, SortField},
+    row::{RowConverter, SortField},
 };
 use async_trait::async_trait;
 use datafusion::{
@@ -46,13 +46,14 @@ use datafusion::{
     },
     logical_expr::dml::InsertOp,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-        coalesce_partitions::CoalescePartitionsExec, metrics::MetricsSet,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+        PlanProperties, coalesce_partitions::CoalescePartitionsExec, metrics::MetricsSet,
         stream::RecordBatchStreamAdapter,
     },
 };
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::StreamExt;
+use hashbrown::HashTable;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
 /// Layers [`KeepFirst`] over `provider` when `on_conflict` resolves conflicts
@@ -96,14 +97,15 @@ fn drop_key_sets<S: std::hash::BuildHasher>(
     };
 
     match on_conflict {
-        OnConflict::DoNothing(columns) => {
-            let columns: Vec<String> = columns.iter().map(str::to_string).collect();
-            if columns.is_empty() {
-                Vec::new()
-            } else {
-                vec![columns]
-            }
-        }
+        // A target that names no column installs nothing, so the engine
+        // refuses it as it would without this layer.
+        OnConflict::DoNothing(columns) => columns
+            .iter()
+            .map(|column| field_name(schema, column))
+            .collect::<Option<Vec<_>>>()
+            .filter(|columns| !columns.is_empty())
+            .into_iter()
+            .collect(),
         OnConflict::DoNothingAll => constraints
             .iter()
             .filter_map(|constraint| {
@@ -116,6 +118,23 @@ fn drop_key_sets<S: std::hash::BuildHasher>(
             })
             .collect(),
         OnConflict::Upsert(_) => Vec::new(),
+    }
+}
+
+/// The field an `on_conflict` target names: the field with exactly that name,
+/// else the only one equal to it ignoring ASCII case, which is how `DuckDB` and
+/// `SQLite` match the target to a column.
+fn field_name(schema: &Schema, column: &str) -> Option<String> {
+    if schema.field_with_name(column).is_ok() {
+        return Some(column.to_string());
+    }
+    let mut matches = schema
+        .fields()
+        .iter()
+        .filter(|field| field.name().eq_ignore_ascii_case(column));
+    match (matches.next(), matches.next()) {
+        (Some(field), None) => Some(field.name().clone()),
+        _ => None,
     }
 }
 
@@ -245,6 +264,20 @@ impl ExecutionPlan for KeepFirstExec {
         vec![&self.input]
     }
 
+    /// "First" is arrival order across the whole write, so the filter takes
+    /// the write as one stream.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -283,52 +316,98 @@ struct SeenKeys {
     reservation: MemoryReservation,
 }
 
-/// One key's admitted values. The encoded keys stay in the [`Rows`] of the
-/// batch they arrived in, so admitting a key allocates nothing per row: an
-/// entry points at its row, and entries whose hashes are equal are chained.
+/// One key's admitted values. Only admitted keys are held: once its batch is
+/// written, a dropped row or a row with a NULL in its key costs nothing.
 struct KeyColumns {
     indices: Vec<usize>,
     converter: RowConverter,
-    batches: Vec<Rows>,
-    /// Bytes held by `batches`, kept as they are pushed.
-    batch_bytes: usize,
-    entries: Vec<KeyEntry>,
-    /// Hash of an encoded key to the latest entry with that hash.
-    heads: HashMap<u64, usize, ahash::RandomState>,
+    admitted: AdmittedKeys,
+    /// Each admitted key's index in `admitted`, by the key's hash.
+    table: HashTable<usize>,
     hasher: ahash::RandomState,
-}
-
-struct KeyEntry {
-    batch: usize,
-    row: usize,
-    /// The previous entry with the same hash.
-    next: Option<usize>,
 }
 
 impl KeyColumns {
     fn contains(&self, hash: u64, key: &[u8]) -> bool {
-        let mut next = self.heads.get(&hash).copied();
-        while let Some(index) = next {
-            let entry = &self.entries[index];
-            if self.batches[entry.batch].row(entry.row).as_ref() == key {
-                return true;
-            }
-            next = entry.next;
-        }
-        false
+        self.table
+            .find(hash, |&index| self.admitted.get(index) == key)
+            .is_some()
     }
 
-    fn insert(&mut self, hash: u64, batch: usize, row: usize) {
-        let next = self.heads.insert(hash, self.entries.len());
-        self.entries.push(KeyEntry { batch, row, next });
+    fn insert(&mut self, hash: u64, key: &[u8]) {
+        let index = self.admitted.push(key);
+        let Self {
+            table,
+            admitted,
+            hasher,
+            ..
+        } = self;
+        table.insert_unique(hash, index, |&index| hasher.hash_one(admitted.get(index)));
     }
 
     fn allocated_size(&self) -> usize {
-        self.batch_bytes
-            + self.batches.capacity() * std::mem::size_of::<Rows>()
-            + self.entries.capacity() * std::mem::size_of::<KeyEntry>()
-            + self.heads.capacity() * (std::mem::size_of::<(u64, usize)>() + 1)
-            + self.converter.size()
+        self.admitted.allocated_size() + self.table.allocation_size() + self.converter.size()
+    }
+}
+
+/// The encoded bytes of every admitted key, back to back.
+#[derive(Default)]
+struct AdmittedKeys {
+    bytes: Vec<u8>,
+    len: usize,
+    layout: KeyLayout,
+}
+
+/// Where each admitted key sits in [`AdmittedKeys::bytes`]. A key of a
+/// fixed-width type encodes to the same width every time, so its position
+/// follows from that width alone; the first key of another width switches to
+/// recording where each key ends.
+#[derive(Default)]
+enum KeyLayout {
+    #[default]
+    Empty,
+    Fixed(usize),
+    /// Where each key ends; a key starts where the one before it ends.
+    Variable(Vec<usize>),
+}
+
+impl AdmittedKeys {
+    fn get(&self, index: usize) -> &[u8] {
+        match &self.layout {
+            KeyLayout::Empty => &[],
+            KeyLayout::Fixed(width) => &self.bytes[index * width..(index + 1) * width],
+            KeyLayout::Variable(ends) => {
+                let start = index.checked_sub(1).map_or(0, |previous| ends[previous]);
+                &self.bytes[start..ends[index]]
+            }
+        }
+    }
+
+    /// Appends `key`, returning its index.
+    fn push(&mut self, key: &[u8]) -> usize {
+        let index = self.len;
+        match &self.layout {
+            KeyLayout::Empty => self.layout = KeyLayout::Fixed(key.len()),
+            KeyLayout::Fixed(width) if *width != key.len() => {
+                let width = *width;
+                self.layout = KeyLayout::Variable((1..=index).map(|n| n * width).collect());
+            }
+            KeyLayout::Fixed(_) | KeyLayout::Variable(_) => {}
+        }
+        self.bytes.extend_from_slice(key);
+        if let KeyLayout::Variable(ends) = &mut self.layout {
+            ends.push(self.bytes.len());
+        }
+        self.len += 1;
+        index
+    }
+
+    fn allocated_size(&self) -> usize {
+        let ends = match &self.layout {
+            KeyLayout::Variable(ends) => ends.capacity() * std::mem::size_of::<usize>(),
+            KeyLayout::Empty | KeyLayout::Fixed(_) => 0,
+        };
+        self.bytes.capacity() + ends
     }
 }
 
@@ -348,10 +427,8 @@ impl SeenKeys {
                 Ok(KeyColumns {
                     indices: indices.clone(),
                     converter: RowConverter::new(fields)?,
-                    batches: Vec::new(),
-                    batch_bytes: 0,
-                    entries: Vec::new(),
-                    heads: HashMap::default(),
+                    admitted: AdmittedKeys::default(),
+                    table: HashTable::new(),
                     hasher: ahash::RandomState::new(),
                 })
             })
@@ -365,49 +442,44 @@ impl SeenKeys {
             return Ok(batch);
         }
 
-        let mut nulls = Vec::with_capacity(self.keys.len());
-        for key in &mut self.keys {
+        // This batch's encoded keys, and which of its rows have a NULL in a
+        // key: such a key never conflicts, as in SQL.
+        let mut encoded = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
             let columns: Vec<ArrayRef> = key
                 .indices
                 .iter()
                 .map(|&index| Arc::clone(batch.column(index)))
                 .collect();
-            // A key with a NULL in it never conflicts, as in SQL.
-            nulls.push(
-                columns
-                    .iter()
-                    .fold(None, |acc: Option<NullBuffer>, column| {
-                        NullBuffer::union(acc.as_ref(), column.logical_nulls().as_ref())
-                    }),
-            );
-            let rows = key.converter.convert_columns(&columns)?;
-            key.batch_bytes += rows.size();
-            key.batches.push(rows);
+            let nulls = columns
+                .iter()
+                .fold(None, |acc: Option<NullBuffer>, column| {
+                    NullBuffer::union(acc.as_ref(), column.logical_nulls().as_ref())
+                });
+            encoded.push((key.converter.convert_columns(&columns)?, nulls));
         }
-        // This batch's encoded keys, just pushed above.
-        let batch_index = self.keys.first().map_or(0, |key| key.batches.len() - 1);
 
         let mut keep = Vec::with_capacity(num_rows);
         let mut dropped = 0;
         let mut hashes = vec![None; self.keys.len()];
         for row in 0..num_rows {
             let mut repeated = false;
-            for ((key, nulls), hash) in self.keys.iter().zip(&nulls).zip(&mut hashes) {
+            for ((key, (rows, nulls)), hash) in self.keys.iter().zip(&encoded).zip(&mut hashes) {
                 *hash = None;
                 if nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)) {
                     continue;
                 }
-                let encoded = key.batches[batch_index].row(row);
-                let value = key.hasher.hash_one(encoded.as_ref());
-                *hash = Some(value);
-                repeated = repeated || key.contains(value, encoded.as_ref());
+                let value = rows.row(row);
+                let value_hash = key.hasher.hash_one(value.as_ref());
+                *hash = Some(value_hash);
+                repeated = repeated || key.contains(value_hash, value.as_ref());
             }
             if repeated {
                 dropped += 1;
             } else {
-                for (key, hash) in self.keys.iter_mut().zip(&hashes) {
+                for ((key, (rows, _)), hash) in self.keys.iter_mut().zip(&encoded).zip(&hashes) {
                     if let Some(hash) = *hash {
-                        key.insert(hash, batch_index, row);
+                        key.insert(hash, rows.row(row).as_ref());
                     }
                 }
             }
@@ -430,7 +502,7 @@ impl SeenKeys {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeepFirst, KeepFirstExec, wrap_with_keep_first_if_needed};
+    use super::{AdmittedKeys, KeepFirst, KeepFirstExec, SeenKeys, wrap_with_keep_first_if_needed};
     use spice_table::SpiceTable;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -443,9 +515,10 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::execution::TaskContext;
+    use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::logical_expr::dml::InsertOp;
-    use datafusion::physical_plan::{ExecutionPlan, collect};
+    use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect};
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     fn schema() -> SchemaRef {
@@ -471,6 +544,25 @@ mod tests {
     fn source(partitions: &[Vec<RecordBatch>]) -> Arc<dyn ExecutionPlan> {
         let src = MemorySourceConfig::try_new(partitions, schema(), None).expect("memory source");
         Arc::new(DataSourceExec::new(Arc::new(src)))
+    }
+
+    fn ids(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32");
+                (0..ids.len()).map(|row| ids.value(row)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn find_keep_first(plan: &Arc<dyn ExecutionPlan>) -> Option<&KeepFirstExec> {
+        plan.downcast_ref::<KeepFirstExec>()
+            .or_else(|| plan.children().into_iter().find_map(find_keep_first))
     }
 
     fn has_keep_first(table: &Arc<dyn TableProvider>) -> bool {
@@ -609,20 +701,9 @@ mod tests {
         let batches = collect(Arc::new(exec), Arc::new(TaskContext::default()))
             .await
             .expect("filter runs");
-        let ids: Vec<i32> = batches
-            .iter()
-            .flat_map(|batch| {
-                let ids = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .expect("id is Int32");
-                (0..ids.len()).map(|row| ids.value(row)).collect::<Vec<_>>()
-            })
-            .collect();
         // (1, b) repeats id 1; (2, a) repeats v 'a'; (3, b) is new on both,
         // because the dropped (1, b) admitted neither of its keys.
-        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(ids(&batches), vec![1, 3]);
     }
 
     /// An append under several `drop` targets is passed through untouched: the
@@ -660,8 +741,9 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    /// The admitted keys are charged to the query memory pool, so a write
-    /// whose keys do not fit fails instead of growing without bound.
+    /// The admitted keys are charged to the memory pool of the session that
+    /// runs the write, so under a bounded pool a write whose keys do not fit
+    /// fails instead of growing without bound.
     #[tokio::test]
     async fn the_admitted_keys_are_charged_to_the_memory_pool() {
         let runtime = RuntimeEnvBuilder::new()
@@ -675,6 +757,128 @@ mod tests {
             .await
             .expect_err("10,000 keys do not fit in 1 KiB");
         assert!(error.to_string().contains("Resources exhausted"), "{error}");
+    }
+
+    /// A key of a variable-width type is matched on its full value, whatever
+    /// width the keys before it had.
+    #[tokio::test]
+    async fn the_filter_matches_keys_of_varying_width() {
+        let input = source(&[vec![
+            batch(&[(Some(1), "a"), (Some(2), "bb"), (Some(3), "a")]),
+            batch(&[(Some(4), "ccc"), (Some(5), "bb"), (Some(6), "b")]),
+        ]]);
+        let key_sets: Arc<[Vec<String>]> = Arc::from(vec![vec!["v".to_string()]]);
+        let exec = KeepFirstExec::try_new(input, &key_sets).expect("plan");
+        let batches = collect(Arc::new(exec), Arc::new(TaskContext::default()))
+            .await
+            .expect("filter runs");
+        assert_eq!(ids(&batches), vec![1, 2, 4, 6]);
+    }
+
+    #[test]
+    fn admitted_keys_record_their_ends_from_the_first_key_of_another_width() {
+        let mut keys = AdmittedKeys::default();
+        assert_eq!(keys.push(b"ab"), 0);
+        assert_eq!(keys.push(b"cd"), 1);
+        assert_eq!(keys.push(b"efg"), 2);
+        assert_eq!(keys.push(b"hi"), 3);
+        let stored: Vec<&[u8]> = (0..4).map(|index| keys.get(index)).collect();
+        assert_eq!(stored, [b"ab".as_slice(), b"cd", b"efg", b"hi"]);
+    }
+
+    /// Only the keys the filter admits are held: a dropped row or a row with a
+    /// NULL key leaves nothing behind once its batch is written.
+    #[test]
+    fn only_admitted_keys_are_held() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut seen = SeenKeys::try_new(
+            &schema(),
+            &[vec![0]],
+            MemoryConsumer::new("test").register(&pool),
+        )
+        .expect("key set");
+        let rows: Vec<(Option<i32>, &str)> = (0..10_000)
+            .map(|n| ((n % 4 != 3).then_some(n % 4), "v"))
+            .collect();
+        let kept = seen.keep_first(batch(&rows)).expect("filter");
+        // Keys 0, 1 and 2 once each, and all 2,500 NULL-keyed rows.
+        assert_eq!(kept.num_rows(), 2_503);
+        assert_eq!(seen.keys[0].admitted.len, 3);
+    }
+
+    /// `DuckDB` and `SQLite` match an `on_conflict` target to its column
+    /// ignoring case, so the filter does too.
+    #[tokio::test]
+    async fn a_target_spelled_in_another_case_names_its_column() {
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let table =
+            wrap_with_keep_first_if_needed(inner, &options("do_nothing:ID"), &schema(), &pk());
+        assert!(has_keep_first(&table));
+
+        let input = source(&[vec![batch(&[(Some(1), "a"), (Some(1), "b")])]]);
+        let rows = write_and_read("do_nothing:ID", &pk(), input, &SessionContext::new())
+            .await
+            .expect("write succeeds");
+        assert_eq!(rows, vec![(Some(1), "a".to_string())]);
+    }
+
+    /// A target that names no column is left to the engine, which refuses it
+    /// as it would without the filter.
+    #[test]
+    fn a_target_naming_no_column_installs_nothing() {
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let table =
+            wrap_with_keep_first_if_needed(inner, &options("do_nothing:missing"), &schema(), &pk());
+        assert!(!has_keep_first(&table));
+    }
+
+    /// A user `INSERT` is planned by the physical optimizer, which must still
+    /// hand the filter the whole write as one partition.
+    #[tokio::test]
+    async fn an_optimized_insert_runs_the_filter_over_one_partition() {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let table = wrap_with_keep_first_if_needed(
+            Arc::clone(&inner) as Arc<dyn TableProvider>,
+            &options("do_nothing:id"),
+            &schema(),
+            &pk(),
+        );
+        ctx.register_table("t", table).expect("register t");
+        let src = MemTable::try_new(
+            schema(),
+            vec![
+                vec![batch(&[(Some(0), "p0"), (Some(1), "p0")])],
+                vec![batch(&[(Some(0), "p1"), (Some(2), "p1")])],
+            ],
+        )
+        .expect("source");
+        ctx.register_table("src", Arc::new(src))
+            .expect("register src");
+
+        let plan = ctx
+            .sql("INSERT INTO t SELECT * FROM src")
+            .await
+            .expect("insert plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let keep_first = find_keep_first(&plan).expect("the plan runs the filter");
+        assert_eq!(
+            keep_first.children()[0]
+                .output_partitioning()
+                .partition_count(),
+            1
+        );
+        collect(plan, ctx.task_ctx()).await.expect("insert runs");
+
+        let scan = inner
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        let mut stored = ids(&collect(scan, ctx.task_ctx()).await.expect("read"));
+        stored.sort_unstable();
+        assert_eq!(stored, vec![0, 1, 2]);
     }
 
     #[test]

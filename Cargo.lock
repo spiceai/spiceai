@@ -6210,6 +6210,7 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "futures",
+ "hashbrown 0.17.1",
  "linkme",
  "paste",
  "runtime-acceleration",

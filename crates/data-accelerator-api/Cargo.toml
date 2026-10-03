@@ -19,6 +19,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true }
 futures.workspace = true
+hashbrown.workspace = true
 linkme.workspace = true
 paste.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
