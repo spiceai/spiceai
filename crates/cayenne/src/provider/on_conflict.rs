@@ -585,9 +585,9 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
 /// PERMANENT store, so what the sinks miss is the whole table.
 ///
 /// The background retention pass deliberately does NOT come through here: it calls
-/// `delete_mem_tier_rows_matching` directly, because the delete-all branch below has no
-/// memory-residency gate and a retention predicate must not reach the tier of a table
-/// that is not memory-resident. See `CayenneTableProvider::apply_retention_filters`.
+/// `delete_mem_tier_rows_matching` directly, because the delete-all branch below releases
+/// the discarded bytes against the process-global mem-tier budget, which a
+/// memory-resident write never reserved. See `CayenneTableProvider::apply_retention_filters`.
 ///
 /// Delete-all discards the tier wholesale (#11987, #12072). A filtered delete
 /// evaluates the predicate against the tier and rebuilds it without the matching

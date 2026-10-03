@@ -26326,10 +26326,9 @@ impl CayenneTableProvider {
     /// The error a failed retention pass reports, whatever step of the pass failed.
     ///
     /// One function rather than a `format!` per arm so a reword cannot land on some of
-    /// them: the pass can fail at the inline materialization, the predicate coercion, the
-    /// sink build, the durable delete, or the mem-tier arm, and a user reading any of the
-    /// five is owed the same three things — which dataset, what is still queryable because
-    /// of it, and where to look next.
+    /// them: whichever step of the pass fails, a user reading the error is owed the same
+    /// three things — which dataset, what is still queryable because of it, and where to
+    /// look next.
     fn retention_failed_message(&self) -> String {
         format!(
             "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
@@ -26513,23 +26512,10 @@ impl CayenneTableProvider {
         // before the durable delete for the reason documented on it.
         let sink = self.taint_row_count_exactness(Arc::new(sink));
 
-        let file_deleted = match sink
+        let file_deleted = sink
             .delete_from(Arc::new(util::session_state::task_context()))
             .await
-        {
-            Ok(deleted) => deleted,
-            Err(err) => {
-                maintenance_metrics::track_maintenance(
-                    table_name,
-                    MaintenanceOp::Retention,
-                    MaintenanceOutcome::Failed,
-                );
-                return Err(CatalogError::InvalidOperation {
-                    message: self.retention_failed_message(),
-                    source: err,
-                });
-            }
-        };
+            .map_err(retention_failed)?;
 
         // The sink above addresses durable Vortex files and catalog-inlined rows, so a
         // row resident in the RAM mem-tier is in neither — and under `mode: memory`
@@ -26538,33 +26524,20 @@ impl CayenneTableProvider {
         //
         // `delete_mem_tier_rows_matching` DIRECTLY rather than `apply_mem_tier_delete`,
         // which is what a client `DELETE` composes. That wrapper routes an all-true
-        // predicate to `purge_mem_tier_all`, and unlike the filtered arm, purge has no
-        // memory-residency gate: it discards the tier in EVERY mode and releases the
-        // discarded bytes against the process-global mem-tier budget. A `retention_sql`
-        // of `DELETE FROM t WHERE TRUE` would then reach into a `cdc_durability: memory`
-        // or file-mode table's tier, and — because a memory-resident write never
-        // RESERVES those bytes — would credit another table's reservation with bytes
-        // this one never took. The filtered arm is gated on `is_memory_resident_mode()`
-        // and handles an all-true predicate by rebuilding the tier empty, which is the
-        // same outcome with none of that reach.
+        // predicate to `purge_mem_tier_all`, which releases the discarded bytes against
+        // the process-global mem-tier budget. A memory-resident write never RESERVES those
+        // bytes, so a `retention_sql` of `DELETE FROM t WHERE TRUE` would credit another
+        // table's reservation with bytes this one never took. The filtered arm is gated on
+        // `is_memory_resident_mode()` and handles an all-true predicate by rebuilding the
+        // tier empty, which is the same outcome without that release.
         //
         // Outside memory-resident mode that gate makes this arm a no-op, and nothing is
         // left for it: the `checkpoint_mem_tier_for_delete` above made the tier durable,
         // so the sink already reached those rows.
-        let mem_tier_deleted = match self.delete_mem_tier_rows_matching(&filters).await {
-            Ok(deleted) => deleted,
-            Err(err) => {
-                maintenance_metrics::track_maintenance(
-                    table_name,
-                    MaintenanceOp::Retention,
-                    MaintenanceOutcome::Failed,
-                );
-                return Err(CatalogError::InvalidOperation {
-                    message: self.retention_failed_message(),
-                    source: Box::new(err),
-                });
-            }
-        };
+        let mem_tier_deleted = self
+            .delete_mem_tier_rows_matching(&filters)
+            .await
+            .map_err(|err| retention_failed(Box::new(err)))?;
 
         // Cleared INSIDE the hold, unlike the durable clear below. A key this pass just
         // removed from the tier stays in the existence cache until something clears it,
