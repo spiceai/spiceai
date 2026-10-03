@@ -835,7 +835,12 @@ impl CayenneTableProvider {
             None if let Some((survivor, key_columns)) = postpass.take() => {
                 let resolved: Result<_> = async {
                     let superseded = self
-                        .find_superseded_by_arrival(&new_snapshot_id, survivor, &key_columns)
+                        .find_superseded_by_arrival(
+                            &new_snapshot_id,
+                            survivor,
+                            &key_columns,
+                            row_count,
+                        )
                         .await?;
                     match file_stats.as_deref() {
                         Some(file_stats) if !superseded.is_empty() => {

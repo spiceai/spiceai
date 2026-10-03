@@ -26,12 +26,14 @@ limitations under the License.
 //! ordinal under the upsert policies, the lowest under `drop` — and returns its
 //! file and position, for position deletes to hide or a fold to remove.
 //!
-//! The query reads only the key columns, and runs in chunks of the key space
-//! sized from the bytes written, so its hash tables hold one chunk's keys at a
-//! time. A chunk of written bytes expands in the query — each row read back
-//! carries its key, ordinal, position, file and key hash, and its key's
-//! aggregate state — so a chunk's memory is a small multiple of its bytes; a
-//! chunk that still outgrows the memory pool cuts the key space finer.
+//! The query reads only the key columns, and runs in chunks of the key space,
+//! so its hash tables hold one chunk's keys at a time. Its memory follows the
+//! rows a chunk covers — each row read back carries its key, ordinal, position,
+//! file and key hash, and its key's aggregate state — not the bytes they were
+//! written in, which shrink with how well the table's other columns compress.
+//! The chunks are sized from the rows written, and from the bytes written for
+//! keys too wide for the row estimate; a chunk that still outgrows the memory
+//! pool cuts the key space finer.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -104,6 +106,21 @@ fn chunk_bytes() -> u64 {
         Some(mb) => mb.max(1) * 1024 * 1024,
         None => CHUNK_BYTES,
     }
+}
+
+/// Rows each chunk of the duplicate query covers. With a single `Int64` key
+/// the query holds about 70 bytes per row of its chunk at its peak, so a chunk
+/// of this many rows holds a little over 1 GiB.
+const CHUNK_ROWS: u64 = 16 * 1024 * 1024;
+
+/// The rows one chunk of the duplicate query covers.
+fn chunk_rows() -> u64 {
+    static OVERRIDE: LazyLock<Option<u64>> = LazyLock::new(|| {
+        std::env::var("SPICE_CAYENNE_REFRESH_DEDUP_CHUNK_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    });
+    OVERRIDE.unwrap_or(CHUNK_ROWS).max(1)
 }
 
 /// `schema` followed by the arrival column.
@@ -345,6 +362,7 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         survivor: Survivor,
         key_columns: &[String],
+        rows_written: u64,
     ) -> super::Result<HashMap<String, Vec<u32>>> {
         let ctx = self.create_session_context();
         let state = ctx.state();
@@ -399,7 +417,10 @@ impl CayenneTableProvider {
         let stored = Arc::new(Field::new_struct("", stored_fields, false));
 
         let total_bytes: u64 = files.iter().map(|file| file.size).sum();
-        let mut chunks = total_bytes.div_ceil(chunk_bytes()).max(1);
+        let mut chunks = total_bytes
+            .div_ceil(chunk_bytes())
+            .max(rows_written.div_ceil(chunk_rows()))
+            .max(1);
         let paths: Vec<String> = files.into_iter().map(|file| file.path).collect();
         let key_names: Arc<[String]> = key_columns.to_vec().into();
         let query = DuplicateQuery {
