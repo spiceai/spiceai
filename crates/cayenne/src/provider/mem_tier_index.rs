@@ -332,6 +332,8 @@ pub(crate) struct Candidates {
     pub(crate) batches: Vec<RecordBatch>,
     /// Whether any batch was read whole for want of an index.
     pub(crate) read_whole: bool,
+    /// Whether any batch was narrowed by its index.
+    pub(crate) indexed: bool,
 }
 
 impl SegmentIndex {
@@ -354,6 +356,7 @@ impl SegmentIndex {
         let mut candidates = Candidates {
             batches: Vec::new(),
             read_whole: false,
+            indexed: false,
         };
         if probe.hashes.is_empty() {
             return Ok(candidates);
@@ -374,6 +377,7 @@ impl SegmentIndex {
                 candidates.read_whole = true;
                 continue;
             };
+            candidates.indexed = true;
             // Distinct hashes hold disjoint rows, so the union needs only
             // sorting back into row order.
             let mut rows: Vec<u32> = probe

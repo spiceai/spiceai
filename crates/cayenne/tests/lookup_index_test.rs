@@ -1147,23 +1147,17 @@ async fn a_large_overwrite_is_covered_when_it_becomes_visible() {
     );
 }
 
-/// On a primary-key upsert table, an upsert's rows land in a protected
-/// snapshot until compaction folds them in. The index covers those files too:
-/// a lookup of an upserted key returns exactly its new row, and reads the one
-/// protected snapshot that holds it rather than every protected snapshot.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn upserted_rows_are_found_through_the_index() {
+/// A primary-key upsert table named `name` whose protected snapshots stay
+/// unfolded, so an upsert's rows stay in the protected snapshot that holds
+/// them; created, or reopened when the catalog already holds it.
+async fn upsert_table(
+    fixture: &common::TestFixture,
+    runtime_env: Arc<RuntimeEnv>,
+    name: &str,
+) -> Arc<CayenneTableProvider> {
     use datafusion_table_providers::util::{
         column_reference::ColumnReference, on_conflict::OnConflict,
     };
-    const TABLE: &str = "svc_upsert";
-    const BATCHES: i64 = 4;
-    // Large enough to be written to files rather than inlined.
-    const PER_BATCH: usize = 10_000;
-    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
-        .await
-        .expect("fixture");
-    let runtime_env = Arc::new(RuntimeEnv::default());
     // Protected snapshots stay unfolded for the length of the test, and the
     // rewrite layout is pinned, so the only thing under test is the index.
     let vortex_config = VortexConfig {
@@ -1174,10 +1168,10 @@ async fn upserted_rows_are_found_through_the_index() {
         compaction_background_interval_ms: 0,
         ..VortexConfig::default()
     };
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), TABLE);
+    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
     let catalog = Arc::clone(&fixture.catalog);
     let catalog: Arc<dyn MetadataCatalog> = catalog;
-    let table = Arc::new(
+    Arc::new(
         CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
             .with_secondary_indexes(
@@ -1187,7 +1181,7 @@ async fn upserted_rows_are_found_through_the_index() {
                     .collect(),
             )
             .create(CreateTableOptions {
-                table_name: TABLE.to_string(),
+                table_name: name.to_string(),
                 schema: service_schema(),
                 primary_key: vec!["AutoId".to_string()],
                 on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
@@ -1199,7 +1193,24 @@ async fn upserted_rows_are_found_through_the_index() {
             })
             .await
             .expect("create table"),
-    );
+    )
+}
+
+/// On a primary-key upsert table, an upsert's rows land in a protected
+/// snapshot until compaction folds them in. The index covers those files too:
+/// a lookup of an upserted key returns exactly its new row, and reads the one
+/// protected snapshot that holds it rather than every protected snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upserted_rows_are_found_through_the_index() {
+    const TABLE: &str = "svc_upsert";
+    const BATCHES: i64 = 4;
+    // Large enough to be written to files rather than inlined.
+    const PER_BATCH: usize = 10_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let table = upsert_table(&fixture, runtime_env, TABLE).await;
     insert(&table, TABLE, service_rows(0, ROWS)).await;
     // Each batch rewrites 10,000 existing keys with a new payload.
     for batch in 0..BATCHES {
@@ -1268,6 +1279,81 @@ async fn upserted_rows_are_found_through_the_index() {
         scanned <= 2,
         "the lookup read {scanned} files across {snapshots} snapshots instead of the candidates only\n{plan}"
     );
+}
+
+/// After a restart with nothing indexed, the background build indexes every
+/// file a lookup reads, the protected snapshots' as well as the current
+/// snapshot's: the lookups that follow read no file in full, and an upserted
+/// key is still found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_background_build_indexes_the_files_of_protected_snapshots() {
+    const TABLE: &str = "svc_upsert_reopened";
+    const PER_BATCH: usize = 10_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let table = upsert_table(&fixture, Arc::clone(&runtime_env), TABLE).await;
+    insert(&table, TABLE, service_rows(0, ROWS)).await;
+    // Each batch rewrites existing keys with a new payload, into a protected
+    // snapshot.
+    for batch in 0..2_i64 {
+        let rows = service_rows(batch * 10_000, PER_BATCH);
+        let ids = rows
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("AutoId");
+        let payload: StringArray = ids
+            .iter()
+            .map(|id| id.map(|id| format!("updated-{id}")))
+            .collect();
+        let mut columns = rows.columns().to_vec();
+        columns[5] = Arc::new(payload);
+        let updated = RecordBatch::try_new(rows.schema(), columns).expect("updated batch");
+        insert(&table, TABLE, updated).await;
+    }
+    drop(table);
+    let table = upsert_table(&fixture, runtime_env, TABLE).await;
+
+    let id = 11_i64;
+    let lookup = format!(
+        "SELECT \"Payload\" FROM {TABLE} WHERE \"TenantId\" = 'AC{:032x}' \
+         AND \"ServiceId\" = 'MG{id:032x}'",
+        id % ACCOUNTS
+    );
+    let uncovered = |plan: &str| -> usize {
+        plan.split("uncovered_files=")
+            .skip(1)
+            .filter_map(|rest| {
+                rest.split(|c: char| !c.is_ascii_digit())
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .sum()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        assert_eq!(
+            rendered(&query(&table, TABLE, &lookup).await),
+            vec!["updated-11".to_string()],
+            "the lookup must return exactly the upserted row"
+        );
+        let plan = arrow::util::pretty::pretty_format_batches(
+            &query(&table, TABLE, &format!("EXPLAIN ANALYZE {lookup}")).await,
+        )
+        .expect("format plan")
+        .to_string();
+        if plan.contains("lookup_index_outcome=selected") && uncovered(&plan) == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background build never indexed every file the lookup reads\n{plan}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// An `IN` list on an indexed key is answered from the index, as one batched

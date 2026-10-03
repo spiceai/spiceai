@@ -593,3 +593,40 @@ async fn memory_mode_batches_the_pool_cannot_fit_are_read_whole() {
         "lookups must report reading unindexed rows: {end:?}"
     );
 }
+
+/// When the pool fits the index of some batches but not others, a lookup
+/// narrows the indexed batches and reads the rest in full: partial coverage is
+/// `selected`, as it is in file mode, and `unbuilt` means no batch read was
+/// indexed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_mode_partly_indexed_lookups_report_selected() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let (env, _pool) = runtime_with_pool(512 * 1024);
+    let indexed = memory_table(&fixture, Arc::clone(&env), "indexed", &INDEXES, false).await;
+    let plain = memory_table(
+        &fixture,
+        Arc::new(RuntimeEnv::default()),
+        "plain",
+        &[],
+        false,
+    )
+    .await;
+    let refresh: Vec<RecordBatch> = (0..5)
+        .map(|chunk| rows(chunk * 8_000, 8_000, "v1"))
+        .collect();
+    overwrite(&indexed, refresh.clone()).await;
+    overwrite(&plain, refresh).await;
+    let built = counters(&indexed);
+    assert!(
+        built.builds_published > 0 && built.builds_unpublished > 0,
+        "the pool must fit some batches' index and not others: {built:?}"
+    );
+    compare(&indexed, &plain, (0..20).map(|i| i * 1_931), "partial").await;
+    let end = counters(&indexed);
+    assert!(
+        end.selected > 0 && end.unbuilt == 0,
+        "a lookup over partly indexed rows is selected, not unbuilt: {end:?}"
+    );
+}

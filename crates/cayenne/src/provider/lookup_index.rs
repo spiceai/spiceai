@@ -2051,10 +2051,18 @@ impl LookupIndexState {
             .encode_keys(keys)
             .ok()
             .and_then(|encoded| index.probe_keys(spec, &encoded, Some(max_rows)));
-        let Some(hit) = hit else {
+        let Some(mut hit) = hit else {
             self.record_runtime_fallback();
             return RuntimeProbe::Declined;
         };
+        // The view spans every file of the table; this scan answers only for
+        // its own, so candidates in any other file select nothing here.
+        let read: HashSet<&str> = scan_files
+            .iter()
+            .map(|file| file_name(file.location.as_ref()))
+            .collect();
+        hit.per_file.retain(|file, _| read.contains(file.as_str()));
+        hit.rows = hit.per_file.values().map(Vec::len).sum();
         // An uncovered file is read in full whatever the covered ones hold, so
         // the probe is `empty` only when every file the scan reads is covered.
         let uncovered = scan_files.len() - covered;
@@ -3168,6 +3176,50 @@ mod tests {
         )
         .expect("indexable")
         .expect("state")
+    }
+
+    /// A join's runtime probe answers for the files its scan reads, and no
+    /// other: a key held only by a file outside the scan selects nothing there,
+    /// so the probe is `empty`, not a selection of a file the scan never opens.
+    #[tokio::test]
+    async fn a_runtime_probe_counts_only_the_files_its_scan_reads() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let state = keyed_state(&pool);
+        write(
+            &state,
+            &[("a.vortex", 0, keyed_batch(&[Some(1)], &[Some("x")]))],
+        )
+        .await;
+        write(
+            &state,
+            &[("b.vortex", 0, keyed_batch(&[Some(2)], &[Some("y")]))],
+        )
+        .await;
+        let view = state.published();
+        let scan = [scan_file("table/snapshot/a.vortex")];
+        let before = state.counters();
+        let probed =
+            state.probe_runtime_filter(0, &view, &scan, &[vec![ScalarValue::Int64(Some(2))]]);
+        let after = state.counters();
+        assert!(
+            matches!(
+                probed,
+                RuntimeProbe::Selection {
+                    uncovered: false,
+                    ..
+                }
+            ),
+            "the scan's one file is covered"
+        );
+        assert_eq!(
+            (
+                after.empty - before.empty,
+                after.selected - before.selected,
+                after.candidate_files - before.candidate_files
+            ),
+            (1, 0, 0),
+            "a key only in a file the scan does not read is an empty probe: {before:?} -> {after:?}"
+        );
     }
 
     /// A schema change resets the index of exactly the keys whose encoding it

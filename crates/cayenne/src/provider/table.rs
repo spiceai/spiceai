@@ -35716,6 +35716,9 @@ impl CayenneTableProvider {
             }
         };
         let mut segments = Vec::new();
+        // Whether any batch read was narrowed by its index, and whether any
+        // was read whole because it has none.
+        let mut narrowed = false;
         let mut read_whole = false;
         let mut candidate_rows = 0u64;
         for shard in shards {
@@ -35724,6 +35727,7 @@ impl CayenneTableProvider {
                 let batches = if let Some(index) = &segment.index {
                     let candidates = index.candidates(&segment.batches, &probe)?;
                     read_whole |= candidates.read_whole;
+                    narrowed |= candidates.indexed;
                     candidates.batches
                 } else {
                     read_whole |= !segment.batches.is_empty();
@@ -35756,9 +35760,11 @@ impl CayenneTableProvider {
                 }
             }
         }
-        let outcome = if read_whole {
+        // As in file mode: `unbuilt` when no batch read was indexed, `empty`
+        // when every batch was and none holds the key, else `selected`.
+        let outcome = if read_whole && !narrowed {
             super::lookup_index::ProbeOutcome::Unbuilt
-        } else if segments.is_empty() {
+        } else if !read_whole && segments.is_empty() {
             super::lookup_index::ProbeOutcome::Empty
         } else {
             super::lookup_index::ProbeOutcome::Selected
@@ -35842,16 +35848,32 @@ impl CayenneTableProvider {
             claim.unpublished();
             return;
         };
+        // A lookup reads the protected snapshots' files too (an upsert's rows
+        // stay there until compaction folds them in), so they are indexed with
+        // the current snapshot's.
+        let protected_map = self.protected_snapshots.load_full();
+        let Ok((_, protected_files)) = self.lookup_index_protected_files(&protected_map).await
+        else {
+            claim.unpublished();
+            return;
+        };
         let view = index_state.published();
+        let mut seen: HashSet<String> = HashSet::new();
         let uncovered: Vec<super::lookup_index::IndexedFile> = files
             .into_iter()
-            .filter(|file| !view.covers(&file.path))
+            .chain(
+                protected_files
+                    .into_iter()
+                    .map(|path| super::lookup_index::IndexedFile { path }),
+            )
+            .filter(|file| !view.covers(&file.path) && seen.insert(file.path.clone()))
             .collect();
         super::lookup_index::spawn_build(claim, store, uncovered, self.lookup_index_list_live());
     }
 
-    /// Lists the table's current warm files under the listing fence, for an
-    /// index build to publish its runs against the files a reader sees then.
+    /// Lists the files a reader sees now under the listing fence, the current
+    /// snapshot's warm files and the protected snapshots', for an index build to
+    /// publish its runs against.
     fn lookup_index_list_live(&self) -> super::lookup_index::ListLive {
         let provider = self.shared_handle();
         Box::new(move || {
@@ -35859,11 +35881,17 @@ impl CayenneTableProvider {
                 let _fence = provider.listing_fence.read().await;
                 let snapshot_id = provider.get_current_snapshot_id();
                 let files = provider.capture_warm_files(&snapshot_id).await.ok()?;
+                let protected_map = provider.protected_snapshots.load_full();
+                let (_, protected_files) = provider
+                    .lookup_index_protected_files(&protected_map)
+                    .await
+                    .ok()?;
                 Some(
                     files
                         .files
                         .iter()
                         .map(|file| file.object_meta.location.to_string())
+                        .chain(protected_files)
                         .collect(),
                 )
             })
