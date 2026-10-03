@@ -15,11 +15,13 @@ name: Verus Verification
 # hit. Prefix-unambiguity of `[tag][id.len() LE][id]` is a Verus postcondition
 # discharged for every `(tag, id, payload)` triple.
 #
-# `crates/key-index/src/escape_proof.rs`: the key encoding is prefix-free per
-# column for every input, so a compound key's concatenated encoding is
-# injective: distinct key tuples never encode to the same bytes. A lookup can
-# still return another key's rows, because a wide key is indexed by a 64-bit
-# hash of those bytes; the query's own filter drops them.
+# `crates/key-index/src/escape_proof.rs`: each column's key encoding is
+# prefix-free for every input, so concatenating a compound key's columns adds
+# no collisions: key tuples whose columns encode differently never encode to
+# the same bytes. Which values one column's encoding tells apart is the
+# encoder's choice (floats give `-0.0` and `0.0`, and every NaN, one encoding
+# each). A lookup can still return another key's rows, because a wide key is
+# indexed by a 64-bit hash of those bytes; the query's own filter drops them.
 #
 # `crates/sharded-cache/src/layout.rs`: both array indices the results cache
 # derives from a key — the shard, and the `TinyLFU` counter cell — subscript
