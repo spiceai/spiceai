@@ -826,13 +826,20 @@ impl Runtime {
             (ds, bootstrap_status)
         };
 
-        if let Some(reason) = Self::waits_for_source_reason(&ds)
-            && crate::dataconnector::sink::recorded_checkpoint_schema(&ds)
-                .await
-                .is_some()
-        {
-            tracing::info!("{}", waits_for_source_message(&ds.name, &reason));
-        }
+        // Why a dataset with an acceleration on disk is not served from it, logged
+        // once when its first attempt fails. Not before: a source that is reached only
+        // when it is read (HTTP, S3) can fail after the dataset is already served
+        // from its acceleration, and then it does not wait.
+        let waits_for_source = parking_lot::Mutex::new(match Self::waits_for_source_reason(&ds) {
+            Some(reason)
+                if crate::dataconnector::sink::recorded_checkpoint_schema(&ds)
+                    .await
+                    .is_some() =>
+            {
+                Some(waits_for_source_message(&ds.name, &reason))
+            }
+            _ => None,
+        });
 
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
@@ -868,10 +875,16 @@ impl Runtime {
             {
                 Ok(()) => Ok(()),
                 Err(err) if runtime.status.is_shutdown() => Err(RetryError::permanent(err)),
-                Err(err) if matches!(err, Error::PermanentDatasetFailure { .. }) => {
-                    Err(RetryError::permanent(err))
+                Err(err) => {
+                    if let Some(message) = waits_for_source.lock().take() {
+                        tracing::info!("{message}");
+                    }
+                    if matches!(err, Error::PermanentDatasetFailure { .. }) {
+                        Err(RetryError::permanent(err))
+                    } else {
+                        Err(RetryError::transient(err))
+                    }
                 }
-                Err(err) => Err(RetryError::transient(err)),
             }
         });
 
