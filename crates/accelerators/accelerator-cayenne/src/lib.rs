@@ -52,7 +52,9 @@ use util::concat_arrays;
 
 use crate::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use data_accelerator_api::FilePathError;
-use data_accelerator_api::snapshots::{download_snapshot, snapshot_bootstrap_enabled};
+use data_accelerator_api::snapshots::{
+    download_snapshot, refuses_datalake_bootstrap, snapshot_bootstrap_enabled,
+};
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
@@ -3786,6 +3788,9 @@ impl DataAccelerator for CayenneAccelerator {
                 Err(cayenne::CatalogError::TableNotFound { .. }) => {}
                 Err(err) => return Err(Box::new(err)),
             }
+            if refuses_datalake_bootstrap(acceleration, source) {
+                return Ok(BootstrapStatus::none());
+            }
             let snapshot_engine = Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
                 catalog,
                 source.name().to_string(),
@@ -5891,6 +5896,62 @@ mod tests {
                 BootstrapStatus::Pending { .. }
             ),
             "an existing shared catalog must not suppress bootstrap of a missing table"
+        );
+    }
+
+    /// A copy restored from a snapshot shares its writer's datalake prefix, and each
+    /// instance's cleanup deletes the other's files, so a dataset with a datalake tier
+    /// loads from its source instead.
+    #[tokio::test]
+    async fn snapshot_bootstrap_skips_a_dataset_with_a_datalake_tier() {
+        use runtime_acceleration::snapshot::SnapshotBehavior;
+        use runtime_secrets::Secrets;
+        use spicepod::component::snapshot::Snapshots;
+        use tokio::sync::RwLock;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let metadata_dir = temp.path().join("metadata");
+        let data_dir = temp.path().join("orders");
+        let snapshots_dir = temp.path().join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir).expect("snapshot directory");
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let acceleration = Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Snapshot),
+            params: HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    data_dir.to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_datalake_location".to_string(),
+                    "s3://lake/orders".to_string(),
+                ),
+            ]),
+            snapshot_behavior: SnapshotBehavior::BootstrapOnly(
+                Arc::new(Snapshots {
+                    enabled: true,
+                    location: Some(format!("file://{}/", snapshots_dir.display())),
+                    ..Default::default()
+                }),
+                Arc::downgrade(&secrets),
+                tokio::runtime::Handle::current(),
+            ),
+            ..Default::default()
+        };
+        let orders = TestAccelerationSource::new("orders").with_acceleration(acceleration);
+        assert_eq!(
+            CayenneAccelerator::new()
+                .init(&orders)
+                .await
+                .expect("prepare missing table"),
+            BootstrapStatus::None,
+            "a dataset with a datalake tier must not be restored from a snapshot"
         );
     }
 

@@ -850,7 +850,8 @@ impl Runtime {
             } else {
                 (ds, bootstrap_status)
             };
-            let bootstrap_status = if matches!(bootstrap_status, BootstrapStatus::Pending { .. })
+            let pending = matches!(bootstrap_status, BootstrapStatus::Pending { .. });
+            let bootstrap_status = if pending
                 && ds.ready_state == crate::component::dataset::ReadyState::OnRegistration
                 && !self.df.table_exists(&ds.name)
             {
@@ -871,7 +872,9 @@ impl Runtime {
             } else {
                 bootstrap_status.complete().await
             };
-            let restored = bootstrap_status.is_bootstrapped();
+            // A restore completed at initialization already updated the cached
+            // timestamps there; only one completed here still needs it.
+            let restored = pending && bootstrap_status.is_bootstrapped();
             if restored {
                 update_cached_dataset_timestamps(ds.as_ref()).await;
             }

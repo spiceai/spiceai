@@ -104,9 +104,10 @@ impl BootstrapStatus {
         else {
             return self;
         };
-        let start = Instant::now();
         let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
         loop {
+            // Times the download that succeeds, not the wait for a snapshot to exist.
+            let start = Instant::now();
             match manager.download_latest_snapshot().await {
                 Ok(Some(info)) => {
                     snapshot::metrics::record_bootstrap_metrics(

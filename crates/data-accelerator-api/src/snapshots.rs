@@ -90,15 +90,25 @@ pub fn should_download_snapshot(
         return false;
     }
 
-    if acceleration.uses_cayenne_datalake() {
-        tracing::warn!(
-            dataset = %source.name(),
-            "Dataset '{}' was not restored from a snapshot, so it loads from its source instead: {CAYENNE_DATALAKE_SNAPSHOT_REASON}",
-            source.name()
-        );
+    !refuses_datalake_bootstrap(acceleration, source)
+}
+
+/// Whether `acceleration` uses a Cayenne datalake tier, which a snapshot cannot restore,
+/// warning that the dataset loads from its source instead. Call it only once a restore
+/// would otherwise happen, so the warning is not logged for a dataset that reopens its
+/// local acceleration.
+pub fn refuses_datalake_bootstrap(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+) -> bool {
+    if !acceleration.uses_cayenne_datalake() {
         return false;
     }
-
+    tracing::warn!(
+        dataset = %source.name(),
+        "Dataset '{}' was not restored from a snapshot, so it loads from its source instead: {CAYENNE_DATALAKE_SNAPSHOT_REASON}",
+        source.name()
+    );
     true
 }
 
