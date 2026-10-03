@@ -53,6 +53,11 @@ enum Command {
         snapshot: Option<String>,
         prefix: String,
     },
+    Get {
+        snapshot: Option<String>,
+        transaction: Option<String>,
+        key: String,
+    },
     Begin {
         name: String,
         snapshot: Option<String>,
@@ -171,6 +176,25 @@ impl Driver {
                 let snapshot = self.snapshot(snapshot.as_deref()).await?;
                 let rows: Vec<_> = snapshot.scan_prefix(&prefix).collect();
                 Ok(json!({"sequence": snapshot.sequence(), "rows": rows}))
+            }
+            Command::Get {
+                snapshot,
+                transaction,
+                key,
+            } => {
+                let value = if let Some(name) = transaction {
+                    if snapshot.is_some() {
+                        return Err("select either transaction or snapshot".into());
+                    }
+                    self.transactions
+                        .get(&name)
+                        .ok_or("unknown transaction")?
+                        .get(&key)
+                        .cloned()
+                } else {
+                    self.snapshot(snapshot.as_deref()).await?.get(&key).cloned()
+                };
+                Ok(json!({"value": value}))
             }
             Command::Begin { name, snapshot } => {
                 let snapshot = self.snapshot(snapshot.as_deref()).await?;

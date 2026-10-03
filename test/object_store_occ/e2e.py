@@ -128,7 +128,7 @@ async def differential(executable, root, artifacts, use_slate, seed, steps):
 
         oracle_dir = root / f"slate-{seed}"
         oracle_dir.mkdir()
-        oracle_store = ObjectStore.resolve(oracle_dir.as_uri() + "/")
+        oracle_store = ObjectStore.resolve(oracle_dir.resolve().as_uri() + "/")
         db = await DbBuilder("oracle", oracle_store).build()
     directory = root / f"differential-{seed}"
     worker = Worker(executable, directory, artifacts, f"history-{seed}-0")
@@ -158,6 +158,12 @@ async def differential(executable, root, artifacts, use_slate, seed, steps):
                 assert own == rows(model, prefix), (seed, step, prefix, "own writes")
                 if tx:
                     assert own == await slate_rows(tx, prefix), (seed, step, prefix, "SlateDB own writes")
+            for key in [keys[step % len(keys)], next(iter(changes)), "absent/key"]:
+                own = worker.request(op="get", transaction="tx", key=key)["value"]
+                assert own == model.get(key), (seed, step, key, "point overlay")
+                if tx:
+                    value = await tx.get(key.encode())
+                    assert own == (list(value) if value is not None else None), (seed, step, key, "SlateDB point overlay")
             receipt = worker.request(op="prepare", name="tx")["receipt"]
             os.fsync(worker.log.fileno())
             result = worker.request(op="commit", name="tx")
@@ -180,7 +186,12 @@ async def differential(executable, root, artifacts, use_slate, seed, steps):
             for name, expected, snapshot in retained:
                 actual = worker.read(snapshot=name)["rows"]
                 assert actual == rows(expected), (seed, step, name, "retained MVCC")
+                key = keys[step % len(keys)]
+                point = worker.request(op="get", snapshot=name, key=key)["value"]
+                assert point == expected.get(key), (seed, step, name, key, "point snapshot")
                 if snapshot:
+                    value = await snapshot.get(key.encode())
+                    assert point == (list(value) if value is not None else None), (seed, step, name, key, "SlateDB point snapshot")
                     assert actual == await slate_rows(snapshot), (seed, step, name, "SlateDB MVCC")
             if step % 31 == 30:
                 retained.clear()
