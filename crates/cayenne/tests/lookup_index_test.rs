@@ -28,8 +28,8 @@ limitations under the License.
 mod common;
 
 use common::lookup_index::{
-    SplitMix64, TableSpec, counters, insert, open_table, overwrite, poll_until, query, rendered,
-    uncovered_files,
+    SplitMix64, TableSpec, counters, explain_total, insert, open_table, overwrite, poll_until,
+    query, rendered,
 };
 
 use std::sync::Arc;
@@ -491,7 +491,7 @@ async fn lookup_index_plan_evidence() {
         .to_string();
     assert!(
         indexed_text.contains("lookup_index=(TenantId, ServiceId)")
-            && indexed_text.contains("lookup_index_outcome=full")
+            && indexed_text.contains("uncovered_files=0")
             && indexed_text.contains("candidate_files=")
             && indexed_text.contains("candidate_rows="),
         "indexed plan did not expose its lookup decision:\n{indexed_text}"
@@ -519,7 +519,7 @@ async fn lookup_index_plan_evidence() {
         .to_string();
     assert!(
         fallback_text.contains("lookup_index=none")
-            && fallback_text.contains("lookup_index_outcome=not_applicable")
+            && !fallback_text.contains("lookup_index_outcome")
             && fallback_text.contains("lookup_index_reason=no_key_pinned"),
         "fallback plan did not explain why the index was skipped:\n{fallback_text}"
     );
@@ -614,8 +614,8 @@ async fn oversized_dynamic_key_sets_fall_back_before_probing() {
 }
 
 /// A hash join's exact runtime key set is batch-probed against the secondary
-/// index after physical planning. The scan-level `lookup_index_outcome` remains
-/// `not_applicable` because no literal existed at `TableProvider::scan` time;
+/// index after physical planning. The scan-level `lookup_index` remains
+/// `none` because no literal existed at `TableProvider::scan` time;
 /// the counter delta proves the later dynamic probe selected row positions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dynamic_filter_batch_probes_the_lookup_index() {
@@ -696,7 +696,7 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
         "the evidence query did not use a dynamically filtered hash join:\n{plan}"
     );
     assert!(
-        plan.contains("lookup_index_outcome=not_applicable"),
+        plan.contains("lookup_index=none"),
         "the index was unexpectedly chosen from static scan filters:\n{plan}"
     );
 
@@ -1130,7 +1130,7 @@ async fn upserted_rows_are_found_through_the_index() {
         .and_then(|digits| digits.parse().ok())
         .expect("the plan reports snapshots_scanned");
     assert!(
-        plan.contains("lookup_index_outcome=full"),
+        !plan.contains("lookup_index=none") && explain_total(&plan, "uncovered_files") == 0,
         "a lookup answered from a protected snapshot must report the selection\n{plan}"
     );
     assert!(
@@ -1194,7 +1194,7 @@ async fn a_background_build_indexes_the_files_of_protected_snapshots() {
             )
             .expect("format plan")
             .to_string();
-            if plan.contains("lookup_index_outcome=full") && uncovered_files(&plan) == 0 {
+            if !plan.contains("lookup_index=none") && explain_total(&plan, "uncovered_files") == 0 {
                 Ok(())
             } else {
                 Err(plan)
@@ -1285,7 +1285,7 @@ async fn in_lists_are_answered_from_the_index() {
         .expect("format plan")
         .to_string();
     assert!(
-        bounded.contains("lookup_index_outcome=not_applicable")
+        bounded.contains("lookup_index=none")
             && bounded.contains("lookup_index_reason=too_many_keys"),
         "a lookup past the key bound did not say why it scanned:\n{bounded}"
     );

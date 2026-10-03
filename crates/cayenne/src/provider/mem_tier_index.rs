@@ -330,10 +330,10 @@ pub(crate) struct SegmentIndex {
 /// The rows of one segment a lookup must read.
 pub(crate) struct Candidates {
     pub(crate) batches: Vec<RecordBatch>,
-    /// Whether any batch was read whole for want of an index.
-    pub(crate) read_whole: bool,
-    /// Whether any batch was narrowed by its index.
-    pub(crate) indexed: bool,
+    /// Batches read whole for want of an index.
+    pub(crate) read_whole: usize,
+    /// Batches narrowed by their index.
+    pub(crate) indexed: usize,
 }
 
 impl SegmentIndex {
@@ -355,8 +355,8 @@ impl SegmentIndex {
     ) -> datafusion_common::Result<Candidates> {
         let mut candidates = Candidates {
             batches: Vec::new(),
-            read_whole: false,
-            indexed: false,
+            read_whole: 0,
+            indexed: 0,
         };
         if probe.hashes.is_empty() {
             return Ok(candidates);
@@ -365,7 +365,7 @@ impl SegmentIndex {
         // else; read the segment whole rather than trust it.
         if self.batches.len() != batches.len() {
             candidates.batches = batches.to_vec();
-            candidates.read_whole = true;
+            candidates.read_whole = batches.len();
             return Ok(candidates);
         }
         for (batch, index) in batches.iter().zip(&self.batches) {
@@ -374,10 +374,10 @@ impl SegmentIndex {
                 .and_then(|index| index.keys.get(probe.position))
             else {
                 candidates.batches.push(batch.clone());
-                candidates.read_whole = true;
+                candidates.read_whole += 1;
                 continue;
             };
-            candidates.indexed = true;
+            candidates.indexed += 1;
             // Distinct hashes hold disjoint rows, so the union needs only
             // sorting back into row order.
             let mut rows: Vec<u32> = probe
@@ -510,7 +510,7 @@ mod tests {
 
         let probe = indexer.probe_key(&pinned(Some(1), "a")).expect("pinned");
         let candidates = index.candidates(&batches, &probe).expect("candidates");
-        assert!(!candidates.read_whole);
+        assert_eq!(candidates.read_whole, 0);
         // Rows 0 and 2 of the first batch and row 0 of the second; the NULL
         // tenant row is not a candidate.
         assert_eq!(payloads(&candidates), vec!["p0", "p0", "p2"]);
@@ -596,7 +596,7 @@ mod tests {
                     ))
                     .expect("both key columns pinned");
                 let candidates = index.candidates(&batches, &probe).expect("candidates");
-                assert!(!candidates.read_whole);
+                assert_eq!(candidates.read_whole, 0);
                 let mut expected: Vec<String> = rows
                     .iter()
                     .enumerate()
@@ -672,7 +672,7 @@ mod tests {
         assert_eq!(pool.reserved(), 0, "a refused batch index reserves nothing");
         let probe = indexer.probe_key(&pinned(Some(1), "a")).expect("pinned");
         let candidates = index.candidates(&batches, &probe).expect("candidates");
-        assert!(candidates.read_whole);
+        assert!(candidates.read_whole > 0);
         assert_eq!(candidates.batches[0].num_rows(), 6);
         assert_eq!(indexer.counters().builds_unpublished, 1);
     }

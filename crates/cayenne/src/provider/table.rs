@@ -35895,23 +35895,25 @@ impl CayenneTableProvider {
             }
         };
         let mut segments = Vec::new();
-        // Whether any batch read was narrowed by its index, and whether any
-        // was read whole because it has none.
-        let mut narrowed = false;
-        let mut read_whole = false;
+        // Batches read narrowed by their index, and batches read whole
+        // because they have none.
+        let mut narrowed = 0_usize;
+        let mut read_whole = 0_usize;
+        let mut candidate_batches = 0_usize;
         let mut candidate_rows = 0u64;
         for shard in shards {
             let deletion_maps = Self::mem_tier_deletion_maps(shard);
             for segment in shard.segments.iter() {
                 let batches = if let Some(index) = &segment.index {
                     let candidates = index.candidates(&segment.batches, &probe)?;
-                    read_whole |= candidates.read_whole;
-                    narrowed |= candidates.indexed;
+                    read_whole += candidates.read_whole;
+                    narrowed += candidates.indexed;
                     candidates.batches
                 } else {
-                    read_whole |= !segment.batches.is_empty();
+                    read_whole += segment.batches.len();
                     segment.batches.to_vec()
                 };
+                candidate_batches += batches.len();
                 let mut visible = Vec::with_capacity(batches.len());
                 for batch in batches {
                     candidate_rows = candidate_rows.saturating_add(batch.num_rows() as u64);
@@ -35942,17 +35944,21 @@ impl CayenneTableProvider {
         // As in file mode, over the batches read: `none` when no batch read
         // was indexed, `partial` when some were and the rest were read whole,
         // else `full`.
-        let coverage = super::lookup_index::Coverage::of(narrowed, read_whole);
+        let coverage = super::lookup_index::Coverage::of(narrowed > 0, read_whole > 0);
         indexer.record(probe.label, coverage, candidate_rows);
         let explain_outcome = super::lookup_index::LookupIndexExplainOutcome::Probed(coverage);
         Ok(Some((
             Some(segments),
-            super::lookup_index::LookupIndexExplain::selection(
-                probe.label.to_string(),
-                explain_outcome,
-                None,
-                candidate_rows,
-            ),
+            super::lookup_index::LookupIndexExplain {
+                candidate_batches: Some(candidate_batches),
+                uncovered_batches: Some(read_whole),
+                ..super::lookup_index::LookupIndexExplain::selection(
+                    probe.label.to_string(),
+                    explain_outcome,
+                    None,
+                    candidate_rows,
+                )
+            },
         )))
     }
 

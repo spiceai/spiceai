@@ -234,10 +234,10 @@ pub fn int64_column(batches: &[RecordBatch]) -> Vec<i64> {
         .collect()
 }
 
-/// The `uncovered_files=` counts a plan reports, summed over every scan that
-/// reports one.
-pub fn uncovered_files(plan: &str) -> usize {
-    plan.split("uncovered_files=")
+/// The `{field}=` counts a plan reports (`candidate_files`,
+/// `uncovered_files`, ...), summed over every scan that reports one.
+pub fn explain_total(plan: &str, field: &str) -> usize {
+    plan.split(&format!(" {field}="))
         .skip(1)
         .filter_map(|rest| {
             rest.split(|c: char| !c.is_ascii_digit())

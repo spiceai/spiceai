@@ -27,8 +27,8 @@ limitations under the License.
 mod common;
 
 use common::lookup_index::{
-    TableSpec, counters, memory_mode_config, open_table, overwrite, poll_until, rendered,
-    runtime_with_pool,
+    TableSpec, counters, explain_total, memory_mode_config, open_table, overwrite, poll_until,
+    rendered, runtime_with_pool,
 };
 
 use std::sync::Arc;
@@ -212,7 +212,7 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     .join("\n");
     assert!(
         explain.contains("lookup_index=(TenantId, ServiceId)")
-            && explain.contains("lookup_index_outcome=full")
+            && explain.contains("uncovered_batches=0")
             && explain.contains("candidate_rows=")
             && !explain.contains("candidate_files="),
         "memory-mode plan did not expose its lookup decision:\n{explain}"
@@ -227,7 +227,7 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     .join("\n");
     assert!(
         fallback.contains("lookup_index=none")
-            && fallback.contains("lookup_index_outcome=not_applicable")
+            && !fallback.contains("lookup_index_outcome")
             && fallback.contains("lookup_index_reason=no_key_pinned"),
         "memory-mode fallback did not explain why the index was skipped:\n{fallback}"
     );
@@ -337,7 +337,7 @@ async fn memory_mode_in_lists_over_a_compound_key_use_the_index() {
             .await
             .join("\n");
         assert!(
-            explain.contains("lookup_index_outcome=full"),
+            !explain.contains("lookup_index=none") && explain.contains("uncovered_batches=0"),
             "{sql} did not plan an index lookup:\n{explain}"
         );
     }
@@ -527,5 +527,20 @@ async fn memory_mode_partly_indexed_lookups_report_partial() {
     assert!(
         end.partial > 0 && end.none == 0,
         "a lookup over partly indexed rows is partial, not none: {end:?}"
+    );
+    // `EXPLAIN` shows it as counts: some batches read are uncovered, not all.
+    let explain = query(
+        &indexed,
+        "indexed",
+        &format!("EXPLAIN {}", unique_lookup(1_931).replace("{t}", "indexed")),
+    )
+    .await
+    .join("\n");
+    let uncovered = explain_total(&explain, "uncovered_batches");
+    assert!(
+        explain.contains("lookup_index=(TenantId, ServiceId)")
+            && uncovered > 0
+            && uncovered < explain_total(&explain, "candidate_batches"),
+        "a partly indexed lookup must name its index and count the batches read in full:\n{explain}"
     );
 }

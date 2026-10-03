@@ -24,7 +24,7 @@ limitations under the License.
 mod common;
 
 use common::lookup_index::{
-    TableSpec, int64_column, open_table, overwrite, query, runtime_with_pool, uncovered_files,
+    TableSpec, explain_total, int64_column, open_table, overwrite, query, runtime_with_pool,
 };
 
 use std::sync::Arc;
@@ -310,7 +310,8 @@ async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
             .expect("format plan")
             .to_string();
         assert!(
-            plan.contains("lookup_index_outcome=partial") && uncovered_files(&plan) > 0,
+            plan.contains("lookup_index=(TenantId, ServiceId)")
+                && explain_total(&plan, "uncovered_files") > 0,
             "a key in {what} must be partly covered, reading the unindexed file in full:\n{plan}"
         );
         let found = int64_column(&query(&table, PARTIAL_TABLE, &sql).await);

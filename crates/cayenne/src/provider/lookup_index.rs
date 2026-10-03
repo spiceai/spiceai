@@ -129,9 +129,9 @@ const MERGE_ABOVE_RUNS: usize = 8;
 /// Name of the file-local row position column the read-back build projects.
 const READ_BACK_POSITION_COLUMN: &str = "__cayenne_lookup_row_idx";
 
-/// How much of what a lookup reads its index covers: the `coverage` dimension
-/// on `cayenne_lookup_index_probe_total` and `lookup_index_outcome` in
-/// `EXPLAIN`. The counts beside it say how much that is.
+/// How much of what a lookup reads its index covers. `EXPLAIN` shows it as
+/// counts (`uncovered_files` of `candidate_files`, or the batch counterparts
+/// in memory mode); the table's counters keep it per lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Coverage {
     /// No file (in memory mode, no batch) the lookup reads is indexed yet, so
@@ -145,14 +145,6 @@ pub(crate) enum Coverage {
 }
 
 impl Coverage {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unindexed => "none",
-            Self::Partial => "partial",
-            Self::Full => "full",
-        }
-    }
-
     /// The coverage of a read that included indexed parts (`indexed`) and
     /// unindexed ones (`unindexed`). A read of nothing is fully covered.
     pub(crate) const fn of(indexed: bool, unindexed: bool) -> Self {
@@ -164,26 +156,18 @@ impl Coverage {
     }
 }
 
-/// The lookup-index decision shown on `CayenneAccelerationExec` in `EXPLAIN`.
-/// `NotApplicable` is a planning decision, not a probe, so it is never counted
-/// as one.
+/// Whether an index served a lookup, and how much of what it read the index
+/// covered. `EXPLAIN` names the index only when it served the lookup
+/// ([`LookupIndexExplain::served_by`]). `NotApplicable` is a planning
+/// decision, not a probe, so it is never counted as one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LookupIndexExplainOutcome {
     NotApplicable,
     Probed(Coverage),
 }
 
-impl LookupIndexExplainOutcome {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotApplicable => "not_applicable",
-            Self::Probed(coverage) => coverage.as_str(),
-        }
-    }
-}
-
 /// Why a lookup on an indexed table scanned instead of using its index,
-/// reported in `EXPLAIN` beside `lookup_index_outcome=not_applicable`.
+/// reported in `EXPLAIN` beside `lookup_index=none`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LookupIndexScanReason {
     /// The filters give no indexed key a value for every one of its columns:
@@ -215,12 +199,17 @@ pub(crate) struct LookupIndexExplain {
     pub(crate) outcome: LookupIndexExplainOutcome,
     pub(crate) candidate_files: Option<usize>,
     /// Files the scan reads in full because no run covers them yet, which are
-    /// part of `candidate_files`: all of them on `none`, `0` on `full`.
+    /// part of `candidate_files`: all of them when the index covers none of
+    /// what the lookup reads, `0` when it covers all of it.
     pub(crate) uncovered_files: Option<usize>,
     /// Files the index answered for (file mode): read at their candidate
     /// rows, or skipped because none holds the key. Not shown in `EXPLAIN`;
     /// with `uncovered_files` it decides the coverage of a merged decision.
     pub(crate) indexed_files: Option<usize>,
+    /// Memory mode's counterparts of `candidate_files` and `uncovered_files`,
+    /// over the in-memory batches a lookup reads.
+    pub(crate) candidate_batches: Option<usize>,
+    pub(crate) uncovered_batches: Option<usize>,
     pub(crate) candidate_rows: Option<u64>,
     /// Why the lookup scanned, when an indexed table's lookup did.
     pub(crate) reason: Option<LookupIndexScanReason>,
@@ -262,8 +251,19 @@ impl LookupIndexExplain {
             candidate_files: sum_files,
             uncovered_files: sum_uncovered,
             indexed_files: sum_indexed,
+            candidate_batches: sum(self.candidate_batches, other.candidate_batches),
+            uncovered_batches: sum(self.uncovered_batches, other.uncovered_batches),
             candidate_rows: sum_rows,
             reason,
+        }
+    }
+
+    /// The key whose index served the lookup, or `None` when no index did:
+    /// none matched, or the one that matched declined (see `reason`).
+    pub(crate) fn served_by(&self) -> Option<&str> {
+        match self.outcome {
+            LookupIndexExplainOutcome::Probed(_) => self.shape.as_deref(),
+            LookupIndexExplainOutcome::NotApplicable => None,
         }
     }
 
@@ -274,6 +274,8 @@ impl LookupIndexExplain {
             candidate_files: None,
             uncovered_files: None,
             indexed_files: None,
+            candidate_batches: None,
+            uncovered_batches: None,
             candidate_rows: None,
             reason: None,
         }
@@ -299,6 +301,8 @@ impl LookupIndexExplain {
             candidate_files,
             uncovered_files: None,
             indexed_files: None,
+            candidate_batches: None,
+            uncovered_batches: None,
             candidate_rows: Some(candidate_rows),
             reason: None,
         }
@@ -776,6 +780,8 @@ impl LookupSelection {
             candidate_files: Some(candidate_files),
             uncovered_files: Some(uncovered),
             indexed_files: Some(covered),
+            candidate_batches: None,
+            uncovered_batches: None,
             candidate_rows,
             reason: None,
         };
@@ -2364,7 +2370,7 @@ impl vortex_datafusion::VortexWriteObserver for RunObserver {
 /// measured in `spiced`.
 const DEFER_FINISH_ROWS: usize = 1 << 20;
 
-/// Counts one probe's coverage and reports it on
+/// Counts one probe's coverage, and reports the probe on
 /// `cayenne_lookup_index_probe_total`.
 pub(crate) fn record_probe_outcome(
     table_name: &str,
@@ -2376,7 +2382,6 @@ pub(crate) fn record_probe_outcome(
     telemetry::cayenne::track_lookup_index_probe(&[
         telemetry::KeyValue::new("table", table_name.to_string()),
         telemetry::KeyValue::new("shape", shape.to_string()),
-        telemetry::KeyValue::new("coverage", coverage.as_str()),
     ]);
 }
 
