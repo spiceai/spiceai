@@ -123,7 +123,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `76655d2ffc1b1e4dfc886de561759b70ead48b96` | `spiceai-1.4.4` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
-| [iceberg-rust](#iceberg-rust) | `351d1bc7b6ac9a835397e248e9c687f305e947d1` | `spiceai-0.10.1-df-54` |
+| [iceberg-rust](#iceberg-rust) | `5375ae3a52a97b22333f48072eab78f2d07d764a` | `lukim/table-provider-accessors` (TEMPORARY: spiceai/iceberg-rust#49) |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
@@ -442,6 +442,7 @@ Upstream [apache/iceberg-rust](https://github.com/apache/iceberg-rust), branch
 | Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | `crates/data_components/src/iceberg/provider.rs::a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one` |
 | Parallel file scanning with eager task bucketing (fork PR #43) | Iceberg scans lose file-level parallelism | silent (perf) | **GAP** |
 | `IcebergTableProvider::try_new` made public | No construction path from Spice | build | compile-guarded by `crates/data_components/src/iceberg/provider.rs`, which calls it |
+| `IcebergTableProvider::catalog` and `::table_ident` exposed (fork PR #49) | The Iceberg REST `loadTable` cannot load the table a provider reads, so no table can be served to an Iceberg client as itself | build | compile-guarded by `crates/runtime/src/http/v1/iceberg/passthrough.rs`, which calls both; what is served is guarded by `…::tests::an_iceberg_table_read_unchanged_is_served_as_itself` |
 | Extended file metadata (`FileIO::lister`, `FileMetadata::mode`) — **carries no code** | Nothing. Recorded so the next audit does not go looking: upstream moved opendal out of the core crate, and re-adding a `Lister` and an `EntryMode` there would put the dependency back and break every `Storage` impl. Spice reaches neither — its Hadoop catalog uses its own opendal `Operator::lister()` — so the commit on the branch is a README whitespace change kept for provenance | none | not applicable |
 
 ## async-openai

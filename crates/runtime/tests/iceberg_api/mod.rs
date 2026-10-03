@@ -38,8 +38,12 @@ pub fn get_s3_dictionary_dataset(name: &str) -> Dataset {
     )
 }
 
+/// A dataset that does not read from an Iceberg table cannot be handed to an
+/// Iceberg client as one: `loadTable` refuses it with the reason and the fix,
+/// rather than describing it with metadata the client would read as an empty
+/// table.
 #[tokio::test]
-async fn test_iceberg_api_get_table_schema() -> Result<(), anyhow::Error> {
+async fn test_iceberg_api_refuses_a_table_that_is_not_iceberg() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -48,7 +52,7 @@ async fn test_iceberg_api_get_table_schema() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let span = tracing::info_span!("test_iceberg_api_get_table_schema");
+            let span = tracing::info_span!("test_iceberg_api_refuses_a_table_that_is_not_iceberg");
             let _span_guard = span.enter();
 
             let mut rng = rand::rng();
@@ -96,7 +100,6 @@ async fn test_iceberg_api_get_table_schema() -> Result<(), anyhow::Error> {
             })
             .await;
 
-            // Get the table schema
             let http_url =
                 format!("http://127.0.0.1:{http_port}/v1/namespaces/spice%1Fpublic/tables/dictionary_example");
             let response = http_client
@@ -104,16 +107,27 @@ async fn test_iceberg_api_get_table_schema() -> Result<(), anyhow::Error> {
                 .send()
                 .await
                 .expect("valid response");
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            let body = serde_json::from_str::<serde_json::Value>(&response.text().await?)?;
+            assert_eq!(body["error"]["type"], "BadRequestException");
+            assert_eq!(body["error"]["code"], 400);
+            let message = body["error"]["message"].as_str().expect("the error has a message");
             assert!(
-                response.status().is_success(),
-                "HTTP health check failed: {}",
-                response.status()
+                message.starts_with(
+                    "Failed to load table 'spice.public.dictionary_example' as an Iceberg table: it does not read from an Iceberg table"
+                ),
+                "{message}"
             );
-            let dictionary_example_snapshot = response.text().await?;
-            let dictionary_example_snapshot = serde_json::from_str::<serde_json::Value>(&dictionary_example_snapshot)?;
-            assert_eq!(dictionary_example_snapshot["metadata"]["location"], "spice.ai/spice.public.dictionary_example");
-            let schemas = dictionary_example_snapshot["metadata"]["schemas"].as_array().expect("schemas is an array");
-            insta::assert_json_snapshot!(schemas);
+            assert!(message.contains("Query it with SQL through Spice instead"), "{message}");
+
+            let missing = http_client
+                .get(format!("http://127.0.0.1:{http_port}/v1/namespaces/spice%1Fpublic/tables/missing"))
+                .send()
+                .await
+                .expect("valid response");
+            assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+            let body = serde_json::from_str::<serde_json::Value>(&missing.text().await?)?;
+            assert_eq!(body["error"]["type"], "NoSuchTableException");
 
             Ok(())
         })
