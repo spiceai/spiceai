@@ -212,8 +212,13 @@ impl Fixture {
         let mut table = builder.build().await.expect("accelerated table");
         // Keep write-side scans out of the read-plan counter. The channel still
         // exercises real enqueueing and the in-flight claim stays held by it.
-        for handler in table.handlers.drain(..) {
+        // Every handler is aborted before any is awaited: an await yields to the
+        // scheduler, which would otherwise run a handler not yet aborted, such as
+        // the eviction sweep that scans the accelerator on its first tick.
+        for handler in &table.handlers {
             handler.abort();
+        }
+        for handler in table.handlers.drain(..) {
             let _ = handler.await;
         }
         let (tx, rx) = caching::create_cache_write_channel();
