@@ -3845,12 +3845,39 @@ impl SnapshotManager {
             {
                 return Err(not_found());
             }
+            // Already current: nothing to write. This also recognizes an earlier attempt
+            // whose write landed but whose response was lost.
+            if dataset_entry.current_snapshot_id == Some(snapshot_id) {
+                return Ok(None);
+            }
             dataset_entry.current_snapshot_id = Some(snapshot_id);
             metadata.last_updated_ms = Utc::now().timestamp_millis();
             Ok(Some(metadata))
         };
 
-        self.update_metadata(select).await.map_err(|err| match err {
+        let err = match self.update_metadata(select).await {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        // The last attempt's write may have landed with its response lost, whether the
+        // loop ran out of conflict attempts or of network retries. Read once more before
+        // reporting a selection that is in place as failed.
+        if matches!(
+            err,
+            MetadataUpdateError::Contention { .. }
+                | MetadataUpdateError::Write(ConditionalWriteError::Store { .. })
+        ) && let Ok(Some(handle)) = self.load_metadata().await
+            && handle
+                .metadata
+                .datasets
+                .get(&self.dataset_name)
+                .is_some_and(|dataset| dataset.current_snapshot_id == Some(snapshot_id))
+        {
+            return Ok(());
+        }
+
+        Err(match err {
             MetadataUpdateError::Load(err) => err.into(),
             MetadataUpdateError::Update(err) => err,
             MetadataUpdateError::Serialize(err) => write_error(err.to_string()),
@@ -5699,6 +5726,108 @@ mod tests {
             .expect("snapshot created");
         let entries = dataset_entries(store.inner.as_ref(), &metadata_path).await;
         assert_eq!(entries.len(), 1, "recorded exactly once: {entries:?}");
+    }
+
+    /// `metadata.json` listing snapshots 100 and 200 of the dataset, with 200 current.
+    fn metadata_with_two_snapshots() -> SnapshotMetadata {
+        let entry = |snapshot_id: u64| SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: 1_704_153_600_000,
+            snapshot: format!("snapshots/snapshot{snapshot_id}.db"),
+            snapshot_checksum: "abc123".to_string(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 1024,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+        let dataset = DatasetMetadata {
+            name: DATASET_NAME.to_string(),
+            snapshots: vec![entry(100), entry(200)],
+            current_snapshot_id: Some(200),
+            ..DatasetMetadata::default()
+        };
+        SnapshotMetadata {
+            datasets: HashMap::from([(DATASET_NAME.to_string(), dataset)]),
+            ..SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0)
+        }
+    }
+
+    async fn current_snapshot_id(store: &dyn ObjectStore, metadata_path: &Path) -> Option<u64> {
+        let bytes = store
+            .get(metadata_path)
+            .await
+            .expect("metadata stored")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let metadata: SnapshotMetadata = serde_json::from_slice(&bytes).expect("parse metadata");
+        metadata
+            .datasets
+            .get(DATASET_NAME)
+            .and_then(|dataset| dataset.current_snapshot_id)
+    }
+
+    /// A selection whose write landed but reported a conflict (a retry after a lost
+    /// response) finds the snapshot already current on the next read, so it writes
+    /// nothing more and succeeds instead of spending the conflict budget.
+    #[tokio::test]
+    async fn a_selection_whose_write_landed_is_not_written_again() {
+        let store = Arc::new(ScriptedStore::new(Script::ConflictOnMetadata {
+            landing_write: Some(1),
+        }));
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        write_metadata(&store.inner, &metadata_path, &metadata_with_two_snapshots()).await;
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            dir.path().join("accelerated.db"),
+            &schema,
+        );
+
+        manager
+            .set_current_snapshot(100)
+            .await
+            .expect("the landed selection is reported as selected");
+        assert_eq!(
+            current_snapshot_id(store.inner.as_ref(), &metadata_path).await,
+            Some(100)
+        );
+        assert_eq!(
+            store
+                .scripted_writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the selection is written once"
+        );
+    }
+
+    /// The last attempt's selection lands but reports a conflict; the selection reads
+    /// once more and succeeds instead of reporting a selection that is in place as failed.
+    #[tokio::test]
+    async fn a_last_selection_attempt_that_landed_is_not_reported_as_failed() {
+        let store = Arc::new(ScriptedStore::new(Script::ConflictOnMetadata {
+            landing_write: Some(test_conflict_retry().max_attempts),
+        }));
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        write_metadata(&store.inner, &metadata_path, &metadata_with_two_snapshots()).await;
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            dir.path().join("accelerated.db"),
+            &schema,
+        );
+
+        manager
+            .set_current_snapshot(100)
+            .await
+            .expect("the landed selection is reported as selected");
+        assert_eq!(
+            current_snapshot_id(store.inner.as_ref(), &metadata_path).await,
+            Some(100)
+        );
     }
 
     /// An invalid S3 parameter is an error: falling back to the defaults would also drop
