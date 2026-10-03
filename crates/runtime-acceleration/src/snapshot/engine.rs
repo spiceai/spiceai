@@ -30,6 +30,14 @@ pub use duckdb::DuckDBSnapshotEngine;
 mod sqlite;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteSnapshotEngine;
+#[cfg(feature = "sqlite")]
+pub(crate) use sqlite::begin_sqlite_restore;
+#[cfg(feature = "sqlite")]
+pub(crate) use sqlite::record_sqlite_restore_aside;
+#[cfg(feature = "sqlite")]
+pub use sqlite::recover_interrupted_sqlite_restore;
+#[cfg(feature = "sqlite")]
+pub use sqlite::wait_for_sqlite_restore;
 
 #[cfg(feature = "turso")]
 mod turso;
@@ -39,8 +47,12 @@ pub use turso::TursoSnapshotEngine;
 #[derive(Debug, Snafu)]
 pub enum SnapshotEngineError {
     #[snafu(display("DuckDB snapshot error: {source}"))]
+    /// Boxed: the checkpoint variants carry a dataset, a path and a `duckdb::Error`,
+    /// which would otherwise make every `Result<_, SnapshotEngineError>` carry them too.
     #[cfg(feature = "duckdb")]
-    DuckDB { source: duckdb::DuckDBSnapshotError },
+    DuckDB {
+        source: Box<duckdb::DuckDBSnapshotError>,
+    },
 
     #[snafu(display("SQLite snapshot error: {source}"))]
     #[cfg(feature = "sqlite")]
@@ -79,21 +91,24 @@ impl SnapshotEngineError {
 #[async_trait]
 pub trait SnapshotEngine: Send + Sync {
     /// Hook invoked on the **live** accelerator file *before* it is copied to a
-    /// temporary snapshot location. Engines that buffer writes outside the
-    /// primary file (e.g. `SQLite`/`Turso`/`DuckDB` WAL) should checkpoint here so
-    /// that the subsequent `fs::copy` produces a self-contained file.
+    /// temporary snapshot location. An engine that buffers writes outside the
+    /// primary file — `DuckDB`, `SQLite` and `Turso` all keep a write-ahead log —
+    /// must checkpoint here so that the subsequent `fs::copy` produces a
+    /// self-contained file. An engine with nothing to flush returns `Ok(())`.
     ///
-    /// Default implementation is a no-op.
+    /// **Deliberately has no default.** A no-op default is invisible to an engine that
+    /// needed to override it: `DuckDB` inherited one for as long as it existed and
+    /// shipped snapshots missing every write still in its log (#13912).
     ///
     /// The caller holds the accelerator's write lock for the duration of this
-    /// call, so no concurrent writes are in flight.
+    /// call, so no concurrent writes are in flight. Only the file-layout snapshot
+    /// path invokes it; a directory-layout engine captures its own state through
+    /// [`SnapshotEngine::prepare_directory_snapshot`] instead.
     async fn checkpoint_live(
         &self,
-        _live_path: &Path,
-        _dataset_name: &str,
-    ) -> Result<(), SnapshotEngineError> {
-        Ok(())
-    }
+        live_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError>;
 
     /// Prepares a snapshot file for upload.
     /// For engines that support compaction (e.g., `DuckDB`), this may compact the file.
@@ -161,6 +176,67 @@ pub trait SnapshotEngine: Send + Sync {
         Ok(())
     }
 
+    /// Hook invoked by `SnapshotManager` right before a downloaded single-file
+    /// snapshot is renamed over the accelerator's file.
+    ///
+    /// Engines that keep state beside the primary file must move it out of the
+    /// way here: a connection that opens the path once the restored file is in
+    /// place would otherwise pair it with the *replaced* file's state. `SQLite`
+    /// in WAL mode is the case: the old database's `-wal` and `-shm` would stay
+    /// beside the restored file, and a connection opening it applies that stale
+    /// write-ahead log, losing the restored rows for good. Removing them only
+    /// after the rename leaves a window for exactly that connection.
+    ///
+    /// The move has to be reversible. When the rename does not replace the live
+    /// file, `SnapshotManager` calls [`Self::abort_file_restore`] so the engine
+    /// can put that state back. Deleting it instead leaves the live database
+    /// damaged for every connection that opens it afterwards.
+    ///
+    /// Default implementation is a no-op. An engine that moves state aside must
+    /// override [`Self::abort_file_restore`] too, and a wrapper must forward both.
+    async fn prepare_file_restore(
+        &self,
+        live_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        let _ = (live_path, dataset_name);
+        Ok(())
+    }
+
+    /// Puts back whatever [`Self::prepare_file_restore`] moved aside, when the
+    /// rename that was about to replace the live file did not do so.
+    ///
+    /// Calling this after that rename has succeeded reattaches the replaced
+    /// file's state to the restored file. `SnapshotManager` calls it only on
+    /// the paths that leave the original file in place.
+    ///
+    /// Default implementation is a no-op. A wrapper must forward it: an inner
+    /// engine may have parked state the default would leave where it is.
+    async fn abort_file_restore(
+        &self,
+        live_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        let _ = (live_path, dataset_name);
+        Ok(())
+    }
+
+    /// Hook invoked by `SnapshotManager` right after a downloaded single-file
+    /// snapshot has been renamed over the accelerator's file.
+    ///
+    /// Engines remove what a connection to the replaced file created beside
+    /// the primary file after [`Self::prepare_file_restore`] ran.
+    ///
+    /// Default implementation is a no-op.
+    async fn finalize_file_snapshot(
+        &self,
+        restored_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        let _ = (restored_path, dataset_name);
+        Ok(())
+    }
+
     /// Hook invoked by `SnapshotManager` *after* extracting a directory-layout
     /// snapshot. Allows engines to perform engine-specific post-processing
     /// (e.g. import a metastore slice that was written into one of the
@@ -214,6 +290,16 @@ pub struct DefaultSnapshotEngine;
 
 #[async_trait]
 impl SnapshotEngine for DefaultSnapshotEngine {
+    /// Nothing to flush: this engine is the fallback for accelerators that do not
+    /// buffer writes outside the file the snapshot copies.
+    async fn checkpoint_live(
+        &self,
+        _live_path: &Path,
+        _dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        Ok(())
+    }
+
     async fn prepare_for_upload(
         &self,
         source_path: &Path,

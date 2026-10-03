@@ -56,6 +56,11 @@
 #                     setup, and again inside the run. Below it a remote run
 #                     stops immediately as an infrastructure failure; a local
 #                     run only warns.
+#   SIGNOFF_STEP_BUDGET_MINUTES  The `Sign off` step's own `timeout-minutes`,
+#                     threaded in by signoff.yml so the script can see its
+#                     deadline. A run whose checks end within
+#                     SIGNOFF_STEP_BUDGET_GRACE_SECONDS (default: 120) of it is
+#                     classified as signalled and publishes no verdict (#13843).
 #
 # Targeted pre-lint always diffs against trunk (not configurable).
 # When the branch has no Rust-affecting changes vs trunk (.rs, Cargo.toml,
@@ -1239,6 +1244,54 @@ disk_is_critical() {
 # without signalling anything.
 SIGNOFF_SIGNALLED="${SIGNOFF_SIGNALLED:-}"
 
+# The `Sign off` step's own budget, as signoff.yml declares it in
+# `timeout-minutes`, and the grace below it within which a run is taken to have
+# expired rather than failed.
+#
+# A budget expiry is never delivered to this script as a signal. The runner
+# declares the step timed out, runs the post-job steps, and only then reaps
+# the leftover process tree — `rustc` or `cargo-nextest` first and this script's
+# own shell last — so `make` returns a small status that reads exactly like a
+# failing recipe, the handler above never fires, and classification falls
+# through to "checks": `signoff=failure` about a build that was still
+# compiling, posted 6–27 s after the workflow's "Resolve an incomplete sign-off"
+# step had already restated the honest `pending` (#13843). Knowing the deadline
+# is what lets failure_kind see the expiry the runner never signalled.
+#
+# The grace absorbs two offsets, both measured on the pool: this script's clock
+# starts a few seconds into the step, and the kill lands a few seconds past the
+# budget, so the elapsed a dying run reports sits 10 s either side of the
+# budget (21170–21225 s against 21180). A genuine failure inside the grace is
+# classified as expired and publishes nothing — the `pending` the run posted on
+# its way in stands, and the author signs off again — which is the cheap
+# direction to be wrong in: that run was within two minutes of being killed
+# regardless, while the other direction is a false `failure` that disqualifies
+# the commit.
+#
+# Unset on a local run, where no budget applies, so the check is inert there.
+SIGNOFF_STEP_BUDGET_MINUTES="${SIGNOFF_STEP_BUDGET_MINUTES:-}"
+SIGNOFF_STEP_BUDGET_GRACE_SECONDS="${SIGNOFF_STEP_BUDGET_GRACE_SECONDS:-120}"
+
+# True when `elapsed` seconds of checks reach the step budget less its grace.
+# False, and inert, when no budget is configured; false, saying so on the debug
+# channel the remote run keeps on, when the budget or the grace is not a whole
+# number, because a malformed value must not turn every failure into an
+# expiry. Each value is bounded to seven decimal
+# digits and read in base 10: bash's arithmetic reads a leading zero as octal
+# (`0353` is 235, a budget that expires two hours early) and wraps a value past
+# 2^63 negative (every failure an expiry), and `^[0-9]+$` admits both.
+budget_expired() {
+  local elapsed="${1:-}"
+  [[ -n "$SIGNOFF_STEP_BUDGET_MINUTES" ]] || return 1
+  if [[ ! "$SIGNOFF_STEP_BUDGET_MINUTES" =~ ^[0-9]{1,7}$ ]] \
+    || [[ ! "$SIGNOFF_STEP_BUDGET_GRACE_SECONDS" =~ ^[0-9]{1,7}$ ]]; then
+    debug "ignoring SIGNOFF_STEP_BUDGET_MINUTES='${SIGNOFF_STEP_BUDGET_MINUTES}' and SIGNOFF_STEP_BUDGET_GRACE_SECONDS='${SIGNOFF_STEP_BUDGET_GRACE_SECONDS}' — each must be a whole number of at most seven digits, so a run that reaches its budget is classified by its exit status alone"
+    return 1
+  fi
+  [[ "$elapsed" =~ ^[0-9]{1,7}$ ]] || return 1
+  (( 10#$elapsed + 10#$SIGNOFF_STEP_BUDGET_GRACE_SECONDS >= 10#$SIGNOFF_STEP_BUDGET_MINUTES * 60 ))
+}
+
 # Record that this run was signalled, for failure_kind to read once the `make`
 # it was waiting on returns.
 #
@@ -1275,7 +1328,7 @@ watch_for_signals() {
 # one whose watcher died before it could read anything — which is why it is not
 # the only signal.
 failure_kind() {
-  local check_status="$1"
+  local check_status="$1" elapsed="${2:-}"
 
   # First, because it is the one kind that says the checks reached no verdict
   # rather than which verdict they reached. The two disk signals below both
@@ -1283,14 +1336,18 @@ failure_kind() {
   # a build that printed ENOSPC and died. Neither can coexist with a status that
   # says make itself was killed.
   #
-  # Two readings, because either one alone misses a case. The status covers a
+  # Three readings, because any one alone misses a case. The status covers a
   # make that died of the signal, including on a local run with no handler
   # armed; the recorded signal covers a make that handled it and returned a
   # small status of its own, which is indistinguishable from a failing recipe by
-  # status alone (#12710). Note the recorded signal is checked even against
-  # EXIT_DISK_EXHAUSTED below: a run signalled during the preflight reached no
-  # verdict either, and "no verdict" outranks naming a cause.
-  if [[ -n "$SIGNOFF_SIGNALLED" ]] || [[ "$check_status" -ge "$EXIT_SIGNAL_BASE" ]]; then
+  # status alone (#12710); the clock covers a step budget that expired, which
+  # neither of the other two can see because the runner reaps `make` without
+  # signalling this script (#13843, see budget_expired). Note the recorded
+  # signal and the clock are checked even against EXIT_DISK_EXHAUSTED below: a
+  # run signalled during the preflight reached no verdict either, and "no
+  # verdict" outranks naming a cause.
+  if [[ -n "$SIGNOFF_SIGNALLED" ]] || [[ "$check_status" -ge "$EXIT_SIGNAL_BASE" ]] \
+    || budget_expired "$elapsed"; then
     echo "signalled"
     return
   fi
@@ -1379,7 +1436,7 @@ SIGNOFF_FAILURE_MESSAGE=""
 describe_check_failure() {
   local check_status="$1" elapsed="$2" user="$3"
 
-  case "$(failure_kind "$check_status")" in
+  case "$(failure_kind "$check_status" "$elapsed")" in
     signalled)
       # Publish nothing. Nothing judged this branch — the process tree was
       # signalled — so the status this run left on its way in is still the most

@@ -162,6 +162,8 @@ mod plan_capture;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;
+#[cfg(any(feature = "mongodb", feature = "dynamodb", feature = "cosmosdb"))]
+mod pushdown_roundtrip;
 #[cfg(feature = "rate-control")]
 mod rate_control;
 mod ready_state;
@@ -185,10 +187,14 @@ mod schema_evolution;
 mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
+// Cayenne does not build on Windows.
+#[cfg(all(feature = "snapshots", feature = "duckdb", not(windows)))]
+mod snapshot_source;
 #[cfg(feature = "snowflake")]
 mod snowflake;
 #[cfg(feature = "snowflake")]
 mod snowflake_catalog;
+mod source_unavailable;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;

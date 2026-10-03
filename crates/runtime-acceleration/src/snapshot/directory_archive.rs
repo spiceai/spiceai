@@ -1149,9 +1149,17 @@ fn add_directory_to_archive_filtered<W: std::io::Write>(
         skip_relative_paths: &HashSet<PathBuf>,
         members: &mut HashSet<String>,
     ) -> std::io::Result<()> {
+        // Name the entry in the error: the root alone does not say which
+        // entry changed under the walk.
+        let at = |path: &std::path::Path| {
+            let path = path.to_path_buf();
+            move |err: std::io::Error| {
+                std::io::Error::new(err.kind(), format!("{}: {err}", path.display()))
+            }
+        };
         if dir.is_dir() {
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
+            for entry in fs::read_dir(dir).map_err(at(dir))? {
+                let entry = entry.map_err(at(dir))?;
                 let path = entry.path();
                 let relative_path = path.strip_prefix(base_path).map_err(|_| {
                     std::io::Error::other(format!("Failed to strip prefix from {}", path.display()))
@@ -1171,7 +1179,7 @@ fn add_directory_to_archive_filtered<W: std::io::Write>(
                     PathBuf::from(archive_prefix).join(relative_path)
                 };
 
-                let metadata = fs::symlink_metadata(&path)?;
+                let metadata = fs::symlink_metadata(&path).map_err(at(&path))?;
                 if metadata.file_type().is_symlink() {
                     tracing::debug!(
                         "Skipping symbolic link during archive creation: {}",
@@ -1190,7 +1198,9 @@ fn add_directory_to_archive_filtered<W: std::io::Write>(
                         members,
                     )?;
                 } else if metadata.is_file() {
-                    archive.append_path_with_name(&path, &archive_path)?;
+                    archive
+                        .append_path_with_name(&path, &archive_path)
+                        .map_err(at(&path))?;
                     members.insert(archive_path.to_string_lossy().into_owned());
                 }
             }

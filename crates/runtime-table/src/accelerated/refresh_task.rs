@@ -1730,6 +1730,9 @@ impl RefreshTask {
                 cpu_runtime_handle,
                 request_context,
                 span,
+                // The scan computes the dataset's indexes as it reads, so it must not start
+                // before the sink has opened their write window (#14619).
+                managed_runtime::StreamStart::OnFirstPoll,
                 async move {
                     // Create ctx inside the managed runtime to avoid creating it twice
                     let mut ctx = Self::create_refresh_df_context(

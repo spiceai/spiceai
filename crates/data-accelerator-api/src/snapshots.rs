@@ -26,7 +26,9 @@ limitations under the License.
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use runtime_acceleration::BootstrapStatus;
-use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
+use runtime_acceleration::acceleration::{
+    Acceleration, CAYENNE_DATALAKE_SNAPSHOT_REASON, Mode, RefreshMode,
+};
 use runtime_acceleration::acceleration_source::{
     AccelerationSource, DefinitionMatch, MaterializationSource, SourceDefinition,
 };
@@ -106,6 +108,15 @@ pub fn should_download_snapshot(
                 || "the configured location".to_string(),
                 |p| p.display().to_string()
             )
+        );
+        return false;
+    }
+
+    if acceleration.uses_cayenne_datalake() {
+        tracing::warn!(
+            dataset = %source.name(),
+            "Dataset '{}' was not restored from a snapshot, so it loads from its source instead: {CAYENNE_DATALAKE_SNAPSHOT_REASON}",
+            source.name()
         );
         return false;
     }
@@ -277,6 +288,15 @@ pub async fn snapshot_before_recreate(
         tracing::warn!(
             dataset = %dataset_name,
             "Skipping the pre-recreation snapshot: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
+        );
+        return;
+    }
+
+    // `build_snapshot_creation_config` applies the same gate to the periodic publish path.
+    if acceleration.uses_cayenne_datalake() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "Skipping the pre-recreation snapshot of dataset '{dataset_name}': {CAYENNE_DATALAKE_SNAPSHOT_REASON}"
         );
         return;
     }

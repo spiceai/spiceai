@@ -29,6 +29,29 @@ use super::SnapshotEngine;
 
 #[derive(Debug, Snafu)]
 pub enum DuckDBSnapshotError {
+    #[snafu(display(
+        "Failed to snapshot dataset '{dataset}' (duckdb): its acceleration file at {path:?} could not be opened to flush pending writes: {source}. Check the file is readable and not in use by another process. See: https://spiceai.org/docs/components/data-accelerators/duckdb"
+    ))]
+    CheckpointConnect {
+        dataset: String,
+        path: PathBuf,
+        source: duckdb::Error,
+    },
+    #[snafu(display(
+        "Failed to snapshot dataset '{dataset}' (duckdb): pending writes in {path:?} could not be flushed: {source}. Snapshotting without them would omit the most recent rows. Retry the snapshot; if it keeps failing, check for another process writing the file. See: https://spiceai.org/docs/components/data-accelerators/duckdb"
+    ))]
+    Checkpoint {
+        dataset: String,
+        path: PathBuf,
+        source: duckdb::Error,
+    },
+    #[snafu(display(
+        "Failed to snapshot dataset '{dataset}' (duckdb): the task flushing pending writes ended unexpectedly"
+    ))]
+    CheckpointJoin {
+        dataset: String,
+        source: tokio::task::JoinError,
+    },
     #[snafu(display("Failed to open DuckDB for snapshot preparation: {path:?}"))]
     CompactionConnect {
         path: PathBuf,
@@ -46,26 +69,6 @@ pub enum DuckDBSnapshotError {
     },
     #[snafu(display("Snapshot preparation task failed unexpectedly for dataset '{dataset}'"))]
     CompactionJoin {
-        dataset: String,
-        source: tokio::task::JoinError,
-    },
-    #[snafu(display("Failed to open DuckDB to fold the write-ahead log at {path:?}"))]
-    CheckpointConnect {
-        path: PathBuf,
-        source: duckdb::Error,
-    },
-    #[snafu(display(
-        "Failed to fold DuckDB's write-ahead log into the database file for dataset '{dataset}' at {path:?}: {source}"
-    ))]
-    Checkpoint {
-        dataset: String,
-        path: PathBuf,
-        source: duckdb::Error,
-    },
-    #[snafu(display(
-        "DuckDB write-ahead log fold task failed unexpectedly for dataset '{dataset}'"
-    ))]
-    CheckpointJoin {
         dataset: String,
         source: tokio::task::JoinError,
     },
@@ -144,23 +147,27 @@ impl DuckDBSnapshotEngine {
 
 #[async_trait]
 impl SnapshotEngine for DuckDBSnapshotEngine {
+    /// `DuckDB` holds committed writes in a `<db>.wal` sidecar until a checkpoint folds
+    /// them into the database file, and the snapshot upload copies that file on its own —
+    /// so a write still resident in the log is absent from the snapshot. `CHECKPOINT`
+    /// against the live database drains it.
+    ///
+    /// The caller holds the accelerator write lock, so no write is in flight. A reader's
+    /// open transaction does not block the checkpoint.
     async fn checkpoint_live(
         &self,
         live_path: &Path,
         dataset_name: &str,
     ) -> Result<(), super::SnapshotEngineError> {
-        // An uncached connection: the shared pool is keyed by path, and
-        // pre-recreation callers delete the live file immediately after this
-        // copy. `CHECKPOINT` folds `<db>.wal` into the main file so
-        // `fs::copy` cannot omit committed rows.
         let live_path = live_path.to_path_buf();
         let dataset = dataset_name.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = duckdb::Connection::open(&live_path).context(CheckpointConnectSnafu {
+                dataset: dataset.clone(),
                 path: live_path.clone(),
             })?;
             conn.execute("CHECKPOINT", []).context(CheckpointSnafu {
-                dataset: dataset.clone(),
+                dataset,
                 path: live_path,
             })?;
             Ok::<(), DuckDBSnapshotError>(())
@@ -169,8 +176,12 @@ impl SnapshotEngine for DuckDBSnapshotEngine {
         .context(CheckpointJoinSnafu {
             dataset: dataset_name.to_string(),
         })
-        .map_err(|e| super::SnapshotEngineError::DuckDB { source: e })?
-        .map_err(|e| super::SnapshotEngineError::DuckDB { source: e })
+        .map_err(|e| super::SnapshotEngineError::DuckDB {
+            source: Box::new(e),
+        })?
+        .map_err(|e| super::SnapshotEngineError::DuckDB {
+            source: Box::new(e),
+        })
     }
 
     async fn prepare_for_upload(
@@ -182,7 +193,9 @@ impl SnapshotEngine for DuckDBSnapshotEngine {
             let compacted_path = source_path.with_extension("compacted");
             self.compact_duckdb(source_path, &compacted_path, dataset_name)
                 .await
-                .map_err(|e| super::SnapshotEngineError::DuckDB { source: e })?;
+                .map_err(|e| super::SnapshotEngineError::DuckDB {
+                    source: Box::new(e),
+                })?;
             Ok(compacted_path)
         } else {
             Ok(source_path.to_path_buf())
@@ -200,114 +213,179 @@ fn escape_duckdb_string(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{DuckDBSnapshotEngine, SnapshotEngine};
+    use duckdb::Connection;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    fn duckdb_wal_sidecar_path(database_path: &Path) -> PathBuf {
-        let mut wal = database_path.as_os_str().to_os_string();
-        wal.push(".wal");
-        PathBuf::from(wal)
+    fn wal_bytes(live: &Path) -> u64 {
+        std::fs::metadata(live.with_added_extension("wal")).map_or(0, |m| m.len())
     }
 
-    fn count_rows_in_duckdb_file(path: &Path) -> i64 {
-        let connection = duckdb::Connection::open(path).expect("open DuckDB file");
-        connection
-            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+    fn count_rows(path: &Path) -> i64 {
+        let conn = Connection::open(path).expect("open for verification");
+        conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
             .expect("count rows")
     }
 
-    /// Writes a table whose schema is in the main file and whose rows are left
-    /// in the write-ahead log — the unclean-shutdown shape a pre-recreation
-    /// snapshot would otherwise copy without folding.
-    fn write_duckdb_with_wal_resident_rows(path: &Path, rows: i32) {
-        let connection = duckdb::Connection::open(path).expect("open DuckDB file");
-        connection
-            .execute_batch(
+    /// A live database holding one checkpointed row and a second row still in the
+    /// write-ahead log. The returned connection is kept open for the rest of the test,
+    /// as the accelerator's pool keeps its own open across a snapshot.
+    fn live_db_with_an_uncheckpointed_write(tmp: &TempDir) -> (PathBuf, Connection) {
+        let live = tmp.path().join("live.db");
+        let conn = Connection::open(&live).expect("open live database");
+        conn.execute_batch("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1); CHECKPOINT;")
+            .expect("seed a checkpointed baseline");
+        conn.execute_batch("INSERT INTO t VALUES (2);")
+            .expect("write without checkpointing");
+        // Assert the shape these tests exist for, so they cannot pass vacuously if a
+        // future DuckDB checkpoints eagerly and leaves nothing in the log.
+        assert!(
+            wal_bytes(&live) > 0,
+            "the second write must still be in the write-ahead log for this test to mean anything"
+        );
+        (live, conn)
+    }
+
+    /// Regression guard for #13912. `DuckDB` keeps a committed write in its
+    /// write-ahead log until a checkpoint folds it into the database file, and
+    /// `create_file_snapshot` copies that file on its own — so without this hook the
+    /// snapshot ships without the write.
+    #[tokio::test]
+    async fn checkpoint_live_then_copy_captures_an_uncheckpointed_write() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (live, _conn) = live_db_with_an_uncheckpointed_write(&tmp);
+
+        DuckDBSnapshotEngine::new(false)
+            .checkpoint_live(&live, "ds")
+            .await
+            .expect("checkpoint the live database");
+
+        assert_eq!(wal_bytes(&live), 0, "the write-ahead log must be drained");
+
+        // Exactly what the upload path does next: copy the database file alone.
+        let copy = tmp.path().join("copy.db");
+        std::fs::copy(&live, &copy).expect("copy the database file");
+        assert_eq!(
+            count_rows(&copy),
+            2,
+            "the copy must carry the write that was still in the log"
+        );
+    }
+
+    /// The unclean-shutdown shape: the connection that wrote the rows is gone and
+    /// left them in the write-ahead log. `file_create` init and schema-recreate
+    /// both publish through `create_file_snapshot`, so a copy taken without the
+    /// fold would omit those rows. Raised by Copilot on #13477.
+    #[tokio::test]
+    async fn checkpoint_live_folds_a_log_left_by_an_unclean_shutdown() {
+        let tmp = TempDir::new().expect("temp dir");
+        let live = tmp.path().join("acceleration.db");
+        {
+            let conn = Connection::open(&live).expect("open live database");
+            conn.execute_batch(
                 "PRAGMA disable_checkpoint_on_shutdown;
                  PRAGMA checkpoint_threshold='1TB';
                  CREATE TABLE t(id INTEGER);
                  CHECKPOINT;",
             )
-            .expect("persist the empty table to the main file");
-        connection
-            .execute(
-                &format!("INSERT INTO t SELECT * FROM generate_series(1, {rows})"),
-                [],
-            )
-            .expect("insert rows that should remain in the write-ahead log");
-    }
-
-    /// Both `file_create` init and schema-recreate publish through
-    /// `create_file_snapshot`, which calls `checkpoint_live` before copying.
-    /// A main-file-only copy of an unclean-shutdown `DuckDB` would omit committed
-    /// WAL rows; folding first makes that copy complete. Raised by Copilot on
-    /// #13477.
-    #[tokio::test]
-    async fn checkpoint_live_then_copy_captures_all_rows() {
-        let dir = TempDir::new().expect("temp dir");
-        let live = dir.path().join("acceleration.db");
-        let rows = 50;
-        write_duckdb_with_wal_resident_rows(&live, rows);
-
-        let wal = duckdb_wal_sidecar_path(&live);
+            .expect("persist the empty table to the database file");
+            conn.execute("INSERT INTO t SELECT * FROM generate_series(1, 50)", [])
+                .expect("insert rows that stay in the write-ahead log");
+        }
         assert!(
-            wal.exists(),
-            "expected a write-ahead log so this test can show a main-file-only copy is incomplete"
+            wal_bytes(&live) > 0,
+            "the rows must still be in the write-ahead log for this test to mean anything"
         );
 
-        let copy_without_fold = dir.path().join("copy_without_fold.db");
-        std::fs::copy(&live, &copy_without_fold).expect("copy the main file before folding");
+        let copy_without_fold = tmp.path().join("copy_without_fold.db");
+        std::fs::copy(&live, &copy_without_fold).expect("copy the database file before folding");
         assert_eq!(
-            count_rows_in_duckdb_file(&copy_without_fold),
+            count_rows(&copy_without_fold),
             0,
-            "copying the main file without folding must omit WAL-resident rows"
+            "copying the database file without folding must omit the logged rows"
         );
 
-        let engine = DuckDBSnapshotEngine::new(false);
-        engine
+        DuckDBSnapshotEngine::new(false)
             .checkpoint_live(&live, "orders")
             .await
-            .expect("fold the write-ahead log into the main file");
+            .expect("fold the write-ahead log into the database file");
 
-        let copy_after_fold = dir.path().join("copy_after_fold.db");
-        std::fs::copy(&live, &copy_after_fold).expect("copy the main file after folding");
+        let copy_after_fold = tmp.path().join("copy_after_fold.db");
+        std::fs::copy(&live, &copy_after_fold).expect("copy the database file after folding");
         assert_eq!(
-            count_rows_in_duckdb_file(&copy_after_fold),
-            i64::from(rows),
-            "a main-file copy after checkpoint_live must include the WAL-resident rows"
+            count_rows(&copy_after_fold),
+            50,
+            "a copy taken after checkpoint_live must carry the logged rows"
         );
     }
 
+    /// A reader's transaction may still be open: the caller's lock guards writes, not
+    /// reads. The checkpoint must still drain the log rather than fail the snapshot.
     #[tokio::test]
-    async fn checkpoint_live_refuses_a_file_that_is_not_a_duckdb_database() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = dir.path().join("not-a-database.db");
-        std::fs::write(&path, b"not a DuckDB database").expect("write an unverifiable file");
+    async fn checkpoint_live_drains_the_log_with_a_reader_transaction_open() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (live, _conn) = live_db_with_an_uncheckpointed_write(&tmp);
 
-        let engine = DuckDBSnapshotEngine::new(false);
-        let error = engine.checkpoint_live(&path, "orders").await.expect_err(
-            "fold must refuse a file that is not a DuckDB database rather than publish it",
-        );
+        let reader = Connection::open(&live).expect("open a reader");
+        reader.execute_batch("BEGIN TRANSACTION").expect("begin");
+        reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0))
+            .expect("read inside the transaction");
 
-        let message = error.to_string();
-        assert!(
-            message.contains("not-a-database.db"),
-            "the error must name the file: {message}"
-        );
+        DuckDBSnapshotEngine::new(false)
+            .checkpoint_live(&live, "ds")
+            .await
+            .expect("checkpoint with a reader transaction open");
+
+        assert_eq!(wal_bytes(&live), 0, "the write-ahead log must be drained");
+        reader.execute_batch("COMMIT").expect("commit");
     }
 
+    /// A dataset that has never been written has an empty database and no log.
     #[tokio::test]
-    async fn checkpoint_live_returns_ok_on_empty_database() {
-        let dir = TempDir::new().expect("temp dir");
-        let live = dir.path().join("empty.db");
-        {
-            drop(duckdb::Connection::open(&live).expect("create empty DuckDB file"));
-        }
+    async fn checkpoint_live_is_ok_on_an_empty_database() {
+        let tmp = TempDir::new().expect("temp dir");
+        let live = tmp.path().join("empty.db");
+        drop(Connection::open(&live).expect("create an empty database"));
 
-        let engine = DuckDBSnapshotEngine::new(false);
-        engine
+        DuckDBSnapshotEngine::new(false)
             .checkpoint_live(&live, "ds_empty")
             .await
-            .expect("checkpoint live empty");
+            .expect("checkpointing an empty database must succeed");
+    }
+
+    /// The snapshot must fail rather than ship a file whose pending writes could not be
+    /// flushed, and the failure must name the dataset and the file so an operator can act
+    /// on it without reading the source.
+    #[tokio::test]
+    async fn a_file_that_is_not_a_database_fails_with_a_message_naming_the_dataset() {
+        let tmp = TempDir::new().expect("temp dir");
+        let live = tmp.path().join("not_a_database.db");
+        std::fs::write(&live, b"this is not a DuckDB database").expect("write a decoy file");
+
+        let err = DuckDBSnapshotEngine::new(false)
+            .checkpoint_live(&live, "orders")
+            .await
+            .expect_err("a file DuckDB cannot open must fail the snapshot");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'orders'"),
+            "the message must name the dataset: {message}"
+        );
+        assert!(
+            message.contains("not_a_database.db"),
+            "the message must name the file: {message}"
+        );
+        assert!(
+            message.contains("spiceai.org/docs"),
+            "the message must point at the docs: {message}"
+        );
+        assert!(
+            message.contains("not a valid DuckDB database file"),
+            "the message must carry what DuckDB said, so the reader can tell which failure \
+             this was: {message}"
+        );
     }
 }
