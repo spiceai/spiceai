@@ -126,9 +126,11 @@ use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion_common::JoinSide;
 use datafusion_common::stats::Precision;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
@@ -867,8 +869,27 @@ fn try_rewrite_oversized_join(
             // allocate (regression for #13918). A parent Inner hash join is
             // *not* rewritten, so restore after coalesce must be Hash on the
             // original join keys, not RoundRobin.
+            //
+            // The same memory gate the Cayenne path below is held to decides
+            // this, because the rewrite is not free: it coalesces both sides to
+            // one partition, so the join and both sorts give up every core but
+            // one. That is worth paying to keep an unspillable build side out
+            // of the pool, and is pure loss when the build side was never going
+            // to fill it — a `customer` scan feeding TPC-H Q13's
+            // `LEFT JOIN orders` is ~150k single-column rows and sorts 1.5M
+            // probe rows on one thread to avoid a hash table it has room for
+            // several thousand times over. An unknown or inexact build estimate
+            // still counts as oversized (`unwrap_or(true)`), which is what the
+            // aggregated Q78 bodies report.
             if matches!(*hash_join.join_type(), JoinType::Left | JoinType::Right)
                 && should_spill_oracle_outer_join(hash_join)
+                && build_side_outgrows_pool_share(
+                    hash_join,
+                    &optimizer_config,
+                    gate_bytes,
+                    hash_join_count,
+                )
+                .unwrap_or(true)
             {
                 return finish_sort_merge_rewrite(hash_join, true);
             }
@@ -880,68 +901,17 @@ fn try_rewrite_oversized_join(
         // same-schema self-join (TPC-DS Q4/Q11/Q74 `year_total` curr/prev).
         // Those joins are 1:1 on the grouping key; sort-merge was returning a
         // different LIMIT-100 customer set than hash join at SF-100.
-        let Some(build_row_count) = build_input_row_estimate(hash_join) else {
-            if !should_spill_unknown_size_join(hash_join) {
-                return Ok(None);
-            }
-            return finish_sort_merge_rewrite(hash_join, true);
-        };
-        let Some(estimated_build_bytes) =
-            build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
-        else {
-            if !should_spill_unknown_size_join(hash_join) {
-                return Ok(None);
-            }
-            return finish_sort_merge_rewrite(hash_join, true);
-        };
-
-        // Per-join budget: the smaller of the absolute pool fraction and an even
-        // share of the pool across every hash join in the plan. A wide query
-        // such as TPC-DS q78 keeps many build sides alive at once, each below
-        // the absolute fraction yet summing past the pool; the fair-share term
-        // catches that, while a lone large join still gets the full fraction.
-        let fair_share = optimizer_config
-            .sort_merge_memory_pool_bytes
-            .map_or(gate_bytes, |pool_bytes| pool_bytes / hash_join_count.max(1));
-        let effective_gate = gate_bytes.min(fair_share);
-
-        // Which of the two terms a join is held to depends on its row count.
-        // Past `gate_bytes` a build side is oversized on the pool's own terms and
-        // spills whatever its rows say — a short-but-wide build can exhaust the
-        // non-spillable hash table well below any row floor. Only the fair-share
-        // term, which tightens as `hash_join_count` grows, can single out a
-        // mid-size join that would have finished comfortably in memory, so a
-        // build side is held to it only once it also clears `sort_merge_min_rows`.
-        //
-        // That is a deliberate loosening of the fair-share bound: a plan wide
-        // enough that `hash_join_count > 1 / sort_merge_memory_pool_fraction` can
-        // now admit builds summing past the pool (at the 0.125 default, above
-        // eight joins). Closing that back up belongs in the share itself, which
-        // charges a 1,000-row build the same slice as a billion-row one and so
-        // under-reports what is free: weighting it by estimated bytes is the fix
-        // (#13155), not holding large builds back from spilling.
-        let clears_row_floor = build_row_count > optimizer_config.sort_merge_min_rows;
-        let applicable_gate = if clears_row_floor {
-            effective_gate
-        } else {
-            gate_bytes
-        };
-        let fire = estimated_build_bytes > applicable_gate;
-
-        tracing::debug!(
-            join_type = ?hash_join.join_type(),
-            build_row_count,
-            estimated_build_bytes,
+        let Some(fire) = build_side_outgrows_pool_share(
+            hash_join,
+            &optimizer_config,
             gate_bytes,
-            fair_share,
-            effective_gate,
-            clears_row_floor,
-            applicable_gate,
-            sort_merge_min_rows = optimizer_config.sort_merge_min_rows,
             hash_join_count,
-            fire,
-            "Evaluated Cayenne oversized-join memory gate"
-        );
+        ) else {
+            if !should_spill_unknown_size_join(hash_join) {
+                return Ok(None);
+            }
+            return finish_sort_merge_rewrite(hash_join, true);
+        };
         fire
     } else {
         // Legacy row-count fallback for direct `DataFusion` users with no memory
@@ -967,6 +937,70 @@ fn try_rewrite_oversized_join(
     }
 
     finish_sort_merge_rewrite(hash_join, false)
+}
+
+/// Does `hash_join`'s build side outgrow the share of the query memory pool it
+/// may claim? `None` means the build size is unknown, which each caller reads
+/// against its own risk: a non-spillable `HashJoinInput` it cannot size is
+/// treated as oversized.
+fn build_side_outgrows_pool_share(
+    hash_join: &HashJoinExec,
+    optimizer_config: &CayenneOptimizerConfig,
+    gate_bytes: usize,
+    hash_join_count: usize,
+) -> Option<bool> {
+    let build_row_count = build_input_row_estimate(hash_join)?;
+    let estimated_build_bytes =
+        build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)?;
+
+    // Per-join budget: the smaller of the absolute pool fraction and an even
+    // share of the pool across every hash join in the plan. A wide query
+    // such as TPC-DS q78 keeps many build sides alive at once, each below
+    // the absolute fraction yet summing past the pool; the fair-share term
+    // catches that, while a lone large join still gets the full fraction.
+    let fair_share = optimizer_config
+        .sort_merge_memory_pool_bytes
+        .map_or(gate_bytes, |pool_bytes| pool_bytes / hash_join_count.max(1));
+    let effective_gate = gate_bytes.min(fair_share);
+
+    // Which of the two terms a join is held to depends on its row count.
+    // Past `gate_bytes` a build side is oversized on the pool's own terms and
+    // spills whatever its rows say — a short-but-wide build can exhaust the
+    // non-spillable hash table well below any row floor. Only the fair-share
+    // term, which tightens as `hash_join_count` grows, can single out a
+    // mid-size join that would have finished comfortably in memory, so a
+    // build side is held to it only once it also clears `sort_merge_min_rows`.
+    //
+    // That is a deliberate loosening of the fair-share bound: a plan wide
+    // enough that `hash_join_count > 1 / sort_merge_memory_pool_fraction` can
+    // now admit builds summing past the pool (at the 0.125 default, above
+    // eight joins). Closing that back up belongs in the share itself, which
+    // charges a 1,000-row build the same slice as a billion-row one and so
+    // under-reports what is free: weighting it by estimated bytes is the fix
+    // (#13155), not holding large builds back from spilling.
+    let clears_row_floor = build_row_count > optimizer_config.sort_merge_min_rows;
+    let applicable_gate = if clears_row_floor {
+        effective_gate
+    } else {
+        gate_bytes
+    };
+    let fire = estimated_build_bytes > applicable_gate;
+
+    tracing::debug!(
+        join_type = ?hash_join.join_type(),
+        build_row_count,
+        estimated_build_bytes,
+        gate_bytes,
+        fair_share,
+        effective_gate,
+        clears_row_floor,
+        applicable_gate,
+        sort_merge_min_rows = optimizer_config.sort_merge_min_rows,
+        hash_join_count,
+        fire,
+        "Evaluated Cayenne oversized-join memory gate"
+    );
+    Some(fire)
 }
 
 /// Replace `hash_join` with a spillable `SortMergeJoinExec`.
@@ -1022,11 +1056,18 @@ fn finish_sort_merge_rewrite(
         .with_preserve_partitioning(true),
     );
 
+    let filter = match hash_join.filter() {
+        None => None,
+        Some(filter) => match left_first_join_filter(filter)? {
+            Some(filter) => Some(filter),
+            None => return Ok(None),
+        },
+    };
     let join = SortMergeJoinExec::try_new(
         left,
         right,
         hash_join.on().to_vec(),
-        hash_join.filter().cloned(),
+        filter,
         *hash_join.join_type(),
         sort_options,
         hash_join.null_equality(),
@@ -1051,6 +1092,78 @@ fn finish_sort_merge_rewrite(
     );
 
     Ok(Some(join))
+}
+
+/// `filter` with its columns reordered so every left-side column precedes every
+/// right-side one, computing the same predicate.
+///
+/// `SortMergeJoinExec` assembles a filter's intermediate batch as all of its
+/// left-side columns followed by all of its right-side ones
+/// (`get_filter_columns`), whatever order the filter lists them in, while the
+/// filter's schema and expression follow the listed order. A hash join whose
+/// inputs were swapped lists them right first — `JoinFilter::swap` flips each
+/// column's side but keeps its position — so rewriting it to sort-merge unchanged
+/// puts the predicate's inputs in the wrong slots, and the query fails at
+/// execution (CH-benCH q17: `column types must match schema types, expected
+/// Int32 but found Float64 at column index 0`).
+///
+/// `None` when a column belongs to neither input (a mark join's), which a
+/// sort-merge join cannot evaluate; the caller keeps the hash join.
+fn left_first_join_filter(filter: &JoinFilter) -> Result<Option<JoinFilter>> {
+    let indices = filter.column_indices();
+    if indices
+        .iter()
+        .any(|column| !matches!(column.side, JoinSide::Left | JoinSide::Right))
+    {
+        return Ok(None);
+    }
+    let order: Vec<usize> = (0..indices.len())
+        .filter(|&i| indices[i].side == JoinSide::Left)
+        .chain((0..indices.len()).filter(|&i| indices[i].side == JoinSide::Right))
+        .collect();
+    if order
+        .iter()
+        .enumerate()
+        .all(|(position, &listed)| position == listed)
+    {
+        return Ok(Some(filter.clone()));
+    }
+    let mut position_of = vec![0; order.len()];
+    for (position, &listed) in order.iter().enumerate() {
+        position_of[listed] = position;
+    }
+    let listed_schema = filter.schema();
+    let fields: Vec<_> = order
+        .iter()
+        .map(|&listed| Arc::clone(&listed_schema.fields()[listed]))
+        .collect();
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        listed_schema.metadata().clone(),
+    ));
+    let column_indices = order
+        .iter()
+        .map(|&listed| indices[listed].clone())
+        .collect();
+    let expression = Arc::clone(filter.expression())
+        .transform(|expr| {
+            let Some(column) = expr.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(expr));
+            };
+            let Some(&position) = position_of.get(column.index()) else {
+                return Err(DataFusionError::Internal(format!(
+                    "join filter column {} (#{}) is outside its {}-column intermediate schema",
+                    column.name(),
+                    column.index(),
+                    position_of.len()
+                )));
+            };
+            Ok(Transformed::yes(
+                Arc::new(Column::new(column.name(), position)) as Arc<dyn PhysicalExpr>,
+            ))
+        })
+        .data()?;
+    Ok(Some(JoinFilter::new(expression, column_indices, schema)))
 }
 
 /// `HashJoinExec` may embed a column projection that `SortMergeJoinExec` does
@@ -2793,6 +2906,26 @@ mod tests {
         file_exec_with_statistics(schema, path, filter, Statistics::new_unknown(schema))
     }
 
+    /// A build side the 107 GiB pool the oracle tests configure cannot hold:
+    /// TPC-DS Q78's `--validate` oracle carries ~100 GB in one `HashJoinInput`
+    /// at SF-100. Expressed as rows against the two-column test schemas, which
+    /// `build_side_memory_estimate` charges at 40 bytes each.
+    const OVERSIZED_ORACLE_BUILD_ROWS: usize = 2_500_000_000;
+    /// TPC-H Q13's `customer` build side — ~6 MB against the same schemas, so
+    /// it fits its share of any production pool many times over.
+    const SMALL_ORACLE_BUILD_ROWS: usize = 150_000;
+
+    /// A file scan reporting an exact row count, for the build-side size the
+    /// memory gate reads.
+    fn sized_file_exec(schema: &Arc<Schema>, path: &str, rows: usize) -> Arc<dyn ExecutionPlan> {
+        file_exec_with_statistics(
+            schema,
+            path,
+            None,
+            Statistics::new_unknown(schema).with_num_rows(Precision::Exact(rows)),
+        )
+    }
+
     fn file_exec_with_statistics(
         schema: &Arc<Schema>,
         path: &str,
@@ -3534,8 +3667,10 @@ mod tests {
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
-        let config =
-            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+        // A pool too small to hold even this 100-key build side, so the outer
+        // child takes the coalesce-and-restore path whose row preservation is
+        // what this test is about.
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(1_024));
 
         let task = datafusion::execution::context::SessionContext::new().task_ctx();
         let optimized = optimize_anti_join_sort_merge_with_config(Arc::clone(&parent), &config);
@@ -3551,6 +3686,146 @@ mod tests {
             rewritten.num_rows(),
             100,
             "restored Hash child must emit every left-outer row"
+        );
+    }
+
+    /// Regression test for CH-benCH q17 failing under load with `column types
+    /// must match schema types, expected Int32 but found Float64 at column index
+    /// 0`. Once the planner swaps a hash join's inputs, its residual filter lists
+    /// the right input's column first; the sort-merge rewrite must hand
+    /// `SortMergeJoinExec` a filter in the left-first layout it assembles, and the
+    /// rewritten join must return the hash join's rows.
+    #[tokio::test]
+    async fn sort_merge_rewrite_keeps_a_right_first_join_filter_evaluable() {
+        use arrow::array::Float64Array;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+        use datafusion_common::JoinSide;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+
+        // Build side: q17's aggregated subquery `t(i_id, a)`.
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("i_id", DataType::Int64, false),
+            Field::new("a", DataType::Float64, false),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            Arc::clone(&left_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Float64Array::from(vec![5.0, 1.5])),
+            ],
+        )
+        .expect("left batch");
+        // Probe side: `order_line(ol_i_id, ol_quantity, ol_amount)`.
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("ol_i_id", DataType::Int64, false),
+            Field::new("ol_quantity", DataType::Int32, false),
+            Field::new("ol_amount", DataType::Int64, false),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 2, 2, 3])),
+                Arc::new(Int32Array::from(vec![3, 7, 1, 2, 1])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .expect("right batch");
+        let left =
+            MemorySourceConfig::try_new_exec(&[vec![left_batch]], Arc::clone(&left_schema), None)
+                .expect("left exec");
+        let right =
+            MemorySourceConfig::try_new_exec(&[vec![right_batch]], Arc::clone(&right_schema), None)
+                .expect("right exec");
+
+        // `CAST(ol_quantity@0 AS Float64) < a@1`, listed right first: the layout
+        // `JoinFilter::swap` leaves when the planner makes `t` the build side.
+        let filter_schema = Arc::new(Schema::new(vec![
+            Field::new("ol_quantity", DataType::Int32, false),
+            Field::new("a", DataType::Float64, false),
+        ]));
+        let predicate = Arc::new(BinaryExpr::new(
+            cast(
+                Arc::new(Column::new("ol_quantity", 0)),
+                filter_schema.as_ref(),
+                DataType::Float64,
+            )
+            .expect("cast ol_quantity"),
+            Operator::Lt,
+            Arc::new(Column::new("a", 1)),
+        )) as Arc<dyn PhysicalExpr>;
+        let filter = JoinFilter::new(
+            predicate,
+            vec![
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Right,
+                },
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+            ],
+            filter_schema,
+        );
+        let hash_join = HashJoinExec::try_new(
+            left,
+            right,
+            vec![(
+                Arc::new(Column::new("i_id", 0)) as Arc<dyn PhysicalExpr>,
+                Arc::new(Column::new("ol_i_id", 0)) as Arc<dyn PhysicalExpr>,
+            )],
+            Some(filter),
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .expect("hash join");
+
+        let rewritten = super::finish_sort_merge_rewrite(&hash_join, false)
+            .expect("the rewrite plans")
+            .expect("an inner hash join with a residual filter is rewritten");
+        assert!(
+            rewritten.is::<SortMergeJoinExec>(),
+            "the rewrite must produce the sort-merge join under test, got {}",
+            displayable(rewritten.as_ref()).one_line()
+        );
+
+        let rows = |batch: &RecordBatch| -> Vec<(i64, i32, i64)> {
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("i_id");
+            let quantity = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("ol_quantity");
+            let amount = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ol_amount");
+            let mut rows: Vec<_> = (0..batch.num_rows())
+                .map(|i| (id.value(i), quantity.value(i), amount.value(i)))
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+        let task = datafusion::execution::context::SessionContext::new().task_ctx();
+        let expected = rows(&collect_plan_rows(Arc::new(hash_join), Arc::clone(&task)).await);
+        assert_eq!(
+            expected,
+            vec![(1, 3, 10), (2, 1, 30)],
+            "hash join oracle: each item keeps only the lines below its average"
+        );
+        assert_eq!(
+            rows(&collect_plan_rows(rewritten, task).await),
+            expected,
+            "the sort-merge rewrite must return the hash join's rows"
         );
     }
 
@@ -4089,12 +4364,26 @@ mod tests {
         let left_schema = channel_schema("ss_item_sk", "ss_qty");
         let right_schema = channel_schema("ws_item_sk", "ws_qty");
         let left = hash_repartition(
-            grouped_count_over(inlined_exec(&left_schema), "ss_item_sk"),
+            grouped_count_over(
+                sized_file_exec(
+                    &left_schema,
+                    "store_sales.parquet",
+                    OVERSIZED_ORACLE_BUILD_ROWS,
+                ),
+                "ss_item_sk",
+            ),
             "ss_item_sk",
             4,
         );
         let right = hash_repartition(
-            grouped_count_over(inlined_exec(&right_schema), "ws_item_sk"),
+            grouped_count_over(
+                sized_file_exec(
+                    &right_schema,
+                    "web_sales.parquet",
+                    OVERSIZED_ORACLE_BUILD_ROWS,
+                ),
+                "ws_item_sk",
+            ),
             "ws_item_sk",
             4,
         );
@@ -4248,8 +4537,24 @@ mod tests {
         // per side and fills the spillable cap at SF-100 (regression for #13918).
         let left_schema = channel_schema("ss_item_sk", "ss_ticket_number");
         let right_schema = channel_schema("sr_item_sk", "sr_ticket_number");
-        let left = hash_repartition(inlined_exec(&left_schema), "ss_item_sk", 4);
-        let right = hash_repartition(inlined_exec(&right_schema), "sr_item_sk", 4);
+        let left = hash_repartition(
+            sized_file_exec(
+                &left_schema,
+                "store_sales.parquet",
+                OVERSIZED_ORACLE_BUILD_ROWS,
+            ),
+            "ss_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            sized_file_exec(
+                &right_schema,
+                "store_returns.parquet",
+                OVERSIZED_ORACLE_BUILD_ROWS,
+            ),
+            "sr_item_sk",
+            4,
+        );
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
@@ -4273,14 +4578,110 @@ mod tests {
         // with 0 bytes cannot allocate (regression for #13918).
         let left_schema = channel_schema("sr_item_sk", "sr_ticket_number");
         let right_schema = channel_schema("ss_item_sk", "ss_ticket_number");
-        let left = hash_repartition(inlined_exec(&left_schema), "sr_item_sk", 4);
-        let right = hash_repartition(inlined_exec(&right_schema), "ss_item_sk", 4);
+        let left = hash_repartition(
+            sized_file_exec(
+                &left_schema,
+                "store_returns.parquet",
+                OVERSIZED_ORACLE_BUILD_ROWS,
+            ),
+            "sr_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            sized_file_exec(
+                &right_schema,
+                "store_sales.parquet",
+                OVERSIZED_ORACLE_BUILD_ROWS,
+            ),
+            "ss_item_sk",
+            4,
+        );
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
             "sr_item_sk",
             "ss_item_sk",
             JoinType::Right,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+        assert_coalesced_oracle_file_scan_sort_merge(&optimized, 4);
+    }
+
+    #[test]
+    fn keeps_small_oracle_left_join_of_file_scans_as_hash_join() {
+        // TPC-H Q13 on a spicepod with no Cayenne: `customer LEFT JOIN orders`.
+        // The build side is ~150k single-key rows, so there is no unspillable
+        // `HashJoinInput` to trade for — and the rewrite would coalesce both
+        // sides to one partition and sort 1.5M probe rows on one thread.
+        let left_schema = channel_schema("c_custkey", "c_val");
+        let right_schema = channel_schema("o_custkey", "o_orderkey");
+        let left = hash_repartition(
+            sized_file_exec(&left_schema, "customer.parquet", SMALL_ORACLE_BUILD_ROWS),
+            "c_custkey",
+            4,
+        );
+        let right = hash_repartition(
+            sized_file_exec(&right_schema, "orders.parquet", 1_500_000),
+            "o_custkey",
+            4,
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "c_custkey",
+            "o_custkey",
+            JoinType::Left,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "an outer join whose build side fits the pool must stay a hash join, not coalesce to one partition: {}",
+            displayable(optimized.as_ref()).indent(false)
+        );
+    }
+
+    #[test]
+    fn rewrites_unknown_size_oracle_left_join_of_file_scans_to_coalesced_sort_merge() {
+        // An outer join over a build side nothing can size is still treated as
+        // oversized: `HashJoinInput` cannot spill, so an unknown build is the
+        // case the pool cannot survive being wrong about.
+        let left_schema = channel_schema("ss_item_sk", "ss_ticket_number");
+        let right_schema = channel_schema("sr_item_sk", "sr_ticket_number");
+        let left = hash_repartition(
+            file_exec_with_statistics(
+                &left_schema,
+                "store_sales.parquet",
+                None,
+                Statistics::new_unknown(&left_schema),
+            ),
+            "ss_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            file_exec_with_statistics(
+                &right_schema,
+                "store_returns.parquet",
+                None,
+                Statistics::new_unknown(&right_schema),
+            ),
+            "sr_item_sk",
+            4,
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "ss_item_sk",
+            "sr_item_sk",
+            JoinType::Left,
             NullEquality::NullEqualsNothing,
         ));
         let config =
