@@ -61,7 +61,7 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-pub use encode::{BoundKeyColumns, KeyEncoder, KeyField};
+pub use encode::{BoundKeyColumns, KeyEncoder, KeyField, can_key, key_type};
 
 use snafu::Snafu;
 

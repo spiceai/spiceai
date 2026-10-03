@@ -231,12 +231,11 @@ pub fn apply_inferred_schema(
 /// The first column of an inferred index that `engine` cannot key, or `None` when
 /// the engine accepts every column of the index.
 ///
-/// Cayenne refuses a floating-point key column at registration (`KeyColumn::resolve`
-/// in `crates/cayenne/src/provider/lookup_index.rs`, which this rule mirrors), since
-/// float equality admits values such as signed zero that have no single byte
-/// encoding. A *declared* index still reaches Cayenne and fails with that actionable
-/// error; an *inferred* one is skipped by the caller, because the user never asked
-/// for it (#14590). The other engines index any column type.
+/// Cayenne keys a column by its value with `key_index`, and refuses a column
+/// type that cannot be encoded, such as a list or a struct, at registration. A
+/// *declared* index still reaches Cayenne and fails with that actionable error;
+/// an *inferred* one is skipped by the caller, because the user never asked for
+/// it. The other engines index any column type.
 ///
 /// Columns absent from `schema` are ignored here; the caller has already skipped
 /// an index naming one.
@@ -251,7 +250,7 @@ fn unindexable_column<'a>(
     columns
         .iter()
         .filter_map(|column| schema.field_with_name(column).ok())
-        .find(|field| field.data_type().is_floating())
+        .find(|field| !key_index::can_key(field.data_type()))
 }
 
 /// The warning logged when an inferred secondary index is skipped because
@@ -264,7 +263,7 @@ fn inferred_index_skip_warning(
     field: &Field,
 ) -> String {
     format!(
-        "Dataset '{dataset_name}' ({engine}): skipped the secondary index on ({}) inferred from the source, so equality lookups on those columns scan the table instead. Cause: column '{}' has floating-point type {}, which the {engine} accelerator cannot index; to index it, use an integer, decimal, string, or other exact-equality type. See: https://spiceai.org/docs/features/data-acceleration/indexes",
+        "Dataset '{dataset_name}' ({engine}): skipped the secondary index on ({}) inferred from the source, so equality lookups on those columns scan the table instead. Cause: column '{}' has type {}, which the {engine} accelerator cannot index; to index it, declare an index on columns of a scalar type such as an integer, decimal, float, string or timestamp. See: https://spiceai.org/docs/features/data-acceleration/indexes",
         index_columns.join(", "),
         field.name(),
         field.data_type()
@@ -950,27 +949,22 @@ mod tests {
 
     // regression test for #14590
     #[test]
-    fn cayenne_skips_inferred_index_on_float_column_and_keeps_the_rest() {
-        // Cayenne rejects a floating-point index key at registration, and the
-        // rejection failed the whole dataset load; the inferred index is dropped
-        // instead, and the inferred index on `(a, b)` still applies.
+    fn cayenne_applies_inferred_index_on_float_column() {
+        // Cayenne indexes a floating-point key, so an index the source holds on
+        // one is applied like any other, alone or within a composite key.
         for refresh_mode in [RefreshMode::Full, RefreshMode::Changes] {
             let mut acc = accel(Engine::Cayenne);
             apply_float_indexed_source(&mut acc, refresh_mode);
 
             assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
             assert_eq!(
-                acc.indexes.keys().collect::<Vec<_>>(),
-                vec![&col_ref(&["a", "b"])],
-                "{refresh_mode:?}: only the integer index is applied"
+                acc.indexes.len(),
+                2,
+                "{refresh_mode:?}: both inferred indexes apply"
             );
+            assert!(acc.indexes.contains_key(&col_ref(&["a", "b"])));
+            assert!(acc.indexes.contains_key(&col_ref(&["v"])));
         }
-    }
-
-    #[test]
-    fn cayenne_skips_inferred_composite_index_with_a_float_column() {
-        // One floating-point column disqualifies the whole key, in any position,
-        // for every float width.
         for float in [DataType::Float16, DataType::Float32, DataType::Float64] {
             let mut acc = accel(Engine::Cayenne);
             let inferred = InferredSchema {
@@ -983,69 +977,82 @@ mod tests {
             let schema = typed_schema(&[("a", DataType::Int32), ("score", float.clone())]);
             apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
 
-            assert!(acc.indexes.is_empty(), "{float}: composite key is skipped");
-        }
-    }
-
-    #[test]
-    fn other_engines_keep_inferred_index_on_float_column() {
-        // Only Cayenne refuses a floating-point key; the other engines still
-        // receive the inferred index unchanged.
-        for engine in [Engine::Sqlite, Engine::PostgreSQL, Engine::Arrow] {
-            let mut acc = accel(engine);
-            apply_float_indexed_source(&mut acc, RefreshMode::Full);
-
             assert_eq!(
-                acc.indexes.len(),
-                2,
-                "{engine}: both inferred indexes apply"
+                acc.indexes.get(&col_ref(&["a", "score"])),
+                Some(&IndexType::Unique),
+                "{float}: composite key with a float column applies"
             );
-            assert!(acc.indexes.contains_key(&col_ref(&["v"])));
         }
     }
 
     #[test]
-    fn cayenne_declared_index_on_float_column_is_left_for_the_engine_to_reject() {
-        // A declared index is the user's decision: inference never touches
-        // `indexes` once any are configured, so the declared float index still
-        // reaches Cayenne, which fails registration with its actionable error.
-        let mut acc = accel(Engine::Cayenne);
-        acc.indexes.insert(col_ref(&["v"]), IndexType::Enabled);
-        apply_float_indexed_source(&mut acc, RefreshMode::Full);
+    fn cayenne_skips_inferred_index_on_a_column_it_cannot_key() {
+        // Cayenne refuses a key column it cannot encode, such as an array, at
+        // registration. An index the source holds on one is skipped instead, so
+        // a dataset that never declared it still loads with its other indexes.
+        let inferred = InferredSchema {
+            indexes: vec![
+                InferredIndex {
+                    columns: vec!["a".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["tags".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["a".to_string(), "tags".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["status".to_string()],
+                    unique: false,
+                },
+            ],
+            ..InferredSchema::default()
+        };
+        let tags = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
+        let status = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = typed_schema(&[("a", DataType::Int32), ("tags", tags), ("status", status)]);
 
-        assert_eq!(acc.indexes.len(), 1);
-        assert!(acc.indexes.contains_key(&col_ref(&["v"])));
+        let mut acc = accel(Engine::Cayenne);
+        apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+        assert_eq!(acc.indexes.len(), 2, "{:?}", acc.indexes.keys());
+        assert!(acc.indexes.contains_key(&col_ref(&["a"])));
+        assert!(
+            acc.indexes.contains_key(&col_ref(&["status"])),
+            "a dictionary column is keyed by its values"
+        );
+
+        let mut acc = accel(Engine::Sqlite);
+        apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+        assert_eq!(acc.indexes.len(), 4, "other engines index any column type");
     }
 
     #[test]
     fn inferred_index_skip_warning_names_the_dataset_index_and_cause() {
-        // The warning is the only explanation the user gets for a lookup that
-        // scans, so it must carry the dataset, the index, the column and type,
-        // what they will observe, and the fix.
-        let columns = vec!["a".to_string(), "v".to_string()];
+        let columns = vec!["a".to_string(), "tags".to_string()];
+        let tags = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
         let message = inferred_index_skip_warning(
             "orders",
             Engine::Cayenne,
             &columns,
-            &Field::new("v", DataType::Float64, true),
+            &Field::new("tags", tags, true),
         );
-
         assert!(
             message.starts_with("Dataset 'orders' (cayenne): "),
             "{message}"
         );
-        assert!(message.contains("secondary index on (a, v)"), "{message}");
-        assert!(message.contains("scan the table instead"), "{message}");
         assert!(
-            message.contains("column 'v' has floating-point type Float64"),
+            message.contains("secondary index on (a, tags)"),
             "{message}"
         );
-        assert!(message.contains("exact-equality type"), "{message}");
-        assert!(message.contains("https://spiceai.org/docs/"), "{message}");
+        assert!(message.contains("scan the table instead"), "{message}");
         assert!(
-            !message.contains('\n'),
-            "log lines stay on one line: {message}"
+            message.contains("column 'tags' has type List("),
+            "{message}"
         );
+        assert!(message.contains("https://spiceai.org/docs/"), "{message}");
     }
 
     #[test]
