@@ -2883,7 +2883,7 @@ impl SnapshotManager {
         // instant `local_path` points to either the old file or the new one,
         // never to a missing entry — which matters for `refresh_mode: snapshot`
         // because the accelerator's pool may still be holding readers open
-        // against `local_path` in the gap before `reload_from_snapshot`
+        // against `local_path` in the gap before `rebuild_provider`
         // evicts them.
         // Moves aside what the live file keeps beside it, renames the download
         // into place, and puts that state back when the rename does not replace
