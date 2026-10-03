@@ -57,8 +57,8 @@ use super::on_conflict::{
     PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
     PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
-    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
-    pk_deletion_snapshot_for_strategy,
+    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
+    ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
@@ -2524,13 +2524,16 @@ pub struct CayenneTableProvider {
     /// Runs claimed by in-flight subset merges, which keeps concurrent merges
     /// on disjoint inputs. See [`ProtectedMergeClaims`].
     protected_merge_claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
-    /// Coalesces write-driven compaction notifications so a high-ingest table
-    /// does not spawn one background compaction task per append while a prior
-    /// notification is still pending.
-    post_write_compaction_scheduled: Arc<AtomicBool>,
+    /// Coalescing state of write-driven compaction — one of
+    /// [`COALESCED_TASK_IDLE`], [`COALESCED_TASK_RUNNING`],
+    /// [`COALESCED_TASK_RUNNING_DIRTY`] — so a high-ingest table does not spawn
+    /// one background compaction task per append, and a request raised while a
+    /// pass runs is re-evaluated once it ends
+    /// (see [`coalesced_task_state_after_signal`]).
+    post_write_compaction_state: Arc<AtomicU8>,
     /// Coalescing state of the orphaned-deletion-vector cleanup sweep — one of
-    /// [`ORPHAN_DV_SWEEP_IDLE`], [`ORPHAN_DV_SWEEP_RUNNING`],
-    /// [`ORPHAN_DV_SWEEP_RUNNING_DIRTY`]. Signalled by every publication that can
+    /// [`COALESCED_TASK_IDLE`], [`COALESCED_TASK_RUNNING`],
+    /// [`COALESCED_TASK_RUNNING_DIRTY`]. Signalled by every publication that can
     /// raise the surviving-sequence floor and so orphan key DVs, and once at open
     /// to drain a backlog an earlier process left behind. At most one sweep runs
     /// on the dedicated compaction runtime; a signal raised while it runs marks
@@ -3629,30 +3632,105 @@ static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// backlog larger than one batch still drains without a further signal.
 const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 4096;
 
-/// `orphan_dv_sweep_state`: no sweep scheduled or running.
-const ORPHAN_DV_SWEEP_IDLE: u8 = 0;
-/// `orphan_dv_sweep_state`: exactly one worker is running and no later signal is
-/// outstanding.
-const ORPHAN_DV_SWEEP_RUNNING: u8 = 1;
-/// `orphan_dv_sweep_state`: a worker is running AND a signal arrived after it
-/// began, so the floor it captured may already be stale. The worker takes another
-/// pass before it may return to [`ORPHAN_DV_SWEEP_IDLE`].
-const ORPHAN_DV_SWEEP_RUNNING_DIRTY: u8 = 2;
+/// State of a coalesced background task — the orphaned-DV sweep
+/// (`orphan_dv_sweep_state`) and the post-write compaction pass
+/// (`post_write_compaction_state`): no task scheduled or running.
+const COALESCED_TASK_IDLE: u8 = 0;
+/// Exactly one task is running and no later signal is outstanding.
+const COALESCED_TASK_RUNNING: u8 = 1;
+/// A task is running AND a signal arrived after it began, so what it observed
+/// may already be stale. The task takes another pass before it may return to
+/// [`COALESCED_TASK_IDLE`].
+const COALESCED_TASK_RUNNING_DIRTY: u8 = 2;
 
-/// State an orphaned-DV sweep signal moves `orphan_dv_sweep_state` to, or `None`
-/// when the signal needs no change because a dirty worker will already re-run.
+/// State a signal moves a coalesced task's state to, or `None` when the signal
+/// needs no change because a dirty task will already re-run.
 ///
-/// A plain "is scheduled" flag loses the edge: a signal raised while a sweep runs
-/// is dropped and the running sweep never re-reads the floor, so a table that goes
-/// idle right after that signal keeps its orphan backlog forever. Recording the
-/// signal as [`ORPHAN_DV_SWEEP_RUNNING_DIRTY`] keeps the at-most-one-worker
-/// property while guaranteeing that some pass observes the newest floor.
-/// [`ORPHAN_DV_SWEEP_IDLE`] is the only state whose signaller owns the worker.
-const fn orphan_dv_sweep_state_after_signal(state: u8) -> Option<u8> {
+/// A plain "is scheduled" flag loses the edge: a signal raised while the task
+/// runs is dropped and the running pass never re-reads what the signal changed,
+/// so a table that goes idle right after that signal keeps the backlog forever —
+/// an orphan backlog for the sweep, an unconsolidated small-file seed for a
+/// compaction pass that a concurrent append aborted. Recording the signal as
+/// [`COALESCED_TASK_RUNNING_DIRTY`] keeps the at-most-one-task property while
+/// guaranteeing that some pass observes the newest state.
+/// [`COALESCED_TASK_IDLE`] is the only state whose signaller owns the task.
+const fn coalesced_task_state_after_signal(state: u8) -> Option<u8> {
     match state {
-        ORPHAN_DV_SWEEP_IDLE => Some(ORPHAN_DV_SWEEP_RUNNING),
-        ORPHAN_DV_SWEEP_RUNNING => Some(ORPHAN_DV_SWEEP_RUNNING_DIRTY),
+        COALESCED_TASK_IDLE => Some(COALESCED_TASK_RUNNING),
+        COALESCED_TASK_RUNNING => Some(COALESCED_TASK_RUNNING_DIRTY),
         _ => None,
+    }
+}
+
+/// Signal a coalesced task: `true` when this caller moved its state from idle to
+/// running and so owns the task it must now spawn; otherwise the signal was
+/// recorded on the task already running.
+fn coalesced_task_try_claim(state: &AtomicU8) -> bool {
+    state.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        coalesced_task_state_after_signal,
+    ) == Ok(COALESCED_TASK_IDLE)
+}
+
+/// One claimed episode of a coalesced task, from the claim to the task's exit.
+///
+/// A task that ends abnormally — a panic during unwind, or the task being dropped
+/// on abort — never reaches [`Self::try_finish`], so dropping an unfinished
+/// episode republishes idle; a stuck state would otherwise permanently suppress
+/// future signals AND hang `drain_in_flight_maintenance`. A clean finish disarms
+/// that reset, so it cannot stomp a state a LATER task already owns.
+///
+/// The abnormal exit deliberately drops a signal that arrived before it rather
+/// than re-arming a task from `Drop`: the abort case IS runtime shutdown, where
+/// spawning panics inside an unwind. Losing one edge is bounded — the next signal
+/// or open replays it — whereas leaving the state dirty with no task wedges it.
+struct CoalescedTaskEpisode {
+    state: Arc<AtomicU8>,
+    armed: bool,
+}
+
+impl CoalescedTaskEpisode {
+    fn new(state: &Arc<AtomicU8>) -> Self {
+        Self {
+            state: Arc::clone(state),
+            armed: true,
+        }
+    }
+
+    /// End the episode if no signal arrived since the pass began, or consume
+    /// the signal and return `false` so the caller takes another pass.
+    ///
+    /// The episode ends only by atomically claiming a CLEAN running state. A
+    /// signal raised anywhere up to this point has already flipped the state to
+    /// dirty, so the exchange fails — the edge cannot be lost in the gap between
+    /// the last pass and the task exiting. A signal that lands between the
+    /// failed exchange and the store finds the state already dirty and adds
+    /// nothing: the pass it wants starts after it, which is what it asked for.
+    fn try_finish(&mut self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                COALESCED_TASK_RUNNING,
+                COALESCED_TASK_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.armed = false;
+            return true;
+        }
+        self.state.store(COALESCED_TASK_RUNNING, Ordering::Release);
+        false
+    }
+}
+
+impl Drop for CoalescedTaskEpisode {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.store(COALESCED_TASK_IDLE, Ordering::Release);
+        }
     }
 }
 
@@ -3769,31 +3847,38 @@ fn select_protected_snapshot_merge_tier(
     max_pass_bytes: Option<u64>,
     below_tier: Option<u32>,
 ) -> ProtectedMergeSelection {
-    if inputs.len() < 2 || min_runs < 2 {
-        // A merge needs at least two runs, and a floor below 2 is meaningless.
-        return ProtectedMergeSelection::NoQualifyingTier;
-    }
-
     // Group input indices by tier, preserving oldest-first order within a tier.
     let mut tiers: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
     for (idx, (_, _, bytes)) in inputs.iter().enumerate() {
         let tier = protected_snapshot_size_tier(*bytes, base_bytes, growth);
         tiers.entry(tier).or_default().push(idx);
     }
+    let no_qualifying_tier = || ProtectedMergeSelection::NoQualifyingTier {
+        runs_per_tier: tiers
+            .iter()
+            .map(|(tier, indices)| (*tier, indices.len()))
+            .collect(),
+    };
+
+    if min_runs < 2 {
+        // A floor below 2 is meaningless: a merge needs at least two runs. Fewer than
+        // two inputs needs no guard, since no tier can then reach `min_runs`.
+        return no_qualifying_tier();
+    }
 
     // BTreeMap iterates tiers in ascending order, so the first qualifying tier
     // is the lowest one.
-    let tiers = tiers
-        .into_iter()
-        .take_while(|(tier, _)| below_tier.is_none_or(|below| *tier < below));
-    for (_tier, indices) in tiers {
+    let eligible = tiers
+        .iter()
+        .take_while(|(tier, _)| below_tier.is_none_or(|below| **tier < below));
+    for (_tier, indices) in eligible {
         if indices.len() < min_runs {
             continue;
         }
         let width = max_width.max(2);
         let mut selected: Vec<(String, i64)> = Vec::with_capacity(width.min(indices.len()));
         let mut selected_bytes: u64 = 0;
-        for &idx in &indices {
+        for &idx in indices {
             if selected.len() == width {
                 break;
             }
@@ -3827,7 +3912,7 @@ fn select_protected_snapshot_merge_tier(
         };
     }
 
-    ProtectedMergeSelection::NoQualifyingTier
+    no_qualifying_tier()
 }
 
 /// Outcome of [`select_protected_snapshot_merge_tier`], distinguishing "nothing
@@ -3837,8 +3922,13 @@ fn select_protected_snapshot_merge_tier(
 enum ProtectedMergeSelection {
     /// Consolidate these runs: always at least 2, oldest-first.
     Merge(Vec<(String, i64)>),
-    /// No size tier has accumulated `min_runs` same-size runs yet.
-    NoQualifyingTier,
+    /// No size tier this pass may merge has accumulated `min_runs` same-size runs.
+    NoQualifyingTier {
+        /// Runs per size tier (`tier -> runs`) across every input, including tiers
+        /// at or above a running merge's tier, which this pass may not select.
+        /// `min_runs` applies to each tier on its own, never to the total.
+        runs_per_tier: std::collections::BTreeMap<u32, usize>,
+    },
     /// A tier has enough runs, but its two OLDEST do not fit `max_pass_bytes`, so
     /// the oldest-first walk cannot form a pair and the pass declines.
     ///
@@ -3855,12 +3945,13 @@ enum ProtectedMergeSelection {
     },
 }
 
+#[cfg(test)]
 impl ProtectedMergeSelection {
     /// The runs to merge, or empty for either declining outcome.
     fn into_inputs(self) -> Vec<(String, i64)> {
         match self {
             Self::Merge(inputs) => inputs,
-            Self::NoQualifyingTier | Self::OverPassBudget { .. } => Vec::new(),
+            Self::NoQualifyingTier { .. } | Self::OverPassBudget { .. } => Vec::new(),
         }
     }
 }
@@ -4796,18 +4887,34 @@ impl RewriteLayout {
     }
 }
 
-/// How a clustering sort consumes its input.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ClusterSortSpan {
-    /// Sort the whole stream as one run, so the output is globally ordered by
-    /// the curve key. Required wherever the resulting files are read back
-    /// through the ordinary scan path.
-    Global,
-    /// Split into byte-capped runs, each sorted independently. Caps per-run
-    /// memory and first-batch latency, but curve key ranges overlap ACROSS runs,
-    /// so the result is not globally ordered — only safe where the files
-    /// advertise no ordering, as cold-tier files do.
-    BoundedRuns,
+/// The order a rewrite writes its rows in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RewriteOrder {
+    /// Whatever order the scan produces.
+    Unordered,
+    /// Lexicographic, by `sort_columns` entries (see
+    /// `util::stream_utils::sort_plan`).
+    Sorted(Vec<String>),
+    /// Along the Hilbert curve over the columns at these schema indices.
+    Curve(Vec<usize>),
+}
+
+impl RewriteOrder {
+    /// A curve over `curve_indices` when there are any, else a sort by
+    /// `sort_columns` when there are any, else no order.
+    fn new(curve_indices: Vec<usize>, sort_columns: Vec<String>) -> Self {
+        if !curve_indices.is_empty() {
+            Self::Curve(curve_indices)
+        } else if !sort_columns.is_empty() {
+            Self::Sorted(sort_columns)
+        } else {
+            Self::Unordered
+        }
+    }
+
+    fn is_ordered(&self) -> bool {
+        !matches!(self, Self::Unordered)
+    }
 }
 
 /// In-memory bytes of rows each shard of a whole-table replace sorts by the
@@ -9187,8 +9294,8 @@ impl CayenneTableProvider {
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::RwLock::new(())),
             protected_merge_claims: Arc::new(ParkingMutex::new(ProtectedMergeClaims::default())),
-            post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
-            orphan_dv_sweep_state: Arc::new(AtomicU8::new(ORPHAN_DV_SWEEP_IDLE)),
+            post_write_compaction_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
+            orphan_dv_sweep_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
             footprint_sample_gate: Arc::new(SampleGate::default()),
             data_dir_sample_gate: Arc::new(SampleGate::default()),
             in_memory_sample_gate: Arc::new(SampleGate::default()),
@@ -10094,10 +10201,16 @@ impl CayenneTableProvider {
             let snapshot_id = snapshot_id.to_string();
             let schema = Arc::clone(schema);
             handles.push(tokio::spawn(async move {
-                let unit_bytes = unit
-                    .iter()
-                    .map(|b| b.get_array_memory_size() as u64)
-                    .fold(0u64, u64::saturating_add);
+                // The unit is fully materialized, so its size is the resident
+                // memory of its batches with each Arrow allocation counted once.
+                // A PK-shard unit was rebuilt by the shard split
+                // (`filter_record_batch` allocates), so it shares nothing and the
+                // count matches its per-reference sum. The inline-corpus unit comes
+                // straight out of the metastore's IPC blobs, where every buffer of an
+                // entry points into one body allocation: a per-reference sum bills
+                // that allocation once per buffer and fans the unit out into ~its
+                // buffer count in files.
+                let unit_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&unit);
                 let estimated_bytes = Some(unit_bytes);
                 let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                     &[unit],
@@ -10145,13 +10258,14 @@ impl CayenneTableProvider {
     }
 
     /// The per-shard encode fan-out for the concurrent checkpoint encode: how many
-    /// files a shard of `unit_bytes` (uncompressed Arrow) must split into so no
-    /// output file exceeds the target Vortex file size — `ceil(unit_bytes / target)`,
-    /// min 1. A shard no larger than one target file stays a single file; a larger
-    /// shard rolls into just enough files to honor the target. Arrow over-counts vs
-    /// the compressed on-disk size, the safe direction (files land under the target
-    /// with margin). `write_to_snapshot` further clamps the result to the write
-    /// budget. `target_size_bytes == 0` means size rolling is DISABLED (one file per
+    /// files a shard of `unit_bytes` (resident Arrow bytes, each allocation counted
+    /// once) must split into so no output file exceeds the target Vortex file size
+    /// — `ceil(unit_bytes / target)`, min 1. A shard no larger than one target file
+    /// stays a single file; a larger shard rolls into just enough files to honor the
+    /// target. Resident Arrow still over-counts vs the compressed on-disk size, the
+    /// safe direction (files land under the target with margin).
+    /// `write_to_snapshot` further clamps the result to the write budget.
+    /// `target_size_bytes == 0` means size rolling is DISABLED (one file per
     /// write is intended — see the config warning), so the shard stays a single
     /// file, matching the pre-roll behavior.
     fn shard_encode_target_partitions(unit_bytes: u64, target_size_bytes: usize) -> usize {
@@ -10191,15 +10305,20 @@ impl CayenneTableProvider {
     ///   lower bound on it) supply a real estimate; only genuinely-unsized
     ///   streams fall back here.
     ///
-    /// **Units (deliberately asymmetric).** `estimated_bytes` is *uncompressed
-    /// in-memory Arrow* size (`RecordBatch::get_array_memory_size`), while
-    /// `target_size_bytes` is the target *on-disk Vortex* file size. Vortex
-    /// compresses, so `arrow_bytes / vortex_target` over-counts the files a write
-    /// will actually produce — i.e. it biases toward *more* shards. That is the
-    /// intended, safe direction: the surplus is bounded by `write_concurrency`,
-    /// extra encode parallelism is free on a multi-core host, and the transient
-    /// sub-target files it emits are merged by compaction (which is pinned to a
-    /// single output shard). The opposite error — discounting for compression and
+    /// **Units (deliberately asymmetric).** `estimated_bytes` is the *uncompressed
+    /// resident Arrow* size — what the batches hold in memory, each physical
+    /// allocation counted once
+    /// ([`RetainedBytes`](arrow_tools::batch_bytes::RetainedBytes)) rather than
+    /// once per buffer referencing it — while `target_size_bytes` is the target
+    /// *on-disk Vortex* file size. Vortex compresses, so `arrow_bytes /
+    /// vortex_target` over-counts the files a write will actually produce — i.e. it
+    /// biases toward *more* shards. That is the intended, safe direction: the
+    /// surplus is bounded by `write_concurrency`, extra encode parallelism is free
+    /// on a multi-core host, and the transient sub-target files it emits are merged
+    /// by compaction (which is pinned to a single output shard). Counting one
+    /// allocation once per buffer referencing it would be a different error
+    /// entirely — not a bias but a multiple, so a sub-target write fans out to the
+    /// concurrency ceiling. The opposite error — discounting for compression and
     /// then *under*-sharding a genuinely large, incompressible write into one
     /// oversized, serially-encoded file — is the costly one, so we do not apply a
     /// compression factor here. A faithful on-disk count would require an
@@ -10247,8 +10366,8 @@ impl CayenneTableProvider {
         // A sorted write must still go through ONE writer, or the global order
         // is scattered across shard files and each file's zone maps span the
         // whole range — forfeiting exactly the pruning the sort was for. Every
-        // stream that goes through `sort_stream_by_columns` or
-        // `cluster_sort_stream` states that with [`EncodeFanOut::Serial`], which
+        // stream ordered by `order_rewrite_plan` or clustered by
+        // `cluster_runs_stream` states that with [`EncodeFanOut::Serial`], which
         // is handled above. A low `session_target_partitions` is NOT a
         // substitute: it bounds only the unset default, while a configured
         // `cayenne_write_concurrency` is honored above it (see
@@ -11221,7 +11340,7 @@ impl CayenneTableProvider {
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
             protected_merge_claims: Arc::clone(&self.protected_merge_claims),
-            post_write_compaction_scheduled: Arc::clone(&self.post_write_compaction_scheduled),
+            post_write_compaction_state: Arc::clone(&self.post_write_compaction_state),
             orphan_dv_sweep_state: Arc::clone(&self.orphan_dv_sweep_state),
             footprint_sample_gate: Arc::clone(&self.footprint_sample_gate),
             data_dir_sample_gate: Arc::clone(&self.data_dir_sample_gate),
@@ -12290,6 +12409,22 @@ impl CayenneTableProvider {
             }
         }
 
+        self.record_table_wide_pk_keys(keys, location, sequence);
+    }
+
+    /// The table-wide half of [`Self::record_pk_keys_with_location`], for a writer
+    /// whose keys are already in the per-shard index: the in-memory sharded apply
+    /// grows that index itself, and records here what the durable path and per-key
+    /// OCC read.
+    pub(crate) fn record_table_wide_pk_keys(
+        &self,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        sequence: i64,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
         let max_bytes = self.effective_single_keyset_budget();
         let mut guard = self.pk_keyset_cache.lock();
         // Take ownership so an over-budget Exact keyset can be replaced by a
@@ -14996,41 +15131,61 @@ impl CayenneTableProvider {
         ))
     }
 
-    pub(crate) async fn validate_and_append_sharded(
+    /// Split every raw batch of an apply into the tier's N per-shard sub-batches
+    /// (order-preserving Arrow filter on the `OwnedRow` shard hash), and measure
+    /// what each shard will hold.
+    ///
+    /// `per_shard_batches[s]` accumulates shard s's sub-batches in apply order;
+    /// empty sub-batches are dropped (an empty append is a no-op). At N>1 the
+    /// filter copies every column into fresh allocations, so the shards share
+    /// nothing with the raw batches or with each other, and each carries its own
+    /// buffer padding and array bookkeeping: their bytes can sum to more than the
+    /// raw batches'. The returned total is therefore what the caller must budget
+    /// and reserve — the same figure the shard segments record and a checkpoint
+    /// later releases, so reservation and release net to zero.
+    pub(crate) fn split_apply_by_pk_shard(
         &self,
-        batches: Vec<RecordBatch>,
-        mut sharded_index: Option<CheckedOutShardedPkIndex>,
+        batches: &[RecordBatch],
         pk_indices: &[usize],
         converter: &RowConverter,
-        on_conflict: &OnConflict,
-        total_incoming_bytes: u64,
-    ) -> Result<ShardedApplyResult> {
+    ) -> Result<ShardedApplyBatches> {
         let n = self.mem_tier.shard_count().max(1);
-
-        // 1. Split every raw batch into N per-shard sub-batches (order-preserving
-        //    Arrow filter on the OwnedRow shard hash).
-        //    `per_shard_batches[s]` accumulates shard s's sub-batches in apply
-        //    order. Empty sub-batches are dropped (an empty append is a no-op).
         let mut per_shard_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
-        let mut per_shard_bytes: Vec<u64> = vec![0; n];
-        for batch in &batches {
+        for batch in batches {
             let shards = Self::split_batch_by_pk_shard(batch, pk_indices, converter, n)?;
             for (s, sub) in shards.into_iter().enumerate() {
                 if sub.num_rows() == 0 {
                     continue;
                 }
-                per_shard_bytes[s] =
-                    per_shard_bytes[s].saturating_add(sub.get_array_memory_size() as u64);
                 per_shard_batches[s].push(sub);
             }
         }
-        // Guard against rounding loss: ensure the byte reservation accounting sums
-        // back to the whole-apply figure the caller reserved (assign any remainder
-        // to shard 0). At N=1 `per_shard_bytes[0]` is the whole apply.
-        let assigned: u64 = per_shard_bytes.iter().fold(0, |a, b| a.saturating_add(*b));
-        if assigned < total_incoming_bytes && !per_shard_bytes.is_empty() {
-            per_shard_bytes[0] = per_shard_bytes[0].saturating_add(total_incoming_bytes - assigned);
-        }
+        let per_shard_bytes = per_shard_batches
+            .iter()
+            .map(|shard| arrow_tools::batch_bytes::RetainedBytes::of(shard))
+            .collect();
+        Ok(ShardedApplyBatches {
+            per_shard_batches,
+            per_shard_bytes,
+        })
+    }
+
+    /// Validate and append an apply already split by
+    /// [`Self::split_apply_by_pk_shard`], whose
+    /// [`ShardedApplyBatches::total_bytes`] the caller has reserved against the
+    /// global budget.
+    pub(crate) async fn validate_and_append_sharded(
+        &self,
+        split: ShardedApplyBatches,
+        mut sharded_index: Option<CheckedOutShardedPkIndex>,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        on_conflict: &OnConflict,
+    ) -> Result<ShardedApplyResult> {
+        let ShardedApplyBatches {
+            per_shard_batches,
+            per_shard_bytes,
+        } = split;
 
         // 2. Validate each shard CONCURRENTLY against ITS existence view, building
         //    that shard's `OnConflictDeletions`. The shards are independent — a key
@@ -15076,9 +15231,12 @@ impl CayenneTableProvider {
             let index_ref = sharded_index.as_ref().map(CheckedOutShardedPkIndex::index);
             let non_empty_shards = per_shard_batches.iter().filter(|b| !b.is_empty()).count();
             // Total rows in this apply. Split preserves every row (only empty
-            // sub-batches are dropped), so the incoming batches sum to the same
-            // count the shards do — computed here without re-touching the data.
-            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            // sub-batches are dropped), so the shards sum to the incoming count.
+            let total_rows: usize = per_shard_batches
+                .iter()
+                .flatten()
+                .map(RecordBatch::num_rows)
+                .sum();
             if non_empty_shards <= 1 || total_rows <= SMALL_APPLY_INLINE_ROWS {
                 // INLINE: either ≤1 non-empty shard (no cross-shard parallelism to
                 // exploit) or a small enough apply that the per-shard OS-thread
@@ -15122,7 +15280,7 @@ impl CayenneTableProvider {
                     // a lazy spawn-then-join iterator chain would start each thread
                     // only as the join step pulled it, validating the shards one at a
                     // time instead of together.
-                    let mut handles: Vec<Option<_>> = Vec::with_capacity(n);
+                    let mut handles: Vec<Option<_>> = Vec::with_capacity(per_shard_batches.len());
                     for (s, shard_batches) in per_shard_batches.into_iter().enumerate() {
                         if shard_batches.is_empty() {
                             handles.push(None);
@@ -15230,6 +15388,19 @@ impl CayenneTableProvider {
         // this apply is about to hide/supersede. The serial feed after
         // `try_join_all` reuses this epoch (dense applier chain).
         let ivm_epoch = self.pre_bump_maintained_aggregate_epoch_for_concurrent_apply();
+        // A shard that validation left with neither rows nor deletions (a
+        // `DoNothing` apply whose keys all exist) appends no segment, so nothing
+        // would ever record — or a checkpoint release — the bytes reserved for it;
+        // they are handed back once the appends land. Memory mode reserves nothing
+        // globally.
+        let unappended_bytes = per_shard_validated
+            .iter()
+            .zip(&per_shard_bytes)
+            .filter(|((filtered_batches, deletions, _), _)| {
+                !filtered_batches.iter().any(|b| b.num_rows() > 0)
+                    && deletions.total_superseded() == 0
+            })
+            .fold(0u64, |total, (_, bytes)| total.saturating_add(*bytes));
         let append_futures = per_shard_validated.iter().enumerate().filter_map(
             |(s, (filtered_batches, deletions, kept))| {
                 let has_rows = filtered_batches.iter().any(|b| b.num_rows() > 0);
@@ -15257,6 +15428,11 @@ impl CayenneTableProvider {
         // The per-shard `MemTier::epoch`s returned here are NOT the slot-ack axis at
         // N>1 (incommensurable); they are drained to surface append errors only.
         futures::future::try_join_all(append_futures).await?;
+        // Only after every append succeeded: on an append error the caller
+        // releases the whole reservation itself.
+        if unappended_bytes > 0 && !self.is_memory_resident_mode() {
+            crate::provider::mem_tier_budget::release_bytes(unappended_bytes);
+        }
         // The relation and published epoch now agree. Registry maintenance can
         // remain asynchronous: scans at the new epoch fall back until it catches up.
         drop(ivm_visibility_guard);
@@ -15357,6 +15533,15 @@ impl CayenneTableProvider {
         //    account apply back-pressure is the lesser evil; bounding a
         //    `DoNothing` keyset needs a sound exact eviction, not a bloom.
         if !validated_keys.is_empty() {
+            // The appends above put these keys in the per-shard index. Record them in
+            // the table-wide index too, as the serial mem-tier apply records its keys:
+            // it is what the durable path validates against (a burst the in-memory tier
+            // cannot take, or the overload fallback) and what per-key OCC reads, and a
+            // copy missing a key this apply wrote reads a durable upsert of it as a new
+            // key and leaves two live rows. `MEM_TIER` is a key-based location, so it
+            // still hides the row after a checkpoint moves it into a file.
+            let record_seq = self.sequence_high_water().await;
+            self.record_table_wide_pk_keys(&validated_keys, &RowLocation::MEM_TIER, record_seq);
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             // Gate on the variant, not just the tally: only an `Exact` index grows
             // per recorded key and only it can be degraded, so this fires on the
@@ -17598,67 +17783,6 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Sort a record batch stream using `DataFusion`'s `SortExec` for optimal performance.
-    ///
-    /// This is used during refresh operations to sort the **entire refresh corpus** before it's
-    /// chunked and written to files, ensuring optimal zone map statistics across all Vortex files.
-    ///
-    /// # External Sort with Disk Spilling
-    ///
-    /// Uses `DataFusion`'s `SortExec` which provides:
-    /// - **Automatic disk spilling**: Handles datasets larger than available memory
-    /// - **Streaming external merge sort**: Processes data incrementally without loading all into RAM
-    /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2 on amd64)
-    /// - **Configurable spill compression**: Supports zstd, `lz4_frame`, or uncompressed spill files
-    /// - **Memory management**: Integrates with `DataFusion`'s memory pool and reservation system
-    ///
-    /// # Configuration
-    ///
-    /// Spill behavior is controlled by runtime configuration:
-    /// - `sort_spill_reservation_bytes`: Memory reserved for merge operations (default: 10MB)
-    /// - `sort_in_place_threshold_bytes`: Size below which data is sorted in-place (default: 1MB)
-    /// - `spill_compression`: Compression codec for spill files (uncompressed, `lz4_frame`, zstd)
-    /// - `temp_directory`: Directory for spill files (configured in runtime)
-    ///
-    /// # Performance
-    ///
-    /// - Small datasets (<1MB): Sorted in-place in memory, no allocations
-    /// - Medium datasets (1MB-available memory): In-memory sort with single merge
-    /// - Large datasets (>available memory): External merge sort with disk spilling
-    /// - All cases use SIMD-optimized Arrow kernels and parallel sorting via rayon
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only if the sort execution itself fails. Columns missing
-    /// from the stream schema (or otherwise unparseable) are skipped with a
-    /// warning and the stream is returned unsorted (see
-    /// `util::stream_utils::sort_stream`) — never surfaced as an error.
-    pub(crate) fn sort_stream_by_columns(
-        &self,
-        stream: SendableRecordBatchStream,
-        sort_columns: &[String],
-        task_ctx: &Arc<datafusion_execution::TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if sort_columns.is_empty() {
-            return Ok(stream);
-        }
-
-        // Reuse the caller's task context — the bounded compaction/query memory
-        // pool (and spill dir) the rewrite scan already runs under. Building a
-        // fresh `TaskContext::default()` here would use an UNBOUNDED memory pool,
-        // so `SortExec` would never spill and a large default-on rewrite could OOM
-        // the process, bypassing the `runtime.query.memory_limit` contract.
-        tracing::debug!(
-            "Sorting data by columns {:?} for table {} using DataFusion SortExec with disk spilling support",
-            sort_columns,
-            self.table_metadata.table_name
-        );
-
-        let sorted_stream = util::stream_utils::sort_stream(stream, sort_columns, task_ctx)?;
-
-        Ok(sorted_stream)
-    }
-
     /// Orders a whole-table replace by the table's configured `sort_columns`,
     /// returning the stream to write and the write fan-out that order allows.
     ///
@@ -17684,8 +17808,8 @@ impl CayenneTableProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error only if the sort execution itself fails; see
-    /// [`Self::sort_stream_by_columns`] for how unusable columns are handled.
+    /// Returns an error only if the ordering plan fails to build or execute;
+    /// see `util::stream_utils::sort_plan` for how unusable columns are handled.
     pub(crate) fn sort_overwrite_input(
         &self,
         data: SendableRecordBatchStream,
@@ -17695,29 +17819,34 @@ impl CayenneTableProvider {
         usize,
         super::delta_encoding::WritePolicy,
     )> {
-        if self.context.has_cluster_by() {
-            let ctx = self.create_session_context();
-            let clustered = self.cluster_sort_stream(
-                data,
-                self.configured_clustering_indices(),
-                &ctx.task_ctx(),
-                ClusterSortSpan::Global,
-            )?;
-            return Ok((clustered, 1, rewrite_write_policy(true)));
-        }
-        if !self.context.sort_columns_are_authoritative() {
+        let order = if self.context.has_cluster_by() {
+            RewriteOrder::Curve(self.configured_clustering_indices())
+        } else if self.context.sort_columns_are_authoritative() {
+            RewriteOrder::Sorted(self.context.sort_columns().to_vec())
+        } else {
+            RewriteOrder::Unordered
+        };
+        if !order.is_ordered() {
             return Ok((data, target_partitions, rewrite_write_policy(false)));
         }
-
-        let sort_columns = self.context.sort_columns().to_vec();
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
-            sort_columns = ?sort_columns,
-            "Sorting whole-table replace before writing the new snapshot"
+            order = ?order,
+            "Ordering whole-table replace before writing the new snapshot"
         );
+        // The replace arrives as one stream, so this is one spilling sort, as
+        // it always was: dealing it over more partitions would need a
+        // round-robin `RepartitionExec` in front of the sorts, which can
+        // deadlock a spilling sort under memory pressure.
         let ctx = self.create_session_context();
-        let sorted = self.sort_stream_by_columns(data, &sort_columns, &ctx.task_ctx())?;
-        Ok((sorted, 1, rewrite_write_policy(true)))
+        let task_ctx = ctx.task_ctx();
+        let input = util::stream_utils::stream_plan(data);
+        let ordered = self.order_rewrite_plan(input, &order, &task_ctx)?;
+        Ok((
+            datafusion_physical_plan::execute_stream(ordered, task_ctx)?,
+            1,
+            rewrite_write_policy(true),
+        ))
     }
 
     /// How a whole-table replace routes its rows into key-range files instead of
@@ -18313,6 +18442,13 @@ impl CayenneTableProvider {
             !self.context.has_sort_columns()
         );
 
+        // Configured sort_columns win; default empty uses hottest observed filters (F4).
+        // An empty list resolves to no key at all, and the rows are then written
+        // in scan order — so whether this rewrite is sorted is a property of the
+        // resolved list, not of the entry point.
+        let order = RewriteOrder::new(clustering, rewrite_sort_columns);
+        let rewrite_is_sorted = order.is_ordered();
+
         // Create a session context and scan the logical table view to get all
         // currently visible rows. The rewrite commit clears deletion/protected
         // snapshot state, so the input stream must have already applied it.
@@ -18323,18 +18459,7 @@ impl CayenneTableProvider {
         // can run while it sorts, and the snapshot current at commit time would
         // then be the overwrite's.
         let replaced_snapshot_id = self.get_current_snapshot_id();
-        let (stream, _) = self.visible_file_stream_for_rewrite(&ctx).await?;
-
-        // Configured sort_columns win; default empty uses hottest observed filters (F4).
-        // An empty list resolves to no key at all, and `sort_stream_by_columns`
-        // then hands the stream back untouched — so whether this rewrite is
-        // sorted is a property of the resolved list, not of the entry point.
-        let rewrite_is_sorted = !clustering.is_empty() || !rewrite_sort_columns.is_empty();
-        let sorted_stream = if clustering.is_empty() {
-            self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?
-        } else {
-            self.cluster_sort_stream(stream, clustering, &ctx.task_ctx(), ClusterSortSpan::Global)?
-        };
+        let (sorted_stream, _) = self.visible_file_stream_for_rewrite(&ctx, &order).await?;
 
         // Write sorted data to a new snapshot directory. Because SortExec lazily
         // reads input files via DataSourceExec, writing to a separate directory
@@ -19261,18 +19386,19 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    pub(crate) fn schedule_post_write_compaction(&self) {
+    /// Whether a write-driven compaction pass is owed: enough new files since
+    /// the last compaction, or a protected-snapshot count/age trigger.
+    fn post_write_compaction_due(&self) -> bool {
         let cfg = self.context.compaction_picker_config();
-        let maintenance_trigger = self.protected_snapshot_maintenance_trigger();
-        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
-            && maintenance_trigger.is_none()
-        {
-            return;
-        }
+        self.new_files_since_last_compaction.load(Ordering::Relaxed) >= cfg.trigger_files
+            || self.protected_snapshot_maintenance_trigger().is_some()
+    }
 
-        if self
-            .post_write_compaction_scheduled
-            .swap(true, Ordering::AcqRel)
+    pub(crate) fn schedule_post_write_compaction(&self) {
+        // A request raised while a pass runs is recorded on it rather than
+        // dropped: it is usually the append that aborts that pass.
+        if !self.post_write_compaction_due()
+            || !coalesced_task_try_claim(&self.post_write_compaction_state)
         {
             return;
         }
@@ -19282,35 +19408,35 @@ impl CayenneTableProvider {
         // full snapshot rewrite) on the dedicated compaction runtime, isolated
         // from the query (compute) and CDC (refresh) runtimes.
         super::compaction::spawn_compaction(async move {
-            // Clear the coalescing flag on ANY exit — normal completion, early
-            // return, a panic during unwind, or the task being dropped on abort —
-            // so a stuck flag can never permanently suppress future compaction
-            // scheduling or hang `drain_in_flight_maintenance`.
-            struct ClearOnDrop(Arc<AtomicBool>);
-            impl Drop for ClearOnDrop {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
-                }
-            }
-            let _clear = ClearOnDrop(Arc::clone(&table.post_write_compaction_scheduled));
+            let mut episode = CoalescedTaskEpisode::new(&table.post_write_compaction_state);
 
             tokio::task::yield_now().await;
-            let result = super::compaction::CompactionRunner::run_compaction_trigger(&table).await;
-
-            match result {
-                Ok(true) => {
-                    tracing::debug!(
-                        table = table.table_metadata.table_name.as_str(),
-                        "Post-write compaction pass completed"
-                    );
+            let mut due = true;
+            loop {
+                if due {
+                    match super::compaction::CompactionRunner::run_compaction_trigger(&table).await
+                    {
+                        Ok(true) => {
+                            tracing::debug!(
+                                table = table.table_metadata.table_name.as_str(),
+                                "Post-write compaction pass completed"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                table = table.table_metadata.table_name.as_str(),
+                                "Post-write compaction trigger failed: {e}"
+                            );
+                        }
+                    }
                 }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        table = table.table_metadata.table_name.as_str(),
-                        "Post-write compaction trigger failed: {e}"
-                    );
+                if episode.try_finish() {
+                    break;
                 }
+                // A pass that committed has reset the file credit, so a request
+                // it already served runs nothing.
+                due = table.post_write_compaction_due();
             }
         });
     }
@@ -19323,7 +19449,7 @@ impl CayenneTableProvider {
     /// per table on the dedicated compaction runtime — mirroring
     /// [`Self::schedule_post_write_compaction`]. A signal raised while that worker
     /// runs is RECORDED rather than dropped
-    /// ([`orphan_dv_sweep_state_after_signal`]): the worker consumes it and takes
+    /// ([`coalesced_task_state_after_signal`]): the worker consumes it and takes
     /// another pass, so the newest floor is always swept even if the table then
     /// goes idle.
     ///
@@ -19333,14 +19459,9 @@ impl CayenneTableProvider {
     /// publisher's `listing_fence` write guard anyway) and misreports when cleanup
     /// became due.
     pub(crate) fn schedule_orphan_dv_sweep(&self) {
-        let previous = self.orphan_dv_sweep_state.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            orphan_dv_sweep_state_after_signal,
-        );
         // Only the idle -> running winner owns the worker; every other signal has
         // been recorded on the worker that is already running.
-        if previous != Ok(ORPHAN_DV_SWEEP_IDLE) {
+        if !coalesced_task_try_claim(&self.orphan_dv_sweep_state) {
             maintenance_metrics::track_maintenance(
                 self.table_metadata.table_name.as_str(),
                 MaintenanceOp::OrphanDvSweep,
@@ -19351,35 +19472,7 @@ impl CayenneTableProvider {
 
         let table = self.clone_for_write();
         super::compaction::spawn_compaction(async move {
-            // A worker that ends abnormally — a panic during unwind, or the task
-            // being dropped on abort — never reaches the exchange below, so
-            // republish idle here or a stuck state would permanently suppress
-            // future sweeps on a long-lived provider AND hang
-            // `drain_in_flight_maintenance`. Disarmed on the clean exit path so
-            // this cannot stomp a state a LATER worker already owns.
-            //
-            // This deliberately drops a signal that arrived before the abnormal
-            // exit rather than re-arming a worker from `Drop`: the abort case IS
-            // runtime shutdown, where spawning panics inside an unwind. Losing one
-            // edge is bounded — the startup pass replays it on the next open, which
-            // is the same repair a crash between a publication and its signal
-            // needs — whereas leaving the state dirty with no worker wedges the
-            // sweep permanently.
-            struct ResetOnAbnormalExit {
-                state: Arc<AtomicU8>,
-                armed: bool,
-            }
-            impl Drop for ResetOnAbnormalExit {
-                fn drop(&mut self) {
-                    if self.armed {
-                        self.state.store(ORPHAN_DV_SWEEP_IDLE, Ordering::Release);
-                    }
-                }
-            }
-            let mut reset = ResetOnAbnormalExit {
-                state: Arc::clone(&table.orphan_dv_sweep_state),
-                armed: true,
-            };
+            let mut episode = CoalescedTaskEpisode::new(&table.orphan_dv_sweep_state);
 
             tokio::task::yield_now().await;
             loop {
@@ -19389,31 +19482,9 @@ impl CayenneTableProvider {
                         ORPHAN_DV_SWEEP_MAX_BATCH,
                     )
                     .await;
-                // End the episode only by atomically claiming a CLEAN running
-                // state. A signal raised anywhere up to this point has already
-                // flipped the state to dirty, so the exchange fails and the worker
-                // sweeps again — the edge cannot be lost in the gap between the
-                // last pass and the worker exiting.
-                if table
-                    .orphan_dv_sweep_state
-                    .compare_exchange(
-                        ORPHAN_DV_SWEEP_RUNNING,
-                        ORPHAN_DV_SWEEP_IDLE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    reset.armed = false;
+                if episode.try_finish() {
                     break;
                 }
-                // Dirty: consume the signal and sweep again. A signal that lands
-                // between the failed exchange and this store finds the state
-                // already dirty and adds nothing — the pass it wants starts after
-                // it, which is exactly what it asked for.
-                table
-                    .orphan_dv_sweep_state
-                    .store(ORPHAN_DV_SWEEP_RUNNING, Ordering::Release);
             }
         });
     }
@@ -19467,8 +19538,8 @@ impl CayenneTableProvider {
             // each mark themselves scheduled BEFORE spawning and clear that mark
             // when done, so spin until all are clear — no scheduled-or-running
             // detached pass remains.
-            while self.post_write_compaction_scheduled.load(Ordering::Acquire)
-                || self.orphan_dv_sweep_state.load(Ordering::Acquire) != ORPHAN_DV_SWEEP_IDLE
+            while self.post_write_compaction_state.load(Ordering::Acquire) != COALESCED_TASK_IDLE
+                || self.orphan_dv_sweep_state.load(Ordering::Acquire) != COALESCED_TASK_IDLE
                 || self.snapshot_cleanup_scheduled.load(Ordering::Acquire)
                 || self.inline_checkpoint_scheduled.load(Ordering::Acquire)
             {
@@ -21818,6 +21889,27 @@ impl CayenneTableProvider {
         // exit below reports itself, so the two together account for each pass
         // exactly once.
         let table_name = self.table_metadata.table_name.as_str();
+        // A `mode: memory` table keeps every row in the RAM tier and has no
+        // durable snapshot to consolidate. The scan below would read the tier
+        // into a new snapshot while the tier stays visible, so every row would
+        // come back twice.
+        if self.is_memory_resident_mode() {
+            maintenance_metrics::track_compaction(
+                table_name,
+                CompactionKind::Full,
+                CompactionOutcome::DeclinedNotConfigured,
+            );
+            return Ok(false);
+        }
+        // Encode the RAM tier before either arm takes `write_lock`, so applies
+        // keep flowing while it is written. The drain under the lock below then
+        // only has to catch rows that landed since. A caller that hands over
+        // `write_lock` already excludes applies, and a sharded tier's checkpoint
+        // would wait on that same lock, so the drain alone covers it.
+        if held_position_guards.is_none() && self.is_cdc_memory_mode() && !self.mem_tier.is_empty()
+        {
+            self.checkpoint_mem_tier().await?;
+        }
         let compaction_start = std::time::Instant::now();
 
         // CONVERGENCE FENCE — prevents a delete/upsert that races this rewrite
@@ -21915,89 +22007,6 @@ impl CayenneTableProvider {
         // `write_lock` only for its capture and publishes under `listing_fence`
         // alone), so a blind protected-snapshot clear would drop rows the scan
         // never folded in.
-        let (mut stream, scope, generation_before, snapshot_id_before): (
-            SendableRecordBatchStream,
-            RewriteScope,
-            u64,
-            String,
-        ) = if uses_position_deletes {
-            let snapshot_id_before = self.get_current_snapshot_id();
-            // Drain the inline memtable FIRST, for the same reason the
-            // key-delete arm does: `visible_file_stream_for_rewrite` also
-            // checkpoints inline data internally, which would publish a
-            // protected snapshot BETWEEN the two folded-set reads below and
-            // spuriously abort every pass on a table with inline data. After
-            // this the internal checkpoint is a no-op. Safe under the
-            // `write_lock` this arm already holds for the whole rewrite.
-            if self.cached_inlined_row_count() > 0 {
-                self.checkpoint_inlined_data().await?;
-            }
-            let folded_before = self.protected_snapshot_ids();
-            let (stream, generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
-            if folded_before != self.protected_snapshot_ids() {
-                tracing::debug!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    "Aborting full rewrite: protected-snapshot set changed during scan \
-                     (concurrent checkpoint); will retry on the next trigger",
-                );
-                maintenance_metrics::track_compaction(
-                    table_name,
-                    CompactionKind::Full,
-                    CompactionOutcome::AbortedConcurrentChange,
-                );
-                return Ok(false);
-            }
-            (
-                stream,
-                RewriteScope::AllTombstonesFoldedSnapshots {
-                    folded: folded_before,
-                },
-                generation_before,
-                snapshot_id_before,
-            )
-        } else {
-            let _capture_guard = self.write_lock_arc().lock_owned().await;
-            // Defense-in-depth for table replacement while this pass encodes.
-            // Promotion is serialized by `compaction_lock`; overwrite/reopened
-            // providers may still flip `current_snapshot_id` without moving the
-            // current-dir generation, so revalidate before catalog publish.
-            let snapshot_id_before = self.get_current_snapshot_id();
-            if self.cached_inlined_row_count() > 0 {
-                self.checkpoint_inlined_data().await?;
-            }
-            let folded_before = self.protected_snapshot_ids();
-            let (stream, generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
-            let cutoff = self.sequence_high_water().await;
-            let folded_after = self.protected_snapshot_ids();
-            if folded_before != folded_after {
-                // A concurrent finalize published a protected snapshot during the
-                // scan; we can no longer tell which snapshots the scan folded.
-                // Abort before any new snapshot dir is created; retry next trigger.
-                tracing::debug!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    "Aborting full rewrite: protected-snapshot set changed during scan \
-                     (concurrent finalize); will retry on the next trigger",
-                );
-                maintenance_metrics::track_compaction(
-                    table_name,
-                    CompactionKind::Full,
-                    CompactionOutcome::AbortedConcurrentChange,
-                );
-                return Ok(false);
-            }
-            (
-                stream,
-                RewriteScope::Fenced {
-                    cutoff,
-                    folded: folded_before,
-                },
-                generation_before,
-                snapshot_id_before,
-            )
-        };
-
         // Configured sort_columns win; otherwise (default empty) sort by the
         // hottest observed filter columns so selective scans prune zone maps
         // without spicepod setup (F4 adaptive cold layout).
@@ -22052,40 +22061,126 @@ impl CayenneTableProvider {
         } else {
             explicit_curve_indices
         };
-        let rewrite_is_curve_ordered = !curve_indices.is_empty();
-        let rewrite_is_sorted = rewrite_is_curve_ordered || !rewrite_sort_columns.is_empty();
-
-        if rewrite_is_curve_ordered {
-            let clustering_columns = if self.context.has_cluster_by() {
-                self.context.cluster_by()
-            } else {
-                &rewrite_sort_columns
-            };
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                clustering_columns = ?clustering_columns,
-                "Clustering compaction rewrite along a curve before writing consolidated output files"
-            );
-            // Global span, NOT byte-bounded runs: this snapshot's files are read
-            // back through the ordinary scan path, and `bounded_sort_stream`
-            // only orders within a run.
-            stream = self.cluster_sort_stream(
-                stream,
-                curve_indices,
-                &ctx.task_ctx(),
-                ClusterSortSpan::Global,
-            )?;
-        } else if rewrite_is_sorted {
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                sort_columns = ?rewrite_sort_columns,
-                auto_from_filters = !self.context.has_sort_columns(),
-                "Sorting compaction rewrite before writing consolidated output files"
-            );
-            stream = self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
+        let order = RewriteOrder::new(curve_indices, rewrite_sort_columns.clone());
+        let rewrite_is_sorted = order.is_ordered();
+        match &order {
+            RewriteOrder::Curve(_) => {
+                let clustering_columns = if self.context.has_cluster_by() {
+                    self.context.cluster_by()
+                } else {
+                    &rewrite_sort_columns
+                };
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    clustering_columns = ?clustering_columns,
+                    "Clustering compaction rewrite along a curve before writing consolidated output files"
+                );
+            }
+            RewriteOrder::Sorted(_) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    sort_columns = ?rewrite_sort_columns,
+                    auto_from_filters = !self.context.has_sort_columns(),
+                    "Sorting compaction rewrite before writing consolidated output files"
+                );
+            }
+            RewriteOrder::Unordered => {}
         }
+        // A global order, NOT byte-bounded runs: this snapshot's files are read
+        // back through the ordinary scan path, which may advertise their order.
+        //
+        // The order is resolved before the scan below so that the scan's stream
+        // is the ordered one: executing it executes the scan, so the rewrite
+        // pins its inputs exactly where the fenced scan does.
+
+        let (stream, scope, generation_before, snapshot_id_before): (
+            SendableRecordBatchStream,
+            RewriteScope,
+            u64,
+            String,
+        ) = if uses_position_deletes {
+            let snapshot_id_before = self.get_current_snapshot_id();
+            // Drain the RAM tier and the inline memtable FIRST, for the same
+            // reason the key-delete arm does: `visible_file_stream_for_rewrite` also
+            // checkpoints inline data internally, which would publish a
+            // protected snapshot BETWEEN the two folded-set reads below and
+            // spuriously abort every pass on a table with inline data. After
+            // this the internal checkpoint is a no-op. Safe under the
+            // `write_lock` this arm already holds for the whole rewrite.
+            self.drain_mem_tier_before_rewrite_scan().await?;
+            if self.cached_inlined_row_count() > 0 {
+                self.checkpoint_inlined_data().await?;
+            }
+            let folded_before = self.protected_snapshot_ids();
+            let (stream, generation_before) =
+                self.visible_file_stream_for_rewrite(&ctx, &order).await?;
+            if folded_before != self.protected_snapshot_ids() {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Aborting full rewrite: protected-snapshot set changed during scan \
+                     (concurrent checkpoint); will retry on the next trigger",
+                );
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionOutcome::AbortedConcurrentChange,
+                );
+                return Ok(false);
+            }
+            (
+                stream,
+                RewriteScope::AllTombstonesFoldedSnapshots {
+                    folded: folded_before,
+                },
+                generation_before,
+                snapshot_id_before,
+            )
+        } else {
+            let _capture_guard = self.write_lock_arc().lock_owned().await;
+            // Defense-in-depth for table replacement while this pass encodes.
+            // Promotion is serialized by `compaction_lock`; overwrite/reopened
+            // providers may still flip `current_snapshot_id` without moving the
+            // current-dir generation, so revalidate before catalog publish.
+            let snapshot_id_before = self.get_current_snapshot_id();
+            self.drain_mem_tier_before_rewrite_scan().await?;
+            if self.cached_inlined_row_count() > 0 {
+                self.checkpoint_inlined_data().await?;
+            }
+            let folded_before = self.protected_snapshot_ids();
+            let (stream, generation_before) =
+                self.visible_file_stream_for_rewrite(&ctx, &order).await?;
+            let cutoff = self.sequence_high_water().await;
+            let folded_after = self.protected_snapshot_ids();
+            if folded_before != folded_after {
+                // A concurrent finalize published a protected snapshot during the
+                // scan; we can no longer tell which snapshots the scan folded.
+                // Abort before any new snapshot dir is created; retry next trigger.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Aborting full rewrite: protected-snapshot set changed during scan \
+                     (concurrent finalize); will retry on the next trigger",
+                );
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionOutcome::AbortedConcurrentChange,
+                );
+                return Ok(false);
+            }
+            (
+                stream,
+                RewriteScope::Fenced {
+                    cutoff,
+                    folded: folded_before,
+                },
+                generation_before,
+                snapshot_id_before,
+            )
+        };
 
         // Compaction is the file-count reduction path. Ordinary appends shard
         // across the session's target partitions for encode throughput, but a
@@ -22423,7 +22518,7 @@ impl CayenneTableProvider {
             // order the scan would advertise. Comparing the lists would pass and
             // claim an ordering the files do not have.
             if !rewrite_sort_columns.is_empty()
-                && !rewrite_is_curve_ordered
+                && !matches!(order, RewriteOrder::Curve(_))
                 && rewrite_sort_columns == self.context.sort_columns()
             {
                 self.current_sorted_snapshot
@@ -22504,6 +22599,21 @@ impl CayenneTableProvider {
         Ok(true)
     }
 
+    /// Checkpoint the in-memory CDC tier before a full rewrite captures its
+    /// scan. The scan reads the tier, but the rewrite's commit replaces only the
+    /// durable snapshot, so a row left in the tier would be visible twice.
+    ///
+    /// The caller holds `write_lock`, so no apply refills the tier before the
+    /// scan; `mem_checkpoint_lock` is taken after it, as cold promotion does. The
+    /// checkpoint publishes a protected snapshot, so this must run before the
+    /// folded-set bracket.
+    async fn drain_mem_tier_before_rewrite_scan(&self) -> Result<()> {
+        if self.is_cdc_memory_mode() && !self.mem_tier.is_empty() {
+            self.checkpoint_mem_tier_holding_write_lock().await?;
+        }
+        Ok(())
+    }
+
     /// Build the consolidation input stream (the full visible scan) and capture
     /// the concurrent-append fence value to verify at commit.
     ///
@@ -22517,17 +22627,75 @@ impl CayenneTableProvider {
     async fn visible_file_stream_for_rewrite(
         &self,
         ctx: &SessionContext,
+        order: &RewriteOrder,
     ) -> Result<(SendableRecordBatchStream, u64)> {
+        let (plan, generation_before) = self.rewrite_scan_plan(ctx).await?;
+        let task_ctx = ctx.task_ctx();
+        let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
+        // Executing the ordered plan executes the scan beneath it (each
+        // operator executes its input when it is executed), so the stream
+        // pins the same scan inputs, at the same point, as the scan alone did.
+        let stream = datafusion_physical_plan::execute_stream(ordered, task_ctx)?;
+        Ok((stream, generation_before))
+    }
+
+    /// The scan plan [`Self::visible_file_stream_for_rewrite`] reads, and the
+    /// current-dir generation sampled before it listed its files. Flushes the
+    /// inline memtable first, so the plan covers every visible row.
+    async fn rewrite_scan_plan(
+        &self,
+        ctx: &SessionContext,
+    ) -> Result<(Arc<dyn ExecutionPlan>, u64)> {
         if self.cached_inlined_row_count() > 0 {
             self.checkpoint_inlined_data().await?;
         }
 
         let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
 
-        let state = ctx.state();
-        let plan = TableProvider::scan(self, &state, None, &[], None).await?;
-        let stream = datafusion_physical_plan::execute_stream(plan, state.task_ctx())?;
-        Ok((stream, generation_before))
+        let plan = TableProvider::scan(self, &ctx.state(), None, &[], None).await?;
+        Ok((plan, generation_before))
+    }
+
+    /// Order `plan` for a rewrite, as one output partition when ordered.
+    ///
+    /// The key (for a curve) is projected in each of `plan`'s partitions,
+    /// concurrently. When the memory pool has room, the sort runs in each
+    /// partition too and a merge combines them; otherwise one spilling sort
+    /// takes the coalesced partitions — see `util::stream_utils::sort_plan`. A
+    /// whole-table pass therefore uses every core of its runtime rather than
+    /// the one draining the result where memory allows, which is what bounds
+    /// how long the rewrite of a position-delete table holds `write_lock`. The order equals a single sort of every row; only rows with
+    /// equal keys may land in a different relative order.
+    ///
+    /// `task_ctx` must be the rewrite session's own: its memory pool is the
+    /// bounded compaction/query pool the scan runs under, which is what makes
+    /// the sorts spill instead of growing past `runtime.query.memory_limit`
+    /// (a fresh `TaskContext::default()` has an unbounded pool).
+    fn order_rewrite_plan(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        order: &RewriteOrder,
+        task_ctx: &datafusion_execution::TaskContext,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        match order {
+            RewriteOrder::Unordered => Ok(plan),
+            RewriteOrder::Sorted(sort_columns) => {
+                Ok(util::stream_utils::sort_plan(plan, sort_columns, task_ctx)?)
+            }
+            RewriteOrder::Curve(indices) => {
+                let columns = plan.schema().fields().len();
+                // One set of bounds for every partition, so all keys share one
+                // coordinate scale and order against each other.
+                let (keyed, key) = super::clustering::with_cluster_key(
+                    plan,
+                    indices,
+                    self.cluster_column_bounds(indices),
+                )?;
+                let sorted =
+                    util::stream_utils::sort_plan(keyed, std::slice::from_ref(&key), task_ctx)?;
+                Ok(super::clustering::without_cluster_key(sorted, columns)?)
+            }
+        }
     }
 
     /// Resolve the explicitly configured clustering columns to schema indices.
@@ -22671,67 +22839,51 @@ impl CayenneTableProvider {
             .collect()
     }
 
-    /// Cluster a stream along a Hilbert curve over `clustering_indices` by
-    /// appending a transient key column, sorting on it with a pool-accounted,
-    /// disk-spilling `SortExec`, then stripping the key. `span` picks how the
-    /// sort consumes the stream; see [`ClusterSortSpan`].
-    /// Empty `clustering_indices` returns the stream unchanged.
+    /// Cluster `plan`'s rows along the Hilbert curve over `clustering_indices`
+    /// in byte-capped runs, each sorted on its own: the key is projected in
+    /// every partition of `plan` concurrently, the partitions are coalesced,
+    /// and `bounded_sort_stream` sorts the runs, capping per-run memory and
+    /// first-batch latency. Key ranges overlap ACROSS runs, so the result is
+    /// not globally ordered — only safe where the files advertise no ordering,
+    /// as cold-tier files do. The key column is stripped again. Empty
+    /// `clustering_indices` returns the rows unclustered.
     ///
     /// # Errors
     ///
-    /// Returns an error if a [`ClusterSortSpan::Global`] sort fails to execute.
-    fn cluster_sort_stream(
+    /// Returns an error if the keyed plan fails to build or execute.
+    fn cluster_runs_stream(
         &self,
-        stream: SendableRecordBatchStream,
-        clustering_indices: Vec<usize>,
+        plan: Arc<dyn ExecutionPlan>,
+        clustering_indices: &[usize],
         task_ctx: &Arc<datafusion_execution::TaskContext>,
-        span: ClusterSortSpan,
     ) -> Result<SendableRecordBatchStream> {
         if clustering_indices.is_empty() {
-            return Ok(stream);
+            return Ok(datafusion_physical_plan::execute_stream(
+                plan,
+                Arc::clone(task_ctx),
+            )?);
         }
-        let original_schema = stream.schema();
-        let key_name = super::clustering::cluster_key_column_name(&original_schema);
-        let augmented_schema =
-            super::clustering::cluster_augmented_schema(&original_schema, &key_name);
-        // Resolved once for the whole rewrite: per-batch bounds would put each
-        // batch on its own coordinate scale, and keys from different scales do
-        // not order against each other.
-        let bounds = self.cluster_column_bounds(&clustering_indices);
-        let idx = clustering_indices;
-        let appended_key_name = key_name.clone();
-        let augmented = stream.map(move |res| {
-            res.and_then(|b| {
-                super::clustering::append_cluster_key_column(&b, &idx, &bounds, &appended_key_name)
-            })
-        });
-        let augmented_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&augmented_schema),
-            augmented,
-        ));
-        let key_column = vec![key_name];
-        let sorted = match span {
-            ClusterSortSpan::Global => {
-                util::stream_utils::sort_stream(augmented_stream, &key_column, task_ctx)?
-            }
-            ClusterSortSpan::BoundedRuns => super::streaming::bounded_sort_stream(
-                &self.table_metadata.table_name,
-                augmented_stream,
-                key_column,
-                task_ctx,
-                self.table_metadata
-                    .vortex_config
-                    .cold_clustering_run_size_bytes(),
-            ),
-        };
-        let orig = Arc::clone(&original_schema);
+        let original_schema = plan.schema();
+        let (keyed, key) = super::clustering::with_cluster_key(
+            plan,
+            clustering_indices,
+            self.cluster_column_bounds(clustering_indices),
+        )?;
+        let keyed = datafusion_physical_plan::execute_stream(keyed, Arc::clone(task_ctx))?;
+        let sorted = super::streaming::bounded_sort_stream(
+            &self.table_metadata.table_name,
+            keyed,
+            vec![key],
+            task_ctx,
+            self.table_metadata
+                .vortex_config
+                .cold_clustering_run_size_bytes(),
+        );
+        let schema = Arc::clone(&original_schema);
         let stripped = sorted.map(move |res| {
-            res.and_then(|b| super::clustering::strip_cluster_key_column(&b, &orig))
+            res.and_then(|b| super::clustering::strip_cluster_key_column(&b, &original_schema))
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            original_schema,
-            stripped,
-        )))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stripped)))
     }
 
     /// Per-file row cap so a file's PK bloom (~10 bits/key) stays within
@@ -23453,7 +23605,7 @@ impl CayenneTableProvider {
                 super::cold_partition::ColdScanFiles(Arc::clone(&dirty_cold)),
             )),
         );
-        let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
+        let (plan, _generation_before) = self.rewrite_scan_plan(&ctx).await?;
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
@@ -23466,8 +23618,7 @@ impl CayenneTableProvider {
         let task_ctx = ctx.task_ctx();
         // Bounded runs: cold files advertise no ordering, so trading a global
         // order for capped per-run memory is a clustering-quality choice only.
-        let stream =
-            self.cluster_sort_stream(stream, clustering, &task_ctx, ClusterSortSpan::BoundedRuns)?;
+        let stream = self.cluster_runs_stream(plan, &clustering, &task_ctx)?;
 
         // Write the clustered, deletes-applied rows to the cold object store.
         let (cold_files, total_rows) = self
@@ -23476,7 +23627,7 @@ impl CayenneTableProvider {
                 self.cold_object_store_config.as_ref(),
                 stream,
                 max_sequence,
-                // `cluster_sort_stream` returned the stream untouched when no
+                // `cluster_runs_stream` left the rows unclustered when no
                 // clustering key resolved; otherwise sharding would scatter the
                 // clustering this promotion exists to create.
                 if clustering_is_empty {
@@ -24101,57 +24252,62 @@ impl CayenneTableProvider {
             in_flight.min_tier(),
         );
 
-        if let ProtectedMergeSelection::OverPassBudget {
-            tier_runs,
-            oldest_pair_bytes,
-        } = &selection
-        {
-            // Declining here costs less than it appears. A merge's benefit is one fewer
-            // scan branch, which is the same whether the runs are 8 MiB or 8 GiB; its
-            // cost is the bytes it rewrites. So a large-run tier is the worst-value work
-            // this pass can do, and leaving it settled is the same call the
-            // current-snapshot picker makes for files at or above the target size.
-            //
-            // The alarm for the read amplification that remains belongs to the read
-            // path, which already WARNs at `8 x compaction_trigger_protected_snapshots`
-            // protected snapshots (`scan_protected_snapshots`) — on the harm itself
-            // rather than on this proxy for it. This line is the cause, for whoever
-            // investigates that warning.
-            maintenance_metrics::track_compaction(
-                table_name,
-                CompactionKind::ProtectedSubset,
-                CompactionOutcome::DeclinedOverPassBudget,
-            );
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
+        let inputs = match selection {
+            ProtectedMergeSelection::Merge(inputs) => inputs,
+            ProtectedMergeSelection::OverPassBudget {
                 tier_runs,
                 oldest_pair_bytes,
-                max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
-                "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
-                 runs exceed the pass memory budget"
-            );
-            return Ok(false);
-        }
-
-        let inputs = selection.into_inputs();
-        if inputs.len() < 2 {
-            maintenance_metrics::track_compaction(
-                table_name,
-                CompactionKind::ProtectedSubset,
-                CompactionOutcome::DeclinedNoQualifyingTier,
-            );
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                candidates = sized_candidates.len(),
-                min_runs,
-                tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
-                max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
-                "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
-            );
-            return Ok(false);
-        }
+            } => {
+                // Declining here costs less than it appears. A merge's benefit is one fewer
+                // scan branch, which is the same whether the runs are 8 MiB or 8 GiB; its
+                // cost is the bytes it rewrites. So a large-run tier is the worst-value work
+                // this pass can do, and leaving it settled is the same call the
+                // current-snapshot picker makes for files at or above the target size.
+                //
+                // The alarm for the read amplification that remains belongs to the read
+                // path, which already WARNs at `8 x compaction_trigger_protected_snapshots`
+                // protected snapshots (`scan_protected_snapshots`) — on the harm itself
+                // rather than on this proxy for it. This line is the cause, for whoever
+                // investigates that warning.
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::ProtectedSubset,
+                    CompactionOutcome::DeclinedOverPassBudget,
+                );
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    tier_runs,
+                    oldest_pair_bytes,
+                    max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
+                    "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
+                     runs exceed the pass memory budget"
+                );
+                return Ok(false);
+            }
+            ProtectedMergeSelection::NoQualifyingTier { runs_per_tier } => {
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::ProtectedSubset,
+                    CompactionOutcome::DeclinedNoQualifyingTier,
+                );
+                // `min_runs` is a per-tier threshold, so `runs_per_tier` is what to read it
+                // against: 4 candidates split {0: 3, 1: 1} decline under `min_runs=4` (#13622).
+                // Tiers at or above `running_merge_min_tier` are not eligible this pass.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    runs_per_tier = ?runs_per_tier,
+                    min_runs,
+                    running_merge_min_tier = ?in_flight.min_tier(),
+                    candidates = sized_candidates.len(),
+                    tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
+                    max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
+                    "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
+                );
+                return Ok(false);
+            }
+        };
 
         // Diagnostics over the SELECTED (single-tier) input set.
         let selected_ids: std::collections::HashSet<&str> =
@@ -31440,10 +31596,12 @@ impl CayenneTableProvider {
         }
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let estimated_flushed_bytes = batches
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .fold(0u64, u64::saturating_add);
+        // Resident memory of the captured corpus, each Arrow allocation counted
+        // once: the tier retains the batches an apply handed it, and one fed over
+        // Arrow IPC (Flight, Flight SQL) points every buffer at one message body,
+        // which a per-reference sum bills once per buffer. It sizes the encode
+        // fan-out, so that over-count is files on disk, not just a number.
+        let estimated_flushed_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
         let estimated_bytes = Some(estimated_flushed_bytes);
         tracing::debug!(
             table = %self.table_metadata.table_name,
@@ -32838,16 +32996,14 @@ impl CayenneTableProvider {
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         // The inline memtable is fully materialized here, so we can size the
-        // checkpoint write exactly (sum of in-memory Arrow bytes). This lets the
-        // write shard count scale with the actual flush size instead of always
+        // checkpoint write exactly: the resident memory of the batches, each Arrow
+        // allocation counted once. The corpus is decoded from the metastore's IPC
+        // blobs, so every buffer of an entry points into that entry's one body
+        // allocation and a per-reference sum bills it once per buffer. This lets
+        // the write shard count scale with the actual flush size instead of always
         // fanning out — a small inline flush stays a single file. Computed before
         // `batches` is moved into the MemorySource below.
-        let estimated_bytes = Some(
-            batches
-                .iter()
-                .map(|b| b.get_array_memory_size() as u64)
-                .fold(0u64, u64::saturating_add),
-        );
+        let estimated_bytes = Some(arrow_tools::batch_bytes::RetainedBytes::of(&batches));
 
         // Extract Int64 PKs from the batches before they're moved into the
         // `MemorySource` below. After the flush, these PKs live in the new
@@ -34997,14 +35153,14 @@ impl CayenneTableProvider {
                 &self.table_schema(),
                 persisted.num_rows,
             )
-            // A blob written before per-column byte sizes were persisted carries no
-            // total, so serving it would report a different size for this file than
-            // the footer does and leave `JoinSelection` picking a build side by which
-            // source happened to answer. Treat it as stale and re-infer from the
-            // footer below, which rewrites the blob with the size in it. A file whose
-            // footer carries no statistics at all re-infers on first touch in each
-            // process and is then held by `scan_file_statistics`.
-            && statistics.total_byte_size != DFPrecision::Absent
+            // A blob written before per-column byte sizes were persisted carries none,
+            // so serving it would report a different size for this file than the footer
+            // does and leave `JoinSelection` picking a build side by which source
+            // happened to answer. Treat it as stale and re-infer from the footer below,
+            // which rewrites the blob with the sizes in it. A file whose footer carries
+            // no statistics at all re-infers on first touch in each process and is then
+            // held by `scan_file_statistics`.
+            && crate::stats::blob_carries_per_column_byte_sizes(&statistics)
         {
             self.scan_file_statistics.put(
                 &TableScopedPath {
@@ -38992,20 +39148,64 @@ mod tests {
     #[test]
     fn orphan_dv_sweep_signal_records_an_edge_raised_during_a_pass() {
         assert_eq!(
-            orphan_dv_sweep_state_after_signal(ORPHAN_DV_SWEEP_IDLE),
-            Some(ORPHAN_DV_SWEEP_RUNNING),
+            coalesced_task_state_after_signal(COALESCED_TASK_IDLE),
+            Some(COALESCED_TASK_RUNNING),
             "an idle table starts a worker"
         );
         assert_eq!(
-            orphan_dv_sweep_state_after_signal(ORPHAN_DV_SWEEP_RUNNING),
-            Some(ORPHAN_DV_SWEEP_RUNNING_DIRTY),
+            coalesced_task_state_after_signal(COALESCED_TASK_RUNNING),
+            Some(COALESCED_TASK_RUNNING_DIRTY),
             "a signal during a pass must be recorded, not coalesced away"
         );
         assert_eq!(
-            orphan_dv_sweep_state_after_signal(ORPHAN_DV_SWEEP_RUNNING_DIRTY),
+            coalesced_task_state_after_signal(COALESCED_TASK_RUNNING_DIRTY),
             None,
             "a second signal during a pass adds nothing: the worker already re-runs"
         );
+    }
+
+    /// A write that asks for compaction while a post-write pass runs must be
+    /// recorded on that pass rather than coalesced away. The request is usually
+    /// the append that makes the running pass abort on a concurrent change, so
+    /// dropping it left a finished seed unconsolidated until the next write or
+    /// background tick. The state IS the spawn decision, so asserting it checks
+    /// both halves: no second task, and a re-evaluation owed. Regression test
+    /// for #13906.
+    #[tokio::test]
+    async fn post_write_compaction_records_a_request_raised_during_a_pass() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "post_write_compaction_records_request",
+            ctx.runtime_env(),
+            &[10, 20, 30],
+        )
+        .await;
+        provider.new_files_since_last_compaction.store(
+            provider.context.compaction_picker_config().trigger_files,
+            Ordering::Relaxed,
+        );
+
+        // Stand in for a pass mid-flight.
+        provider
+            .post_write_compaction_state
+            .store(COALESCED_TASK_RUNNING, Ordering::Release);
+
+        provider.schedule_post_write_compaction();
+        assert_eq!(
+            provider.post_write_compaction_state.load(Ordering::Acquire),
+            COALESCED_TASK_RUNNING_DIRTY,
+            "a request during a pass must be recorded on it, not dropped"
+        );
+        provider.schedule_post_write_compaction();
+        assert_eq!(
+            provider.post_write_compaction_state.load(Ordering::Acquire),
+            COALESCED_TASK_RUNNING_DIRTY,
+            "a further request leaves the state dirty"
+        );
+
+        provider
+            .post_write_compaction_state
+            .store(COALESCED_TASK_IDLE, Ordering::Release);
     }
 
     /// Signalling a table whose worker is already running must record the signal
@@ -39028,24 +39228,24 @@ mod tests {
         // Stand in for a worker mid-pass.
         provider
             .orphan_dv_sweep_state
-            .store(ORPHAN_DV_SWEEP_RUNNING, Ordering::Release);
+            .store(COALESCED_TASK_RUNNING, Ordering::Release);
 
         provider.schedule_orphan_dv_sweep();
         assert_eq!(
             provider.orphan_dv_sweep_state.load(Ordering::Acquire),
-            ORPHAN_DV_SWEEP_RUNNING_DIRTY,
+            COALESCED_TASK_RUNNING_DIRTY,
             "the signal must be recorded on the running worker"
         );
         provider.schedule_orphan_dv_sweep();
         assert_eq!(
             provider.orphan_dv_sweep_state.load(Ordering::Acquire),
-            ORPHAN_DV_SWEEP_RUNNING_DIRTY,
+            COALESCED_TASK_RUNNING_DIRTY,
             "a further signal leaves the state dirty"
         );
 
         provider
             .orphan_dv_sweep_state
-            .store(ORPHAN_DV_SWEEP_IDLE, Ordering::Release);
+            .store(COALESCED_TASK_IDLE, Ordering::Release);
     }
 
     /// A signal raised while a sweep is mid-pass — after it captured its
@@ -39109,7 +39309,7 @@ mod tests {
         );
         assert_eq!(
             provider.orphan_dv_sweep_state.load(Ordering::Acquire),
-            ORPHAN_DV_SWEEP_IDLE,
+            COALESCED_TASK_IDLE,
             "the episode ends idle once no signal is outstanding"
         );
     }
@@ -40359,8 +40559,11 @@ mod tests {
         );
         assert_eq!(
             select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, Some(1)),
-            ProtectedMergeSelection::NoQualifyingTier,
-            "tier 1 must not merge alongside a running tier-1 merge"
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1), (1, 2)].into(),
+            },
+            "tier 1 must not merge alongside a running tier-1 merge, and the decline still \
+             reports the ineligible tier's runs"
         );
     }
 
@@ -40372,7 +40575,30 @@ mod tests {
         let inputs = vec![sized("a", 1024), sized("b", base * 4)];
         assert_eq!(
             select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, None),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1), (1, 1)].into(),
+            }
+        );
+    }
+
+    /// Regression test for #13622: four candidates under `min_runs = 4` decline when
+    /// they are split across tiers, and the decline carries the per-tier split that
+    /// explains it rather than only the total.
+    #[test]
+    fn select_merge_tier_reports_runs_per_tier_when_the_total_reaches_min_runs() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        let inputs = vec![
+            sized("merged", base * 2), // tier 1
+            sized("a", 1024),          // tier 0
+            sized("b", 2048),          // tier 0
+            sized("c", 4096),          // tier 0
+        ];
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&inputs, 4, 32, base, growth, None, None),
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 3), (1, 1)].into(),
+            }
         );
     }
 
@@ -40401,7 +40627,9 @@ mod tests {
         // Fewer than two inputs, or a sub-2 floor, can never merge.
         assert_eq!(
             select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth, None, None),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 1)].into(),
+            }
         );
         assert_eq!(
             select_protected_snapshot_merge_tier(
@@ -40413,7 +40641,9 @@ mod tests {
                 None,
                 None
             ),
-            ProtectedMergeSelection::NoQualifyingTier
+            ProtectedMergeSelection::NoQualifyingTier {
+                runs_per_tier: [(0, 2)].into(),
+            }
         );
     }
 
@@ -40622,13 +40852,15 @@ mod tests {
     /// caller is arranging. `drain_in_flight_maintenance` cannot be used here:
     /// it ends by taking the same lock.
     ///
-    /// The flag is set before the task spawns and cleared on any exit, so once
-    /// it reads false with the lock still held, no scheduled pass remains.
+    /// The state leaves idle before the task spawns and returns to it on any
+    /// exit, so once it reads idle with the lock still held, no scheduled pass
+    /// remains.
     async fn park_post_write_compaction(provider: &CayenneTableProvider) {
         for _ in 0..1_000 {
-            if !provider
-                .post_write_compaction_scheduled
+            if provider
+                .post_write_compaction_state
                 .load(std::sync::atomic::Ordering::Acquire)
+                == COALESCED_TASK_IDLE
             {
                 return;
             }
@@ -44988,6 +45220,264 @@ mod tests {
             .await
             .expect("table created");
         (provider, catalog, temp_dir)
+    }
+
+    /// Makes `[1, 2, 3]` durable through a mem-tier checkpoint and leaves `[4]`
+    /// in the RAM tier. `flush` also drains post-write maintenance in between,
+    /// which a test driving the compaction trigger itself must skip.
+    async fn seed_resident_mem_segment(
+        provider: &CayenneTableProvider,
+        batch: impl Fn(&[i64]) -> RecordBatch,
+        flush: bool,
+    ) {
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ))));
+        let no_deletions = OnConflictDeletions::default();
+        for (ids, checkpoint) in [(&[1_i64, 2, 3][..], true), (&[4][..], false)] {
+            let rows = batch(ids);
+            let bytes = rows.get_array_memory_size() as u64;
+            provider
+                .append_to_mem_tier(vec![rows], &no_deletions, bytes, 0)
+                .await
+                .expect("append");
+            if checkpoint {
+                provider.checkpoint_mem_tier().await.expect("checkpoint");
+                if flush {
+                    provider
+                        .flush_pending_maintenance()
+                        .await
+                        .expect("flush maintenance");
+                }
+            }
+        }
+        assert_eq!(scan_sorted_ids(provider).await, vec![1, 2, 3, 4]);
+        assert_eq!(provider.mem_tier.total_rows(), 1, "premise: one row in RAM");
+    }
+
+    /// Runs a full rewrite over [`seed_resident_mem_segment`]'s state and checks
+    /// that the RAM-tier row is neither duplicated nor left behind.
+    async fn rewrite_with_a_resident_mem_segment(
+        provider: &CayenneTableProvider,
+        batch: impl Fn(&[i64]) -> RecordBatch,
+    ) {
+        seed_resident_mem_segment(provider, batch, true).await;
+
+        // Bounded: the drain takes `mem_checkpoint_lock` while the rewrite holds
+        // `write_lock`, so a lock-order regression shows up as a timeout.
+        let committed = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.rewrite_current_snapshot_for_compaction(),
+        )
+        .await
+        .expect("rewrite must not deadlock")
+        .expect("rewrite");
+        assert!(committed, "the rewrite commits");
+        assert_eq!(
+            scan_sorted_ids(provider).await,
+            vec![1, 2, 3, 4],
+            "the RAM-tier row must not appear both in the new snapshot and in the tier"
+        );
+        assert_eq!(
+            provider.mem_tier.total_rows(),
+            0,
+            "the rewrite drained the tier"
+        );
+        let stats_rows = provider
+            .optimizer_table_statistics()
+            .map(|s| s.num_rows)
+            .expect("statistics present");
+        assert_eq!(stats_rows.get_value(), Some(&4));
+
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("later checkpoint");
+        assert_eq!(scan_sorted_ids(provider).await, vec![1, 2, 3, 4]);
+    }
+
+    /// Regression test for #14450 on a key-delete table.
+    #[tokio::test]
+    async fn full_rewrite_does_not_duplicate_resident_mem_tier_rows() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("rewrite_resident_mem_segment", runtime_env).await;
+        rewrite_with_a_resident_mem_segment(&provider, int64_id_batch).await;
+    }
+
+    /// Regression test for #14450 on a `deletion_mode: position` table, which
+    /// takes the rewrite's position arm (writers and visibility flips excluded
+    /// for the whole pass) and still runs the in-memory CDC tier.
+    #[tokio::test]
+    async fn position_mode_full_rewrite_does_not_duplicate_resident_mem_tier_rows() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "position_rewrite_resident_mem_segment",
+            runtime_env,
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_min_flush_bytes: 0,
+                deletion_mode: crate::metadata::DeletionMode::Position,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "premise: in-memory CDC tier");
+        assert!(
+            provider.should_capture_positions(),
+            "premise: the rewrite takes its position arm"
+        );
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        rewrite_with_a_resident_mem_segment(&provider, |ids| {
+            id_value_batch(Arc::clone(&schema), ids, &vec![0; ids.len()])
+        })
+        .await;
+    }
+
+    /// The small-file compaction hands the rewrite a `write_lock` it already
+    /// holds. With more than one shard a mem-tier checkpoint takes `write_lock`
+    /// itself, so the rewrite must drain the tier without re-acquiring it.
+    #[tokio::test]
+    async fn position_mode_rewrite_with_held_guards_drains_sharded_mem_tier() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "position_rewrite_held_guards_sharded_mem",
+            runtime_env,
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_min_flush_bytes: 0,
+                cdc_mem_tier_shards: 2,
+                deletion_mode: crate::metadata::DeletionMode::Position,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.mem_tier.shard_count() > 1, "premise: sharded tier");
+        assert!(
+            provider.should_capture_positions(),
+            "premise: the rewrite takes its position arm"
+        );
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let ctx = SessionContext::new();
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        for (ids, checkpoint) in [(&[1_i64, 2, 3][..], true), (&[4][..], false)] {
+            let write = provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(
+                        Arc::clone(&schema),
+                        ids,
+                        &vec![0; ids.len()],
+                    )),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("sharded CDC insert");
+            assert!(
+                write.in_memory_epoch().is_some(),
+                "premise: rows land in RAM"
+            );
+            if checkpoint {
+                provider.checkpoint_mem_tier().await.expect("checkpoint");
+                provider
+                    .flush_pending_maintenance()
+                    .await
+                    .expect("flush maintenance");
+            }
+        }
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4]);
+        assert_eq!(provider.mem_tier.total_rows(), 1, "premise: one row in RAM");
+
+        let guards = PositionRewriteGuards {
+            _write: provider.write_lock_arc().lock_owned().await,
+            _visibility: provider.visibility_lock_arc().lock_owned().await,
+        };
+        let committed = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.rewrite_current_snapshot_for_compaction_holding(Some(guards)),
+        )
+        .await
+        .expect("rewrite must not re-acquire the held write_lock")
+        .expect("rewrite");
+        assert!(committed, "the rewrite commits");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4]);
+        assert_eq!(
+            provider.mem_tier.total_rows(),
+            0,
+            "the rewrite drained the tier"
+        );
+    }
+
+    /// #14450 through the background compaction entry point: a mem-tier
+    /// checkpoint publishes a protected snapshot, which fires the count trigger
+    /// while the next apply's rows are still in the RAM tier.
+    #[tokio::test]
+    async fn protected_snapshot_trigger_pass_does_not_duplicate_resident_mem_tier_rows() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "trigger_pass_resident_mem_segment",
+            runtime_env,
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_min_flush_bytes: 0,
+                compaction_trigger_protected_snapshots: 1,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        seed_resident_mem_segment(
+            &provider,
+            |ids| id_value_batch(Arc::clone(&schema), ids, &vec![0; ids.len()]),
+            false,
+        )
+        .await;
+        assert!(
+            provider.protected_snapshot_maintenance_trigger().is_some(),
+            "premise: the checkpoint's protected snapshot fires the trigger"
+        );
+
+        assert!(
+            provider.run_one_compaction_pass().await.expect("pass"),
+            "the triggered pass commits a full rewrite"
+        );
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4]);
+    }
+
+    /// A `mode: memory` table has no durable snapshot to consolidate, so a full
+    /// rewrite declines instead of copying the RAM tier into one.
+    #[tokio::test]
+    async fn full_rewrite_declines_on_memory_resident_table() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "rewrite_memory_resident",
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            VortexConfig {
+                memory_mode: true,
+                ..VortexConfig::default()
+            },
+            vec![],
+            SessionContext::new().runtime_env(),
+        )
+        .await;
+        assert!(provider.is_memory_resident_mode(), "premise: mode: memory");
+        let batch = int64_id_batch(&[1, 2, 3]);
+        let bytes = batch.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(
+                vec![batch],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
+            .await
+            .expect("append");
+
+        let committed = provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("rewrite");
+        assert!(!committed, "nothing durable to rewrite");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3]);
     }
 
     /// A key re-inserted after its delete was checkpointed must stay visible even
@@ -55837,7 +56327,7 @@ mod tests {
     /// must not be sorted in its place: the rows must come out in the same curve
     /// order as for a table without that column.
     #[tokio::test]
-    async fn test_cluster_sort_stream_ignores_a_column_named_like_the_key() {
+    async fn test_curve_order_ignores_a_column_named_like_the_key() {
         use arrow::array::{AsArray, Int64Array};
         use arrow::datatypes::Int64Type;
 
@@ -55877,10 +56367,20 @@ mod tests {
                 Arc::clone(&schema),
                 stream::iter(vec![Ok(batch)]),
             ));
+            let task_ctx = ctx.task_ctx();
             let sorted = provider
-                .cluster_sort_stream(input, vec![0, 1], &ctx.task_ctx(), ClusterSortSpan::Global)
+                .order_rewrite_plan(
+                    util::stream_utils::stream_plan(input),
+                    &RewriteOrder::Curve(vec![0, 1]),
+                    &task_ctx,
+                )
                 .expect("cluster sort");
-            let batches: Vec<RecordBatch> = sorted.try_collect().await.expect("sorted rows");
+            let batches: Vec<RecordBatch> =
+                datafusion_physical_plan::execute_stream(sorted, task_ctx)
+                    .expect("plan executes")
+                    .try_collect()
+                    .await
+                    .expect("sorted rows");
             batches
                 .iter()
                 .flat_map(|batch| {
@@ -55903,6 +56403,264 @@ mod tests {
             "the fixture must actually be reordered by clustering"
         );
         assert_eq!(cluster_order(&rows, true).await, plain);
+    }
+
+    /// The curve order is keyed and sorted in each input partition and merged,
+    /// so it must come out in non-decreasing curve-key order across the whole
+    /// output — the order one sort of every row gives — with every input row,
+    /// however the rows are spread over the partitions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_curve_order_is_global_across_partitions() {
+        use arrow::array::{Array, BinaryArray, Int64Array, StringArray};
+        use datafusion::datasource::memory::MemorySourceConfig;
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _dir) = create_cayenne_table_with_config(
+            "curve_partitions",
+            Arc::clone(&schema),
+            VortexConfig::default(),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // A permutation of 0..rows; `s` is a function of `id` with some NULLs.
+        let rows = 30_000_usize;
+        let ids: Vec<i64> = (0..rows).map(|i| scrambled(i, rows)).collect();
+        let text = |id: i64| {
+            (id % 53 != 0).then(|| format!("{:08x}", id.wrapping_mul(2_654_435_761) & 0xffff_ffff))
+        };
+        let batches: Vec<RecordBatch> = ids
+            .chunks(700)
+            .map(|chunk| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(chunk.to_vec())),
+                        Arc::new(StringArray::from(
+                            chunk.iter().map(|&id| text(id)).collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .expect("valid batch")
+            })
+            .collect();
+        // Five partitions of uneven size, plus an empty one.
+        let mut partitions: Vec<Vec<RecordBatch>> = vec![Vec::new(); 6];
+        for (n, batch) in batches.into_iter().enumerate() {
+            partitions[(n * n) % 5].push(batch);
+        }
+        let input = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&schema), None)
+            .expect("memory source");
+
+        let task_ctx = ctx.task_ctx();
+        let ordered = provider
+            .order_rewrite_plan(input, &RewriteOrder::Curve(vec![0, 1]), &task_ctx)
+            .expect("plan builds");
+        assert_eq!(
+            ordered.schema(),
+            schema,
+            "the curve key column must be projected away"
+        );
+        let out: Vec<RecordBatch> = datafusion_physical_plan::execute_stream(ordered, task_ctx)
+            .expect("plan executes")
+            .try_collect()
+            .await
+            .expect("sort succeeds");
+
+        let bounds = provider.cluster_column_bounds(&[0, 1]);
+        let mut previous: Option<Vec<u8>> = None;
+        let mut seen: Vec<i64> = Vec::with_capacity(rows);
+        for batch in &out {
+            let keys: BinaryArray = super::super::clustering::cluster_keys(
+                &[Arc::clone(batch.column(0)), Arc::clone(batch.column(1))],
+                &bounds,
+            )
+            .expect("keys compute");
+            for key in keys.iter().flatten() {
+                if let Some(p) = &previous {
+                    assert!(p.as_slice() <= key, "curve order broken across the merge");
+                }
+                previous = Some(key.to_vec());
+            }
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id");
+            let s = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("s");
+            for i in 0..batch.num_rows() {
+                assert_eq!(
+                    s.is_valid(i).then(|| s.value(i).to_string()),
+                    text(id.value(i)),
+                    "a row's columns must stay together"
+                );
+                seen.push(id.value(i));
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..i64::try_from(rows).expect("fits")).collect::<Vec<_>>(),
+            "rows changed"
+        );
+    }
+
+    /// The full-snapshot compaction rewrite sorts each scan partition on its
+    /// own and merges them, so the files it writes must still hold one global
+    /// order: each output file one contiguous run of ids, the files disjoint,
+    /// and together every input row. Every input file here interleaves with
+    /// every other (file `b` holds the ids congruent to `b` mod 8, descending),
+    /// so a partition written out without the merge would put ids from across
+    /// the whole range into one file.
+    ///
+    /// The rewrite is called directly with every automatic trigger off, so no
+    /// post-write pass can race the inserts. Each file is read on its own:
+    /// the order in which a snapshot lists its files is not specified.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_sorted_compaction_rewrite_writes_one_global_order_across_files() {
+        use arrow::array::{Int64Array, StringArray};
+        use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _dir) = create_cayenne_table_with_config(
+            "sorted_rewrite_global_order",
+            Arc::clone(&schema),
+            VortexConfig {
+                sort_columns: vec!["id".to_string()],
+                target_vortex_file_size_mb: 1,
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 0,
+                compaction_trigger_files: usize::MAX,
+                compaction_trigger_protected_snapshots: usize::MAX,
+                compaction_trigger_snapshot_age_ms: u64::MAX,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let files = 8_i64;
+        let rows_per_file = 20_000_i64;
+        for file in 0..files {
+            let ids: Vec<i64> = (0..rows_per_file).rev().map(|i| i * files + file).collect();
+            // Wide, poorly compressible values, so the rewrite spans several
+            // 1 MiB output files.
+            let values: Vec<String> = ids
+                .iter()
+                .map(|id| {
+                    let id = id.unsigned_abs();
+                    format!(
+                        "v_{id:020}_{:016x}_{:016x}",
+                        id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        id.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+                    )
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .expect("batch");
+            insert_batch(&provider, batch).await;
+        }
+
+        assert!(
+            provider
+                .rewrite_current_snapshot_for_compaction_tracked(None)
+                .await
+                .expect("rewrite succeeds"),
+            "the rewrite must commit a new snapshot"
+        );
+
+        let snapshot_id = provider.get_current_snapshot_id();
+        let snapshot_dir = provider.snapshot_dir_path_for(&snapshot_id);
+        let written = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("list snapshot files");
+        assert!(
+            written.len() > 1,
+            "the rewrite must span several files for the order to be tested across them, got {}",
+            written.len()
+        );
+
+        // (min, max, rows) of each file, read on its own.
+        let mut ranges: Vec<(i64, i64, i64)> = Vec::new();
+        for (i, (name, _size)) in written.iter().enumerate() {
+            let path = snapshot_dir.join(name);
+            let url = ListingTableUrl::parse(format!("file://{}", path.display())).expect("url");
+            let options = ListingOptions::new(Arc::clone(provider.context.file_format())
+                as Arc<dyn datafusion::datasource::file_format::FileFormat>)
+            .with_file_extension(".vortex");
+            let table = format!("rewritten_{i}");
+            ctx.register_listing_table(
+                &table,
+                url.as_str(),
+                options,
+                Some(Arc::clone(&schema)),
+                None,
+            )
+            .await
+            .expect("register file");
+            let out = ctx
+                .sql(&format!("SELECT min(id), max(id), count(*) FROM {table}"))
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("read file");
+            let col = |c: usize| {
+                out[0]
+                    .column(c)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64")
+                    .value(0)
+            };
+            ranges.push((col(0), col(1), col(2)));
+        }
+        ranges.sort_unstable();
+        for &(lo, hi, rows) in &ranges {
+            assert_eq!(
+                rows,
+                hi - lo + 1,
+                "a file must hold one contiguous run of ids, but [{lo}, {hi}] holds {rows} rows"
+            );
+        }
+        for pair in ranges.windows(2) {
+            assert_eq!(
+                pair[0].1 + 1,
+                pair[1].0,
+                "files must tile the ids without overlap or gaps: {pair:?}"
+            );
+        }
+        assert_eq!(
+            ranges.first().map(|r| r.0),
+            Some(0),
+            "the first file starts at id 0"
+        );
+        assert_eq!(
+            ranges.last().map(|r| r.1),
+            Some(files * rows_per_file - 1),
+            "the last file ends at the last id"
+        );
     }
 
     #[tokio::test]
@@ -69502,6 +70260,99 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+
+    /// A sharded apply records its keys in the table-wide index as well as the
+    /// per-shard one, as the serial mem-tier apply does, so the durable path and
+    /// per-key OCC read a complete index without rebuilding it from the table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sharded_apply_records_its_keys_in_the_table_wide_index() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_records_table_wide",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 1), (8, 1)])
+                .await
+                .is_some(),
+            "precondition: the burst takes the in-memory sharded path"
+        );
+
+        let key_7 = pk_digest_set_for_ids(&converter, &[7])
+            .iter_with_digest()
+            .next()
+            .expect("one key")
+            .0;
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Exact(keyset)) => assert!(
+                keyset.location_by_digest(key_7).is_some(),
+                "the table-wide index must hold key 7, which a sharded apply wrote"
+            ),
+            other => panic!(
+                "the warm table-wide index must stay cached, present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// A burst the in-memory tier cannot take is written durably: the runtime
+    /// checkpoints the tier, clears the slot advancer, and the durable path validates
+    /// against the table-wide index. The keys earlier sharded applies wrote must be in
+    /// that index, or an upsert of one reads as a new key and leaves two live rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_durable_upsert_after_sharded_applies_replaces_their_rows() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_durable_after_sharded",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.maybe_install_warm_pk_caches().await;
+
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 1), (8, 1)])
+                .await
+                .is_some(),
+            "precondition: the first burst takes the in-memory sharded path"
+        );
+
+        // The runtime's sequence for a burst that must be durable
+        // (`checkpoint_pending_memory_cdc_commits`, then `clear_slot_advancer`).
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint the in-memory tier");
+        provider.clear_slot_advancer();
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)])
+                .await
+                .is_none(),
+            "precondition: the second burst writes durably"
+        );
+
+        let rows = collect_id_value_pairs(&ctx, &provider, "pk_durable_after_sharded").await;
+        assert_eq!(
+            rows,
+            vec![(7, 2), (8, 1)],
+            "one live row per key, key 7 upserted"
+        );
     }
 
     /// An abandoned checkout must release the resident-byte accounting its window

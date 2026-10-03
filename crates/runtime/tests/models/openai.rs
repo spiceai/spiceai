@@ -1248,6 +1248,7 @@ async fn get_openai_chat_model(
     let model_secrets = get_params_with_secrets_value(&model_with_tools.params, &rt).await;
     try_to_chat_model(&model_with_tools, &model_secrets, rt)
         .await
+        .map(|loaded| loaded.chat)
         .map_err(anyhow::Error::from)
 }
 
