@@ -192,7 +192,7 @@ dependencies = [
 [[package]]
 name = "adbc_core"
 version = "0.24.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=674d6184f89bd1c549a22a37d01381880f5d8a39#674d6184f89bd1c549a22a37d01381880f5d8a39"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6e4119ac2007c6647702a1817505d6849b07e0e0#6e4119ac2007c6647702a1817505d6849b07e0e0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -201,7 +201,7 @@ dependencies = [
 [[package]]
 name = "adbc_driver_manager"
 version = "0.24.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=674d6184f89bd1c549a22a37d01381880f5d8a39#674d6184f89bd1c549a22a37d01381880f5d8a39"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6e4119ac2007c6647702a1817505d6849b07e0e0#6e4119ac2007c6647702a1817505d6849b07e0e0"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -218,7 +218,7 @@ dependencies = [
 [[package]]
 name = "adbc_ffi"
 version = "0.24.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=674d6184f89bd1c549a22a37d01381880f5d8a39#674d6184f89bd1c549a22a37d01381880f5d8a39"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6e4119ac2007c6647702a1817505d6849b07e0e0#6e4119ac2007c6647702a1817505d6849b07e0e0"
 dependencies = [
  "adbc_core",
  "arrow-array",
@@ -7354,7 +7354,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=5f50cfd5b8fab41c217b2639c4b537277c2e45e9#5f50cfd5b8fab41c217b2639c4b537277c2e45e9"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=465926a30443ebfbbc95366b6f0277bff80a8ba9#465926a30443ebfbbc95366b6f0277bff80a8ba9"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -10477,7 +10477,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a0bd6b04cf11ad34dfc103043bba4cfce072bf45#a0bd6b04cf11ad34dfc103043bba4cfce072bf45"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=3e2a14e8182cb39d75b74b95d9c7b83244ecac55#3e2a14e8182cb39d75b74b95d9c7b83244ecac55"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10534,7 +10534,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a0bd6b04cf11ad34dfc103043bba4cfce072bf45#a0bd6b04cf11ad34dfc103043bba4cfce072bf45"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=3e2a14e8182cb39d75b74b95d9c7b83244ecac55#3e2a14e8182cb39d75b74b95d9c7b83244ecac55"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10549,7 +10549,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a0bd6b04cf11ad34dfc103043bba4cfce072bf45#a0bd6b04cf11ad34dfc103043bba4cfce072bf45"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=3e2a14e8182cb39d75b74b95d9c7b83244ecac55#3e2a14e8182cb39d75b74b95d9c7b83244ecac55"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10573,7 +10573,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a0bd6b04cf11ad34dfc103043bba4cfce072bf45#a0bd6b04cf11ad34dfc103043bba4cfce072bf45"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=3e2a14e8182cb39d75b74b95d9c7b83244ecac55#3e2a14e8182cb39d75b74b95d9c7b83244ecac55"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10589,7 +10589,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a0bd6b04cf11ad34dfc103043bba4cfce072bf45#a0bd6b04cf11ad34dfc103043bba4cfce072bf45"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=3e2a14e8182cb39d75b74b95d9c7b83244ecac55#3e2a14e8182cb39d75b74b95d9c7b83244ecac55"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10608,7 +10608,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a0bd6b04cf11ad34dfc103043bba4cfce072bf45#a0bd6b04cf11ad34dfc103043bba4cfce072bf45"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=3e2a14e8182cb39d75b74b95d9c7b83244ecac55#3e2a14e8182cb39d75b74b95d9c7b83244ecac55"
 dependencies = [
  "iceberg",
  "tracing-subscriber",
@@ -19836,7 +19836,7 @@ dependencies = [
 [[package]]
 name = "snowflake-api"
 version = "0.14.0"
-source = "git+https://github.com/spiceai/snowflake-rs.git?rev=b95a74e89902a672ffa26f01407365e31da086d0#b95a74e89902a672ffa26f01407365e31da086d0"
+source = "git+https://github.com/spiceai/snowflake-rs.git?rev=f5557381f79f1535014e0dc0555c53ac8de1cafc#f5557381f79f1535014e0dc0555c53ac8de1cafc"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -19865,7 +19865,7 @@ dependencies = [
 [[package]]
 name = "snowflake-jwt"
 version = "0.3.1"
-source = "git+https://github.com/spiceai/snowflake-rs.git?rev=b95a74e89902a672ffa26f01407365e31da086d0#b95a74e89902a672ffa26f01407365e31da086d0"
+source = "git+https://github.com/spiceai/snowflake-rs.git?rev=f5557381f79f1535014e0dc0555c53ac8de1cafc#f5557381f79f1535014e0dc0555c53ac8de1cafc"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
@@ -19916,7 +19916,7 @@ checksum = "45e14297decde697ddf377c25752aead0927d5cfc89c2684d2af96901a4ceeea"
 [[package]]
 name = "spark-connect-core"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=3bf6421a929bf432365c8a48ae3eb4e989d2e601#3bf6421a929bf432365c8a48ae3eb4e989d2e601"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=18ae9bd3ac5c447612f292e41bf348a5c6ed9b50#18ae9bd3ac5c447612f292e41bf348a5c6ed9b50"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -19938,7 +19938,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-rs"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=3bf6421a929bf432365c8a48ae3eb4e989d2e601#3bf6421a929bf432365c8a48ae3eb4e989d2e601"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=18ae9bd3ac5c447612f292e41bf348a5c6ed9b50#18ae9bd3ac5c447612f292e41bf348a5c6ed9b50"
 dependencies = [
  "spark-connect-core",
 ]
@@ -20078,7 +20078,7 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "4.0.0"
-source = "git+https://github.com/spiceai/spice-rs.git?rev=932a4d9cc3e7f22ad8f9fa31c30458c7d9aafe20#932a4d9cc3e7f22ad8f9fa31c30458c7d9aafe20"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=4429f3956972c4c329ee406ac60b15ad6ae4a777#4429f3956972c4c329ee406ac60b15ad6ae4a777"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -20941,7 +20941,7 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=93ed65ee299e7303fd841d66f66a93fff527f0fb#93ed65ee299e7303fd841d66f66a93fff527f0fb"
+source = "git+https://github.com/spiceai/spicebench.git?rev=8a90555dcb14e2bbbde8263d225f2c4e7ee547fc#8a90555dcb14e2bbbde8263d225f2c4e7ee547fc"
 dependencies = [
  "arrow-schema",
  "async-trait",
