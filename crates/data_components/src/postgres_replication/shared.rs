@@ -490,8 +490,9 @@ struct MemberHandle {
     /// source-commit time is within this of now, so the dataset becomes Ready
     /// only once it has caught up to the source head.
     ready_lag: std::time::Duration,
-    /// Where this member's applied-LSN watermark is recorded. Only
-    /// [`run_applied_lsn_writer`] writes it, which is what keeps concurrent
+    /// Where this member's applied-LSN watermark is recorded. Producers never
+    /// write it directly: only [`write_published_positions`] does, serialized by
+    /// [`SharedSource::position_write_lock`], which is what keeps concurrent
     /// producers from landing out of order.
     applied_lsn_store: Arc<dyn AppliedLsnStore>,
     /// Wakes the applied-position writer when this member publishes a position.
@@ -3029,16 +3030,18 @@ struct OrphanedPosition {
     write_back_registry: Option<Arc<XidRegistry>>,
 }
 
-/// The **only** writer of applied positions for a source.
+/// The background writer of applied positions for a source.
 ///
 /// Producers publish a position onto their member's [`AckSlot::pending`] with an
 /// atomic max and wake this task; it persists whatever the furthest published
-/// position is when it gets there. Two properties follow, and both matter:
+/// position is when it gets there. The pump's shutdown also writes, through the same
+/// [`write_published_positions`]. Two properties follow, and both matter:
 ///
 ///   * **No reordering.** [`AppliedLsnStore::save`] overwrites rather than taking a
-///     maximum, so concurrent writers could land out of order and move a recorded
+///     maximum, so concurrent writes could land out of order and move a recorded
 ///     position backwards — costing a rebuild that does not self-correct until the
-///     member advances past the lost value. One writer makes that unrepresentable.
+///     member advances past the lost value. Every write pass holds
+///     [`SharedSource::position_write_lock`], which makes that unrepresentable.
 ///   * **Coalescing.** Positions published while a write is in flight collapse into
 ///     that write's successor, so a busy member costs writes at the store's pace
 ///     rather than one per commit.
