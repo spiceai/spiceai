@@ -398,6 +398,11 @@ impl IndexRun {
         let mut reader = crate::persist::open(bytes, crate::persist::KIND_RUN)?;
         let encoding = reader.u64()?;
         let count = reader.u32()? as usize;
+        // No builder writes more, and a merge involving more could never be
+        // built.
+        if count > MAX_RUN_FILES {
+            return Err(Error::Corrupt);
+        }
         let mut files: Vec<Arc<str>> = Vec::with_capacity(count.min(1 << 20));
         // A run covers each file once, as a builder writes it: a name given
         // twice would let one row be reached through both, and returned twice.

@@ -1024,6 +1024,38 @@ mod persist {
         );
     }
 
+    /// A run naming more files than [`MAX_RUN_FILES`] is rejected: no builder
+    /// writes one, and a merge involving it could never be built.
+    #[test]
+    fn a_run_naming_too_many_files_is_rejected() {
+        // A run of no rows over `files` distinct files, written as `to_bytes`
+        // writes one.
+        let run_over = |files: usize| {
+            let mut out = Vec::new();
+            crate::persist::header(&mut out, crate::persist::KIND_RUN);
+            out.extend_from_slice(&0_u64.to_le_bytes());
+            out.extend_from_slice(&u32::try_from(files).expect("fits").to_le_bytes());
+            for file in 0..files {
+                let name = file.to_string();
+                out.extend_from_slice(&u32::try_from(name.len()).expect("fits").to_le_bytes());
+                out.extend_from_slice(name.as_bytes());
+            }
+            out.extend_from_slice(&0_u64.to_le_bytes()); // rows
+            out.extend_from_slice(&0_u64.to_le_bytes()); // words
+            out.extend_from_slice(&0_u64.to_le_bytes()); // postings
+            crate::persist::seal(&mut out);
+            out
+        };
+        assert_eq!(
+            IndexRun::from_bytes(&run_over(MAX_RUN_FILES + 1)).err(),
+            Some(Error::Corrupt)
+        );
+        assert!(
+            IndexRun::from_bytes(&run_over(2)).is_ok(),
+            "a run within the limit loads"
+        );
+    }
+
     /// Two words whose slots share one posting stream, leaving the stream of
     /// the second unreferenced, are rejected even when the row count adds
     /// up: the second word's lookups would read the first's rows and miss
