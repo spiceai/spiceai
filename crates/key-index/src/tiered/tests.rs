@@ -780,6 +780,44 @@ fn a_file_is_covered_by_one_run_only() {
     );
 }
 
+/// A merge keeps only the files still live when it starts. A file retired
+/// from one run can be covered again by a later run (a write that becomes
+/// visible after its grace ran out, then indexed by a read-back), and a merged
+/// run naming it twice would be one its own reader rejects.
+#[test]
+fn a_merge_drops_retired_files_from_the_merged_run() {
+    let index = TieredIndex::new(encoder());
+    let mut builder = RunBuilder::new(encoder());
+    builder.add_batch("same", 0, &column(&[11])).expect("add");
+    builder.add_batch("keep", 0, &column(&[12])).expect("add");
+    index.publish(vec![builder.finish().expect("finish")], &[]);
+    index.publish(vec![], &["same"]);
+    index.publish(vec![run_of("same", &[13])], &[]);
+    assert!(index.merge_all().expect("merge"));
+    let runs = index.view().run_list();
+    assert_eq!(runs.len(), 1);
+    let merged = &runs[0];
+    let mut names: Vec<&str> = merged.files().iter().map(AsRef::as_ref).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["keep", "same"], "the retired file is not kept");
+    let restored = IndexRun::from_bytes(&merged.to_bytes()).expect("the merged run reads back");
+    assert_eq!(restored.len(), merged.len());
+    let found = |key: i64| {
+        let mut found = Vec::new();
+        index.candidates(&encoded(key), |candidate| {
+            found.push((candidate.file.to_string(), candidate.position));
+        });
+        found
+    };
+    assert_eq!(
+        found(11),
+        Vec::<(String, u64)>::new(),
+        "a retired file's row"
+    );
+    assert_eq!(found(12), vec![("keep".to_string(), 0)]);
+    assert_eq!(found(13), vec![("same".to_string(), 0)]);
+}
+
 mod persist {
     use std::collections::BTreeMap;
 
@@ -1086,7 +1124,7 @@ mod persist {
                 (35_592, 0xB56C_576B_EAC6_1324),
                 (95, 0xCBA3_9660_1670_7D8D),
                 (49_423, 0xF5F8_EEA9_AF2A_AA0E),
-                (12_749, 0x3A66_5409_8906_7BBE),
+                (12_673, 0xA17C_D5CB_4945_D384),
             ]
         );
     }

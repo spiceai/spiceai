@@ -989,23 +989,33 @@ fn pick_merge(runs: &[RunEntry]) -> Option<Vec<usize>> {
         })
 }
 
-/// One run of `encoding`'s words over all of `sources`' files, dropping the
-/// rows of files already retired, by a k-way merge of their words.
+/// One run of `encoding`'s words over `sources`' files that are still live,
+/// by a k-way merge of their words. A retired file is left out, rows and
+/// name: another run may cover a file of that name again, and a run naming a
+/// file twice is one [`IndexRun::from_bytes`] rejects.
 fn merge_runs(encoding: u64, sources: &[&RunEntry]) -> Result<IndexRun> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     let mut files: Vec<Arc<str>> = Vec::new();
-    let mut offsets: Vec<u64> = Vec::with_capacity(sources.len());
+    // Per source, each file's id in the merged run, or `None` once retired.
+    let mut ids: Vec<Vec<Option<u64>>> = Vec::with_capacity(sources.len());
     for source in sources {
-        offsets.push(files.len() as u64);
-        files.extend(source.run.files.iter().cloned());
+        let mut source_ids = Vec::with_capacity(source.run.files.len());
+        for (file, state) in source.run.files.iter().zip(source.files.iter()) {
+            source_ids.push(state.is_live().then(|| {
+                files.push(Arc::clone(file));
+                files.len() as u64 - 1
+            }));
+        }
+        ids.push(source_ids);
     }
     ensure!(files.len() <= MAX_RUN_FILES, TooManyFilesSnafu);
     let merged_files = files.len() as u64;
-    // Sources every file of which is live need no per-posting check.
-    let all_live: Vec<bool> = sources
+    // A source that lost a file is renumbered by more than an offset, so its
+    // postings are sorted again rather than trusted to keep their order.
+    let compacted: Vec<bool> = ids
         .iter()
-        .map(|source| source.files.iter().all(|state| state.is_live()))
+        .map(|source_ids| source_ids.iter().any(Option::is_none))
         .collect();
     // Per source, the index of its next word.
     let mut next: Vec<usize> = vec![0; sources.len()];
@@ -1029,16 +1039,11 @@ fn merge_runs(encoding: u64, sources: &[&RunEntry]) -> Result<IndexRun> {
     // into the merged run's files, and moves past it; returns the source's
     // following word, if any.
     let take = |i: usize, next: &mut [usize], group: &mut Vec<u64>| {
-        let (source, offset) = (sources[i], offsets[i]);
-        let run = &source.run;
+        let run = &sources[i].run;
         let at = next[i];
         run.rows_at(at, |file, position| {
-            if all_live[i] || source.files.get(file).is_some_and(|state| state.is_live()) {
-                group.push(word_proof::posting(
-                    position,
-                    file as u64 + offset,
-                    merged_files,
-                ));
+            if let Some(&Some(id)) = ids[i].get(file) {
+                group.push(word_proof::posting(position, id, merged_files));
             }
         });
         next[i] = at + 1;
@@ -1061,8 +1066,8 @@ fn merge_runs(encoding: u64, sources: &[&RunEntry]) -> Result<IndexRun> {
         }
         if !group.is_empty() {
             // One source's postings are already ascending: renumbering its
-            // files keeps their order.
-            if shared {
+            // files by an offset keeps their order.
+            if shared || compacted[first] {
                 group.sort_unstable();
             }
             writer.push(word, &group)?;
@@ -1077,6 +1082,9 @@ fn merge_runs(encoding: u64, sources: &[&RunEntry]) -> Result<IndexRun> {
             group.clear();
             following = take(first, &mut next, &mut group);
             if !group.is_empty() {
+                if compacted[first] {
+                    group.sort_unstable();
+                }
                 writer.push(after, &group)?;
             }
         }
@@ -1437,21 +1445,24 @@ impl TieredIndex {
 
         let _swap = self.swap.lock();
         let now = self.layers.load_full();
-        // The merged run's files, in source order, as live as the sources are
-        // now: a source dropped meanwhile had all its files retired.
+        // The merged run's files (the sources' files live when the merge
+        // started, in source order), as live as the sources are now: a source
+        // dropped meanwhile had all its files retired.
         let mut states: Vec<FileState> = Vec::with_capacity(merged.files.len());
         for source in &sources {
-            if let Some(entry) = now
+            let now_states = now
                 .runs
                 .iter()
                 .find(|entry| Arc::ptr_eq(&entry.run, &source.run))
-            {
-                states.extend(entry.files.iter());
-            } else {
-                states.extend(std::iter::repeat_n(
-                    FileState::Retired,
-                    source.run.files.len(),
-                ));
+                .map(|entry| &entry.files);
+            for (at, then) in source.files.iter().enumerate() {
+                if then.is_live() {
+                    states.push(
+                        now_states
+                            .and_then(|states| states.get(at).copied())
+                            .unwrap_or(FileState::Retired),
+                    );
+                }
             }
         }
         let mut runs: Vec<RunEntry> = now
