@@ -222,7 +222,7 @@ mod tests {
 
         let df = Arc::new(
             DataFusion::builder(
-                crate::status::RuntimeStatus::new(),
+                runtime_status::RuntimeStatus::new(),
                 Arc::new(crate::dataaccelerator::AcceleratorEngineRegistry::default()),
                 tokio::runtime::Handle::current(),
             )

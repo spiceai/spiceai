@@ -1502,7 +1502,7 @@ mod tests {
         )])));
         rt.status().update_model(
             "deepseek",
-            crate::status::ComponentStatus::error_with_message("Insufficient Balance"),
+            runtime_status::ComponentStatus::error_with_message("Insufficient Balance"),
         );
         // A model that failed to load is never inserted into the chat model store.
         let llms: Arc<RwLock<LLMChatCompletionsModelStore>> = Arc::default();

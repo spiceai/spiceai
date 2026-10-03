@@ -862,7 +862,7 @@ pub async fn build_object_store_internal(
     state_location: &str,
     config: &SchedulerConfig,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
-    crate::object_store_state::build_object_store(
+    runtime_object_store::state::build_object_store(
         secrets,
         io_runtime,
         state_location,
@@ -884,9 +884,9 @@ mod tests {
     use super::*;
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::datafusion::builder::DataFusionBuilder;
-    use crate::status;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
+    use runtime_status as status;
 
     #[tokio::test]
     async fn registry_runner_basic_register_and_shutdown() {
