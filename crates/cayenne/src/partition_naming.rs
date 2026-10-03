@@ -43,14 +43,18 @@ pub fn legacy_partition_child_table_name(parent: &str, partition_values: &[Strin
 }
 
 /// Every child table name a partition holding `partition_values` may legally
-/// answer to under `parent`: the composite-key name this build writes, and the
-/// [legacy][legacy_partition_child_table_name] one an older runtime wrote.
+/// answer to under `parent`, in the order a partition resolves its child: the
+/// composite-key name this build writes, then the
+/// [legacy][legacy_partition_child_table_name] one an older runtime wrote. A
+/// partition's child is the first of these a table exists under.
 ///
-/// Both the catalog's child lookup and the snapshot slice's validator have to
-/// accept the same set — one resolves a child to drop or export, the other
-/// decides whether a restored child is this dataset's — so a name the two
-/// disagree about is a dataset one of them drops and the other refuses. The
-/// composite key is derived here rather than by the caller for the same reason.
+/// One function for every caller, because they must agree: the partition
+/// creator opens a partition's child in this order, the snapshot slice's
+/// validator predicts which child a restored partition opens in the same order,
+/// and the catalog's child lookup binds both names to drop or export a child. A
+/// name or an order two of them disagree about is a dataset one restores and the
+/// other reads wrongly. The composite key is derived here rather than by the
+/// caller for the same reason.
 #[must_use]
 pub fn partition_child_candidate_names(parent: &str, partition_values: &[String]) -> [String; 2] {
     [

@@ -235,13 +235,6 @@ impl CayennePartitionCreator {
         crate::partition_naming::partition_child_table_name(&self.table_name, partition_key)
     }
 
-    fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {
-        crate::partition_naming::legacy_partition_child_table_name(
-            &self.table_name,
-            partition_values,
-        )
-    }
-
     fn partition_dir(&self, partition_values: &[ScalarValue]) -> Result<PathBuf, creator::Error> {
         let pairings: Vec<(PartitionedBy, ScalarValue)> = self
             .partition_by
@@ -404,29 +397,22 @@ impl PartitionCreator for CayennePartitionCreator {
                 partition_values.push(partition_value);
             }
 
-            let partition_key = partition_meta.composite_key();
-            let partition_table_name = self.partition_table_name(&partition_key);
+            let [current_name, legacy_name] =
+                crate::partition_naming::partition_child_candidate_names(
+                    &self.table_name,
+                    &partition_meta.partition_values,
+                );
 
-            // Current name first, legacy only when it is not found. The snapshot
-            // slice validator predicts the child each partition opens by this same
-            // order, so changing it changes which restored slices are safe to accept.
-            let cayenne_table = match self
-                .partition_table_builder()
-                .open(&partition_table_name)
-                .await
-            {
+            let cayenne_table = match self.partition_table_builder().open(&current_name).await {
                 Ok(table) => table,
                 Err(crate::provider::Error::Catalog {
                     source: crate::catalog::CatalogError::TableNotFound { .. },
-                }) => {
-                    let legacy_name =
-                        self.legacy_partition_table_name(&partition_meta.partition_values);
-                    self.partition_table_builder()
-                        .open(&legacy_name)
-                        .await
-                        .boxed()
-                        .context(creator::InferringPartitionsSnafu)?
-                }
+                }) => self
+                    .partition_table_builder()
+                    .open(&legacy_name)
+                    .await
+                    .boxed()
+                    .context(creator::InferringPartitionsSnafu)?,
                 Err(error) => {
                     return Err(creator::Error::InferringPartitions {
                         source: Box::new(error),
@@ -474,7 +460,7 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use tempfile::TempDir;
 
-    use crate::metadata::{CreateTableOptions, VortexConfig};
+    use crate::metadata::{CreateTableOptions, PartitionMetadata, VortexConfig};
     use crate::{CayenneCatalog, CayenneTableProvider};
     use arrow::datatypes::{DataType, Field, Schema};
 
@@ -725,20 +711,41 @@ mod tests {
                 .expect("partition is created");
         }
 
-        let source_anchor = source
+        let restored = restore_on_a_fresh_node(&source).await;
+
+        let mut values: Vec<String> = creator_for(&restored)
+            .infer_existing_partitions()
+            .await
+            .expect("every restored partition opens")
+            .iter()
+            .map(|partition| match partition.partition_values.as_slice() {
+                [ScalarValue::Utf8(Some(value))] => value.clone(),
+                other => panic!("expected one Utf8 partition value, got {other:?}"),
+            })
+            .collect();
+        values.sort();
+        assert_eq!(values, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// The directory `export_dataset_slice` anchors `fixture`'s paths to.
+    fn anchor_of(fixture: &Fixture) -> PathBuf {
+        fixture
             .base_path
             .parent()
             .expect("the table directory has a parent")
-            .to_path_buf();
+            .to_path_buf()
+    }
+
+    /// Export `source` and import it on a fresh node: its own metastore, its
+    /// own data directory. Nothing is copied across — the slice alone has to
+    /// describe the dataset well enough for every partition to open.
+    async fn restore_on_a_fresh_node(source: &Fixture) -> Fixture {
         let slice = source
             .catalog
-            .export_dataset_slice(TABLE, &source_anchor)
+            .export_dataset_slice(TABLE, &anchor_of(source))
             .await
             .expect("the partitioned dataset exports");
 
-        // A fresh node: its own metastore, its own data directory. Nothing is
-        // copied across — the slice alone has to describe the dataset well
-        // enough for every partition to open.
         let restored_tmp = TempDir::new().expect("tempdir");
         let restored_anchor = restored_tmp.path().to_path_buf();
         let restored_catalog: Arc<dyn MetadataCatalog> = Arc::new(
@@ -762,27 +769,159 @@ mod tests {
             .await
             .expect("the restored parent is registered")
             .table_id;
-        let restored = Fixture {
+        Fixture {
             catalog: restored_catalog,
             table_id: restored_table_id,
             schema: Arc::clone(&source.schema),
             base_path: restored_anchor.join(TABLE),
             runtime_env: Arc::clone(&source.runtime_env),
             _tmp: restored_tmp,
-        };
+        }
+    }
 
-        let mut values: Vec<String> = creator_for(&restored)
-            .infer_existing_partitions()
+    /// The child table name this build gives the partition holding `value`.
+    fn current_child(value: &str) -> String {
+        let [current, _legacy] =
+            crate::partition_naming::partition_child_candidate_names(TABLE, &[value.to_string()]);
+        current
+    }
+
+    /// The partition value whose legacy-scheme child name is `x`'s
+    /// current-scheme one: `x`'s child name with the parent's prefix removed.
+    fn value_colliding_with_x() -> String {
+        current_child("x")
+            .strip_prefix(&format!("{TABLE}_"))
+            .expect("a child name starts with its parent's")
+            .to_string()
+    }
+
+    /// Register a partition the way an older runtime wrote one — its value as
+    /// the raw string — rooted at `dir` under the table, with a child table
+    /// under each of `children`.
+    async fn legacy_partition(fixture: &Fixture, value: &str, dir: &str, children: &[&str]) {
+        let path = fixture.base_path.join(dir);
+        tokio::fs::create_dir_all(&path)
             .await
-            .expect("every restored partition opens")
+            .expect("the partition directory is created");
+        let path = path.to_string_lossy().to_string();
+        fixture
+            .catalog
+            .add_partition(PartitionMetadata::new_composite(
+                fixture.table_id.clone(),
+                vec!["bucket".to_string()],
+                vec![value.to_string()],
+                path.clone(),
+                false,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("the partition {value} is registered: {error}"));
+        for child in children {
+            creator_for(fixture)
+                .partition_table_builder()
+                .create(CreateTableOptions {
+                    table_name: (*child).to_string(),
+                    schema: Arc::clone(&fixture.schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: path.clone(),
+                    partition_column: None,
+                    vortex_config: VortexConfig::default(),
+                })
+                .await
+                .unwrap_or_else(|error| panic!("the child {child} is created: {error}"));
+        }
+    }
+
+    /// Each partition's value and the name of the child table it opened,
+    /// sorted.
+    fn opened_children(partitions: &[Partition]) -> Vec<(String, String)> {
+        let mut opened: Vec<(String, String)> = partitions
             .iter()
-            .map(|partition| match partition.partition_values.as_slice() {
-                [ScalarValue::Utf8(Some(value))] => value.clone(),
-                other => panic!("expected one Utf8 partition value, got {other:?}"),
+            .map(|partition| {
+                let [ScalarValue::Utf8(Some(value))] = partition.partition_values.as_slice() else {
+                    panic!(
+                        "expected one Utf8 partition value, got {:?}",
+                        partition.partition_values
+                    );
+                };
+                let child = partition
+                    .table_provider
+                    .downcast_ref::<CayenneTableProvider>()
+                    .expect("a Cayenne partition")
+                    .table_name()
+                    .to_string();
+                (value.clone(), child)
             })
             .collect();
-        values.sort();
-        assert_eq!(values, vec!["alpha".to_string(), "beta".to_string()]);
+        opened.sort();
+        opened
+    }
+
+    /// One partition's current-scheme child name can equal another's
+    /// legacy-scheme name. With each partition holding its own current-scheme
+    /// child, a restored partition still opens its own — which holds only
+    /// while the slice validator that accepts the restore and
+    /// `infer_existing_partitions` try a partition's names in the same order.
+    #[tokio::test]
+    async fn a_restored_partition_opens_its_own_child_when_child_names_collide() {
+        let source = fixture().await;
+        let colliding = value_colliding_with_x();
+        legacy_partition(&source, "x", "kx", &[&current_child("x")]).await;
+        legacy_partition(&source, &colliding, "kc", &[&current_child(&colliding)]).await;
+
+        let restored = restore_on_a_fresh_node(&source).await;
+        let partitions = creator_for(&restored)
+            .infer_existing_partitions()
+            .await
+            .expect("every restored partition opens");
+
+        assert_eq!(
+            opened_children(&partitions),
+            vec![
+                (colliding.clone(), current_child(&colliding)),
+                ("x".to_string(), current_child("x")),
+            ]
+        );
+    }
+
+    /// The other side of the same collision: `x`'s current-scheme child, which
+    /// is also the colliding partition's legacy-scheme name, and no child of
+    /// the colliding partition's own. The runtime opens `x`'s child for both
+    /// partitions, so the colliding one reads `x`'s rows — and the export that
+    /// would carry the dataset to another node is refused rather than
+    /// restoring that.
+    #[tokio::test]
+    async fn a_dataset_whose_partitions_open_one_child_does_not_export() {
+        let source = fixture().await;
+        let colliding = value_colliding_with_x();
+        let x_child = current_child("x");
+        legacy_partition(&source, "x", "shared", &[&x_child, &format!("{TABLE}_x")]).await;
+        legacy_partition(&source, &colliding, "shared", &[]).await;
+
+        let partitions = creator_for(&source)
+            .infer_existing_partitions()
+            .await
+            .expect("both partitions open");
+        assert_eq!(
+            opened_children(&partitions),
+            vec![
+                (colliding, x_child.clone()),
+                ("x".to_string(), x_child.clone())
+            ],
+            "the runtime resolves both partitions to one child"
+        );
+
+        let error = source
+            .catalog
+            .export_dataset_slice(TABLE, &anchor_of(&source))
+            .await
+            .expect_err("a dataset two of whose partitions open one child must not export");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("would both open the child table '{x_child}'")),
+            "{error}"
+        );
     }
 
     /// One value per `partition_by` expression, no more and no fewer.
