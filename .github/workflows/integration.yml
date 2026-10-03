@@ -408,6 +408,22 @@ jobs:
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/)'
           fi
 
+      - name: Configure apt mirrors for the retention OOM test
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        uses: ./.github/actions/configure-apt
+
+      # The retention OOM test packages its own debug test binary as the Docker build context
+      # and runs `strip --strip-debug` on it first. This job installs no C toolchain, so without
+      # binutils the test stages the unstripped binary (several GiB), and every attempt spends
+      # its 360s ceiling transferring and exporting that context before the workload starts.
+      - name: Install binutils for the retention OOM test
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils
+          strip --version | head -1
+
       - name: Run retention OOM regression test
         if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
         # Sized to hold the test's whole retry budget, not one pass of it: nextest

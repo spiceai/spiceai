@@ -417,32 +417,108 @@ mod tests {
         FunctionSupport, deny_spice_functions_for_bigquery_table_providers,
         deny_spice_functions_for_duckdb_dialect_without_carve_out,
         deny_spice_functions_for_duckdb_table_providers,
+        deny_spice_functions_for_mysql_table_providers,
+        deny_spice_functions_for_postgres_table_providers,
         deny_spice_functions_for_sqlite_table_providers,
     };
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::DFSchema;
+    use datafusion::functions::core::expr_fn::{
+        arrow_cast, arrow_try_cast, cast_to_type, try_cast_to_type,
+    };
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
-    use datafusion::logical_expr::{LogicalPlan, table_scan};
+    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, table_scan};
     use datafusion::prelude::{Expr, cast, col, lit, try_cast};
     use datafusion::scalar::ScalarValue;
     use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
-    use runtime_udfs_api::{add_user_function, remove_user_function};
+    use runtime_udfs_api::{add_user_function, function_support, remove_user_function};
 
     /// A scan of `t(s, start)` projecting `expr`, which is the shape federation
     /// is asked to decide about.
     fn plan_projecting(expr: Expr) -> LogicalPlan {
-        let schema = Schema::new(vec![
-            Field::new("s", DataType::Utf8, true),
-            Field::new("start", DataType::Int64, true),
-        ]);
-        table_scan(Some("t"), &schema, None)
-            .expect("scan t")
+        scan_t()
             .project(vec![expr])
             .expect("project")
             .build()
             .expect("build plan")
+    }
+
+    /// A scan of `t(s, start)` filtered by `predicate`.
+    fn plan_filtering(predicate: Expr) -> LogicalPlan {
+        scan_t()
+            .filter(predicate)
+            .expect("filter")
+            .build()
+            .expect("build plan")
+    }
+
+    fn scan_t() -> LogicalPlanBuilder {
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("start", DataType::Int64, true),
+        ]);
+        table_scan(Some("t"), &schema, None).expect("scan t")
+    }
+
+    /// Regression test for #14444. `DataFusion`'s own cast built-ins must be
+    /// evaluated locally under every backend policy — as a projection and as a
+    /// filter — because each backend either lacks the function (`DuckDB` and
+    /// `SQLite` failed the query as an unknown function) or, like `DuckDB`'s
+    /// `cast_to_type`, casts by its own rules rather than Arrow's.
+    #[test]
+    fn a_datafusion_cast_builtin_stays_local_on_every_backend() {
+        let plans: Vec<(&str, LogicalPlan)> = [
+            ("arrow_cast", arrow_cast(col("start"), lit("LargeUtf8"))),
+            ("arrow_try_cast", arrow_try_cast(col("s"), lit("Int64"))),
+            ("cast_to_type", cast_to_type(col("start"), lit(1_i32))),
+            ("try_cast_to_type", try_cast_to_type(col("s"), lit(1_i64))),
+        ]
+        .into_iter()
+        .flat_map(|(name, cast)| {
+            [
+                (name, plan_projecting(cast.clone())),
+                (name, plan_filtering(cast.is_not_null())),
+            ]
+        })
+        .collect();
+        // The column itself still federates: the refusal costs only the casts
+        // it is about.
+        let plain_column = plan_projecting(col("start"));
+        let policies = [
+            ("plain", function_support()),
+            ("DuckDB", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "DuckLake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+            (
+                "BigQuery",
+                deny_spice_functions_for_bigquery_table_providers(),
+            ),
+            (
+                "PostgreSQL",
+                deny_spice_functions_for_postgres_table_providers(),
+            ),
+            ("SQLite", deny_spice_functions_for_sqlite_table_providers()),
+            ("MySQL", deny_spice_functions_for_mysql_table_providers()),
+        ];
+
+        for (policy, support) in &policies {
+            for (name, plan) in &plans {
+                assert!(
+                    contains_unsupported_functions(plan, support)
+                        .expect("the support check must not error"),
+                    "the {policy} policy must evaluate {name} locally rather than federate it:\n{plan}"
+                );
+            }
+            assert!(
+                !contains_unsupported_functions(&plain_column, support)
+                    .expect("the support check must not error"),
+                "the {policy} policy must still federate a plain column"
+            );
+        }
     }
 
     /// Whether federation would push this plan into `DuckDB`, which is what
@@ -949,11 +1025,13 @@ mod tests {
         ));
     }
 
-    /// A scan of `t(id, a)` with `a` binary, filtered by `predicate` and
-    /// projecting `projection` — the shapes #14355 measured.
+    /// A scan of `t(id, s, a)` with `s` text and `a` binary, filtered by
+    /// `predicate` and projecting `projection` — the shapes #14355 and #14397
+    /// measured.
     fn plan_over_binary(predicate: Option<Expr>, projection: Expr) -> LogicalPlan {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
             Field::new("a", DataType::Binary, true),
         ]);
         let mut plan = table_scan(Some("t"), &schema, None).expect("scan t");
@@ -966,13 +1044,9 @@ mod tests {
             .expect("build plan")
     }
 
-    /// Regression test for #14355, through both `DuckDB` accessors: a cast of a
-    /// binary column into text answers with a row on `DuckDB` where
-    /// `DataFusion` raises (`CAST`) or answers NULL (`TRY_CAST`), so a plan
-    /// holding one, in a projection or a filter, must stay local.
-    #[test]
-    fn a_duckdb_text_cast_over_a_binary_column_is_not_federated() {
-        use datafusion::prelude::{cast, try_cast};
+    /// Asserts, through both `DuckDB` accessors, that every plan in `local`
+    /// stays local and every plan in `federated` still federates.
+    fn assert_duckdb_federation(local: &[LogicalPlan], federated: &[LogicalPlan]) {
         for (accessor, support) in [
             (
                 "table providers",
@@ -983,7 +1057,61 @@ mod tests {
                 deny_spice_functions_for_duckdb_dialect_without_carve_out(),
             ),
         ] {
-            for plan in [
+            for plan in local {
+                assert!(
+                    contains_unsupported_functions(plan, &support)
+                        .expect("the support check must not error"),
+                    "the {accessor} accessor must keep this plan local:\n{plan}"
+                );
+            }
+            for plan in federated {
+                assert!(
+                    !contains_unsupported_functions(plan, &support)
+                        .expect("the support check must not error"),
+                    "the {accessor} accessor must still federate:\n{plan}"
+                );
+            }
+        }
+    }
+
+    /// Regression test for #14397, through both `DuckDB` accessors: no cast into
+    /// a binary type has a `DuckDB` rendering that answers what `DataFusion`
+    /// does, so a plan holding one, in a projection or a filter, stays local.
+    #[test]
+    fn a_duckdb_cast_into_binary_is_not_federated() {
+        assert_duckdb_federation(
+            &[
+                plan_over_binary(None, cast(col("s"), DataType::Binary)),
+                plan_over_binary(None, try_cast(col("s"), DataType::Binary)),
+                plan_over_binary(
+                    Some(cast(col("s"), DataType::Binary).eq(col("a"))),
+                    col("id"),
+                ),
+                // A literal cast is sent as the bare string, which `DuckDB`
+                // reads under its own escape rules.
+                plan_over_binary(
+                    Some(col("a").eq(cast(lit("\\xFF"), DataType::Binary))),
+                    col("id"),
+                ),
+            ],
+            // Casts into other types, and the binary column itself, still
+            // federate: the refusal costs only the casts it is about.
+            &[
+                plan_over_binary(None, col("a")),
+                plan_over_binary(None, cast(col("s"), DataType::Utf8View)),
+                plan_over_binary(Some(col("a").is_not_null()), col("id")),
+            ],
+        );
+    }
+
+    /// Regression test for #14355, through both `DuckDB` accessors: a cast of a
+    /// binary column into text answers with a row on `DuckDB` where
+    /// `DataFusion` raises (`CAST`) or answers NULL (`TRY_CAST`), so a plan
+    /// holding one, in a projection or a filter, must stay local.
+    #[test]
+    fn a_duckdb_text_cast_over_a_binary_column_is_not_federated() {
+        assert_duckdb_federation(
+            &[
                 plan_over_binary(None, cast(col("a"), DataType::Utf8)),
                 plan_over_binary(None, try_cast(col("a"), DataType::Utf8)),
                 plan_over_binary(None, cast(col("a"), DataType::Utf8View)),
@@ -991,28 +1119,15 @@ mod tests {
                     Some(cast(col("a"), DataType::Utf8).like(lit("%bad%"))),
                     col("id"),
                 ),
-            ] {
-                assert!(
-                    contains_unsupported_functions(&plan, &support)
-                        .expect("the support check must not error"),
-                    "the {accessor} accessor must keep this plan local:\n{plan}"
-                );
-            }
-
+            ],
             // The binary column itself, and a text cast over a non-binary
             // column, still federate: the refusal costs only the casts it is
             // about.
-            for plan in [
+            &[
                 plan_over_binary(None, col("a")),
                 plan_over_binary(None, cast(col("id"), DataType::Utf8)),
                 plan_over_binary(Some(col("a").is_not_null()), col("id")),
-            ] {
-                assert!(
-                    !contains_unsupported_functions(&plan, &support)
-                        .expect("the support check must not error"),
-                    "the {accessor} accessor must still federate:\n{plan}"
-                );
-            }
-        }
+            ],
+        );
     }
 }

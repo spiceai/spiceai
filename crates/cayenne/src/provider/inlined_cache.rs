@@ -20,12 +20,9 @@ limitations under the License.
 //! on `CayenneTableProvider`.
 
 use crate::metadata::InlinedData;
-use arrow::array::{Array, ArrayData};
-use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
+use arrow_tools::batch_bytes::RetainedBytes;
 use datafusion_common::Statistics;
-use std::collections::HashSet;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// Per-entry decoded view of one metastore inline-data row.
@@ -148,69 +145,25 @@ pub(crate) struct InlinedDurableCommit {
 
 /// Resident Arrow bytes of `batches`, counting each physical allocation once.
 ///
-/// [`RecordBatch::get_array_memory_size`] cannot be used for this. It sums
-/// `Buffer::capacity()` once per buffer *reference*, and `capacity()` reports
-/// the whole parent allocation however narrow a slice the reference covers. The
-/// batches in this cache come out of the IPC reader, which decodes a message
-/// body into one allocation and points every column and child buffer at a slice
-/// of it — so that sum bills a single allocation once per buffer in the batch
-/// and over-reports by roughly the buffer count per row-group. On a table whose
-/// entries carry 19 buffers it reported 554 MB for a cache holding 28.7 MB.
+/// [`RecordBatch::get_array_memory_size`] cannot be used for this: the batches
+/// in this cache come out of the IPC reader, which points every buffer of an
+/// entry at one body allocation, and that sum bills the allocation once per
+/// buffer. On a table whose entries carry 19 buffers it reported 554 MB for a
+/// cache holding 28.7 MB. See [`RetainedBytes`] for the dedupe.
 ///
-/// Sliced batches reach the budget and chunking paths too
-/// ([`super::streaming::ChunkCap::Bytes`], the mem-tier cap), where the same
-/// over-report errs toward smaller chunks and tighter budgets and is therefore
-/// left alone. A gauge has no conservative direction: an operator attributing
-/// resident memory reads the number as the memory, so it has to be the memory.
-///
-/// # Dedupe key
-///
-/// [`arrow::buffer::Buffer::data_ptr`] — the parent allocation's base address —
-/// and never `as_ptr()`, which has the slice offset already applied and so hands
-/// every slice of one allocation a distinct key, dedupes nothing, and silently
-/// reproduces the buggy sum. An address identifies an allocation only while it
-/// is alive, which holds here: the caller owns `batches` across the walk.
-///
-/// Counts buffer capacity only. `get_array_memory_size` also adds a fixed-size
-/// term per array and per buffer reference for the Arrow bookkeeping structs,
-/// which is a real cost — on a cache of one-row batches it rivals the values
-/// themselves — but it is an estimate rather than a measurement, and a gauge
-/// that was disbelieved for over-reporting does not get to carry one.
-/// `cayenne_inline_cache_batches` beside it is what that cost tracks: bytes far
-/// below what the batch count implies is a cache paying per batch rather than
-/// per row.
+/// Counts buffer capacity only. The Arrow bookkeeping structs are a real cost —
+/// on a cache of one-row batches they rival the values themselves — and the
+/// mem-tier limit counts them, but they are an estimate rather than a
+/// measurement, and a gauge that was disbelieved for over-reporting does not get
+/// to carry one. `cayenne_inline_cache_batches` beside it is what that cost
+/// tracks: bytes far below what the batch count implies is a cache paying per
+/// batch rather than per row.
 pub(crate) fn resident_bytes(batches: &[RecordBatch]) -> usize {
-    // The inline corpus is bounded by the checkpoint thresholds
-    // (`INLINE_FLUSH_MAX_ROWS`/`_SEGMENTS`), so this set stays small enough that
-    // the default hasher costs nothing worth a dependency.
-    let mut seen = HashSet::new();
-    let mut total = 0usize;
+    let mut bytes = RetainedBytes::new();
     for batch in batches {
-        for column in batch.columns() {
-            add_distinct_allocations(&column.to_data(), &mut seen, &mut total);
-        }
+        bytes.add(batch);
     }
-    total
-}
-
-/// Add every allocation reachable from `data` that `seen` has not already
-/// counted, recursing through child arrays.
-fn add_distinct_allocations(data: &ArrayData, seen: &mut HashSet<NonZeroUsize>, total: &mut usize) {
-    for buffer in data.buffers() {
-        add_buffer_once(buffer, seen, total);
-    }
-    if let Some(nulls) = data.nulls() {
-        add_buffer_once(nulls.buffer(), seen, total);
-    }
-    for child in data.child_data() {
-        add_distinct_allocations(child, seen, total);
-    }
-}
-
-fn add_buffer_once(buffer: &Buffer, seen: &mut HashSet<NonZeroUsize>, total: &mut usize) {
-    if seen.insert(buffer.data_ptr().addr()) {
-        *total = total.saturating_add(buffer.capacity());
-    }
+    bytes.buffer_bytes()
 }
 
 #[cfg(test)]

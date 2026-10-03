@@ -65,7 +65,7 @@ const TOTAL_ID_SUM: i64 = 16 * (16 + 1) / 2;
 /// partition-assignment metadata to persist.
 fn local_scheduler_config(state_dir: &std::path::Path) -> SchedulerConfig {
     SchedulerConfig {
-        state_location: format!("file://{}", state_dir.display()),
+        state_location: Some(format!("file://{}", state_dir.display())),
         params: None,
         partition_assignment_interval: "1s".to_string(),
         max_partition_assignments_per_interval:
