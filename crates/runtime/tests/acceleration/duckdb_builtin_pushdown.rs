@@ -1071,8 +1071,8 @@ async fn duckdb_regexp_like_and_replace_stay_local_where_the_engines_disagree()
                 ),
                 (
                     r"regexp_replace(s, '(a)(b)', '\2\1')",
-                    "the POSIX spelling of that rewrite",
-                    None,
+                    "the POSIX spelling of that rewrite, which both engines read alike",
+                    Some("regexp_replace("),
                 ),
                 (
                     r"regexp_like(s, 'a')",
@@ -1183,6 +1183,186 @@ async fn duckdb_regexp_like_and_replace_stay_local_where_the_engines_disagree()
                     r"SELECT id FROM accelerated WHERE regexp_like(s, '\w') ORDER BY id"
                 )
                 .await?
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// URL-shaped rows for the capture-group rewrites, plus a row where an
+/// optional group does not take part in the match (`b` under `(a)?b`) and
+/// the NULL row.
+fn write_regexp_group_reference_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        path,
+        "id,s\n\
+         1,https://www.google.com/search?q=1\n\
+         2,http://yandex.ru/a/b\n\
+         3,https://example.org/\n\
+         4,ab\n\
+         5,aab\n\
+         6,b\n\
+         7,xyz\n\
+         8,\n",
+    )?;
+    Ok(())
+}
+
+/// A `regexp_replace` whose replacement names a capture group as `\N` is
+/// pushed down to `DuckDB` and agrees with local evaluation on every row, and
+/// every other backslash form stays local (#13966). The rule is
+/// `re2::engine_neutral_replacement`.
+///
+/// The first shape is `ClickBench` q29's, whose `DuckDB` benchmark plans
+/// snapshot the aggregate federated; refusing it evaluated the whole
+/// `GROUP BY` above a bare scan.
+#[tokio::test]
+async fn duckdb_regexp_replace_group_references_push_down_where_the_engines_agree()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("regexp_group_reference.csv");
+            write_regexp_group_reference_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_regexp_group_reference")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            // `true` — must be rendered as DuckDB's `regexp_replace`; `false`
+            // — must not reach DuckDB at all.
+            let calls: [(&str, &str, bool); 10] = [
+                (
+                    r"regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1')",
+                    "the ClickBench q29 host extraction",
+                    true,
+                ),
+                (
+                    r"regexp_replace(s, '(a)?b', '<\1>')",
+                    "a group that does not take part in the match (row 6)",
+                    true,
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\0-\2\1')",
+                    "the whole match and two groups",
+                    true,
+                ),
+                (
+                    r"regexp_replace(s, 'a(b)?', '[\1]', 'g')",
+                    "a global replace naming an optional group",
+                    true,
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\10')",
+                    "a two-digit group reference",
+                    false,
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\\1')",
+                    "a doubled backslash",
+                    false,
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\3')",
+                    "a group the pattern does not have",
+                    false,
+                ),
+                (
+                    r"regexp_replace(s, '(?:a)(b)', '\2')",
+                    "a group counted from a non-capturing one",
+                    false,
+                ),
+                (
+                    "regexp_replace(s, '(a)(b)', '\\1\u{661}')",
+                    "a group reference followed by a non-ASCII digit",
+                    false,
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\q')",
+                    "an escape that is not a group reference",
+                    false,
+                ),
+            ];
+            for (call, what, pushed_down) in calls {
+                let sql = |table: &str| format!("SELECT id, {call} AS v FROM {table} ORDER BY id");
+                let accelerated =
+                    to_pretty_display(&run_query(&rt, &sql("accelerated")).await?)?.to_string();
+                let local = to_pretty_display(&run_query(&rt, &sql("local")).await?)?.to_string();
+                assert_eq!(
+                    accelerated, local,
+                    "{what} ({call}) must answer what local evaluation answers on every row"
+                );
+
+                let plan = to_pretty_display(
+                    &run_query(&rt, &format!("EXPLAIN SELECT {call} FROM accelerated")).await?,
+                )?
+                .to_string();
+                let remote_sql = pushed_down_sql(&plan);
+                assert_eq!(
+                    remote_sql.contains("regexp_replace("),
+                    pushed_down,
+                    "{what} ({call}): expected pushed down = {pushed_down}; the SQL sent was:\n{remote_sql}"
+                );
+            }
+
+            // The values, so the agreement is not two engines agreeing on a
+            // wrong answer: the host of each URL row, and an empty group where
+            // the optional one did not take part.
+            assert_batches_eq!(
+                [
+                    "+----+-------------+",
+                    "| id | k           |",
+                    "+----+-------------+",
+                    "| 1  | google.com  |",
+                    "| 2  | yandex.ru   |",
+                    "| 3  | example.org |",
+                    "+----+-------------+",
+                ],
+                &run_query(
+                    &rt,
+                    r"SELECT id, regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k FROM accelerated WHERE id <= 3 ORDER BY id"
+                )
+                .await?
+            );
+            assert_batches_eq!(
+                ["+----+", "| k  |", "+----+", "| <> |", "+----+",],
+                &run_query(
+                    &rt,
+                    r"SELECT regexp_replace(s, '(a)?b', '<\1>') AS k FROM accelerated WHERE id = 6"
+                )
+                .await?
+            );
+
+            // The ClickBench q29 shape: the aggregate over the extraction is
+            // evaluated by DuckDB, not above a bare scan.
+            let q29 = r"SELECT regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, count(*) AS c FROM {table} WHERE s <> '' GROUP BY 1 ORDER BY k";
+            let accelerated = run_query(&rt, &q29.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &q29.replace("{table}", "local")).await?;
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "the ClickBench q29 shape must answer what local evaluation answers"
+            );
+            let plan = to_pretty_display(
+                &run_query(&rt, &format!("EXPLAIN {}", q29.replace("{table}", "accelerated")))
+                    .await?,
+            )?
+            .to_string();
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                remote_sql.contains("regexp_replace(") && remote_sql.contains("GROUP BY"),
+                "the ClickBench q29 aggregate must be evaluated by DuckDB; the SQL sent was:\n{remote_sql}"
             );
 
             rt.shutdown().await;

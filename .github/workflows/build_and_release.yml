@@ -100,8 +100,10 @@ jobs:
             // Include Windows and Linux ARM only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
             const includeWindowsAndLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
 
-            // Tagged releases use GitHub hosted runners, others use spiceai runners
-            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos-large";
+            // Tagged releases use hosted macOS; only trunk pushes use the standard self-hosted pool.
+            const isTrunkPush = context.eventName === 'push' && context.ref === 'refs/heads/trunk';
+            const macosRunner = isTaggedRelease ? "macos-15" :
+                                isTrunkPush ? "spiceai-macos" : "spiceai-macos-large";
             const linuxRunner = isTaggedRelease ? "ubuntu-24.04" : "spiceai-dev-runners";
 
             // Use minio for spiceai runners (trunk, release branches, manual dispatch on non-tagged)
@@ -179,6 +181,14 @@ jobs:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
+    # Trunk macOS builds run one at a time on `spiceai-macos`: a newer push replaces the
+    # build still waiting, never the one running, so a burst of merges builds its first and
+    # latest commit and a steady stream of merges cannot starve the build.
+    # Every other leg and event keeps a group of its own, including the Linux x64 leg whose
+    # per-commit MinIO upload `testoperator dispatch` reads.
+    concurrency:
+      group: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/trunk' && matrix.target.target_os == 'darwin') && format('{0}-trunk-darwin', github.workflow) || format('{0}-{1}-{2}-{3}', github.workflow, github.run_id, matrix.target.target_os, matrix.target.target_arch) }}
+      cancel-in-progress: false
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
       # Internal builds include PostgreSQL acceleration for benchmarks; tagged releases omit it.
