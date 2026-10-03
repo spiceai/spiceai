@@ -304,7 +304,14 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                         .collect();
                 x.join("\n")
             }
-            None => unimplemented!("Assistant message with no content is not supported"),
+            // An assistant turn with no textual content is protocol-valid: it is how a
+            // client replays a tool call in conversation history, carrying `tool_calls`
+            // and no prose. It therefore arrives from request input, and aborting the
+            // task on it takes down a request a caller is entitled to make. Empty text
+            // is what this conversion means for such a turn — it is lossy by contract
+            // and discards the tool metadata of every other arm too — and it is what
+            // the `Function` arm below already answers for a missing body.
+            None => String::new(),
         },
         ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
@@ -486,7 +493,129 @@ pub trait Chat: Sync + Send {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use async_openai::types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+        ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest, FunctionCall,
+    };
+
+    use super::{Chat, Error, Result, SqlGeneration, message_to_content};
+
+    /// A tool-call-only assistant turn, in the shape a client replays one.
+    #[expect(deprecated)]
+    fn assistant_tool_call_turn() -> ChatCompletionRequestMessage {
+        ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            content: None,
+            refusal: None,
+            name: None,
+            audio: None,
+            tool_calls: Some(vec![ChatCompletionMessageToolCalls::Function(
+                ChatCompletionMessageToolCall {
+                    id: "call_123".to_string(),
+                    function: FunctionCall {
+                        name: "lookup".to_string(),
+                        arguments: r#"{"q":"spice"}"#.to_string(),
+                    },
+                },
+            )]),
+            function_call: None,
+        })
+    }
+
+    fn user_turn(text: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            name: None,
+            content: ChatCompletionRequestUserMessageContent::Text(text.to_string()),
+        })
+    }
+
+    /// Regression test for #13207.
+    #[test]
+    fn an_assistant_turn_carrying_only_tool_calls_flattens_to_empty_text() {
+        assert_eq!(
+            message_to_content(&assistant_tool_call_turn()),
+            "",
+            "a tool-call-only assistant turn has no textual content to contribute"
+        );
+    }
+
+    /// The arms that carry text answer with it, so the empty case above is the
+    /// only one that flattens to nothing.
+    #[test]
+    #[expect(deprecated)]
+    fn an_assistant_turn_that_carries_text_still_answers_with_it() {
+        let spoken =
+            ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                content: Some(ChatCompletionRequestAssistantMessageContent::Text(
+                    "the answer is 4".to_string(),
+                )),
+                refusal: None,
+                name: None,
+                audio: None,
+                tool_calls: None,
+                function_call: None,
+            });
+        assert_eq!(message_to_content(&spoken), "the answer is 4");
+    }
+
+    /// Captures the prompt the default `chat_request` body flattens: it maps every
+    /// message through `message_to_content` before a provider sees one.
+    #[derive(Default)]
+    struct PromptCapturingChat {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Chat for PromptCapturingChat {
+        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+            None
+        }
+
+        async fn run(&self, prompt: String) -> Result<Option<String>> {
+            self.seen
+                .lock()
+                .expect("prompt capture was poisoned")
+                .push(prompt.clone());
+            Ok(Some(prompt))
+        }
+    }
+
+    /// Regression test for #13207, through the production path: `chat_request`
+    /// flattens every message before a provider sees one, so asserting on the
+    /// flattened prompt covers the converter *and* its caller.
+    #[tokio::test]
+    async fn a_request_replaying_a_tool_call_completes_instead_of_panicking() {
+        let chat = PromptCapturingChat::default();
+        let response = chat
+            .chat_request(CreateChatCompletionRequest {
+                messages: vec![
+                    user_turn("what is 2 + 2"),
+                    assistant_tool_call_turn(),
+                    user_turn("thanks"),
+                ],
+                ..Default::default()
+            })
+            .await
+            .expect("a replayed tool call is protocol-valid and must not fail the request");
+
+        // The tool-call turn contributes an empty line between the two it sits between.
+        let flattened = "what is 2 + 2\n\nthanks";
+
+        let seen = chat.seen.lock().expect("prompt capture was poisoned");
+        assert_eq!(
+            seen.as_slice(),
+            [flattened],
+            "every message reaches the provider as one flattened prompt"
+        );
+        assert_eq!(
+            response
+                .choices
+                .first()
+                .and_then(|choice| choice.message.content.as_deref()),
+            Some(flattened),
+        );
+    }
 
     /// The only place this wording lives; `/v1/chat/completions` renders this variant
     /// rather than composing its own sentence.
