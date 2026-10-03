@@ -29,7 +29,6 @@ limitations under the License.
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::fmt::Write as _;
 use std::time::Duration;
 
 use app::AppBuilder;

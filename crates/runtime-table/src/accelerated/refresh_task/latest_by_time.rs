@@ -40,8 +40,8 @@ use arrow::datatypes::{
 };
 use arrow::error::ArrowError;
 use arrow::row::{RowConverter, SortField};
-use datafusion::datasource::file_format::options::ArrowReadOptions;
 use datafusion::common::hash_utils::{RandomState, create_hashes};
+use datafusion::datasource::file_format::options::ArrowReadOptions;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::disk_manager::{DiskManager, RefCountedTempFile};
@@ -114,6 +114,9 @@ struct Superseded {
     older: u64,
     equal_time: u64,
     unchanged: u64,
+    /// How many of them were never passed on to the write (the rest were, and the
+    /// engine replaces them).
+    not_written: u64,
 }
 
 impl Superseded {
@@ -121,7 +124,7 @@ impl Superseded {
     fn count(&mut self, version: Kept, winner: Kept) {
         if version.time < winner.time {
             self.older += 1;
-        } else if version.hash == winner.hash {
+        } else if version.order() == winner.order() {
             self.unchanged += 1;
         } else {
             self.equal_time += 1;
@@ -130,13 +133,39 @@ impl Superseded {
 }
 
 /// The version of a key kept so far.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Kept {
     /// The greatest `time_column` kept, in UTC nanoseconds.
     time: i64,
     /// A hash of the kept row's contents: it settles equal times, and an equal hash means
-    /// the same row read again.
+    /// the same row read again. Content hashes have their lowest bit clear; it is set
+    /// when this refresh received the row, rather than finding it stored.
     hash: u64,
+}
+
+impl Kept {
+    /// What versions are ordered by: the time, then the content hash.
+    fn order(self) -> (i64, u64) {
+        (self.time, self.hash & !1)
+    }
+
+    /// Whether this refresh received the row (and so wrote it).
+    fn received(self) -> bool {
+        self.hash & 1 == 1
+    }
+
+    /// Whether this version replaces `other`.
+    fn beats(self, other: Self) -> bool {
+        self.order() > other.order()
+    }
+
+    /// This version, marked as received by this refresh.
+    fn as_received(self) -> Self {
+        Self {
+            time: self.time,
+            hash: self.hash | 1,
+        }
+    }
 }
 
 /// How a key becomes its 128-bit identity in the map.
@@ -175,11 +204,8 @@ pub(crate) struct LatestByTime {
     /// The type each key column is encoded as: the incoming rows' types, so stored keys
     /// read back from an engine that rewrites types still encode to the same identity.
     key_types: Vec<DataType>,
-    time_column: String,
-    time_format: Option<TimeFormat>,
-    /// The incoming rows' columns: a row's content hash is over these, cast to these types,
-    /// so a stored copy of a row hashes like the incoming one.
-    hashed: SchemaRef,
+    /// Reads each row's time and content hash.
+    reader: Arc<VersionReader>,
     encoding: KeyEncoding,
     latest: HashMap<u128, Kept>,
     /// The share of the query memory pool `latest` is charged to; `None` without a pool.
@@ -257,9 +283,12 @@ impl LatestByTime {
             dataset: dataset.to_string(),
             key_columns,
             key_types,
-            time_column,
-            time_format,
-            hashed: Arc::clone(schema),
+            reader: Arc::new(VersionReader {
+                dataset: dataset.to_string(),
+                time_column,
+                time_format,
+                hashed: Arc::clone(schema),
+            }),
             encoding,
             latest: HashMap::new(),
             reservation: None,
@@ -268,6 +297,12 @@ impl LatestByTime {
             runs: Vec::new(),
             deferred: None,
         })
+    }
+
+    /// The reader of each row's version, for an accelerator that resolves repeated keys
+    /// after writing them.
+    pub(crate) fn row_versions(&self) -> Arc<dyn util::session_state::RowVersions> {
+        Arc::clone(&self.reader) as Arc<dyn util::session_state::RowVersions>
     }
 
     /// Charge the map to `runtime_env`'s memory pool, spilling to its disk manager when
@@ -373,9 +408,9 @@ impl LatestByTime {
         stored: &RecordBatch,
     ) -> Result<(), DataFusionError> {
         let keys = self.keys(stored)?;
-        let column = self.time_column_of(stored)?;
-        let times = time_nanos(&column, self.time_format)?;
-        let hashes = self.content_hashes(stored)?;
+        let column = self.reader.time_column_of(stored)?;
+        let times = time_nanos(&column, self.reader.time_format)?;
+        let hashes = self.reader.content_hashes(stored)?;
         for (row, key) in keys.into_iter().enumerate() {
             if times.is_null(row) {
                 continue;
@@ -386,7 +421,7 @@ impl LatestByTime {
             };
             match latest.entry(key) {
                 Entry::Occupied(mut entry) => {
-                    if version > *entry.get() {
+                    if version.beats(*entry.get()) {
                         entry.insert(version);
                     }
                 }
@@ -420,9 +455,9 @@ impl LatestByTime {
         }
         // The map no longer fits, or a seed already spilled, so it cannot decide this
         // row alone: check the times now, then defer the row to after the last one.
-        let times = self.times(batch)?;
+        let times = self.reader.times(batch)?;
         let keys = self.keys(batch)?;
-        let hashes = self.content_hashes(batch)?;
+        let hashes = self.reader.content_hashes(batch)?;
         if self.deferred.is_none() {
             self.spill_map().await?;
             self.deferred = Some(DeferredRows::new(&batch.schema(), &self.spill_disk()?)?);
@@ -434,15 +469,14 @@ impl LatestByTime {
     }
 
     fn record(&self, superseded: &Superseded) {
-        for (count, labels) in [
-            (superseded.older, &self.older_labels),
-            (superseded.equal_time, &self.equal_time_labels),
-            (superseded.unchanged, &self.unchanged_labels),
-        ] {
-            if count > 0 {
-                metrics::REFRESH_ROWS_SUPERSEDED.add(count, labels);
-            }
-        }
+        record_superseded(
+            superseded,
+            &[
+                self.older_labels.clone(),
+                self.equal_time_labels.clone(),
+                self.unchanged_labels.clone(),
+            ],
+        );
     }
 
     /// After the last row: decide every deferred row against every run, and return the
@@ -519,24 +553,31 @@ impl LatestByTime {
         if num_rows == 0 {
             return Ok((batch.clone(), Superseded::default()));
         }
-        let times = self.times(batch)?;
+        let times = self.reader.times(batch)?;
         let keys = self.keys(batch)?;
-        let hashes = self.content_hashes(batch)?;
+        let hashes = self.reader.content_hashes(batch)?;
         let mut keep = vec![false; num_rows];
         let mut superseded = Superseded::default();
         for (row, keep_row) in keep.iter_mut().enumerate() {
             let version = Kept {
                 time: times.value(row),
                 hash: hashes[row],
-            };
+            }
+            .as_received();
             match self.latest.entry(keys[row]) {
                 Entry::Occupied(mut entry) => {
                     let kept = entry.get_mut();
-                    if version > *kept {
+                    if version.beats(*kept) {
+                        // A copy this refresh already passed on is superseded too: the
+                        // engine keeps this later one.
+                        if kept.received() {
+                            superseded.count(*kept, version);
+                        }
                         *kept = version;
                         *keep_row = true;
                     } else {
                         superseded.count(version, *kept);
+                        superseded.not_written += 1;
                     }
                 }
                 Entry::Vacant(entry) => {
@@ -545,8 +586,8 @@ impl LatestByTime {
                 }
             }
         }
-        // A key kept more than once in this batch: only its last (newest) row is written,
-        // and the earlier ones count as superseded by it.
+        // A key kept more than once in this batch: only its last (newest) row is written.
+        // The earlier ones were counted when it replaced them.
         let mut last_kept: HashMap<u128, usize> = HashMap::new();
         for (row, _) in keep.iter().enumerate().filter(|(_, keep_row)| **keep_row) {
             last_kept.insert(keys[row], row);
@@ -554,53 +595,13 @@ impl LatestByTime {
         for (row, keep_row) in keep.iter_mut().enumerate() {
             if *keep_row && last_kept.get(&keys[row]) != Some(&row) {
                 *keep_row = false;
-                let version = Kept {
-                    time: times.value(row),
-                    hash: hashes[row],
-                };
-                let last = last_kept[&keys[row]];
-                superseded.count(
-                    version,
-                    Kept {
-                        time: times.value(last),
-                        hash: hashes[last],
-                    },
-                );
+                superseded.not_written += 1;
             }
         }
         Ok((
             filter_record_batch(batch, &BooleanArray::from(keep))?,
             superseded,
         ))
-    }
-
-    /// Each row's content hash: every incoming column, cast to its incoming type, with
-    /// floats normalized as an engine may store them (`-0.0` as `0.0`, `NaN` as NULL), so
-    /// a stored copy of a row hashes like the row it came from.
-    fn content_hashes(&self, batch: &RecordBatch) -> Result<Vec<u64>, DataFusionError> {
-        let columns = self
-            .hashed
-            .fields()
-            .iter()
-            .map(|field| {
-                let column = batch.column_by_name(field.name()).ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "column '{}' missing from a batch of dataset '{}'",
-                        field.name(),
-                        self.dataset
-                    ))
-                })?;
-                let column = if column.data_type() == field.data_type() {
-                    Arc::clone(column)
-                } else {
-                    cast_with_options(column, field.data_type(), &CastOptions::default())?
-                };
-                normalize_floats(&column)
-            })
-            .collect::<Result<Vec<ArrayRef>, DataFusionError>>()?;
-        let mut hashes = vec![0_u64; batch.num_rows()];
-        create_hashes(&columns, &RandomState::default(), &mut hashes)?;
-        Ok(hashes)
     }
 
     /// The key columns of `batch`, cast to the types the selector encodes keys as.
@@ -648,6 +649,55 @@ impl LatestByTime {
             }
         }
     }
+}
+
+/// Reads each row's version — its `time_column` as UTC nanoseconds and its content
+/// hash — the same way for the selector and for an accelerator that resolves
+/// repeated keys after writing them ([`RowVersions`]).
+#[derive(Debug)]
+pub(crate) struct VersionReader {
+    dataset: String,
+    time_column: String,
+    time_format: Option<TimeFormat>,
+    /// The incoming rows' columns: a row's content hash is over these, cast to these
+    /// types, so a stored copy of a row hashes like the incoming one.
+    hashed: SchemaRef,
+}
+
+impl VersionReader {
+    /// Each row's content hash: every incoming column, cast to its incoming type, with
+    /// floats normalized as an engine may store them (`-0.0` as `0.0`, `NaN` as NULL), so
+    /// a stored copy of a row hashes like the row it came from.
+    fn content_hashes(&self, batch: &RecordBatch) -> Result<Vec<u64>, DataFusionError> {
+        let columns = self
+            .hashed
+            .fields()
+            .iter()
+            .map(|field| {
+                let column = batch.column_by_name(field.name()).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "column '{}' missing from a batch of dataset '{}'",
+                        field.name(),
+                        self.dataset
+                    ))
+                })?;
+                let column = if column.data_type() == field.data_type() {
+                    Arc::clone(column)
+                } else {
+                    cast_with_options(column, field.data_type(), &CastOptions::default())?
+                };
+                Ok(normalize_floats(&column))
+            })
+            .collect::<Result<Vec<ArrayRef>, DataFusionError>>()?;
+        let mut hashes = vec![0_u64; batch.num_rows()];
+        create_hashes(&columns, &RandomState::default(), &mut hashes)?;
+        // The lowest bit is the selector's own mark (see `Kept`), so it is left out of
+        // every content hash.
+        for hash in &mut hashes {
+            *hash &= !1;
+        }
+        Ok(hashes)
+    }
 
     fn time_column_of(&self, batch: &RecordBatch) -> Result<ArrayRef, DataFusionError> {
         batch
@@ -682,6 +732,32 @@ impl LatestByTime {
                 time_format_name(self.time_format),
             ))
         })
+    }
+}
+
+impl util::session_state::RowVersions for VersionReader {
+    fn versions(&self, batch: &RecordBatch) -> Result<(Vec<i64>, Vec<u64>), DataFusionError> {
+        let times = self.times(batch)?;
+        Ok((times.values().to_vec(), self.content_hashes(batch)?))
+    }
+}
+
+/// Record the rows a selection did not pass on: in `rows_superseded` by reason, and in
+/// `rows_written`, which counts every row a refresh receives. `labels` holds the
+/// `older`, `equal_time` and `unchanged` label sets, each the dataset's then `reason`.
+fn record_superseded(superseded: &Superseded, labels: &[[KeyValue; 2]; 3]) {
+    for (count, labels) in [
+        (superseded.older, &labels[0]),
+        (superseded.equal_time, &labels[1]),
+        (superseded.unchanged, &labels[2]),
+    ] {
+        if count > 0 {
+            metrics::REFRESH_ROWS_SUPERSEDED.add(count, labels);
+        }
+    }
+    // Rows passed on are counted as the write receives them; the rest only here.
+    if superseded.not_written > 0 {
+        metrics::REFRESH_ROWS_WRITTEN.add(superseded.not_written, &labels[0][..1]);
     }
 }
 
@@ -764,7 +840,6 @@ impl RunReader {
     }
 }
 
-
 /// Merge `runs` into one run holding each key's newest version, or `None` without runs.
 fn merge_runs(
     disk: &Arc<DiskManager>,
@@ -796,7 +871,12 @@ fn merge_runs(
             }
             let entry = Kept { time, hash };
             current = match current {
-                Some((current_key, kept)) if current_key == key => Some((key, kept.max(entry))),
+                Some((current_key, kept)) if current_key == key => {
+                    // The later version; on an equal one, the copy this refresh received.
+                    let later =
+                        entry.beats(kept) || (entry.order() == kept.order() && entry.received());
+                    Some((key, if later { entry } else { kept }))
+                }
                 Some((current_key, kept)) => {
                     out.write_all(&current_key.to_le_bytes())?;
                     out.write_all(&kept.time.to_le_bytes())?;
@@ -1008,18 +1088,27 @@ impl DeferredResolver {
             Some(run) => run.version_of(group.key).await?,
             None => None,
         };
-        let write = kept.is_none_or(|kept| group.best_version > kept);
+        let write = kept.is_none_or(|kept| group.best_version.beats(kept));
         let winner = match kept {
             Some(kept) if !write => kept,
             _ => group.best_version,
         };
+        // A copy this refresh wrote before the map spilled is superseded too.
+        if write
+            && let Some(kept) = kept
+            && kept.received()
+        {
+            self.superseded.count(kept, group.best_version);
+        }
         for &version in &group.others {
             self.superseded.count(version, winner);
         }
+        self.superseded.not_written += group.others.len() as u64;
         if write {
             Ok(Some(group.best))
         } else {
             self.superseded.count(group.best_version, winner);
+            self.superseded.not_written += 1;
             Ok(None)
         }
     }
@@ -1047,10 +1136,11 @@ impl DeferredResolver {
             let version = Kept {
                 time: times.value(row),
                 hash: hashes.value(row),
-            };
+            }
+            .as_received();
             match self.group.as_mut() {
                 Some(group) if group.key == key => {
-                    if version > group.best_version {
+                    if version.beats(group.best_version) {
                         group.others.push(group.best_version);
                         group.best = batch.slice(row, 1);
                         group.best_version = version;
@@ -1095,16 +1185,7 @@ impl DeferredResolver {
                 if let Some(batch) = resolver.next_batch().await? {
                     Ok(Some((batch, Some(resolver))))
                 } else {
-                    let s = &resolver.superseded;
-                    for (count, labels) in [
-                        (s.older, &labels[0]),
-                        (s.equal_time, &labels[1]),
-                        (s.unchanged, &labels[2]),
-                    ] {
-                        if count > 0 {
-                            metrics::REFRESH_ROWS_SUPERSEDED.add(count, labels);
-                        }
-                    }
+                    record_superseded(&resolver.superseded, &labels);
                     Ok(None)
                 }
             }
@@ -1131,8 +1212,8 @@ fn strip_helpers(batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
 
 /// `column` with `-0.0` read as `0.0` and `NaN` as NULL, as engines that do not keep them
 /// store them; other columns unchanged.
-fn normalize_floats(column: &ArrayRef) -> Result<ArrayRef, DataFusionError> {
-    Ok(match column.data_type() {
+fn normalize_floats(column: &ArrayRef) -> ArrayRef {
+    match column.data_type() {
         DataType::Float32 => {
             let normalized: arrow::array::Float32Array = column
                 .as_primitive::<arrow::datatypes::Float32Type>()
@@ -1150,7 +1231,7 @@ fn normalize_floats(column: &ArrayRef) -> Result<ArrayRef, DataFusionError> {
             Arc::new(normalized)
         }
         _ => Arc::clone(column),
-    })
+    }
 }
 
 /// Shift each key left by `width + 1` bits and append `column`'s value and a NULL flag.
@@ -1280,6 +1361,7 @@ pub(crate) fn select_latest(
         Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
         update.update_type,
     )
+    .superseded_counted_before_write()
 }
 
 #[cfg(test)]
@@ -1541,6 +1623,7 @@ mod tests {
                 older: 1,
                 equal_time: 0,
                 unchanged: 1,
+                not_written: 2,
             }
         );
     }
@@ -1576,18 +1659,21 @@ mod tests {
         let b = || batch(&[(1, Some(10), "b")]);
         let (across_ab, sup_ab) = last_written(None, &[a(), b()]);
         let (across_ba, sup_ba) = last_written(None, &[b(), a()]);
-        let (within_ab, _) = last_written(None, &[batch(&[(1, Some(10), "a"), (1, Some(10), "b")])]);
-        let (within_ba, _) = last_written(None, &[batch(&[(1, Some(10), "b"), (1, Some(10), "a")])]);
+        let (within_ab, _) =
+            last_written(None, &[batch(&[(1, Some(10), "a"), (1, Some(10), "b")])]);
+        let (within_ba, _) =
+            last_written(None, &[batch(&[(1, Some(10), "b"), (1, Some(10), "a")])]);
         let (stored_a, _) = last_written(Some(&a()), &[b()]);
         let (stored_b, _) = last_written(Some(&b()), &[a()]);
-        let winner = across_ab.clone();
+        let winner = across_ab;
         assert!(winner == "a" || winner == "b");
         for got in [&across_ba, &within_ab, &within_ba, &stored_a, &stored_b] {
             assert_eq!(got, &winner);
         }
-        // Read loser first: it is written, then replaced. Winner first: the loser is
-        // superseded and counted.
-        assert_eq!(sup_ab.equal_time + sup_ba.equal_time, 1);
+        // Either order supersedes the loser once: not passed on, or passed on and then
+        // replaced by the winner.
+        assert_eq!(sup_ab.equal_time, 1);
+        assert_eq!(sup_ba.equal_time, 1);
         assert_eq!(sup_ab.unchanged + sup_ba.unchanged, 0);
     }
 
@@ -1618,9 +1704,11 @@ mod tests {
         )
         .expect("selector");
         let incoming = s
+            .reader
             .content_hashes(&rows(vec![Some(-0.0), Some(f64::NAN), Some(1.5)]))
             .expect("hashes");
         let stored = s
+            .reader
             .content_hashes(&rows(vec![Some(0.0), None, Some(1.5)]))
             .expect("hashes");
         assert_eq!(incoming, stored);
@@ -1802,121 +1890,5 @@ mod tests {
             message.starts_with("'acceleration.on_conflict: upsert_dedup_by_time_column' could not spill its key versions to 'runtime.query.temp_directory', so this refresh was not applied and the previous data is still served. Free space there, or raise 'runtime.query.memory_limit'. Cause: "),
             "{message}"
         );
-    }
-
-    /// Per-batch cost of hashing every column of a row, next to today's per-row selection,
-    /// for a narrow and a wide schema. Run with `--release -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "benchmark"]
-    fn bench_row_hash_cost() {
-        use arrow::array::{Float64Array, StringArray as Utf8};
-        use datafusion::common::hash_utils::{RandomState, create_hashes};
-        use std::time::Instant;
-
-        const ROWS: usize = 8_192;
-        const BATCHES: usize = 300;
-        let words: Vec<String> = (0..4096).map(|i| format!("w{i:05}-{:x<14}", i % 977)).collect();
-        let make = |wide: bool, b: usize| -> RecordBatch {
-            let start = i64::try_from(b * ROWS).expect("start");
-            let n = i64::try_from(ROWS).expect("rows");
-            let mut fields = vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new(
-                    "occurred_at",
-                    DataType::Timestamp(TimeUnit::Microsecond, None),
-                    false,
-                ),
-            ];
-            let mut cols: Vec<ArrayRef> = vec![
-                Arc::new(Int64Array::from_iter_values(start..start + n)),
-                Arc::new(TimestampMicrosecondArray::from_iter_values(start..start + n)),
-            ];
-            if wide {
-                for c in 0..8_i64 {
-                    fields.push(Field::new(format!("i{c}"), DataType::Int64, false));
-                    cols.push(Arc::new(Int64Array::from_iter_values(
-                        (start..start + n).map(|v| v.wrapping_mul(0x9E37_79B9 + c)),
-                    )));
-                }
-                for c in 0..8_usize {
-                    fields.push(Field::new(format!("s{c}"), DataType::Utf8, false));
-                    cols.push(Arc::new(Utf8::from_iter_values(
-                        (0..ROWS).map(|r| words[(r * 31 + c * 7 + b) % words.len()].as_str()),
-                    )));
-                }
-                for c in 0..2_u32 {
-                    fields.push(Field::new(format!("f{c}"), DataType::Float64, false));
-                    cols.push(Arc::new(Float64Array::from_iter_values(
-                        (0..ROWS).map(|r| f64::from(u32::try_from(r).expect("r")) * 1.5 + f64::from(c)),
-                    )));
-                }
-            } else {
-                fields.push(Field::new("v", DataType::Int64, false));
-                cols.push(Arc::new(Int64Array::from_iter_values(start..start + n)));
-            }
-            RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).expect("batch")
-        };
-        let stats = |mut us: Vec<f64>| {
-            us.sort_by(f64::total_cmp);
-            let p50 = us[us.len() / 2];
-            let p99 = us[us.len() * 99 / 100];
-            (p50, p99)
-        };
-        for wide in [false, true] {
-            let batches: Vec<RecordBatch> = (0..BATCHES).map(|b| make(wide, b)).collect();
-            let schema = batches[0].schema();
-            let label = if wide { "wide(20 cols)" } else { "narrow(3 cols)" };
-
-            // Today: select per row (distinct keys, so every row inserts).
-            let mut selector = LatestByTime::try_new(
-                "bench",
-                &schema,
-                vec!["id".to_string()],
-                "occurred_at".to_string(),
-                None,
-            )
-            .expect("selector");
-            let mut us = Vec::new();
-            for batch in &batches {
-                let t = Instant::now();
-                std::hint::black_box(selector.select_counted(batch).expect("select"));
-                us.push(t.elapsed().as_secs_f64() * 1e6);
-            }
-            let (p50, p99) = stats(us);
-            eprintln!("{label} selector_today       p50={p50:8.1}us p99={p99:8.1}us  ns/row(p99)={:.1}", p99 * 1e3 / ROWS as f64);
-
-            // RowConverter over every column, then XXH3-64 per row.
-            let converter = RowConverter::new(
-                schema.fields().iter().map(|f| SortField::new(f.data_type().clone())).collect(),
-            )
-            .expect("converter");
-            let mut us = Vec::new();
-            for batch in &batches {
-                let t = Instant::now();
-                let rows = converter.convert_columns(batch.columns()).expect("rows");
-                let hashes: Vec<u64> = rows
-                    .iter()
-                    .map(|row| twox_hash::XxHash3_64::oneshot(row.as_ref()))
-                    .collect();
-                std::hint::black_box(hashes);
-                us.push(t.elapsed().as_secs_f64() * 1e6);
-            }
-            let (p50, p99) = stats(us);
-            eprintln!("{label} rowconv+xxh3_64      p50={p50:8.1}us p99={p99:8.1}us  ns/row(p99)={:.1}", p99 * 1e3 / ROWS as f64);
-
-            // DataFusion's vectorized column hashing with its fixed state.
-            let state = RandomState::default();
-            let mut buffer = vec![0_u64; ROWS];
-            let mut us = Vec::new();
-            for batch in &batches {
-                let t = Instant::now();
-                buffer.iter_mut().for_each(|h| *h = 0);
-                create_hashes(batch.columns(), &state, &mut buffer).expect("hashes");
-                std::hint::black_box(&buffer);
-                us.push(t.elapsed().as_secs_f64() * 1e6);
-            }
-            let (p50, p99) = stats(us);
-            eprintln!("{label} datafusion_hashes    p50={p50:8.1}us p99={p99:8.1}us  ns/row(p99)={:.1}", p99 * 1e3 / ROWS as f64);
-        }
     }
 }

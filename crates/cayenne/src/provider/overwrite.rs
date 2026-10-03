@@ -76,6 +76,7 @@ use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::key_conflicts::Survivor;
 use super::mutation_writer::InlineBatchBuffer;
+use super::overwrite_postpass::CopyOrder;
 use super::table::{
     CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, OverwriteRouting,
     RangePartitioning, serialize_batches_to_ipc,
@@ -494,6 +495,12 @@ impl CayenneTableProvider {
         if inline_max_rows == 0 || inline_max_bytes == 0 || !self.inline_overwrite_admissible() {
             return Ok(OverwriteAdmission::Fallback(stream));
         }
+        // The inline path keeps the last copy of a repeated key to arrive; a write
+        // that supplies row versions must keep the greatest version instead, which
+        // the post-pass on the normal path does.
+        if self.row_versions.is_some() {
+            return Ok(OverwriteAdmission::Fallback(stream));
+        }
         let Some(admission) = self.context().try_acquire_overwrite_inline_admission() else {
             self.track_overwrite_inline_fallback("admission_busy");
             return Ok(OverwriteAdmission::Fallback(stream));
@@ -675,18 +682,28 @@ impl CayenneTableProvider {
         // its rows with its arrival sequence, and once the files are written a
         // query finds every copy other than the one the policy keeps — the last
         // under the upsert policies, the first under `drop`.
-        let mut postpass: Option<(Survivor, Vec<String>)> = None;
+        // A writer that supplies row versions (`upsert_dedup_by_time_column`)
+        // orders the copies by version instead of arrival.
+        let mut postpass: Option<(CopyOrder, Vec<String>)> = None;
+        let mut batch_superseded = None;
         let data: SendableRecordBatchStream = match self.key_resolver()? {
             None => data,
             Some(resolver) => {
                 let indices = self.primary_key_indices()?.unwrap_or_default();
+                let order = match &self.row_versions {
+                    Some(_) => CopyOrder::Version,
+                    None => CopyOrder::Arrival(Survivor::for_policy(resolver.policy())),
+                };
                 postpass = Some((
-                    Survivor::for_policy(resolver.policy()),
+                    order,
                     super::overwrite_postpass::key_column_names(&self.table_schema(), &indices),
                 ));
-                Box::pin(super::overwrite_postpass::ArrivalStream::new(
-                    data, resolver,
-                ))
+                let arrival = super::overwrite_postpass::ArrivalStream::new(data, resolver);
+                batch_superseded = Some(arrival.superseded());
+                match &self.row_versions {
+                    Some(versions) => Box::pin(arrival.with_versions(Arc::clone(versions))),
+                    None => Box::pin(arrival),
+                }
             }
         };
 
@@ -740,10 +757,12 @@ impl CayenneTableProvider {
         // single serial writer. Without split points the shards hash the key and
         // each still sorts its rows by it, so an equality on the key reads about
         // one zone of every file instead of all of them.
-        let write_schema = if postpass.is_some() {
-            super::overwrite_postpass::with_arrival(&self.table_schema())
-        } else {
-            self.table_schema()
+        let write_schema = match &postpass {
+            Some((order, _)) => super::overwrite_postpass::with_hidden(
+                &self.table_schema(),
+                matches!(order, CopyOrder::Version),
+            ),
+            None => self.table_schema(),
         };
         let written: Result<_> = async {
             let written = self
@@ -785,16 +804,24 @@ impl CayenneTableProvider {
         // hold them without them and so publishes no deletes at all.
         let (position_deletions, write_stats_acc) = match postpass.take() {
             None => (HashMap::new(), write_stats_acc),
-            Some((survivor, key_columns)) => {
+            Some((order, key_columns)) => {
                 let resolved: Result<_> = async {
-                    let superseded = self
+                    let (superseded, mut counts) = self
                         .find_superseded_by_arrival(
                             &new_snapshot_id,
-                            survivor,
+                            order,
                             &key_columns,
                             row_count,
                         )
                         .await?;
+                    if let Some(within) = &batch_superseded {
+                        counts.add(&within.lock());
+                    }
+                    if let Some(report) = &self.superseded_report
+                        && !counts.is_empty()
+                    {
+                        report.superseded(&counts);
+                    }
                     match file_stats.as_deref() {
                         Some(file_stats) if !superseded.is_empty() => {
                             let stats = self

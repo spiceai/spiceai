@@ -182,12 +182,43 @@ use runtime_datafusion::error::find_datafusion_root;
 pub struct StreamingDataUpdate {
     pub data: SendableRecordBatchStream,
     pub update_type: UpdateType,
+    /// How the accelerator should order the copies of a key this update repeats,
+    /// when it resolves them after writing; see
+    /// [`util::session_state::RowVersions`]. A wrapper that rebuilds the update
+    /// must carry it forward.
+    pub row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
+    /// Whether the accelerator reports the copies of repeated keys it does not keep.
+    /// False when the refresh already counted them before the write.
+    pub engine_reports_superseded: bool,
 }
 
 impl StreamingDataUpdate {
     #[must_use]
     pub fn new(data: SendableRecordBatchStream, update_type: UpdateType) -> Self {
-        Self { data, update_type }
+        Self {
+            data,
+            update_type,
+            row_versions: None,
+            engine_reports_superseded: true,
+        }
+    }
+
+    /// This update with the copies of repeated keys already counted by the refresh,
+    /// so the accelerator does not report them again.
+    #[must_use]
+    pub fn superseded_counted_before_write(mut self) -> Self {
+        self.engine_reports_superseded = false;
+        self
+    }
+
+    /// This update with the row versions its writer supplies.
+    #[must_use]
+    pub fn with_row_versions(
+        mut self,
+        row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
+    ) -> Self {
+        self.row_versions = row_versions;
+        self
     }
 
     /// Drains the stream into an in-memory [`DataUpdate`].
@@ -218,10 +249,7 @@ impl TryFrom<DataUpdate> for StreamingDataUpdate {
             MemoryStream::try_new(data_update.data, data_update.schema, None)
                 .map_err(find_datafusion_root)?,
         ) as SendableRecordBatchStream;
-        Ok(Self {
-            data,
-            update_type: data_update.update_type,
-        })
+        Ok(Self::new(data, data_update.update_type))
     }
 }
 

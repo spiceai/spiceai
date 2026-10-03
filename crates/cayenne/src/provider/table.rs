@@ -1873,6 +1873,14 @@ pub struct CayenneTableProvider {
     /// ([`util::session_state::UserStatementWrite`]), which keeps its own
     /// semantics.
     resolves_repeated_keys: bool,
+    /// How a full refresh orders the copies of a key it repeats, when the writer
+    /// supplies row versions (`on_conflict: upsert_dedup_by_time_column`): the copy
+    /// with the greatest version survives instead of the last to arrive. Set per
+    /// write by [`TableProvider::insert_into`] from the session.
+    pub(crate) row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
+    /// Where a refresh's write reports the copies of repeated keys it did not keep.
+    /// Set per write by [`TableProvider::insert_into`] from the session.
+    pub(crate) superseded_report: Option<Arc<dyn util::session_state::SupersededReport>>,
     /// Bytes of input a streaming write that resolves repeated keys collapses in
     /// memory at a time, before it splits them into layers or, for a partition's
     /// append, writes them; see [`super::collapse_window::CollapseWindow`].
@@ -9178,6 +9186,8 @@ impl CayenneTableProvider {
             scan_view_reuse,
             upsert_dedup,
             resolves_repeated_keys: true,
+            row_versions: None,
+            superseded_report: None,
             collapse_window_bytes: super::collapse_window::COLLAPSE_WINDOW_BYTES,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -11245,6 +11255,8 @@ impl CayenneTableProvider {
             scan_view_reuse: self.scan_view_reuse,
             upsert_dedup: self.upsert_dedup,
             resolves_repeated_keys: self.resolves_repeated_keys,
+            row_versions: self.row_versions.clone(),
+            superseded_report: self.superseded_report.clone(),
             collapse_window_bytes: self.collapse_window_bytes,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
@@ -37394,6 +37406,8 @@ impl TableProvider for CayenneTableProvider {
         let mut table = self.clone_for_write();
         table.resolves_repeated_keys =
             self.resolves_repeated_keys && !util::session_state::is_user_statement(state.config());
+        table.row_versions = util::session_state::row_versions(state.config());
+        table.superseded_report = util::session_state::superseded_report(state.config());
         let sink = Arc::new(CayenneDataSink::new(
             table,
             overwrite,

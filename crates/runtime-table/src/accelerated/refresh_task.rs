@@ -109,6 +109,31 @@ pub mod changes;
 mod deletion;
 mod latest_by_time;
 
+/// Records the copies of repeated keys an accelerator's write did not keep in
+/// `dataset_acceleration_refresh_rows_superseded`, by reason.
+#[derive(Debug)]
+struct RecordSuperseded {
+    /// The dataset's label set.
+    dataset: Vec<KeyValue>,
+}
+
+impl util::session_state::SupersededReport for RecordSuperseded {
+    fn superseded(&self, counts: &util::session_state::SupersededCounts) {
+        for (count, reason) in [
+            (counts.repeated, "repeated"),
+            (counts.older, "older"),
+            (counts.equal_time, "equal_time"),
+            (counts.unchanged, "unchanged"),
+        ] {
+            if count > 0 {
+                let mut labels = self.dataset.clone();
+                labels.push(KeyValue::new("reason", reason));
+                metrics::REFRESH_ROWS_SUPERSEDED.add(count, &labels);
+            }
+        }
+    }
+}
+
 /// The largest UTC offset a time may carry (+14:00), in nanoseconds.
 const MAX_UTC_OFFSET_NANOS: u128 = 14 * 3_600 * 1_000_000_000;
 
@@ -1012,6 +1037,8 @@ impl RefreshTask {
         };
 
         let schema = Arc::clone(&data_update.data.schema());
+        let row_versions = data_update.row_versions.clone();
+        let engine_reports_superseded = data_update.engine_reports_superseded;
 
         let (notify_written_data_stat_available, mut on_written_data_stat_available) =
             oneshot::channel::<RefreshStat>();
@@ -1106,7 +1133,23 @@ impl RefreshTask {
         let sink = &*sink_lock;
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
-        if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
+        // The write carries where to report the copies of repeated keys the
+        // accelerator does not keep, and, for `upsert_dedup_by_time_column`, how to
+        // order them.
+        let refresh_write = util::session_state::RefreshWrite {
+            row_versions,
+            superseded: engine_reports_superseded.then(|| {
+                Arc::new(RecordSuperseded {
+                    dataset: self.dataset_metric_labels.dataset().to_vec(),
+                }) as Arc<dyn util::session_state::SupersededReport>
+            }),
+        };
+        let written = util::session_state::with_refresh_write(
+            refresh_write,
+            sink.insert_into(record_batch_stream, overwrite),
+        )
+        .await;
+        if let Err(e) = written {
             let error_message = format_datafusion_error(&e);
             self.set_refresh_status(
                 sql,
@@ -1346,7 +1389,11 @@ impl RefreshTask {
             .await;
             // Every incoming column: a stored row's content hash settles ties with it.
             let incoming = update.data.schema();
-            let columns: Vec<&str> = incoming.fields().iter().map(|f| f.name().as_str()).collect();
+            let columns: Vec<&str> = incoming
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
             // A string time column is filtered by comparing strings, which misorders values
             // with different UTC offsets; starting the read 14 hours (the largest offset)
             // earlier can only add rows, which the selector then compares as instants.
@@ -1388,6 +1435,15 @@ impl RefreshTask {
             }
         }
 
+        // A full refresh of an accelerator that resolves repeated keys after writing
+        // them hands it each row's version instead of resolving across batches here.
+        if refresh.versions_resolved_after_write && window_start.is_none() {
+            // The accelerator reads each row's version once as it writes it, fails
+            // the write on a NULL or unreadable time, and keeps each key's greatest
+            // version, so the rows go to it untouched.
+            let row_versions = selector.row_versions();
+            return Ok(update.with_row_versions(Some(row_versions)));
+        }
         Ok(latest_by_time::select_latest(selector, update))
     }
 

@@ -82,6 +82,17 @@ use super::table::CayenneTableProvider;
 /// arrival ordinal. The table schema does not name it, so no scan reads it, and
 /// compaction, which rewrites through the table schema, drops it.
 pub(crate) const ARRIVAL_COLUMN: &str = "__cayenne_arrival";
+/// Trailing columns holding each row's version when the writer supplies one
+/// ([`util::session_state::RowVersions`]): its time (UTC nanoseconds) and content
+/// hash. A key's copies order by `(time, hash, arrival)`. Like the arrival column,
+/// the table schema does not name them.
+pub(crate) const VERSION_TIME_COLUMN: &str = "__cayenne_version_time";
+pub(crate) const VERSION_HASH_COLUMN: &str = "__cayenne_version_hash";
+/// The read-back column holding the arrival ordinal.
+const ORDER_COLUMN: &str = "__cayenne_order";
+/// The read-back columns holding a row's version time and hash.
+const ORDER_TIME_COLUMN: &str = "__cayenne_order_time";
+const ORDER_HASH_COLUMN: &str = "__cayenne_order_hash";
 
 const KEY_PREFIX: &str = "__cayenne_key_";
 const BEST_KEY_PREFIX: &str = "__cayenne_best_key_";
@@ -411,13 +422,116 @@ fn plan_chunks(
 
 /// `schema` followed by the arrival column.
 pub(crate) fn with_arrival(schema: &SchemaRef) -> SchemaRef {
+    with_hidden(schema, false)
+}
+
+/// `schema` followed by the arrival column and, when `versioned`, the version
+/// column.
+pub(crate) fn with_hidden(schema: &SchemaRef, versioned: bool) -> SchemaRef {
     let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(
         ARRIVAL_COLUMN,
         DataType::UInt32,
         false,
     )));
+    if versioned {
+        fields.push(Arc::new(Field::new(
+            VERSION_TIME_COLUMN,
+            DataType::Int64,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            VERSION_HASH_COLUMN,
+            DataType::UInt64,
+            false,
+        )));
+    }
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// How the duplicate query orders the copies of a key, keeping the greatest or
+/// least.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CopyOrder {
+    /// By arrival sequence; the survivor per the table's policy.
+    Arrival(Survivor),
+    /// By row version (time, content hash, arrival); the greatest survives.
+    Version,
+}
+
+impl CopyOrder {
+    fn versioned(self) -> bool {
+        matches!(self, Self::Version)
+    }
+
+    fn survivor(self) -> Survivor {
+        match self {
+            Self::Arrival(survivor) => survivor,
+            Self::Version => Survivor::Latest,
+        }
+    }
+}
+
+/// Count a copy with version `loser` that lost to `winner`, both `(time, hash)`.
+fn count_superseded(
+    counts: &mut util::session_state::SupersededCounts,
+    loser: (i64, u64),
+    winner: (i64, u64),
+) {
+    if loser.0 < winner.0 {
+        counts.older += 1;
+    } else if loser.1 == winner.1 {
+        counts.unchanged += 1;
+    } else {
+        counts.equal_time += 1;
+    }
+}
+
+/// Split one order value back into its `(time, hash)`.
+fn order_version(bytes: &[u8]) -> (i64, u64) {
+    let mut time = [0_u8; 8];
+    time.copy_from_slice(&bytes[..8]);
+    let mut hash = [0_u8; 8];
+    hash.copy_from_slice(&bytes[8..16]);
+    (
+        (u64::from_be_bytes(time) ^ (1 << 63)).cast_signed(),
+        u64::from_be_bytes(hash),
+    )
+}
+
+/// One value per row that orders like its `(time, hash, arrival)`: the time with its
+/// sign bit flipped, then the hash, then the arrival ordinal, all big-endian.
+fn order_bytes(
+    times: &ArrayRef,
+    hashes: &ArrayRef,
+    arrivals: &ArrayRef,
+) -> datafusion_common::Result<arrow::array::BinaryArray> {
+    let missing = |name: &str| {
+        datafusion_common::DataFusionError::Internal(format!("version {name} has the wrong type"))
+    };
+    let times = times
+        .as_primitive_opt::<arrow::datatypes::Int64Type>()
+        .ok_or_else(|| missing("time"))?;
+    let hashes = hashes
+        .as_primitive_opt::<UInt64Type>()
+        .ok_or_else(|| missing("hash"))?;
+    let arrivals = arrivals
+        .as_primitive_opt::<UInt32Type>()
+        .ok_or_else(|| missing("arrival"))?;
+    let mut builder = arrow::array::BinaryBuilder::with_capacity(times.len(), times.len() * 20);
+    for ((time, hash), arrival) in times
+        .values()
+        .iter()
+        .zip(hashes.values().iter())
+        .zip(arrivals.values().iter())
+    {
+        let mut bytes = [0_u8; 20];
+        bytes[..8].copy_from_slice(&(time.cast_unsigned() ^ (1 << 63)).to_be_bytes());
+        bytes[8..16].copy_from_slice(&hash.to_be_bytes());
+        bytes[16..].copy_from_slice(&arrival.to_be_bytes());
+        builder.append_value(bytes);
+    }
+    Ok(builder.finish())
 }
 
 /// Resolves each batch's own repeats per the policy and stamps every surviving
@@ -428,6 +542,10 @@ pub(crate) struct ArrivalStream {
     schema: SchemaRef,
     next: u64,
     stamped: Arc<std::sync::atomic::AtomicU64>,
+    /// The writer's row versions, stamped in the version columns when present.
+    versions: Option<Arc<dyn util::session_state::RowVersions>>,
+    /// Copies each batch's own resolution did not keep.
+    superseded: Arc<parking_lot::Mutex<util::session_state::SupersededCounts>>,
 }
 
 impl ArrivalStream {
@@ -439,7 +557,26 @@ impl ArrivalStream {
             schema,
             next: 0,
             stamped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            versions: None,
+            superseded: Arc::default(),
         }
+    }
+
+    /// The copies each batch's own resolution has not kept so far.
+    pub(crate) fn superseded(
+        &self,
+    ) -> Arc<parking_lot::Mutex<util::session_state::SupersededCounts>> {
+        Arc::clone(&self.superseded)
+    }
+
+    /// Also stamp each row's version from `versions`.
+    pub(crate) fn with_versions(
+        mut self,
+        versions: Arc<dyn util::session_state::RowVersions>,
+    ) -> Self {
+        self.schema = with_hidden(&self.input.schema(), true);
+        self.versions = Some(versions);
+        self
     }
 
     /// The number of batches the stream has stamped so far. A write of at most
@@ -454,7 +591,70 @@ impl ArrivalStream {
         if !self.resolver.has_null_key(&batch) && !self.resolver.may_repeat_within(&batch)? {
             return Ok(batch);
         }
-        Ok(self.resolver.resolve_batch(&batch)?.batch)
+        let rows = batch.num_rows();
+        let resolved = self.resolver.resolve_batch(&batch)?.batch;
+        self.superseded.lock().repeated += (rows - resolved.num_rows()) as u64;
+        Ok(resolved)
+    }
+
+    /// Resolve `batch`'s own repeats keeping each key's greatest version, and return
+    /// the surviving rows with their versions. A batch that may repeat a key is sorted
+    /// by version first, so the resolver's last copy is the greatest.
+    fn resolve_by_version(
+        &self,
+        versions: &Arc<dyn util::session_state::RowVersions>,
+        batch: RecordBatch,
+    ) -> datafusion_common::Result<(RecordBatch, Vec<i64>, Vec<u64>)> {
+        let (times, hashes) = versions.versions(&batch)?;
+        let repeats = self.resolver.has_null_key(&batch)
+            || self
+                .resolver
+                .may_repeat_within(&batch)
+                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+        if !repeats {
+            return Ok((batch, times, hashes));
+        }
+        let order = arrow::compute::lexsort_to_indices(
+            &[
+                arrow::compute::SortColumn {
+                    values: Arc::new(arrow::array::Int64Array::from(times.clone())),
+                    options: None,
+                },
+                arrow::compute::SortColumn {
+                    values: Arc::new(arrow::array::UInt64Array::from(hashes.clone())),
+                    options: None,
+                },
+            ],
+            None,
+        )?;
+        let sorted = arrow::compute::take_record_batch(&batch, &order)?;
+        // Sorted by version, a key's last copy is the one kept; every earlier copy
+        // is counted against it.
+        let digests = self
+            .resolver
+            .digests(&sorted)
+            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+        let order: Vec<usize> = order.values().iter().map(|&i| i as usize).collect();
+        let version = |row: usize| (times[order[row]], hashes[order[row]]);
+        let mut kept: HashMap<u128, usize> = HashMap::with_capacity(digests.len());
+        for (row, digest) in digests.iter().enumerate() {
+            kept.insert(*digest, row);
+        }
+        let mut counts = util::session_state::SupersededCounts::default();
+        for (row, digest) in digests.iter().enumerate() {
+            let winner = kept[digest];
+            if winner != row {
+                count_superseded(&mut counts, version(row), version(winner));
+            }
+        }
+        self.superseded.lock().add(&counts);
+        let resolved = self
+            .resolver
+            .resolve_batch(&sorted)
+            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?
+            .batch;
+        let (times, hashes) = versions.versions(&resolved)?;
+        Ok((resolved, times, hashes))
     }
 }
 
@@ -466,10 +666,17 @@ impl Stream for ArrivalStream {
         match this.input.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 // Most batches hold no key twice; only one that may pays for the
-                // exact resolution. A null key fails either way.
-                let resolved = match this.resolve(batch) {
-                    Ok(resolved) => resolved,
-                    Err(error) => return Poll::Ready(Some(Err(error.into()))),
+                // exact resolution. A null key fails either way. A write with row
+                // versions reads them once, and keeps each key's greatest.
+                let (resolved, stamped_versions) = match &this.versions {
+                    Some(versions) => match this.resolve_by_version(versions, batch) {
+                        Ok((resolved, times, hashes)) => (resolved, Some((times, hashes))),
+                        Err(error) => return Poll::Ready(Some(Err(error))),
+                    },
+                    None => match this.resolve(batch) {
+                        Ok(resolved) => (resolved, None),
+                        Err(error) => return Poll::Ready(Some(Err(error.into()))),
+                    },
                 };
                 // A batch holds each key once, so its sequence number orders the
                 // copies of a key as well as a per-row ordinal would.
@@ -486,6 +693,10 @@ impl Stream for ArrivalStream {
                     .store(this.next, std::sync::atomic::Ordering::Relaxed);
                 let mut columns = resolved.columns().to_vec();
                 columns.push(Arc::new(arrival));
+                if let Some((times, hashes)) = stamped_versions {
+                    columns.push(Arc::new(arrow::array::Int64Array::from(times)));
+                    columns.push(Arc::new(UInt64Array::from(hashes)));
+                }
                 Poll::Ready(Some(
                     RecordBatch::try_new(Arc::clone(&this.schema), columns).map_err(Into::into),
                 ))
@@ -513,8 +724,10 @@ struct ReadBack {
     /// `(file id, path)` of each file this partition reads.
     files: Vec<ReadBackFile>,
     key_names: Arc<[String]>,
-    /// The key columns as stored, then the arrival column.
+    /// The key columns as stored, then the order column.
     stored: Arc<Field>,
+    /// Whether the version time and hash columns are read too.
+    versioned: bool,
     schema: SchemaRef,
     chunk: (u64, u64),
     /// The key sub-range this step reads, pushed into each file's scan.
@@ -550,7 +763,18 @@ impl ReadBack {
             &state,
             |hashes| Ok(UInt64Array::from(hashes.to_vec())),
         )?;
-        let mut columns: Vec<ArrayRef> = stored.columns()[..=keys].to_vec();
+        let mut columns: Vec<ArrayRef> = stored.columns()[..keys].to_vec();
+        if self.versioned {
+            // The version time and hash follow the stored position; with the arrival
+            // ordinal they make one value that orders like `(time, hash, arrival)`.
+            columns.push(Arc::new(order_bytes(
+                stored.column(keys + 2),
+                stored.column(keys + 3),
+                stored.column(keys),
+            )?));
+        } else {
+            columns.push(Arc::clone(stored.column(keys)));
+        }
         columns.push(Arc::new(positions));
         columns.push(Arc::new(UInt32Array::from_value(file, stored.num_rows())));
         columns.push(Arc::new(hashes));
@@ -585,6 +809,7 @@ impl PartitionStream for ReadBack {
             files: self.files.clone(),
             key_names: Arc::clone(&self.key_names),
             stored: Arc::clone(&self.stored),
+            versioned: self.versioned,
             schema: Arc::clone(&self.schema),
             chunk: self.chunk,
             range: self.range.clone(),
@@ -629,9 +854,26 @@ impl PartitionStream for ReadBack {
                     )
                 })
                 .chain([
-                    (ARRIVAL_COLUMN.to_string(), get_item(ARRIVAL_COLUMN, root())),
+                    (ORDER_COLUMN.to_string(), get_item(ARRIVAL_COLUMN, root())),
                     (POSITION_COLUMN.to_string(), row_idx()),
-                ]),
+                ])
+                .chain(
+                    this.versioned
+                        .then(|| {
+                            [
+                                (
+                                    ORDER_TIME_COLUMN.to_string(),
+                                    get_item(VERSION_TIME_COLUMN, root()),
+                                ),
+                                (
+                                    ORDER_HASH_COLUMN.to_string(),
+                                    get_item(VERSION_HASH_COLUMN, root()),
+                                ),
+                            ]
+                        })
+                        .into_iter()
+                        .flatten(),
+                ),
             Nullability::NonNullable,
         );
         let schema = Arc::clone(&this.schema);
@@ -781,10 +1023,13 @@ impl CayenneTableProvider {
     pub(crate) async fn find_superseded_by_arrival(
         &self,
         snapshot_id: &str,
-        survivor: Survivor,
+        order: CopyOrder,
         key_columns: &[String],
         rows_written: u64,
-    ) -> super::Result<HashMap<String, Vec<u32>>> {
+    ) -> super::Result<(
+        HashMap<String, Vec<u32>>,
+        util::session_state::SupersededCounts,
+    )> {
         let ctx = self.create_session_context();
         let state = ctx.state();
         let Some((store, files)) = self
@@ -798,7 +1043,10 @@ impl CayenneTableProvider {
             });
         };
         if files.is_empty() {
-            return Ok(HashMap::new());
+            return Ok((
+                HashMap::new(),
+                util::session_state::SupersededCounts::default(),
+            ));
         }
         let table_schema = self.table_schema();
         let mut stored_fields: Vec<FieldRef> = Vec::with_capacity(key_columns.len() + 2);
@@ -819,8 +1067,17 @@ impl CayenneTableProvider {
             stored_fields.push(Arc::clone(&field));
             fields.push(field);
         }
-        let arrival = Arc::new(Field::new(ARRIVAL_COLUMN, DataType::UInt32, false));
+        let arrival = Arc::new(Field::new(ORDER_COLUMN, DataType::UInt32, false));
         stored_fields.push(Arc::clone(&arrival));
+        let arrival = Arc::new(Field::new(
+            ORDER_COLUMN,
+            if order.versioned() {
+                DataType::Binary
+            } else {
+                DataType::UInt32
+            },
+            false,
+        ));
         stored_fields.push(Arc::new(Field::new(
             POSITION_COLUMN,
             DataType::UInt64,
@@ -834,6 +1091,14 @@ impl CayenneTableProvider {
         )));
         fields.push(Arc::new(Field::new(FILE_COLUMN, DataType::UInt32, false)));
         fields.push(Arc::new(Field::new(HASH_COLUMN, DataType::UInt64, false)));
+        if order.versioned() {
+            for (name, data_type) in [
+                (ORDER_TIME_COLUMN, DataType::Int64),
+                (ORDER_HASH_COLUMN, DataType::UInt64),
+            ] {
+                stored_fields.push(Arc::new(Field::new(name, data_type, false)));
+            }
+        }
         let schema: SchemaRef = Arc::new(Schema::new(fields));
         let stored = Arc::new(Field::new_struct("", stored_fields, false));
 
@@ -885,12 +1150,12 @@ impl CayenneTableProvider {
                 key_names: &key_names,
                 stored: &stored,
                 schema: &schema,
-                survivor,
+                order,
                 keys: key_columns.len(),
                 group_rows,
             };
             match query.run(&plan.specs).await {
-                Ok(superseded) => break superseded,
+                Ok(found) => break found,
                 Err(error)
                     if matches!(
                         error.find_root(),
@@ -902,6 +1167,7 @@ impl CayenneTableProvider {
                 Err(error) => return Err(error.into()),
             }
         };
+        let (superseded, counts) = superseded;
         // Sort each file's positions on the blocking pool, files in parallel.
         let sorts = superseded
             .into_iter()
@@ -916,7 +1182,7 @@ impl CayenneTableProvider {
             });
         futures::future::try_join_all(sorts)
             .await
-            .map(|sorted| sorted.into_iter().collect::<HashMap<_, _>>())
+            .map(|sorted| (sorted.into_iter().collect::<HashMap<_, _>>(), counts))
             .map_err(|error| super::Error::Internal {
                 table: self.table_name().to_string(),
                 message: format!("Overwrite: sorting superseded positions failed: {error}"),
@@ -935,7 +1201,7 @@ struct DuplicateQuery<'a> {
     key_names: &'a Arc<[String]>,
     stored: &'a Arc<Field>,
     schema: &'a SchemaRef,
-    survivor: Survivor,
+    order: CopyOrder,
     keys: usize,
     /// The rows of each cluster split into key ranges, by group: the ranges'
     /// rows must add up to it, or a row was read by no range.
@@ -945,15 +1211,20 @@ struct DuplicateQuery<'a> {
 impl DuplicateQuery<'_> {
     /// The positions of every superseded copy, by file id, querying the key
     /// space in `chunks` chunks.
-    async fn run(&self, specs: &[ChunkSpec]) -> datafusion_common::Result<Vec<Vec<u32>>> {
+    async fn run(
+        &self,
+        specs: &[ChunkSpec],
+    ) -> datafusion_common::Result<(Vec<Vec<u32>>, util::session_state::SupersededCounts)> {
         let ctx = self.ctx;
-        let survivor = self.survivor;
+        let survivor = self.order.survivor();
         let schema = self.schema;
         let partitions = ctx.state().config().target_partitions().max(1);
         // Positions of superseded copies, by file id; each copy is emitted once,
         // since the join's build side holds each repeated key once.
         let mut superseded: Vec<Vec<u32>> = vec![Vec::new(); self.paths.len()];
         let mut group_read: Vec<u64> = vec![0; self.group_rows.len()];
+        let mut counts = util::session_state::SupersededCounts::default();
+        let versioned = self.order.versioned();
         for spec in specs {
             let rows_read = Arc::new(AtomicU64::new(0));
             let mut groups: Vec<Vec<ReadBackFile>> = vec![Vec::new(); partitions];
@@ -969,6 +1240,7 @@ impl DuplicateQuery<'_> {
                         files,
                         key_names: Arc::clone(self.key_names),
                         stored: Arc::clone(self.stored),
+                        versioned: self.order.versioned(),
                         schema: Arc::clone(schema),
                         chunk: spec.hash,
                         range: spec.range.clone(),
@@ -984,8 +1256,8 @@ impl DuplicateQuery<'_> {
                 .map(|i| format!("{BEST_KEY_PREFIX}{i}"))
                 .collect();
             let best = match survivor {
-                Survivor::Latest => max(column(ARRIVAL_COLUMN)),
-                Survivor::Earliest => min(column(ARRIVAL_COLUMN)),
+                Survivor::Latest => max(column(ORDER_COLUMN)),
+                Survivor::Earliest => min(column(ORDER_COLUMN)),
             };
             let repeated = ctx
                 .read_table(Arc::clone(&table) as _)?
@@ -1015,9 +1287,14 @@ impl DuplicateQuery<'_> {
             }
             let repeated = ctx.read_batches(repeated_batches)?;
             let superseded_copy = match survivor {
-                Survivor::Latest => column(ARRIVAL_COLUMN).lt(column(BEST_COLUMN)),
-                Survivor::Earliest => column(ARRIVAL_COLUMN).gt(column(BEST_COLUMN)),
+                Survivor::Latest => column(ORDER_COLUMN).lt(column(BEST_COLUMN)),
+                Survivor::Earliest => column(ORDER_COLUMN).gt(column(BEST_COLUMN)),
             };
+            // A version's losers are classified against the copy kept, so both are read.
+            let mut projection = vec![column(FILE_COLUMN), column(POSITION_COLUMN)];
+            if versioned {
+                projection.extend([column(ORDER_COLUMN), column(BEST_COLUMN)]);
+            }
             let left: Vec<&str> = keys.iter().map(String::as_str).collect();
             let right: Vec<&str> = best_keys.iter().map(String::as_str).collect();
             let joined = rows
@@ -1028,7 +1305,7 @@ impl DuplicateQuery<'_> {
                     &right,
                     Some(superseded_copy),
                 )?
-                .select(vec![column(FILE_COLUMN), column(POSITION_COLUMN)])?;
+                .select(projection)?;
             let mut stream = joined.execute_stream().await?;
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
@@ -1038,6 +1315,21 @@ impl DuplicateQuery<'_> {
                     return Err(datafusion_common::DataFusionError::Execution(
                         "a row position exceeds the position-delete range".to_string(),
                     ));
+                }
+                if versioned {
+                    let losers = batch.column(2).as_binary::<i32>();
+                    let best = batch.column(3).as_binary::<i32>();
+                    for (loser, best) in losers.iter().zip(best.iter()) {
+                        if let (Some(loser), Some(best)) = (loser, best) {
+                            count_superseded(
+                                &mut counts,
+                                order_version(loser),
+                                order_version(best),
+                            );
+                        }
+                    }
+                } else {
+                    counts.repeated += batch.num_rows() as u64;
                 }
                 for (file, position) in files.values().iter().zip(positions.values().iter()) {
                     // Checked above: every position of the batch fits.
@@ -1055,7 +1347,7 @@ impl DuplicateQuery<'_> {
                 )));
             }
         }
-        Ok(superseded)
+        Ok((superseded, counts))
     }
 }
 

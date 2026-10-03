@@ -96,6 +96,9 @@ pub struct Refresh {
     /// `on_conflict: upsert_dedup_by_time_column`: keep only rows newer than the version
     /// of their key already kept (see `refresh_task::latest_by_time`).
     pub(crate) upsert_dedup_by_time_column: bool,
+    /// The accelerator resolves a full refresh's repeated keys after writing them,
+    /// by the row versions the refresh supplies (unpartitioned Cayenne).
+    pub(crate) versions_resolved_after_write: bool,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
     /// TTL for cache entries. Data older than this is considered stale.
@@ -213,6 +216,12 @@ impl Refresh {
     #[must_use]
     pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
+        self
+    }
+
+    #[must_use]
+    pub fn versions_resolved_after_write(mut self, enabled: bool) -> Self {
+        self.versions_resolved_after_write = enabled;
         self
     }
 
@@ -524,6 +533,7 @@ impl Default for Refresh {
             period: None,
             append_overlap: None,
             upsert_dedup_by_time_column: false,
+            versions_resolved_after_write: false,
             retry_enabled: false,
             retry_max_attempts: None,
             caching_ttl: None,
