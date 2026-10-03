@@ -1368,7 +1368,6 @@ async fn notify_executor_of_assignments(
     Ok(())
 }
 
-#[expect(clippy::result_large_err)]
 fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -22,7 +22,7 @@ use crate::accelerated::refresh::{self, RefreshOverrides};
 use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::accelerated::refresh_task::probe_acceleration_contents;
-use crate::accelerated::snapshots::SnapshotRefreshState;
+use crate::accelerated::snapshots::{SnapshotRefreshState, reload_on_snapshot_notifications};
 use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
@@ -59,11 +59,15 @@ use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
 use data_accelerator_api::swappable::SwappableTableProvider;
+use data_connector_api::accelerated::RegisteredAcceleratedTable;
 use data_connector_api::federated::FederatedTableProvider;
 use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_acceleration::snapshot::notifications::{
+    NotificationConfig, SnapshotNotifications, Subscription,
+};
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
@@ -155,6 +159,7 @@ pub use runtime_datafusion::param_utils;
 pub use runtime_datafusion::pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
+pub(crate) mod point_lookup;
 pub(crate) use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
 pub use runtime_datafusion::retention_sql;
@@ -537,6 +542,12 @@ pub enum Error {
         source: crate::dataaccelerator::FilePathError,
     },
 
+    #[snafu(display("Failed to register dataset {dataset_name}: {source}"))]
+    SnapshotNotificationsConfig {
+        dataset_name: String,
+        source: runtime_acceleration::snapshot::notifications::Error,
+    },
+
     #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {source}"))]
     PreRefreshPartitionDiscoveryFailed {
         table_name: String,
@@ -577,6 +588,8 @@ impl Error {
                 | Self::SnapshotRefreshModeRequiresSnapshots
                 | Self::SnapshotRefreshModeUnsupportedEngine { .. }
                 | Self::SnapshotRefreshModeReloadUnsupported { .. }
+                // An invalid `snapshots.params.s3_queue_url`.
+                | Self::SnapshotNotificationsConfig { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
                 | Self::InvalidSnapshotCreationBatches { .. }
@@ -612,7 +625,7 @@ fn validate_distributed_engine(
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
 /// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
-fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
+pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => Some(AccelerationEngine::DuckDB),
@@ -729,7 +742,7 @@ const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 /// not specify `refresh_check_interval` explicitly. Picked to be slightly
 /// shorter than the default snapshot creation interval so a freshly created
 /// snapshot is picked up promptly without aggressive object-store load.
-const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
+pub(crate) const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
 
 pub enum Table {
     Accelerated {
@@ -872,6 +885,10 @@ pub struct DataFusion {
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
+    /// The SQS consumers that reload `refresh_mode: snapshot` datasets when
+    /// their snapshot location reports a new snapshot. Shared, so datasets on
+    /// one queue use one consumer.
+    snapshot_notifications: SnapshotNotifications,
     /// Datasets whose table provider is installed somewhere other than the
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
@@ -1460,6 +1477,31 @@ impl DataFusion {
                         .register_table(dataset_table_ref.clone(), table_provider)
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
+                    notifier
+                } else if crate::dataconnector::sink::registers_from_acceleration(
+                    dataset.acceleration.as_ref(),
+                    source.as_ref(),
+                ) {
+                    // The acceleration already holds this dataset's rows and the schema they
+                    // were written under, so there is a table to build now. Register it,
+                    // rather than leaving the stored rows unqueryable until the next write.
+                    let notifier = self
+                        .register_accelerated_table(
+                            dataset,
+                            source,
+                            federated_read_table,
+                            secrets,
+                            bootstrap_status,
+                            initial_partition_filters,
+                        )
+                        .await?;
+                    // A sink has nothing to load from: its rows arrive by write, so being
+                    // registered is the whole of its readiness — the same point the parked
+                    // path below reports ready at. Say so here too, or a sink whose
+                    // `refresh_mode` resolves to `disabled` (its default) starts no refresh
+                    // and so never leaves `Refreshing`.
+                    self.runtime_status
+                        .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
                     notifier
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
@@ -3071,6 +3113,20 @@ impl DataFusion {
                 (accelerated_table_provider, None)
             };
 
+        // Subscribed before the table is built, so a bad `s3_queue_url` fails the
+        // dataset before its first refresh starts.
+        let snapshot_subscription = match &snapshot_refresh_state {
+            Some(state) => self
+                .subscribe_to_snapshot_notifications(
+                    dataset,
+                    &acceleration_settings.snapshot_behavior,
+                    state,
+                )
+                .await?
+                .map(|subscription| (subscription, state.clone())),
+            None => None,
+        };
+
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
@@ -3093,10 +3149,16 @@ impl DataFusion {
             // snapshotting enabled, we delay readiness until the first refresh completes so that
             // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
             // Additionally, for CDC we let connector/stream to decide when dataset is ready.
+            //
+            // A dataset that reads snapshots (`file_format: snapshot`) is ready only once it
+            // has restored a snapshot in this process: a copy left from an earlier run can be
+            // arbitrarily old, or from a location the dataset no longer reads.
             let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
                 && dataset.time_column.is_some()
                 && acceleration_settings.snapshot_behavior.bootstrap_enabled()
-                || matches!(refresh_mode, RefreshMode::Changes);
+                || matches!(refresh_mode, RefreshMode::Changes)
+                || (dataset.is_snapshot_source()
+                    && bootstrap_status.loaded_snapshot_id().is_none());
 
             if !delay_initial_ready {
                 self.runtime_status
@@ -3587,12 +3649,61 @@ impl DataFusion {
             .await
             .context(AccelerationRegistrationSnafu)?;
 
-        accelerated_table_builder
-            .build()
-            .await
-            .context(UnableToBuildAcceleratedTableSnafu {
+        let mut accelerated_table = accelerated_table_builder.build().await.context(
+            UnableToBuildAcceleratedTableSnafu {
                 dataset_name: dataset.name.to_string(),
-            })
+            },
+        )?;
+
+        if let Some((subscription, state)) = snapshot_subscription
+            && let Some(requester) = accelerated_table.refresh_requester()
+            && let Some(completion) = accelerated_table.refresher().refresh_completion()
+        {
+            accelerated_table.attach_task(self.io_runtime.spawn(reload_on_snapshot_notifications(
+                subscription,
+                move || state.current_loaded_id(),
+                requester,
+                completion,
+            )));
+        }
+
+        Ok(accelerated_table)
+    }
+
+    /// Subscribe a `refresh_mode: snapshot` dataset to its snapshot location's
+    /// S3 event notifications, when `snapshots.params.s3_queue_url` names the
+    /// SQS queue that receives them. `None` when no queue is configured, and on
+    /// a scheduler, which loads no accelerations itself.
+    async fn subscribe_to_snapshot_notifications(
+        &self,
+        dataset: &Dataset,
+        snapshot_behavior: &SnapshotBehavior,
+        state: &SnapshotRefreshState,
+    ) -> Result<Option<Subscription>> {
+        let (SnapshotBehavior::Enabled(snapshots, secrets, io_runtime, _)
+        | SnapshotBehavior::BootstrapOnly(snapshots, secrets, io_runtime)) = snapshot_behavior
+        else {
+            return Ok(None);
+        };
+        // The runtime's secrets are gone only while it shuts down.
+        let Some(secrets) = secrets.upgrade() else {
+            return Ok(None);
+        };
+        let config = NotificationConfig::resolve(snapshots, secrets)
+            .await
+            .context(SnapshotNotificationsConfigSnafu {
+                dataset_name: dataset.name.to_string(),
+            })?;
+        if matches!(
+            self.cluster_config.effective_role(),
+            Some(crate::config::ClusterRole::Scheduler)
+        ) {
+            return Ok(None);
+        }
+        Ok(config.map(|config| {
+            self.snapshot_notifications
+                .subscribe(&config, &state.manager, io_runtime)
+        }))
     }
 
     // Compare the checkpoint schema (from the previous run) against the source/refresh
@@ -5684,6 +5795,17 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
+    // Same gate as `snapshot_before_recreate`.
+    if acceleration_settings.uses_cayenne_datalake() {
+        tracing::warn!(
+            dataset = %dataset.name,
+            "Snapshot creation is disabled for dataset '{}': {}",
+            dataset.name,
+            runtime_acceleration::acceleration::CAYENNE_DATALAKE_SNAPSHOT_REASON
+        );
+        return Ok(None);
+    }
+
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
@@ -5814,6 +5936,17 @@ async fn build_snapshot_creation_config(
     .await
     .map(|sm| {
         let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
+        // How often the dataset creates snapshots decides how long its snapshot
+        // writer lease lasts without renewal.
+        let snapshot_interval = match &snapshot_creation_trigger {
+            SnapshotCreateTrigger::Interval(interval) => Some(*interval),
+            SnapshotCreateTrigger::RefreshComplete => dataset.refresh_check_interval(),
+            SnapshotCreateTrigger::Batches(_) => None,
+        };
+        let sm = match snapshot_interval {
+            Some(interval) => sm.with_snapshot_interval(interval),
+            None => sm,
+        };
         let sm = if let Some(engine) = snapshot_engine_override {
             sm.with_snapshot_engine(engine)
         } else {
