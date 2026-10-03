@@ -124,6 +124,7 @@ pub(crate) struct ArrivalStream {
     resolver: KeyResolver,
     schema: SchemaRef,
     next: u64,
+    stamped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ArrivalStream {
@@ -134,7 +135,14 @@ impl ArrivalStream {
             resolver,
             schema,
             next: 0,
+            stamped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// The number of batches the stream has stamped so far. A write of at most
+    /// one batch repeats no key once that batch resolved its own repeats.
+    pub(crate) fn stamped_batches(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.stamped)
     }
 }
 
@@ -171,6 +179,8 @@ impl Stream for ArrivalStream {
                 };
                 let arrival = UInt32Array::from_value(sequence, resolved.num_rows());
                 this.next += 1;
+                this.stamped
+                    .store(this.next, std::sync::atomic::Ordering::Relaxed);
                 let mut columns = resolved.columns().to_vec();
                 columns.push(Arc::new(arrival));
                 Poll::Ready(Some(

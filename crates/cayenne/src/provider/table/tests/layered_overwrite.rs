@@ -847,3 +847,221 @@ async fn a_refresh_in_a_small_memory_pool_spills_and_keeps_the_last_copy() {
         );
     }
 }
+
+/// The live row count the table's statistics report once its post-write
+/// maintenance has run.
+async fn statistics_rows(provider: &CayenneTableProvider) -> Option<usize> {
+    provider
+        .flush_pending_maintenance()
+        .await
+        .expect("flush maintenance");
+    provider
+        .statistics()
+        .and_then(|stats| stats.num_rows.get_value().copied())
+}
+
+async fn upsert_table(
+    mode: DeletionMode,
+    on_conflict: OnConflict,
+) -> (
+    CayenneTableProvider,
+    Arc<dyn MetadataCatalog>,
+    Arc<RuntimeEnv>,
+    TempDir,
+) {
+    let runtime_env = SessionContext::new().runtime_env();
+    let (mut provider, catalog, dir) = create_cdc_table_with_schema(
+        "t",
+        Arc::clone(&runtime_env),
+        schema(),
+        vec!["id".to_string()],
+        VortexConfig {
+            deletion_mode: mode,
+            inline_max_rows: 0,
+            stream_publish_interval_ms: 0,
+            compaction_background_interval_ms: 3_600_000,
+            ..VortexConfig::default()
+        },
+        on_conflict,
+    )
+    .await;
+    provider.collapse_window_bytes = 1;
+    (provider, catalog, runtime_env, dir)
+}
+
+fn upsert_on_id() -> OnConflict {
+    OnConflict::Upsert(
+        datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+            "id".to_string(),
+        ]),
+    )
+}
+
+fn drop_on_id() -> OnConflict {
+    OnConflict::DoNothing(
+        datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+            "id".to_string(),
+        ]),
+    )
+}
+
+/// A key a streaming append repeats across batches that also meets a stored
+/// copy supersedes that stored copy once: the rows, `COUNT(*)` and the live row
+/// count the statistics carry all hold one row per key.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_supersedes_a_stored_copy_once_per_key() {
+    let mut failures = Vec::new();
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = upsert_table(mode, upsert_on_id()).await;
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![batch(&[(1, "old"), (2, "old"), (9, "old")])],
+        )
+        .await
+        .expect("seed");
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![
+                batch(&[(1, "a"), (2, "a")]),
+                batch(&[(2, "b"), (1, "b")]),
+                batch(&[(1, "c")]),
+            ],
+        )
+        .await
+        .expect("streaming append");
+        let expected = (owned(&[(1, "c"), (2, "b"), (9, "old")]), 3);
+        for (stage, provider) in [
+            ("after append", provider.clone_for_write()),
+            (
+                "after reopen",
+                reopen(&catalog, &runtime_env, UpsertDedup::None).await,
+            ),
+        ] {
+            let observed = visible(&provider).await;
+            let rows = statistics_rows(&provider).await;
+            eprintln!("{mode:?} {stage}: {observed:?}, statistics rows {rows:?}");
+            if observed != expected {
+                failures.push(format!("{mode:?} {stage}: {observed:?}"));
+            }
+            if rows.is_some_and(|rows| rows != 3) {
+                failures.push(format!("{mode:?} {stage}: statistics rows {rows:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Under `drop`, a stored key keeps its stored copy however often a streaming
+/// append repeats it, and a new key keeps its first copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_drop_keeps_stored_then_first_copies() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = upsert_table(mode, drop_on_id()).await;
+        write(&provider, InsertOp::Append, vec![batch(&[(1, "old")])])
+            .await
+            .expect("seed");
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![
+                batch(&[(1, "a"), (2, "a")]),
+                batch(&[(2, "b"), (1, "b"), (3, "b")]),
+                batch(&[(3, "c")]),
+            ],
+        )
+        .await
+        .expect("streaming drop append");
+        let expected = (owned(&[(1, "old"), (2, "a"), (3, "b")]), 3);
+        assert_eq!(visible(&provider).await, expected, "{mode:?}");
+        assert_eq!(statistics_rows(&provider).await.unwrap_or(3), 3, "{mode:?}");
+        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        assert_eq!(visible(&provider).await, expected, "{mode:?}: reopened");
+    }
+}
+
+/// `upsert_dedup` collapses an identical repeat within a batch and keeps the
+/// last copy of a key repeated across batches.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_upsert_dedup_keeps_the_last_copy_across_batches() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, _catalog, _runtime_env, _dir) =
+            table(mode, UpsertDedup::DropIdentical).await;
+        write(&provider, InsertOp::Append, vec![batch(&[(1, "old")])])
+            .await
+            .expect("seed");
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![
+                batch(&[(1, "a"), (1, "a"), (2, "a")]),
+                batch(&[(2, "b")]),
+                batch(&[(1, "c"), (3, "c"), (3, "c")]),
+            ],
+        )
+        .await
+        .expect("streaming upsert_dedup append");
+        assert_eq!(
+            visible(&provider).await,
+            (owned(&[(1, "c"), (2, "b"), (3, "c")]), 3),
+            "{mode:?}"
+        );
+        assert_eq!(statistics_rows(&provider).await.unwrap_or(3), 3, "{mode:?}");
+    }
+}
+
+/// A streaming append spanning many batches and files keeps the last copy of
+/// every key, including keys it repeats that were already stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_resolves_repeats_across_many_batches() {
+    const KEYS: i64 = 50_000;
+    const STORED: i64 = 10_000;
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, _catalog, _runtime_env, _dir) = upsert_table(mode, upsert_on_id()).await;
+        let seed: Vec<(i64, &str)> = (0..STORED).map(|id| (id, "old")).collect();
+        write(
+            &provider,
+            InsertOp::Append,
+            seed.chunks(4096).map(batch).collect(),
+        )
+        .await
+        .expect("seed");
+        let rows: Vec<(i64, &str)> = ["first", "last"]
+            .iter()
+            .flat_map(|value| (0..KEYS).map(move |id| (id, *value)))
+            .collect();
+        write(
+            &provider,
+            InsertOp::Append,
+            rows.chunks(8192).map(batch).collect(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{mode:?}: streaming append failed: {error}"));
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider.clone_for_write()))
+            .expect("register");
+        let counts = ctx
+            .sql("SELECT COUNT(*), COUNT(DISTINCT id), SUM(CASE WHEN value = 'last' THEN 1 ELSE 0 END) FROM t")
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("collect");
+        let column = |index: usize| {
+            counts[0]
+                .column(index)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .value(0)
+        };
+        assert_eq!(
+            (column(0), column(1), column(2)),
+            (KEYS, KEYS, KEYS),
+            "{mode:?}: (rows, keys, last copies)"
+        );
+        let rows = statistics_rows(&provider).await;
+        eprintln!("{mode:?}: statistics rows {rows:?}");
+        let keys = usize::try_from(KEYS).expect("key count fits");
+        assert_eq!(rows.unwrap_or(keys), keys, "{mode:?}: statistics rows");
+    }
+}

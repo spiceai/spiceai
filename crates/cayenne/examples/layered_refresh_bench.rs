@@ -27,6 +27,11 @@ limitations under the License.
 //!     --policy <none|drop|upsert|keep_last> --keys 1000000 --passes 4 [--refreshes 2]
 //! ```
 //!
+//! `--append` writes the generated data as an append refresh instead, through
+//! the streaming append path (`stream_publish_interval_ms: 0`), so its repeats
+//! are resolved as an append resolves them; `--refreshes` then appends again
+//! over the rows the previous append left.
+//!
 //! `--refreshes` repeats the refresh over the table the previous one left; every
 //! refresh after the first replaces a table of known size, which is the common
 //! shape of a scheduled refresh.
@@ -173,6 +178,74 @@ fn source(keys: usize, passes: usize, progress_rows: usize) -> SendableRecordBat
     ))
 }
 
+/// A plan that yields `stream` once, so an append reads the generated source
+/// lazily through `insert_into`.
+struct OneShot {
+    schema: SchemaRef,
+    stream: std::sync::Mutex<Option<SendableRecordBatchStream>>,
+}
+
+impl std::fmt::Debug for OneShot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OneShot")
+    }
+}
+
+impl datafusion::physical_plan::streaming::PartitionStream for OneShot {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _ctx: Arc<datafusion::execution::TaskContext>) -> SendableRecordBatchStream {
+        self.stream
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("the source is read once")
+    }
+}
+
+async fn append(
+    provider: &Arc<cayenne::CayenneTableProvider>,
+    ctx: &SessionContext,
+    stream: SendableRecordBatchStream,
+) -> u64 {
+    use datafusion::datasource::TableProvider;
+    let partition: Arc<dyn datafusion::physical_plan::streaming::PartitionStream> =
+        Arc::new(OneShot {
+            schema: schema(),
+            stream: std::sync::Mutex::new(Some(stream)),
+        });
+    let source = Arc::new(
+        datafusion::physical_plan::streaming::StreamingTableExec::try_new(
+            schema(),
+            vec![partition],
+            None,
+            Vec::new(),
+            false,
+            None,
+        )
+        .expect("source"),
+    );
+    let plan = provider
+        .insert_into(
+            &ctx.state(),
+            source,
+            datafusion::logical_expr::dml::InsertOp::Append,
+        )
+        .await
+        .expect("plan");
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .expect("append");
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .expect("count")
+        .value(0)
+}
+
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[((sorted.len() as f64 - 1.0) * p).round() as usize]
 }
@@ -243,6 +316,7 @@ async fn main() {
     let progress_rows: usize = arg("--progress-rows", "0").parse().expect("progress rows");
     let memory_limit_mb: usize = arg("--memory-limit-mb", "0").parse().expect("memory limit");
     let skip_queries = std::env::args().any(|a| a == "--skip-queries");
+    let append_mode = std::env::args().any(|a| a == "--append");
     let ctx = if memory_limit_mb == 0 {
         SessionContext::new()
     } else {
@@ -277,6 +351,11 @@ async fn main() {
                 deletion_mode,
                 inline_max_rows: 0,
                 compaction_background_interval_ms: 3_600_000,
+                stream_publish_interval_ms: if append_mode {
+                    0
+                } else {
+                    VortexConfig::default().stream_publish_interval_ms
+                },
                 ..VortexConfig::default()
             },
         })
@@ -288,6 +367,14 @@ async fn main() {
     let mut written = 0;
     for refresh in 1..=refreshes {
         let start = Instant::now();
+        if append_mode {
+            written = append(&provider, &ctx, source(keys, passes, progress_rows)).await;
+            refresh_s = start.elapsed().as_secs_f64();
+            if refreshes > 1 {
+                println!("  append {refresh} of {refreshes}: refresh_s={refresh_s:.2}");
+            }
+            continue;
+        }
         let prepared = provider
             .begin_overwrite(
                 source(keys, passes, progress_rows),
@@ -317,7 +404,8 @@ async fn main() {
         .expect("layers")
         .len();
     println!(
-        "policy={policy} deletion_mode={deletion_mode:?} keys={keys} passes={passes} rows_in={} rows_written={written} layers={layers} refresh_s={refresh_s:.2} rows_per_s={:.0}",
+        "mode={} policy={policy} deletion_mode={deletion_mode:?} keys={keys} passes={passes} rows_in={} rows_written={written} layers={layers} refresh_s={refresh_s:.2} rows_per_s={:.0}",
+        if append_mode { "append" } else { "overwrite" },
         total_rows(keys, passes),
         total_rows(keys, passes) as f64 / refresh_s,
     );
