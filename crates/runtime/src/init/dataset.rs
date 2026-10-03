@@ -1000,7 +1000,11 @@ impl Runtime {
         use crate::component::dataset::acceleration::Mode;
 
         let acceleration = ds.acceleration.as_ref().filter(|a| a.enabled)?;
-        let refresh_mode = acceleration.refresh_mode.unwrap_or(RefreshMode::Full);
+        // An unset mode resolves the way the connector resolves it (`changes` for
+        // `debezium` and `cdc`), which this check runs before the connector exists to ask.
+        let refresh_mode = acceleration.refresh_mode.unwrap_or_else(|| {
+            runtime_acceleration::acceleration::unset_refresh_mode_for_connector(ds.source())
+        });
         let reason = if ds.access().allows_write() {
             "`access: read_write`".to_string()
         } else if ds.has_embeddings() {

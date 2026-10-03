@@ -186,7 +186,11 @@ impl DataConnector for ReconnectingConnector {
     fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
         match self.built() {
             Some(inner) => inner.resolve_refresh_mode(refresh_mode),
-            None => refresh_mode.unwrap_or(RefreshMode::Full),
+            None => refresh_mode.unwrap_or_else(|| {
+                runtime_acceleration::acceleration::unset_refresh_mode_for_connector(
+                    &self.source_name,
+                )
+            }),
         }
     }
 
