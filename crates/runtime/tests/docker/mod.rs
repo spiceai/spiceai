@@ -596,13 +596,29 @@ impl<'a> ContainerRunner<'a> {
     }
 }
 
-/// Creates a container called `name`.
+/// Creates a container called `name`, taking the name over from whatever
+/// container still holds it.
 ///
-/// `wait_for_name_release` polls the container list, and the daemon drops
-/// a container from that list before it releases the name — so the list
-/// can report the name free while it is still reserved, and creation
-/// answers 409. Retry on exactly that, under the same bound, rather than
-/// failing the test for a window that closes on its own.
+/// [`ContainerRunner::wait_for_name_release`] polls the container list, and two
+/// things can hold the name without appearing in it when it looks:
+///
+/// - A container the daemon has dropped from the list but not yet released the
+///   name of. It goes on its own.
+/// - A creation an earlier attempt of this test sent, whose request timed out on
+///   this side (bollard's `Timeout error`) while the daemon went on to finish
+///   it. It never reached a [`RunningContainer`] guard, so nothing removes it,
+///   and it joins the list only once the daemon has finished registering it --
+///   on a daemon slow enough to time the request out, minutes later. Retrying
+///   the creation alone answers 409 until the deadline, and so does every nextest
+///   retry of the test after it.
+///
+/// So every conflict removes whatever holds the name before retrying. That is
+/// safe because the name is this test's alone: each name is derived from a
+/// constant no other test uses, and each CI job has its own Docker daemon. The
+/// removal is best-effort within the same bound -- a 404 (not registered yet) or
+/// 409 (already being removed) is expected -- and if the name is still taken at
+/// the deadline, the error carries the last removal failure, which is usually
+/// the actual cause (an unkillable container, a daemon that stopped answering).
 async fn create_taking_over_name(
     docker: &Docker,
     name: &str,
@@ -613,23 +629,37 @@ async fn create_taking_over_name(
         platform: None,
     };
     let create_deadline = std::time::Instant::now() + NAME_RELEASE_TIMEOUT;
+    let mut removal_failure: Option<anyhow::Error> = None;
     loop {
-        match docker
+        let conflict = match docker
             .create_container(Some(options.clone()), config.clone())
             .await
         {
             Ok(_) => return Ok(()),
-            Err(e) if is_name_still_taken(&e) => {
-                if std::time::Instant::now() >= create_deadline {
-                    return Err(anyhow::Error::new(e).context(format!(
-                        "the name of test container {name} was still reserved {NAME_RELEASE_TIMEOUT:?} after its removal completed"
-                    )));
-                }
-                tracing::debug!("Docker still holds the name {name}; retrying the creation");
-                tokio::time::sleep(NAME_RELEASE_POLL_INTERVAL).await;
-            }
+            Err(e) if is_name_still_taken(&e) => e,
             Err(e) => return Err(e.into()),
+        };
+        if std::time::Instant::now() >= create_deadline {
+            // One message rather than nested contexts: callers format with `{e}`,
+            // which prints only the outermost one.
+            let removal = removal_failure.map_or_else(
+                || "removing its holder raised no error".to_string(),
+                |e| format!("the last attempt to remove its holder failed: {e:#}"),
+            );
+            return Err(anyhow::Error::new(conflict).context(format!(
+                "test container {name} could not be created: Docker still reported the name taken {NAME_RELEASE_TIMEOUT:?} after this test began removing whatever held it, and {removal}"
+            )));
         }
+        tracing::debug!(
+            "Docker still holds the name {name}; removing its holder and retrying the creation"
+        );
+        match remove(docker, name).await {
+            Err(e) if !is_already_gone(&e) && !is_removal_already_in_progress(&e) => {
+                removal_failure = Some(e);
+            }
+            _ => {}
+        }
+        tokio::time::sleep(NAME_RELEASE_POLL_INTERVAL).await;
     }
 }
 
