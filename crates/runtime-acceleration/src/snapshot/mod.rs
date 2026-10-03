@@ -2239,6 +2239,12 @@ impl SnapshotManager {
                 self.dataset_name
             );
             metrics::record_snapshot_skipped(&self.dataset_name);
+            // A holder that cannot publish lets another instance take over, as a failed
+            // attempt does: renewing the lease while refused would keep every other
+            // instance on standby for as long as the refusal lasts.
+            if writer_generation.is_some() {
+                self.release_writer_lease().await;
+            }
             return Ok(None);
         }
 
