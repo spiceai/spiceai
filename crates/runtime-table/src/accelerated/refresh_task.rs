@@ -232,6 +232,7 @@ pub struct RefreshTaskBuilder {
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
@@ -283,6 +284,7 @@ impl RefreshTaskBuilder {
             federated,
             federated_source,
             accelerator,
+            change_sink: None,
             disable_federation: false,
             semaphore: None,
             metrics: None,
@@ -301,6 +303,15 @@ impl RefreshTaskBuilder {
                 std::collections::HashMap::new(),
             )),
         }
+    }
+
+    #[must_use]
+    pub fn with_change_sink(
+        mut self,
+        sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    ) -> Self {
+        self.change_sink = sink;
+        self
     }
 
     /// Sets the `disable_federation` flag
@@ -474,7 +485,7 @@ impl RefreshTaskBuilder {
             is_s3_express_acceleration: self.is_s3_express_acceleration,
             engine_type_rewrites: self.engine_type_rewrites,
             snapshot_refresh_state: self.snapshot_refresh_state,
-            cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
+            change_sink: tokio::sync::OnceCell::new_with(self.change_sink),
             cdc_param_overrides: self.cdc_param_overrides,
             in_flight_revalidations: self.in_flight_revalidations,
             session_state,
@@ -552,8 +563,7 @@ pub struct RefreshTask {
     /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
     /// other refresh modes.
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
-    /// Cached generic CDC append plan. Cayenne's native CDC path bypasses this.
-    cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
+    change_sink: tokio::sync::OnceCell<runtime_acceleration::change_sink::ChangeSink>,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
@@ -581,6 +591,29 @@ impl std::fmt::Debug for RefreshTask {
 }
 
 impl RefreshTask {
+    async fn change_sink(&self) -> &runtime_acceleration::change_sink::ChangeSink {
+        self.change_sink
+            .get_or_init(|| async {
+                use runtime_acceleration::change_sink::provider::ProviderChangeSinkBackend;
+                use runtime_acceleration::change_sink::{ChangeSink, ChangeSinkContext};
+
+                let mut context = ChangeSinkContext::new(
+                    self.dataset_name.clone(),
+                    Arc::clone(&self.accelerator),
+                );
+                context.write_lock = Arc::clone(&self.accelerator_write_mutex);
+                let federated = Arc::clone(&self.federated);
+                context.external_indexes = Arc::new(move || indexes_from_federated(&federated));
+                ChangeSink::new(
+                    Arc::new(ProviderChangeSinkBackend::new(context)),
+                    util::session_state::session_context(),
+                    &Handle::current(),
+                    changes::cdc_config().prefetch_buffer,
+                )
+            })
+            .await
+    }
+
     #[must_use]
     pub fn builder(
         runtime_status: Arc<status::RuntimeStatus>,

@@ -289,6 +289,7 @@ pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTa
 pub struct AcceleratedTable {
     dataset_name: TableReference,
     accelerator: Arc<dyn TableProvider>,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
     federated: Arc<FederatedTable>,
     refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>,
 
@@ -418,6 +419,7 @@ pub struct Builder {
     federated: Arc<FederatedTable>,
     federated_source: String,
     accelerator: Arc<dyn TableProvider>,
+    change_sink_engine: Option<Arc<dyn data_accelerator_api::DataAccelerator>>,
     refresh: refresh::Refresh,
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
@@ -482,6 +484,7 @@ impl Builder {
             federated,
             federated_source,
             accelerator,
+            change_sink_engine: None,
             refresh,
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
@@ -527,6 +530,14 @@ impl Builder {
     /// storage column from users.
     pub fn user_facing_schema(&mut self, schema: SchemaRef) -> &mut Self {
         self.user_facing_schema = Some(schema);
+        self
+    }
+
+    pub fn change_sink_engine(
+        &mut self,
+        engine: Option<Arc<dyn data_accelerator_api::DataAccelerator>>,
+    ) -> &mut Self {
+        self.change_sink_engine = engine;
         self
     }
 
@@ -968,6 +979,42 @@ impl Builder {
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
+        let change_sink = if matches!(refresh_mode, RefreshMode::Changes | RefreshMode::Append) {
+            use runtime_acceleration::change_sink::provider::ProviderChangeSinkBackend;
+            use runtime_acceleration::change_sink::{ChangeSink, ChangeSinkContext};
+
+            let mut context =
+                ChangeSinkContext::new(self.dataset_name.clone(), Arc::clone(&self.accelerator));
+            context.write_lock = Arc::clone(&self.accelerator_write_mutex);
+            let federated = Arc::clone(&self.federated);
+            context.external_indexes =
+                Arc::new(move || refresh_task::indexes_from_federated(&federated));
+            let runtime = self
+                .cdc_apply_runtime
+                .as_ref()
+                .or(self.cpu_runtime.as_ref())
+                .cloned()
+                .unwrap_or_else(Handle::current);
+            let capacity = refresh_task::changes::cdc_config().prefetch_buffer;
+            let native = if let Some(engine) = &self.change_sink_engine {
+                engine
+                    .change_sink(context.clone(), &runtime, capacity)
+                    .await
+                    .map_err(|source| Error::FailedToWriteData { source })?
+            } else {
+                None
+            };
+            Some(native.unwrap_or_else(|| {
+                ChangeSink::new(
+                    Arc::new(ProviderChangeSinkBackend::new(context)),
+                    util::session_state::session_context(),
+                    &runtime,
+                    capacity,
+                )
+            }))
+        } else {
+            None
+        };
         let refresh_params = Arc::new(RwLock::new(self.refresh));
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
@@ -991,6 +1038,7 @@ impl Builder {
             self.io_runtime.clone(),
             Arc::clone(&self.accelerator_write_mutex),
         );
+        refresher.with_change_sink(change_sink.clone());
         refresher.with_refresh_completion(refresh_completion.clone());
         refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
@@ -1308,6 +1356,7 @@ impl Builder {
         Ok(AcceleratedTable {
             dataset_name: self.dataset_name,
             accelerator: self.accelerator,
+            change_sink,
             federated: self.federated,
             refresh_trigger,
             handlers,
@@ -1335,6 +1384,23 @@ impl Builder {
 }
 
 impl AcceleratedTable {
+    #[must_use]
+    pub fn change_sink(&self) -> Option<&runtime_acceleration::change_sink::ChangeSink> {
+        self.change_sink.as_ref()
+    }
+
+    /// Stop producers and drain accepted changes before the storage target can
+    /// be removed or rebound. A failed drain leaves admission fenced.
+    pub async fn drain_changes(&self, timeout: Duration) -> DataFusionResult<()> {
+        if let Some(sink) = &self.change_sink {
+            for handler in &self.handlers {
+                handler.abort();
+            }
+            sink.close(timeout).await?;
+        }
+        Ok(())
+    }
+
     pub fn builder(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
@@ -1641,6 +1707,9 @@ impl Drop for AcceleratedTable {
     fn drop(&mut self) {
         for handler in self.handlers.drain(..) {
             handler.abort();
+        }
+        if let Some(sink) = &self.change_sink {
+            sink.begin_close();
         }
     }
 }
