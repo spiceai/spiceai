@@ -477,12 +477,9 @@ pub(crate) fn file_name(path: &str) -> &str {
 }
 
 /// The type a key column is encoded in: its stored type, or a dictionary's
-/// value type (equal values encode equally whatever their dictionary).
+/// value type (see [`key_index::key_type`]).
 fn encoded_type(data_type: &DataType) -> DataType {
-    match data_type {
-        DataType::Dictionary(_, value) => value.as_ref().clone(),
-        other => other.clone(),
-    }
+    key_index::key_type(data_type).clone()
 }
 
 /// Whether a column of `data_type` can be indexed. The index encodes a key

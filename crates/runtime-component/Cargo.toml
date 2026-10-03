@@ -21,6 +21,7 @@ datafusion-table-providers = { workspace = true }
 fundu = { workspace = true }
 globset.workspace = true
 logos.workspace = true
+key-index = { path = "../key-index" }
 runtime-acceleration = { path = "../runtime-acceleration" }
 serde = { workspace = true, features = ["derive"] }
 snafu.workspace = true

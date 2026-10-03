@@ -17690,6 +17690,7 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "globset",
+ "key-index",
  "logos",
  "opentelemetry",
  "runtime-acceleration",
