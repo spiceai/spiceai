@@ -166,11 +166,12 @@ fn error_response_remedy(status: u16) -> &'static str {
 /// [`Warn`] and [`Store`] reach only the statuses this connector does *not* retry. A 5xx
 /// or 429 that outlives the retry ladder fails the request whatever the action says,
 /// because it is a statement about the origin's health rather than about the resource
-/// (RFC 9110 S15.6) — and the rest of the connector already reads it that way:
-/// `cache::batches_cacheable` keeps such a row out of the results cache and
-/// `HttpExec` counts it through [`crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME`]. Without
-/// that scoping, the setting a dataset picks to keep a meaningful 404 working would also
-/// let an outage overwrite its contents (spiceai/spiceai#13578).
+/// (RFC 9110 S15.6) — the same line `cache::batches_cacheable` draws when it keeps a row
+/// carrying such a status out of the results cache. Because the status is refused
+/// before it becomes a row, a caller that keeps its previous result when the origin
+/// fails tells it apart from other failures with [`is_transient_origin_failure`].
+/// Without that scoping, the setting a dataset picks to keep a meaningful 404 working
+/// would also let an outage overwrite its contents (spiceai/spiceai#13578).
 ///
 /// [`Warn`]: ErrorResponseAction::Warn
 /// [`Store`]: ErrorResponseAction::Store
@@ -243,6 +244,29 @@ impl Error {
     }
 }
 
+/// Whether `error`, or any error it was built from, is this connector refusing a status it
+/// retries (5xx/429) once its retries ran out: an origin that is down, rather than an
+/// answer about the resource.
+///
+/// The connector refuses such a status before it becomes a row (see
+/// [`ErrorResponseAction`]), so a caller that keeps its previous result when the origin
+/// fails sees it as an error rather than as a row carrying the status. This is how such a
+/// caller tells the two kinds of failure apart; the error may arrive wrapped in any number
+/// of `DataFusionError` layers.
+#[must_use]
+pub fn is_transient_origin_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if let Some(Error::ErrorResponse { status, .. }) = err.downcast_ref::<Error>()
+            && HttpTableProvider::is_retryable_status(*status)
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 impl From<Error> for DataFusionError {
     fn from(err: Error) -> Self {
         match err {
@@ -257,12 +281,16 @@ impl From<Error> for DataFusionError {
             // invocation re-asking an origin that will keep saying no. The statuses worth
             // re-asking are the ones the request ladder already retries, so both read the
             // same predicate rather than two taxonomies that can drift apart.
+            //
+            // The retryable case keeps the typed error rather than its text, so a caller
+            // can still tell an origin that is down from any other failure once the error
+            // has been wrapped on its way out of the plan — see
+            // [`is_transient_origin_failure`].
             Error::ErrorResponse { status, .. } => {
-                let message = err.to_string();
                 if HttpTableProvider::is_retryable_status(status) {
-                    DataFusionError::External(Box::new(std::io::Error::other(message)))
+                    DataFusionError::External(Box::new(err))
                 } else {
-                    DataFusionError::Plan(message)
+                    DataFusionError::Plan(err.to_string())
                 }
             }
             Error::RateLimited { message } => DataFusionError::External(Box::new(
@@ -8639,6 +8667,36 @@ mod tests {
     /// it asks whether the error is retriable.
     fn check_retriable(err: DataFusionError) -> DataFusionError {
         datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error(err)
+    }
+
+    #[test]
+    fn a_refused_transient_status_is_recognisable_through_any_wrapping() {
+        let refused = |status| -> DataFusionError {
+            Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into()
+        };
+        for status in [429, 500, 503] {
+            assert!(is_transient_origin_failure(&refused(status)), "{status}");
+            // The shapes an execution error takes on its way out of a plan.
+            let wrapped = DataFusionError::Context(
+                "scan".to_string(),
+                Box::new(DataFusionError::Shared(Arc::new(refused(status)))),
+            );
+            assert!(is_transient_origin_failure(&wrapped), "{status} wrapped");
+        }
+        for status in [400, 404] {
+            assert!(
+                !is_transient_origin_failure(&refused(status)),
+                "{status} is an answer about the resource, not an origin that is down"
+            );
+        }
+        assert!(!is_transient_origin_failure(&DataFusionError::Execution(
+            "connection reset".to_string()
+        )));
     }
 
     #[test]
