@@ -278,32 +278,80 @@ mod tests {
     #[test]
     fn test_error_invalid_direction() {
         let schema = test_schema();
-        parse_sort_columns("id INVALID", &schema).expect_err("should fail on invalid direction");
+        let err = parse_sort_columns("id INVALID", &schema)
+            .expect_err("should fail on invalid direction");
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidDirection { column, direction }
+                    if column == "id" && direction == "INVALID"
+            ),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Invalid sort direction 'INVALID' for column 'id', expected 'ASC' or 'DESC'"
+        );
     }
 
     #[test]
     fn test_error_column_not_found() {
         let schema = test_schema();
-        parse_sort_columns("nonexistent DESC", &schema)
+        let err = parse_sort_columns("nonexistent DESC", &schema)
             .expect_err("should fail on nonexistent column");
+        assert!(
+            matches!(
+                &err,
+                Error::ColumnNotFound { column, available }
+                    if column == "nonexistent" && available == "id, timestamp, value"
+            ),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Sort column 'nonexistent' does not exist in schema. Available columns: id, timestamp, value"
+        );
     }
 
     #[test]
     fn test_error_empty_input() {
         let schema = test_schema();
-        parse_sort_columns("", &schema).expect_err("should fail on empty input");
+        let err = parse_sort_columns("", &schema).expect_err("should fail on empty input");
+        assert!(
+            matches!(&err, Error::NoColumnsFound { input } if input.is_empty()),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(err.to_string(), "No valid sort columns found in ''");
     }
 
     #[test]
     fn test_error_only_whitespace() {
         let schema = test_schema();
-        parse_sort_columns("   ,   ", &schema).expect_err("should fail on whitespace-only input");
+        let err = parse_sort_columns("   ,   ", &schema)
+            .expect_err("should fail on whitespace-only input");
+        assert!(
+            matches!(&err, Error::NoColumnsFound { input } if input == "   ,   "),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(err.to_string(), "No valid sort columns found in '   ,   '");
     }
 
     #[test]
     fn test_error_too_many_parts() {
         let schema = test_schema();
-        parse_sort_columns("id ASC extra", &schema).expect_err("should fail on too many parts");
+        let err =
+            parse_sort_columns("id ASC extra", &schema).expect_err("should fail on too many parts");
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidSpecification { specification } if specification == "id ASC extra"
+            ),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Invalid sort column specification 'id ASC extra', expected 'column [ASC|DESC] [NULLS FIRST|LAST]'"
+        );
     }
 
     #[test]
@@ -330,10 +378,25 @@ mod tests {
     #[test]
     fn test_error_invalid_nulls_placement() {
         let schema = test_schema();
-        parse_sort_columns("id NULLS SOMETIMES", &schema)
-            .expect_err("should fail on invalid NULLS placement");
-        parse_sort_columns("id DESC NULLS", &schema)
-            .expect_err("should fail on dangling NULLS keyword");
+        // An unknown placement, and a `NULLS` keyword with no placement at all.
+        for specification in ["id NULLS SOMETIMES", "id DESC NULLS"] {
+            let err = parse_sort_columns(specification, &schema)
+                .expect_err("should fail on an invalid NULLS placement");
+            assert!(
+                matches!(
+                    &err,
+                    Error::InvalidSpecification { specification: rejected }
+                        if rejected == specification
+                ),
+                "unexpected error {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Invalid sort column specification '{specification}', expected 'column [ASC|DESC] [NULLS FIRST|LAST]'"
+                )
+            );
+        }
     }
 
     #[test]

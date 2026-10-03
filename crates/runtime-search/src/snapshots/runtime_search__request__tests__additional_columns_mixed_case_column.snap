@@ -1,0 +1,5 @@
+---
+source: crates/runtime-search/src/request.rs
+expression: "run_parse_additional_columns(&[\"CoLuMn\"]).as_str()"
+---
+[Column { relation: None, name: "CoLuMn" }]

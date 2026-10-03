@@ -681,7 +681,13 @@ mod tests {
         let params = encode_single_row_parameters(&mut decoder, &schema_ref)
             .await
             .expect("a single row of parameters should be accepted");
-        assert!(!params.is_empty());
+        // An IPC stream holds a schema and an end marker even with no batches,
+        // so read the row back rather than checking the bytes are non-empty.
+        let batches = StreamReader::try_new(params.as_slice(), None)
+            .expect("parameters should be an Arrow IPC stream")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parameter batches should decode");
+        assert_eq!(batches, vec![one_col_batch(&schema, vec![1])]);
     }
 
     #[tokio::test]

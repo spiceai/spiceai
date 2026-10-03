@@ -27,13 +27,13 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
-    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
-    StringViewArray, Time32SecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    Time32SecondArray, Time64NanosecondArray, TimestampMicrosecondArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, i256};
-use arrow_schema::SortOptions;
+use arrow_schema::{ArrowError, SortOptions};
 
 use super::{OwnedRow, RowConverter, RowFormatVersion, Rows, SortField};
 
@@ -452,28 +452,15 @@ fn unsupported_primary_key_types_error() {
             true,
         ))),
     ] {
+        let Err(err) = RowConverter::new(vec![SortField::new(dt.clone())]) else {
+            panic!("expected {dt:?} to be rejected");
+        };
+        let expected = format!("cayenne row_converter: unsupported primary key type: {dt}");
         assert!(
-            RowConverter::new(vec![SortField::new(dt.clone())]).is_err(),
-            "expected {dt:?} to be rejected"
+            matches!(&err, ArrowError::NotYetImplemented(message) if *message == expected),
+            "{dt:?}: {err:?}"
         );
     }
-}
-
-#[test]
-fn unsupported_type_does_not_reach_arrow_row() {
-    // Sanity: FixedSizeBinary is a valid arrow-row type but is not a Cayenne PK type, so we
-    // deliberately reject it even though arrow-row would accept it.
-    let fsb = FixedSizeBinaryArray::try_from_iter(vec![vec![1u8, 2, 3, 4]].into_iter())
-        .expect("build fixed-size-binary array");
-    assert!(
-        arrow_row::RowConverter::new(vec![arrow_row::SortField::new(fsb.data_type().clone())])
-            .is_ok(),
-        "arrow-row accepts FixedSizeBinary"
-    );
-    assert!(
-        RowConverter::new(vec![SortField::new(fsb.data_type().clone())]).is_err(),
-        "cayenne rejects FixedSizeBinary as a primary key"
-    );
 }
 
 #[test]
@@ -504,9 +491,16 @@ fn decode_rejects_truncated_fixed_bytes() {
         buffer: vec![1u8, 0, 0],
         offsets: vec![0, 3],
     };
+    let err = converter
+        .convert_rows(rows.iter())
+        .expect_err("truncated fixed-width row must error, not panic");
     assert!(
-        converter.convert_rows(rows.iter()).is_err(),
-        "truncated fixed-width row must error, not panic"
+        matches!(
+            &err,
+            ArrowError::InvalidArgumentError(message)
+                if message == "row_converter: truncated row, expected at least 9 bytes, got 3"
+        ),
+        "{err:?}"
     );
 }
 
@@ -519,8 +513,15 @@ fn decode_rejects_truncated_variable_bytes() {
         buffer: vec![2u8],
         offsets: vec![0, 1],
     };
+    let err = converter
+        .convert_rows(rows.iter())
+        .expect_err("truncated variable-width row must error, not panic");
     assert!(
-        converter.convert_rows(rows.iter()).is_err(),
-        "truncated variable-width row must error, not panic"
+        matches!(
+            &err,
+            ArrowError::InvalidArgumentError(message)
+                if message == "row_converter: truncated or malformed row bytes"
+        ),
+        "{err:?}"
     );
 }

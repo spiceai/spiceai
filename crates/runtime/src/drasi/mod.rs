@@ -442,8 +442,31 @@ mod tests {
     fn empty_required_param_is_treated_as_missing() {
         let params =
             std::collections::HashMap::from([(HTTP_ENDPOINT_PARAM.to_string(), String::new())]);
-        required_param("orders", &params, HTTP_ENDPOINT_PARAM)
+        let empty = required_param("orders", &params, HTTP_ENDPOINT_PARAM)
             .expect_err("an empty endpoint is not a usable endpoint");
+        assert!(
+            matches!(
+                &empty,
+                runtime_drasi::Error::MissingParameter { dataset, parameter }
+                    if dataset == "orders" && *parameter == HTTP_ENDPOINT_PARAM
+            ),
+            "expected MissingParameter, got {empty:?}"
+        );
+
+        // The user sees exactly what an absent parameter reports.
+        let absent = required_param(
+            "orders",
+            &std::collections::HashMap::new(),
+            HTTP_ENDPOINT_PARAM,
+        )
+        .expect_err("the endpoint is required for the http transport");
+        assert_eq!(empty.to_string(), absent.to_string());
+        assert_eq!(
+            empty.to_string(),
+            "Failed to configure Drasi forwarding for dataset orders (drasi): Missing required \
+             parameter 'drasi_http_endpoint'. Add it under 'drasi.params'. See: \
+             https://spiceai.org/docs/reference/spicepod/datasets#drasi"
+        );
     }
 
     #[test]

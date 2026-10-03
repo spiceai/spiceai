@@ -1441,6 +1441,15 @@ mod tests {
         Ok(lines)
     }
 
+    /// The error `ArrayToNdjson::try_new` reports for `input`. The adapter is
+    /// not `Debug`, so `expect_err` is not available on its result.
+    fn try_new_error(input: &str) -> io::Error {
+        match ArrayToNdjson::try_new(Cursor::new(input)) {
+            Ok(_) => panic!("{input:?} must be rejected before any element is read"),
+            Err(err) => err,
+        }
+    }
+
     // Direct unit tests for filter_element_bytes function
     mod filter_element_bytes_tests {
         use super::*;
@@ -1839,10 +1848,9 @@ mod tests {
 
     #[test]
     fn test_invalid_json_missing_opening_bracket() {
-        let input = r#"{"name": "John"}"#;
-        let cursor = Cursor::new(input);
-        let result = ArrayToNdjson::try_new(cursor);
-        assert!(result.is_err());
+        let err = try_new_error(r#"{"name": "John"}"#);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "expected '[' but found '{'");
     }
 
     #[test]
@@ -1850,8 +1858,12 @@ mod tests {
         let input = r#"[{"name": "John"}"#;
         let cursor = Cursor::new(input);
         let adapter = ArrayToNdjson::try_new(cursor).expect("Test should not fail");
-        let result = read_all_lines(adapter);
-        result.expect_err("Should fail for missing closing bracket");
+        let err = read_all_lines(adapter).expect_err("Should fail for missing closing bracket");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "EOF while peeking next byte");
+        // The element is whole but its delimiter never arrived, so it is never
+        // published as a row, however long a caller keeps reading.
+        bare_scalar_elements::assert_stays_failed(input.as_bytes(), 0);
     }
 
     #[test]
@@ -1859,24 +1871,26 @@ mod tests {
         let input = r#"[{"name": John}]"#; // missing quotes around John
         let cursor = Cursor::new(input);
         let adapter = ArrayToNdjson::try_new(cursor).expect("Test should not fail");
-        let result = read_all_lines(adapter);
-        result.expect_err("Should fail for malformed JSON element");
+        let err = read_all_lines(adapter).expect_err("Should fail for malformed JSON element");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // serde counts columns from the element, which starts after the `[`.
+        assert_eq!(err.to_string(), "expected value at line 1 column 10");
     }
 
     #[test]
     fn test_empty_string_input() {
-        let input = "";
-        let cursor = Cursor::new(input);
-        let result = ArrayToNdjson::try_new(cursor);
-        assert!(result.is_err());
+        let err = try_new_error("");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "EOF before '['");
     }
 
     #[test]
     fn test_only_whitespace() {
-        let input = "   \t\n   ";
-        let cursor = Cursor::new(input);
-        let result = ArrayToNdjson::try_new(cursor);
-        assert!(result.is_err());
+        // The whitespace is skipped to the end of the input rather than rejected
+        // as a stray byte.
+        let err = try_new_error("   \t\n   ");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "EOF before '['");
     }
 
     #[test]
@@ -4536,9 +4550,21 @@ mod tests {
         #[test]
         fn a_truncated_array_is_still_reported() {
             for body in [&br"[1,2"[..], &br"[1"[..], &br"[1.5"[..]] {
-                assert!(
-                    ndjson_lines(body).is_err(),
-                    "{} has no closing ']' and must not read clean",
+                let Err(err) = ndjson_lines(body) else {
+                    panic!(
+                        "{} has no closing ']' and must not read clean",
+                        String::from_utf8_lossy(body)
+                    );
+                };
+                // The last scalar parses; it is the delimiter after it that
+                // never arrives, which is a short read rather than bad data.
+                assert_eq!(
+                    (err.kind(), err.to_string()),
+                    (
+                        io::ErrorKind::UnexpectedEof,
+                        "EOF while peeking next byte".to_string()
+                    ),
+                    "{} must be reported as cut short",
                     String::from_utf8_lossy(body)
                 );
             }
@@ -6009,19 +6035,19 @@ mod tests {
         }
 
         #[test]
-        fn test_skip_ws_until_bom_then_bracket() {
-            let mut input = vec![0xEF, 0xBB, 0xBF];
-            input.push(b'[');
-            let mut cursor = Cursor::new(input);
-            skip_ws_until(&mut cursor, b'[').expect("should find [");
-        }
-
-        #[test]
         fn test_skip_ws_until_bom_then_ws_then_bracket() {
             let mut input = vec![0xEF, 0xBB, 0xBF];
-            input.extend_from_slice(b"  \n  [");
+            input.extend_from_slice(b"  \n  [1]");
             let mut cursor = Cursor::new(input);
             skip_ws_until(&mut cursor, b'[').expect("should find [");
+            // The BOM (3 bytes), the whitespace (5) and the `[` are consumed, and
+            // nothing after it: the first element starts at the very next byte.
+            assert_eq!(cursor.position(), 9);
+            let mut rest = String::new();
+            cursor
+                .read_to_string(&mut rest)
+                .expect("the remainder is UTF-8");
+            assert_eq!(rest, "1]");
         }
 
         #[test]

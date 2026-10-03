@@ -487,12 +487,7 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        SubqueryAlias: test_table
-          Union
-            TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-            TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!("table_scan_rewritten_to_union", result.display_indent());
     }
 
     #[test]
@@ -515,18 +510,7 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        Limit: skip=0, fetch=5
-          Sort: test_table.id ASC NULLS LAST
-            SubqueryAlias: test_table
-              Union
-                Sort: test_table.id ASC NULLS LAST, fetch=5
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                Sort: test_table.id ASC NULLS LAST, fetch=5
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!("limit_sort_pushdown_through_union", result.display_indent());
     }
 
     #[test]
@@ -549,18 +533,7 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        Limit: skip=10, fetch=5
-          Sort: test_table.id ASC NULLS LAST
-            SubqueryAlias: test_table
-              Union
-                Sort: test_table.id ASC NULLS LAST, fetch=15
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                Sort: test_table.id ASC NULLS LAST, fetch=15
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!("limit_sort_with_offset_pushdown", result.display_indent());
     }
 
     #[test]
@@ -585,20 +558,10 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        Limit: skip=0, fetch=5
-          Sort: test_table.id ASC NULLS LAST
-            SubqueryAlias: test_table
-              Union
-                Sort: test_table.id ASC NULLS LAST, fetch=5
-                  Projection: test_table.id, test_table.name
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                Sort: test_table.id ASC NULLS LAST, fetch=5
-                  Projection: test_table.id, test_table.name
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!(
+            "limit_sort_pushdown_through_projection_and_union",
+            result.display_indent()
+        );
     }
 
     /// Regression test for distributed queries with column projections.
@@ -633,19 +596,10 @@ mod tests {
 
         // Sort(TopK) should be pushed into each union leg despite the Projection
         // between Limit and Sort.
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        Limit: skip=0, fetch=3
-          Projection: test_table.id, test_table.name
-            Sort: test_table.partition_id DESC NULLS FIRST
-              SubqueryAlias: test_table
-                Union
-                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=3
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=3
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!(
+            "limit_projection_above_sort_pushdown",
+            result.display_indent()
+        );
     }
 
     /// Test with both Projection above Sort AND Projection below Sort.
@@ -673,21 +627,10 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        Limit: skip=0, fetch=5
-          Projection: test_table.id
-            Sort: test_table.name ASC NULLS LAST
-              SubqueryAlias: test_table
-                Union
-                  Sort: test_table.name ASC NULLS LAST, fetch=5
-                    Projection: test_table.id, test_table.name
-                      SubqueryAlias: test_table
-                        TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                  Sort: test_table.name ASC NULLS LAST, fetch=5
-                    Projection: test_table.id, test_table.name
-                      SubqueryAlias: test_table
-                        TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!(
+            "limit_projection_above_and_below_sort_pushdown",
+            result.display_indent()
+        );
     }
 
     /// Test with offset and Projection above Sort.
@@ -714,19 +657,10 @@ mod tests {
             .expect("analyze failed");
 
         // fetch pushed into union legs should be skip + fetch = 5 + 3 = 8
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        Limit: skip=5, fetch=3
-          Projection: test_table.id, test_table.name
-            Sort: test_table.partition_id DESC NULLS FIRST
-              SubqueryAlias: test_table
-                Union
-                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=8
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=8
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!(
+            "limit_with_offset_projection_above_sort_pushdown",
+            result.display_indent()
+        );
     }
 
     #[test]
@@ -752,20 +686,10 @@ mod tests {
             .expect("analyze failed");
 
         // Sort(TopK) and Filter should both be pushed into each union leg.
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        Limit: skip=0, fetch=5
-          Sort: test_table.id ASC NULLS LAST
-            SubqueryAlias: test_table
-              Union
-                Sort: test_table.id ASC NULLS LAST, fetch=5
-                  Filter: test_table.name != Utf8("x")
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                Sort: test_table.id ASC NULLS LAST, fetch=5
-                  Filter: test_table.name != Utf8("x")
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!(
+            "limit_sort_filter_pushdown_through_union",
+            result.display_indent()
+        );
     }
 
     #[test]
@@ -791,20 +715,10 @@ mod tests {
             .expect("analyze failed");
 
         // fetch pushed into union legs should be skip + fetch = 10 + 5 = 15
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        Limit: skip=10, fetch=5
-          Sort: test_table.id ASC NULLS LAST
-            SubqueryAlias: test_table
-              Union
-                Sort: test_table.id ASC NULLS LAST, fetch=15
-                  Filter: test_table.name != Utf8("x")
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                Sort: test_table.id ASC NULLS LAST, fetch=15
-                  Filter: test_table.name != Utf8("x")
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!(
+            "limit_sort_filter_with_offset_pushdown",
+            result.display_indent()
+        );
     }
 
     #[test]
@@ -832,22 +746,10 @@ mod tests {
             .expect("analyze failed");
 
         // Filter pushed into legs, Projection re-wrapped around Union.
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        Limit: skip=0, fetch=5
-          Sort: test_table.id ASC NULLS LAST
-            SubqueryAlias: test_table
-              Union
-                Sort: test_table.id ASC NULLS LAST, fetch=5
-                  Projection: test_table.id, test_table.name
-                    Filter: test_table.partition_id > Int32(0)
-                      SubqueryAlias: test_table
-                        TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                Sort: test_table.id ASC NULLS LAST, fetch=5
-                  Projection: test_table.id, test_table.name
-                    Filter: test_table.partition_id > Int32(0)
-                      SubqueryAlias: test_table
-                        TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!(
+            "limit_sort_filter_with_projection_pushdown",
+            result.display_indent()
+        );
     }
 
     #[test]
@@ -917,12 +819,6 @@ mod tests {
             .expect("analyze failed");
 
         // No Sort in original plan, so no Sort(TopK) should be pushed into union legs.
-        insta::assert_snapshot!(result.display_indent(), @r#"
-        Limit: skip=0, fetch=5
-          SubqueryAlias: test_table
-            Union
-              TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-              TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
-        "#);
+        insta::assert_snapshot!("limit_without_sort_no_pushdown", result.display_indent());
     }
 }

@@ -2162,21 +2162,25 @@ mod tests {
             })
             .await;
 
-        // Allow the background task to finish.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if let Some(cp) = df.results_cache_provider() {
-            cp.run_pending_tasks().await;
-        }
-
-        // Alice now sees a fresh HIT — proving SWR wrote back into her
+        // Poll for the background revalidation instead of sleeping a fixed
+        // interval. Alice seeing a fresh HIT proves SWR wrote back into her
         // namespace, not into System.
-        let q = QueryBuilder::new("SELECT 42", Arc::clone(&df)).build();
-        Arc::clone(&alice)
-            .scope(async move {
-                let r = q.run().await.expect("ok");
-                assert_eq!(r.cache_status, CacheStatus::CacheHit);
-            })
-            .await;
+        let mut last_status = CacheStatus::CacheStaleWhileRevalidate;
+        for _ in 0..100 {
+            if let Some(cp) = df.results_cache_provider() {
+                cp.run_pending_tasks().await;
+            }
+            last_status = run_and_drain(Arc::clone(&df), Arc::clone(&alice), "SELECT 42").await;
+            if last_status == CacheStatus::CacheHit {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            last_status,
+            CacheStatus::CacheHit,
+            "background revalidation never refreshed alice's entry"
+        );
 
         // Bob still sees MISS for the same SQL — SWR did not bleed Alice's
         // entry into a cross-user scope.
@@ -3852,8 +3856,25 @@ mod tests {
             })
             .await;
 
-        // Step 5: Wait a bit for background revalidation to complete
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Step 5: Poll for the background revalidation instead of sleeping a
+        // fixed interval: once it has stored SELECT 3's result, the entry is
+        // fresh again. The poll repeats SELECT 3, so a poll that lands while the
+        // entry is still stale cannot revalidate it with a different query.
+        let mut last = (CacheStatus::CacheStaleWhileRevalidate, 1);
+        for _ in 0..100 {
+            last = Arc::clone(&request_context)
+                .scope(run_i64_query(&df, "SELECT 3", ResultsCacheMode::Default))
+                .await;
+            if last.0 == CacheStatus::CacheHit {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            last,
+            (CacheStatus::CacheHit, 3),
+            "background revalidation never refreshed the entry with SELECT 3's result"
+        );
 
         // Step 6: Fourth request - HIT (cached after revalidation)
         // The background revalidation should have refreshed the cache with SELECT 3
@@ -3917,9 +3938,11 @@ mod tests {
         // Expected behavior:
         // 1. Multiple concurrent requests during stale window
         // 2. All get stale data immediately (CacheStaleWhileRevalidate)
-        // 3. Only ONE background query executes (single-in-flight semantics)
-        // 4. STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES == total concurrent requests
-        // 5. STALE_WHILE_REVALIDATE_SKIPPED == (concurrent requests - 1)
+        // 3. Only ONE background query executes (single-in-flight semantics):
+        //    the queried table counts its scans, and every scan returns its own
+        //    sequence number, so the table is scanned exactly twice — the
+        //    initial miss and the one revalidation.
+        const SQL: &str = "SELECT scan FROM counted_table";
 
         // Configure cache with 1s TTL and 5s stale window
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
@@ -3929,32 +3952,21 @@ mod tests {
             ..Default::default()
         }))
         .await;
+        let scans = register_counted_table(&df, "counted_table");
 
         let request_context = create_test_request_context(
             CacheControl::MaxStale(CacheKeyType::ClientSupplied, Some(Duration::from_secs(5))),
             Some("single-in-flight-test".to_string()),
         );
 
-        // Step 1: Populate cache with initial query
+        // Step 1: Populate cache with initial query (the first scan)
         tracing::info!("Populating cache with initial query");
-        let query_builder = QueryBuilder::new("SELECT 100", Arc::clone(&df));
-        let query = query_builder.build();
-        Arc::clone(&request_context)
-            .scope(async move {
-                let result = query.run().await.expect("query should succeed");
-                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
-                let records = result.collect_batches().await.expect("should collect");
-                assert_eq!(
-                    records[0]
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .expect("must read i64 array")
-                        .value(0),
-                    100
-                );
-            })
-            .await;
+        assert_eq!(
+            Arc::clone(&request_context)
+                .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+                .await,
+            (CacheStatus::CacheMiss, 1)
+        );
 
         // Step 2: Wait for entry to become stale (past TTL but within stale window)
         tracing::info!("Waiting 1.5s for entry to become stale");
@@ -3970,35 +3982,15 @@ mod tests {
             let df_clone = Arc::clone(&df);
             let ctx_clone = Arc::clone(&request_context);
             let handle = tokio::spawn(async move {
-                let query_builder = QueryBuilder::new("SELECT 200", df_clone); // Different query, same cache key
-                let query = query_builder.build();
-                ctx_clone
-                    .scope(async move {
-                        let result = query.run().await.expect("query should succeed");
-                        tracing::debug!("Request {i} got status: {:?}", result.cache_status);
-
-                        // All requests should get stale data
-                        assert_eq!(
-                            result.cache_status,
-                            CacheStatus::CacheStaleWhileRevalidate,
-                            "Request {i} should get stale data"
-                        );
-
-                        let records = result.collect_batches().await.expect("should collect");
-
-                        // Verify we got the STALE value (100 from initial query, not 200)
-                        assert_eq!(
-                            records[0]
-                                .column(0)
-                                .as_any()
-                                .downcast_ref::<Int64Array>()
-                                .expect("must read i64 array")
-                                .value(0),
-                            100,
-                            "Request {i} should get stale value 100"
-                        );
-                    })
+                // All requests get the STALE value from the first scan.
+                let observed = ctx_clone
+                    .scope(run_i64_query(&df_clone, SQL, ResultsCacheMode::Default))
                     .await;
+                assert_eq!(
+                    observed,
+                    (CacheStatus::CacheStaleWhileRevalidate, 1),
+                    "Request {i} should get the stale value from the first scan"
+                );
             });
             handles.push(handle);
         }
@@ -4010,40 +4002,93 @@ mod tests {
                 .unwrap_or_else(|_| panic!("Request {i} should not panic"));
         }
 
-        // Step 4: Wait for background revalidation to complete (single-in-flight ensures only ONE ran)
+        // Step 4: Poll for the background revalidation instead of sleeping a
+        // fixed interval. The poll repeats the same query, so it can only ever
+        // read the one revalidation's result.
         tracing::info!("Waiting for background revalidation to complete");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut last = (CacheStatus::CacheStaleWhileRevalidate, 1);
+        for _ in 0..100 {
+            last = Arc::clone(&request_context)
+                .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+                .await;
+            if last.0 == CacheStatus::CacheHit {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
-        // Step 5: Verify cache was updated with fresh data (from the ONE background query)
-        // This proves that despite 10 concurrent requests, only ONE background query executed
-        // and successfully updated the cache with the revalidated value (200)
-        let query_builder = QueryBuilder::new("SELECT 300", Arc::clone(&df));
-        let query = query_builder.build();
-        Arc::clone(&request_context)
-            .scope(async move {
-                let result = query.run().await.expect("query should succeed");
-                assert_eq!(
-                    result.cache_status,
-                    CacheStatus::CacheHit,
-                    "Cache should have been revalidated"
-                );
-                let records = result.collect_batches().await.expect("should collect");
-
-                // Verify cache now contains the revalidated value (200 from the single background query)
-                assert_eq!(
-                    records[0]
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .expect("must read i64 array")
-                        .value(0),
-                    200,
-                    "Cache should contain revalidated value 200 from the single background query"
-                );
-            })
-            .await;
+        // Step 5: the entry holds the revalidated value (the second scan), and
+        // the table was scanned exactly twice: despite 10 concurrent stale
+        // requests, only ONE background query executed.
+        assert_eq!(
+            last,
+            (CacheStatus::CacheHit, 2),
+            "the cache should hold the single revalidation's result"
+        );
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the initial miss and exactly one revalidation should have scanned the table"
+        );
 
         tracing::info!("Single-in-flight test completed successfully");
+    }
+
+    /// A one-column table whose every scan returns its own sequence number, so
+    /// a test can count how many times a query over it actually executed.
+    #[derive(Debug)]
+    struct CountingScans {
+        schema: arrow::datatypes::SchemaRef,
+        scans: Arc<std::sync::atomic::AtomicI64>,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for CountingScans {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            datafusion::datasource::TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[datafusion::logical_expr::Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            let scan = self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let batch = arrow::array::RecordBatch::try_new(
+                Arc::clone(&self.schema),
+                vec![Arc::new(Int64Array::from(vec![scan]))],
+            )?;
+            datafusion::datasource::MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?
+                .scan(state, projection, filters, limit)
+                .await
+        }
+    }
+
+    /// Registers a [`CountingScans`] table and returns its scan counter.
+    fn register_counted_table(
+        df: &Arc<DataFusion>,
+        name: &'static str,
+    ) -> Arc<std::sync::atomic::AtomicI64> {
+        let scans = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("scan", arrow::datatypes::DataType::Int64, false),
+        ]));
+        df.ctx
+            .register_table(
+                TableReference::bare(name),
+                Arc::new(CountingScans {
+                    schema,
+                    scans: Arc::clone(&scans),
+                }),
+            )
+            .expect("should register table");
+        scans
     }
 
     /// A hit is served where the request arrived: it has nothing to plan or execute, so it

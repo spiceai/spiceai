@@ -466,21 +466,26 @@ mod tests {
     #[tokio::test]
     async fn test_built_controller_respects_concurrency() {
         let rc = config(2, 10000).build();
+        assert_eq!(rc.available_permits(), Some(2));
 
         let _p1 = rc.acquire().await.expect("p1 should be acquired");
         let p2 = rc.acquire().await.expect("p2 should be acquired");
+        assert_eq!(rc.available_permits(), Some(0));
 
-        tokio::select! {
-            _ = rc.acquire() => panic!("Expected semaphore to block with concurrency=2"),
-            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
-        }
+        // A third request waits on the concurrency cap: it is not admitted on its
+        // first poll while both permits are held.
+        let mut third = std::pin::pin!(rc.acquire());
+        assert!(
+            futures::poll!(third.as_mut()).is_pending(),
+            "Expected the semaphore to block a third request with concurrency=2"
+        );
 
+        // Releasing one permit admits the waiting request, which then holds it.
         drop(p2);
-        tokio::select! {
-            result = rc.acquire() => { result.expect("permit should be acquired after drop"); },
-            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                panic!("Expected to acquire permit after drop");
-            }
-        }
+        let _p3 = tokio::time::timeout(std::time::Duration::from_secs(5), third)
+            .await
+            .expect("the waiting request should be admitted once a permit is released")
+            .expect("permit should be acquired after drop");
+        assert_eq!(rc.available_permits(), Some(0));
     }
 }

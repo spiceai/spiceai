@@ -1595,12 +1595,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /// Time is paused, so the 10 s model calls and the 500 ms bound are exact rather than raced.
+    #[tokio::test(start_paused = true)]
     async fn test_cancellation_support() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Duration, sleep, timeout};
 
-        // Mock Chat that simulates long-running operations
-        struct SlowMockChat;
+        // Mock Chat that simulates long-running operations, counting the calls that start
+        // and the ones that run to completion.
+        struct SlowMockChat {
+            started: Arc<AtomicUsize>,
+            completed: Arc<AtomicUsize>,
+        }
 
         #[async_trait]
         impl Chat for SlowMockChat {
@@ -1609,7 +1615,9 @@ mod tests {
             }
 
             async fn run(&self, _prompt: String) -> llms::chat::Result<Option<String>> {
+                self.started.fetch_add(1, Ordering::SeqCst);
                 sleep(Duration::from_secs(10)).await;
+                self.completed.fetch_add(1, Ordering::SeqCst);
                 Ok(Some("Should be cancelled".to_string()))
             }
 
@@ -1620,6 +1628,8 @@ mod tests {
             {
                 use async_stream::stream;
 
+                self.started.fetch_add(1, Ordering::SeqCst);
+                let completed = Arc::clone(&self.completed);
                 let stream = stream! {
                     // Yield a chunk
                     yield Ok(CreateChatCompletionStreamResponse {
@@ -1648,6 +1658,7 @@ mod tests {
 
                     // Simulate a long delay between chunks
                     sleep(Duration::from_secs(10)).await;
+                    completed.fetch_add(1, Ordering::SeqCst);
 
                     yield Ok(CreateChatCompletionStreamResponse {
                         id: "slow-id".to_string(),
@@ -1670,7 +1681,9 @@ mod tests {
                 _req: CreateChatCompletionRequest,
             ) -> Result<CreateChatCompletionResponse, async_openai::error::OpenAIError>
             {
+                self.started.fetch_add(1, Ordering::SeqCst);
                 sleep(Duration::from_secs(10)).await;
+                self.completed.fetch_add(1, Ordering::SeqCst);
                 Err(async_openai::error::OpenAIError::ApiError(ApiError {
                     message: "Should be cancelled".to_string(),
                     r#type: None,
@@ -1680,10 +1693,15 @@ mod tests {
             }
         }
 
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
         let mut store = HashMap::new();
         store.insert(
             "slow-model".to_string(),
-            Arc::new(SlowMockChat) as Arc<dyn Chat>,
+            Arc::new(SlowMockChat {
+                started: Arc::clone(&started),
+                completed: Arc::clone(&completed),
+            }) as Arc<dyn Chat>,
         );
         let model_store = Arc::new(RwLock::new(store));
         let udf = Ai::new(
@@ -1703,23 +1721,26 @@ mod tests {
             .get("slow-model")
             .expect("should get slow-model");
 
-        // Start the processing task with a timeout
+        // A bound far shorter than the model calls: dropping the timed-out future is the
+        // cancellation a query timeout or a user's cancel delivers.
         let result = timeout(
-            Duration::from_millis(500), // Short timeout to trigger cancellation
-            udf.process_messages(
-                Arc::clone(model),
-                "slow-model",
-                messages,
-                None,
-                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
-            ),
+            Duration::from_millis(500),
+            udf.process_messages(Arc::clone(model), "slow-model", messages, None, 3),
         )
         .await;
+        result.expect_err("10 s model calls cannot finish inside a 500 ms bound");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            3,
+            "every message's model call was in flight when the bound expired"
+        );
 
-        // Should timeout, demonstrating that long-running operations can be cancelled
-        assert!(
-            result.is_err(),
-            "Task should timeout (which is a form of cancellation)"
+        // Well past the calls' own 10 s: a call left running detached would finish now.
+        sleep(Duration::from_secs(20)).await;
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            0,
+            "cancelling the AI function must cancel its in-flight model calls, not detach them"
         );
     }
 

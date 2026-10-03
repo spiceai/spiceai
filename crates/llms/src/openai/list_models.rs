@@ -101,6 +101,7 @@ impl ListModels for OpenAiModelLister {
 mod tests {
     use super::*;
     use crate::provider::ListModelsError;
+    use async_openai::config::Config;
 
     #[test]
     fn test_from_params_missing_key() {
@@ -116,8 +117,10 @@ mod tests {
     fn test_from_params_with_key() {
         let mut params = HashMap::new();
         params.insert("openai_api_key".to_string(), SecretString::from("test-key"));
-        let result = OpenAiModelLister::from_params(&params);
-        result.expect("should succeed");
+        let lister = OpenAiModelLister::from_params(&params).expect("should succeed");
+        let config = lister.client.config();
+        assert_eq!(config.api_base(), "https://api.openai.com/v1");
+        assert_eq!(config.api_key().expose_secret(), "test-key");
     }
 
     #[test]
@@ -128,8 +131,11 @@ mod tests {
             "openai_api_base".to_string(),
             SecretString::from("https://custom.api.com"),
         );
-        // Verify that from_params succeeds with custom base URL
-        let result = OpenAiModelLister::from_params(&params);
-        result.expect("should succeed with custom base URL");
+        // The key must go to the configured base, not to `api.openai.com`.
+        let lister =
+            OpenAiModelLister::from_params(&params).expect("should succeed with custom base URL");
+        let config = lister.client.config();
+        assert_eq!(config.api_base(), "https://custom.api.com");
+        assert_eq!(config.api_key().expose_secret(), "test-key");
     }
 }

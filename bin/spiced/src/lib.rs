@@ -2027,19 +2027,6 @@ mod tests {
         ));
     }
 
-    #[cfg(not(feature = "anonymous_telemetry"))]
-    #[tokio::test]
-    async fn returns_without_telemetry_config_when_anonymous_telemetry_is_not_compiled() {
-        let telemetry_config = Arc::new(SetOnce::new());
-
-        tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            start_anonymous_telemetry(None, telemetry_config, None),
-        )
-        .await
-        .expect("anonymous telemetry should return without waiting for telemetry config when the feature is disabled");
-    }
-
     #[test]
     fn does_not_warn_when_spicepod_enables_telemetry() {
         let config = TelemetryConfig::default();

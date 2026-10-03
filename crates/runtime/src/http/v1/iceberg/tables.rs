@@ -481,7 +481,27 @@ mod tests {
 
         let result = assign_field_ids(&schema);
 
-        // Verify all fields have IDs assigned and iceberg conversion succeeds
+        // IDs are assigned in pre-order: outer_list=0, element=1, name=2,
+        // inner_list=3, item=4.
+        let outer_list = &result.fields[0];
+        assert_eq!(get_field_id(outer_list), Some(0));
+        let DataType::List(element) = outer_list.data_type() else {
+            panic!("Expected list type, got {:?}", outer_list.data_type());
+        };
+        assert_eq!(get_field_id(element), Some(1));
+        let DataType::Struct(struct_fields) = element.data_type() else {
+            panic!("Expected struct element, got {:?}", element.data_type());
+        };
+        assert_eq!(get_field_id(&struct_fields[0]), Some(2));
+        assert_eq!(get_field_id(&struct_fields[1]), Some(3));
+        let DataType::List(item) = struct_fields[1].data_type() else {
+            panic!(
+                "Expected inner list type, got {:?}",
+                struct_fields[1].data_type()
+            );
+        };
+        assert_eq!(get_field_id(item), Some(4));
+
         arrow_schema_to_schema(&result).expect("Should convert deeply nested schema to iceberg");
     }
 
@@ -675,6 +695,30 @@ mod tests {
         iceberg_schema_for(schema).expect("Should convert to iceberg schema")
     }
 
+    /// Asserts `iceberg_schema` holds exactly `expected` as top-level
+    /// `(name, type, required)` fields: nothing dropped, nothing mistyped.
+    fn assert_top_level_fields(
+        iceberg_schema: &iceberg::spec::Schema,
+        expected: &[(&str, PrimitiveType, bool)],
+    ) {
+        assert_eq!(
+            iceberg_schema.as_struct().fields().len(),
+            expected.len(),
+            "every column must be served"
+        );
+        for (name, primitive, required) in expected {
+            let field = iceberg_schema
+                .field_by_name(name)
+                .unwrap_or_else(|| panic!("Iceberg schema should have field {name}"));
+            assert_eq!(
+                field.field_type.as_ref(),
+                &Type::Primitive(primitive.clone()),
+                "{name}"
+            );
+            assert_eq!(field.required, *required, "{name} required");
+        }
+    }
+
     #[test]
     fn test_coerce_timestamps_all_units_and_timezones() {
         let schema = ArrowSchema::new(vec![
@@ -719,7 +763,21 @@ mod tests {
                 false,
             ),
         ]);
-        coerce_and_convert(&schema);
+        // Every unit is served at Iceberg v2's microsecond precision: zone-less
+        // as `timestamp`, UTC as `timestamptz`.
+        assert_top_level_fields(
+            &coerce_and_convert(&schema),
+            &[
+                ("ts_s", PrimitiveType::Timestamp, false),
+                ("ts_ms", PrimitiveType::Timestamp, false),
+                ("ts_ns", PrimitiveType::Timestamp, false),
+                ("ts_us", PrimitiveType::Timestamp, true),
+                ("ts_s_utc", PrimitiveType::Timestamptz, false),
+                ("ts_ms_utc", PrimitiveType::Timestamptz, false),
+                ("ts_ns_utc", PrimitiveType::Timestamptz, false),
+                ("ts_us_utc", PrimitiveType::Timestamptz, true),
+            ],
+        );
     }
 
     #[test]
@@ -748,7 +806,17 @@ mod tests {
                 true,
             ),
         ]);
-        coerce_and_convert(&schema);
+        assert_top_level_fields(
+            &coerce_and_convert(&schema),
+            &[
+                ("d32", PrimitiveType::Date, true),
+                ("d64", PrimitiveType::Date, false),
+                ("t32_s", PrimitiveType::Time, false),
+                ("t32_ms", PrimitiveType::Time, false),
+                ("t64_us", PrimitiveType::Time, true),
+                ("t64_ns", PrimitiveType::Time, false),
+            ],
+        );
     }
 
     #[test]
@@ -777,7 +845,27 @@ mod tests {
             Field::new("active", DataType::Boolean, false),
             Field::new("data", DataType::Binary, true),
         ]);
-        coerce_and_convert(&schema);
+        assert_top_level_fields(
+            &coerce_and_convert(&schema),
+            &[
+                ("id", PrimitiveType::Long, true),
+                ("name", PrimitiveType::String, false),
+                ("created_at", PrimitiveType::Timestamp, false),
+                ("updated_at", PrimitiveType::Timestamptz, false),
+                ("event_date", PrimitiveType::Date, false),
+                ("event_time", PrimitiveType::Time, false),
+                (
+                    "amount",
+                    PrimitiveType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    false,
+                ),
+                ("active", PrimitiveType::Boolean, true),
+                ("data", PrimitiveType::Binary, false),
+            ],
+        );
     }
 
     fn iceberg_type_of(schema: &iceberg::spec::Schema, name: &str) -> iceberg::spec::Type {
@@ -933,16 +1021,33 @@ mod tests {
     /// Types with no Iceberg v2 equivalent that holds every value stay a conversion error.
     #[test]
     fn test_types_without_an_iceberg_equivalent_are_rejected() {
-        for data_type in [
-            DataType::UInt64,
-            DataType::Duration(TimeUnit::Second),
-            DataType::Decimal256(40, 0),
+        for (data_type, expected_message) in [
+            // A UInt64 above i64::MAX has no lossless Iceberg type.
+            (
+                DataType::UInt64,
+                "UInt64 is not supported. Use Int64 for values ≤ 9,223,372,036,854,775,807 or Decimal(20,0) for full uint64 range.".to_string(),
+            ),
+            (
+                DataType::Duration(TimeUnit::Second),
+                format!(
+                    "Unsupported Arrow data type: {}",
+                    DataType::Duration(TimeUnit::Second)
+                ),
+            ),
+            (
+                DataType::Decimal256(40, 0),
+                format!(
+                    "Unsupported Arrow data type: {}",
+                    DataType::Decimal256(40, 0)
+                ),
+            ),
         ] {
             let schema = ArrowSchema::new(vec![Field::new("c", data_type.clone(), true)]);
-            assert!(
-                iceberg_schema_for(&schema).is_err(),
-                "{data_type} should not convert"
-            );
+            let Err(err) = iceberg_schema_for(&schema) else {
+                panic!("{data_type} should not convert");
+            };
+            assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{data_type}");
+            assert_eq!(err.message(), expected_message, "{data_type}");
         }
     }
 
