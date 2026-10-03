@@ -144,8 +144,10 @@ pub struct KeyEncoder {
 #[derive(Debug, Clone)]
 enum WordRule {
     /// Every field is fixed-width and their values fit 8 bytes: the word is
-    /// the values' bytes as one big-endian integer, so distinct keys have
-    /// distinct words, in key order. Per field: whether it is nullable (its
+    /// the values' encoded bytes as one big-endian integer, so keys with
+    /// distinct encodings have distinct words, in key order. (Floats `-0.0`
+    /// and `0.0`, and every NaN, share an encoding by design; see the module
+    /// docs.) Per field: whether it is nullable (its
     /// encoding then starts with a marker byte) and its value's width.
     Exact(Vec<(bool, usize)>),
     /// Otherwise the word is a 64-bit hash of the encoded key, keeping only
@@ -229,8 +231,9 @@ fn kind(data_type: &DataType) -> Option<Kind> {
 
 impl Kind {
     /// The encoded width of a value when it is fixed, for the kinds whose
-    /// encoding is a fixed-width, injective image of the value and that may
-    /// fold into an exact word. Others return `None` and are hashed, which is
+    /// encoding is fixed-width and that may fold into an exact word. The
+    /// encoding is injective on values, except that floats give `-0.0` and
+    /// `0.0`, and every NaN, one encoding each (see the module docs). Others return `None` and are hashed, which is
     /// always correct.
     fn fixed_width(self) -> Option<usize> {
         match self {

@@ -29,9 +29,12 @@ limitations under the License.
 //! specification.
 //!
 //! An index stores a 64-bit word per key ([`KeyEncoder::key_word`]): the
-//! key's own bytes when its fields are fixed-width and fit 8 bytes, so
-//! distinct keys have distinct words, and otherwise a 64-bit hash of the
-//! encoded key. An index answers candidate rows that every query still
+//! key's encoded bytes when its fields are fixed-width and fit 8 bytes, so
+//! keys with distinct encodings have distinct words, and otherwise a 64-bit
+//! hash of the encoded key. The encoding is injective on key values except
+//! for floats, where `-0.0` and `0.0`, and every NaN, share an encoding by
+//! design (see the `encode` module): a lookup for one also returns rows holding the
+//! other, which its filter drops if the query tells them apart. An index answers candidate rows that every query still
 //! filters, so two keys sharing a word cost only extra rows read.
 //!
 //! # Structures
