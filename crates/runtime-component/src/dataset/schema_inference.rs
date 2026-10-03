@@ -428,6 +428,14 @@ mod tests {
         ))
     }
 
+    fn typed_schema(cols: &[(&str, DataType)]) -> SchemaRef {
+        Arc::new(Schema::new(
+            cols.iter()
+                .map(|(name, data_type)| Field::new(*name, data_type.clone(), true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
     fn accel(engine: Engine) -> Acceleration {
         Acceleration {
             engine,
@@ -853,6 +861,74 @@ mod tests {
         );
         assert_eq!(acc.indexes.len(), 1);
         assert!(acc.indexes.contains_key(&col_ref(&["existing"])));
+    }
+
+    /// The issue's table: a source with b-tree indexes on `(a, b)` and on the
+    /// `double precision` column `v`, and no `indexes` declared.
+    fn float_indexed_source() -> (InferredSchema, SchemaRef) {
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            indexes: vec![
+                InferredIndex {
+                    columns: vec!["a".to_string(), "b".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["v".to_string()],
+                    unique: false,
+                },
+            ],
+            ..InferredSchema::default()
+        };
+        let schema = typed_schema(&[
+            ("id", DataType::Int64),
+            ("a", DataType::Int32),
+            ("b", DataType::Int32),
+            ("v", DataType::Float64),
+        ]);
+        (inferred, schema)
+    }
+
+    /// Applies the issue's table to `acc`.
+    fn apply_float_indexed_source(acc: &mut Acceleration, refresh_mode: RefreshMode) {
+        let (inferred, schema) = float_indexed_source();
+        apply_inferred_schema(acc, &inferred, &schema, "t", refresh_mode);
+    }
+
+    // regression test for #14590
+    #[test]
+    fn cayenne_applies_inferred_index_on_float_column() {
+        // Cayenne indexes a floating-point key, so an index the source holds on
+        // one is applied like any other, alone or within a composite key.
+        for refresh_mode in [RefreshMode::Full, RefreshMode::Changes] {
+            let mut acc = accel(Engine::Cayenne);
+            apply_float_indexed_source(&mut acc, refresh_mode);
+
+            assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
+            assert_eq!(
+                acc.indexes.keys().collect::<BTreeSet<_>>(),
+                BTreeSet::from([&col_ref(&["a", "b"]), &col_ref(&["v"])]),
+                "{refresh_mode:?}: both inferred indexes apply"
+            );
+        }
+        for float in [DataType::Float16, DataType::Float32, DataType::Float64] {
+            let mut acc = accel(Engine::Cayenne);
+            let inferred = InferredSchema {
+                indexes: vec![InferredIndex {
+                    columns: vec!["a".to_string(), "score".to_string()],
+                    unique: true,
+                }],
+                ..InferredSchema::default()
+            };
+            let schema = typed_schema(&[("a", DataType::Int32), ("score", float.clone())]);
+            apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+
+            assert_eq!(
+                acc.indexes.get(&col_ref(&["a", "score"])),
+                Some(&IndexType::Unique),
+                "{float}: composite key with a float column applies"
+            );
+        }
     }
 
     #[test]

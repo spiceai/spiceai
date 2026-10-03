@@ -27,7 +27,9 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 fundu.workspace = true
 futures.workspace = true
+gethostname.workspace = true
 object_store.workspace = true
+parking_lot.workspace = true
 opentelemetry.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-datafusion = { path = "../runtime-datafusion" }
@@ -36,6 +38,7 @@ telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
+s3-event-notifications = { path = "../s3-event-notifications" }
 rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

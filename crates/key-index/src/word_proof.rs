@@ -28,7 +28,9 @@ limitations under the License.
 //! - [`fold_word`]: the word of a key whose fields fit 8 bytes is their bytes
 //!   as one big-endian integer. It never overflows, and two value byte strings
 //!   of the same length have the same word only when they are the same bytes
-//!   ([`lemma_word_is_injective`]), so such keys never share a word.
+//!   ([`lemma_word_is_injective`]), so keys whose encodings differ never share
+//!   a word. That is a property of the encoded bytes: the encoding itself
+//!   gives some distinct float values one encoding (see `encode`).
 //!
 //! Verus reads the `verus!` block; a normal `cargo build` erases the
 //! specifications and compiles the bodies as ordinary Rust. `cargo verus

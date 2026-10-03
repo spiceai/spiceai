@@ -20,19 +20,24 @@ limitations under the License.
 //! # Keys
 //!
 //! [`KeyEncoder`] turns a row's key columns into a byte string that is
-//! order-preserving (byte order is the SQL order of the key tuple, NULLs
-//! first) and prefix-free per column, so the concatenation of a compound key's
-//! columns is injective: two distinct key tuples never encode to the same
-//! bytes. Arrow's row format is not used. `escape_proof` machine-checks the
+//! prefix-free per column, so concatenating a compound key's columns adds no
+//! collisions: key tuples whose columns encode differently never encode to the
+//! same bytes. Each column's encoding tells apart every two values except
+//! floats, where `-0.0` and `0.0`, and every NaN, share an encoding by design.
+//! Byte order is the SQL order of the key tuple, NULLs first, except for those
+//! floats: that one NaN encoding sorts above `+∞`. Index lookups compare
+//! encodings only for equality, so a lookup for one of those floats also
+//! returns rows holding the others, which its filter drops if the query tells
+//! them apart. Arrow's row format is not used. `escape_proof` machine-checks the
 //! prefix-freedom of the encoding's specification, and the escape the encoder
 //! writes every string and binary value with is verified against that
 //! specification.
 //!
 //! An index stores a 64-bit word per key ([`KeyEncoder::key_word`]): the
-//! key's own bytes when its fields are fixed-width and fit 8 bytes, so
-//! distinct keys have distinct words, and otherwise a 64-bit hash of the
-//! encoded key. An index answers candidate rows that every query still
-//! filters, so two keys sharing a word cost only extra rows read.
+//! key's encoded bytes when its fields are fixed-width and fit 8 bytes, so
+//! keys with distinct encodings have distinct words, and otherwise a 64-bit
+//! hash of the encoded key. An index answers candidate rows that every query
+//! still filters, so two keys sharing a word cost only extra rows read.
 //!
 //! # Structures
 //!
@@ -64,7 +69,7 @@ use snafu::Snafu;
 #[derive(Debug, Snafu, PartialEq, Eq)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    /// A key column type has no order-preserving encoding.
+    /// A key column type has no key encoding.
     #[snafu(display(
         "Failed to encode an index key: the column type {data_type} is not supported."
     ))]

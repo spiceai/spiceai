@@ -1216,6 +1216,25 @@ pub(crate) struct PostValidationState {
     pub(crate) validated_keys: PkDigestSet,
 }
 
+/// One apply's raw batches split by PK shard
+/// ([`CayenneTableProvider::split_apply_by_pk_shard`]), with the resident bytes
+/// each shard's sub-batches hold.
+pub(crate) struct ShardedApplyBatches {
+    /// Shard s's non-empty sub-batches, in apply order.
+    pub(crate) per_shard_batches: Vec<Vec<RecordBatch>>,
+    /// Shard s's resident bytes, each Arrow allocation counted once.
+    pub(crate) per_shard_bytes: Vec<u64>,
+}
+
+impl ShardedApplyBatches {
+    /// The whole apply's resident bytes: the figure to budget and reserve.
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.per_shard_bytes
+            .iter()
+            .fold(0, |total, bytes| total.saturating_add(*bytes))
+    }
+}
+
 /// Aggregate result of one sharded in-memory CDC apply
 /// ([`CayenneTableProvider::validate_and_append_sharded`]).
 pub(crate) struct ShardedApplyResult {

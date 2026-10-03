@@ -1,6 +1,9 @@
 [workspace]
 default-members = ["bin/spiced"]
-exclude = ["crates/data-connectors/connector-nfs"]
+exclude = [
+    "crates/data-connectors/connector-nfs",
+    "tools/turso-072-fixture-gen",
+]
 members = [
     "bin/spice/",
     "bin/spiced/",
@@ -39,6 +42,7 @@ members = [
     "crates/embed-api",
     "crates/rerank-api",
     "crates/evaluate-api",
+    "crates/evaluate-chat",
     "crates/ns_lookup",
     "crates/object_store_occ",
     "crates/otel-arrow",
@@ -84,6 +88,7 @@ members = [
     "crates/runtime-rate-control",
     "crates/runtime-request-context",
     "crates/elasticsearch",
+    "crates/s3-event-notifications",
     "crates/s3_vectors",
     "crates/s3_vectors_metadata_filter",
     "crates/search",
@@ -454,13 +459,18 @@ tonic-health = { version = "0.14" }
 # extension. `tpchgen-arrow` would be the natural fit but wants arrow 59 and this
 # workspace is on the 58 fork; the core crate has no dependencies at all.
 tpchgen = "3.0.0"
+# Its TPC-DS sibling, from the same project, run in its C `dsdgen` compatibility
+# mode: TPC-DS fixtures for the correctness lanes whose process cannot drive
+# DuckDB's `dsdgen` (chDB aborts a process that does) or reach its extension
+# repository. Also dependency-free; pinned exactly while it is an alpha.
+tpcdsgen = "=0.1.0-alpha.1"
 tower = "0.5.2"
 tower-http = { version = "0.6.2", features = ["cors", "limit"] }
 tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-turso = { version = "0.7.2", default-features = false }
+turso = { version = "0.8.1", default-features = false }
 turso-shared = { path = "crates/turso-shared" }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
