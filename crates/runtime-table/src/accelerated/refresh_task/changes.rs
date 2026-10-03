@@ -51,7 +51,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
-use futures::{StreamExt, stream};
+use futures::{FutureExt, StreamExt, stream};
 use runtime_acceleration::dataupdate::{
     StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
@@ -1201,6 +1201,10 @@ impl RefreshTask {
             labels: metric_labels.clone(),
         };
 
+        // Set while the apply loop is applying a burst. The reader builds deferred
+        // change rows ahead only then (see below).
+        let applying = Arc::new(AtomicBool::new(false));
+        let reader_applying = Arc::clone(&applying);
         let reader_dataset = dataset_name.clone();
         let reader_metric_labels = metric_labels.clone();
         let reader_handle = tokio::spawn(async move {
@@ -1225,29 +1229,50 @@ impl RefreshTask {
                     }
                     item = stream.next() => {
                         let Some(item) = item else { return; };
-                        // Charge the envelope before handing it over: once `send`
-                        // returns the apply loop may already have taken it and
-                        // subtracted, and crediting afterwards could then drive
-                        // the counter negative. `encoded_len` does not force a
-                        // deferred envelope to build.
-                        let queued_bytes = match &item {
-                            Ok(envelope) => envelope.encoded_len() as u64,
-                            Err(_) => 0,
+                        // While the apply loop is applying a burst, build deferred
+                        // change rows here, so the build overlaps that apply instead
+                        // of adding to the next one. An idle or lingering apply loop
+                        // gains nothing from the overlap — it builds its burst itself,
+                        // in one blocking-pool handoff — so the reader then forwards
+                        // envelopes as they come rather than paying a handoff per
+                        // group. The group takes no more than the channel has room
+                        // for, so what is in flight stays within
+                        // `cdc_prefetch_buffer` (plus the one envelope a reader
+                        // parked on `send` always held).
+                        let (group, ended) = if reader_applying.load(Ordering::Acquire) {
+                            let room = tx.capacity().clamp(1, PREBUILD_GROUP_MAX_ENVELOPES);
+                            let (group, ended) = take_ready_group(item, &mut stream, room);
+                            (cdc::prebuild_offloaded(group).await, ended)
+                        } else {
+                            (vec![item], false)
                         };
-                        reader_prefetch_bytes.fetch_add(queued_bytes, Ordering::Relaxed);
-                        // Time blocked on send: non-zero => the prefetch channel is
-                        // full and the apply loop can't drain fast enough (apply-bound).
-                        let send_start = Instant::now();
-                        let send_res = tx.send(item).await;
-                        if send_res.is_err() {
-                            // Nobody will receive it, so nobody will subtract it.
-                            discharge_prefetch_bytes(&reader_prefetch_bytes, queued_bytes);
+                        for item in group {
+                            // Charge the envelope before handing it over: once `send`
+                            // returns the apply loop may already have taken it and
+                            // subtracted, and crediting afterwards could then drive
+                            // the counter negative.
+                            let queued_bytes = match &item {
+                                Ok(envelope) => envelope.encoded_len() as u64,
+                                Err(_) => 0,
+                            };
+                            reader_prefetch_bytes.fetch_add(queued_bytes, Ordering::Relaxed);
+                            // Time blocked on send: non-zero => the prefetch channel is
+                            // full and the apply loop can't drain fast enough (apply-bound).
+                            let send_start = Instant::now();
+                            let send_res = tx.send(item).await;
+                            if send_res.is_err() {
+                                // Nobody will receive it, so nobody will subtract it.
+                                discharge_prefetch_bytes(&reader_prefetch_bytes, queued_bytes);
+                            }
+                            metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), send_labels);
+                            if send_res.is_err() {
+                                tracing::debug!(
+                                    "CDC consumer for {reader_dataset} dropped; reader exiting"
+                                );
+                                return;
+                            }
                         }
-                        metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), send_labels);
-                        if send_res.is_err() {
-                            tracing::debug!(
-                                "CDC consumer for {reader_dataset} dropped; reader exiting"
-                            );
+                        if ended {
                             return;
                         }
                     }
@@ -1656,10 +1681,12 @@ impl RefreshTask {
             } else {
                 "drained"
             };
-            if !self
+            applying.store(true, Ordering::Release);
+            let applied = self
                 .apply_burst(&mut apply_context, burst, close_reason)
-                .await
-            {
+                .await;
+            applying.store(false, Ordering::Release);
+            if !applied {
                 rx.close();
                 reader_handle.abort();
                 break;
@@ -2158,17 +2185,19 @@ impl RefreshTask {
             }
             return true;
         }
-        // Time the deferred-batch build: sources that defer the decode (MySQL
-        // binlog and Postgres logical-replication rows) pay one `spawn_blocking`
-        // round trip per burst here — a cost otherwise invisible between the
+        // Time what is left of the deferred-batch build: sources that defer the
+        // decode (MySQL binlog and Postgres logical-replication rows) have the
+        // envelopes that arrived while the previous burst was applying built by
+        // the reader (`take_ready_group`), and pay one `spawn_blocking` round trip
+        // per burst here for the rest — a cost otherwise invisible between the
         // recv_wait and coalesce stage timers.
         let decode_start = Instant::now();
-        // Build on the per-dataset apply task, off the source's shared
-        // read/route path. A deferred build can fail on per-row value typing that
-        // only surfaces at build time (e.g. an unmergeable unchanged-TOAST column
-        // under REPLICA IDENTITY DEFAULT); treat it as terminal for this dataset,
-        // mirroring the eager path's pump-side fatal. The burst's committers are
-        // dropped unacked, so the source re-streams on reconnect.
+        // A deferred build can fail on per-row value typing that only surfaces at
+        // build time (e.g. an unmergeable unchanged-TOAST column under REPLICA
+        // IDENTITY DEFAULT), whether it ran here or in the reader; treat it as
+        // terminal for this dataset, mirroring the eager path's pump-side fatal.
+        // The burst's committers are dropped unacked, so the source re-streams on
+        // reconnect.
         let parts = match cdc::into_parts_offloaded_burst(envelopes).await {
             Ok(parts) => parts,
             Err(e) => {
@@ -3493,9 +3522,51 @@ fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -
     // `encoded_len` answers WITHOUT forcing a build — a deferred (e.g. Postgres)
     // envelope from a schema-aware estimate of its buffered wire size, a built
     // one from its actual Arrow size. Used only to bound how much a single burst
-    // accumulates before applying; the real Arrow build is deferred to apply
-    // time (`into_parts_offloaded_burst`), off the source's shared read path.
+    // accumulates before applying. An envelope the reader built ahead
+    // (`take_ready_group`) keeps answering with its source's estimate, so the
+    // budget reads it the same whether or not it was built early.
     item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
+}
+
+/// Most envelopes the CDC reader takes from the source into one build group.
+const PREBUILD_GROUP_MAX_ENVELOPES: usize = 1024;
+
+/// Most encoded bytes (`ChangeEnvelope::encoded_len`, the decode-free estimate)
+/// the CDC reader takes into one build group, so one group's build stays short
+/// and the first envelope of a backlog is not held behind a large one.
+const PREBUILD_GROUP_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// `first` plus whatever else `stream` has ready right now, without waiting,
+/// as one [`cdc::prebuild_offloaded`] group of at most `max_envelopes`
+/// envelopes and [`PREBUILD_GROUP_MAX_BYTES`]; and whether the stream ended
+/// while gathering.
+///
+/// The group grows only when `first` has a deferred batch to build, so an eager
+/// source's envelopes reach the apply loop one at a time, as they arrive.
+fn take_ready_group(
+    first: Result<cdc::ChangeEnvelope, cdc::StreamError>,
+    stream: &mut cdc::ChangesStream,
+    max_envelopes: usize,
+) -> (Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>, bool) {
+    let needs_build = first
+        .as_ref()
+        .is_ok_and(|envelope| !envelope.is_materialized());
+    let mut bytes = cdc_item_budget_bytes(&first);
+    let mut group = vec![first];
+    if !needs_build {
+        return (group, false);
+    }
+    while group.len() < max_envelopes && bytes < PREBUILD_GROUP_MAX_BYTES {
+        match stream.next().now_or_never() {
+            Some(Some(item)) => {
+                bytes = bytes.saturating_add(cdc_item_budget_bytes(&item));
+                group.push(item);
+            }
+            Some(None) => return (group, true),
+            None => break,
+        }
+    }
+    (group, false)
 }
 
 /// Zeroes `cdc_prefetch_buffer_bytes` for one dataset when the CDC stream that
@@ -8873,5 +8944,475 @@ mod tests {
         assert!(result.is_ok(), "Non-null PK should succeed");
         let (str_val, _expr) = result.expect("already asserted Ok");
         assert_eq!(str_val, "42");
+    }
+
+    // ----- the reader's build groups -----
+
+    /// A deferred [`cdc::ChangeRows`] that builds a one-row batch.
+    struct OneRow {
+        encoded_len: usize,
+    }
+
+    impl cdc::ChangeRows for OneRow {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            self.encoded_len
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<cdc::ChangeBatch, cdc::ChangeBatchError> {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+            )
+            .expect("one-row batch");
+            cdc::wrap_data_as_change_batch(&schema, &data)
+        }
+    }
+
+    fn deferred_envelope_of(encoded_len: usize) -> cdc::ChangeEnvelope {
+        cdc::ChangeEnvelope::new_from_rows(
+            Box::new(cdc::NoOpCommitter),
+            Box::new(OneRow { encoded_len }),
+            false,
+        )
+    }
+
+    fn deferred_envelope() -> cdc::ChangeEnvelope {
+        deferred_envelope_of(8)
+    }
+
+    fn eager_envelope() -> cdc::ChangeEnvelope {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("one-row batch");
+        cdc::ChangeEnvelope::new(
+            Box::new(cdc::NoOpCommitter),
+            cdc::wrap_data_as_change_batch(&schema, &data).expect("change batch"),
+            false,
+        )
+    }
+
+    #[test]
+    fn an_eager_envelope_is_not_held_for_a_build_group() {
+        let mut stream: cdc::ChangesStream = Box::pin(futures::stream::iter(vec![
+            Ok(deferred_envelope()),
+            Ok(deferred_envelope()),
+        ]));
+        let (group, ended) = take_ready_group(
+            Ok(eager_envelope()),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 1);
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_takes_what_is_ready_and_reports_the_end_of_the_stream() {
+        let mut stream: cdc::ChangesStream = Box::pin(futures::stream::iter(vec![
+            Ok(deferred_envelope()),
+            Err(cdc::StreamError::External("transient".to_string())),
+            Ok(eager_envelope()),
+        ]));
+        let (group, ended) = take_ready_group(
+            Ok(deferred_envelope()),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 4);
+        assert!(
+            group[2].is_err(),
+            "a stream error keeps its place in the group"
+        );
+        assert!(ended);
+    }
+
+    #[test]
+    fn a_build_group_stops_at_what_is_not_ready_yet() {
+        let ready = futures::stream::iter(vec![Ok(deferred_envelope()), Ok(deferred_envelope())]);
+        let mut stream: cdc::ChangesStream = Box::pin(ready.chain(futures::stream::pending()));
+        let (group, ended) = take_ready_group(
+            Ok(deferred_envelope()),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 3);
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_takes_no_more_than_the_room_it_is_given() {
+        let mut stream: cdc::ChangesStream = Box::pin(futures::stream::iter(
+            (0..10).map(|_| Ok(deferred_envelope())),
+        ));
+        let (group, ended) = take_ready_group(Ok(deferred_envelope()), &mut stream, 4);
+        assert_eq!(group.len(), 4);
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_stops_at_its_byte_budget() {
+        // Each envelope estimates a third of the budget: the group closes once
+        // the running total reaches it.
+        let third = PREBUILD_GROUP_MAX_BYTES / 3 + 1;
+        let mut stream: cdc::ChangesStream = Box::pin(futures::stream::iter(
+            (0..10).map(move |_| Ok(deferred_envelope_of(third))),
+        ));
+        let (group, ended) = take_ready_group(
+            Ok(deferred_envelope_of(third)),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 3);
+        assert!(!ended);
+    }
+
+    /// What a deferred envelope's build does in the pipeline tests below.
+    #[derive(Clone, Copy)]
+    enum TestBuild {
+        Succeeds,
+        Fails,
+        Panics,
+    }
+
+    /// A deferred [`cdc::ChangeRows`] carrying one tracked row; counts its builds.
+    struct TrackedRows {
+        id: i32,
+        build: TestBuild,
+        builds: Arc<AtomicUsize>,
+    }
+
+    impl cdc::ChangeRows for TrackedRows {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            8
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<cdc::ChangeBatch, cdc::ChangeBatchError> {
+            self.builds.fetch_add(1, AtomicOrdering::SeqCst);
+            match self.build {
+                TestBuild::Succeeds => Ok(create_test_change_batch(
+                    vec!["c"],
+                    &[vec!["id"]],
+                    vec![self.id],
+                    vec![Some("row")],
+                )),
+                TestBuild::Fails => Err(cdc::ChangeBatchError::DeferredBuild {
+                    message: "test build failure".to_string(),
+                }),
+                TestBuild::Panics => panic!("test build panicked"),
+            }
+        }
+    }
+
+    fn make_deferred_tracked_envelope(
+        id: i32,
+        log: &Arc<CommitLog>,
+        builds: &Arc<AtomicUsize>,
+        build: TestBuild,
+    ) -> ChangeEnvelope {
+        ChangeEnvelope::new_from_rows(
+            Box::new(TrackingCommitter {
+                id,
+                log: Arc::clone(log),
+                outcome: Ok(()),
+            }),
+            Box::new(TrackedRows {
+                id,
+                build,
+                builds: Arc::clone(builds),
+            }),
+            false,
+        )
+    }
+
+    /// Holds the first `insert_into` until `builds` reaches `needed`, and records
+    /// whether it gave up waiting instead.
+    #[derive(Debug)]
+    struct FirstWriteHeldForBuilds {
+        inner: Arc<dyn TableProvider>,
+        builds: Arc<AtomicUsize>,
+        needed: usize,
+        writes_started: Arc<AtomicUsize>,
+        gave_up: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl TableProvider for FirstWriteHeldForBuilds {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if self.writes_started.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while self.builds.load(AtomicOrdering::SeqCst) < self.needed {
+                    if std::time::Instant::now() > deadline {
+                        self.gave_up.store(true, AtomicOrdering::SeqCst);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
+    /// The deferred build of envelopes that arrive while a write is in flight
+    /// happens during that write, not after it: the first write is held until
+    /// the next two envelopes are built, which the apply loop could only do once
+    /// the write it is stuck in had finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reader_builds_arriving_envelopes_while_a_write_is_in_flight() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let writes_started = Arc::new(AtomicUsize::new(0));
+        let gave_up = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(FirstWriteHeldForBuilds {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            builds: Arc::clone(&builds),
+            needed: 3,
+            writes_started: Arc::clone(&writes_started),
+            gave_up: Arc::clone(&gave_up),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        let (source, stream) = futures::channel::mpsc::unbounded();
+        let stream: ChangesStream = stream.boxed();
+        source
+            .unbounded_send(Ok(make_deferred_tracked_envelope(
+                1,
+                &log,
+                &builds,
+                TestBuild::Succeeds,
+            )))
+            .expect("queue envelope 1");
+        let join = tokio::spawn(async move {
+            run_changes_stream_with_config(&task, test_cdc_config(0), stream).await
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while writes_started.load(AtomicOrdering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "the first write never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for id in [2, 3] {
+            source
+                .unbounded_send(Ok(make_deferred_tracked_envelope(
+                    id,
+                    &log,
+                    &builds,
+                    TestBuild::Succeeds,
+                )))
+                .expect("queue envelope");
+        }
+        drop(source);
+
+        join.await
+            .expect("task join")
+            .expect("changes stream should succeed");
+        assert!(
+            !gave_up.load(AtomicOrdering::SeqCst),
+            "envelopes 2 and 3 were not built while the first write was in flight (builds: {})",
+            builds.load(AtomicOrdering::SeqCst)
+        );
+        assert_eq!(
+            builds.load(AtomicOrdering::SeqCst),
+            3,
+            "each envelope builds once"
+        );
+        assert_eq!(log.ids().await, vec![1, 2, 3]);
+    }
+
+    /// Run deferred envelopes with ids from 1 through the real reader and apply
+    /// loop: the first alone, then `later` while the first write is held, so the
+    /// reader builds them (the hold lasts until `later_builds` more builds have run,
+    /// and records whether it had to give up instead). Returns the committed ids,
+    /// the dataset status, and whether the hold gave up.
+    async fn run_with_later_envelopes_built_in_the_reader(
+        name: &str,
+        later: &[TestBuild],
+        later_builds: usize,
+    ) -> (Vec<i32>, Option<runtime_status::ComponentStatus>, bool) {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let writes_started = Arc::new(AtomicUsize::new(0));
+        let gave_up = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(FirstWriteHeldForBuilds {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            builds: Arc::clone(&builds),
+            needed: 1 + later_builds,
+            writes_started: Arc::clone(&writes_started),
+            gave_up: Arc::clone(&gave_up),
+        });
+        let task = Arc::new(make_refresh_task_named(
+            name,
+            provider as Arc<dyn TableProvider>,
+        ));
+        let log = CommitLog::new();
+
+        let (source, stream) = futures::channel::mpsc::unbounded();
+        let stream: ChangesStream = stream.boxed();
+        source
+            .unbounded_send(Ok(make_deferred_tracked_envelope(
+                1,
+                &log,
+                &builds,
+                TestBuild::Succeeds,
+            )))
+            .expect("queue envelope 1");
+        let run_task = Arc::clone(&task);
+        let join = tokio::spawn(async move {
+            run_changes_stream_with_config(&run_task, test_cdc_config(0), stream).await
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while writes_started.load(AtomicOrdering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "the first write never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for (id, kind) in (2..).zip(later) {
+            source
+                .unbounded_send(Ok(make_deferred_tracked_envelope(id, &log, &builds, *kind)))
+                .expect("queue envelope");
+        }
+        drop(source);
+        let _ = join.await.expect("task join");
+
+        let status = task
+            .runtime_status
+            .get_dataset_status(&TableReference::bare(name.to_string()));
+        (
+            log.ids().await,
+            status,
+            gave_up.load(AtomicOrdering::SeqCst),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_deferred_build_stops_the_dataset_with_nothing_committed_from_it_on() {
+        // Envelopes 2–4 are built in the reader (all three builds run, the failing
+        // one included) while envelope 1's write is held.
+        let (committed, status, gave_up) = run_with_later_envelopes_built_in_the_reader(
+            "prebuild_failed_build",
+            &[TestBuild::Succeeds, TestBuild::Fails, TestBuild::Succeeds],
+            3,
+        )
+        .await;
+        assert!(!gave_up, "envelopes 2-4 must be built in the reader");
+        assert!(
+            committed.iter().all(|id| *id < 3),
+            "nothing at or after the failed envelope may commit, got {committed:?}"
+        );
+        let message = status
+            .as_ref()
+            .and_then(runtime_status::ComponentStatus::error_message)
+            .unwrap_or_default();
+        assert!(
+            message.contains("test build failure"),
+            "the dataset must fail with the build's own error, got {status:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_deferred_build_stops_the_dataset_with_nothing_committed_from_it_on() {
+        // Envelopes 2 and 3 reach the reader as one group while envelope 1's write
+        // is held; envelope 2's build panics, which loses the group's build task
+        // after that one build ran.
+        let (committed, status, gave_up) = run_with_later_envelopes_built_in_the_reader(
+            "prebuild_lost_build",
+            &[TestBuild::Panics, TestBuild::Succeeds],
+            1,
+        )
+        .await;
+        assert!(!gave_up, "envelope 2 must be built in the reader");
+        assert!(
+            committed.iter().all(|id| *id < 2),
+            "nothing at or after the lost build may commit, got {committed:?}"
+        );
+        let message = status
+            .as_ref()
+            .and_then(runtime_status::ComponentStatus::error_message)
+            .unwrap_or_default();
+        assert!(
+            message.contains("deferred CDC batch build task failed"),
+            "the dataset must fail with the lost build's reason, got {status:?}"
+        );
+    }
+
+    /// While the apply loop is idle the reader forwards deferred envelopes
+    /// unbuilt, and the apply loop builds them in its burst.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_apply_loop_builds_its_burst_itself() {
+        let task = make_refresh_task_named(
+            "prebuild_idle_apply",
+            make_mem_table() as Arc<dyn TableProvider>,
+        );
+        let log = CommitLog::new();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let items: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=4)
+            .map(|id| {
+                Ok(make_deferred_tracked_envelope(
+                    id,
+                    &log,
+                    &builds,
+                    TestBuild::Succeeds,
+                ))
+            })
+            .collect();
+        run_changes_stream_with_config(&task, test_cdc_config(0), make_changes_stream(items))
+            .await
+            .expect("changes stream should succeed");
+        assert_eq!(
+            builds.load(AtomicOrdering::SeqCst),
+            4,
+            "each envelope builds once"
+        );
+        assert_eq!(log.ids().await, vec![1, 2, 3, 4]);
     }
 }
