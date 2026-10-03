@@ -25,6 +25,10 @@ limitations under the License.
 
 mod common;
 
+use common::lookup_index::{
+    TableSpec, counters, open_table, overwrite, runtime_with_pool, until_covered,
+};
+
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -34,14 +38,12 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use cayenne::CayenneTableProvider;
 use cayenne::lookup_index::LookupIndexCounters;
-use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::provider::CayenneContext;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::metadata::VortexConfig;
 
 use datafusion::datasource::TableProvider;
-use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
 
 const KEY: [&str; 2] = ["TenantId", "ServiceId"];
@@ -89,15 +91,6 @@ fn lookup_sql(table: &str, id: i64) -> String {
     )
 }
 
-fn runtime_with_pool(bytes: usize) -> (Arc<RuntimeEnv>, Arc<dyn MemoryPool>) {
-    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
-    let runtime_env = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::clone(&pool))
-        .build_arc()
-        .expect("runtime env");
-    (runtime_env, pool)
-}
-
 /// Creates the table, or reopens it when the catalog already holds one of this
 /// name — the same call the accelerator makes on every registration.
 async fn open(
@@ -130,52 +123,12 @@ async fn open_configured(
     indexes: &[&[&str]],
     vortex_config: VortexConfig,
 ) -> Arc<CayenneTableProvider> {
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
-    let options = CreateTableOptions {
-        table_name: name.to_string(),
-        schema: schema(),
-        primary_key: vec![],
-        on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
-        partition_column: None,
-        vortex_config,
-    };
-    let catalog = Arc::clone(&fixture.catalog);
-    let catalog: Arc<dyn MetadataCatalog> = catalog;
-    Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .with_context(context)
-            .with_secondary_indexes(
-                indexes
-                    .iter()
-                    .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
-                    .collect(),
-            )
-            .create(options)
-            .await
-            .expect("create or reopen table"),
+    open_table(
+        fixture,
+        runtime_env,
+        TableSpec::new(name, schema(), indexes).config(vortex_config),
     )
-}
-
-async fn overwrite(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
-    let ctx = SessionContext::new();
-    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-        &[vec![batch]],
-        schema(),
-        None,
-    )
-    .expect("overwrite source");
-    let plan = provider
-        .insert_into(
-            &ctx.state(),
-            exec,
-            datafusion_expr::dml::InsertOp::Overwrite,
-        )
-        .await
-        .expect("overwrite plan");
-    datafusion_physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("overwrite");
+    .await
 }
 
 async fn insert(provider: &Arc<CayenneTableProvider>, name: &str, batch: RecordBatch) {
@@ -276,12 +229,6 @@ async fn dynamic_lookup(provider: &Arc<CayenneTableProvider>, name: &str, ids: &
         .collect()
 }
 
-fn counters(provider: &Arc<CayenneTableProvider>) -> LookupIndexCounters {
-    provider
-        .lookup_index_counters()
-        .expect("the table declares an index")
-}
-
 /// Runs lookups over ids `0..rows` until `done` holds, failing with the last
 /// counters after `timeout`.
 async fn lookups_until(
@@ -308,30 +255,6 @@ async fn lookups_until(
     }
 }
 
-/// Runs lookups until a rebuild covers every file of `name` again, failing
-/// with the last verification after 30 seconds; returns that verification.
-async fn healed(
-    provider: &Arc<CayenneTableProvider>,
-    name: &str,
-) -> cayenne::lookup_index::LookupIndexVerification {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        lookup(provider, name, 7).await;
-        let verification = provider
-            .verify_lookup_index_against_read_back()
-            .await
-            .expect("verify");
-        if verification.uncovered_files == 0 {
-            return verification;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "'{name}' was not rebuilt to cover every file: {verification:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// The index follows the `indexes` each registration passes, not whatever the
 /// table was first created with: adding an entry to an existing table indexes
 /// it, and removing it stops indexing.
@@ -346,7 +269,7 @@ async fn indexes_follow_each_registration_not_the_stored_table() {
 
     {
         let first = open(&fixture, Arc::clone(&env), name, &[]).await;
-        overwrite(&first, rows(0, ROWS)).await;
+        overwrite(&first, vec![rows(0, ROWS)]).await;
         assert!(first.lookup_index_counters().is_none());
     }
 
@@ -383,7 +306,7 @@ async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
     let name = "dynamic_rebuild";
 
     let initial = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
-    overwrite(&initial, rows(0, ROWS)).await;
+    overwrite(&initial, vec![rows(0, ROWS)]).await;
     drop(initial);
 
     let reopened = open(&fixture, env, name, &[&KEY]).await;
@@ -497,7 +420,7 @@ async fn a_build_the_pool_cannot_fit_is_not_retried_on_every_lookup() {
     let (env, _pool) = runtime_with_pool(MIB);
     let name = "refused";
     let initial = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
-    overwrite(&initial, rows(0, ROWS)).await;
+    overwrite(&initial, vec![rows(0, ROWS)]).await;
     // The overwrite's own write-time build is refused by this pool too, and a
     // refused write-time build seeds the very schedule the loop below measures:
     // the next build waits `2 * max(1s, 10 * write_build_time)`, which passes the
@@ -615,7 +538,7 @@ async fn dropping_an_indexed_table_releases_its_memory() {
     let (env, pool) = runtime_with_pool(1024 * MIB);
     let name = "dropped";
     let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
-    overwrite(&table, rows(0, ROWS)).await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
     let used = lookups_until(
         &table,
         name,
@@ -666,7 +589,7 @@ async fn appends_and_compactions_keep_the_index_current() {
     };
     let table = open_with(&fixture, Arc::clone(&env), name, &[&KEY], config).await;
     table.init_scan_view_cache();
-    overwrite(&table, rows(0, ROWS)).await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
     let rows_i64 = i64::try_from(ROWS).expect("fits");
     // Above the inline cap, so each append writes a file, and small.
     let appended_rows: i64 = 3_000;
@@ -817,7 +740,7 @@ async fn a_key_column_relaxed_to_nullable_on_an_open_table_keeps_lookups_exact()
     let env = Arc::new(RuntimeEnv::default());
     let name = "relaxed_live";
     let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
-    overwrite(&table, rows(0, ROWS)).await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
     lookup(&table, name, 11).await;
 
     let relaxed = Arc::new(Schema::new(vec![
@@ -899,7 +822,7 @@ async fn a_key_column_relaxed_to_nullable_on_an_open_table_keeps_lookups_exact()
     assert!(verification.agrees(), "{verification:?}");
     // The index heals: a lookup over the uncovered files rebuilds it, after
     // which every file is covered again and lookups use it.
-    let healed = healed(&table, name).await;
+    let healed = until_covered(&table, async || lookup(&table, name, 7).await).await;
     println!("after the rebuild: {healed:?}");
     assert!(healed.agrees(), "{healed:?}");
     let before = counters(&table);
@@ -929,7 +852,7 @@ async fn a_key_spelled_in_another_case_is_used_by_lookups() {
         &[&["tenantid", "SERVICEID"]],
     )
     .await;
-    overwrite(&table, rows(0, ROWS)).await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
     let before = counters(&table);
     lookup(&table, name, 7).await;
     let after = counters(&table);

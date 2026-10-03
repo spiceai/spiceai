@@ -26,18 +26,19 @@ limitations under the License.
 
 mod common;
 
+use common::lookup_index::{
+    SplitMix64, TableSpec, counters, file_mode_config, memory_mode_config, open_table,
+    until_covered,
+};
+
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
 
-use cayenne::lookup_index::LookupIndexCounters;
-use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::provider::CayenneContext;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::CayenneTableProvider;
 
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -60,31 +61,6 @@ enum Mode {
     Memory,
 }
 
-fn vortex_config(mode: Mode) -> VortexConfig {
-    match mode {
-        Mode::File => VortexConfig {
-            target_vortex_file_size_mb: 1,
-            ..VortexConfig::default()
-        },
-        Mode::Memory => VortexConfig {
-            memory_mode: true,
-            cdc_mem_tier_shards: 1,
-            cdc_mem_tier_max_age_ms: 0,
-            cdc_mem_tier_checkpoint_interval_ms: 0,
-            cdc_mem_tier_seal_age_ms: 0,
-            compaction_background_interval_ms: 0,
-            cold_tier_location: None,
-            inline_max_rows: 0,
-            inline_max_bytes: 0,
-            inline_max_buffer_bytes: 0,
-            cdc_mem_tier_max_bytes: 0,
-            cdc_durability: CdcDurability::Memory,
-            deletion_mode: DeletionMode::Key,
-            ..VortexConfig::default()
-        },
-    }
-}
-
 /// Creates the table, or reopens it when the catalog already holds one of
 /// this name.
 async fn open(
@@ -95,48 +71,17 @@ async fn open(
     key: DataType,
     indexed: bool,
 ) -> Arc<CayenneTableProvider> {
-    let config = vortex_config(mode);
-    let context = CayenneContext::new(&config, Arc::clone(env), name);
-    let options = CreateTableOptions {
-        table_name: name.to_string(),
-        schema: schema(key),
-        primary_key: vec![],
-        on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
-        partition_column: None,
-        vortex_config: config,
+    let config = match mode {
+        Mode::File => file_mode_config(),
+        Mode::Memory => memory_mode_config(),
     };
-    let catalog = Arc::clone(&fixture.catalog);
-    let catalog: Arc<dyn MetadataCatalog> = catalog;
-    let secondary: Vec<Vec<String>> = if indexed {
-        INDEXES
-            .iter()
-            .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    Arc::new(
-        CayenneTableProviderBuilder::new(catalog, Arc::clone(env))
-            .with_context(context)
-            .with_secondary_indexes(secondary)
-            .create(options)
-            .await
-            .expect("create or reopen table"),
+    let keys: &[&[&str]] = if indexed { &INDEXES } else { &[] };
+    open_table(
+        fixture,
+        Arc::clone(env),
+        TableSpec::new(name, schema(key), keys).config(config),
     )
-}
-
-/// A deterministic stream of pseudo-random `u64`s.
-struct Lcg(u64);
-
-impl Lcg {
-    fn next(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        self.0 >> 11
-    }
+    .await
 }
 
 /// The integer keys a user's data could hold: the extremes, zero and its
@@ -157,16 +102,16 @@ fn integer_keys() -> Vec<Option<i32>> {
         Some(i32::MAX),
         None,
     ];
-    let mut rng = Lcg(7);
+    let mut rng = SplitMix64(7);
     for i in 0..6_000 {
         keys.push(match i % 4 {
             // Repeated small values, NULLs among them.
             0 | 1 => {
-                let small = i32::try_from(rng.next() % 101).expect("small") - 50;
+                let small = i32::try_from(rng.next_u64() % 101).expect("small") - 50;
                 (small != 13).then_some(small)
             }
             #[expect(clippy::cast_possible_truncation, reason = "a random i32")]
-            _ => Some(rng.next() as i32),
+            _ => Some(rng.next_u64() as i32),
         });
     }
     keys
@@ -286,10 +231,6 @@ fn lookups(probes: &[String]) -> Vec<String> {
         ));
     }
     sql
-}
-
-fn counters(table: &Arc<CayenneTableProvider>) -> LookupIndexCounters {
-    table.lookup_index_counters().expect("indexed")
 }
 
 /// Every row written so far, with its key in `key`'s type, as an in-memory
@@ -415,28 +356,6 @@ fn widening_plan(table: &Arc<CayenneTableProvider>) -> arrow_tools::schema_evolu
     }
 }
 
-/// Runs lookups until the index covers every file of `table`, so the next
-/// comparison is answered from the index rather than by reading files whole.
-async fn rebuilt(table: &Arc<CayenneTableProvider>) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        ids(table, "SELECT \"AutoId\" FROM t WHERE \"K\" = 7").await;
-        let verification = table
-            .verify_lookup_index_against_read_back()
-            .await
-            .expect("verify");
-        assert!(verification.agrees(), "{verification:?}");
-        if verification.uncovered_files == 0 {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the index was not rebuilt over every file: {verification:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 async fn widened_keys_return_the_rows_of_an_unindexed_table(mode: Mode) {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
@@ -501,7 +420,10 @@ async fn widened_keys_return_the_rows_of_an_unindexed_table(mode: Mode) {
     }
 
     if matches!(mode, Mode::File) {
-        rebuilt(&indexed).await;
+        until_covered(&indexed, async || {
+            ids(&indexed, "SELECT \"AutoId\" FROM t WHERE \"K\" = 7").await;
+        })
+        .await;
     }
     let answered = compare("index rebuilt", &indexed, &plain, &truth, &probes).await;
     assert!(answered > 0, "the Float64 lookups never used the index");
@@ -511,7 +433,10 @@ async fn widened_keys_return_the_rows_of_an_unindexed_table(mode: Mode) {
         let indexed = open(&fixture, &env, mode, "indexed", DataType::Float64, true).await;
         let plain = open(&fixture, &env, mode, "plain", DataType::Float64, false).await;
         compare("reopened", &indexed, &plain, &truth, &probes).await;
-        rebuilt(&indexed).await;
+        until_covered(&indexed, async || {
+            ids(&indexed, "SELECT \"AutoId\" FROM t WHERE \"K\" = 7").await;
+        })
+        .await;
         let answered = compare("reopened and rebuilt", &indexed, &plain, &truth, &probes).await;
         assert!(answered > 0, "the reopened lookups never used the index");
     }

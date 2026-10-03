@@ -1400,6 +1400,10 @@ pub(crate) struct LookupIndexState {
     /// Whether the pool's refusal has been reported since runs last fit, so a
     /// table the pool cannot fit warns once rather than on every write.
     refusal_reported: AtomicBool,
+    /// Whether a write that could not be indexed has been reported since runs
+    /// last published, so a table whose writes keep failing to index warns
+    /// once rather than on every write.
+    write_failure_reported: AtomicBool,
     counters: Counters,
     /// The table's scan-input version. Scan views pin the published view, so
     /// every change to it must invalidate the cached views, or scans keep
@@ -1468,6 +1472,7 @@ impl LookupIndexState {
             schedule: Mutex::new(BuildSchedule::default()),
             published_once: AtomicBool::new(false),
             refusal_reported: AtomicBool::new(false),
+            write_failure_reported: AtomicBool::new(false),
             counters: Counters::default(),
             scan_input_version,
         });
@@ -1656,6 +1661,7 @@ impl LookupIndexState {
             self.repin();
         }
         self.refusal_reported.store(false, Ordering::Relaxed);
+        self.write_failure_reported.store(false, Ordering::Relaxed);
         self.report_coverage();
         self.counters
             .builds_published
@@ -1917,7 +1923,9 @@ impl LookupIndexState {
                 Ok(runs) => {
                     state.publish_runs(runs, None);
                 }
-                Err(cause) => state.write_unindexed(&cause),
+                Err(cause) => {
+                    state.write_unindexed(&cause);
+                }
             }
             tracing::debug!(
                 table = %state.table_name,
@@ -1929,15 +1937,23 @@ impl LookupIndexState {
         });
     }
 
-    fn write_unindexed(&self, cause: &str) {
+    /// Reports a write whose rows could not be indexed: at `warn` once until
+    /// runs publish again, then at `debug`. Returns whether it warned.
+    fn write_unindexed(&self, cause: &str) -> bool {
         self.counters
             .builds_unpublished
             .fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(
-            table = %self.table_name,
+        let message = format!(
             "Dataset '{}' (cayenne): failed to index a write's rows for its secondary index, so lookups read that write's files in full until they are indexed in the background. Cause: {cause}",
             self.table_name
         );
+        if self.write_failure_reported.swap(true, Ordering::Relaxed) {
+            tracing::debug!(table = %self.table_name, "{message}");
+            false
+        } else {
+            tracing::warn!(table = %self.table_name, "{message}");
+            true
+        }
     }
 
     /// The right to index the table's uncovered files in the background, or
@@ -3195,6 +3211,26 @@ mod tests {
         )
         .expect("indexable")
         .expect("state")
+    }
+
+    /// A table whose writes keep failing to index warns once, not on every
+    /// write, until runs publish again.
+    #[tokio::test]
+    async fn a_failing_write_warns_once_until_runs_publish() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let state = keyed_state(&pool);
+        assert!(state.write_unindexed("first"), "the first failure warns");
+        assert!(!state.write_unindexed("second"), "a repeat does not");
+        write(
+            &state,
+            &[("a.vortex", 0, keyed_batch(&[Some(1)], &[Some("x")]))],
+        )
+        .await;
+        assert!(
+            state.write_unindexed("after a publish"),
+            "a failure after runs published warns again"
+        );
+        assert_eq!(state.counters().builds_unpublished, 3);
     }
 
     /// A join's runtime probe answers for the files its scan reads, and no
