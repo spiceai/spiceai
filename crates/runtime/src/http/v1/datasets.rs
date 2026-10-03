@@ -242,14 +242,17 @@ fn dataset_infos(
 }
 
 /// `ds`'s last refresh and next scheduled refresh, as RFC 3339 timestamps, for an
-/// accelerated dataset. A `refresh_cron` dataset's next refresh is the first cron
-/// time after its last refresh.
+/// accelerated dataset. Only a dataset with a schedule has a next refresh. For a
+/// `refresh_cron` dataset it is the first cron time after its last refresh, or,
+/// once that time has come, when its jittered refresh starts.
 fn dataset_freshness(df: &DataFusion, ds: &Dataset) -> (Option<String>, Option<String>) {
     let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
         return (None, None);
     };
     let freshness = df.runtime_status().dataset_freshness(&ds.name);
-    let next_refresh = freshness.next_refresh.or_else(|| {
+    let scheduled =
+        acceleration.refresh_check_interval.is_some() || acceleration.refresh_cron.is_some();
+    let next_refresh = freshness.next_refresh.filter(|_| scheduled).or_else(|| {
         let cron = acceleration.refresh_cron.as_deref()?;
         scheduler::channel::cron::next_cron_time(cron, freshness.last_refresh?).ok()
     });

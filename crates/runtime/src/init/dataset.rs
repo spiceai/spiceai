@@ -1539,6 +1539,7 @@ impl Runtime {
         // Drop the dataset's CDC schema-evolution settings; a reload re-installs
         // them at registration before the changes stream starts.
         crate::accelerated::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
+        self.status.remove_dataset_freshness(&ds_name);
 
         // Deregistering the table is not enough to stop it being read: a cached
         // logical plan holds the `TableSource` it was planned against, so a query

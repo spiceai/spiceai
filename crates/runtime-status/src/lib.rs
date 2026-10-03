@@ -206,6 +206,28 @@ impl RuntimeStatus {
             .next_refresh = Some(at);
     }
 
+    /// Forgets when `dataset`'s next refresh is due, for a refresh that has run
+    /// without one being scheduled after it.
+    pub fn clear_dataset_next_refresh(&self, dataset: &TableReference) {
+        if let Some(freshness) = self
+            .dataset_freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&dataset.to_string())
+        {
+            freshness.next_refresh = None;
+        }
+    }
+
+    /// Forgets `dataset`'s refresh times, when it is unloaded, so a dataset later
+    /// registered under the same name starts from its own.
+    pub fn remove_dataset_freshness(&self, dataset: &TableReference) {
+        self.dataset_freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&dataset.to_string());
+    }
+
     /// When `dataset` was last refreshed and when its next scheduled refresh is due,
     /// as far as recorded.
     #[must_use]
