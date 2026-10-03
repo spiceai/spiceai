@@ -409,15 +409,26 @@ fn plan_chunks(
     best
 }
 
-/// `schema` followed by the arrival column.
-pub(crate) fn with_arrival(schema: &SchemaRef) -> SchemaRef {
+/// `schema` followed by the arrival column, named `arrival`.
+pub(crate) fn with_arrival(schema: &SchemaRef, arrival: &str) -> SchemaRef {
     let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
-    fields.push(Arc::new(Field::new(
-        ARRIVAL_COLUMN,
-        DataType::UInt32,
-        false,
-    )));
+    fields.push(Arc::new(Field::new(arrival, DataType::UInt32, false)));
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// The name the arrival column is stored under for a table of `schema`:
+/// [`ARRIVAL_COLUMN`], or that with the first numeric suffix no column of the
+/// table already uses, so a user column of the same name is never shadowed.
+pub(crate) fn arrival_column(schema: &Schema) -> String {
+    let taken = |name: &str| schema.fields().iter().any(|field| field.name() == name);
+    if !taken(ARRIVAL_COLUMN) {
+        return ARRIVAL_COLUMN.to_string();
+    }
+    // `n` columns leave one of the first `n + 1` suffixes free.
+    (1..=schema.fields().len() + 1)
+        .map(|suffix| format!("{ARRIVAL_COLUMN}_{suffix}"))
+        .find(|name| !taken(name))
+        .unwrap_or_else(|| ARRIVAL_COLUMN.to_string())
 }
 
 /// Resolves each batch's own repeats per the policy and stamps every surviving
@@ -431,8 +442,14 @@ pub(crate) struct ArrivalStream {
 }
 
 impl ArrivalStream {
-    pub(crate) fn new(input: SendableRecordBatchStream, resolver: KeyResolver) -> Self {
-        let schema = with_arrival(&input.schema());
+    /// `arrival` is the name the table stores the column under
+    /// ([`arrival_column`]).
+    pub(crate) fn new(
+        input: SendableRecordBatchStream,
+        resolver: KeyResolver,
+        arrival: &str,
+    ) -> Self {
+        let schema = with_arrival(&input.schema(), arrival);
         Self {
             input,
             resolver,
@@ -517,6 +534,8 @@ struct ReadBack {
     stored: Arc<Field>,
     schema: SchemaRef,
     chunk: (u64, u64),
+    /// The name the arrival column is stored under ([`arrival_column`]).
+    arrival_source: Arc<str>,
     /// The key sub-range this step reads, pushed into each file's scan.
     range: Option<KeyRange>,
     /// Rows read back before the chunk filter (diagnostics).
@@ -588,6 +607,7 @@ impl PartitionStream for ReadBack {
             schema: Arc::clone(&self.schema),
             chunk: self.chunk,
             range: self.range.clone(),
+            arrival_source: Arc::clone(&self.arrival_source),
             rows_read: Arc::clone(&self.rows_read),
         });
         // `key >= lo AND key < hi` on the stored column, so the scan prunes the
@@ -629,7 +649,10 @@ impl PartitionStream for ReadBack {
                     )
                 })
                 .chain([
-                    (ARRIVAL_COLUMN.to_string(), get_item(ARRIVAL_COLUMN, root())),
+                    (
+                        ARRIVAL_COLUMN.to_string(),
+                        get_item(this.arrival_source.as_ref(), root()),
+                    ),
                     (POSITION_COLUMN.to_string(), row_idx()),
                 ]),
             Nullability::NonNullable,
@@ -887,6 +910,7 @@ impl CayenneTableProvider {
                 schema: &schema,
                 survivor,
                 keys: key_columns.len(),
+                arrival_source: Arc::from(arrival_column(&table_schema)),
                 group_rows,
             };
             match query.run(&plan.specs).await {
@@ -937,6 +961,8 @@ struct DuplicateQuery<'a> {
     schema: &'a SchemaRef,
     survivor: Survivor,
     keys: usize,
+    /// The name the arrival column is stored under.
+    arrival_source: Arc<str>,
     /// The rows of each cluster split into key ranges, by group: the ranges'
     /// rows must add up to it, or a row was read by no range.
     group_rows: Vec<u64>,
@@ -972,6 +998,7 @@ impl DuplicateQuery<'_> {
                         schema: Arc::clone(schema),
                         chunk: spec.hash,
                         range: spec.range.clone(),
+                        arrival_source: Arc::clone(&self.arrival_source),
                         rows_read: Arc::clone(&rows_read),
                     }) as Arc<dyn PartitionStream>
                 })
@@ -1219,10 +1246,31 @@ mod tests {
     #[test]
     fn arrival_is_trailing_and_not_null() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let with = with_arrival(&schema);
+        let with = with_arrival(&schema, ARRIVAL_COLUMN);
         assert_eq!(with.fields().len(), 2);
         assert_eq!(with.field(1).name(), ARRIVAL_COLUMN);
         assert!(!with.field(1).is_nullable());
+    }
+
+    #[test]
+    fn the_arrival_column_avoids_the_tables_own_names() {
+        let named = |names: &[&str]| {
+            Schema::new(
+                names
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Int64, false))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(arrival_column(&named(&["id"])), ARRIVAL_COLUMN);
+        assert_eq!(
+            arrival_column(&named(&["id", ARRIVAL_COLUMN])),
+            format!("{ARRIVAL_COLUMN}_1")
+        );
+        assert_eq!(
+            arrival_column(&named(&[ARRIVAL_COLUMN, &format!("{ARRIVAL_COLUMN}_1")])),
+            format!("{ARRIVAL_COLUMN}_2")
+        );
     }
 
     fn int_bounds(ranges: &[(i64, i64)]) -> Vec<(ScalarValue, ScalarValue)> {

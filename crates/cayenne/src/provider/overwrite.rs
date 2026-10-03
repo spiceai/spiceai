@@ -684,8 +684,9 @@ impl CayenneTableProvider {
                     Survivor::for_policy(resolver.policy()),
                     super::overwrite_postpass::key_column_names(&self.table_schema(), &indices),
                 ));
+                let arrival = super::overwrite_postpass::arrival_column(&self.table_schema());
                 Box::pin(super::overwrite_postpass::ArrivalStream::new(
-                    data, resolver,
+                    data, resolver, &arrival,
                 ))
             }
         };
@@ -741,7 +742,9 @@ impl CayenneTableProvider {
         // each still sorts its rows by it, so an equality on the key reads about
         // one zone of every file instead of all of them.
         let write_schema = if postpass.is_some() {
-            super::overwrite_postpass::with_arrival(&self.table_schema())
+            let table_schema = self.table_schema();
+            let arrival = super::overwrite_postpass::arrival_column(&table_schema);
+            super::overwrite_postpass::with_arrival(&table_schema, &arrival)
         } else {
             self.table_schema()
         };
