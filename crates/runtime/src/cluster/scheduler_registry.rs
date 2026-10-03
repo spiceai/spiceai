@@ -29,6 +29,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use app::spicepod::component::runtime::Scheduler as SchedulerConfig;
+use futures::FutureExt;
+use futures::future::{Fuse, FusedFuture};
 use object_store::ObjectStore;
 use runtime_secrets::Secrets;
 use snafu::prelude::*;
@@ -90,6 +92,9 @@ fn worst_case_tick(ttl_ms: u64) -> Duration {
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
+/// How often a scheduler deletes jobs whose results expired. Expired jobs already
+/// read as expired; this only reclaims their state and result chunks.
+const JOB_CLEANUP_INTERVAL: Duration = Duration::from_mins(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
 
 /// Compare-and-set attempts for one heartbeat before skipping this beat.
@@ -259,7 +264,7 @@ async fn recover_orphaned_jobs(
                 scheduler_node = ?job.scheduler_node,
                 "Recovering job orphaned by a lost scheduler"
             );
-            job_executor.resume(&job.job_id).await;
+            job_executor.resume(&job).await;
         }
     }
 }
@@ -283,6 +288,14 @@ impl SchedulerRegistryRunner {
             tokio::time::Instant::now() + JOB_RECOVERY_INTERVAL,
             JOB_RECOVERY_INTERVAL,
         );
+        let mut cleanup_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + JOB_CLEANUP_INTERVAL,
+            JOB_CLEANUP_INTERVAL,
+        );
+        // A cleanup pass issues requests for as long as there are expired jobs to delete,
+        // so it runs beside the other arms rather than inside one: a long pass must not
+        // hold up the heartbeat that tells peers this scheduler is alive.
+        let mut cleanup = std::pin::pin!(Fuse::terminated());
 
         // Run an initial discovery so peers are populated promptly.
         if let Err(err) = self.refresh_peers().await {
@@ -326,6 +339,16 @@ impl SchedulerRegistryRunner {
                 _ = recovery_tick.tick() => {
                     recover_orphaned_jobs(&self.job_executor, &self.peers, self.instance_id).await;
                 }
+                _ = cleanup_tick.tick(), if cleanup.is_terminated() => {
+                    cleanup.set(self.job_executor.cleanup_expired_jobs().fuse());
+                }
+                result = &mut cleanup => match result {
+                    Ok(0) => {}
+                    Ok(deleted) => tracing::debug!(deleted, "Deleted expired async query jobs"),
+                    Err(err) => tracing::warn!(
+                        "Failed to delete expired async query jobs, so their results stay in the scheduler state location until the next attempt: {err}"
+                    ),
+                },
             }
         }
 
