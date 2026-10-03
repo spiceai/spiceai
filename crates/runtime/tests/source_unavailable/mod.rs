@@ -696,8 +696,8 @@ mod served_from_acceleration {
     }
 
     /// A source that is reachable but slow to answer does not hold the dataset
-    /// unregistered: queries are answered from the existing acceleration after a
-    /// short wait, and the data catches up once the source answers.
+    /// unregistered: queries are answered from the existing acceleration at once, the
+    /// source is read once in the background, and the data catches up when it answers.
     #[tokio::test]
     async fn a_slow_source_does_not_hold_back_an_acceleration() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));
@@ -725,17 +725,17 @@ mod served_from_acceleration {
         assert_eq!(
             source.reads() - reads_before_restart,
             1,
-            "the read in progress when the acceleration starts serving is the one the source answers, not repeated"
+            "the source is read once in the background, not repeated"
         );
         stop(rt, loader).await;
         Ok(())
     }
 
-    /// A source that is slow to connect to does not hold the dataset unregistered, and
-    /// the connection already in progress is the one used once it completes, rather
-    /// than a second one started after the wait.
+    /// A source that is slow to connect to does not hold the dataset unregistered: it
+    /// is served from its existing acceleration at once, and connected to once in the
+    /// background.
     #[tokio::test]
-    async fn a_slow_connection_is_used_rather_than_opened_again() -> Result<(), anyhow::Error> {
+    async fn a_slow_connection_does_not_hold_back_an_acceleration() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));
         let fixture = Fixture::new("slow-connection").await?;
         let source = &fixture.source;
@@ -761,7 +761,7 @@ mod served_from_acceleration {
         assert_eq!(
             source.builds() - builds_before_restart,
             1,
-            "the connection in progress when the acceleration starts serving is used, not opened again"
+            "the source is connected to once in the background, not repeatedly"
         );
         stop(rt, loader).await;
         Ok(())

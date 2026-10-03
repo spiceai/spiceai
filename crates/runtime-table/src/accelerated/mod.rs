@@ -1196,38 +1196,31 @@ impl Builder {
                     let dataset_name = self.dataset_name.clone();
                     let federated = Arc::clone(&self.federated);
                     let wait_handle = tokio::spawn(async move {
-                        // Wait for the deferred federated table provider to resolve. Only mark
-                        // the dataset ready if the deferred provider actually connected (its
-                        // schema was resolved and access was verified). If resolution failed
-                        // (e.g. shutdown or task panic), `try_wait_table_provider` returns
-                        // `Err(FederatedResolutionError::Unavailable, ..)`; leave the status
-                        // untouched so the caller surfaces the error through the refresh path
-                        // instead of a misleading `Ready`.
-                        match federated.try_wait_table_provider().await {
-                            Err((crate::federated::FederatedResolutionError::Unavailable, _)) => {
-                                tracing::warn!(
-                                    "Deferred federated provider for dataset {dataset_name} did not resolve successfully; leaving dataset status unchanged"
-                                );
-                            }
-                            Ok(_) => {
-                                // If the refresh path has already marked the dataset as `Error`
-                                // (e.g. the initial refresh failed quickly), don't overwrite it
-                                // with `Ready` — schema-resolution readiness must not mask refresh
-                                // failures that are surfaced via dataset status and metrics.
-                                let current_status = runtime_status
-                                    .get_component_status(&format!("dataset:{dataset_name}"));
-                                if matches!(current_status, Some(status::ComponentStatus::Error(_)))
-                                {
-                                    tracing::debug!(
-                                        "Deferred federated provider for dataset {dataset_name} resolved successfully, but dataset status is already Error; leaving dataset status unchanged"
-                                    );
-                                } else {
-                                    runtime_status.update_dataset(
-                                        &dataset_name,
-                                        status::ComponentStatus::Ready,
-                                    );
-                                }
-                            }
+                        // Wait for the source to be reached: the deferred provider's first
+                        // successful read of it, even when the schema it reports differs
+                        // from the acceleration's and the provider keeps retrying (the
+                        // dataset serves the acceleration's schema meanwhile). If the task
+                        // ends without reaching the source (e.g. shutdown), leave the status
+                        // untouched instead of reporting a misleading `Ready`.
+                        if !federated.wait_for_source_reached().await {
+                            tracing::warn!(
+                                "Deferred federated provider for dataset {dataset_name} did not reach its source; leaving dataset status unchanged"
+                            );
+                            return;
+                        }
+                        // If the refresh path has already marked the dataset as `Error`
+                        // (e.g. the initial refresh failed quickly), don't overwrite it
+                        // with `Ready` — schema-resolution readiness must not mask refresh
+                        // failures that are surfaced via dataset status and metrics.
+                        let current_status =
+                            runtime_status.get_component_status(&format!("dataset:{dataset_name}"));
+                        if matches!(current_status, Some(status::ComponentStatus::Error(_))) {
+                            tracing::debug!(
+                                "Deferred federated provider for dataset {dataset_name} reached its source, but dataset status is already Error; leaving dataset status unchanged"
+                            );
+                        } else {
+                            runtime_status
+                                .update_dataset(&dataset_name, status::ComponentStatus::Ready);
                         }
                     });
                     handlers.push(wait_handle);

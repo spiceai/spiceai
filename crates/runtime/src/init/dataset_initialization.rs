@@ -52,7 +52,6 @@ use tokio::sync::Semaphore;
 use crate::Error as RuntimeError;
 use crate::component::dataset::Dataset;
 use crate::dataaccelerator::BootstrapStatus;
-use crate::dataconnector::reconnecting::SourceUnavailable;
 use crate::dataconnector::{DataConnector, NewDataConnectorResult};
 use crate::{Result, Runtime, accelerated::AcceleratedTable};
 
@@ -222,7 +221,7 @@ impl DatasetInitialization {
                 // its first query from that acceleration rather than connecting to the
                 // source first; the source is connected in the background.
                 let connector = if Runtime::serves_existing_acceleration(&dataset).await {
-                    Runtime::reconnecting_connector(&dataset, None, SourceUnavailable::NotContacted)
+                    Runtime::reconnecting_connector(&dataset)
                 } else {
                     match builder().await {
                         Ok(connector) => connector,

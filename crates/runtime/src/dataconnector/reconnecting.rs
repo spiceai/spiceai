@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A connector for a dataset whose source could not be reached when the dataset
-//! loaded, but whose existing acceleration can serve queries in the meantime.
+//! A connector for a dataset served from its existing acceleration before its
+//! source has been contacted.
 //!
 //! Many connectors contact their source while being constructed (to validate
-//! credentials, or to detect the server's variant), so an unreachable source
-//! leaves no connector to register the dataset with, even though the
+//! credentials, or to detect the server's variant), so building the connector
+//! first would tie the dataset's startup to its source, even though the
 //! acceleration already holds its data. [`ReconnectingConnector`] stands in for
 //! that connector: it builds the real one on first use — which, for a dataset
 //! served from its acceleration, is the deferred federated provider retrying
@@ -30,7 +30,7 @@ limitations under the License.
 //! with the trait's default, and the registration hooks do nothing. That is only
 //! correct for the datasets `Runtime::serves_existing_acceleration` admits.
 
-use std::{any::Any, sync::Arc, time::Duration};
+use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -45,42 +45,27 @@ use crate::component::dataset::DatasetSpec;
 use crate::component::dataset::acceleration::RefreshMode;
 
 /// Builds the real connector. Called again after each failure, until one succeeds.
-pub type ConnectorBuilder = Arc<dyn Fn() -> ConnectorAttempt + Send + Sync>;
+pub type ConnectorBuilder =
+    Arc<dyn Fn() -> BoxFuture<'static, crate::Result<Arc<dyn DataConnector>>> + Send + Sync>;
 
-/// One attempt to build the real connector.
-pub type ConnectorAttempt = BoxFuture<'static, crate::Result<Arc<dyn DataConnector>>>;
-
-/// How long loading a dataset waits for its source before serving an existing
-/// acceleration instead. A responsive source answers well within this, and keeps
-/// the dataset on the path that registers with the live source provider; a slow or
-/// unresponsive one no longer holds a dataset that already has its data locally
-/// unregistered.
-pub const SOURCE_WAIT_BEFORE_SERVING_ACCELERATION: Duration = Duration::from_secs(2);
-
-/// Why a dataset is registered before its real connector exists.
+/// Why a dataset is served from its existing acceleration before its source has
+/// answered.
 #[derive(Debug, Clone)]
 pub enum SourceUnavailable {
-    /// Building the connector failed with a retriable error.
+    /// Reading the source failed with a retriable error.
     Failed(String),
-    /// The source did not respond within [`SOURCE_WAIT_BEFORE_SERVING_ACCELERATION`].
-    Slow,
-    /// The source was not contacted: a deferred dataset (`ready_state:
-    /// on_registration` with typed `columns:`) serves its first query from its
-    /// existing acceleration and connects in the background.
+    /// The source has not been contacted yet: the dataset is served from its
+    /// acceleration and connects in the background.
     NotContacted,
 }
 
 impl SourceUnavailable {
     /// Logs why `dataset` is served from its existing acceleration: a source that
-    /// could not be reached is a warning; a slow source, or one not contacted yet,
-    /// resolves on its own and is informational.
+    /// could not be reached is a warning. A source not contacted yet logs nothing
+    /// here; a failure to reach it is reported when it happens.
     pub fn log_serving_from_acceleration(&self, dataset: &TableReference) {
-        match self {
-            Self::Failed(cause) => {
-                tracing::warn!("{}", unreachable_source_warning(dataset, cause));
-            }
-            Self::Slow => tracing::info!("{}", slow_source_message(dataset)),
-            Self::NotContacted => tracing::info!("{}", not_contacted_message(dataset)),
+        if let Self::Failed(cause) = self {
+            tracing::warn!("{}", unreachable_source_warning(dataset, cause));
         }
     }
 }
@@ -94,34 +79,10 @@ pub(crate) fn unreachable_source_warning(dataset: &TableReference, cause: &str) 
     )
 }
 
-/// The message logged when a dataset's source did not respond within
-/// [`SOURCE_WAIT_BEFORE_SERVING_ACCELERATION`], so queries are served from its
-/// existing acceleration until it does.
-#[must_use]
-fn slow_source_message(dataset: &TableReference) -> String {
-    format!(
-        "The source for dataset '{dataset}' did not respond within {}s, so queries are served from the existing acceleration for '{dataset}' until the source responds and the next refresh completes.",
-        SOURCE_WAIT_BEFORE_SERVING_ACCELERATION.as_secs()
-    )
-}
-
-/// The message logged when a deferred dataset serves its first query from its
-/// existing acceleration while it connects to the source in the background.
-#[must_use]
-fn not_contacted_message(dataset: &TableReference) -> String {
-    format!(
-        "Dataset '{dataset}' is served from its existing acceleration while it connects to its source in the background."
-    )
-}
-
 pub struct ReconnectingConnector {
     /// The connector name from the dataset's `from:`, for errors.
     source_name: String,
     build: ConnectorBuilder,
-    /// A build already in progress when the dataset loaded, awaited before `build`
-    /// is called, so a slow source is not connected to twice.
-    first_attempt: parking_lot::Mutex<Option<ConnectorAttempt>>,
-    unavailable: SourceUnavailable,
     inner: OnceCell<Arc<dyn DataConnector>>,
     /// Object stores the runtime asked to register before the real connector existed,
     /// replayed once it is built.
@@ -130,27 +91,19 @@ pub struct ReconnectingConnector {
 
 impl ReconnectingConnector {
     #[must_use]
-    pub fn new(
-        source_name: impl Into<String>,
-        build: ConnectorBuilder,
-        first_attempt: Option<ConnectorAttempt>,
-        unavailable: SourceUnavailable,
-    ) -> Self {
+    pub fn new(source_name: impl Into<String>, build: ConnectorBuilder) -> Self {
         Self {
             source_name: source_name.into(),
             build,
-            first_attempt: parking_lot::Mutex::new(first_attempt),
-            unavailable,
             inner: OnceCell::new(),
             pending_object_stores: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
-    /// Why the real connector was not built when the dataset loaded, until it has
-    /// been built.
+    /// Whether the real connector has been built.
     #[must_use]
-    pub fn pending_reason(&self) -> Option<&SourceUnavailable> {
-        (!self.inner.initialized()).then_some(&self.unavailable)
+    pub fn is_connected(&self) -> bool {
+        self.inner.initialized()
     }
 
     /// The real connector, once it has been built.
@@ -165,12 +118,7 @@ impl ReconnectingConnector {
     ) -> Result<&Arc<dyn DataConnector>, DataConnectorError> {
         let connector = self
             .inner
-            .get_or_try_init(|| {
-                // Taken by whichever initialization runs first; if that one fails or
-                // is dropped, the next builds afresh.
-                let first_attempt = self.first_attempt.lock().take();
-                first_attempt.unwrap_or_else(|| (self.build)())
-            })
+            .get_or_try_init(|| (self.build)())
             .await
             .map_err(|err| self.build_error(dataset, err))?;
 
@@ -380,7 +328,7 @@ impl DataConnector for ReconnectingConnector {
 mod tests {
     use datafusion::sql::TableReference;
 
-    use super::{not_contacted_message, slow_source_message, unreachable_source_warning};
+    use super::unreachable_source_warning;
 
     #[test]
     fn unreachable_source_warning_names_the_dataset_and_the_cause() {
@@ -391,23 +339,6 @@ mod tests {
         assert_eq!(
             warning,
             "Failed to connect to the source for dataset orders. Serving data from the existing acceleration for orders while retrying the connection. Cannot connect to the dataset orders (postgres) on db:5432."
-        );
-    }
-
-    #[test]
-    fn slow_source_message_names_the_dataset_the_wait_and_what_is_served() {
-        let message = slow_source_message(&TableReference::bare("orders"));
-        assert_eq!(
-            message,
-            "The source for dataset 'orders' did not respond within 2s, so queries are served from the existing acceleration for 'orders' until the source responds and the next refresh completes."
-        );
-    }
-
-    #[test]
-    fn not_contacted_message_names_the_dataset_and_what_is_served() {
-        assert_eq!(
-            not_contacted_message(&TableReference::bare("orders")),
-            "Dataset 'orders' is served from its existing acceleration while it connects to its source in the background."
         );
     }
 }
