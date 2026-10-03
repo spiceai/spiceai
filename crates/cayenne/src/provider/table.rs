@@ -26604,9 +26604,11 @@ impl CayenneTableProvider {
 
         // Refresh deletion cache after applying retention filters
         if deleted_count > 0 {
-            // `file_deleted`, not `deleted_count`: the mem-tier arm cleared its own keys
-            // inside the hold above, and clearing again here would only discard a rebuild
-            // a writer may have paid for in between.
+            // `file_deleted`, not `deleted_count`: the mem-tier arm already cleared its own
+            // keys inside the hold above. A file delete clears here, before
+            // `refresh_deletion_cache` awaits the catalog, so a writer in that window cannot
+            // judge a deleted key present; the refresh clears again once it has loaded the
+            // new deletion vectors.
             if file_deleted > 0 {
                 self.clear_cached_pk_keyset();
             }
