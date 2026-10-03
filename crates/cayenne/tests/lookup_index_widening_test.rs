@@ -27,8 +27,8 @@ limitations under the License.
 mod common;
 
 use common::lookup_index::{
-    SplitMix64, TableSpec, counters, file_mode_config, memory_mode_config, open_table,
-    until_covered,
+    SplitMix64, TableSpec, counters, file_mode_config, int64_column, memory_mode_config,
+    open_table, query, until_covered,
 };
 
 use std::sync::Arc;
@@ -42,7 +42,6 @@ use cayenne::CayenneTableProvider;
 
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::prelude::SessionContext;
 
 const INDEXES: [&[&str]; 2] = [&["K"], &["Tag", "K"]];
 
@@ -173,30 +172,9 @@ async fn write(tables: &[&Arc<CayenneTableProvider>], batch: &RecordBatch) {
     }
 }
 
-/// The ids `sql` returns from `table`, sorted.
-async fn ids(table: &Arc<CayenneTableProvider>, sql: &str) -> Vec<i64> {
-    let ctx = SessionContext::new();
-    ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
-        .expect("register");
-    let batches = ctx
-        .sql(sql)
-        .await
-        .unwrap_or_else(|e| panic!("plan {sql}: {e}"))
-        .collect()
-        .await
-        .unwrap_or_else(|e| panic!("run {sql}: {e}"));
-    let mut ids: Vec<i64> = batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("AutoId")
-                .values()
-                .to_vec()
-        })
-        .collect();
+/// The ids `sql` returns from `table`, registered as `t`, sorted.
+async fn ids<T: TableProvider + 'static>(table: &Arc<T>, sql: &str) -> Vec<i64> {
+    let mut ids = int64_column(&query(table, "t", sql).await);
     ids.sort_unstable();
     ids
 }
@@ -248,34 +226,6 @@ fn oracle(written: &[RecordBatch], key: &DataType) -> Arc<datafusion::datasource
     Arc::new(datafusion::datasource::MemTable::try_new(target, vec![batches]).expect("oracle"))
 }
 
-/// The ids `sql` returns from `table`, a `MemTable`, sorted.
-async fn oracle_ids(table: &Arc<datafusion::datasource::MemTable>, sql: &str) -> Vec<i64> {
-    let ctx = SessionContext::new();
-    ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
-        .expect("register");
-    let batches = ctx
-        .sql(sql)
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("run");
-    let mut ids: Vec<i64> = batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("AutoId")
-                .values()
-                .to_vec()
-        })
-        .collect();
-    ids.sort_unstable();
-    ids
-}
-
 /// Runs every lookup on the indexed table, the unindexed one and the in-memory
 /// `oracle`, and fails on the first that disagrees. The indexed table must
 /// match the unindexed one on every lookup, so the index never changes an
@@ -300,7 +250,7 @@ async fn compare(
         if !sql.contains("'NaN'") {
             assert_eq!(
                 got,
-                oracle_ids(oracle, &sql).await,
+                ids(oracle, &sql).await,
                 "{stage}, against the engine: {sql}"
             );
         }

@@ -23,7 +23,9 @@ limitations under the License.
 
 mod common;
 
-use common::lookup_index::{TableSpec, open_table, overwrite, query, runtime_with_pool};
+use common::lookup_index::{
+    TableSpec, explain_total, int64_column, open_table, overwrite, query, runtime_with_pool,
+};
 
 use std::sync::Arc;
 
@@ -31,11 +33,9 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use cayenne::CayenneTableProvider;
 use cayenne::metadata::VortexConfig;
 
 use datafusion::datasource::TableProvider;
-use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
 
 const TABLE: &str = "svc_budget";
@@ -99,24 +99,9 @@ fn service_rows_from(offset: usize, rows: usize) -> RecordBatch {
     .expect("fixture batch")
 }
 
-/// The indexed table `name`, writing files of up to
-/// `target_vortex_file_size_mb`.
-async fn build_with_file_size(
-    fixture: &common::TestFixture,
-    runtime_env: Arc<RuntimeEnv>,
-    name: &str,
-    target_vortex_file_size_mb: usize,
-) -> Arc<CayenneTableProvider> {
-    let config = VortexConfig {
-        target_vortex_file_size_mb,
-        ..VortexConfig::default()
-    };
-    open_table(
-        fixture,
-        runtime_env,
-        TableSpec::new(name, service_schema(), &[&INDEX_KEY]).config(config),
-    )
-    .await
+/// The indexed table `name`, in file mode unless `spec` says otherwise.
+fn spec(name: &str) -> TableSpec<'_> {
+    TableSpec::new(name, service_schema(), &[&INDEX_KEY])
 }
 
 fn rows_of(batches: &[RecordBatch]) -> usize {
@@ -135,7 +120,7 @@ async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
         .await
         .expect("fixture");
     let (runtime_env, pool) = runtime_with_pool(POOL_BYTES);
-    let table = build_with_file_size(&fixture, Arc::clone(&runtime_env), TABLE, 1).await;
+    let table = open_table(&fixture, Arc::clone(&runtime_env), spec(TABLE)).await;
     overwrite(&table, vec![service_rows(ROWS)]).await;
 
     // The write's runs were built and refused; no file may be covered.
@@ -211,7 +196,7 @@ async fn a_mixed_type_composite_key_is_indexed() {
         .await
         .expect("fixture");
     let (runtime_env, pool) = runtime_with_pool(POOL_BYTES);
-    let table = build_with_file_size(&fixture, Arc::clone(&runtime_env), SMALL_TABLE, 1).await;
+    let table = open_table(&fixture, Arc::clone(&runtime_env), spec(SMALL_TABLE)).await;
     overwrite(&table, vec![service_rows(SMALL_ROWS)]).await;
 
     let report = table
@@ -268,16 +253,6 @@ async fn a_mixed_type_composite_key_is_indexed() {
     );
 }
 
-/// The `uncovered_files=` count an `EXPLAIN` line reports, if any.
-fn uncovered_files_of(plan: &str) -> Option<usize> {
-    let (_, rest) = plan.split_once("uncovered_files=")?;
-    rest.chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .ok()
-}
-
 /// A write whose index the pool cannot fit is read in full beside the index of
 /// the writes that did fit, and the lookup says so: coverage `partial`, with
 /// that file counted in `uncovered_files`, and never `full` — even through a
@@ -290,7 +265,16 @@ async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
     let (runtime_env, _pool) = runtime_with_pool(POOL_BYTES);
     // One file per write, so the background build of the append's file needs
     // as much memory as its write did and is refused too.
-    let table = build_with_file_size(&fixture, Arc::clone(&runtime_env), PARTIAL_TABLE, 256).await;
+    let config = VortexConfig {
+        target_vortex_file_size_mb: 256,
+        ..VortexConfig::default()
+    };
+    let table = open_table(
+        &fixture,
+        Arc::clone(&runtime_env),
+        spec(PARTIAL_TABLE).config(config),
+    )
+    .await;
     overwrite(&table, vec![service_rows(SMALL_ROWS)]).await;
     let indexed = table
         .lookup_index_counters()
@@ -326,23 +310,11 @@ async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
             .expect("format plan")
             .to_string();
         assert!(
-            plan.contains("lookup_index_outcome=partial")
-                && uncovered_files_of(&plan).is_some_and(|files| files > 0),
+            plan.contains("lookup_index=(TenantId, ServiceId)")
+                && explain_total(&plan, "uncovered_files") > 0,
             "a key in {what} must be partly covered, reading the unindexed file in full:\n{plan}"
         );
-        let rows = query(&table, PARTIAL_TABLE, &sql).await;
-        let found: Vec<i64> = rows
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("AutoId")
-                    .values()
-                    .to_vec()
-            })
-            .collect();
+        let found = int64_column(&query(&table, PARTIAL_TABLE, &sql).await);
         assert_eq!(
             found,
             vec![i64::try_from(id).expect("fits i64")],

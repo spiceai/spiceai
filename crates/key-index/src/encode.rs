@@ -14,12 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A compact, order-preserving, prefix-free byte encoding of compound Arrow
-//! keys, written one row at a time straight from the columns.
+//! A compact, prefix-free byte encoding of compound Arrow keys, written one
+//! row at a time straight from the columns. Byte order is the order of the key
+//! tuple, except for the floats the encoding gives one encoding (below):
+//! `-0.0` and `0.0` encode alike, and every NaN encodes as the one positive
+//! quiet NaN, above `+∞`, wherever the NaN's own bits sort.
 //!
 //! A key is the concatenation of its columns' encodings, so the bytes of the
-//! leading columns are a prefix of the key and byte order is the order of the
-//! key tuple. Each column encodes as:
+//! leading columns are a prefix of the key. Each column encodes as:
 //!
 //! | column | encoding |
 //! |---|---|
@@ -144,8 +146,10 @@ pub struct KeyEncoder {
 #[derive(Debug, Clone)]
 enum WordRule {
     /// Every field is fixed-width and their values fit 8 bytes: the word is
-    /// the values' bytes as one big-endian integer, so distinct keys have
-    /// distinct words, in key order. Per field: whether it is nullable (its
+    /// the values' encoded bytes as one big-endian integer, so keys with
+    /// distinct encodings have distinct words, in key order. (Floats `-0.0`
+    /// and `0.0`, and every NaN, share an encoding by design; see the module
+    /// docs.) Per field: whether it is nullable (its
     /// encoding then starts with a marker byte) and its value's width.
     Exact(Vec<(bool, usize)>),
     /// Otherwise the word is a 64-bit hash of the encoded key, keeping only
@@ -188,8 +192,7 @@ enum Kind {
     FixedSizeBinary(i32),
 }
 
-/// The [`Kind`] of `data_type`, or `None` when it has no order-preserving
-/// encoding here.
+/// The [`Kind`] of `data_type`, or `None` when it has no key encoding here.
 fn kind(data_type: &DataType) -> Option<Kind> {
     Some(match data_type {
         DataType::Int8 => Kind::Int8,
@@ -227,10 +230,29 @@ fn kind(data_type: &DataType) -> Option<Kind> {
     })
 }
 
+/// The type a column of `column_type` is keyed by: its own, or a dictionary
+/// column's value type, since equal values must share a key whatever
+/// dictionary holds them.
+#[must_use]
+pub fn key_type(column_type: &DataType) -> &DataType {
+    match column_type {
+        DataType::Dictionary(_, value) => value,
+        other => other,
+    }
+}
+
+/// Whether a column of `column_type` can be part of a key, keyed by its
+/// [`key_type`].
+#[must_use]
+pub fn can_key(column_type: &DataType) -> bool {
+    kind(key_type(column_type)).is_some()
+}
+
 impl Kind {
     /// The encoded width of a value when it is fixed, for the kinds whose
-    /// encoding is a fixed-width, injective image of the value and that may
-    /// fold into an exact word. Others return `None` and are hashed, which is
+    /// encoding is fixed-width and that may fold into an exact word. The
+    /// encoding is injective on values, except that floats give `-0.0` and
+    /// `0.0`, and every NaN, one encoding each (see the module docs). Others return `None` and are hashed, which is
     /// always correct.
     fn fixed_width(self) -> Option<usize> {
         match self {
@@ -279,8 +301,8 @@ impl KeyEncoder {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::UnsupportedType`] when a field's type has no
-    /// order-preserving encoding here.
+    /// [`crate::Error::UnsupportedType`] when a field's type has no key
+    /// encoding here.
     pub fn new(fields: Vec<KeyField>) -> Result<Self> {
         let kinds = fields
             .iter()

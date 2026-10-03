@@ -24,10 +24,12 @@ limitations under the License.
 
 mod common;
 
-use common::lookup_index::{TableSpec, counters, open_table, overwrite, query, rendered};
+use common::lookup_index::{
+    TableSpec, counters, open_table, overwrite, poll_until, query, rendered,
+};
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -302,22 +304,28 @@ async fn position_deletes_compose_with_the_index() {
     };
 
     // The index may be rebuilt for the post-delete snapshot in the background;
-    // keep issuing lookups until one is served from it or the deadline passes.
-    let deadline = Instant::now() + Duration::from_mins(2);
-    let mut served = false;
-    while !served && Instant::now() < deadline {
-        let before = counters(&indexed).full;
-        let _ = query(
-            &indexed,
-            INDEXED,
-            &query_for(keys[1]).replace("{t}", INDEXED),
-        )
-        .await;
-        served = counters(&indexed).full > before;
-        if !served {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }
+    // keep issuing lookups until one is served from it.
+    poll_until(
+        Duration::from_mins(2),
+        Duration::from_millis(250),
+        async || {
+            let before = counters(&indexed).full;
+            let _ = query(
+                &indexed,
+                INDEXED,
+                &query_for(keys[1]).replace("{t}", INDEXED),
+            )
+            .await;
+            let after = counters(&indexed);
+            if after.full > before { Ok(()) } else { Err(after) }
+        },
+        |after| {
+            format!(
+                "lookups on a table with position deletes were never served from the index: {after:?}"
+            )
+        },
+    )
+    .await;
 
     let before = counters(&indexed);
     for &id in &keys {
@@ -333,8 +341,7 @@ async fn position_deletes_compose_with_the_index() {
     // key. None falls back to a scan.
     let answered = (after.full - before.full) + (after.partial - before.partial);
     assert!(
-        served
-            && answered == u64::try_from(keys.len()).expect("fits")
+        answered == u64::try_from(keys.len()).expect("fits")
             && after.full > before.full
             && after.none == before.none,
         "lookups on a table with position deletes were not served from the index: {before:?} -> {after:?}"
@@ -388,7 +395,7 @@ async fn position_deletes_compose_with_the_index() {
         }
     };
     let expected = rendered(&run_join(Arc::clone(&plain), PLAIN).await);
-    let selected_before = counters(&indexed).full;
+    let full_before = counters(&indexed).full;
     let actual = rendered(&run_join(Arc::clone(&indexed), INDEXED).await);
     assert_eq!(
         actual, expected,
@@ -396,7 +403,7 @@ async fn position_deletes_compose_with_the_index() {
     );
     assert_eq!(
         counters(&indexed).full,
-        selected_before + 1,
+        full_before + 1,
         "the dynamic join did not compose its index selection with position deletes"
     );
 }

@@ -35,14 +35,14 @@ limitations under the License.
 //! lacks a key column — is read whole.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
 use datafusion_common::ScalarValue;
 
 use super::lookup_index::{
-    Counters, Coverage, KeyColumn, KeySpec, LookupIndexCounters, LookupIndexScanReason, cast_to,
-    key_converter, key_tuples, record_probe_outcome,
+    Counters, Coverage, KeyColumn, KeySpec, LookupIndexCounters, LookupIndexScanReason, WarnOnce,
+    cast_to, key_converter, key_tuples, record_probe_outcome,
 };
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
 use crate::row_converter::RowConverter;
@@ -63,9 +63,9 @@ pub(crate) struct MemTierIndexer {
     table_name: String,
     keys: Vec<ResolvedKey>,
     account: Arc<CayenneMemoryAccount>,
-    /// Whether a refused batch has been reported yet, so the warning is logged
-    /// once per table rather than once per batch.
-    refusal_reported: AtomicBool,
+    /// A refused batch, reported at `warn` once per table rather than once
+    /// per batch.
+    refusal: WarnOnce,
     counters: Counters,
 }
 
@@ -125,7 +125,7 @@ impl MemTierIndexer {
             table_name: table_name.to_string(),
             keys,
             account,
-            refusal_reported: AtomicBool::new(false),
+            refusal: WarnOnce::default(),
             counters: Counters::default(),
         }))
     }
@@ -176,13 +176,13 @@ impl MemTierIndexer {
             self.counters
                 .builds_unpublished
                 .fetch_add(1, Ordering::Relaxed);
-            if !self.refusal_reported.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    table = %self.table_name,
+            self.refusal.report(
+                &self.table_name,
+                &format!(
                     "Dataset '{}' (cayenne): part of its secondary index was not built because the query memory pool cannot fit it, so lookups read those rows in full. Raise `runtime.query.memory_limit` or remove the entry from `indexes`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
                     self.table_name
-                );
-            }
+                ),
+            );
             return None;
         };
         self.counters
@@ -330,10 +330,10 @@ pub(crate) struct SegmentIndex {
 /// The rows of one segment a lookup must read.
 pub(crate) struct Candidates {
     pub(crate) batches: Vec<RecordBatch>,
-    /// Whether any batch was read whole for want of an index.
-    pub(crate) read_whole: bool,
-    /// Whether any batch was narrowed by its index.
-    pub(crate) indexed: bool,
+    /// Batches read whole for want of an index.
+    pub(crate) read_whole: usize,
+    /// Batches narrowed by their index.
+    pub(crate) indexed: usize,
 }
 
 impl SegmentIndex {
@@ -355,8 +355,8 @@ impl SegmentIndex {
     ) -> datafusion_common::Result<Candidates> {
         let mut candidates = Candidates {
             batches: Vec::new(),
-            read_whole: false,
-            indexed: false,
+            read_whole: 0,
+            indexed: 0,
         };
         if probe.hashes.is_empty() {
             return Ok(candidates);
@@ -365,7 +365,7 @@ impl SegmentIndex {
         // else; read the segment whole rather than trust it.
         if self.batches.len() != batches.len() {
             candidates.batches = batches.to_vec();
-            candidates.read_whole = true;
+            candidates.read_whole = batches.len();
             return Ok(candidates);
         }
         for (batch, index) in batches.iter().zip(&self.batches) {
@@ -374,10 +374,10 @@ impl SegmentIndex {
                 .and_then(|index| index.keys.get(probe.position))
             else {
                 candidates.batches.push(batch.clone());
-                candidates.read_whole = true;
+                candidates.read_whole += 1;
                 continue;
             };
-            candidates.indexed = true;
+            candidates.indexed += 1;
             // Distinct hashes hold disjoint rows, so the union needs only
             // sorting back into row order.
             let mut rows: Vec<u32> = probe
@@ -510,7 +510,7 @@ mod tests {
 
         let probe = indexer.probe_key(&pinned(Some(1), "a")).expect("pinned");
         let candidates = index.candidates(&batches, &probe).expect("candidates");
-        assert!(!candidates.read_whole);
+        assert_eq!(candidates.read_whole, 0);
         // Rows 0 and 2 of the first batch and row 0 of the second; the NULL
         // tenant row is not a candidate.
         assert_eq!(payloads(&candidates), vec!["p0", "p0", "p2"]);
@@ -596,7 +596,7 @@ mod tests {
                     ))
                     .expect("both key columns pinned");
                 let candidates = index.candidates(&batches, &probe).expect("candidates");
-                assert!(!candidates.read_whole);
+                assert_eq!(candidates.read_whole, 0);
                 let mut expected: Vec<String> = rows
                     .iter()
                     .enumerate()
@@ -672,7 +672,7 @@ mod tests {
         assert_eq!(pool.reserved(), 0, "a refused batch index reserves nothing");
         let probe = indexer.probe_key(&pinned(Some(1), "a")).expect("pinned");
         let candidates = index.candidates(&batches, &probe).expect("candidates");
-        assert!(candidates.read_whole);
+        assert!(candidates.read_whole > 0);
         assert_eq!(candidates.batches[0].num_rows(), 6);
         assert_eq!(indexer.counters().builds_unpublished, 1);
     }

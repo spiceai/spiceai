@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 //! What the secondary index tests share: opening an indexed table, writing
-//! and querying it, reading its index counters, and waiting for its index to
-//! cover every file.
+//! and querying it, reading its index counters and plans, and waiting for its
+//! index to cover every file.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, RecordBatch};
+use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use cayenne::lookup_index::{IndexPersistence, LookupIndexCounters, LookupIndexVerification};
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
@@ -31,6 +31,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::SessionContext;
+use datafusion_expr::dml::InsertOp;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -164,27 +165,33 @@ pub fn runtime_with_pool(bytes: usize) -> (Arc<RuntimeEnv>, Arc<dyn MemoryPool>)
 
 /// Replaces the table's rows with `batches`, in one write.
 pub async fn overwrite(provider: &Arc<CayenneTableProvider>, batches: Vec<RecordBatch>) {
-    let ctx = SessionContext::new();
-    let schema = batches.first().expect("a batch").schema();
-    let exec =
-        datafusion::datasource::memory::MemorySourceConfig::try_new_exec(&[batches], schema, None)
-            .expect("overwrite source");
-    let plan = provider
-        .insert_into(
-            &ctx.state(),
-            exec,
-            datafusion_expr::dml::InsertOp::Overwrite,
-        )
-        .await
-        .expect("overwrite plan");
-    datafusion_physical_plan::collect(plan, ctx.task_ctx())
+    super::write_batches(provider, batches, InsertOp::Overwrite)
         .await
         .expect("overwrite");
 }
 
-/// Runs `sql` against the table registered as `name`.
-pub async fn query(
-    provider: &Arc<CayenneTableProvider>,
+/// Appends `batch` through SQL (`INSERT INTO name SELECT * FROM src`), so the
+/// write takes the path a SQL `INSERT` does rather than calling the table's
+/// `insert_into` directly.
+pub async fn insert(provider: &Arc<CayenneTableProvider>, name: &str, batch: RecordBatch) {
+    let ctx = SessionContext::new();
+    ctx.register_table(name, Arc::clone(provider) as Arc<dyn TableProvider>)
+        .expect("register target");
+    let mem = datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch]])
+        .expect("memtable");
+    ctx.register_table("src", Arc::new(mem))
+        .expect("register src");
+    ctx.sql(&format!("INSERT INTO {name} SELECT * FROM src"))
+        .await
+        .expect("insert plan")
+        .collect()
+        .await
+        .expect("insert");
+}
+
+/// Runs `sql` against `provider` registered as `name`.
+pub async fn query<T: TableProvider + 'static>(
+    provider: &Arc<T>,
     name: &str,
     sql: &str,
 ) -> Vec<RecordBatch> {
@@ -223,11 +230,65 @@ pub fn rendered(batches: &[RecordBatch]) -> Vec<String> {
     rows
 }
 
+/// The values of the first column of `batches`, an `Int64` column, in order.
+pub fn int64_column(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("the first column is Int64")
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// The `{field}=` counts a plan reports (`candidate_files`,
+/// `uncovered_files`, ...), summed over every scan that reports one.
+pub fn explain_total(plan: &str, field: &str) -> usize {
+    plan.split(&format!(" {field}="))
+        .skip(1)
+        .filter_map(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .sum()
+}
+
 /// The table's secondary index counters.
 pub fn counters(provider: &Arc<CayenneTableProvider>) -> LookupIndexCounters {
     provider
         .lookup_index_counters()
         .expect("the table declares indexes")
+}
+
+/// Runs `attempt` every `interval` until it returns `Ok`, and returns that
+/// value. An `Err` carries the state `attempt` observed; once `timeout` has
+/// passed, the test fails with `failure` applied to the last such state.
+pub async fn poll_until<T, S>(
+    timeout: Duration,
+    interval: Duration,
+    mut attempt: impl AsyncFnMut() -> Result<T, S>,
+    failure: impl FnOnce(S) -> String,
+) -> T {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state = match attempt().await {
+            Ok(done) => return done,
+            Err(state) => state,
+        };
+        assert!(
+            Instant::now() < deadline,
+            "{} (waited {timeout:?})",
+            failure(state)
+        );
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Runs `poke` (a lookup, which requests a background build of any file the
@@ -238,23 +299,25 @@ pub async fn until_covered(
     provider: &Arc<CayenneTableProvider>,
     mut poke: impl AsyncFnMut(),
 ) -> LookupIndexVerification {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        poke().await;
-        let verification = provider
-            .verify_lookup_index_against_read_back()
-            .await
-            .expect("verify the index");
-        assert!(verification.agrees(), "{verification:?}");
-        if verification.uncovered_files == 0 {
-            return verification;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the index was not built over every file: {verification:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(20),
+        async || {
+            poke().await;
+            let verification = provider
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify the index");
+            assert!(verification.agrees(), "{verification:?}");
+            if verification.uncovered_files == 0 {
+                Ok(verification)
+            } else {
+                Err(verification)
+            }
+        },
+        |verification| format!("the index was not built over every file: {verification:?}"),
+    )
+    .await
 }
 
 /// A small, seedable pseudo-random generator (`SplitMix64`), so a test's data

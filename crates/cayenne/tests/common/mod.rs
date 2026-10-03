@@ -229,6 +229,18 @@ pub async fn insert_batches(
     provider: &CayenneTableProvider,
     batches: Vec<RecordBatch>,
 ) -> DFResult<u64> {
+    write_batches(provider, batches, InsertOp::Append).await
+}
+
+/// Write record batches through the `insert_into()` API with `op`, in one
+/// write; returns the row count the write reports.
+///
+/// Creates a temporary `SessionContext` internally.
+pub async fn write_batches(
+    provider: &CayenneTableProvider,
+    batches: Vec<RecordBatch>,
+    op: InsertOp,
+) -> DFResult<u64> {
     use datafusion::physical_plan::collect;
 
     if batches.is_empty() {
@@ -240,9 +252,7 @@ pub async fn insert_batches(
     let ctx = SessionContext::new();
     let schema = Arc::clone(batches[0].schema_ref());
     let input_exec = MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
-    let insert_plan = provider
-        .insert_into(&ctx.state(), input_exec, InsertOp::Append)
-        .await?;
+    let insert_plan = provider.insert_into(&ctx.state(), input_exec, op).await?;
     let results = collect(insert_plan, ctx.task_ctx()).await?;
 
     Ok(extract_row_count(&results))

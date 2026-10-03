@@ -737,6 +737,87 @@ fn a_run_of_another_encoding_is_not_published() {
     assert_eq!(found, vec![("own".to_string(), 0)]);
 }
 
+/// Each live file is covered by one run, so a lookup returns each of its rows
+/// once. A run over a file another live run already covers (a write's run and
+/// a read-back of the same file, both finishing) is not published, whether
+/// that run was published before or alongside it; a run with any such file is
+/// refused whole, so its other files stay uncovered and are read in full.
+#[test]
+fn a_file_is_covered_by_one_run_only() {
+    let candidates = |index: &TieredIndex, key: i64| {
+        let mut found = Vec::new();
+        index.candidates(&encoded(key), |candidate| {
+            found.push((candidate.file.to_string(), candidate.position));
+        });
+        found
+    };
+    let one = vec![("same".to_string(), 0)];
+
+    let index = TieredIndex::new(encoder());
+    index.publish(vec![run_of("same", &[11])], &[]);
+    index.publish(vec![run_of("same", &[11])], &[]);
+    assert_eq!(candidates(&index, 11), one, "published one after the other");
+    assert_eq!(index.view().runs(), 1);
+
+    let index = TieredIndex::new(encoder());
+    index.publish(vec![run_of("same", &[11]), run_of("same", &[11])], &[]);
+    assert_eq!(candidates(&index, 11), one, "published together");
+
+    let index = TieredIndex::new(encoder());
+    index.publish(vec![run_of("same", &[11])], &[]);
+    let mut overlapping = RunBuilder::new(encoder());
+    overlapping
+        .add_batch("same", 0, &column(&[11]))
+        .expect("add");
+    overlapping
+        .add_batch("other", 0, &column(&[12]))
+        .expect("add");
+    index.publish(vec![overlapping.finish().expect("finish")], &[]);
+    assert_eq!(candidates(&index, 11), one, "a partly overlapping run");
+    assert!(
+        !index.view().covers("other"),
+        "a refused run's other files stay uncovered"
+    );
+}
+
+/// A merge keeps only the files still live when it starts. A file retired
+/// from one run can be covered again by a later run (a write that becomes
+/// visible after its grace ran out, then indexed by a read-back), and a merged
+/// run naming it twice would be one its own reader rejects.
+#[test]
+fn a_merge_drops_retired_files_from_the_merged_run() {
+    let index = TieredIndex::new(encoder());
+    let mut builder = RunBuilder::new(encoder());
+    builder.add_batch("same", 0, &column(&[11])).expect("add");
+    builder.add_batch("keep", 0, &column(&[12])).expect("add");
+    index.publish(vec![builder.finish().expect("finish")], &[]);
+    index.publish(vec![], &["same"]);
+    index.publish(vec![run_of("same", &[13])], &[]);
+    assert!(index.merge_all().expect("merge"));
+    let runs = index.view().run_list();
+    assert_eq!(runs.len(), 1);
+    let merged = &runs[0];
+    let mut names: Vec<&str> = merged.files().iter().map(AsRef::as_ref).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["keep", "same"], "the retired file is not kept");
+    let restored = IndexRun::from_bytes(&merged.to_bytes()).expect("the merged run reads back");
+    assert_eq!(restored.len(), merged.len());
+    let found = |key: i64| {
+        let mut found = Vec::new();
+        index.candidates(&encoded(key), |candidate| {
+            found.push((candidate.file.to_string(), candidate.position));
+        });
+        found
+    };
+    assert_eq!(
+        found(11),
+        Vec::<(String, u64)>::new(),
+        "a retired file's row"
+    );
+    assert_eq!(found(12), vec![("keep".to_string(), 0)]);
+    assert_eq!(found(13), vec![("same".to_string(), 0)]);
+}
+
 mod persist {
     use std::collections::BTreeMap;
 
@@ -916,6 +997,65 @@ mod persist {
         );
     }
 
+    /// A run that names one file twice is rejected: its postings could reach
+    /// one row through both names, and a lookup would return the row twice.
+    #[test]
+    fn a_run_naming_a_file_twice_is_rejected() {
+        // Postings 0 and 1 are row 0 of file 0 and row 0 of file 1, both
+        // `same`.
+        let bytes = sealed(
+            &["same", "same"],
+            vec![7],
+            vec![word_proof::offset_slot(0)],
+            varints(&[2, 0, 1]),
+            2,
+        );
+        assert_eq!(IndexRun::from_bytes(&bytes).err(), Some(Error::Corrupt));
+        let distinct = sealed(
+            &["a", "b"],
+            vec![7],
+            vec![word_proof::offset_slot(0)],
+            varints(&[2, 0, 1]),
+            2,
+        );
+        assert!(
+            IndexRun::from_bytes(&distinct).is_ok(),
+            "distinct names load"
+        );
+    }
+
+    /// A run naming more files than [`MAX_RUN_FILES`] is rejected: no builder
+    /// writes one, and a merge involving it could never be built.
+    #[test]
+    fn a_run_naming_too_many_files_is_rejected() {
+        // A run of no rows over `files` distinct files, written as `to_bytes`
+        // writes one.
+        let run_over = |files: usize| {
+            let mut out = Vec::new();
+            crate::persist::header(&mut out, crate::persist::KIND_RUN);
+            out.extend_from_slice(&0_u64.to_le_bytes());
+            out.extend_from_slice(&u32::try_from(files).expect("fits").to_le_bytes());
+            for file in 0..files {
+                let name = file.to_string();
+                out.extend_from_slice(&u32::try_from(name.len()).expect("fits").to_le_bytes());
+                out.extend_from_slice(name.as_bytes());
+            }
+            out.extend_from_slice(&0_u64.to_le_bytes()); // rows
+            out.extend_from_slice(&0_u64.to_le_bytes()); // words
+            out.extend_from_slice(&0_u64.to_le_bytes()); // postings
+            crate::persist::seal(&mut out);
+            out
+        };
+        assert_eq!(
+            IndexRun::from_bytes(&run_over(MAX_RUN_FILES + 1)).err(),
+            Some(Error::Corrupt)
+        );
+        assert!(
+            IndexRun::from_bytes(&run_over(2)).is_ok(),
+            "a run within the limit loads"
+        );
+    }
+
     /// Two words whose slots share one posting stream, leaving the stream of
     /// the second unreferenced, are rejected even when the row count adds
     /// up: the second word's lookups would read the first's rows and miss
@@ -1016,7 +1156,7 @@ mod persist {
                 (35_592, 0xB56C_576B_EAC6_1324),
                 (95, 0xCBA3_9660_1670_7D8D),
                 (49_423, 0xF5F8_EEA9_AF2A_AA0E),
-                (12_749, 0x3A66_5409_8906_7BBE),
+                (12_673, 0xA17C_D5CB_4945_D384),
             ]
         );
     }

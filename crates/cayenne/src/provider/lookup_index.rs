@@ -135,9 +135,9 @@ const MERGE_ABOVE_RUNS: usize = 8;
 /// Name of the file-local row position column the read-back build projects.
 const READ_BACK_POSITION_COLUMN: &str = "__cayenne_lookup_row_idx";
 
-/// How much of what a lookup reads its index covers: the `coverage` dimension
-/// on `cayenne_lookup_index_probe_total` and `lookup_index_outcome` in
-/// `EXPLAIN`. The counts beside it say how much that is.
+/// How much of what a lookup reads its index covers. `EXPLAIN` shows it as
+/// counts (`uncovered_files` of `candidate_files`, or the batch counterparts
+/// in memory mode); the table's counters keep it per lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Coverage {
     /// No file (in memory mode, no batch) the lookup reads is indexed yet, so
@@ -151,14 +151,6 @@ pub(crate) enum Coverage {
 }
 
 impl Coverage {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unindexed => "none",
-            Self::Partial => "partial",
-            Self::Full => "full",
-        }
-    }
-
     /// The coverage of a read that included indexed parts (`indexed`) and
     /// unindexed ones (`unindexed`). A read of nothing is fully covered.
     pub(crate) const fn of(indexed: bool, unindexed: bool) -> Self {
@@ -168,37 +160,20 @@ impl Coverage {
             _ => Self::Full,
         }
     }
-
-    /// The coverage of two reads together.
-    const fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Unindexed, Self::Unindexed) => Self::Unindexed,
-            (Self::Full, Self::Full) => Self::Full,
-            _ => Self::Partial,
-        }
-    }
 }
 
-/// The lookup-index decision shown on `CayenneAccelerationExec` in `EXPLAIN`.
-/// `NotApplicable` is a planning decision, not a probe, so it is never counted
-/// as one.
+/// Whether an index served a lookup, and how much of what it read the index
+/// covered. `EXPLAIN` names the index only when it served the lookup
+/// ([`LookupIndexExplain::served_by`]). `NotApplicable` is a planning
+/// decision, not a probe, so it is never counted as one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LookupIndexExplainOutcome {
     NotApplicable,
     Probed(Coverage),
 }
 
-impl LookupIndexExplainOutcome {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotApplicable => "not_applicable",
-            Self::Probed(coverage) => coverage.as_str(),
-        }
-    }
-}
-
 /// Why a lookup on an indexed table scanned instead of using its index,
-/// reported in `EXPLAIN` beside `lookup_index_outcome=not_applicable`.
+/// reported in `EXPLAIN` beside `lookup_index=none`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LookupIndexScanReason {
     /// The filters give no indexed key a value for every one of its columns:
@@ -230,33 +205,50 @@ pub(crate) struct LookupIndexExplain {
     pub(crate) outcome: LookupIndexExplainOutcome,
     pub(crate) candidate_files: Option<usize>,
     /// Files the scan reads in full because no run covers them yet, which are
-    /// part of `candidate_files`: all of them on `none`, `0` on `full`.
+    /// part of `candidate_files`: all of them when the index covers none of
+    /// what the lookup reads, `0` when it covers all of it.
     pub(crate) uncovered_files: Option<usize>,
+    /// Files the index answered for (file mode): read at their candidate
+    /// rows, or skipped because none holds the key. Not shown in `EXPLAIN`;
+    /// with `uncovered_files` it decides the coverage of a merged decision.
+    pub(crate) indexed_files: Option<usize>,
+    /// Memory mode's counterparts of `candidate_files` and `uncovered_files`,
+    /// over the in-memory batches a lookup reads.
+    pub(crate) candidate_batches: Option<usize>,
+    pub(crate) uncovered_batches: Option<usize>,
     pub(crate) candidate_rows: Option<u64>,
     /// Why the lookup scanned, when an indexed table's lookup did.
     pub(crate) reason: Option<LookupIndexScanReason>,
 }
 
 impl LookupIndexExplain {
-    /// One decision for a scan that read several snapshots: their coverage
-    /// together (`none` when no snapshot's files were indexed, `full` when all
-    /// were, else `partial`), with their file counts summed. A snapshot the
-    /// index did not apply to leaves the others' decision as it is.
+    /// One decision for a scan that read several snapshots, over all of their
+    /// files: `none` when no file read was indexed, `full` when every one
+    /// was, else `partial`, with their file counts summed. A snapshot that
+    /// read no file, or that the index did not apply to, leaves the others'
+    /// decision as it is.
     #[must_use]
     pub(crate) fn merge(self, other: Self) -> Self {
         use LookupIndexExplainOutcome::{NotApplicable, Probed};
-        let (outcome, reason) = match (self.outcome, other.outcome) {
-            (Probed(a), Probed(b)) => (Probed(a.and(b)), None),
-            (Probed(_), NotApplicable) => (self.outcome, None),
-            (NotApplicable, Probed(_)) => (other.outcome, None),
-            (NotApplicable, NotApplicable) => (NotApplicable, self.reason.or(other.reason)),
-        };
         let sum = |a: Option<usize>, b: Option<usize>| match (a, b) {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
         };
         let sum_files = sum(self.candidate_files, other.candidate_files);
         let sum_uncovered = sum(self.uncovered_files, other.uncovered_files);
+        let sum_indexed = sum(self.indexed_files, other.indexed_files);
+        let (outcome, reason) = match (self.outcome, other.outcome) {
+            (Probed(_), Probed(_)) => (
+                Probed(Coverage::of(
+                    sum_indexed.unwrap_or(0) > 0,
+                    sum_uncovered.unwrap_or(0) > 0,
+                )),
+                None,
+            ),
+            (Probed(_), NotApplicable) => (self.outcome, None),
+            (NotApplicable, Probed(_)) => (other.outcome, None),
+            (NotApplicable, NotApplicable) => (NotApplicable, self.reason.or(other.reason)),
+        };
         // Every snapshot reports the selection's candidate rows, not its own.
         let sum_rows = self.candidate_rows.max(other.candidate_rows);
         Self {
@@ -264,8 +256,20 @@ impl LookupIndexExplain {
             outcome,
             candidate_files: sum_files,
             uncovered_files: sum_uncovered,
+            indexed_files: sum_indexed,
+            candidate_batches: sum(self.candidate_batches, other.candidate_batches),
+            uncovered_batches: sum(self.uncovered_batches, other.uncovered_batches),
             candidate_rows: sum_rows,
             reason,
+        }
+    }
+
+    /// The key whose index served the lookup, or `None` when no index did:
+    /// none matched, or the one that matched declined (see `reason`).
+    pub(crate) fn served_by(&self) -> Option<&str> {
+        match self.outcome {
+            LookupIndexExplainOutcome::Probed(_) => self.shape.as_deref(),
+            LookupIndexExplainOutcome::NotApplicable => None,
         }
     }
 
@@ -275,6 +279,9 @@ impl LookupIndexExplain {
             outcome: LookupIndexExplainOutcome::NotApplicable,
             candidate_files: None,
             uncovered_files: None,
+            indexed_files: None,
+            candidate_batches: None,
+            uncovered_batches: None,
             candidate_rows: None,
             reason: None,
         }
@@ -285,30 +292,6 @@ impl LookupIndexExplain {
         Self {
             reason: Some(reason),
             ..Self::not_applicable(shape)
-        }
-    }
-
-    pub(crate) fn fallback(shape: String, outcome: LookupIndexExplainOutcome) -> Self {
-        Self {
-            shape: Some(shape),
-            outcome,
-            candidate_files: None,
-            uncovered_files: None,
-            candidate_rows: None,
-            reason: None,
-        }
-    }
-
-    /// A lookup that read all `files` of its scan in full because none is
-    /// indexed.
-    fn unindexed(shape: String, files: usize) -> Self {
-        Self {
-            candidate_files: Some(files),
-            uncovered_files: Some(files),
-            ..Self::fallback(
-                shape,
-                LookupIndexExplainOutcome::Probed(Coverage::Unindexed),
-            )
         }
     }
 
@@ -323,6 +306,9 @@ impl LookupIndexExplain {
             outcome,
             candidate_files,
             uncovered_files: None,
+            indexed_files: None,
+            candidate_batches: None,
+            uncovered_batches: None,
             candidate_rows: Some(candidate_rows),
             reason: None,
         }
@@ -369,7 +355,7 @@ impl KeySpec {
 
     /// This key over `columns`, the table's spelling of its columns, keeping
     /// the label `indexes` gave it.
-    fn with_columns(self, columns: Vec<String>) -> Self {
+    pub(crate) fn with_columns(self, columns: Vec<String>) -> Self {
         Self {
             columns,
             label: self.label,
@@ -483,12 +469,9 @@ pub(crate) fn file_name(path: &str) -> &str {
 }
 
 /// The type a key column is encoded in: its stored type, or a dictionary's
-/// value type (equal values encode equally whatever their dictionary).
+/// value type (see [`key_index::key_type`]).
 fn encoded_type(data_type: &DataType) -> DataType {
-    match data_type {
-        DataType::Dictionary(_, value) => value.as_ref().clone(),
-        other => other.clone(),
-    }
+    key_index::key_type(data_type).clone()
 }
 
 /// Whether a column of `data_type` can be indexed. The index encodes a key
@@ -694,19 +677,24 @@ impl LookupIndexView {
 
     /// Candidates of `keys` (encoded; `None` matches nothing) under key
     /// `shape`, grouped by file name, each file's positions sorted and
-    /// distinct. `None` when more than `max_rows` would be selected: callers
-    /// never use a partial answer.
+    /// distinct; only those in the files `only` names, when it is given.
+    /// `None` when more than `max_rows` would be selected: callers never use
+    /// a partial answer.
     fn probe_keys(
         &self,
         shape: usize,
         keys: &[Option<Vec<u8>>],
         max_rows: Option<usize>,
+        only: Option<&HashSet<&str>>,
     ) -> Option<ProbeHit> {
         let present: Vec<&[u8]> = keys.iter().flatten().map(Vec::as_slice).collect();
         let mut by_file: HashMap<String, Vec<u64>> = HashMap::new();
         let mut selected = 0_usize;
         let mut over = false;
         self.views[shape].candidates_batch(&present, |_, Candidate { file, position }| {
+            if only.is_some_and(|only| !only.contains(file)) {
+                return;
+            }
             selected += 1;
             over |= max_rows.is_some_and(|limit| selected > limit);
             if !over {
@@ -747,10 +735,6 @@ pub(crate) struct LookupSelection {
     shape: String,
     per_file: HashMap<String, Vec<u64>>,
     rows: usize,
-    /// Whether [`Self::restrict`] records the probe's outcome. One query
-    /// records one probe, from its current snapshot's files; the copies that
-    /// narrow its protected snapshots do not.
-    record: bool,
 }
 
 /// The result of probing a fully pinned lookup-index key.
@@ -765,19 +749,10 @@ impl LookupSelection {
         &self.shape
     }
 
-    /// This selection, for narrowing one more snapshot of the same scan
-    /// without recording another probe.
-    #[must_use]
-    pub(crate) fn unrecorded(&self) -> Self {
-        Self {
-            record: false,
-            ..self.clone()
-        }
-    }
-
     /// Narrows a scan's file groups and returns the access-plan provider that
-    /// carries the candidate positions into the Vortex scan, recording the
-    /// probe's outcome.
+    /// carries the candidate positions into the Vortex scan, and the decision
+    /// for `EXPLAIN`, which the caller merges over every snapshot the scan
+    /// reads and records once (see [`LookupIndexState::record_lookup`]).
     ///
     /// Each file is judged on its own. A file the pinned view covers is kept
     /// only when it holds a candidate, and then read at those positions. A
@@ -818,46 +793,27 @@ impl LookupSelection {
             })
             .collect();
         let coverage = Coverage::of(covered > 0, uncovered > 0);
-        if coverage == Coverage::Unindexed {
-            // Nothing to narrow: every file this scan reads is unindexed.
-            if self.record {
-                self.state.record_probe(&self.shape, coverage);
-            }
-            return (
-                file_groups,
-                None,
-                LookupIndexExplain::unindexed(self.shape, uncovered),
-                true,
-            );
-        }
         let candidate_files: usize = file_groups.iter().map(FileGroup::len).sum();
-        if candidate_files == 0 {
+        let candidate_rows = match coverage {
+            Coverage::Unindexed => None,
             // Every file is indexed and none holds the key: nothing is read.
-            if self.record {
-                self.state.record_probe(&self.shape, Coverage::Full);
-            }
-            return (
-                file_groups,
-                None,
-                LookupIndexExplain {
-                    uncovered_files: Some(0),
-                    ..LookupIndexExplain::selection(
-                        self.shape,
-                        LookupIndexExplainOutcome::Probed(Coverage::Full),
-                        Some(0),
-                        0,
-                    )
-                },
-                false,
-            );
-        }
-        if self.record {
-            self.state.record_selection(
-                &self.shape,
-                coverage,
-                candidate_files as u64,
-                self.rows as u64,
-            );
+            _ if candidate_files == 0 => Some(0),
+            _ => Some(u64::try_from(self.rows).unwrap_or(u64::MAX)),
+        };
+        let explain = LookupIndexExplain {
+            shape: Some(self.shape),
+            outcome: LookupIndexExplainOutcome::Probed(coverage),
+            candidate_files: Some(candidate_files),
+            uncovered_files: Some(uncovered),
+            indexed_files: Some(covered),
+            candidate_batches: None,
+            uncovered_batches: None,
+            candidate_rows,
+            reason: None,
+        };
+        // Nothing to narrow when no file read is indexed, or none is left.
+        if covered == 0 || candidate_files == 0 {
+            return (file_groups, None, explain, uncovered > 0);
         }
         let provider = LookupAccessPlanProvider {
             state: self.state,
@@ -868,15 +824,7 @@ impl LookupSelection {
         (
             file_groups,
             Some(Arc::new(provider)),
-            LookupIndexExplain {
-                uncovered_files: Some(uncovered),
-                ..LookupIndexExplain::selection(
-                    self.shape,
-                    LookupIndexExplainOutcome::Probed(coverage),
-                    Some(candidate_files),
-                    u64::try_from(self.rows).unwrap_or(u64::MAX),
-                )
-            },
+            explain,
             uncovered > 0,
         )
     }
@@ -1300,6 +1248,35 @@ pub struct LookupIndexCounters {
     pub builds_unpublished: u64,
 }
 
+/// A problem that keeps recurring is logged at `warn` the first time, then
+/// at `debug` until [`Self::reset`], so a table that keeps hitting it does not
+/// flood the log.
+#[derive(Debug, Default)]
+pub(crate) struct WarnOnce(AtomicBool);
+
+impl WarnOnce {
+    /// Logs `message` for `table`, at `warn` unless it already has since the
+    /// last reset.
+    pub(crate) fn report(&self, table: &str, message: &str) {
+        if self.0.swap(true, Ordering::Relaxed) {
+            tracing::debug!(table = %table, "{message}");
+        } else {
+            tracing::warn!(table = %table, "{message}");
+        }
+    }
+
+    /// Whether it has warned since the last reset.
+    #[cfg(test)]
+    pub(crate) fn warned(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// The next report warns again.
+    pub(crate) fn reset(&self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Counters {
     none: AtomicU64,
@@ -1423,15 +1400,13 @@ pub(crate) struct LookupIndexState {
     /// Whether runs have been published yet, so only the first is logged at
     /// `info`.
     published_once: AtomicBool,
-    /// Whether the pool's refusal has been reported since runs last fit, so a
-    /// table the pool cannot fit warns once rather than on every write.
-    refusal_reported: AtomicBool,
+    /// The pool's refusal of runs, reported once until runs fit again.
+    refusal: WarnOnce,
     /// Where the runs persist, when they do.
     persisted_runs: std::sync::OnceLock<Arc<PersistedRuns>>,
-    /// Whether a write that could not be indexed has been reported since runs
-    /// last published, so a table whose writes keep failing to index warns
-    /// once rather than on every write.
-    write_failure_reported: AtomicBool,
+    /// A write that could not be indexed, reported once until runs publish
+    /// again.
+    write_failure: WarnOnce,
     counters: Counters,
     /// The table's scan-input version. Scan views pin the published view, so
     /// every change to it must invalidate the cached views, or scans keep
@@ -1462,21 +1437,6 @@ impl LookupIndexState {
             .iter()
             .map(|spec| Shape::new(spec, schema, word_bits).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
-        // A key column resolves to its table column whatever case `indexes`
-        // spelled it in; a filter names the table column, so match on that.
-        let specs: Vec<KeySpec> = specs
-            .into_iter()
-            .zip(&shapes)
-            .map(|(spec, shape)| {
-                spec.with_columns(
-                    shape
-                        .columns
-                        .iter()
-                        .map(|column| column.name.clone())
-                        .collect(),
-                )
-            })
-            .collect();
         let labels: Vec<&str> = specs.iter().map(KeySpec::label).collect();
         tracing::info!(
             table = %table_name,
@@ -1499,9 +1459,9 @@ impl LookupIndexState {
             merging: AtomicBool::new(false),
             schedule: Mutex::new(BuildSchedule::default()),
             published_once: AtomicBool::new(false),
-            refusal_reported: AtomicBool::new(false),
+            refusal: WarnOnce::default(),
             persisted_runs: std::sync::OnceLock::new(),
-            write_failure_reported: AtomicBool::new(false),
+            write_failure: WarnOnce::default(),
             counters: Counters::default(),
             scan_input_version,
         });
@@ -1741,12 +1701,8 @@ impl LookupIndexState {
         self.counters
             .builds_unpublished
             .fetch_add(1, Ordering::Relaxed);
-        let message = refused_build_message(&self.table_name);
-        if self.refusal_reported.swap(true, Ordering::Relaxed) {
-            tracing::debug!(table = %self.table_name, "{message}");
-        } else {
-            tracing::warn!(table = %self.table_name, "{message}");
-        }
+        self.refusal
+            .report(&self.table_name, &refused_build_message(&self.table_name));
     }
 
     /// Publishes one run per key over the same files, and pins the new view.
@@ -1778,8 +1734,8 @@ impl LookupIndexState {
             self.charge(self.run_bytes());
             self.repin();
         }
-        self.refusal_reported.store(false, Ordering::Relaxed);
-        self.write_failure_reported.store(false, Ordering::Relaxed);
+        self.refusal.reset();
+        self.write_failure.reset();
         self.report_coverage();
         self.counters
             .builds_published
@@ -2041,9 +1997,7 @@ impl LookupIndexState {
                 Ok(runs) => {
                     state.publish_runs(runs, None);
                 }
-                Err(cause) => {
-                    state.write_unindexed(&cause);
-                }
+                Err(cause) => state.write_unindexed(&cause),
             }
             tracing::debug!(
                 table = %state.table_name,
@@ -2056,8 +2010,8 @@ impl LookupIndexState {
     }
 
     /// Reports a write whose rows could not be indexed: at `warn` once until
-    /// runs publish again, then at `debug`. Returns whether it warned.
-    fn write_unindexed(&self, cause: &str) -> bool {
+    /// runs publish again, then at `debug`.
+    fn write_unindexed(&self, cause: &str) {
         self.counters
             .builds_unpublished
             .fetch_add(1, Ordering::Relaxed);
@@ -2065,13 +2019,7 @@ impl LookupIndexState {
             "Dataset '{}' (cayenne): failed to index a write's rows for its secondary index, so lookups read that write's files in full until they are indexed in the background. Cause: {cause}",
             self.table_name
         );
-        if self.write_failure_reported.swap(true, Ordering::Relaxed) {
-            tracing::debug!(table = %self.table_name, "{message}");
-            false
-        } else {
-            tracing::warn!(table = %self.table_name, "{message}");
-            true
-        }
+        self.write_failure.report(&self.table_name, &message);
     }
 
     /// The right to index the table's uncovered files in the background, or
@@ -2155,7 +2103,7 @@ impl LookupIndexState {
                 LookupIndexScanReason::ValueNotIndexable,
             ));
         };
-        let Some(hit) = index.probe_keys(shape, &encoded, max_rows) else {
+        let Some(hit) = index.probe_keys(shape, &encoded, max_rows, None) else {
             return LookupProbe::Fallback(LookupIndexExplain::scanned(
                 Some(label),
                 LookupIndexScanReason::TooManyCandidates,
@@ -2167,7 +2115,6 @@ impl LookupIndexState {
             shape: hit.shape,
             per_file: hit.per_file,
             rows: hit.rows,
-            record: true,
         })
     }
 
@@ -2187,10 +2134,13 @@ impl LookupIndexState {
         keys: &[Vec<ScalarValue>],
     ) -> RuntimeProbe {
         let label = self.shape_label(spec);
-        let covered = scan_files
+        // The view spans every file of the table; this scan answers only for
+        // its own, so only their candidates count, against the row bound too.
+        let read: HashSet<&str> = scan_files
             .iter()
-            .filter(|file| index.covers(file.location.as_ref()))
-            .count();
+            .map(|file| file_name(file.location.as_ref()))
+            .collect();
+        let covered = read.iter().filter(|name| index.covers(name)).count();
         if covered == 0 {
             self.record_probe(label, Coverage::Unindexed);
             return RuntimeProbe::IndexUnusable;
@@ -2201,22 +2151,14 @@ impl LookupIndexState {
         let hit = index.shapes[spec]
             .encode_keys(keys)
             .ok()
-            .and_then(|encoded| index.probe_keys(spec, &encoded, Some(max_rows)));
-        let Some(mut hit) = hit else {
+            .and_then(|encoded| index.probe_keys(spec, &encoded, Some(max_rows), Some(&read)));
+        let Some(hit) = hit else {
             self.record_runtime_fallback();
             return RuntimeProbe::Declined;
         };
-        // The view spans every file of the table; this scan answers only for
-        // its own, so candidates in any other file select nothing here.
-        let read: HashSet<&str> = scan_files
-            .iter()
-            .map(|file| file_name(file.location.as_ref()))
-            .collect();
-        hit.per_file.retain(|file, _| read.contains(file.as_str()));
-        hit.rows = hit.per_file.values().map(Vec::len).sum();
         // An uncovered file is read in full whatever the covered ones hold, so
         // a probe reads nothing only when every file the scan reads is covered.
-        let uncovered = scan_files.len() - covered;
+        let uncovered = read.len() - covered;
         if hit.rows == 0 && uncovered == 0 {
             // Every file is indexed and none holds a key: nothing is read.
             self.record_probe(&hit.shape, Coverage::Full);
@@ -2236,6 +2178,26 @@ impl LookupIndexState {
 
     fn record_probe(&self, shape: &str, coverage: Coverage) {
         record_probe_outcome(&self.table_name, &self.counters, shape, coverage);
+    }
+
+    /// Records a file-mode lookup once, from the decision its scan reached
+    /// over every snapshot it read.
+    pub(crate) fn record_lookup(&self, explain: &LookupIndexExplain) {
+        let (Some(shape), LookupIndexExplainOutcome::Probed(coverage)) =
+            (&explain.shape, explain.outcome)
+        else {
+            return;
+        };
+        if coverage == Coverage::Unindexed {
+            self.record_probe(shape, coverage);
+        } else {
+            self.record_selection(
+                shape,
+                coverage,
+                explain.candidate_files.unwrap_or(0) as u64,
+                explain.candidate_rows.unwrap_or(0),
+            );
+        }
     }
 
     fn record_selection(&self, shape: &str, coverage: Coverage, files: u64, rows: u64) {
@@ -2781,7 +2743,7 @@ fn run_file_name(run: &IndexRun) -> String {
     format!("{:016x}.run", hash_index::hash_key_bytes(&[&descriptor]))
 }
 
-/// Counts one probe's coverage and reports it on
+/// Counts one probe's coverage, and reports the probe on
 /// `cayenne_lookup_index_probe_total`.
 pub(crate) fn record_probe_outcome(
     table_name: &str,
@@ -2793,7 +2755,6 @@ pub(crate) fn record_probe_outcome(
     telemetry::cayenne::track_lookup_index_probe(&[
         telemetry::KeyValue::new("table", table_name.to_string()),
         telemetry::KeyValue::new("shape", shape.to_string()),
-        telemetry::KeyValue::new("coverage", coverage.as_str()),
     ]);
 }
 
@@ -3133,8 +3094,9 @@ fn diff_entries(
     }
 }
 
-/// Diffs `view`'s runs against a read-back of the files of `snapshot_id` it
-/// covers. `files` is that snapshot's whole file list, as a scan lists it.
+/// Diffs `view`'s runs against a read-back of the `files` it covers: every
+/// file a lookup on current snapshot `snapshot_id` reads, its own and the
+/// protected snapshots'.
 pub(crate) async fn verify_against_read_back(
     state: &Arc<LookupIndexState>,
     view: Arc<LookupIndexView>,
@@ -3583,17 +3545,19 @@ mod tests {
     async fn a_failing_write_warns_once_until_runs_publish() {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
         let state = keyed_state(&pool);
-        assert!(state.write_unindexed("first"), "the first failure warns");
-        assert!(!state.write_unindexed("second"), "a repeat does not");
+        state.write_unindexed("first");
+        assert!(state.write_failure.warned(), "the first failure warns");
+        state.write_unindexed("second");
         write(
             &state,
             &[("a.vortex", 0, keyed_batch(&[Some(1)], &[Some("x")]))],
         )
         .await;
         assert!(
-            state.write_unindexed("after a publish"),
+            !state.write_failure.warned(),
             "a failure after runs published warns again"
         );
+        state.write_unindexed("after a publish");
         assert_eq!(state.counters().builds_unpublished, 3);
     }
 
@@ -4120,7 +4084,7 @@ mod tests {
                 .expect("bounded");
             let encoded = state.shapes.load()[1].encode_keys(&keys).expect("encodes");
             assert_eq!(encoded.iter().filter(|key| key.is_none()).count(), 1);
-            let hit = view.probe_keys(1, &encoded, None).expect("unbounded");
+            let hit = view.probe_keys(1, &encoded, None, None).expect("unbounded");
             let mut expected: Vec<(String, u64)> = ["s0", "s2"]
                 .iter()
                 .filter_map(|service| truth.get(&(tenant, Some((*service).to_string()))))
@@ -4231,6 +4195,52 @@ mod tests {
         );
     }
 
+    /// A lookup over several snapshots is counted once, with the coverage
+    /// `EXPLAIN` reports for the whole scan: a current snapshot the index
+    /// covers and a protected one it does not make a partly covered lookup,
+    /// and a current snapshot with no files leaves the protected one's `none`.
+    #[tokio::test]
+    async fn a_lookup_over_several_snapshots_is_counted_with_its_merged_coverage() {
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        write(&state, &[("a.vortex", 0, keyed_batch(&[Some(1)], &[None]))]).await;
+        let view = state.published();
+        let counts = |state: &LookupIndexState| {
+            let counters = state.counters.snapshot(0);
+            (counters.none, counters.partial, counters.full)
+        };
+        for (current, protected, expected) in [
+            (&["a.vortex"][..], &["b.vortex"][..], Coverage::Partial),
+            (&[][..], &["b.vortex"][..], Coverage::Unindexed),
+        ] {
+            let before = counts(&state);
+            let selection = selection(state.probe(&view, &tenant_values(&[1])));
+            let (_, _, protected_explain, _) = selection
+                .clone()
+                .restrict(group(protected), no_table_plans());
+            let (_, _, current_explain, _) = selection.restrict(group(current), no_table_plans());
+            let explain = current_explain.merge(protected_explain);
+            state.record_lookup(&explain);
+            let after = counts(&state);
+            let recorded = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+            let reported = match explain.outcome {
+                LookupIndexExplainOutcome::Probed(Coverage::Unindexed) => (1, 0, 0),
+                LookupIndexExplainOutcome::Probed(Coverage::Partial) => (0, 1, 0),
+                LookupIndexExplainOutcome::Probed(Coverage::Full) => (0, 0, 1),
+                LookupIndexExplainOutcome::NotApplicable => (0, 0, 0),
+            };
+            assert_eq!(
+                explain.outcome,
+                LookupIndexExplainOutcome::Probed(expected),
+                "{current:?} + {protected:?}"
+            );
+            assert_eq!(
+                recorded, reported,
+                "{current:?} + {protected:?}: the metric matches EXPLAIN"
+            );
+        }
+    }
+
     /// A scan over several snapshots, one of them read in full, is one
     /// decision: partly covered, with the snapshot read in full counted among
     /// its candidate and uncovered files. Two fully covered snapshots stay
@@ -4239,6 +4249,7 @@ mod tests {
     fn a_selection_merged_with_an_unindexed_snapshot_counts_its_files() {
         let full = |files: usize| LookupIndexExplain {
             uncovered_files: Some(0),
+            indexed_files: Some(files),
             ..LookupIndexExplain::selection(
                 "TenantId".to_string(),
                 LookupIndexExplainOutcome::Probed(Coverage::Full),
@@ -4246,7 +4257,18 @@ mod tests {
                 4,
             )
         };
-        let unindexed = LookupIndexExplain::unindexed("TenantId".to_string(), 3);
+        let unindexed = LookupIndexExplain {
+            candidate_files: Some(3),
+            uncovered_files: Some(3),
+            indexed_files: Some(0),
+            candidate_rows: None,
+            ..LookupIndexExplain::selection(
+                "TenantId".to_string(),
+                LookupIndexExplainOutcome::Probed(Coverage::Unindexed),
+                None,
+                0,
+            )
+        };
         assert_eq!(
             full(2).merge(full(1)).outcome,
             LookupIndexExplainOutcome::Probed(Coverage::Full)

@@ -16,18 +16,22 @@ limitations under the License.
 
 //! Machine-checked prefix-freedom of the compound key encoding.
 //!
-//! Two distinct key tuples must never encode to the same bytes. The encoding
-//! has three steps: a variable-length value is escaped (`00` → `01 01`,
-//! `01` → `01 02`) and terminated by `00`; a nullable column is `00` for NULL
-//! or `01` followed by the value; and a key is its columns' encodings
-//! concatenated. The lemmas below prove, for every input, that each step keeps
-//! the set of encodings prefix-free, so the concatenation is injective.
+//! Two key tuples whose columns encode differently must never encode to the
+//! same bytes. The encoding frames each column in three steps: a
+//! variable-length value is escaped (`00` → `01 01`, `01` → `01 02`) and
+//! terminated by `00`; a nullable column is `00` for NULL or `01` followed by
+//! the value; and a key is its columns' encodings concatenated. The lemmas
+//! below prove, for every input, that each step keeps the set of encodings
+//! prefix-free, so the concatenation adds no collisions: it keeps every
+//! distinction the columns' encodings make. Which values one column's encoding
+//! tells apart is the encoder's choice; floats give `-0.0` and `0.0`, and
+//! every NaN, one encoding each.
 //!
 //! That is a property of the encoding, not of a lookup: an index stores a key
 //! that does not fit 8 bytes as a 64-bit hash of these bytes (see
 //! `word_proof`), which two keys can share, and the query's own filter drops
-//! the other key's rows. Injectivity makes that hash the only place two keys
-//! can collide.
+//! the other key's rows. The framing makes that hash the only place two keys
+//! whose columns encode differently can collide.
 //!
 //! [`escape_value_into`] is the executable escape [`crate::encode`] writes
 //! every string and binary value with, and its postcondition is the
