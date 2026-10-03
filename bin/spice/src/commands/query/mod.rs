@@ -47,7 +47,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 Queries are submitted asynchronously and the CLI auto-polls for completion. Press Ctrl+C to stop
 waiting for a query (the query continues running in the background).
 
-Async queries require cluster mode with scheduler.state_location configured."#
+Async queries require cluster mode with `runtime.scheduler.state_location` or `runtime.state.location` configured."#
 )]
 pub struct QueryArgs {
     /// SQL query to submit (if not provided, starts interactive REPL)

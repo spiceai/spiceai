@@ -152,10 +152,18 @@ impl Runtime {
                     let rate_controller =
                         crate::model::rate_limit::build_model_rate_controller(m, &params);
 
+                    // Every chat model also answers `/v1/evaluate`.
+                    let evaluator = completions_model.evaluator(&m.name);
+
                     let completion_llms = self.completion_llms();
                     let mut llm_map = completion_llms.write().await;
-                    llm_map.insert(m.name.clone(), completions_model);
+                    llm_map.insert(m.name.clone(), completions_model.chat);
                     drop(llm_map);
+
+                    let evaluate_models = self.llm_runtime_stores.evaluate_models();
+                    let mut evaluate_map = evaluate_models.write().await;
+                    evaluate_map.insert(m.name.clone(), evaluator);
+                    drop(evaluate_map);
 
                     if let Some(responses_model) = responses_model {
                         let responses_llms = self.responses_llms();
