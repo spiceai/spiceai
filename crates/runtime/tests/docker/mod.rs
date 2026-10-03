@@ -652,7 +652,7 @@ async fn create_taking_over_name(
             // One message rather than nested contexts: callers format with `{e}`,
             // which prints only the outermost one.
             let removal = removal_failure.map_or_else(
-                || "no attempt to inspect or remove its holder failed".to_string(),
+                || "the last attempt to inspect or remove its holder did not fail".to_string(),
                 |e| format!("the last attempt to inspect or remove its holder failed: {e:#}"),
             );
             return Err(anyhow::Error::new(conflict).context(format!(
@@ -660,9 +660,9 @@ async fn create_taking_over_name(
             )));
         }
         tracing::debug!("Docker still holds the name {name}; retrying the creation");
-        if let Err(e) = remove_if_never_started(docker, name).await {
-            removal_failure = Some(e);
-        }
+        // Only the latest attempt's outcome: an earlier failure that a later
+        // attempt got past is not the reason the name is still taken.
+        removal_failure = remove_if_never_started(docker, name).await.err();
         tokio::time::sleep(NAME_RELEASE_POLL_INTERVAL).await;
     }
 }
