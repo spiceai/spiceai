@@ -446,6 +446,34 @@ mod served_from_acceleration {
         dataset
     }
 
+    /// `dataset` refreshed on the cron schedule `cron` instead of an interval.
+    fn with_refresh_cron(mut dataset: SpicepodDataset, cron: &str) -> SpicepodDataset {
+        if let Some(acceleration) = dataset.acceleration.as_mut() {
+            acceleration.refresh_check_interval = None;
+            acceleration.refresh_cron = Some(cron.to_string());
+        }
+        dataset
+    }
+
+    /// `orders`'s `last_refresh` and `next_refresh` from `/v1/datasets?status=true`.
+    async fn freshness(
+        rt: &Arc<Runtime>,
+    ) -> (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let infos = runtime::dataset_infos_with_status(rt).await;
+        let Some(orders) = infos.iter().find(|info| info.name == "orders") else {
+            return (None, None);
+        };
+        let parse = |time: &Option<String>| {
+            time.as_deref()
+                .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+                .map(|time| time.with_timezone(&chrono::Utc))
+        };
+        (parse(&orders.last_refresh), parse(&orders.next_refresh))
+    }
+
     /// `dataset` checking for a due refresh only every `interval`.
     fn with_refresh_check_interval(
         mut dataset: SpicepodDataset,
@@ -949,6 +977,78 @@ mod served_from_acceleration {
         assert!(
             sum_and_count(&rt).await.is_none(),
             "an excluded dataset is not served while its source is down"
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// The acceleration's last refresh, and when its next scheduled refresh is due, are
+    /// reported from startup, read from its checkpoint, while the source is down.
+    #[tokio::test]
+    async fn freshness_is_reported_from_startup_while_the_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("freshness-from-startup").await?;
+        let source = &fixture.source;
+        let spec = || with_refresh_check_interval(fixture.dataset(ReadyState::OnLoad), "1h");
+        seed(source, spec()).await?;
+
+        let restarted_at = chrono::Utc::now();
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
+        assert!(served_from_acceleration(&rt, Duration::from_secs(10)).await);
+        let reported = wait_until_true(Duration::from_secs(10), || async {
+            matches!(freshness(&rt).await, (Some(_), Some(_)))
+        })
+        .await;
+        assert!(
+            reported,
+            "last_refresh and next_refresh are reported from startup"
+        );
+        let (Some(last_refresh), Some(next_refresh)) = freshness(&rt).await else {
+            anyhow::bail!("freshness disappeared");
+        };
+        assert!(
+            last_refresh <= restarted_at,
+            "last_refresh comes from the checkpoint written before the restart ({last_refresh} > {restarted_at})"
+        );
+        let due_after = (next_refresh - last_refresh).num_seconds();
+        assert!(
+            (3590..=3610).contains(&due_after),
+            "next_refresh is refresh_check_interval after last_refresh, got {due_after}s"
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A dataset refreshed on a cron schedule reports the first cron time after its
+    /// last refresh as its next refresh.
+    #[tokio::test]
+    async fn a_cron_scheduled_dataset_reports_its_next_cron_time() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("freshness-cron").await?;
+        let source = &fixture.source;
+        // Midnight on January 1st: never due during the test.
+        let spec = || with_refresh_cron(fixture.dataset(ReadyState::OnLoad), "0 0 1 1 *");
+        seed(source, spec()).await?;
+
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
+        assert!(served_from_acceleration(&rt, Duration::from_secs(10)).await);
+        let (Some(last_refresh), Some(next_refresh)) = freshness(&rt).await else {
+            anyhow::bail!("a cron-scheduled dataset reports last_refresh and next_refresh");
+        };
+        let next_local = next_refresh.with_timezone(&chrono::Local);
+        assert!(
+            next_refresh > last_refresh,
+            "the next cron time follows the last refresh"
+        );
+        assert_eq!(
+            (
+                chrono::Datelike::month(&next_local),
+                chrono::Datelike::day(&next_local),
+                chrono::Timelike::hour(&next_local)
+            ),
+            (1, 1, 0),
+            "next_refresh is the cron's next time, got {next_local}"
         );
         stop(rt, loader).await;
         Ok(())

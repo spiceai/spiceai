@@ -842,6 +842,16 @@ impl Refresher {
             }
         };
 
+        // The acceleration's last refresh, as its checkpoint records it, is reported
+        // from startup rather than only after the first refresh in this process.
+        if let Some(checkpointer) = &self.checkpointer
+            && let Ok(Some(last_refresh)) = checkpointer.last_checkpoint_time().await
+        {
+            self.runtime_status
+                .record_dataset_last_refresh(&dataset_name, last_refresh);
+            record_last_refresh_metric(&dataset_name, &self.refresh, last_refresh).await;
+        }
+
         let (snapshot_manager, snapshot_trigger) = match self.snapshot_config.as_ref() {
             Some(SnapshotCreationConfig {
                 manager,
@@ -1088,9 +1098,23 @@ impl Refresher {
         //   1. Periodic and manual refreshes happening at the same time
         //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
         //        refresh (the sleep future is reset when a manual refresh completes).
+        let refresh_status = Arc::clone(&self.runtime_status);
+        // Schedules the next periodic refresh after `delay` plus jitter, and records
+        // when it is due for a dataset with a refresh schedule.
+        let schedule_refresh = {
+            let runtime_status = Arc::clone(&self.runtime_status);
+            let dataset_name = dataset_name.clone();
+            move |delay: Duration| {
+                let delay = Self::compute_delay(delay, max_jitter);
+                if refresh_check_interval.is_some() {
+                    runtime_status
+                        .record_dataset_next_refresh(&dataset_name, SystemTime::now() + delay);
+                }
+                sleep(delay)
+            }
+        };
         Ok(Some(tokio::spawn(async move {
-            let mut next_scheduled_refresh_timer =
-                initial_refresh_delay.map(|delay| sleep(Self::compute_delay(delay, max_jitter)));
+            let mut next_scheduled_refresh_timer = initial_refresh_delay.map(&schedule_refresh);
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =
@@ -1137,6 +1161,7 @@ impl Refresher {
                         let refresh_changed_accelerator = refresh_result_changed_accelerator(&res);
 
                         if refresh_succeeded {
+                            refresh_status.record_dataset_last_refresh(&dataset_name, SystemTime::now());
                             // Store the flag before recording the completion, so a
                             // caller woken by the completion observes the initial
                             // load as done. The CDC apply path already orders it
@@ -1189,12 +1214,15 @@ impl Refresher {
                         }
 
                         // Restart periodic refresh timer (after either cron or manual dataset refresh).
-                        // For datasets with no periodic refresh, this will be a no-op.
+                        // For datasets with no periodic refresh, this will be a no-op. The next
+                        // refresh is due an interval after the last successful one, so a failed
+                        // refresh retries on the timer but leaves the recorded due time, now past.
                         if let Some(refresh_check_interval) = refresh_check_interval {
-                            next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
-                                refresh_check_interval,
-                                max_jitter,
-                            )));
+                            next_scheduled_refresh_timer = Some(if refresh_succeeded {
+                                schedule_refresh(refresh_check_interval)
+                            } else {
+                                sleep(Self::compute_delay(refresh_check_interval, max_jitter))
+                            });
                         }
                     }
                 }
@@ -1316,6 +1344,21 @@ fn refresh_result_changed_accelerator(result: &super::Result<RefreshOutcome>) ->
 /// unused and any value will do.
 fn issue_refresh_request(refresh_completion: Option<&RefreshCompletion>) -> RefreshRequestId {
     refresh_completion.map_or(0, RefreshCompletion::issue)
+}
+
+/// Publishes `at` as `dataset_name`'s last refresh time, with the labels a completed
+/// refresh publishes it with.
+async fn record_last_refresh_metric(
+    dataset_name: &TableReference,
+    refresh: &Arc<RwLock<Refresh>>,
+    at: SystemTime,
+) {
+    let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
+    if let Some(sql) = &refresh.read().await.sql {
+        labels.push(KeyValue::new("sql", sql.display_sql()));
+    }
+    let at = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    metrics::LAST_REFRESH_TIME_MS.record(at.as_secs_f64() * 1000.0, &labels);
 }
 
 /// Records a completed refresh under the request that started it: releases the

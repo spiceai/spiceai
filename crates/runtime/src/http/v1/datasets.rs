@@ -220,6 +220,11 @@ fn dataset_infos(
             let error_message = status
                 .as_ref()
                 .and_then(|s| s.error_message().map(String::from));
+            let (last_refresh, next_refresh) = if include_status {
+                dataset_freshness(df, d)
+            } else {
+                (None, None)
+            };
             DatasetResponseItem {
                 from: d.from.clone(),
                 name: d.name.to_quoted_string(),
@@ -229,9 +234,33 @@ fn dataset_infos(
                 status,
                 error,
                 error_message,
+                last_refresh,
+                next_refresh,
             }
         })
         .collect()
+}
+
+/// `ds`'s last refresh and next scheduled refresh, as RFC 3339 timestamps, for an
+/// accelerated dataset. A `refresh_cron` dataset's next refresh is the first cron
+/// time after its last refresh.
+fn dataset_freshness(df: &DataFusion, ds: &Dataset) -> (Option<String>, Option<String>) {
+    let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
+        return (None, None);
+    };
+    let freshness = df.runtime_status().dataset_freshness(&ds.name);
+    let next_refresh = freshness.next_refresh.or_else(|| {
+        let cron = acceleration.refresh_cron.as_deref()?;
+        scheduler::channel::cron::next_cron_time(cron, freshness.last_refresh?).ok()
+    });
+    (
+        freshness.last_refresh.map(rfc3339),
+        next_refresh.map(rfc3339),
+    )
+}
+
+fn rfc3339(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
