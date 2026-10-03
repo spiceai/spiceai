@@ -42,7 +42,8 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install the independent test oracle
-        run: python -m pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
+        run: |
+          python -m pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
       - name: Test state protocol and cancellation
         run: cargo test --locked --profile dev -p object_store_occ --lib --test state_store --test transactional_wal --test local_cancellation -- --nocapture
       - name: Build the process worker
