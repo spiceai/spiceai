@@ -65,19 +65,18 @@ use util::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("HTTP request failed: {source}"))]
-    HttpRequest { source: reqwest::Error },
+    /// Build with [`Error::http_request`].
+    #[snafu(display("HTTP request to {endpoint} failed: {source}"))]
+    HttpRequest {
+        endpoint: String,
+        source: reqwest::Error,
+    },
 
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
 
     #[snafu(display("HTTP request was rate limited: {message}"))]
     RateLimited { message: String },
-
-    #[snafu(display(
-        "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
-    ))]
-    AllRetriesFailed { max_retries: usize, url: String },
 
     #[snafu(display("Invalid URL: {source}"))]
     InvalidUrl { source: url::ParseError },
@@ -233,6 +232,17 @@ impl std::str::FromStr for ErrorResponseAction {
     }
 }
 
+impl Error {
+    /// A transport failure on a request to `endpoint`. `reqwest::Error`'s `Display` appends
+    /// the full request URL, so it is stripped and only [`endpoint_label`] is named.
+    fn http_request(endpoint: &Url, source: reqwest::Error) -> Self {
+        Error::HttpRequest {
+            endpoint: endpoint_label(endpoint),
+            source: source.without_url(),
+        }
+    }
+}
+
 impl From<Error> for DataFusionError {
     fn from(err: Error) -> Self {
         match err {
@@ -255,21 +265,16 @@ impl From<Error> for DataFusionError {
                     DataFusionError::Plan(message)
                 }
             }
-            // Retry exhaustion is an external error
-            Error::AllRetriesFailed { max_retries, url } => {
-                DataFusionError::External(Box::new(std::io::Error::other(format!(
-                    "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
-                ))))
-            }
             Error::RateLimited { message } => DataFusionError::External(Box::new(
                 std::io::Error::other(format!("HTTP request was rate limited: {message}")),
             )),
             // All other errors are internal/external errors
-            Error::HttpRequest { source } => DataFusionError::External(Box::new(source)),
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
-            err @ Error::JsonNesting { .. } => DataFusionError::External(Box::new(err)),
+            err @ (Error::HttpRequest { .. } | Error::JsonNesting { .. }) => {
+                DataFusionError::External(Box::new(err))
+            }
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
@@ -1366,7 +1371,9 @@ impl HttpTableProvider {
             test_url
         };
 
-        tracing::debug!("Validating HTTP endpoint: {test_url}");
+        // The probe URL keeps the configured query string, so log only its origin.
+        let endpoint = endpoint_label(&test_url);
+        tracing::debug!("Validating HTTP endpoint: {endpoint}");
 
         let _rate_control_permit = self.acquire_rate_control_permit().await?;
 
@@ -1377,22 +1384,21 @@ impl HttpTableProvider {
                 let status = response.status();
                 if self.health_probe.is_some() {
                     tracing::debug!(
-                        "HTTP endpoint validation response using health probe: {test_url} (status: {status})"
+                        "HTTP endpoint validation response using health probe: {endpoint} (status: {status})"
                     );
                     // For custom health probe, require successful status (2xx)
                     if !status.is_success() {
                         return Err(Error::HttpClientError {
                             status: status.as_u16(),
                             message: format!(
-                                "Failed to validate HTTP endpoint {}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
-                                self.base_url,
+                                "Failed to validate HTTP endpoint {endpoint}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
                                 test_url.path()
                             ),
                         });
                     }
                 } else {
                     tracing::debug!(
-                        "HTTP endpoint validation response: {test_url} (status: {status}). Any status (including 404) is expected for the random probe path."
+                        "HTTP endpoint validation response: {endpoint} (status: {status}). Any status (including 404) is expected for the random probe path."
                     );
                     // Any response (including 404) means the endpoint is reachable
                 }
@@ -1400,7 +1406,7 @@ impl HttpTableProvider {
             }
             Err(e) => {
                 // Check the error type to provide more specific messages and just return the error
-                Err(Error::HttpRequest { source: e })
+                Err(Error::http_request(&self.base_url, e))
             }
         }
     }
@@ -1655,11 +1661,13 @@ impl HttpTableProvider {
             url.set_query(Some(q));
         }
 
-        let final_url = url.as_str().to_owned();
-        final_url
+        url.as_str()
             .parse::<Uri>()
             .map_err(|err| Error::FilterRejected {
-                message: format!("Constructed request URI '{final_url}' is invalid: {err}"),
+                message: format!(
+                    "Constructed request URI for {} is invalid: {err}",
+                    endpoint_label(&url)
+                ),
             })?;
 
         Ok(url)
@@ -1708,7 +1716,11 @@ impl HttpTableProvider {
         let request_headers_owned = request_headers.cloned();
         let path_owned = path_label.to_string();
 
-        let result = retry(retry_strategy, || {
+        // The ladder spends exactly the configured budget: no request follows the last
+        // attempt it allows. When that attempt ended on a 5xx/429, its error is the
+        // request's answer, because a retryable status is never recorded as a row under
+        // any `on_error_response` (see [`ErrorResponseAction`]).
+        retry(retry_strategy, || {
             let this = this.clone();
             let url = url_clone.clone();
             let body = body_owned.clone();
@@ -1716,45 +1728,11 @@ impl HttpTableProvider {
             let path = path_owned.clone();
 
             async move {
-                this.perform_single_request(
-                    &url,
-                    body.as_deref(),
-                    request_headers.as_ref(),
-                    &path,
-                    false,
-                )
-                .await
+                this.perform_single_request(&url, body.as_deref(), request_headers.as_ref(), &path)
+                    .await
             }
         })
-        .await;
-
-        // A ladder exhausted by something other than a status gets one final attempt that
-        // accepts whatever comes back; a status is decided below without spending it.
-        match result {
-            Ok(fetch_result) => Ok(fetch_result),
-            // That final attempt exists only to turn an exhausted retry into a row. A
-            // ladder that ended on a *status* has no row left to make under any action —
-            // the status is either retryable, which is refused whatever the action says,
-            // or it is one `error` already refused — so the attempt would spend one more
-            // request on an origin that has already failed and arrive at this same error.
-            //
-            // A ladder exhausted by a network error, a rate-control acquisition failure or
-            // a body read that broke mid-stream is a different case: the extra attempt is
-            // a real recovery chance that has nothing to do with this action, and if it
-            // does answer non-2xx the check in `perform_single_request` refuses it there.
-            Err(err @ Error::ErrorResponse { .. }) => Err(err),
-            Err(_) => {
-                tracing::debug!(
-                    "Retries exhausted for {}, making final attempt accepting any status",
-                    endpoint_label(&self.base_url)
-                );
-                self.perform_single_request(&url, body, request_headers, path_label, true)
-                    .await
-                    .map_err(|e| match e {
-                        RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
-                    })
-            }
-        }
+        .await
     }
 
     /// Returns true for HTTP status codes that should trigger retry with backoff.
@@ -1768,17 +1746,17 @@ impl HttpTableProvider {
 
     /// Perform a single HTTP request without retry logic.
     ///
-    /// If `accept_retryable` is false, returns a transient error on 5xx/429 to trigger retry.
-    /// If it is true, that retry gate is skipped — but a retryable status is still refused
-    /// below, so the flag decides whether the ladder re-runs, never whether a row is made.
+    /// A 5xx/429 is returned as a transient error, so the ladder retries it while its
+    /// budget lasts and answers with it once the budget is spent.
     async fn perform_single_request(
         &self,
         url: &Url,
         body: Option<&str>,
         request_headers: Option<&HeaderMap>,
         path_label: &str,
-        accept_retryable: bool,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        // Held until the body below has been read, so a response still streaming counts
+        // against the rate controller's concurrency limit.
         let _rate_control_permit = self
             .acquire_rate_control_permit()
             .await
@@ -1820,8 +1798,9 @@ impl HttpTableProvider {
         }
 
         let response = request_builder.send().await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {e}");
-            RetryError::transient(Error::HttpRequest { source: e })
+            let err = Error::http_request(&self.base_url, e);
+            tracing::debug!("{err}");
+            RetryError::transient(err)
         })?;
 
         let status_code = response.status().as_u16();
@@ -1829,38 +1808,32 @@ impl HttpTableProvider {
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
 
-        // 5xx/429: retry with backoff (transient server issue or rate limiting).
-        // Carries the same error the accepting pass below would raise, so exhausting the
-        // ladder and being handed the status directly read the same way to the operator.
-        if !accept_retryable && Self::is_retryable_status(status_code) {
+        // 5xx/429: retry with backoff (transient server issue or rate limiting). The body
+        // is not read, on this attempt or on the last one the budget allows: a retryable
+        // status fails the request whatever `on_error_response` says, because it is an
+        // origin that is down rather than an answer about the resource, and recording one
+        // would let the setting a dataset picked to keep a 404 working overwrite its
+        // contents during an outage. See [`ErrorResponseAction`].
+        if Self::is_retryable_status(status_code) {
             tracing::debug!("HTTP retryable status ({status_code}), will retry");
             return Err(RetryError::transient(self.error_response(status_code)));
         }
 
-        // Everything the origin did not mark successful reaches here: 4xx always (a 404
-        // "not found" can be a business fact for an API-shaped dataset), and 5xx/429 once
-        // retries are exhausted. `error_response_action` decides whether such a body is
-        // data. Anything that is not recorded has to answer here rather than downstream of
-        // the row: the row is what a full refresh writes over good data with.
+        // A non-2xx that reaches here is a status this connector does not retry: a 4xx (a
+        // 404 "not found" can be a business fact for an API-shaped dataset), or a 3xx left
+        // by an exhausted redirect chain. `error_response_action` decides whether its body
+        // is data. Anything that is not recorded has to answer here rather than downstream
+        // of the row: the row is what a full refresh writes over good data with.
         let is_error_response = !(200..300).contains(&status_code);
 
-        // A retryable status is refused whatever the action is: it is an origin that is
-        // down rather than an answer about the resource, and recording one would let the
-        // setting a dataset picked to keep a 404 working overwrite its contents during an
-        // outage. The ladder refuses its own retryable statuses above, so what reaches
-        // here is the post-ladder attempt taken after a *network* failure. See
-        // [`ErrorResponseAction`].
-        let refuse = self.error_response_action == ErrorResponseAction::Error
-            || Self::is_retryable_status(status_code);
-
-        if is_error_response && refuse {
-            // Permanent: the retry ladder above already spent its attempts on the statuses
-            // worth retrying, so retrying here would only repeat them.
+        if is_error_response && self.error_response_action == ErrorResponseAction::Error {
+            // Permanent: asking again would get the same answer.
             return Err(RetryError::Permanent(self.error_response(status_code)));
         }
 
         let fetched = Self::extract_response(
             response,
+            &self.base_url,
             status_code,
             path_label,
             attempt_started,
@@ -1885,6 +1858,7 @@ impl HttpTableProvider {
     /// Extract content and metadata from an HTTP response.
     async fn extract_response(
         response: reqwest::Response,
+        endpoint: &Url,
         status_code: u16,
         path_label: &str,
         attempt_started: Instant,
@@ -2007,7 +1981,7 @@ impl HttpTableProvider {
         let content = response
             .text()
             .await
-            .map_err(|e| RetryError::transient(Error::HttpRequest { source: e }))?;
+            .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -3380,8 +3354,8 @@ fn resolve_and_validate_url(raw: &str, base_url: &Url, context: &str) -> Result<
         return Err(Error::Pagination {
             message: format!(
                 "{context} URL origin '{}' does not match base URL origin '{}'. The next page URL must stay on the same origin.",
-                resolved.origin().ascii_serialization(),
-                base_url.origin().ascii_serialization(),
+                endpoint_label(&resolved),
+                endpoint_label(base_url),
             ),
         });
     }
@@ -5350,8 +5324,16 @@ mod tests {
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
     use reqwest::header::AUTHORIZATION;
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use runtime_rate_control::{RateControllerBuilder, RateControllerMetrics};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
     use url::Url;
 
     #[derive(Debug)]
@@ -5439,6 +5421,430 @@ mod tests {
             "json".to_string(),
             false,
         )
+    }
+
+    async fn retry_test_server(
+        replies: Vec<(u16, String)>,
+        delay: Duration,
+    ) -> (Url, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test origin");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("origin address")
+        ))
+        .expect("valid origin URL");
+        let count = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::clone(&count);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let ordinal = requests.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = &replies[ordinal.min(replies.len() - 1)];
+                let mut buffer = [0; 4096];
+                if stream.read(&mut buffer).await.is_err() {
+                    continue;
+                }
+                tokio::time::sleep(delay).await;
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nX-Reply: {ordinal}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (url, count, task)
+    }
+
+    fn retry_test_provider(
+        url: Url,
+        max_retries: usize,
+        timeout: Duration,
+    ) -> (HttpTableProvider, Arc<RateControllerMetrics>) {
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let controller = RateControllerBuilder::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_max_concurrent_requests(4)
+            .build();
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("HTTP test client");
+        let mut provider = HttpTableProvider::new(url, client, "json".to_string(), false)
+            .with_rate_controller(Some(controller))
+            .with_max_retries(u32::try_from(max_retries).expect("small retry count"));
+        provider.retry_strategy = RetryBackoffBuilder::new()
+            .max_retries(Some(max_retries))
+            .base_interval(Duration::from_millis(1))
+            .method(BackoffMethod::Linear)
+            .randomization_factor(0.0)
+            .build();
+        (provider, metrics)
+    }
+
+    #[tokio::test]
+    async fn http_retry_budget_transport_failure_and_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refusal socket");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("socket address")
+        ))
+        .expect("valid URL");
+        drop(listener);
+        for budget in [0, 2] {
+            let (provider, permits) =
+                retry_test_provider(url.clone(), budget, Duration::from_secs(2));
+            let Err(error) = provider
+                .perform_request_with_retry(url.clone(), None, None, "/lookup")
+                .await
+            else {
+                panic!("connection refusal should fail");
+            };
+            assert!(matches!(error, Error::HttpRequest { source, .. } if source.is_connect()));
+            assert_eq!(permits.permits_acquired_total(), budget as u64 + 1);
+        }
+
+        let (url, requests, server) =
+            retry_test_server(vec![(200, "{}".to_string())], Duration::from_millis(300)).await;
+        let (provider, permits) = retry_test_provider(url.clone(), 0, Duration::from_millis(50));
+        let Err(error) = provider
+            .perform_request_with_retry(url, None, None, "/lookup")
+            .await
+        else {
+            panic!("timed out origin should fail");
+        };
+        assert!(matches!(error, Error::HttpRequest { source, .. } if source.is_timeout()));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(permits.permits_acquired_total(), 1);
+        server.abort();
+    }
+
+    /// A transport failure names the endpoint's origin and nothing a URL can carry a
+    /// secret in: userinfo, path or query (regression test for #13534).
+    #[tokio::test]
+    async fn http_transport_failure_does_not_render_request_url() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refusal socket");
+        let addr = listener.local_addr().expect("socket address");
+        drop(listener);
+        let url = Url::parse(&format!(
+            "http://user:pass-secret@{addr}/path-secret?api_key=query-secret"
+        ))
+        .expect("valid URL");
+        let origin = format!("http://{addr}");
+        let (provider, _) = retry_test_provider(url.clone(), 0, Duration::from_secs(2));
+
+        let Err(send_error) = provider
+            .perform_request_with_retry(url, None, None, "/path-secret")
+            .await
+        else {
+            panic!("connection refusal should fail");
+        };
+        let validate_error = provider
+            .validate_endpoint()
+            .await
+            .expect_err("connection refusal should fail validation");
+
+        for error in [send_error, validate_error] {
+            assert!(matches!(&error, Error::HttpRequest { source, .. } if source.is_connect()));
+            let rendered = [error.to_string(), DataFusionError::from(error).to_string()];
+            for message in rendered {
+                assert_names_only_origin(&message, &origin);
+            }
+        }
+    }
+
+    /// A health probe that answers non-2xx names the endpoint's origin, not the configured
+    /// URL with its userinfo and query (regression test for #13534).
+    #[tokio::test]
+    async fn http_health_probe_failure_does_not_render_configured_url() {
+        let (mut url, _, server) =
+            retry_test_server(vec![(404, String::new())], Duration::ZERO).await;
+        let origin = endpoint_label(&url);
+        url.set_username("user").expect("set username");
+        url.set_password(Some("pass-secret")).expect("set password");
+        url.set_path("/path-secret");
+        url.set_query(Some("api_key=query-secret"));
+        let (provider, _) = retry_test_provider(url, 0, Duration::from_secs(2));
+        let provider = provider
+            .with_health_probe(Some("/health".to_string()))
+            .expect("valid health probe");
+
+        let error = provider
+            .validate_endpoint()
+            .await
+            .expect_err("a 404 health probe should fail validation");
+        assert_names_only_origin(&error.to_string(), &origin);
+        server.abort();
+    }
+
+    fn assert_names_only_origin(message: &str, origin: &str) {
+        assert!(message.contains(origin), "names the origin: {message}");
+        for secret in ["pass-secret", "path-secret", "query-secret", "user:"] {
+            assert!(!message.contains(secret), "leaks {secret}: {message}");
+        }
+    }
+
+    /// The ladder spends exactly the configured budget, and a retryable status that
+    /// outlives it fails the request under every `on_error_response`: a 5xx or 429 is
+    /// never recorded as a row, so its last body is not read either.
+    #[tokio::test]
+    async fn http_retry_budget_refuses_the_last_retryable_status() {
+        for action in ErrorResponseAction::VARIANTS {
+            for status in [429, 500, 503] {
+                for budget in [0, 2] {
+                    // One reply past the budget, so an extra attempt would be answered
+                    // rather than hang, and would show in the request count.
+                    let replies = (0..=budget + 1)
+                        .map(|i| (status, format!("{{\"attempt\":{i}}}")))
+                        .collect::<Vec<_>>();
+                    let (url, requests, server) = retry_test_server(replies, Duration::ZERO).await;
+                    let (provider, permits) =
+                        retry_test_provider(url.clone(), budget, Duration::from_secs(3));
+                    let provider = provider.with_error_response_action(action);
+                    let Err(error) = provider
+                        .perform_request_with_retry(url, None, None, "/lookup")
+                        .await
+                    else {
+                        panic!("{status} under `{action}` must fail the request");
+                    };
+                    assert!(
+                        matches!(error, Error::ErrorResponse { status: refused, .. } if refused == status),
+                        "{status} under `{action}`: {error}"
+                    );
+                    assert_eq!(requests.load(Ordering::SeqCst), budget + 1);
+                    assert_eq!(permits.permits_acquired_total(), (budget + 1) as u64);
+                    server.abort();
+                }
+            }
+        }
+    }
+
+    /// A body that is recorded as a row is read under the rate-control permit, so a
+    /// response still streaming counts against the concurrency limit. A 404 under
+    /// `store` is the non-2xx case whose body is read.
+    #[tokio::test]
+    async fn http_retry_budget_holds_permit_until_final_body_is_read() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind streaming origin");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("streaming origin address")
+        ))
+        .expect("valid URL");
+        let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+        let (release_body, mut body_ready) = tokio::sync::oneshot::channel();
+        let (second_accepted, second_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = [0; 4096];
+            let bytes_read = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(bytes_read, 0, "request must contain bytes");
+            let body = "{\"message\":\"final-response\"}";
+            let headers = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            headers_sent.send(()).expect("signal response headers");
+            tokio::select! {
+                second = listener.accept() => {
+                    second.expect("accept second request");
+                    second_accepted.send(()).expect("signal second request");
+                    body_ready.await.expect("body release signal");
+                }
+                result = &mut body_ready => {
+                    result.expect("body release signal");
+                }
+            }
+            stream
+                .write_all(body.as_bytes())
+                .await
+                .expect("write response body");
+        });
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let controller = RateControllerBuilder::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_max_concurrent_requests(1)
+            .build();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("streaming test client");
+        let provider = HttpTableProvider::new(url.clone(), client, "json".to_string(), false)
+            .with_rate_controller(Some(controller))
+            .with_max_retries(0)
+            .with_error_response_action(ErrorResponseAction::Store);
+        let second_provider = provider.clone();
+        let second_url = url.clone();
+        let request = tokio::spawn(async move {
+            provider
+                .perform_request_with_retry(url, None, None, "/lookup")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), headers_received)
+            .await
+            .expect("response headers arrived in time")
+            .expect("headers signal sent");
+        let second_request = tokio::spawn(async move {
+            second_provider
+                .perform_request_with_retry(second_url, None, None, "/lookup")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), second_received)
+                .await
+                .is_err(),
+            "the next origin request must wait for the first response body"
+        );
+        assert_eq!(metrics.permits_acquired_total(), 1);
+        assert_eq!(
+            metrics.inflight_permits(),
+            1,
+            "response body still in flight"
+        );
+        second_request.abort();
+        release_body.send(()).expect("release response body");
+        let result = request
+            .await
+            .expect("request task completed")
+            .expect("final HTTP response retained");
+        assert_eq!(result.response_status, 404);
+        assert_eq!(result.content, "{\"message\":\"final-response\"}");
+        assert_eq!(metrics.inflight_permits(), 0);
+        server.await.expect("streaming origin finished");
+    }
+
+    /// A refused retryable status is answered from its status line: the request fails
+    /// without waiting for a body it will not record, and gives its permit back.
+    #[tokio::test]
+    async fn http_retry_budget_refuses_a_retryable_status_without_reading_its_body() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind streaming origin");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("streaming origin address")
+        ))
+        .expect("valid URL");
+        let (release_body, body_ready) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = [0; 4096];
+            let bytes_read = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(bytes_read, 0, "request must contain bytes");
+            let body = "{\"error\":\"unavailable\"}";
+            let headers = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            // The body is withheld until the request has already answered.
+            let _ = body_ready.await;
+            let _ = stream.write_all(body.as_bytes()).await;
+        });
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let controller = RateControllerBuilder::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_max_concurrent_requests(1)
+            .build();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("streaming test client");
+        let provider = HttpTableProvider::new(url.clone(), client, "json".to_string(), false)
+            .with_rate_controller(Some(controller))
+            .with_max_retries(0)
+            .with_error_response_action(ErrorResponseAction::Store);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.perform_request_with_retry(url, None, None, "/lookup"),
+        )
+        .await
+        .expect("the refusal must not wait for the withheld body");
+        let Err(error) = result else {
+            panic!("a 503 must fail the request even under `store`");
+        };
+        assert!(
+            matches!(error, Error::ErrorResponse { status: 503, .. }),
+            "{error}"
+        );
+        assert_eq!(metrics.permits_acquired_total(), 1);
+        assert_eq!(metrics.inflight_permits(), 0, "the permit is released");
+        let _ = release_body.send(());
+        server.await.expect("streaming origin finished");
+    }
+
+    #[tokio::test]
+    async fn http_retry_budget_success_and_permanent_status() {
+        for (replies, budget, expected_status, expected_body, expected_attempts) in [
+            (
+                vec![(503, "{\"attempt\":0}"), (200, "{\"attempt\":1}")],
+                2,
+                200,
+                "{\"attempt\":1}",
+                2,
+            ),
+            (vec![(200, "{\"ok\":true}")], 2, 200, "{\"ok\":true}", 1),
+            (
+                vec![(404, "{\"message\":\"missing\"}")],
+                2,
+                404,
+                "{\"message\":\"missing\"}",
+                1,
+            ),
+        ] {
+            let replies = replies
+                .into_iter()
+                .map(|(status, body)| (status, body.to_string()))
+                .collect();
+            let (url, requests, server) = retry_test_server(replies, Duration::ZERO).await;
+            let (provider, permits) =
+                retry_test_provider(url.clone(), budget, Duration::from_secs(3));
+            // `store`, so the 404 body is data and the case can assert what was read.
+            let provider = provider.with_error_response_action(ErrorResponseAction::Store);
+            let result = provider
+                .perform_request_with_retry(url, None, None, "/lookup")
+                .await
+                .expect("HTTP response should remain available");
+            assert_eq!(result.response_status, expected_status);
+            assert_eq!(result.content, expected_body);
+            assert_eq!(requests.load(Ordering::SeqCst), expected_attempts);
+            assert_eq!(permits.permits_acquired_total(), expected_attempts as u64);
+            server.abort();
+        }
+
+        // Under the default `error` the same 404 fails the request, still after one
+        // request: a status this connector does not retry is not asked again.
+        let (url, requests, server) = retry_test_server(
+            vec![(404, "{\"message\":\"missing\"}".to_string())],
+            Duration::ZERO,
+        )
+        .await;
+        let (provider, permits) = retry_test_provider(url.clone(), 2, Duration::from_secs(3));
+        let Err(error) = provider
+            .perform_request_with_retry(url, None, None, "/lookup")
+            .await
+        else {
+            panic!("a 404 under the default `on_error_response` must fail the request");
+        };
+        assert!(
+            matches!(error, Error::ErrorResponse { status: 404, .. }),
+            "{error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(permits.permits_acquired_total(), 1);
+        server.abort();
     }
 
     /// Test helper: build the legacy all-Utf8 nesting schema that
@@ -8174,10 +8580,17 @@ mod tests {
         base_url: Url,
         action: ErrorResponseAction,
     ) -> std::result::Result<Vec<RecordBatch>, DataFusionError> {
+        scan_provider(status_provider(base_url, action)).await
+    }
+
+    /// Run `SELECT content, response_status` against `provider`.
+    async fn scan_provider(
+        provider: HttpTableProvider,
+    ) -> std::result::Result<Vec<RecordBatch>, DataFusionError> {
         use datafusion::prelude::SessionContext;
 
         let ctx = SessionContext::new();
-        ctx.register_table("items", Arc::new(status_provider(base_url, action)))
+        ctx.register_table("items", Arc::new(provider))
             .expect("table should register");
         ctx.sql("SELECT content, response_status FROM items")
             .await?
@@ -8433,13 +8846,8 @@ mod tests {
         );
     }
 
-    /// Accept, count, and drop the connection without answering — a transient failure
-    /// that is not a status, which is what separates the two arms of the shortcut.
-    /// Hang up on the first `hangups` connections, then answer `status`.
-    ///
-    /// The shape that reaches the refusal through the *post-ladder* attempt: the ladder
-    /// ends on a network failure rather than on a status, so the extra accepting attempt
-    /// is spent — and it is that attempt which sees the 5xx.
+    /// Hang up on the first `hangups` connections without answering, then answer
+    /// `status`: a ladder that meets a network failure before the status it ends on.
     async fn start_hangup_then_status_server(
         hangups: usize,
         status: u16,
@@ -8485,21 +8893,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_post_ladder_attempt_still_refuses_a_transient_status() {
+    async fn a_transient_status_after_a_network_failure_is_still_refused() {
         use std::sync::atomic::Ordering;
 
-        // The ladder here ends on a *network* failure, so the accepting post-ladder
-        // attempt is taken (that is the case `refusing_a_status_does_not_cost_a_network_
-        // failure_its_last_attempt` pins). This asserts the other half: when that attempt
-        // is answered with a 5xx, it is still refused rather than recorded — the retryable
-        // arm of the refusal, which no other test reaches.
+        // A ladder whose earlier attempt failed on the network and whose last allowed
+        // attempt is answered with a 5xx: the status is refused rather than recorded
+        // under every action, and nothing is asked past the budget.
         for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
             let (base_url, requests) =
                 start_hangup_then_status_server(1, 503, r#"{"error":"upstream is down"}"#).await;
 
-            let error = scan_status_dataset(base_url, action)
+            let error = scan_provider(status_provider(base_url, action).with_max_retries(1))
                 .await
-                .expect_err("the accepting attempt must not record a 503 either");
+                .expect_err("the last allowed attempt must not record a 503 either");
 
             assert!(
                 error.to_string().contains("503"),
@@ -8508,41 +8914,9 @@ mod tests {
             assert_eq!(
                 requests.load(Ordering::SeqCst),
                 2,
-                "{action}: one hung-up ladder attempt, then the accepting attempt"
+                "{action}: one hung-up attempt, then the one retry the budget allows"
             );
         }
-    }
-
-    async fn start_hangup_server() -> (Url, Arc<AtomicUsize>) {
-        use std::sync::atomic::Ordering;
-        use tokio::io::AsyncReadExt;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("mock server should bind");
-        let address = listener.local_addr().expect("mock server should have addr");
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let request_count_for_server = Arc::clone(&request_count);
-
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let request_count = Arc::clone(&request_count_for_server);
-                tokio::spawn(async move {
-                    let mut buffer = [0_u8; 1024];
-                    let _ = stream.read(&mut buffer).await;
-                    request_count.fetch_add(1, Ordering::SeqCst);
-                    drop(stream);
-                });
-            }
-        });
-
-        (
-            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
-            request_count,
-        )
     }
 
     /// Serve `status` with a `Content-Length` that overstates the body, then hang up — the
@@ -8688,24 +9062,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refusing_a_status_does_not_cost_a_network_failure_its_last_attempt() {
-        use std::sync::atomic::Ordering;
-
-        // The shortcut that skips the post-ladder attempt is about there being no row to
-        // make. A ladder exhausted by a network error is not that case, and it kept its
-        // extra attempt before `on_error_response` existed.
-        let (base_url, request_count) = start_hangup_server().await;
-
-        let _ = scan_status_dataset(base_url, ErrorResponseAction::Error).await;
-
-        assert_eq!(
-            request_count.load(Ordering::SeqCst),
-            2,
-            "a ladder exhausted by a network error keeps its post-ladder attempt"
-        );
-    }
-
-    #[tokio::test]
     async fn a_client_error_response_does_not_become_a_row() {
         // 404 is never retried, so it reaches the decision on the first response rather
         // than through the exhausted ladder — a separate route to the same substitution.
@@ -8785,7 +9141,7 @@ mod tests {
                 assert_eq!(
                     requests.load(Ordering::SeqCst),
                     1,
-                    "no row to make means no post-ladder attempt for {action}/{status}"
+                    "{action}/{status}: one request, the whole of a zero-retry budget"
                 );
             }
         }

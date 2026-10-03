@@ -152,9 +152,13 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     {
         ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
         ctx.register_udf(
-            Ai::new(runtime.completion_llms(), runtime.model_rate_controllers())
-                .into_async_udf()
-                .into_scalar_udf(),
+            Ai::new(
+                runtime.completion_llms(),
+                runtime.model_rate_controllers(),
+                runtime.status(),
+            )
+            .into_async_udf()
+            .into_scalar_udf(),
         );
     }
 
@@ -1231,6 +1235,11 @@ mod tests {
         // stay local, while the three the dialect renders faithfully keep
         // federating — `regexp_count` among them, whose rendering coalesces the
         // NULL `len(regexp_extract_all(NULL, p))` to the kernel's 0 (#13870).
+        //
+        // All three are probed with the arguments of a real call, because all
+        // three are screened per call rather than by name: the dialect renders
+        // only a literal pattern built from syntax RE2 and the kernel's `regex`
+        // crate read alike (#14148), so a bare name carries no answer.
         for support in [
             deny_spice_functions_for_duckdb(),
             Arc::new(deny_spice_functions_for_duckdb_table_providers()),
@@ -1241,19 +1250,16 @@ mod tests {
                     "{name} has no value-preserving DuckDB rendering and must not be pushed down"
                 );
             }
-            for name in ["regexp_like", "regexp_replace"] {
+            for (name, args) in [
+                ("regexp_like", vec![lit("ab"), lit("a")]),
+                ("regexp_replace", vec![lit("ab"), lit("a"), lit("X")]),
+                ("regexp_count", vec![lit("ab"), lit("a")]),
+            ] {
                 assert!(
-                    support.supports(&make_named_expr(name), None),
-                    "{name} is rendered natively by the DuckDB dialect and must be pushed down"
+                    support.supports(&make_named_call(name, args), None),
+                    "{name} with a literal pattern is rendered natively by the DuckDB dialect and must be pushed down"
                 );
             }
-            assert!(
-                support.supports(
-                    &make_named_call("regexp_count", vec![lit("ab"), lit("a")]),
-                    None
-                ),
-                "regexp_count with a literal pattern is rendered by the DuckDB dialect and must be pushed down"
-            );
         }
     }
 

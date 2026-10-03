@@ -16,6 +16,7 @@ limitations under the License.
 #![allow(dead_code, clippy::allow_attributes)]
 
 mod dml;
+mod pushdown_roundtrip;
 mod schema_registration;
 pub(super) mod streams;
 

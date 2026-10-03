@@ -126,7 +126,6 @@ impl Runtime {
 
     /// Returns a list of valid views from the given App, with SQL validated and dependencies extracted.
     /// Skips any that fail to parse and logs an error for them.
-    #[expect(clippy::result_large_err)]
     pub(crate) fn get_valid_views(
         self: Arc<Self>,
         app: &Arc<App>,
@@ -350,7 +349,6 @@ impl Runtime {
         }
     }
 
-    #[expect(clippy::result_large_err)]
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
         let df = Arc::clone(&self.df);
         let register_task = df
@@ -387,6 +385,12 @@ impl Runtime {
                             // resurrect one for a view that is no longer there.
                             tracing::debug!(
                                 "Accelerated view '{view_name}' was removed before its initial refresh completed; not creating a refresh schedule."
+                            );
+                            return;
+                        }
+                        DeferredRefreshOutcome::Failed => {
+                            tracing::debug!(
+                                "Accelerated view '{view_name}' initial refresh failed terminally; not creating a refresh schedule."
                             );
                             return;
                         }

@@ -29,8 +29,7 @@ use data_accelerator_api::{FilePathError, spice_data_base_path};
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    catalog::TableProviderFactory, datasource::TableProvider, logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::{
@@ -271,6 +270,30 @@ impl SqliteAccelerator {
         let file_path: Arc<str> = sqlite_file.into();
         let busy_timeout = self.effective_busy_timeout(source, storage)?;
 
+        // A snapshot restore that crashed after parking the WAL leaves the
+        // committed rows only in that parked file. Put them back, or drop them
+        // when the replacement database is already in place, before any
+        // connection opens the file.
+        if matches!(
+            mode,
+            datafusion_table_providers::sql::db_connection_pool::Mode::File
+        ) {
+            let dataset_name = source.name().to_string();
+            let database = std::path::Path::new(file_path.as_ref());
+            // Do not open the file while a restore has its WAL parked. A
+            // connection in that interval creates a `-wal` that the restore
+            // then deletes, and the next connection fails to open the file.
+            runtime_acceleration::snapshot::engine::wait_for_sqlite_restore(database).await;
+            runtime_acceleration::snapshot::engine::recover_interrupted_sqlite_restore(
+                database,
+                &dataset_name,
+            )
+            .await
+            .map_err(|source| Error::AccelerationCreationFailed {
+                source: source.into(),
+            })?;
+        }
+
         let pool = self
             .sqlite_factory
             .get_or_init_instance(Arc::clone(&file_path), mode, busy_timeout)
@@ -457,6 +480,18 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
+            // Before a snapshot download or a connection opens the file. See
+            // `get_shared_pool` for the same recovery on every other open.
+            let dataset_name = source.name().to_string();
+            runtime_acceleration::snapshot::engine::recover_interrupted_sqlite_restore(
+                std::path::Path::new(&path),
+                &dataset_name,
+            )
+            .await
+            .map_err(|source| Error::AccelerationInitializationFailed {
+                source: source.into(),
+            })?;
+
             // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
             if acceleration.mode == Mode::FileCreate {
                 let file_path = std::path::Path::new(&path);
@@ -571,7 +606,7 @@ impl DataAccelerator for SqliteAccelerator {
             }
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let table_provider = TableProviderFactory::create(&self.sqlite_factory, &ctx.state(), &cmd)
             .await
             .context(UnableToCreateTableSnafu)
