@@ -195,10 +195,11 @@ const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
 /// safe to a base-table scan, which is slower but always correct.
 const MAINTAINED_AGGREGATE_INDEX_POOL_FRACTION: f64 = 0.10;
 
-/// Retained-index budget used when the query memory pool is unbounded, and the
-/// ceiling applied to the derived fraction on a very large pool. An unbounded
-/// pool still needs *some* bound, or an index on a large table grows until the
-/// host OOMs.
+/// Retained-index budget used when the query memory pool is unbounded. An
+/// unbounded pool still needs *some* bound, or an index on a large table grows
+/// until the host OOMs. A bounded pool is charged its fraction with no further
+/// ceiling: the index of a table with tens of millions of maintained rows takes
+/// gigabytes, and the fraction is already the operator's budget for it.
 const MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT: usize = 512 * 1024 * 1024;
 
 /// How many mem-tier checkpoints pass between attempts to rebuild a stale
@@ -223,10 +224,12 @@ const MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES: u64 = 3;
 /// ended, when it did not error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaintainedAggregateRebuild {
-    /// The views were rebuilt from a scan that no write changed while it ran.
+    /// The views were rebuilt from a snapshot of the table, with the writes
+    /// published while it was read applied on top.
     Rebuilt,
-    /// A write became visible while the scan ran, so the scanned rows match no
-    /// single epoch; the registry was left stale for a later attempt.
+    /// The rebuild was abandoned while it ran — the registry was marked stale,
+    /// missed a write's delta, or held more deltas than its budget allows — so
+    /// the registry was left stale for a later attempt.
     Superseded,
 }
 
@@ -255,7 +258,7 @@ fn maintained_aggregate_max_index_bytes(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
-                reason = "budget fraction; result is clamped to [MIN, DEFAULT] and capped at the pool limit"
+                reason = "budget fraction; result is lifted to MIN and capped at the pool limit"
             )]
             let scaled = (limit as f64 * MAINTAINED_AGGREGATE_INDEX_POOL_FRACTION) as usize;
             // The floor lifts a modest pool's share to something an index can
@@ -265,12 +268,7 @@ fn maintained_aggregate_max_index_bytes(
             // budget). Capping at `limit` leaves such a pool a budget any real
             // index overruns, so maintained aggregates fail safe to base-table
             // scans — the intended outcome for a pool that cannot afford them.
-            scaled
-                .clamp(
-                    MAINTAINED_AGGREGATE_MIN_INDEX_BYTES,
-                    MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT,
-                )
-                .min(limit)
+            scaled.max(MAINTAINED_AGGREGATE_MIN_INDEX_BYTES).min(limit)
         }
         // No knowable ceiling to derive from — fall back to the standalone
         // default rather than leaving the index unbounded.
@@ -25983,62 +25981,95 @@ impl CayenneTableProvider {
 
         let ctx = self.create_session_context();
         let session_state = Arc::new(ctx.state());
+        // Read only the columns the views use: the primary key and what they
+        // group by, aggregate, and filter on.
+        let columns: Arc<[usize]> = self.maintained_aggregates.rebuild_columns().into();
         // Take the epoch and the scan's snapshot together under `write_lock`, which
         // every write that changes the visible rows holds while it does so, so the
-        // snapshot is the state at exactly this epoch. Planning captures the
-        // snapshot; the read below runs after the lock is released.
-        let (plan, epoch) = {
+        // snapshot is the state at exactly this epoch, and start the rebuild under
+        // it too, so the registry holds the delta of every write after the
+        // snapshot. Planning captures the snapshot; the read below runs after the
+        // lock is released, and writes that land meanwhile are applied on top of
+        // it when the rebuild is installed.
+        let (plan, mut rebuilder) = {
             let _write_guard = self.write_lock.lock().await;
             let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
-            // NOTE: the scan is deliberately unprojected. The views resolve their
-            // group-by, aggregate-input, and PK columns as indices into the TABLE
-            // schema (`ResolvedAggregateSpec`), so a projected scan would renumber
-            // the columns out from under them. Projecting requires re-resolving every
-            // view against the projected schema; until that lands, correctness wins
-            // over the wasted materialization.
-            let plan = <Self as TableProvider>::scan(self, session_state.as_ref(), None, &[], None)
-                .await?;
-            (plan, epoch)
+            let plan = <Self as TableProvider>::scan(
+                self,
+                session_state.as_ref(),
+                Some(&columns.to_vec()),
+                &[],
+                None,
+            )
+            .await?;
+            (plan, self.maintained_aggregates.begin_rebuild(epoch)?)
         };
-        let mut stream = datafusion_physical_plan::execute_stream(plan, session_state.task_ctx())?;
-        let mut batches = Vec::new();
+        let mut stream = match datafusion_physical_plan::execute_stream(plan, session_state.task_ctx()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.maintained_aggregates.abandon_rebuild(&rebuilder);
+                return Err(error);
+            }
+        };
+        let (mut batch_count, mut row_count) = (0_usize, 0_usize);
         while let Some(batch) = stream.next().await {
-            batches.push(batch?);
-            // Stop reading once a write is published: the rebuild is superseded
-            // (below), so the rest of the table would be read for nothing.
-            if self.maintained_aggregate_epoch.load(Ordering::Acquire) != epoch {
-                break;
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.maintained_aggregates.abandon_rebuild(&rebuilder);
+                    return Err(error);
+                }
+            };
+            batch_count += 1;
+            row_count += batch.num_rows();
+            // Folding a batch extracts scalars row by row — CPU-heavy — so it runs
+            // on the blocking pool rather than stalling the async runtime.
+            let columns = Arc::clone(&columns);
+            let folded = task::spawn_blocking(move || {
+                let result = rebuilder.apply_projected(&batch, &columns);
+                (rebuilder, result)
+            })
+            .await
+            .map_err(|error| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "maintained aggregate rebuild task failed: {error}"
+                ))
+            })?;
+            rebuilder = folded.0;
+            if let Err(error) = folded.1 {
+                self.maintained_aggregates.abandon_rebuild(&rebuilder);
+                return Err(error);
+            }
+            // A stale mark, an epoch gap, or more held deltas than the budget
+            // allows has abandoned the rebuild; stop reading for nothing.
+            if !self.maintained_aggregates.rebuild_is_current(&rebuilder) {
+                tracing::debug!(
+                    table = %self.table_metadata.table_name,
+                    epoch = rebuilder.epoch(),
+                    "Maintained aggregate rebuild abandoned during its scan; the registry stays stale until a later attempt"
+                );
+                return Ok(MaintainedAggregateRebuild::Superseded);
             }
         }
         #[cfg(test)]
         self.run_test_post_maintained_aggregate_scan_hook().await;
-        // A write that became visible while the scan ran is not in these rows, and
-        // its delta reached a stale registry, which dropped it. Marked fresh, the
-        // views would be served without that write's rows, so leave the registry
-        // stale and let a later attempt rebuild it.
-        if self.maintained_aggregate_epoch.load(Ordering::Acquire) != epoch {
-            self.mark_maintained_aggregates_stale();
-            tracing::debug!(
-                table = %self.table_metadata.table_name,
-                epoch,
-                "Maintained aggregate rebuild superseded by a write during its scan; the registry stays stale until a later attempt"
-            );
-            return Ok(MaintainedAggregateRebuild::Superseded);
-        }
-        // Capture stats before `batches` is moved into the blocking task.
-        let batch_count = batches.len();
-        let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-        // Rebuilding iterates every visible row and extracts scalars — CPU-heavy.
-        // Run it on the blocking pool so it cannot stall the async runtime
-        // (mirrors `apply_maintained_aggregate_insert_batches`).
+        let epoch = rebuilder.epoch();
         let registry = Arc::clone(&self.maintained_aggregates);
-        task::spawn_blocking(move || registry.rebuild_from_batches(epoch, &batches))
+        let installed = task::spawn_blocking(move || registry.finish_rebuild(rebuilder))
             .await
             .map_err(|error| {
                 datafusion_common::DataFusionError::Execution(format!(
                     "maintained aggregate rebuild task failed: {error}"
                 ))
             })??;
+        if !installed {
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                epoch,
+                "Maintained aggregate rebuild abandoned before it was installed; the registry stays stale until a later attempt"
+            );
+            return Ok(MaintainedAggregateRebuild::Superseded);
+        }
         tracing::debug!(
             table = %self.table_metadata.table_name,
             epoch,
@@ -38614,11 +38645,11 @@ mod tests {
             "a pool that can afford the floor is lifted to it"
         );
 
-        // A large pool takes the fraction, capped by the standalone default.
+        // A large pool takes its fraction, with no ceiling below it.
         assert_eq!(
             budget_for(8 * 1024 * 1024 * 1024),
-            MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT,
-            "a large pool is capped at the standalone default"
+            8 * 1024 * 1024 * 1024 / 10,
+            "a large pool takes its tenth"
         );
 
         // The invariant across the range, including degenerate pools.
