@@ -28,11 +28,11 @@ limitations under the License.
 use std::{collections::HashMap, hash::BuildHasher, sync::Arc};
 
 use arrow::{
-    array::{ArrayRef, BooleanArray, RecordBatch},
-    buffer::NullBuffer,
+    array::{Array, ArrayRef, BooleanArray, RecordBatch},
+    buffer::{Buffer, NullBuffer},
     compute::filter_record_batch,
     datatypes::{Schema, SchemaRef},
-    row::{RowConverter, SortField},
+    row::{RowConverter, Rows, SortField},
 };
 use async_trait::async_trait;
 use datafusion::{
@@ -313,30 +313,201 @@ struct SeenKeys {
 /// written, a dropped row or a row with a NULL in its key costs nothing.
 struct KeyColumns {
     indices: Vec<usize>,
-    converter: RowConverter,
-    admitted: AdmittedKeys,
-    /// Each admitted key's index in `admitted`, by the key's hash.
-    table: HashTable<usize>,
     hasher: DefaultHashBuilder,
+    admitted: Admitted,
+}
+
+/// How one key's admitted values are held: as cheaply as its type allows.
+enum Admitted {
+    /// A single column at most eight bytes wide, held as each value's bits.
+    /// Two values are equal exactly when their bits are, which is also how
+    /// arrow's row format compares them, so this drops the same rows as
+    /// `Encoded` without encoding a key or storing it twice.
+    Bits { width: usize, table: HashTable<u64> },
+    /// Any other key, in arrow's row format. The table holds each admitted
+    /// key's index in `keys`.
+    Encoded {
+        converter: RowConverter,
+        keys: AdmittedKeys,
+        table: HashTable<usize>,
+    },
 }
 
 impl KeyColumns {
-    fn contains(&self, hash: u64, key: &[u8]) -> bool {
-        self.table
-            .find(hash, |&index| self.admitted.get(index) == key)
-            .is_some()
+    fn try_new(schema: &Schema, indices: &[usize]) -> datafusion::error::Result<Self> {
+        let bits_width = match indices {
+            [index] => schema
+                .field(*index)
+                .data_type()
+                .primitive_width()
+                .filter(|&width| width <= 8),
+            _ => None,
+        };
+        let admitted = match bits_width {
+            Some(width) => Admitted::Bits {
+                width,
+                table: HashTable::new(),
+            },
+            None => Admitted::Encoded {
+                converter: RowConverter::new(
+                    indices
+                        .iter()
+                        .map(|&index| SortField::new(schema.field(index).data_type().clone()))
+                        .collect(),
+                )?,
+                keys: AdmittedKeys::default(),
+                table: HashTable::new(),
+            },
+        };
+        Ok(Self {
+            indices: indices.to_vec(),
+            hasher: DefaultHashBuilder::default(),
+            admitted,
+        })
     }
 
-    fn insert(&mut self, hash: u64, key: &[u8]) {
-        let index = self.admitted.push(key);
-        self.table.insert_unique(hash, index, |&index| {
-            self.hasher.hash_one(self.admitted.get(index))
-        });
+    /// This batch's values of the key, borrowed with the key's admitted
+    /// values, and which rows have a NULL in the key: such a key never
+    /// conflicts, as in SQL.
+    fn batch_keys(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> datafusion::error::Result<(BatchKeys<'_>, Option<NullBuffer>)> {
+        let columns: Vec<ArrayRef> = self
+            .indices
+            .iter()
+            .map(|&index| Arc::clone(batch.column(index)))
+            .collect();
+        let nulls = columns
+            .iter()
+            .fold(None, |acc: Option<NullBuffer>, column| {
+                NullBuffer::union(acc.as_ref(), column.logical_nulls().as_ref())
+            });
+        let keys = match &mut self.admitted {
+            Admitted::Bits { width, table } => {
+                let data = columns
+                    .first()
+                    .ok_or_else(|| DataFusionError::Internal("a key has no column".to_string()))?
+                    .to_data();
+                let values = data.buffers().first().ok_or_else(|| {
+                    DataFusionError::Internal("a fixed-width key column has no values".to_string())
+                })?;
+                BatchKeys::Bits {
+                    values: values.slice(data.offset() * *width),
+                    width: *width,
+                    table,
+                    hasher: &self.hasher,
+                }
+            }
+            Admitted::Encoded {
+                converter,
+                keys,
+                table,
+            } => BatchKeys::Encoded {
+                rows: converter.convert_columns(&columns)?,
+                keys,
+                table,
+                hasher: &self.hasher,
+            },
+        };
+        Ok((keys, nulls))
     }
 
     fn allocated_size(&self) -> usize {
-        self.admitted.allocated_size() + self.table.allocation_size() + self.converter.size()
+        match &self.admitted {
+            Admitted::Bits { table, .. } => table.allocation_size(),
+            Admitted::Encoded {
+                converter,
+                keys,
+                table,
+            } => keys.allocated_size() + table.allocation_size() + converter.size(),
+        }
     }
+}
+
+/// One batch's values of one key, with the key's admitted values, so each row
+/// can be looked up and admitted.
+enum BatchKeys<'a> {
+    Bits {
+        /// The column's value bytes, from its first row.
+        values: Buffer,
+        width: usize,
+        table: &'a mut HashTable<u64>,
+        hasher: &'a DefaultHashBuilder,
+    },
+    Encoded {
+        rows: Rows,
+        keys: &'a mut AdmittedKeys,
+        table: &'a mut HashTable<usize>,
+        hasher: &'a DefaultHashBuilder,
+    },
+}
+
+impl BatchKeys<'_> {
+    fn hash(&self, row: usize) -> u64 {
+        match self {
+            Self::Bits {
+                values,
+                width,
+                hasher,
+                ..
+            } => hasher.hash_one(bits(values, *width, row)),
+            Self::Encoded { rows, hasher, .. } => hasher.hash_one(rows.row(row).data()),
+        }
+    }
+
+    fn contains(&self, hash: u64, row: usize) -> bool {
+        match self {
+            Self::Bits {
+                values,
+                width,
+                table,
+                ..
+            } => {
+                let value = bits(values, *width, row);
+                table.find(hash, |&admitted| admitted == value).is_some()
+            }
+            Self::Encoded {
+                rows, keys, table, ..
+            } => {
+                let value = rows.row(row).data();
+                table
+                    .find(hash, |&index| keys.get(index) == value)
+                    .is_some()
+            }
+        }
+    }
+
+    fn insert(&mut self, hash: u64, row: usize) {
+        match self {
+            Self::Bits {
+                values,
+                width,
+                table,
+                hasher,
+            } => {
+                table.insert_unique(hash, bits(values, *width, row), |&admitted| {
+                    hasher.hash_one(admitted)
+                });
+            }
+            Self::Encoded {
+                rows,
+                keys,
+                table,
+                hasher,
+            } => {
+                let index = keys.push(rows.row(row).data());
+                table.insert_unique(hash, index, |&index| hasher.hash_one(keys.get(index)));
+            }
+        }
+    }
+}
+
+/// The bits of the value at `row` of a column `width` bytes wide.
+fn bits(values: &[u8], width: usize, row: usize) -> u64 {
+    let mut bits = [0; 8];
+    bits[..width].copy_from_slice(&values[row * width..(row + 1) * width]);
+    u64::from_le_bytes(bits)
 }
 
 /// The encoded bytes of every admitted key, back to back.
@@ -408,20 +579,8 @@ impl SeenKeys {
     ) -> datafusion::error::Result<Self> {
         let keys = key_indices
             .iter()
-            .map(|indices| {
-                let fields = indices
-                    .iter()
-                    .map(|&index| SortField::new(schema.field(index).data_type().clone()))
-                    .collect();
-                Ok(KeyColumns {
-                    indices: indices.clone(),
-                    converter: RowConverter::new(fields)?,
-                    admitted: AdmittedKeys::default(),
-                    table: HashTable::new(),
-                    hasher: DefaultHashBuilder::default(),
-                })
-            })
-            .collect::<datafusion::error::Result<Vec<_>>>()?;
+            .map(|indices| KeyColumns::try_new(schema, indices))
+            .collect::<datafusion::error::Result<_>>()?;
         Ok(Self { keys, reservation })
     }
 
@@ -431,45 +590,34 @@ impl SeenKeys {
             return Ok(batch);
         }
 
-        // This batch's encoded keys, and which of its rows have a NULL in a
-        // key: such a key never conflicts, as in SQL.
-        let mut encoded = Vec::with_capacity(self.keys.len());
-        for key in &self.keys {
-            let columns: Vec<ArrayRef> = key
-                .indices
-                .iter()
-                .map(|&index| Arc::clone(batch.column(index)))
-                .collect();
-            let nulls = columns
-                .iter()
-                .fold(None, |acc: Option<NullBuffer>, column| {
-                    NullBuffer::union(acc.as_ref(), column.logical_nulls().as_ref())
-                });
-            encoded.push((key.converter.convert_columns(&columns)?, nulls));
-        }
-
         let mut keep = Vec::with_capacity(num_rows);
-        let mut hashes = vec![None; self.keys.len()];
-        for row in 0..num_rows {
-            let mut repeated = false;
-            for ((key, (rows, nulls)), hash) in self.keys.iter().zip(&encoded).zip(&mut hashes) {
-                *hash = None;
-                if nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)) {
-                    continue;
+        {
+            let mut keys = self
+                .keys
+                .iter_mut()
+                .map(|key| key.batch_keys(&batch))
+                .collect::<datafusion::error::Result<Vec<_>>>()?;
+            let mut hashes = vec![None; keys.len()];
+            for row in 0..num_rows {
+                let mut repeated = false;
+                for ((key, nulls), hash) in keys.iter().zip(&mut hashes) {
+                    *hash = None;
+                    if nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)) {
+                        continue;
+                    }
+                    let value_hash = key.hash(row);
+                    *hash = Some(value_hash);
+                    repeated = repeated || key.contains(value_hash, row);
                 }
-                let value = rows.row(row);
-                let value_hash = key.hasher.hash_one(value.as_ref());
-                *hash = Some(value_hash);
-                repeated = repeated || key.contains(value_hash, value.as_ref());
-            }
-            if !repeated {
-                for ((key, (rows, _)), hash) in self.keys.iter_mut().zip(&encoded).zip(&hashes) {
-                    if let Some(hash) = *hash {
-                        key.insert(hash, rows.row(row).as_ref());
+                if !repeated {
+                    for ((key, _), hash) in keys.iter_mut().zip(&hashes) {
+                        if let Some(hash) = *hash {
+                            key.insert(hash, row);
+                        }
                     }
                 }
+                keep.push(!repeated);
             }
-            keep.push(!repeated);
         }
 
         self.reservation.try_resize(
@@ -489,13 +637,14 @@ impl SeenKeys {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdmittedKeys, KeepFirst, KeepFirstExec, KeyLayout, SeenKeys, wrap_with_keep_first_if_needed,
+        Admitted, AdmittedKeys, KeepFirst, KeepFirstExec, KeyColumns, KeyLayout, SeenKeys,
+        wrap_with_keep_first_if_needed,
     };
     use spice_table::{LayerWalk, find_layer};
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{Array, Int32Array, RecordBatch, StringArray};
+    use arrow::array::{Array, Float64Array, Int32Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::MemTable;
     use datafusion::common::{Constraint, Constraints};
@@ -817,10 +966,10 @@ mod tests {
             ]))
             .expect("filter");
         assert_eq!(ids(&[first, second]), vec![1, 2, 4, 6]);
-        assert!(matches!(
-            seen.keys[0].admitted.layout,
-            KeyLayout::Variable(_)
-        ));
+        let Admitted::Encoded { keys, .. } = &seen.keys[0].admitted else {
+            panic!("a string key is held in the row format");
+        };
+        assert!(matches!(keys.layout, KeyLayout::Variable(_)));
     }
 
     #[test]
@@ -834,18 +983,109 @@ mod tests {
         assert_eq!(stored, [b"ab".as_slice(), b"cd", b"efg", b"hi"]);
     }
 
-    /// Only the keys the filter admits are held: a dropped row or a row with a
-    /// NULL key leaves nothing behind once its batch is written.
+    /// How many keys `key` holds, however it holds them.
+    fn admitted(key: &KeyColumns) -> usize {
+        match &key.admitted {
+            Admitted::Bits { table, .. } => table.len(),
+            Admitted::Encoded { keys, table, .. } => {
+                assert_eq!(keys.len, table.len());
+                table.len()
+            }
+        }
+    }
+
+    /// Only the keys the filter admits are held, whether as bits or in the row
+    /// format: a dropped row or a row with a NULL key leaves nothing behind
+    /// once its batch is written.
     #[test]
     fn only_admitted_keys_are_held() {
-        let mut seen = seen_keys(&[vec![0]]);
-        let rows: Vec<(Option<i32>, &str)> = (0..10_000)
-            .map(|n| ((n % 4 != 3).then_some(n % 4), "v"))
+        let values: Vec<String> = (0..10_000).map(|n| (n % 4).to_string()).collect();
+        let rows: Vec<(Option<i32>, &str)> = (0_i32..)
+            .zip(&values)
+            .map(|(n, v)| ((n % 4 != 3).then_some(n % 4), v.as_str()))
             .collect();
-        let kept = seen.keep_first(batch(&rows)).expect("filter");
-        // Keys 0, 1 and 2 once each, and all 2,500 NULL-keyed rows.
+
+        let mut by_id = seen_keys(&[vec![0]]);
+        assert!(matches!(by_id.keys[0].admitted, Admitted::Bits { .. }));
+        let kept = by_id.keep_first(batch(&rows)).expect("filter");
+        // Ids 0, 1 and 2 once each, and all 2,500 NULL-keyed rows.
         assert_eq!(kept.num_rows(), 2_503);
-        assert_eq!(seen.keys[0].admitted.len, 3);
+        assert_eq!(admitted(&by_id.keys[0]), 3);
+
+        let mut by_v = seen_keys(&[vec![1]]);
+        assert!(matches!(by_v.keys[0].admitted, Admitted::Encoded { .. }));
+        let kept = by_v.keep_first(batch(&rows)).expect("filter");
+        assert_eq!(kept.num_rows(), 4);
+        assert_eq!(admitted(&by_v.keys[0]), 4);
+    }
+
+    /// A key held as its bits drops exactly the rows the same key drops in
+    /// arrow's row format, including floats whose bits differ while they
+    /// compare equal in SQL: `-0.0` and `0.0`, and NaNs with different
+    /// payloads. A constant second column puts the same key in the row format.
+    #[test]
+    fn a_key_held_as_bits_drops_what_the_row_format_drops() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, true),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let other_nan = f64::from_bits(f64::NAN.to_bits() ^ 1);
+        let values = vec![
+            Some(0.0),
+            Some(-0.0),
+            Some(0.0),
+            Some(f64::NAN),
+            Some(other_nan),
+            Some(f64::NAN),
+            Some(1.5),
+            Some(-0.0),
+            None,
+            Some(f64::INFINITY),
+            Some(1.5),
+            None,
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Float64Array::from(values)),
+                Arc::new(Int32Array::from(vec![7; 12])),
+            ],
+        )
+        .expect("build batch");
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut as_bits = SeenKeys::try_new(
+            &schema,
+            &[vec![0]],
+            MemoryConsumer::new("bits").register(&pool),
+        )
+        .expect("key set");
+        let mut as_rows = SeenKeys::try_new(
+            &schema,
+            &[vec![0, 1]],
+            MemoryConsumer::new("rows").register(&pool),
+        )
+        .expect("key set");
+        assert!(matches!(as_bits.keys[0].admitted, Admitted::Bits { .. }));
+        assert!(matches!(as_rows.keys[0].admitted, Admitted::Encoded { .. }));
+
+        let kept = as_bits.keep_first(batch.clone()).expect("filter");
+        assert_eq!(kept, as_rows.keep_first(batch).expect("filter"));
+        // 0.0, -0.0, NaN, the other NaN, 1.5, infinity, and both NULLs.
+        assert_eq!(kept.num_rows(), 8);
+    }
+
+    /// A batch sliced from a larger one is read from its own first row.
+    #[test]
+    fn a_sliced_batch_is_read_from_its_first_row() {
+        let mut seen = seen_keys(&[vec![0]]);
+        let rows = batch(&[
+            (Some(1), "a"),
+            (Some(2), "b"),
+            (Some(3), "c"),
+            (Some(2), "d"),
+        ]);
+        let kept = seen.keep_first(rows.slice(1, 3)).expect("filter");
+        assert_eq!(ids(&[kept]), vec![2, 3]);
     }
 
     /// `DuckDB` and `SQLite` match an `on_conflict` target to its column
