@@ -112,16 +112,13 @@ impl<
         self.cache.get(key).await?.read().clone()
     }
 
-    /// Drops every cached value `discard` selects, before moka is told to invalidate it.
+    /// Drops every cached value, before moka is told to invalidate it.
     ///
     /// This runs first because moka's iterator is not documented to visit an entry it has
     /// already invalidated. An entry inserted after this pass is invalidated by moka but
     /// not emptied, and is released only when moka destroys it.
-    fn empty_slots(&self, discard: impl Fn(&V) -> bool) {
+    fn empty_slots(&self) {
         for (_, slot) in &self.cache {
-            if !slot.read().as_ref().is_some_and(&discard) {
-                continue;
-            }
             // Taken under the lock, dropped after it: dropping a plan can release the
             // providers it holds, and that should not block a reader of this key.
             let taken = slot.write().take();
@@ -211,7 +208,7 @@ impl<
     }
 
     async fn invalidate_all(&self) {
-        self.empty_slots(|_| true);
+        self.empty_slots();
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
     }
@@ -244,13 +241,17 @@ impl<
 {
     async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         let table_name = crate::invalidated_table_name(&table_ref);
-        let reads_table = move |value: &V| {
-            crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
-        };
-        self.empty_slots(&reads_table);
-        // An emptied slot was discarded by an invalidation, so it matches too.
+        // Left to moka's maintenance rather than emptied here: matching means walking every
+        // cached plan, and this runs on every refresh of every dataset, while the providers
+        // a refreshed table's plans hold are still registered. An unload and a reload discard
+        // through `invalidate_all`, which does release them at once. An emptied slot was
+        // discarded by an invalidation, so it matches too.
         self.cache
-            .invalidate_entries_if(move |_key, slot| slot.read().as_ref().is_none_or(&reads_table))
+            .invalidate_entries_if(move |_key, slot| {
+                slot.read().as_ref().is_none_or(|value| {
+                    crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
+                })
+            })
             .context(FailedToInvalidateCacheSnafu { table_name })?;
 
         Ok(())
@@ -510,9 +511,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidate_for_table_releases_only_the_plans_over_that_table() {
+    async fn invalidate_for_table_discards_only_the_plans_over_that_table() {
         let cache = SimpleCache::new(10, Duration::from_hours(1), RandomState::default());
-        let (removed_plan, removed_alive) = plan_over("removed");
+        let (removed_plan, _) = plan_over("removed");
         let (kept_plan, kept_alive) = plan_over("kept");
         cache.put_raw_key(&1, removed_plan).await;
         cache.put_raw_key(&2, kept_plan).await;
@@ -523,10 +524,6 @@ mod tests {
             .await
             .expect("invalidation succeeds");
 
-        assert!(
-            removed_alive.upgrade().is_none(),
-            "a plan over the invalidated table must not keep its provider alive"
-        );
         assert!(cache.get_raw_key(&1).await.is_none());
         assert!(kept_alive.upgrade().is_some());
         let kept = cache
