@@ -819,7 +819,7 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
 
     test_request_context()
         .scope(async {
-            let container = common::start_mysql_docker_container()
+            let container = common::start_mysql_docker_container_retrying_startup()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
             let port = container.host_port(3306)?;
@@ -1227,7 +1227,7 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
 
     test_request_context()
         .scope(async {
-            let container = common::start_mysql_docker_container()
+            let container = common::start_mysql_docker_container_retrying_startup()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
             let port = container.host_port(3306)?;

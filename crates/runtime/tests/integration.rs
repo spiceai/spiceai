@@ -171,6 +171,7 @@ mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
 mod results_cache;
+mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
@@ -194,6 +195,7 @@ mod snapshot_source;
 mod snowflake;
 #[cfg(feature = "snowflake")]
 mod snowflake_catalog;
+mod source_unavailable;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;
