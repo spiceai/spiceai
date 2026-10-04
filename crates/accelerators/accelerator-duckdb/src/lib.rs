@@ -3147,6 +3147,139 @@ mod tests {
         assert_eq!(total_rows, 3, "should have 3 rows");
     }
 
+    /// Regression test for #14482 through a real `DuckDB`: a fractional value
+    /// cast into an integer answers as `DataFusion` evaluates it — `1.5`
+    /// truncates to `1` — whether the projection is federated whole into the
+    /// accelerated store or the filter over it is pushed down by the table's
+    /// own scan. Without the gate `DuckDB` rounds on both paths: the projection
+    /// answers `2, 3, 5` for `1.5, 3.0, 4.5`, and a filter selecting `1` or `4`
+    /// matches no row where the plan matches one.
+    #[tokio::test]
+    async fn a_fractional_to_integer_cast_answers_as_datafusion_does_on_a_duckdb_table() {
+        use arrow::array::Float64Array;
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use runtime_datafusion::analyzer_rule::correlated_filter_push_down::federation_analyzer_rule;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("cast_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let table = DuckDBAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("DuckDB table should be created");
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Float64Array::from(vec![1.5, 3.0, 4.5])),
+            ],
+        )
+        .expect("record batch");
+        let write_ctx = SessionContext::new();
+        let insertion = table
+            .insert_into(
+                &write_ctx.state(),
+                Arc::new(MockExec::new(vec![Ok(data)], Arc::clone(&schema))),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insertion should plan");
+        collect(insertion, write_ctx.task_ctx())
+            .await
+            .expect("insertion should succeed");
+
+        // The federated path: the analyzer pushes a whole plan into the
+        // accelerated store where the deny-list lets it.
+        let federated = SessionContext::new_with_state(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_analyzer_rule(Arc::new(federation_analyzer_rule()))
+                .build(),
+        );
+        federated
+            .register_table("cast_test", Arc::clone(&table))
+            .expect("register the table for federation");
+        // The scan path: no federation analyzer, so only the table's own
+        // filter pushdown decides what DuckDB evaluates.
+        let scanned = SessionContext::new();
+        scanned
+            .register_table("cast_test", table)
+            .expect("register the table for scanning");
+
+        let rows =
+            |batches: &[RecordBatch]| pretty_format_batches(batches).expect("format").to_string();
+        for (path, ctx) in [("federated", &federated), ("scan", &scanned)] {
+            let projected = ctx
+                .sql("SELECT id, CAST(f AS INT) AS n, TRY_CAST(f AS BIGINT) AS t FROM cast_test ORDER BY id")
+                .await
+                .expect("the projection should plan")
+                .collect()
+                .await
+                .expect("the projection should run");
+            assert_eq!(
+                rows(&projected),
+                [
+                    "+----+---+---+",
+                    "| id | n | t |",
+                    "+----+---+---+",
+                    "| 1  | 1 | 1 |",
+                    "| 2  | 3 | 3 |",
+                    "| 3  | 4 | 4 |",
+                    "+----+---+---+",
+                ]
+                .join("\n"),
+                "{path}: the cast must truncate as DataFusion does"
+            );
+            for (predicate, expected_id) in
+                [("CAST(f AS INT) = 1", 1_i64), ("CAST(f AS INT) = 4", 3)]
+            {
+                let filtered = ctx
+                    .sql(&format!("SELECT id FROM cast_test WHERE {predicate}"))
+                    .await
+                    .expect("the filter should plan")
+                    .collect()
+                    .await
+                    .expect("the filter should run");
+                let ids: Vec<i64> = filtered
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("id column")
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                assert_eq!(
+                    ids,
+                    vec![expected_id],
+                    "{path}: `{predicate}` must select the row the truncating cast matches"
+                );
+            }
+        }
+    }
+
     /// Tests that the DROP TABLE SQL used by `drop_table` correctly removes a table.
     #[tokio::test]
     async fn test_drop_table_sql_removes_table() {
