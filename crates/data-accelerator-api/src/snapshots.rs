@@ -27,12 +27,15 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use runtime_acceleration::BootstrapStatus;
 use runtime_acceleration::acceleration::{
-    Acceleration, CAYENNE_DATALAKE_SNAPSHOT_REASON, Mode, RefreshMode,
+    Acceleration, CAYENNE_DATALAKE_SNAPSHOT_REASON, DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL, Mode,
+    RefreshMode,
 };
 use runtime_acceleration::acceleration_source::{
     AccelerationSource, DefinitionMatch, MaterializationSource, SourceDefinition,
+    resolved_refresh_mode,
 };
 use runtime_acceleration::snapshot::engine::SnapshotEngine;
+use runtime_acceleration::snapshot::notifications;
 use runtime_acceleration::snapshot::{
     AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager, metrics,
 };
@@ -77,15 +80,7 @@ pub fn should_download_snapshot(
     layout: &AccelerationLayout,
     refresh_mode: RefreshMode,
 ) -> bool {
-    if !acceleration.snapshot_behavior.bootstrap_enabled() {
-        return false;
-    }
-
-    if !mode_allows_snapshot_bootstrap(acceleration, refresh_mode) {
-        tracing::info!(
-            "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
-            source.name()
-        );
+    if !snapshot_bootstrap_enabled(acceleration, source, refresh_mode) {
         return false;
     }
 
@@ -112,10 +107,42 @@ pub fn should_download_snapshot(
         return false;
     }
 
-    if acceleration.uses_cayenne_datalake() {
-        tracing::warn!(
-            dataset = %source.name(),
-            "Dataset '{}' was not restored from a snapshot, so it loads from its source instead: {CAYENNE_DATALAKE_SNAPSHOT_REASON}",
+    !refuses_datalake_bootstrap(acceleration, source)
+}
+
+/// Whether `acceleration` uses a Cayenne datalake tier, which a snapshot cannot restore,
+/// warning that the dataset loads from its source instead. Call it only once a restore
+/// would otherwise happen, so the warning is not logged for a dataset that reopens its
+/// local acceleration.
+pub fn refuses_datalake_bootstrap(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+) -> bool {
+    if !acceleration.uses_cayenne_datalake() {
+        return false;
+    }
+    tracing::warn!(
+        dataset = %source.name(),
+        "Dataset '{}' was not restored from a snapshot, so it loads from its source instead: {CAYENNE_DATALAKE_SNAPSHOT_REASON}",
+        source.name()
+    );
+    true
+}
+
+/// Whether the configuration permits bootstrap. Engines with a shared metastore
+/// must check for the individual table, rather than the metastore directory.
+pub fn snapshot_bootstrap_enabled(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+    refresh_mode: RefreshMode,
+) -> bool {
+    if !acceleration.snapshot_behavior.bootstrap_enabled() {
+        return false;
+    }
+
+    if !mode_allows_snapshot_bootstrap(acceleration, refresh_mode) {
+        tracing::info!(
+            "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
             source.name()
         );
         return false;
@@ -130,13 +157,16 @@ pub fn should_download_snapshot(
 /// [`should_download_snapshot`]; this function performs no checks of its own before
 /// downloading — it exists so the decision and the (potentially side-effecting) act of
 /// downloading can happen at different points in a caller's startup sequence.
+///
+/// # Errors
+/// Returns an error when snapshot notification configuration is invalid.
 pub async fn download_snapshot(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
     engine_override: Option<Arc<dyn SnapshotEngine>>,
-) -> BootstrapStatus {
+) -> Result<BootstrapStatus, notifications::Error> {
     let dataset_name = source.name().to_string();
     // A view withholds bootstrap while any dependency has an unpersisted refresh
     // override: `with_source` would otherwise stamp the static Spicepod fingerprint
@@ -146,7 +176,7 @@ pub async fn download_snapshot(
             dataset = %dataset_name,
             "{reason}; skipping snapshot download"
         );
-        return BootstrapStatus::none();
+        return Ok(BootstrapStatus::none());
     }
     // The source opens its own checkpoint: each engine's checkpointer carries that
     // engine's sidecar SQL and lives in its own `runtime-checkpoint-*` crate, so it
@@ -174,26 +204,46 @@ pub async fn download_snapshot(
         // Views share the same live-refresh identity publish uses (see
         // `View::definition_fingerprint`); datasets keep the Spicepod identity.
         manager = manager.with_source(source);
+        let manager = Arc::new(manager);
         let start_time = Instant::now();
+        let snapshot_reader = resolved_refresh_mode(source, acceleration) == RefreshMode::Snapshot;
+        let subscription =
+            if snapshot_reader && let Some(notifications) = source.snapshot_notifications() {
+                notifications
+                    .subscribe_for_behavior(&acceleration.snapshot_behavior, &manager)
+                    .await?
+            } else {
+                None
+            };
+        if snapshot_reader {
+            // Dataset load tasks own potentially unbounded bootstrap waits. Shared
+            // accelerator initialization must finish before any dataset can load.
+            return Ok(BootstrapStatus::Pending {
+                manager,
+                subscription,
+                poll_interval: acceleration
+                    .refresh_check_interval
+                    .unwrap_or(DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL),
+            });
+        }
         match manager.download_latest_snapshot().await {
             Ok(Some(info)) => {
-                let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 metrics::record_bootstrap_metrics(
                     &dataset_name,
-                    duration_ms,
+                    start_time.elapsed().as_secs_f64() * 1000.0,
                     info.bytes_downloaded,
                     &info.checksum,
                 );
-                BootstrapStatus::bootstrapped(info)
+                Ok(BootstrapStatus::bootstrapped(info, subscription))
             }
-            Ok(None) => BootstrapStatus::none(),
+            Ok(None) => Ok(BootstrapStatus::none()),
             Err(e) => {
                 tracing::error!(dataset = %dataset_name, error = %e, "Failed to download snapshot");
-                BootstrapStatus::none()
+                Ok(BootstrapStatus::none())
             }
         }
     } else {
-        BootstrapStatus::none()
+        Ok(BootstrapStatus::none())
     }
 }
 
@@ -204,6 +254,9 @@ pub async fn download_snapshot(
 /// callers (`DuckDB`, `SQLite`, Turso) that make the decision and perform the download at
 /// the same point in their startup, with no side-effecting setup of their own in
 /// between.
+///
+/// # Errors
+/// Returns an error when snapshot notification configuration is invalid.
 pub async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
@@ -211,9 +264,9 @@ pub async fn download_snapshot_if_needed(
     engine: AccelerationEngine,
     engine_override: Option<Arc<dyn SnapshotEngine>>,
     refresh_mode: RefreshMode,
-) -> BootstrapStatus {
+) -> Result<BootstrapStatus, notifications::Error> {
     if !should_download_snapshot(acceleration, source, &layout, refresh_mode) {
-        return BootstrapStatus::none();
+        return Ok(BootstrapStatus::none());
     }
 
     download_snapshot(acceleration, source, layout, engine, engine_override).await
@@ -530,33 +583,6 @@ pub enum SharedAccelerationSnapshotError {
     DuckDbSharedFile { components: String, path: String },
 }
 
-#[derive(Debug, Snafu)]
-pub enum CayenneSnapshotValidationError {
-    #[snafu(display(
-        "Cayenne components sharing the metadata directory '{metadata_dir}' disagree about \
-        snapshots, so none of them load. Snapshots enabled: {enabled_components}. \
-        Snapshots disabled: {disabled_components}. \
-        Set the same `snapshots` value on all of them, or give them separate metadata directories. \
-        See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
-    ))]
-    InconsistentSnapshotSettings {
-        metadata_dir: String,
-        enabled_components: String,
-        disabled_components: String,
-    },
-
-    #[snafu(display(
-        "Cayenne doesn't support snapshots for shared acceleration, so none of these can be \
-        snapshotted: {components} all share the metadata directory '{metadata_dir}'. \
-        Give each one its own metadata directory. \
-        See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
-    ))]
-    SharedAcceleration {
-        metadata_dir: String,
-        components: String,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,28 +678,5 @@ mod tests {
             "only the outgoing definition was persisted, so the archive must not vouch for a source selection a `refresh_mode: snapshot` follower would trust"
         );
         assert_eq!(stamped.matched_on, DefinitionMatch::FullDefinition);
-    }
-
-    #[test]
-    fn inconsistent_snapshot_settings_names_both_sides_by_label() {
-        let message = CayenneSnapshotValidationError::InconsistentSnapshotSettings {
-            metadata_dir: "/data/cayenne".to_string(),
-            enabled_components: "view 'orders_us'".to_string(),
-            disabled_components: "dataset 'orders'".to_string(),
-        }
-        .to_string();
-
-        assert!(
-            message.contains("view 'orders_us'") && message.contains("dataset 'orders'"),
-            "both sides of the disagreement must be named with their own labels: {message}"
-        );
-        assert!(
-            !message.contains("Cayenne datasets sharing"),
-            "a disagreement involving a view must not be reported as dataset-only: {message}"
-        );
-        assert!(
-            message.contains("/data/cayenne") && message.contains("snapshots"),
-            "the message must name the shared directory and the setting to align: {message}"
-        );
     }
 }

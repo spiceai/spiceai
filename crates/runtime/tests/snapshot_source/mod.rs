@@ -189,16 +189,31 @@ async fn replicate_snapshots(rustfs: Rustfs, prefix: &str) -> Result<()> {
     let source = bucket_store(rustfs, WRITER_BUCKET)?;
     let target = bucket_store(rustfs, READER_BUCKET)?;
 
+    // Read before listing: the writer keeps publishing, so a `metadata.json` read after
+    // the listing can name a snapshot the listing missed, and the copy would point the
+    // reader at an object it does not hold.
+    let metadata_key = ObjectPath::from(format!("{prefix}/metadata.json"));
+    let metadata = match source.get(&metadata_key).await {
+        Ok(result) => Some(result.bytes().await?),
+        Err(object_store::Error::NotFound { .. }) => None,
+        Err(err) => return Err(err.into()),
+    };
+
     let mut listed = source.list(Some(&ObjectPath::from(prefix)));
     let mut keys = Vec::new();
     while let Some(meta) = listed.next().await {
-        keys.push(meta.context("listing the writer's snapshots")?.location);
+        let key = meta.context("listing the writer's snapshots")?.location;
+        if key != metadata_key {
+            keys.push(key);
+        }
     }
-    keys.sort_by_key(|key| key.as_ref().ends_with("metadata.json"));
 
     for key in keys {
         let bytes = source.get(&key).await?.bytes().await?;
         target.put(&key, bytes.into()).await?;
+    }
+    if let Some(metadata) = metadata {
+        target.put(&metadata_key, metadata.into()).await?;
     }
     Ok(())
 }
@@ -852,13 +867,12 @@ const VIEW_CATALOG: Rustfs = Rustfs {
     port: 19131,
 };
 
-/// A snapshot dataset restored into Cayenne joins the process's Cayenne catalog. An
-/// accelerated view in that catalog that does not restore snapshots cannot share it, which
-/// startup refuses for any other snapshot-restoring dataset, so the snapshot dataset is
-/// refused once its engine is known.
+/// A snapshot dataset restored into Cayenne joins the process's Cayenne catalog beside an
+/// accelerated view that does not restore snapshots. A restore imports only the dataset's
+/// own metastore rows, so the two share the catalog: the dataset serves the rows of the
+/// snapshot it restored, and the view serves its own.
 #[tokio::test]
-async fn refuses_a_cayenne_snapshot_dataset_beside_a_cayenne_view_without_snapshots() -> Result<()>
-{
+async fn loads_a_cayenne_snapshot_dataset_beside_a_cayenne_view_without_snapshots() -> Result<()> {
     let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
     let modules = unique("modules");
     let view = unique("module_ids");
@@ -896,7 +910,7 @@ async fn view_catalog_scenario(rustfs: Rustfs, modules: &str, view: &str) -> Res
 
     // Accelerated in the default Cayenne catalog, with snapshots left disabled.
     let mut cayenne_view = View::new(view.to_string());
-    cayenne_view.sql = Some("SELECT 1 AS id".to_string());
+    cayenne_view.sql = Some("SELECT 1 AS id, 'view' AS name".to_string());
     cayenne_view.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("cayenne".to_string()),
@@ -918,33 +932,21 @@ async fn view_catalog_scenario(rustfs: Rustfs, modules: &str, view: &str) -> Res
     let load = tokio::spawn(Arc::clone(&reader).load_components());
 
     let table = datafusion::sql::TableReference::bare(modules);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut status = None;
-    while Instant::now() < deadline {
-        status = reader.status().get_dataset_status(&table);
-        let refused = status
-            .as_ref()
-            .and_then(ComponentStatus::error_message)
-            .is_some_and(|message| message.contains("shares the Cayenne catalog"));
-        if refused || matches!(status, Some(ComponentStatus::Ready)) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let served = async {
+        wait_for_rows(&reader, modules, 3).await?;
+        wait_for_rows(&reader, view, 1).await
     }
-    let message = status
-        .as_ref()
-        .and_then(ComponentStatus::error_message)
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        message.contains("shares the Cayenne catalog")
-            && message.contains(&format!("view '{view}'")),
-        "the snapshot dataset is refused, naming the view, got {status:?}"
-    );
+    .await
+    .with_context(|| {
+        format!(
+            "'{modules}' reported {:?}",
+            reader.status().get_dataset_status(&table)
+        )
+    });
 
     load.abort();
     reader.shutdown().await;
-    Ok(())
+    served
 }
 
 const REPLACED: Rustfs = Rustfs {

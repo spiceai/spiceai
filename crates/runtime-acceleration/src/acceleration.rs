@@ -33,6 +33,9 @@ use spicepod::{
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
+/// Default polling interval for snapshot readers, including initial bootstrap.
+pub const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
+
 /// Errors that can occur when parsing acceleration configuration.
 #[derive(Debug, Snafu)]
 pub enum ParseError {
