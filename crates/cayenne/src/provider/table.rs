@@ -31467,7 +31467,7 @@ impl CayenneTableProvider {
             })
             .await
             .map_err(|source| Error::TaskPanicked {
-                table: self.table_metadata.table_name.to_string(),
+                table: self.table_metadata.table_name.clone(),
                 source,
             })?;
             Arc::new(union)
