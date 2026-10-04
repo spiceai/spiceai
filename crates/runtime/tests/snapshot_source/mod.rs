@@ -188,16 +188,31 @@ async fn replicate_snapshots(rustfs: Rustfs, prefix: &str) -> Result<()> {
     let source = bucket_store(rustfs, WRITER_BUCKET)?;
     let target = bucket_store(rustfs, READER_BUCKET)?;
 
+    // Read before listing: the writer keeps publishing, so a `metadata.json` read after
+    // the listing can name a snapshot the listing missed, and the copy would point the
+    // reader at an object it does not hold.
+    let metadata_key = ObjectPath::from(format!("{prefix}/metadata.json"));
+    let metadata = match source.get(&metadata_key).await {
+        Ok(result) => Some(result.bytes().await?),
+        Err(object_store::Error::NotFound { .. }) => None,
+        Err(err) => return Err(err.into()),
+    };
+
     let mut listed = source.list(Some(&ObjectPath::from(prefix)));
     let mut keys = Vec::new();
     while let Some(meta) = listed.next().await {
-        keys.push(meta.context("listing the writer's snapshots")?.location);
+        let key = meta.context("listing the writer's snapshots")?.location;
+        if key != metadata_key {
+            keys.push(key);
+        }
     }
-    keys.sort_by_key(|key| key.as_ref().ends_with("metadata.json"));
 
     for key in keys {
         let bytes = source.get(&key).await?.bytes().await?;
         target.put(&key, bytes.into()).await?;
+    }
+    if let Some(metadata) = metadata {
+        target.put(&metadata_key, metadata.into()).await?;
     }
     Ok(())
 }
