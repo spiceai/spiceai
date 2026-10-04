@@ -21,7 +21,6 @@ bytes.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
 data_components = { path = "../data_components" }
-parking_lot.workspace = true
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 twox-hash.workspace = true
@@ -34,6 +33,7 @@ duckdb = { workspace = true, features = [
 fundu.workspace = true
 futures.workspace = true
 object_store.workspace = true
+parking_lot.workspace = true
 opentelemetry.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-datafusion = { path = "../runtime-datafusion" }
