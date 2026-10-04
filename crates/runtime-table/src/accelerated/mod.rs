@@ -2825,6 +2825,9 @@ impl Retention {
 }
 
 #[cfg(test)]
+mod drain_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
