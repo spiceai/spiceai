@@ -57,9 +57,12 @@ use super::{
 };
 use crate::catalog::{CatalogError, CatalogResult};
 
-/// The version an unpartitioned dataset's slice is written at, and the lowest
-/// this build reads. Unchanged since the format existed, so a reader that
-/// predates partition children still restores every slice it could before.
+/// The version a slice is written at when every row it carries is one a
+/// version-1 import clears before inserting, and the lowest this build reads.
+/// Unchanged since the format existed, so a reader that predates partition
+/// children still restores every slice it could before. Partitioning alone does
+/// not decide it: an unpartitioned dataset carrying other blob-keyed rows is
+/// written at [`SLICE_FORMAT_VERSION_FULL_CLEANUP`].
 pub const SLICE_FORMAT_VERSION: u32 = 1;
 
 /// The version a slice is written at when it carries rows a
@@ -476,9 +479,10 @@ impl DatasetMetastoreSlice {
     /// clears the dataset it claims to replace rather than merging into it.
     fn table_names(&self) -> Vec<&str> {
         let mut names = vec![self.dataset_name.as_str()];
+        let mut seen: HashSet<&str> = HashSet::from([self.dataset_name.as_str()]);
         for row in slice_rows(self, "cayenne_table") {
             if let Some(name) = text_at(row, CAYENNE_TABLE_NAME_INDEX)
-                && !names.contains(&name)
+                && seen.insert(name)
             {
                 names.push(name);
             }
@@ -854,6 +858,7 @@ pub async fn import_dataset(
         )
         .await?;
     }
+    let stale_child_id_set: HashSet<&str> = stale_child_ids.iter().map(String::as_str).collect();
 
     let txn = metastore.begin_transaction().await?;
 
@@ -914,7 +919,7 @@ pub async fn import_dataset(
         let is_parent = table_name == slice.dataset_name;
         let is_local_child = existing_table_id
             .as_deref()
-            .is_some_and(|id| stale_child_ids.iter().any(|child| child == id));
+            .is_some_and(|id| stale_child_id_set.contains(id));
         if !is_parent && !is_local_child {
             continue;
         }
