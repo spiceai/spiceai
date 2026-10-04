@@ -2120,13 +2120,15 @@ impl AggregateAccumulator {
 
 /// Whether an `AggregateExec`'s shape (independent of its aggregation mode) is one
 /// the maintained-aggregate machinery can serve: no LIMIT folded into the aggregate,
-/// no per-aggregate FILTER, and a single non-`GROUPING SET` grouping. The accepted
+/// no per-aggregate FILTER, and at most one non-`GROUPING SET` grouping. A `GROUP
+/// BY` plans one grouping; an aggregate without one plans none
+/// (`PhysicalGroupBy::new(vec![], vec![], vec![], false)`). The accepted
 /// `AggregateMode`s differ by call site, so the mode gate is checked separately.
 pub(crate) fn aggregate_shape_is_maintainable(aggregate: &AggregateExec) -> bool {
     aggregate.limit_options().is_none()
         && aggregate.filter_expr().iter().all(Option::is_none)
         && !aggregate.group_expr().has_grouping_set()
-        && aggregate.group_expr().groups().len() == 1
+        && aggregate.group_expr().groups().len() <= 1
 }
 
 /// The `Column` an aggregate input expression ultimately references, seeing

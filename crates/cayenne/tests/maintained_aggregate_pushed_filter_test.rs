@@ -73,6 +73,7 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 const TABLE: &str = "maintained_pushed_filter";
 const TABLE_DEL: &str = "maintained_pushed_filter_del";
 const TABLE_SERVED: &str = "maintained_pushed_filter_served";
+const TABLE_CHBENCH: &str = "order_line";
 /// Rows whose `v` clears the filter threshold. With the data below, the correct
 /// FILTERED totals are k10 = 200, k20 = 300; the (wrong) UNFILTERED totals the
 /// bug serves are k10 = 205, k20 = 350.
@@ -502,3 +503,162 @@ async fn maintained_aggregate_filtered_view_serves_pushed_filter_impl(
 }
 
 test_with_backends!(maintained_aggregate_filtered_view_serves_pushed_filter_impl);
+
+/// A maintained filter as the Cayenne accelerator builds it from `filter_sql`:
+/// parsed against the table schema, coerced and folded the way the planner
+/// folds a query's `WHERE`, then planned.
+fn filter_from_sql(sql: &str, schema: &Arc<Schema>) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
+    use datafusion::common::ToDFSchema;
+    let df_schema = schema
+        .as_ref()
+        .clone()
+        .to_dfschema()
+        .expect("schema converts");
+    let context = util::session_state::session_context();
+    let logical = context
+        .parse_sql_expr(sql, &df_schema)
+        .expect("filter parses");
+    let logical = util::expr::coerce_and_simplify_exprs([logical], schema)
+        .expect("filter folds")
+        .pop()
+        .expect("one filter");
+    context
+        .create_physical_expr(logical, &df_schema)
+        .expect("filter plans")
+}
+
+/// The scheduled CH-benCH pods declare q1 and q6 as maintained views on
+/// `order_line`, with the queries' own predicates as `filter_sql`. Each query,
+/// with its `WHERE` pushed into the scan, must be answered by its view, and
+/// the answer must equal the base-table scan's.
+async fn chbench_q1_and_q6_are_served_by_their_views_impl(fixture: TestFixture) -> TestResult<()> {
+    use arrow::array::{Decimal128Array, Int32Array, TimestampMicrosecondArray};
+    use arrow::datatypes::TimeUnit;
+
+    let ctx = cayenne_ctx();
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ol_w_id", DataType::Int32, false),
+        Field::new("ol_number", DataType::Int32, false),
+        Field::new(
+            "ol_delivery_d",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new("ol_quantity", DataType::Int32, false),
+        Field::new("ol_amount", DataType::Decimal128(6, 2), false),
+    ]));
+    let options = CreateTableOptions {
+        table_name: TABLE_CHBENCH.to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["ol_w_id".to_string(), "ol_number".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "ol_w_id".to_string(),
+            "ol_number".to_string(),
+        ]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        },
+    };
+    let table = Arc::new(
+        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env())
+            .await?,
+    );
+    // 2008-01-01 (delivered) and NULL (undelivered) delivery dates.
+    let delivered = Some(1_199_145_600_000_000_i64);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 1, 1, 2, 2])),
+            Arc::new(Int32Array::from(vec![1, 2, 3, 1, 2])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                delivered, delivered, None, delivered, delivered,
+            ])),
+            Arc::new(Int32Array::from(vec![5, 3, 7, 0, 9])),
+            Arc::new(
+                Decimal128Array::from(vec![1_050_i128, 2_000, 333, 10, 99_999])
+                    .with_precision_and_scale(6, 2)?,
+            ),
+        ],
+    )?;
+    let inserted = common::insert_batch(table.as_ref(), batch).await?;
+    assert_eq!(inserted, 5, "all five rows must be written");
+    drop(table);
+
+    let q1_view = MaintainedAggregateSpec {
+        group_by: vec!["ol_number".to_string()],
+        aggregates: vec![
+            MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("ol_quantity".to_string()),
+            },
+            MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("ol_amount".to_string()),
+            },
+            MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("ol_quantity".to_string()),
+            },
+            MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("ol_amount".to_string()),
+            },
+            MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            },
+        ],
+        filter: Some(filter_from_sql(
+            "ol_delivery_d > '2007-01-02 00:00:00.000000'",
+            &schema,
+        )),
+    };
+    let q6_view = MaintainedAggregateSpec {
+        group_by: vec![],
+        aggregates: vec![MaintainedAggregateExpr {
+            function: MaintainedAggregateFunction::Sum,
+            column: Some("ol_amount".to_string()),
+        }],
+        filter: Some(filter_from_sql(
+            "ol_delivery_d >= '1997-01-01 00:00:00' AND ol_delivery_d < '2030-01-01 00:00:00' AND ol_quantity BETWEEN 1 AND 100000",
+            &schema,
+        )),
+    };
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_maintained_aggregates(vec![q1_view, q6_view])
+            .open(TABLE_CHBENCH)
+            .await?,
+    ) as Arc<dyn TableProvider>;
+    ctx.register_table(TABLE_CHBENCH, Arc::clone(&reopened))?;
+    let scan_only = SessionContext::new_with_state(
+        SessionStateBuilder::new().with_default_features().build(),
+    );
+    scan_only.register_table(TABLE_CHBENCH, reopened)?;
+
+    let q1 = "SELECT ol_number, sum(ol_quantity) as sum_qty, sum(ol_amount) as sum_amount, avg(ol_quantity) as avg_qty, avg(ol_amount) as avg_amount, count(*) as count_order FROM order_line WHERE ol_delivery_d > '2007-01-02 00:00:00.000000' GROUP BY ol_number ORDER BY ol_number";
+    let q6 = "SELECT sum(ol_amount) AS revenue FROM order_line WHERE ol_delivery_d >= '1997-01-01 00:00:00' AND ol_delivery_d < '2030-01-01 00:00:00' AND ol_quantity BETWEEN 1 AND 100000";
+    for (name, sql) in [("q1", q1), ("q6", q6)] {
+        let plan = plan_string(&ctx, sql).await?;
+        assert!(
+            plan.contains("MaintainedAggregateExec"),
+            "CH-benCH {name} must be served by its maintained view. Plan:\n{plan}"
+        );
+        let served = ctx.sql(sql).await?.collect().await?;
+        let scanned = scan_only.sql(sql).await?.collect().await?;
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&served)?.to_string(),
+            arrow::util::pretty::pretty_format_batches(&scanned)?.to_string(),
+            "CH-benCH {name} served from its view must equal the base-table scan"
+        );
+    }
+    Ok(())
+}
+
+test_with_backends!(chbench_q1_and_q6_are_served_by_their_views_impl);
+

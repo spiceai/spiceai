@@ -2806,6 +2806,54 @@ mod tests {
         CayenneMaintainedAggregateRewriter::new().optimize(plan, &ConfigOptions::default())
     }
 
+    // An aggregate without `GROUP BY` is planned with no grouping at all, not one
+    // empty grouping; it must still be answered by a view without `GROUP BY`.
+    #[test]
+    fn maintained_aggregate_rewriter_serves_an_aggregate_without_group_by() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec![],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("value".to_string()),
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, &[maintained_aggregate_test_batch()])?;
+        let memory = MemorySourceConfig::try_new_exec(
+            &[vec![maintained_aggregate_test_batch()]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+        let sum = AggregateExprBuilder::new(sum_udaf(), vec![col("value", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("sum(value)".to_string())
+            .build()?;
+        let aggregate = Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            // What the physical planner builds for an aggregate without GROUP BY.
+            PhysicalGroupBy::new(vec![], vec![], vec![], false),
+            vec![Arc::new(sum)],
+            vec![None],
+            scan,
+            Arc::clone(&schema),
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let optimized = rewrite(aggregate)?;
+
+        assert!(
+            optimized.is::<MaintainedAggregateExec>(),
+            "an aggregate without GROUP BY must be served from a view without one"
+        );
+        Ok(())
+    }
+
     // A `WHERE` pushed into the scan is still the query's `WHERE`: when every
     // branch applies the view's filter, the view answers. The file source names
     // `value` at a position of its own schema, so the match must go by name.
