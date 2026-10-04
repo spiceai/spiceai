@@ -9,6 +9,7 @@ A Rust library for storing and retrieving serializable structs in object storage
 - **Conflict detection**: Clear API for handling insert vs update vs conflict scenarios
 - **Local caching**: Optional in-memory cache with refresh capabilities
 - **Zero external state**: No database or coordination service required—uses object store as source of truth
+- **Transactional WAL and MVCC**: The internal `wal::WalStateStore` API commits atomic K/V batches, reads stable snapshots, checkpoints state, and resolves uncertain commits from retained history. See [the transactional state contract](WAL.md) for limits and backend requirements.
 
 ## Quick Start
 

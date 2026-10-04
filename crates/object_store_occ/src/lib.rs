@@ -32,6 +32,8 @@ mod conditional;
 pub mod local_conditional_put;
 mod retry;
 mod state;
+pub mod store;
+pub mod wal;
 
 use snafu::Snafu;
 

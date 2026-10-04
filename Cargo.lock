@@ -4952,6 +4952,7 @@ dependencies = [
  "paste",
  "runtime",
  "runtime-component",
+ "runtime-datafusion",
  "runtime-parameters",
  "runtime-udfs-api",
  "secrecy",
@@ -11244,6 +11245,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "key-index"
+version = "2.4.0-unstable"
+dependencies = [
+ "arc-swap",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
+ "hash-index",
+ "parking_lot",
+ "rand 0.10.1",
+ "snafu",
+ "vstd",
+]
+
+[[package]]
 name = "keyed_priority_queue"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13871,11 +13887,13 @@ name = "object_store_occ"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "bytes",
  "futures",
  "object_store 0.13.2",
  "parking_lot",
  "rand 0.10.1",
+ "rayon",
  "serde",
  "serde_json",
  "snafu",

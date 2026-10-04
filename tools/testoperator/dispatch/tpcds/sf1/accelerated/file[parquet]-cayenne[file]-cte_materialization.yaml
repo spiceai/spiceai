@@ -1,6 +1,7 @@
 tests:
   bench:
     spicepod_path: accelerated/file[parquet]-cayenne[file]-cte_materialization.yaml
+    ready_wait: 300
     query_set: tpcds
     runner_type: spiceai-dev-runners
     validate_results: true
