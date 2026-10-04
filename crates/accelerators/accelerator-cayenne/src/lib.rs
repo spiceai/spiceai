@@ -2003,11 +2003,8 @@ impl CayenneAccelerator {
             // Presence of a non-empty `cayenne_datalake_location` enables it; the
             // rest tune the clustering key, cold file size, and the warm→cold
             // promotion trigger.
-            if let Some(loc) = acceleration.params.get("cayenne_datalake_location") {
-                let loc = loc.trim();
-                if !loc.is_empty() {
-                    config.cold_tier_location = Some(loc.to_string());
-                }
+            if let Some(loc) = acceleration.cayenne_datalake_location() {
+                config.cold_tier_location = Some(loc.to_string());
             }
             if let Some(cols) = acceleration.params.get("cayenne_cluster_by") {
                 config.cluster_by = cols
