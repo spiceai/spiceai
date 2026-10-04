@@ -51570,12 +51570,22 @@ mod tests {
         )
         .await;
 
-        let n: i64 = 100_000;
+        // Large enough on disk (incompressible `value`s, > 10 MiB) that the main
+        // scan's small-scan opt-out (`MAIN_SCAN_REPARTITION_OPT_OUT_BYTES`) does
+        // not apply, so the non-selective control still fans out.
+        let n: i64 = 1_500_000;
+        let value_of = |x: i64| {
+            x.cast_unsigned()
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407)
+                .rotate_left(29)
+                .cast_signed()
+        };
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
                 Arc::new(Int64Array::from_iter_values(0..n)),
-                Arc::new(Int64Array::from_iter_values((0..n).map(|x| x * 10))),
+                Arc::new(Int64Array::from_iter_values((0..n).map(value_of))),
             ],
         )
         .expect("batch built");
