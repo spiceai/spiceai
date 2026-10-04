@@ -31,13 +31,13 @@ use arrow::{
     array::{Array, ArrayRef, BooleanArray, RecordBatch},
     buffer::{Buffer, NullBuffer},
     compute::filter_record_batch,
-    datatypes::{Schema, SchemaRef},
+    datatypes::{DataType, Schema, SchemaRef},
     row::{RowConverter, Rows, SortField},
 };
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraint, Constraints},
+    common::{Constraint, Constraints, internal_err},
     datasource::TableProvider,
     error::DataFusionError,
     execution::{
@@ -48,7 +48,7 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
         PlanProperties, coalesce_partitions::CoalescePartitionsExec, metrics::MetricsSet,
-        stream::RecordBatchStreamAdapter,
+        stream::RecordBatchReceiverStream,
     },
 };
 use datafusion_table_providers::util::on_conflict::OnConflict;
@@ -289,13 +289,26 @@ impl ExecutionPlan for KeepFirstExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        let input = self.input.execute(partition, Arc::clone(&context))?;
+        let mut input = self.input.execute(partition, Arc::clone(&context))?;
         let schema = self.schema();
         let reservation = MemoryConsumer::new(format!("KeepFirstExec[{partition}]"))
             .register(context.memory_pool());
         let mut seen = SeenKeys::try_new(&schema, &self.key_indices, reservation)?;
-        let stream = input.map(move |batch| seen.keep_first(batch?));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        // The filter runs on a task of its own, so it filters the next batch
+        // while whatever drains this stream (the engine's write) handles the
+        // last one, rather than the two taking turns.
+        let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&schema), 2);
+        let tx = builder.tx();
+        builder.spawn(async move {
+            while let Some(batch) = input.next().await {
+                if tx.send(Ok(seen.keep_first(batch?)?)).await.is_err() {
+                    // Nothing reads the stream any more.
+                    break;
+                }
+            }
+            Ok(())
+        });
+        Ok(builder.build())
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -323,7 +336,11 @@ enum Admitted {
     /// Two values are equal exactly when their bits are, which is also how
     /// arrow's row format compares them, so this drops the same rows as
     /// `Encoded` without encoding a key or storing it twice.
-    Bits { width: usize, table: HashTable<u64> },
+    Bits {
+        data_type: DataType,
+        width: usize,
+        table: HashTable<u64>,
+    },
     /// Any other key, in arrow's row format. The table holds each admitted
     /// key's index in `keys`.
     Encoded {
@@ -335,16 +352,19 @@ enum Admitted {
 
 impl KeyColumns {
     fn try_new(schema: &Schema, indices: &[usize]) -> datafusion::error::Result<Self> {
-        let bits_width = match indices {
-            [index] => schema
-                .field(*index)
-                .data_type()
-                .primitive_width()
-                .filter(|&width| width <= 8),
+        let bits = match indices {
+            [index] => {
+                let data_type = schema.field(*index).data_type();
+                data_type
+                    .primitive_width()
+                    .filter(|&width| width <= 8)
+                    .map(|width| (data_type.clone(), width))
+            }
             _ => None,
         };
-        let admitted = match bits_width {
-            Some(width) => Admitted::Bits {
+        let admitted = match bits {
+            Some((data_type, width)) => Admitted::Bits {
+                data_type,
                 width,
                 table: HashTable::new(),
             },
@@ -384,11 +404,23 @@ impl KeyColumns {
                 NullBuffer::union(acc.as_ref(), column.logical_nulls().as_ref())
             });
         let keys = match &mut self.admitted {
-            Admitted::Bits { width, table } => {
-                let data = columns
+            Admitted::Bits {
+                data_type,
+                width,
+                table,
+            } => {
+                let column = columns
                     .first()
-                    .ok_or_else(|| DataFusionError::Internal("a key has no column".to_string()))?
-                    .to_data();
+                    .ok_or_else(|| DataFusionError::Internal("a key has no column".to_string()))?;
+                // Read at another type's width, the column would yield wrong
+                // keys, so a batch that does not match the write is refused.
+                if column.data_type() != data_type {
+                    return internal_err!(
+                        "Failed to keep the first copy of each key: the key column is {}, but the write declared {data_type}",
+                        column.data_type()
+                    );
+                }
+                let data = column.to_data();
                 let values = data.buffers().first().ok_or_else(|| {
                     DataFusionError::Internal("a fixed-width key column has no values".to_string())
                 })?;
@@ -644,7 +676,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{Array, Float64Array, Int32Array, RecordBatch, StringArray};
+    use arrow::array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::MemTable;
     use datafusion::common::{Constraint, Constraints};
@@ -1072,6 +1104,33 @@ mod tests {
         assert_eq!(kept, as_rows.keep_first(batch).expect("filter"));
         // 0.0, -0.0, NaN, the other NaN, 1.5, infinity, and both NULLs.
         assert_eq!(kept.num_rows(), 8);
+    }
+
+    /// A batch whose key column is not the type the write declared is refused
+    /// rather than read at the wrong width.
+    #[test]
+    fn a_key_column_of_another_type_is_refused() {
+        let mut seen = seen_keys(&[vec![0]]);
+        let other = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("v", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("build batch");
+        let error = seen
+            .keep_first(other)
+            .expect_err("an Int64 column under an Int32 key");
+        assert!(
+            error
+                .to_string()
+                .contains("the key column is Int64, but the write declared Int32"),
+            "{error}"
+        );
     }
 
     /// A batch sliced from a larger one is read from its own first row.
