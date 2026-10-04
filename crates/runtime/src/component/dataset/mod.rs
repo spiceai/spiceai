@@ -565,7 +565,8 @@ mod tests {
     /// A `file_format: snapshot` dataset is rebuilt as a `refresh_mode: snapshot` reader
     /// whose `from` is the snapshot location, so its own source selection can never
     /// match the publisher's. It must not carry one, or it refuses every snapshot it
-    /// exists to serve.
+    /// exists to serve. Only a build with snapshots accepts such a dataset at all.
+    #[cfg(feature = "snapshots")]
     #[tokio::test]
     async fn snapshot_file_format_dataset_checks_no_source_identity() {
         let mut reader = spicepod::component::dataset::Dataset::new(

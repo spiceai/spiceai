@@ -1528,16 +1528,17 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let runtime_snapshots = runtime
-                .app()
-                .read()
-                .await
-                .as_ref()
-                .and_then(|app| app.snapshots.clone())
-                .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
-
+            // `OnChange` compares each create with the last entry of the snapshot series. The
+            // runtimes publish their own snapshots of this dataset to the fixture's location in
+            // the background (this one once it is ready, the fixture's even after its shutdown
+            // returns), and an entry appended between the creates below would decide them. So
+            // the manager under test publishes to a location no runtime writes to.
+            let isolated = SnapshotS3Context::new("snapshot_int_test9_onchange").await?;
             let snapshot_behavior = RuntimeSnapshotBehavior::enabled(
-                runtime_snapshots,
+                Arc::new(build_snapshots_config(
+                    &isolated,
+                    BootstrapOnFailureBehavior::Warn,
+                )),
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),
                 SnapshotsCompaction::Disabled,
@@ -1568,36 +1569,11 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
                 "First snapshot should be created since no prior snapshot exists with this timestamp"
             );
 
-            // Wait for snapshot to appear in storage
-            let snapshots_after_first = fixture
-                .context
-                .wait_for_snapshot_objects(
-                    TAXI_TRIPS_DATASET_NAME,
-                    fixture.initial_snapshot_count + 1,
-                    Duration::from_mins(1),
-                )
+            // Wait for snapshot to appear in storage. The create recorded `last_updated_at` on
+            // the entry it appended, which is what the next create compares against.
+            let snapshots_after_first = isolated
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
                 .await?;
-
-            // Update metadata to include the new snapshot
-            let updated_metadata = build_metadata_document(
-                &fixture.context,
-                TAXI_TRIPS_DATASET_NAME,
-                &snapshots_after_first,
-                &schema,
-            );
-
-            // Manually set the snapshot_last_updated_at_ms in metadata
-            let mut metadata = updated_metadata;
-            if let Some(dataset_entry) = metadata.get_mut(TAXI_TRIPS_DATASET_NAME)
-                && let Some(snapshots_arr) =
-                    dataset_entry.get_mut("snapshots").and_then(Value::as_array_mut)
-                && let Some(last_snapshot) = snapshots_arr.last_mut()
-                && let Some(obj) = last_snapshot.as_object_mut()
-            {
-                obj.insert("snapshot-last-updated-at-ms".to_string(), json!(12345u64));
-            }
-            fixture.context.write_metadata(&metadata).await?;
-
             let snapshot_count_after_first = snapshots_after_first.len();
 
             // Try to create another snapshot with the SAME last_updated_at
@@ -1614,10 +1590,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
 
             // Verify no new snapshot was created
             sleep(Duration::from_secs(2)).await;
-            let snapshots_after_second = fixture
-                .context
-                .snapshot_objects(TAXI_TRIPS_DATASET_NAME)
-                .await?;
+            let snapshots_after_second = isolated.snapshot_objects(TAXI_TRIPS_DATASET_NAME).await?;
 
             assert_eq!(
                 snapshots_after_second.len(),
@@ -1639,8 +1612,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
             );
 
             // Wait and verify new snapshot was created
-            let snapshots_after_third = fixture
-                .context
+            let snapshots_after_third = isolated
                 .wait_for_snapshot_objects(
                     TAXI_TRIPS_DATASET_NAME,
                     snapshot_count_after_first + 1,
@@ -1654,6 +1626,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
             );
 
             runtime.shutdown().await;
+            isolated.cleanup().await?;
             fixture.cleanup().await
         })
         .await
