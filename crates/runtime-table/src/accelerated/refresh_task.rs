@@ -106,6 +106,7 @@ use util::timestamp_filter::is_day_granular;
 use util::{RetryError, retry};
 
 pub mod changes;
+#[cfg(test)]
 mod deletion;
 
 // Reuse the single shared schema-evolution instrument rather than registering a

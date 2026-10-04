@@ -20,8 +20,6 @@ use super::DatasetMetricLabels;
 use super::RefreshTask;
 use crate::accelerated::refresh::Refresh;
 use crate::accelerated::refresh_completion::RefreshCompletion;
-#[cfg(test)]
-use crate::accelerated::refresh_task::deletion::build_pk_only_batch_from_change_batch;
 use arrow::array::RecordBatch;
 #[cfg(test)]
 use arrow::array::{Array, Int32Array, Int64Array, StringArray};
@@ -62,6 +60,7 @@ use runtime_acceleration::change_sink::provider::partitioned_widening_refusal;
 use runtime_acceleration::change_sink::provider::{
     cdc::{ChangeOperationType, contiguous_row_span, encode_primary_key, group_into_sub_batches},
     delete_matching_rows_from_arrow_provider,
+    deletion::build_pk_only_batch_from_change_batch,
 };
 #[cfg(test)]
 use runtime_acceleration::change_sink::source_policy::{CdcPolicy, SchemaDecision};
