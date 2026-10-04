@@ -30,15 +30,15 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A cached value, behind a lock an invalidation can take it out of.
+/// A cached value, behind a lock the eviction listener takes it out of.
 ///
-/// moka removes a discarded entry from its map at once, but destroys it later, through
+/// moka removes an entry from its map during maintenance, but destroys it later, through
 /// epoch-based reclamation, whenever some later cache operation happens to collect it. A
 /// cached logical plan holds the providers it was planned against, so until then a
 /// discarded plan keeps a removed dataset's provider, and the query memory that provider
-/// has reserved, alive (#14251). Emptying the slot drops the value while the invalidation
-/// runs, and what moka destroys later is an empty slot. An entry moka evicts for capacity
-/// or TTL is still released whenever moka destroys it.
+/// has reserved, alive (#14251). moka calls the eviction listener as it removes the entry,
+/// for every cause, and emptying the slot there drops the value at once; what moka
+/// destroys later is an empty slot.
 type Slot<V> = Arc<RwLock<Option<V>>>;
 
 fn slot<V>(value: V) -> Slot<V> {
@@ -98,6 +98,12 @@ impl<
             .time_to_live(ttl)
             .max_capacity(cache_max_size)
             .support_invalidation_closures()
+            .eviction_listener(|_key, slot: Slot<V>, _cause| {
+                // Taken under the lock, dropped after it: dropping a plan can release the
+                // providers it holds, and that should not block a reader of this key.
+                let taken = slot.write().take();
+                drop(taken);
+            })
             .build_with_hasher(PassthroughHashBuilder::new(hasher.clone()));
 
         SimpleCache {
@@ -110,20 +116,6 @@ impl<
 
     async fn get_value(&self, key: &u64) -> Option<V> {
         self.cache.get(key).await?.read().clone()
-    }
-
-    /// Drops every cached value, before moka is told to invalidate it.
-    ///
-    /// This runs first because moka's iterator is not documented to visit an entry it has
-    /// already invalidated. An entry inserted after this pass is invalidated by moka but
-    /// not emptied, and is released only when moka destroys it.
-    fn empty_slots(&self) {
-        for (_, slot) in &self.cache {
-            // Taken under the lock, dropped after it: dropping a plan can release the
-            // providers it holds, and that should not block a reader of this key.
-            let taken = slot.write().take();
-            drop(taken);
-        }
     }
 }
 
@@ -208,7 +200,6 @@ impl<
     }
 
     async fn invalidate_all(&self) {
-        self.empty_slots();
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
     }
@@ -241,14 +232,12 @@ impl<
 {
     async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         let table_name = crate::invalidated_table_name(&table_ref);
-        // Left to moka's maintenance rather than emptied here: matching means walking every
-        // cached plan, and this runs on every refresh of every dataset, while the providers
-        // a refreshed table's plans hold are still registered. An unload and a reload discard
-        // through `invalidate_all`, which does release them at once. An emptied slot was
-        // discarded by an invalidation, so it matches too.
+        // The matching entries are removed, and their values dropped by the eviction listener,
+        // at moka's next maintenance rather than here: matching walks every cached plan, and
+        // this runs on every refresh of every dataset.
         self.cache
             .invalidate_entries_if(move |_key, slot| {
-                slot.read().as_ref().is_none_or(|value| {
+                slot.read().as_ref().is_some_and(|value| {
                     crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
                 })
             })
@@ -533,6 +522,27 @@ mod tests {
         assert_eq!(
             kept.as_table_refs().as_ref(),
             &HashSet::from([TableReference::bare("kept")])
+        );
+    }
+
+    // A refresh invalidates the refreshed table's plans. The provider they hold must go once
+    // moka removes them, or a later removal of the dataset cannot release it (#14251).
+    #[tokio::test]
+    async fn a_plan_invalidated_for_its_table_releases_its_provider_at_the_next_maintenance() {
+        let cache = SimpleCache::new(10, Duration::from_hours(1), RandomState::default());
+        let (plan, alive) = plan_over("refreshed");
+        cache.put_raw_key(&1, plan).await;
+        cache.checkpoint().await;
+
+        cache
+            .invalidate_for_table(TableReference::bare("refreshed"))
+            .await
+            .expect("invalidation succeeds");
+        cache.checkpoint().await;
+
+        assert!(
+            alive.upgrade().is_none(),
+            "a plan moka has removed must not keep its provider alive"
         );
     }
 }
