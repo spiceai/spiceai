@@ -30,8 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, new_empty_array,
-    new_null_array,
+    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, new_empty_array, new_null_array,
 };
 use arrow::datatypes::Decimal128Type;
 use arrow_schema::{
@@ -47,9 +46,9 @@ use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_functions_aggregate_common::utils::DecimalAverager;
 use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
-use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
-use datafusion_physical_expr::{Distribution, OrderingRequirements};
 use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::{Distribution, OrderingRequirements};
+use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use hash_index::PrehashedBuildHasher;
 use parking_lot::RwLock;
@@ -252,7 +251,11 @@ struct GroupTable {
 
 impl GroupTable {
     /// The id of the group keyed `key`, creating it when absent.
-    fn id_for(&mut self, key: Vec<ScalarValue>, spec: &ResolvedAggregateSpec) -> DataFusionResult<u32> {
+    fn id_for(
+        &mut self,
+        key: Vec<ScalarValue>,
+        spec: &ResolvedAggregateSpec,
+    ) -> DataFusionResult<u32> {
         if let Some(&id) = self.ids.get(&key) {
             return Ok(id);
         }
@@ -366,14 +369,13 @@ impl RecordLayout {
                     MaintainedAggregateFunction::Sum
                     | MaintainedAggregateFunction::Avg
                     | MaintainedAggregateFunction::Min
-                    | MaintainedAggregateFunction::Max => {
-                        value_words(&column.data_type).ok_or_else(|| {
+                    | MaintainedAggregateFunction::Max => value_words(&column.data_type)
+                        .ok_or_else(|| {
                             DataFusionError::Plan(format!(
                                 "{:?} maintained aggregate does not support column type {}",
                                 aggregate.function, column.data_type
                             ))
-                        })?
-                    }
+                        })?,
                 };
                 let position = if let Some(position) = columns
                     .iter()
@@ -1244,11 +1246,7 @@ impl PredicateConjuncts {
 /// containment one way imply containment the other way.
 impl PartialEq for PredicateConjuncts {
     fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len()
-            && self
-                .0
-                .iter()
-                .all(|conjunct| other.0.contains(conjunct))
+        self.0.len() == other.0.len() && self.0.iter().all(|conjunct| other.0.contains(conjunct))
     }
 }
 
@@ -1724,7 +1722,10 @@ impl MaintainedAggregateRegistry {
     /// Returns an error (after clearing the indexes and marking the registry
     /// stale) when a held delta fails to apply or the result exceeds the byte
     /// budget.
-    pub fn finish_rebuild(&self, rebuilder: MaintainedAggregateRebuilder) -> DataFusionResult<bool> {
+    pub fn finish_rebuild(
+        &self,
+        rebuilder: MaintainedAggregateRebuilder,
+    ) -> DataFusionResult<bool> {
         let mut state = self.state.write();
         let state = &mut *state;
         let Some(snapshot_epoch) = rebuilder.snapshot_epoch else {
@@ -3313,9 +3314,11 @@ fn retained_bytes(views: &[MaintainedAggregateView], index: Option<&RetractionIn
 }
 
 fn retained_entries(views: &[MaintainedAggregateView], index: Option<&RetractionIndex>) -> usize {
-    views.iter().fold(index.map_or(0, RetractionIndex::len), |total, view| {
-        total.saturating_add(view.retained_multiset_entries)
-    })
+    views
+        .iter()
+        .fold(index.map_or(0, RetractionIndex::len), |total, view| {
+            total.saturating_add(view.retained_multiset_entries)
+        })
 }
 
 /// A retained-entry counter overflowed `usize`. Distinct from
@@ -3879,7 +3882,10 @@ mod tests {
             let words = value_words(&data_type).expect("every aggregate input type is storable");
             let encoded = encode_value(&scalar)?;
             let decoded = decode_value(&encoded[..words], &data_type)?;
-            assert_eq!(decoded, scalar, "{data_type} must decode to the stored value");
+            assert_eq!(
+                decoded, scalar,
+                "{data_type} must decode to the stored value"
+            );
             assert_eq!(decoded.data_type(), data_type);
         }
         Ok(())
@@ -3993,14 +3999,21 @@ mod tests {
     /// are skipped rather than counted twice.
     #[test]
     fn a_rebuild_takes_in_the_writes_made_while_it_reads() -> DataFusionResult<()> {
-        let registry =
-            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
         registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
 
         // Holding starts after epoch 1. Epochs 2 and 3 land before the snapshot
         // is taken (so it contains them), epochs 4 and 5 after it.
         let mut rebuilder = registry.begin_rebuild(1)?;
-        assert!(registry.is_stale(), "a registry being rebuilt does not serve");
+        assert!(
+            registry.is_stale(),
+            "a registry being rebuilt does not serve"
+        );
         registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 20)])])?;
         registry.apply_insert_batches(3, &[group_batch(&[("b", 3, 5)])])?;
         assert!(rebuilder.set_snapshot_epoch(3));
@@ -4033,8 +4046,12 @@ mod tests {
     /// applied again.
     #[test]
     fn deltas_the_installed_snapshot_already_holds_are_skipped() -> DataFusionResult<()> {
-        let registry =
-            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
         let mut rebuilder = registry.begin_rebuild(2)?;
         assert!(rebuilder.set_snapshot_epoch(2));
         rebuilder.apply_projected(&group_batch(&[("a", 1, 10), ("a", 2, 20)]), &[0, 1, 2, 3])?;
@@ -4060,8 +4077,12 @@ mod tests {
     #[test]
     fn an_abandoned_rebuild_installs_nothing() -> DataFusionResult<()> {
         // Marked stale while it reads.
-        let registry =
-            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
         let mut rebuilder = registry.begin_rebuild(0)?;
         assert!(rebuilder.set_snapshot_epoch(0));
         registry.mark_stale(1);
@@ -4070,8 +4091,12 @@ mod tests {
         assert!(registry.is_stale());
 
         // A delta skipped an epoch.
-        let registry =
-            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
         let mut rebuilder = registry.begin_rebuild(0)?;
         assert!(rebuilder.set_snapshot_epoch(0));
         registry.apply_insert_batches(2, &[group_batch(&[("a", 1, 10)])])?;
@@ -4091,8 +4116,12 @@ mod tests {
 
         // A snapshot older than the hold: the deltas in between were dropped
         // before the hold began, so the rebuild cannot be completed.
-        let registry =
-            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
         let mut rebuilder = registry.begin_rebuild(3)?;
         assert!(!rebuilder.set_snapshot_epoch(2));
         assert!(
@@ -4107,8 +4136,12 @@ mod tests {
     /// while planning, so the format must not grow with the retained rows.
     #[test]
     fn debug_formatting_does_not_print_retained_rows() -> DataFusionResult<()> {
-        let registry =
-            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
         let rows = (0..10_000_u64)
             .map(|pk| ("a", pk, 1_i64))
             .collect::<Vec<_>>();

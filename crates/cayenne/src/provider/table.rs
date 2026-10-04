@@ -26037,13 +26037,14 @@ impl CayenneTableProvider {
             );
             return Ok(MaintainedAggregateRebuild::Superseded);
         }
-        let mut stream = match datafusion_physical_plan::execute_stream(plan, session_state.task_ctx()) {
-            Ok(stream) => stream,
-            Err(error) => {
-                self.maintained_aggregates.abandon_rebuild(&rebuilder);
-                return Err(error);
-            }
-        };
+        let mut stream =
+            match datafusion_physical_plan::execute_stream(plan, session_state.task_ctx()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    self.maintained_aggregates.abandon_rebuild(&rebuilder);
+                    return Err(error);
+                }
+            };
         let (mut batch_count, mut row_count) = (0_usize, 0_usize);
         while let Some(batch) = stream.next().await {
             let batch = match batch {
