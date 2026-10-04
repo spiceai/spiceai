@@ -31323,7 +31323,7 @@ impl CayenneTableProvider {
         // `owned_capture_write_lock` is Some only for the public N>1 path. A caller
         // using `checkpoint_mem_tier_holding_locks` owns its write guard outside
         // this method, so it passes None and retains that lock for its operation.
-        let (shard_snapshots, flushed_counts, snapshot, durable_epoch, reserved_snapshot_sequence) = {
+        let (shard_snapshots, flushed_counts, durable_epoch, reserved_snapshot_sequence) = {
             // Acquire all shard publish locks in index order (deadlock-free).
             let mut guards = Vec::with_capacity(n);
             for lock in self.mem_tier_publish_locks.iter() {
@@ -31398,27 +31398,8 @@ impl CayenneTableProvider {
                 .zip(flushed_counts.iter())
                 .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
                 .max();
-            // The metadata/encode path reads ONE tier's tombstones/epoch. At N==1
-            // that is shard 0's snapshot unchanged (byte-identical); at N>1 it is
-            // the cross-shard UNION view (disjoint keys ⇒ exact union).
-            let snapshot = if n == 1 {
-                Arc::clone(&shard_snapshots[0])
-            } else {
-                Arc::new(
-                    crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(
-                        &shard_snapshots,
-                        durable_epoch.unwrap_or(0),
-                    ),
-                )
-            };
             drop(guards);
-            (
-                shard_snapshots,
-                flushed_counts,
-                snapshot,
-                durable_epoch,
-                seq,
-            )
+            (shard_snapshots, flushed_counts, durable_epoch, seq)
         };
         // The all-shards-atomic capture window: the per-shard snapshot load +
         // sequence reservation under the publish locks (and `write_lock` at N>1).
@@ -31445,12 +31426,11 @@ impl CayenneTableProvider {
         // tombstone union + the summed byte/row counts but ALWAYS has empty
         // `segments` (the row-bearing segments are iterated per shard below), so
         // `snapshot.is_empty()` (segments ∧ tombstones empty) would spuriously
-        // report a pure-insert tier as empty and skip the flush. At N==1
-        // `snapshot` IS shard 0's snapshot, so `is_empty()` there is the
-        // byte-identical pre-shard check; at N>1 a tier is empty only when every
-        // shard is empty.
+        // report a pure-insert tier as empty and skip the flush. At N==1 the
+        // snapshot is shard 0's, so its `is_empty()` is the byte-identical
+        // pre-shard check; at N>1 a tier is empty only when every shard is empty.
         let nothing_to_flush = if n == 1 {
-            snapshot.is_empty()
+            shard_snapshots[0].is_empty()
         } else {
             shard_snapshots.iter().all(|s| s.is_empty())
         };
@@ -31470,6 +31450,28 @@ impl CayenneTableProvider {
             self.refire_last_durable_slot_advancer().await;
             return Ok(0);
         }
+        // The metadata/encode path reads ONE tier's tombstones/epoch. At N==1 that
+        // is shard 0's snapshot unchanged (byte-identical); at N>1 it is the
+        // cross-shard UNION view (disjoint keys ⇒ exact union). It reads only the
+        // captured immutable shard snapshots, so it is built here, after the capture
+        // locks are released: merging the shards' tombstone maps grows with the
+        // tier, and under the locks it held every append and the apply's
+        // `write_lock` for the whole merge.
+        let snapshot = if n == 1 {
+            Arc::clone(&shard_snapshots[0])
+        } else {
+            let shards = shard_snapshots.clone();
+            let epoch = durable_epoch.unwrap_or(0);
+            let union = tokio::task::spawn_blocking(move || {
+                crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(&shards, epoch)
+            })
+            .await
+            .map_err(|source| Error::TaskPanicked {
+                table: self.table_metadata.table_name.to_string(),
+                source,
+            })?;
+            Arc::new(union)
+        };
         // At N==1 the slot-ack currency stays the single shard's `MemTier::epoch`
         // (no `source_position` stamped), byte-identical to the pre-shard path. At
         // N>1 it is the shared per-apply `durable_epoch` MAX computed above.
