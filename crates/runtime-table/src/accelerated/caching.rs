@@ -31,7 +31,7 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::logical_expr::{Expr, dml::InsertOp, not};
+use datafusion::logical_expr::{Expr, dml::InsertOp, not, utils::split_conjunction};
 use datafusion::logical_expr::{col, lit};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -56,6 +56,8 @@ use runtime_request_context::CacheNamespace;
 use runtime_status::{ComponentStatus, RuntimeStatus};
 use util::expr::combine_exprs_balanced;
 
+#[cfg(test)]
+mod lookup_tests;
 mod writer;
 use writer::RetainedBufferCharge;
 pub use writer::{CacheSinkWriter, CacheWorkDrain, CacheWriteSender, SynchronizedCacheTarget};
@@ -514,15 +516,27 @@ pub fn namespace_filter_expr(namespace_id: &str) -> Expr {
     col(CACHE_NAMESPACE_COLUMN).eq(lit(namespace_id))
 }
 
-/// Bound a keyed cache lookup to the complete logical HTTP request identity.
-/// Unfiltered cache scans and predicates that are not request-key conjunctions
-/// retain their supplied filters. Namespace filtering remains separate.
+/// Bound a keyed cache lookup to the complete logical HTTP request identity,
+/// preserving response predicates. Scans without request predicates, or whose
+/// request predicates do not describe a single identity, retain their filters.
+/// Namespace filtering remains separate; lookup filters do not establish
+/// replacement completeness.
 #[must_use]
 pub fn cache_lookup_filters(schema: &arrow::datatypes::Schema, filters: &[Expr]) -> Vec<Expr> {
-    if filters.is_empty() {
-        return Vec::new();
+    let (request_filters, other_filters): (Vec<_>, Vec<_>) = filters
+        .iter()
+        .flat_map(split_conjunction)
+        .partition(|filter| {
+            filter
+                .column_refs()
+                .iter()
+                .any(|column| REQUEST_KEY_COLUMNS.contains(&column.name.as_str()))
+        });
+    if request_filters.is_empty() {
+        return filters.to_vec();
     }
-    let Some(canonical) = writer::canonical_request_filters(filters) else {
+    let request_filters: Vec<_> = request_filters.into_iter().cloned().collect();
+    let Some(canonical) = writer::canonical_request_filters(&request_filters) else {
         return filters.to_vec();
     };
     canonical
@@ -533,6 +547,7 @@ pub fn cache_lookup_filters(schema: &arrow::datatypes::Schema, filters: &[Expr])
                 .iter()
                 .all(|column| schema.column_with_name(&column.name).is_some())
         })
+        .chain(other_filters.into_iter().cloned())
         .collect()
 }
 
