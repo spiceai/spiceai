@@ -42,19 +42,19 @@ use data_components::kafka::{
     rdkafka::types::RDKafkaErrorCode,
 };
 #[cfg(test)]
-use datafusion::datasource::TableProvider;
-#[cfg(test)]
 use datafusion::error::DataFusionError;
 #[cfg(test)]
 use datafusion::execution::{SessionState, context::SessionContext};
 #[cfg(test)]
 use datafusion::logical_expr::Expr;
 #[cfg(test)]
-use datafusion::logical_expr::{dml::InsertOp, lit};
+use datafusion::logical_expr::lit;
 #[cfg(test)]
 use datafusion::physical_plan::collect;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
+#[cfg(test)]
+use futures::StreamExt;
 use futures::stream;
 #[cfg(all(test, not(windows)))]
 use runtime_acceleration::change_sink::provider::partitioned_widening_refusal;
@@ -74,7 +74,7 @@ use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
 use runtime_component::dataset::OnSchemaChange;
 use runtime_component::dataset::acceleration::RefreshMode;
 #[cfg(test)]
-use runtime_component::schema_evolution::evolution_allowed;
+use runtime_component::schema_evolution::{evolution_allowed, widening_plan_kind};
 #[cfg(test)]
 use runtime_datafusion::error::find_datafusion_root;
 use runtime_datafusion::error::format_datafusion_error;
@@ -142,9 +142,31 @@ impl SourceDurabilityObserver {
         }
         {
             let mut queue = self.queue.lock().await;
-            self.pending_count
-                .fetch_add(committers.len(), Ordering::AcqRel);
-            queue.push_back((fence, committers));
+            // The oldest queued fence must stay fixed so an in-progress
+            // checkpoint can release it even while newer publications arrive.
+            // Only a compatible singleton tail behind that head can absorb.
+            let merged = if queue.len() > 1
+                && let (Some((tail_fence, tail)), [incoming]) =
+                    (queue.back_mut(), committers.as_slice())
+                && let [retained] = tail.as_mut_slice()
+                && retained.supports_deferral()
+                && incoming.supports_deferral()
+                && retained.as_any().is_some()
+                && incoming.as_any().is_some()
+                && retained.try_absorb(incoming.as_ref())
+            {
+                *tail_fence = (*tail_fence).max(fence);
+                true
+            } else {
+                false
+            };
+            if merged {
+                drop(committers);
+            } else {
+                self.pending_count
+                    .fetch_add(committers.len(), Ordering::AcqRel);
+                queue.push_back((fence, committers));
+            }
         }
         // A checkpoint may finish before the publication receipt reaches the
         // source. Retry against its remembered fence, including on an idle source.
@@ -162,10 +184,19 @@ impl SourceDurabilityObserver {
         }
     }
 
-    async fn is_empty(&self) -> bool {
+    async fn is_empty(&self, trace: Option<&CdcFlushTrace<'_>>, stage: &'static str) -> bool {
         // A detached ready prefix still counts as pending acknowledgement.
+        let drain_start = Instant::now();
         let _drain = self.drain.lock().await;
-        self.queue.lock().await.is_empty()
+        if let Some(trace) = trace {
+            trace.record(stage, "observer_drain_lock", drain_start);
+        }
+        let queue_start = Instant::now();
+        let empty = self.queue.lock().await.is_empty();
+        if let Some(trace) = trace {
+            trace.record(stage, "observer_queue_lock", queue_start);
+        }
+        empty
     }
 }
 
@@ -193,8 +224,7 @@ impl DurabilityObserver for SourceDurabilityObserver {
             ready
         };
 
-        // Cross-epoch coalescing is legal here (unlike at push time): every
-        // committer in `ready` is at or below the durable fence, so folding the
+        // Every committer in `ready` is at or below the durable fence, so folding the
         // whole prefix to a single max-LSN commit and acking once is equivalent
         // to acking each epoch in turn — O(epochs) work becomes one `fetch_max`.
         // A dataset's deferred queue holds a single committer type, so this is
@@ -295,18 +325,8 @@ fn fold_committers(
             if last.try_absorb(committer.as_ref()) {
                 continue;
             }
-            // Within a single dataset's run every coalesce-capable committer
-            // targets the same stream position (e.g. one Postgres member slot),
-            // so two of the same concrete type must always absorb; a failure
-            // means two members' commits were routed into one dataset's run — an
-            // upstream (pump) bug, not something to paper over here.
-            debug_assert!(
-                !matches!(
-                    (last.as_any(), committer.as_any()),
-                    (Some(a), Some(b)) if a.type_id() == b.type_id()
-                ),
-                "two coalesce-capable committers of the same type failed to absorb"
-            );
+            // The same committer type can carry different source identities.
+            // A refused merge retains both commits in their original order.
         }
         folded.push(committer);
     }
@@ -339,6 +359,47 @@ fn change_batch_requires_durable_cdc_path(
     })
 }
 
+struct CdcFlushTrace<'a> {
+    dataset: &'a TableReference,
+    id: u64,
+    started: Instant,
+}
+
+impl<'a> CdcFlushTrace<'a> {
+    fn new(dataset: &'a TableReference) -> Option<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        if !tracing::enabled!(target: "changesink_diagnostic", tracing::Level::DEBUG) {
+            return None;
+        }
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if id == 1025 {
+            tracing::debug!(target: "changesink_diagnostic", limit = 1024, "CDC flush phase trace limit reached; further calls are not traced");
+        }
+        if id > 1024 {
+            return None;
+        }
+        tracing::debug!(target: "changesink_diagnostic", dataset = %dataset, flush_id = id, "CDC flush phase trace started");
+        Some(Self {
+            dataset,
+            id,
+            started: Instant::now(),
+        })
+    }
+
+    fn record(&self, stage: &'static str, phase: &'static str, start: Instant) {
+        tracing::debug!(
+            target: "changesink_diagnostic",
+            dataset = %self.dataset,
+            flush_id = self.id,
+            stage,
+            phase,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1000.0,
+            since_start_ms = self.started.elapsed().as_secs_f64() * 1000.0,
+            "CDC flush phase completed"
+        );
+    }
+}
+
 async fn flush_pending_source_commits(
     sink: &ChangeSink,
     observer: &SourceDurabilityObserver,
@@ -350,17 +411,27 @@ async fn flush_pending_source_commits(
     // `items_after_statements`).
     const MAX_CHECKPOINT_ATTEMPTS: usize = 3;
 
-    if observer.is_empty().await {
+    let trace = CdcFlushTrace::new(dataset_name);
+    if observer.is_empty(trace.as_ref(), "initial_check").await {
         return None;
     }
 
     // Retry transient source acknowledgements and storage fences before allowing
     // a later immediate commit. A nonempty queue must never be skipped.
     for attempt in 1..=MAX_CHECKPOINT_ATTEMPTS {
-        match sink.flush().await {
+        let flush_start = Instant::now();
+        let flush_result = sink.flush().await;
+        if let Some(trace) = &trace {
+            trace.record("flush", "sink_flush", flush_start);
+        }
+        match flush_result {
             Ok(()) => {
+                let retry_start = Instant::now();
                 observer.retry().await;
-                if observer.is_empty().await {
+                if let Some(trace) = &trace {
+                    trace.record("retry", "observer_retry", retry_start);
+                }
+                if observer.is_empty(trace.as_ref(), "post_retry_check").await {
                     return None;
                 }
                 if attempt < MAX_CHECKPOINT_ATTEMPTS {
@@ -4086,17 +4157,247 @@ mod tests {
                 .as_any()
                 .and_then(<dyn std::any::Any>::downcast_ref::<FoldableCommitter>)
             {
-                Some(other) => {
+                Some(other) if Arc::ptr_eq(&self.log, &other.log) => {
                     self.value = self.value.max(other.value);
                     true
                 }
-                None => false,
+                _ => false,
             }
         }
 
         fn as_any(&self) -> Option<&dyn std::any::Any> {
             Some(self)
         }
+    }
+
+    fn deferred_foldable(
+        value: u64,
+        log: &Arc<TokioMutex<Vec<u64>>>,
+    ) -> Box<dyn cdc::CommitChange + Send + Sync> {
+        Box::new(FoldableCommitter {
+            value,
+            log: Arc::clone(log),
+        })
+    }
+
+    fn deferred_observer() -> SourceDurabilityObserver {
+        SourceDurabilityObserver::new(
+            TableReference::bare("test"),
+            runtime_status::RuntimeStatus::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_keeps_oldest_fence_and_covers_merged_tail() {
+        let observer = deferred_observer();
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        for fence in 1..=384 {
+            observer
+                .enqueue(fence, vec![deferred_foldable(fence, &log)])
+                .await;
+            assert!(observer.pending_count() <= 2);
+        }
+        assert!(log.lock().await.is_empty(), "publication is not durability");
+        {
+            let queue = observer.queue.lock().await;
+            assert_eq!(queue.iter().map(|(f, _)| *f).collect::<Vec<_>>(), [1, 384]);
+        }
+        observer.on_durable(1).await;
+        assert_eq!(*log.lock().await, [1]);
+        for fence in 385..=768 {
+            observer
+                .enqueue(fence, vec![deferred_foldable(fence, &log)])
+                .await;
+            assert!(observer.pending_count() <= 2);
+        }
+        observer.on_durable(384).await;
+        assert_eq!(
+            *log.lock().await,
+            [1, 384],
+            "the next oldest fence stays fixed"
+        );
+        observer.on_durable(767).await;
+        assert_eq!(
+            *log.lock().await,
+            [1, 384],
+            "a partial tail fence cannot acknowledge it"
+        );
+        observer.on_durable(768).await;
+        assert_eq!(*log.lock().await, [1, 384, 768]);
+        assert_eq!(observer.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_continuous_publication_does_not_starve_acknowledgement() {
+        let observer = deferred_observer();
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        for fence in 1..=10_000 {
+            observer
+                .enqueue(fence, vec![deferred_foldable(fence, &log)])
+                .await;
+            assert!(
+                observer.pending_count() <= 2,
+                "fixed retained metadata bound"
+            );
+            if fence % 32 == 0 {
+                let durable = fence - 16;
+                observer.on_durable(durable).await;
+                let log = log.lock().await;
+                let last = *log.last().expect("an old fixed fence is durable");
+                assert!(last <= durable, "never acknowledge beyond durability");
+                assert!(
+                    fence - last <= 64,
+                    "old checkpoints must make progress under continuous input"
+                );
+            }
+        }
+        observer.on_durable(10_000).await;
+        assert_eq!(log.lock().await.last(), Some(&10_000));
+        assert_eq!(observer.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_preserves_mixed_failure_order() {
+        let observer = deferred_observer();
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        let failures = CommitLog::new();
+        observer.enqueue(1, vec![deferred_foldable(1, &log)]).await;
+        observer
+            .enqueue(
+                2,
+                vec![Box::new(DeferrableTrackingCommitter {
+                    id: 2,
+                    log: Arc::clone(&failures),
+                    outcome: Err("retry me".into()),
+                })],
+            )
+            .await;
+        for fence in 3..=4 {
+            observer
+                .enqueue(fence, vec![deferred_foldable(fence, &log)])
+                .await;
+        }
+        observer
+            .enqueue(
+                5,
+                vec![Box::new(DeferrableTrackingCommitter {
+                    id: 5,
+                    log: Arc::clone(&failures),
+                    outcome: Ok(()),
+                })],
+            )
+            .await;
+        assert_eq!(observer.pending_count(), 4);
+        observer.on_durable(5).await;
+        observer.retry().await;
+        assert_eq!(
+            *log.lock().await,
+            [1],
+            "a failed predecessor fences the folded tail"
+        );
+        assert_eq!(failures.ids().await, [2, 2]);
+        assert_eq!(observer.pending_count(), 3);
+        let queue = observer.queue.lock().await;
+        assert_eq!(queue.iter().map(|(f, _)| *f).collect::<Vec<_>>(), [2, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_preserves_incompatible_source_identity() {
+        let observer = deferred_observer();
+        let first = Arc::new(TokioMutex::new(Vec::new()));
+        let second = Arc::new(TokioMutex::new(Vec::new()));
+        observer
+            .enqueue(1, vec![deferred_foldable(1, &first)])
+            .await;
+        observer
+            .enqueue(2, vec![deferred_foldable(2, &first)])
+            .await;
+        observer
+            .enqueue(3, vec![deferred_foldable(3, &second)])
+            .await;
+        assert_eq!(observer.pending_count(), 3);
+        observer.on_durable(3).await;
+        assert_eq!(*first.lock().await, [2]);
+        assert_eq!(*second.lock().await, [3]);
+        assert_eq!(observer.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_leaves_multi_committer_epochs_intact() {
+        let observer = deferred_observer();
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        observer.enqueue(1, vec![deferred_foldable(1, &log)]).await;
+        observer
+            .enqueue(
+                2,
+                vec![deferred_foldable(2, &log), deferred_foldable(3, &log)],
+            )
+            .await;
+        observer.enqueue(3, vec![deferred_foldable(4, &log)]).await;
+        assert_eq!(observer.pending_count(), 4);
+        let queue = observer.queue.lock().await;
+        assert_eq!(
+            queue.iter().map(|(f, c)| (*f, c.len())).collect::<Vec<_>>(),
+            [(1, 1), (2, 2), (3, 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_late_enqueue_retries_durable_fence() {
+        let observer = deferred_observer();
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        observer.on_durable(10).await;
+        for fence in 1..=10 {
+            observer
+                .enqueue(fence, vec![deferred_foldable(fence, &log)])
+                .await;
+            assert_eq!(observer.pending_count(), 0);
+            assert_eq!(log.lock().await.last(), Some(&fence));
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_cancelled_enqueue_retains_published_acknowledgement() {
+        let observer = Arc::new(deferred_observer());
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        observer.enqueue(1, vec![deferred_foldable(1, &log)]).await;
+        observer.enqueue(2, vec![deferred_foldable(2, &log)]).await;
+        observer.on_durable(0).await;
+        let drain = observer.drain.lock().await;
+        let task_observer = Arc::clone(&observer);
+        let task_log = Arc::clone(&log);
+        let task = tokio::spawn(async move {
+            task_observer
+                .enqueue(3, vec![deferred_foldable(3, &task_log)])
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !observer
+                .queue
+                .lock()
+                .await
+                .back()
+                .is_some_and(|(fence, _)| *fence == 3)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("enqueue reaches its durability retry");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("enqueue waiter cancelled")
+                .is_cancelled()
+        );
+        drop(drain);
+        assert!(log.lock().await.is_empty());
+        assert_eq!(observer.pending_count(), 2);
+        observer.on_durable(2).await;
+        assert_eq!(*log.lock().await, [1]);
+        observer.on_durable(3).await;
+        assert_eq!(*log.lock().await, [1, 3]);
+        assert_eq!(observer.pending_count(), 0);
     }
 
     #[test]
