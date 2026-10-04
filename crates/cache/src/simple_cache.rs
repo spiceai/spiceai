@@ -234,7 +234,8 @@ impl<
         let table_name = crate::invalidated_table_name(&table_ref);
         // The matching entries are removed, and their values dropped by the eviction listener,
         // at moka's next maintenance rather than here: matching walks every cached plan, and
-        // this runs on every refresh of every dataset.
+        // this runs on every refresh, every applied CDC batch, and every DML statement, where
+        // maintenance folds the predicates registered since its last pass into one walk.
         self.cache
             .invalidate_entries_if(move |_key, slot| {
                 slot.read().as_ref().is_some_and(|value| {
