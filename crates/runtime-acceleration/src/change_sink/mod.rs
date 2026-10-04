@@ -25,6 +25,9 @@ mod driver;
 pub mod provider;
 pub mod source_policy;
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 
 use arrow_tools::schema_evolution::WideningPlan;
