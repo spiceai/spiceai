@@ -125,7 +125,6 @@ pub enum MaintainedAggregateFunction {
 }
 
 /// Shared maintained aggregate state for a single Cayenne table.
-#[derive(Debug)]
 pub struct MaintainedAggregateRegistry {
     state: RwLock<RegistryState>,
     /// Upper bound on approximate resident BYTES retained across all views:
@@ -147,6 +146,21 @@ pub struct MaintainedAggregateRegistry {
     no_views: bool,
     /// The table schema the views resolve their columns against.
     schema: SchemaRef,
+}
+
+/// A summary, never the retained state. Every Cayenne scan plan carries the
+/// registry, and plans are formatted with `Debug` on ordinary planning paths:
+/// `DataFusion`'s physical planner formats each extension node it plans (a
+/// materialized CTE wraps a scan) to build an error context, whether or not
+/// planning fails. Printing the retraction index, one entry per maintained row,
+/// would cost seconds and gigabytes on every such plan.
+impl std::fmt::Debug for MaintainedAggregateRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaintainedAggregateRegistry")
+            .field("has_pk_index", &self.has_pk_index)
+            .field("max_index_bytes", &self.max_index_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -4086,6 +4100,26 @@ mod tests {
             "a rebuild without a usable snapshot epoch installs nothing"
         );
         assert!(registry.is_stale());
+        Ok(())
+    }
+
+    /// A scan plan carries its table's registry and gets formatted with `Debug`
+    /// while planning, so the format must not grow with the retained rows.
+    #[test]
+    fn debug_formatting_does_not_print_retained_rows() -> DataFusionResult<()> {
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
+        let rows = (0..10_000_u64)
+            .map(|pk| ("a", pk, 1_i64))
+            .collect::<Vec<_>>();
+        registry.apply_insert_batches(1, &[group_batch(&rows)])?;
+
+        let formatted = format!("{registry:?}");
+        assert!(
+            formatted.len() < 256,
+            "the registry's Debug must be a summary, but it is {} bytes",
+            formatted.len()
+        );
         Ok(())
     }
 
