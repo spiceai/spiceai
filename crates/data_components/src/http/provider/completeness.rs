@@ -28,6 +28,9 @@ use datafusion::{
 };
 use futures::Stream;
 
+#[cfg(test)]
+mod tests;
+
 const NOT_STARTED: u8 = 0;
 const RUNNING: u8 = 1;
 const COMPLETE: u8 = 2;
