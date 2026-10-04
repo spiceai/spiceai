@@ -240,7 +240,7 @@ pub async fn archive_directories<W>(dirs: &[(PathBuf, String)], writer: W) -> Re
 where
     W: AsyncWrite + Unpin + Send,
 {
-    archive_directories_with_plan(dirs, writer, &[], &[]).await
+    archive_directories_with_plan(dirs, writer, &[], &[], &[]).await
 }
 
 /// Like [`archive_directories`], but allows excluding files (`skip_relative_paths`,
@@ -249,6 +249,9 @@ where
 ///
 /// `extras[i]` is added to the archive with `archive_path = extras[i].0` and
 /// `bytes = extras[i].1`. The bytes count toward the returned total.
+/// `optional_files[i]`, a `(source, archive_path)` pair, is archived only if
+/// the file still exists when the archive reaches it (see
+/// `DirectorySnapshotPlan::optional_files`).
 ///
 /// # Errors
 ///
@@ -260,6 +263,7 @@ pub async fn archive_directories_with_plan<W>(
     writer: W,
     skip_relative_paths: &[PathBuf],
     extras: &[(String, Vec<u8>)],
+    optional_files: &[(PathBuf, String)],
 ) -> Result<u64>
 where
     W: AsyncWrite + Unpin + Send,
@@ -271,6 +275,7 @@ where
     let dirs = dirs.to_vec();
     let skip: HashSet<PathBuf> = skip_relative_paths.iter().cloned().collect();
     let extras = extras.to_vec();
+    let optional_files = optional_files.to_vec();
 
     // Use spawn_blocking since tar operations are synchronous
     let (total_bytes, tar_data) = spawn_blocking(move || {
@@ -313,6 +318,8 @@ where
                         source: e,
                     })?;
             }
+
+            append_optional_files(&mut archive, &optional_files)?;
 
             // Append in-memory extras after the on-disk content.
             for (archive_path, bytes) in &extras {
@@ -365,11 +372,13 @@ pub async fn archive_directories_to_file_with_plan(
     destination: &Path,
     skip_relative_paths: &[PathBuf],
     extras: &[(String, Vec<u8>)],
+    optional_files: &[(PathBuf, String)],
 ) -> Result<u64> {
     let dirs = dirs.to_vec();
     let destination = destination.to_path_buf();
     let skip: HashSet<PathBuf> = skip_relative_paths.iter().cloned().collect();
     let extras = extras.to_vec();
+    let optional_files = optional_files.to_vec();
 
     tokio::task::spawn_blocking(move || {
         let file =
@@ -406,6 +415,8 @@ pub async fn archive_directories_to_file_with_plan(
                     source,
                 })?;
         }
+
+        append_optional_files(&mut archive, &optional_files)?;
 
         for (archive_path, bytes) in &extras {
             let mut header = tar::Header::new_gnu();
@@ -1102,6 +1113,37 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
 /// Walks `dir_path` recursively and appends each file to `archive` under
 /// `archive_prefix`, skipping any file whose path *relative to `dir_path`*
 /// is contained in `skip_relative_paths`.
+/// Appends each `(source, archive_path)` file that still exists. A file
+/// deleted before it is opened is left out; one deleted after is archived
+/// whole, from the handle opened before.
+fn append_optional_files<W: std::io::Write>(
+    archive: &mut tar::Builder<W>,
+    files: &[(PathBuf, String)],
+) -> Result<()> {
+    for (source, archive_path) in files {
+        let mut file = match std::fs::File::open(source) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(
+                    "Leaving {} out of the archive: it was deleted before the archive reached it",
+                    source.display()
+                );
+                continue;
+            }
+            Err(err) => {
+                return Err(ArchiveError::CreateArchive {
+                    path: source.clone(),
+                    source: err,
+                });
+            }
+        };
+        archive
+            .append_file(archive_path, &mut file)
+            .map_err(|source| ArchiveError::WriteArchive { source })?;
+    }
+    Ok(())
+}
+
 fn add_directory_to_archive_filtered<W: std::io::Write>(
     archive: &mut tar::Builder<W>,
     dir_path: &Path,
@@ -1289,7 +1331,7 @@ mod tests {
         let dirs = vec![(data_dir.clone(), "data/".to_string())];
         let extras = vec![("meta.json".to_string(), b"{\"v\":1}".to_vec())];
         let bytes_written =
-            archive_directories_to_file_with_plan(&dirs, &archive_path, &[], &extras).await?;
+            archive_directories_to_file_with_plan(&dirs, &archive_path, &[], &extras, &[]).await?;
         assert!(bytes_written > 0);
         assert!(archive_path.exists());
 

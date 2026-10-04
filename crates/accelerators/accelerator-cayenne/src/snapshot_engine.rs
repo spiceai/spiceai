@@ -58,7 +58,8 @@ use cayenne::MetadataCatalog;
 use cayenne::metastore::EXPECTED_TABLES;
 use cayenne::metastore::snapshot::{DatasetMetastoreSlice, SliceValue};
 use runtime_acceleration::snapshot::engine::{
-    DirectoryArchiveExtra, DirectorySnapshotPlan, SnapshotEngine, SnapshotEngineError,
+    DirectoryArchiveExtra, DirectoryArchiveFile, DirectorySnapshotPlan, SnapshotEngine,
+    SnapshotEngineError,
 };
 use snafu::{ResultExt, Snafu};
 use tokio::fs;
@@ -216,13 +217,12 @@ async fn unreferenced_data_entries(
         let name = entry.file_name().to_string_lossy().into_owned();
         if Some(&name) == table_id.as_ref() {
             // `<table_id>/<snapshot_id>/`: keep the referenced snapshots, and
-            // the persisted secondary index runs the slice registers (a file
-            // no run is registered for is deleted when the table opens).
+            // the persisted secondary index runs under `<table_id>/_lookup_index/`
+            // are archived file by file instead (see `persisted_run_files`).
             let mut children = tokio::fs::read_dir(entry.path()).await?;
             while let Some(child) = children.next_entry().await? {
                 let child_name = child.file_name().to_string_lossy().into_owned();
-                if child_name != cayenne::LOOKUP_INDEX_DIR_NAME && !referenced.contains(&child_name)
-                {
+                if !referenced.contains(&child_name) {
                     skip.insert(PathBuf::from(&name).join(child_name));
                 }
             }
@@ -232,6 +232,41 @@ async fn unreferenced_data_entries(
         }
     }
     Ok(skip)
+}
+
+/// The persisted secondary index runs the slice registers, as files the
+/// archive takes only if they still exist: the background sync deletes a
+/// merged or retired run's file at any time, without waiting for a snapshot,
+/// so one may be gone by the time the archive reaches it. A run left out
+/// restores as a registration with no file, which the restored table drops,
+/// indexing that run's files again. `data_prefix` is the data directory's
+/// path inside the archive.
+fn persisted_run_files(
+    anchor: &Path,
+    data_prefix: &str,
+    slice: &DatasetMetastoreSlice,
+) -> Vec<DirectoryArchiveFile> {
+    let (table_id, index_key, run_name) = (
+        slice_column("cayenne_index_run", "table_id"),
+        slice_column("cayenne_index_run", "index_key"),
+        slice_column("cayenne_index_run", "run_name"),
+    );
+    slice
+        .tables
+        .get("cayenne_index_run")
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let relative = PathBuf::from(slice_text(row, table_id)?)
+                .join(cayenne::LOOKUP_INDEX_DIR_NAME)
+                .join(slice_text(row, index_key)?)
+                .join(slice_text(row, run_name)?);
+            Some(DirectoryArchiveFile {
+                source: anchor.join(&relative),
+                archive_path: format!("{data_prefix}{}", relative.to_string_lossy()),
+            })
+        })
+        .collect()
 }
 
 /// Snapshot engine for Cayenne accelerators.
@@ -317,7 +352,7 @@ impl SnapshotEngine for CayenneSnapshotEngine {
 
     async fn prepare_directory_snapshot(
         &self,
-        _dirs: &[(PathBuf, String)],
+        dirs: &[(PathBuf, String)],
         dataset_name: &str,
     ) -> Result<DirectorySnapshotPlan, SnapshotEngineError> {
         // Sanity: refuse to snapshot a dataset other than the one we were
@@ -363,10 +398,18 @@ impl SnapshotEngine for CayenneSnapshotEngine {
             archive_path: slice_archive_path(&self.dataset_name),
             bytes,
         }];
+        // The persisted index runs go in file by file, under the data
+        // directory's prefix in the archive.
+        let optional_files = dirs
+            .iter()
+            .find(|(dir, _)| *dir == self.data_dir_anchor)
+            .map(|(_, prefix)| persisted_run_files(&self.data_dir_anchor, prefix, &slice))
+            .unwrap_or_default();
 
         Ok(DirectorySnapshotPlan {
             skip_relative_paths: skip,
             extra_entries: extras,
+            optional_files,
         })
     }
 
@@ -767,7 +810,7 @@ mod tests {
             .into_iter()
             .map(|e| (e.archive_path, e.bytes))
             .collect();
-        archive_directories_to_file_with_plan(&dirs, &tar, &skip, &extras)
+        archive_directories_to_file_with_plan(&dirs, &tar, &skip, &extras, &[])
             .await
             .expect("archive");
 
@@ -1033,33 +1076,84 @@ mod tests {
             }
         }
 
-        /// Archives the writer's two directories as an acceleration snapshot.
-        async fn snapshot(catalog: &Arc<CayenneCatalog>, meta: &Path, data: &Path, archive: &Path) {
-            let dirs = vec![
+        /// The writer's two directories, as the runtime hands them to the
+        /// snapshot engine.
+        fn snapshot_dirs(meta: &Path, data: &Path) -> Vec<(PathBuf, String)> {
+            vec![
                 (meta.to_path_buf(), "metadata/".to_string()),
                 (data.to_path_buf(), "data/".to_string()),
-            ];
-            let plan = CayenneSnapshotEngine::new(
+            ]
+        }
+
+        /// The engine's plan for a snapshot of the writer's directories: the
+        /// metastore slice is exported here.
+        async fn snapshot_plan(
+            catalog: &Arc<CayenneCatalog>,
+            meta: &Path,
+            data: &Path,
+        ) -> DirectorySnapshotPlan {
+            CayenneSnapshotEngine::new(
                 Arc::clone(catalog) as Arc<dyn MetadataCatalog>,
                 NAME,
                 data.to_path_buf(),
             )
-            .prepare_directory_snapshot(&dirs, NAME)
+            .prepare_directory_snapshot(&snapshot_dirs(meta, data), NAME)
             .await
-            .expect("prepare snapshot");
+            .expect("prepare snapshot")
+        }
+
+        /// Writes the archive `plan` describes, as the runtime does.
+        async fn archive_with(
+            plan: &DirectorySnapshotPlan,
+            meta: &Path,
+            data: &Path,
+            archive: &Path,
+        ) -> Result<u64, runtime_acceleration::snapshot::directory_archive::ArchiveError> {
             let extras: Vec<(String, Vec<u8>)> = plan
                 .extra_entries
                 .iter()
                 .map(|extra| (extra.archive_path.clone(), extra.bytes.clone()))
                 .collect();
+            let optional_files: Vec<(PathBuf, String)> = plan
+                .optional_files
+                .iter()
+                .map(|file| (file.source.clone(), file.archive_path.clone()))
+                .collect();
             archive_directories_to_file_with_plan(
-                &dirs,
+                &snapshot_dirs(meta, data),
                 archive,
                 &plan.skip_relative_paths.iter().cloned().collect::<Vec<_>>(),
                 &extras,
+                &optional_files,
             )
             .await
-            .expect("archive");
+        }
+
+        /// Archives the writer's two directories as an acceleration snapshot.
+        async fn snapshot(catalog: &Arc<CayenneCatalog>, meta: &Path, data: &Path, archive: &Path) {
+            let plan = snapshot_plan(catalog, meta, data).await;
+            archive_with(&plan, meta, data, archive)
+                .await
+                .expect("archive");
+        }
+
+        /// Every run file under `dir`.
+        fn run_file_paths(dir: &Path) -> Vec<PathBuf> {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return Vec::new();
+            };
+            entries
+                .map(|entry| entry.expect("dir entry").path())
+                .flat_map(|path| {
+                    if path.is_dir() {
+                        run_file_paths(&path)
+                    } else if path.extension().is_some_and(|ext| ext == "run") {
+                        vec![path]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect()
         }
 
         /// Bootstraps a reader from `archive` into `root`'s own directories.
@@ -1187,6 +1281,153 @@ mod tests {
             assert!(
                 verification.files == 0 && verification.uncovered_files > 0,
                 "without persistence a restored table starts uncovered: {verification:?}"
+            );
+        }
+
+        /// The background sync deletes a merged or retired run's file whenever
+        /// it likes, including while a snapshot is being written. A run file
+        /// that disappears under the archive must not fail the snapshot: here
+        /// a thread keeps deleting and rewriting the registered run files
+        /// while snapshots are taken, and every one of them must succeed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_run_file_deleted_while_the_snapshot_is_written_does_not_fail_it() {
+            const SNAPSHOTS: usize = 200;
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let runs: Vec<(PathBuf, Vec<u8>)> = run_file_paths(&data)
+                .into_iter()
+                .map(|path| {
+                    let bytes = std::fs::read(&path).expect("read run");
+                    (path, bytes)
+                })
+                .collect();
+            assert_eq!(runs.len(), 2, "the writer persisted two runs");
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let churn = {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Rewritten the way the object store writes one: to a
+                        // temporary file, then renamed into place.
+                        for (path, bytes) in &runs {
+                            let _ = std::fs::remove_file(path);
+                            let staged = path.with_extension("staged");
+                            std::fs::write(&staged, bytes).expect("stage run");
+                            std::fs::rename(&staged, path).expect("rewrite run");
+                        }
+                    }
+                })
+            };
+            let archive = tmp.path().join("snapshot.tar");
+            let mut failures = Vec::new();
+            for _ in 0..SNAPSHOTS {
+                let plan = snapshot_plan(&catalog, &meta, &data).await;
+                if let Err(error) = archive_with(&plan, &meta, &data, &archive).await {
+                    failures.push(error.to_string());
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            churn.join().expect("churn thread");
+            assert!(
+                failures.is_empty(),
+                "{} of {SNAPSHOTS} snapshots failed; first: {:?}",
+                failures.len(),
+                failures.first()
+            );
+        }
+
+        /// A run the metastore slice registers but whose file was deleted
+        /// before the archive reached it is left out of the snapshot. The
+        /// restored table then holds a registration with no file: it drops
+        /// that registration, answers lookups correctly by reading the lost
+        /// run's files in full, and indexes them again in the background
+        /// until every file is covered.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_snapshot_missing_a_registered_run_file_restores_and_heals() {
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let plan = snapshot_plan(&catalog, &meta, &data).await;
+            // After the slice is exported, before the archive is written.
+            let lost = run_file_paths(&data)
+                .into_iter()
+                .next()
+                .expect("a persisted run");
+            std::fs::remove_file(&lost).expect("delete a registered run file");
+            let archive = tmp.path().join("snapshot.tar");
+            archive_with(&plan, &meta, &data, &archive)
+                .await
+                .expect("archive");
+
+            let (reader_catalog, reader_data) = restore(&archive, &tmp.path().join("r")).await;
+            let table_id = reader_catalog
+                .get_table(NAME)
+                .await
+                .expect("table")
+                .table_id;
+            assert_eq!(
+                reader_catalog
+                    .list_index_runs(&table_id)
+                    .await
+                    .expect("list runs")
+                    .len(),
+                2,
+                "the slice still registers the lost run"
+            );
+            assert_eq!(run_files(&reader_data), 1, "the archive holds one run file");
+            let reader = open(
+                &env,
+                Arc::clone(&reader_catalog),
+                &reader_data,
+                IndexPersistence::Enabled,
+            )
+            .await;
+            assert_eq!(
+                persisted(&reader_catalog, &reader_data, 1).await.len(),
+                1,
+                "opening drops the registration whose file is missing"
+            );
+            let restored = reader
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            assert!(
+                restored.agrees() && restored.files > 0 && restored.uncovered_files > 0,
+                "the remaining run covers its files and the lost run's are uncovered: {restored:?}"
+            );
+            // A key from each write: correct whether its files are covered or
+            // read in full, and the lookups request the missing files' build.
+            for id in [7, 9_999, 20_011, 24_999] {
+                assert_eq!(lookup(&reader, id).await, 1, "lookup of row {id}");
+            }
+            let deadline = Instant::now() + Duration::from_mins(1);
+            let healed = loop {
+                let verification = reader
+                    .verify_lookup_index_against_read_back()
+                    .await
+                    .expect("verify");
+                if verification.uncovered_files == 0 {
+                    break verification;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the restored index never healed: {verification:?}"
+                );
+                lookup(&reader, 7).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            assert!(healed.agrees(), "{healed:?}");
+            for id in [7, 9_999, 20_011, 24_999] {
+                assert_eq!(
+                    lookup(&reader, id).await,
+                    1,
+                    "lookup of row {id} after healing"
+                );
+            }
+            assert!(
+                persisted(&reader_catalog, &reader_data, 2).await.len() >= 2,
+                "the rebuilt runs are persisted again"
             );
         }
 
