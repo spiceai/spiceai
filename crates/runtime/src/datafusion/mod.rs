@@ -5094,18 +5094,20 @@ impl DataFusion {
             &dataset.metadata,
             &dataset.columns,
         );
-        self.install_table_provider(&dataset.name, table_provider)?;
-        if dataset.access().allows_write() {
-            self.mark_dataset_writable(&dataset.name)?;
-        }
         if register_metadata {
             self.register_metadata_table(dataset, Arc::clone(&source))
                 .await?;
         }
-        self.accelerated_tables
-            .write()
-            .await
-            .insert(dataset.name.clone());
+        let mut accelerated_tables = self.accelerated_tables.write().await;
+        let mut writers = if dataset.access().allows_write() {
+            Some(
+                self.data_writers
+                    .write()
+                    .map_err(|_| Error::UnableToLockDataWriters {})?,
+            )
+        } else {
+            None
+        };
         let caching_ready = dataset.acceleration.as_ref().is_some_and(|acceleration| {
             source.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Caching
         });
@@ -5125,6 +5127,19 @@ impl DataFusion {
                 .context(UnableToDrainChangesSnafu {
                     dataset_name: dataset.name.to_string(),
                 })?;
+        // No await or fallible bookkeeping may separate publication from ownership.
+        if let Err(error) = self.install_table_provider(&dataset.name, table_provider) {
+            permit.installation_failed();
+            return Err(error);
+        }
+        if let Some(writers) = &mut writers {
+            tracing::warn!(
+                "Access mode 'read_write' is enabled for dataset {}. This feature is currently in preview.",
+                dataset.name,
+            );
+            writers.insert(dataset.name.clone());
+        }
+        accelerated_tables.insert(dataset.name.clone());
         if caching_ready {
             self.runtime_status
                 .update_dataset(&dataset.name, status::ComponentStatus::Ready);
@@ -6754,6 +6769,9 @@ async fn build_snapshot_refresh_state(
         metadata_e_tag: Arc::default(),
     })
 }
+
+#[cfg(test)]
+mod installation_tests;
 
 #[cfg(test)]
 mod tests {

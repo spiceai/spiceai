@@ -142,6 +142,9 @@ impl<T> PreparedGeneration<T> {
         Ok((self.value, self.permit))
     }
 
+    /// Commit to synchronous installation after asynchronous preparation.
+    /// The caller must finish publication and bookkeeping without awaiting, or
+    /// consume the permit with `installation_failed` if publication fails.
     pub(crate) fn installed_with_permit(mut self) -> Result<(T, GenerationPermit)> {
         self.permit.ensure_open()?;
         self.permit.installed = true;
@@ -273,6 +276,11 @@ impl GenerationPermit {
             return Err(fenced(&self.name, "runtime is shutting down"));
         }
         Ok(())
+    }
+
+    /// Drain a constructed owner when synchronous catalog installation fails.
+    pub(crate) fn installation_failed(mut self) {
+        self.installed = false;
     }
 
     async fn drain_previous_owned(&mut self) -> Result<()> {
@@ -440,6 +448,32 @@ mod tests {
         drop(prepared);
         assert!(stopped.load(Ordering::SeqCst));
         assert!(registry.acquire(&name(), Duration::ZERO).await.is_err());
+        assert!(registry.acquire(&name(), Duration::ZERO).await.is_err());
+        sender.send_replace(Some(Ok(())));
+        drop(
+            registry
+                .acquire(&name(), WAIT)
+                .await
+                .expect("actual drain completed"),
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_catalog_installation_retains_the_drain() {
+        let registry = ChangeGenerations::default();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = watch::channel(None);
+        let prepared = prepare(
+            &registry,
+            Arc::clone(&stopped),
+            Publication::Pending(receiver),
+        )
+        .await;
+        let ((), permit) = prepared
+            .installed_with_permit()
+            .expect("commit to installation");
+        permit.installation_failed();
+        assert!(stopped.load(Ordering::SeqCst));
         assert!(registry.acquire(&name(), Duration::ZERO).await.is_err());
         sender.send_replace(Some(Ok(())));
         drop(
