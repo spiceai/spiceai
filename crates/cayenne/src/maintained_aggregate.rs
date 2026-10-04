@@ -141,6 +141,10 @@ pub struct MaintainedAggregateRegistry {
     /// Whether a per-PK index is maintained (a non-empty PK was configured), so
     /// UPDATE/DELETE can be retracted incrementally rather than marking stale.
     has_pk_index: bool,
+    /// Whether no views are configured. Fixed at construction and read without
+    /// the state lock: the write path and every scan ask it, and they must not
+    /// queue behind the applier holding the lock to fold a delta.
+    no_views: bool,
     /// The table schema the views resolve their columns against.
     schema: SchemaRef,
 }
@@ -167,13 +171,14 @@ enum RegistryStatus {
     Stale,
 }
 
-/// A rebuild in progress. It reads the table as of `epoch`, so the deltas of
-/// later epochs are not in what it reads and are held here, in epoch order, to
-/// be applied once it is installed.
+/// A rebuild in progress. Every delta after `hold_from` is held here, in epoch
+/// order, because the rebuild reads a snapshot taken after it started: the held
+/// deltas the snapshot already contains are dropped when the rebuild is
+/// installed, and the rest are applied on top of it.
 #[derive(Debug)]
 struct PendingRebuild {
-    epoch: u64,
-    deltas: Vec<PendingDelta>,
+    hold_from: u64,
+    deltas: Vec<(u64, PendingDelta)>,
     /// Memory the held deltas reference.
     bytes: usize,
 }
@@ -833,7 +838,8 @@ fn apply_deletes(
 /// [`MaintainedAggregateRegistry::begin_rebuild`].
 #[derive(Debug)]
 pub struct MaintainedAggregateRebuilder {
-    epoch: u64,
+    hold_from: u64,
+    snapshot_epoch: Option<u64>,
     views: Vec<MaintainedAggregateView>,
     index: Option<RetractionIndex>,
     max_index_bytes: usize,
@@ -841,10 +847,24 @@ pub struct MaintainedAggregateRebuilder {
 }
 
 impl MaintainedAggregateRebuilder {
-    /// The epoch of the snapshot being read.
+    /// The epoch of the snapshot being read once it is known, else the epoch
+    /// the registry started holding deltas after.
     #[must_use]
     pub fn epoch(&self) -> u64 {
-        self.epoch
+        self.snapshot_epoch.unwrap_or(self.hold_from)
+    }
+
+    /// Records the epoch of the snapshot the rebuild reads. Returns `false` when
+    /// the snapshot predates the epoch the registry started holding deltas
+    /// after: the deltas in between were dropped, so the rebuild cannot be
+    /// completed and must be abandoned.
+    #[must_use]
+    pub fn set_snapshot_epoch(&mut self, epoch: u64) -> bool {
+        if epoch < self.hold_from {
+            return false;
+        }
+        self.snapshot_epoch = Some(epoch);
+        true
     }
 
     /// Folds a batch of the snapshot that holds only the table columns at
@@ -1397,6 +1417,7 @@ impl MaintainedAggregateRegistry {
             }),
             max_index_bytes,
             has_pk_index,
+            no_views: specs.is_empty(),
             schema: Arc::clone(schema),
         })
     }
@@ -1404,7 +1425,7 @@ impl MaintainedAggregateRegistry {
     /// Returns true when no maintained aggregate views are configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.state.read().views.is_empty()
+        self.no_views
     }
 
     /// Whether this registry maintains a per-PK index and can therefore retract
@@ -1510,6 +1531,7 @@ impl MaintainedAggregateRegistry {
             Pass::Hold => {
                 hold_delta(
                     state,
+                    epoch,
                     PendingDelta::Upserts(batches.to_vec()),
                     self.max_held_bytes(),
                 );
@@ -1542,6 +1564,7 @@ impl MaintainedAggregateRegistry {
             Pass::Hold => {
                 hold_delta(
                     state,
+                    epoch,
                     PendingDelta::Deletes(pk_batch.clone()),
                     self.max_held_bytes(),
                 );
@@ -1608,20 +1631,22 @@ impl MaintainedAggregateRegistry {
         columns.into_iter().collect()
     }
 
-    /// Starts rebuilding the views from the table as of `epoch`. Until the
-    /// rebuild is installed by [`Self::finish_rebuild`], the registry is stale
-    /// and holds the deltas of later epochs, which the rebuild's snapshot does
-    /// not contain, to apply on top of it — so writes that land while the
-    /// rebuild reads the table do not undo it.
+    /// Starts rebuilding the views. From here until the rebuild is installed by
+    /// [`Self::finish_rebuild`], the registry is stale and holds the delta of
+    /// every epoch after `hold_from`, so that whatever epoch the rebuild's
+    /// snapshot turns out to be at (see
+    /// [`MaintainedAggregateRebuilder::set_snapshot_epoch`]), the writes after it
+    /// are applied on top — writes that land while the rebuild reads the table do
+    /// not undo it.
     ///
-    /// Call it while no write can publish a new epoch (the provider's
-    /// `write_lock`), and take the snapshot under the same hold, so the snapshot
-    /// is the table at exactly `epoch` and every later delta is held.
+    /// `hold_from` must be the table's epoch at a moment no write can publish a
+    /// new one (the provider's `write_lock`), and the snapshot must be taken
+    /// after this call, so no delta after the snapshot can arrive unheld.
     ///
     /// # Errors
     ///
     /// Returns an error when the primary-key encoder cannot be built.
-    pub fn begin_rebuild(&self, epoch: u64) -> DataFusionResult<MaintainedAggregateRebuilder> {
+    pub fn begin_rebuild(&self, hold_from: u64) -> DataFusionResult<MaintainedAggregateRebuilder> {
         let mut state = self.state.write();
         let state = &mut *state;
         let views = state
@@ -1637,12 +1662,13 @@ impl MaintainedAggregateRegistry {
         state.status = RegistryStatus::Stale;
         reset_retained_state(state);
         state.rebuild = Some(PendingRebuild {
-            epoch,
+            hold_from,
             deltas: Vec::new(),
             bytes: 0,
         });
         Ok(MaintainedAggregateRebuilder {
-            epoch,
+            hold_from,
+            snapshot_epoch: None,
             views,
             index,
             max_index_bytes: self.max_index_bytes,
@@ -1658,7 +1684,7 @@ impl MaintainedAggregateRegistry {
             .read()
             .rebuild
             .as_ref()
-            .is_some_and(|rebuild| rebuild.epoch == rebuilder.epoch)
+            .is_some_and(|rebuild| rebuild.hold_from == rebuilder.hold_from)
     }
 
     /// Abandons `rebuilder` and drops the deltas held for it; the registry stays
@@ -1668,15 +1694,16 @@ impl MaintainedAggregateRegistry {
         if state
             .rebuild
             .as_ref()
-            .is_some_and(|rebuild| rebuild.epoch == rebuilder.epoch)
+            .is_some_and(|rebuild| rebuild.hold_from == rebuilder.hold_from)
         {
             state.rebuild = None;
         }
     }
 
-    /// Installs a rebuild that has read the whole snapshot and applies the
-    /// deltas held since. Returns `Ok(false)` when the rebuild was abandoned in
-    /// the meantime; the registry then stays stale for a later attempt.
+    /// Installs a rebuild that has read its whole snapshot and applies the held
+    /// deltas the snapshot does not contain. Returns `Ok(false)` when the rebuild
+    /// was abandoned in the meantime or never learned its snapshot's epoch; the
+    /// registry then stays stale for a later attempt.
     ///
     /// # Errors
     ///
@@ -1686,9 +1713,19 @@ impl MaintainedAggregateRegistry {
     pub fn finish_rebuild(&self, rebuilder: MaintainedAggregateRebuilder) -> DataFusionResult<bool> {
         let mut state = self.state.write();
         let state = &mut *state;
+        let Some(snapshot_epoch) = rebuilder.snapshot_epoch else {
+            if state
+                .rebuild
+                .as_ref()
+                .is_some_and(|rebuild| rebuild.hold_from == rebuilder.hold_from)
+            {
+                state.rebuild = None;
+            }
+            return Ok(false);
+        };
         let Some(rebuild) = state
             .rebuild
-            .take_if(|rebuild| rebuild.epoch == rebuilder.epoch)
+            .take_if(|rebuild| rebuild.hold_from == rebuilder.hold_from)
         else {
             return Ok(false);
         };
@@ -1699,10 +1736,13 @@ impl MaintainedAggregateRegistry {
         // ones already taken in; they are in the snapshot, so they are skipped.
         // Every later delta was held, so applying them in order brings the views
         // to the registry's epoch.
-        state.epoch = state.epoch.max(rebuild.epoch);
-        state.rebuilt_through = state.rebuilt_through.max(rebuild.epoch);
+        state.epoch = state.epoch.max(snapshot_epoch);
+        state.rebuilt_through = state.rebuilt_through.max(snapshot_epoch);
         let mut failure = None;
-        for delta in rebuild.deltas {
+        for (epoch, delta) in rebuild.deltas {
+            if epoch <= snapshot_epoch {
+                continue;
+            }
             let applied = match delta {
                 PendingDelta::Upserts(batches) => {
                     apply_upsert_batches(state, &batches, self.max_index_bytes)
@@ -3143,7 +3183,7 @@ fn begin_maintenance_pass(state: &mut RegistryState, epoch: u64) -> Pass {
     }
     state.epoch = epoch;
     if let Some(rebuild) = &state.rebuild {
-        return if epoch <= rebuild.epoch {
+        return if epoch <= rebuild.hold_from {
             Pass::Skip
         } else {
             Pass::Hold
@@ -3159,7 +3199,7 @@ fn begin_maintenance_pass(state: &mut RegistryState, epoch: u64) -> Pass {
 /// Holds `delta` for the rebuild in progress. A rebuild whose held deltas
 /// would reference more than `max_held_bytes` is abandoned, releasing them; the
 /// registry stays stale and a later rebuild tries again.
-fn hold_delta(state: &mut RegistryState, delta: PendingDelta, max_held_bytes: usize) {
+fn hold_delta(state: &mut RegistryState, epoch: u64, delta: PendingDelta, max_held_bytes: usize) {
     let Some(rebuild) = &mut state.rebuild else {
         return;
     };
@@ -3168,7 +3208,7 @@ fn hold_delta(state: &mut RegistryState, delta: PendingDelta, max_held_bytes: us
         state.rebuild = None;
         return;
     }
-    rebuild.deltas.push(delta);
+    rebuild.deltas.push((epoch, delta));
 }
 
 /// Applies `batches` as upserts, checking the byte budget after every batch so
@@ -3932,26 +3972,26 @@ mod tests {
         Ok(())
     }
 
-    /// A rebuild reads the table as of one epoch while writes keep landing. The
-    /// deltas after that epoch are held and applied on top when it is installed;
-    /// the deltas of the epochs the snapshot already holds, which can still be
-    /// queued behind the rebuild, are skipped rather than counted twice.
+    /// A rebuild starts holding deltas, then reads a snapshot of the table while
+    /// writes keep landing. Installing it applies the held deltas after the
+    /// snapshot's epoch and drops those the snapshot already contains; the deltas
+    /// of epochs before the hold, which can still be queued behind the rebuild,
+    /// are skipped rather than counted twice.
     #[test]
     fn a_rebuild_takes_in_the_writes_made_while_it_reads() -> DataFusionResult<()> {
         let registry =
             MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
         registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
 
-        // The snapshot is the table at epoch 3; epochs 2 and 3 are still queued.
-        let mut rebuilder = registry.begin_rebuild(3)?;
+        // Holding starts after epoch 1. Epochs 2 and 3 land before the snapshot
+        // is taken (so it contains them), epochs 4 and 5 after it.
+        let mut rebuilder = registry.begin_rebuild(1)?;
         assert!(registry.is_stale(), "a registry being rebuilt does not serve");
-        let snapshot = group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)]);
-        rebuilder.apply_projected(&snapshot, &[0, 1, 2, 3])?;
-
-        // Epoch 2's delta (already in the snapshot) arrives during the rebuild,
-        // then two writes after the snapshot.
         registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 20)])])?;
         registry.apply_insert_batches(3, &[group_batch(&[("b", 3, 5)])])?;
+        assert!(rebuilder.set_snapshot_epoch(3));
+        let snapshot = group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)]);
+        rebuilder.apply_projected(&snapshot, &[0, 1, 2, 3])?;
         registry.apply_insert_batches(4, &[group_batch(&[("a", 1, 100)])])?;
         registry.apply_pk_deletes(5, &group_batch(&[("", 2, 0)]).project(&[2])?)?;
         assert!(registry.rebuild_is_current(&rebuilder));
@@ -3962,7 +4002,7 @@ mod tests {
         assert_eq!(
             sum_i_by_name(&registry)?,
             BTreeMap::from([("a".to_string(), 100), ("b".to_string(), 5)]),
-            "the rebuilt views include the writes made while the rebuild read"
+            "the rebuilt views include the writes after the snapshot, once each"
         );
 
         // Deltas keep applying after it.
@@ -3982,6 +4022,7 @@ mod tests {
         let registry =
             MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
         let mut rebuilder = registry.begin_rebuild(2)?;
+        assert!(rebuilder.set_snapshot_epoch(2));
         rebuilder.apply_projected(&group_batch(&[("a", 1, 10), ("a", 2, 20)]), &[0, 1, 2, 3])?;
         assert!(registry.finish_rebuild(rebuilder)?);
         assert_eq!(registry.epoch_for_test(), 2);
@@ -3999,14 +4040,16 @@ mod tests {
         Ok(())
     }
 
-    /// A stale mark, an epoch gap, or held deltas over budget abandon the
-    /// rebuild: it installs nothing and the registry stays stale.
+    /// A stale mark, an epoch gap, held deltas over budget, or a snapshot older
+    /// than the hold abandon the rebuild: it installs nothing and the registry
+    /// stays stale.
     #[test]
     fn an_abandoned_rebuild_installs_nothing() -> DataFusionResult<()> {
         // Marked stale while it reads.
         let registry =
             MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
-        let rebuilder = registry.begin_rebuild(0)?;
+        let mut rebuilder = registry.begin_rebuild(0)?;
+        assert!(rebuilder.set_snapshot_epoch(0));
         registry.mark_stale(1);
         assert!(!registry.rebuild_is_current(&rebuilder));
         assert!(!registry.finish_rebuild(rebuilder)?);
@@ -4015,7 +4058,8 @@ mod tests {
         // A delta skipped an epoch.
         let registry =
             MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
-        let rebuilder = registry.begin_rebuild(0)?;
+        let mut rebuilder = registry.begin_rebuild(0)?;
+        assert!(rebuilder.set_snapshot_epoch(0));
         registry.apply_insert_batches(2, &[group_batch(&[("a", 1, 10)])])?;
         assert!(!registry.finish_rebuild(rebuilder)?);
         assert!(registry.is_stale());
@@ -4024,10 +4068,23 @@ mod tests {
         let budget = group_batch(&[("a", 1, 10)]).get_array_memory_size() * 2;
         let registry =
             MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], budget)?;
-        let rebuilder = registry.begin_rebuild(0)?;
+        let mut rebuilder = registry.begin_rebuild(0)?;
+        assert!(rebuilder.set_snapshot_epoch(0));
         registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
         assert!(!registry.rebuild_is_current(&rebuilder));
         assert!(!registry.finish_rebuild(rebuilder)?);
+        assert!(registry.is_stale());
+
+        // A snapshot older than the hold: the deltas in between were dropped
+        // before the hold began, so the rebuild cannot be completed.
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], usize::MAX)?;
+        let mut rebuilder = registry.begin_rebuild(3)?;
+        assert!(!rebuilder.set_snapshot_epoch(2));
+        assert!(
+            !registry.finish_rebuild(rebuilder)?,
+            "a rebuild without a usable snapshot epoch installs nothing"
+        );
         assert!(registry.is_stale());
         Ok(())
     }
