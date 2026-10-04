@@ -1158,3 +1158,116 @@ async fn a_refresh_cut_into_many_key_ranges_keeps_the_last_copy_of_every_key() {
     }
     super::super::super::overwrite_postpass::TEST_CHUNK_ROWS.store(0, Ordering::Relaxed);
 }
+
+/// A staged append — the path dual-write takes for a user's `INSERT` — refuses a
+/// table with a primary key in either deletion mode, so it never reaches the
+/// repeated-key resolution a refresh runs: a user statement through dual-write
+/// cannot take refresh semantics. A staged append that started accepting keyed
+/// tables would need to keep statement semantics; this test would fail first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_append_refuses_a_keyed_table() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        assert!(provider.key_resolver().expect("resolver").is_some());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema(),
+            futures::stream::iter(
+                vec![batch(&[(1, "a"), (2, "a")]), batch(&[(1, "b")])]
+                    .into_iter()
+                    .map(Ok),
+            ),
+        ));
+        let Err(error) = provider.begin_staged_append(stream, 1).await else {
+            panic!("{mode:?}: a staged append into a keyed table must be refused");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("staged append for Cayenne tables with primary-key deletion handling"),
+            "{mode:?}: {error}"
+        );
+    }
+}
+
+/// A table may name one of its own columns like the post-write resolution's
+/// arrival column; the refresh still keeps the last copy of every key and the
+/// user's column keeps its values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_column_named_like_the_arrival_column_is_left_alone() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("__cayenne_arrival", DataType::Int64, false),
+        ]));
+        // The user's column counts down, so it disagrees with arrival order.
+        let batch_of = |rows: &[(i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|(k, _)| *k))),
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|(_, v)| *v))),
+                ],
+            )
+            .expect("batch")
+        };
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _dir) = create_cdc_table_with_schema(
+            "t",
+            Arc::clone(&runtime_env),
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+            VortexConfig {
+                deletion_mode: mode,
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        let ctx = SessionContext::new();
+        let source = MemorySourceConfig::try_new_exec(
+            &[vec![
+                batch_of(&[(1, 30), (2, 30)]),
+                batch_of(&[(1, 20)]),
+                batch_of(&[(2, 10), (3, 10)]),
+            ]],
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("source");
+        let plan = provider
+            .insert_into(&ctx.state(), source, InsertOp::Overwrite)
+            .await
+            .expect("plan");
+        collect(plan, ctx.task_ctx())
+            .await
+            .unwrap_or_else(|error| panic!("{mode:?}: overwrite failed: {error}"));
+        ctx.register_table("t", Arc::new(provider.clone_for_write()))
+            .expect("register");
+        let batches = ctx
+            .sql("SELECT id, \"__cayenne_arrival\" FROM t ORDER BY id")
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("collect");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let values = batch
+                .column(1)
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            for row in 0..batch.num_rows() {
+                rows.push((ids.value(row), values.value(row)));
+            }
+        }
+        assert_eq!(rows, vec![(1, 20), (2, 10), (3, 10)], "{mode:?}");
+    }
+}

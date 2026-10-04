@@ -1203,7 +1203,8 @@ impl<'a> AppendMutationWriter<'a> {
         let table_schema = self.table.table_schema();
         let indices = self.table.primary_key_indices()?.unwrap_or_default();
         let key_columns = super::overwrite_postpass::key_column_names(&table_schema, &indices);
-        let arrival = super::overwrite_postpass::ArrivalStream::new(data, resolver);
+        let arrival_name = super::overwrite_postpass::arrival_column(&table_schema);
+        let arrival = super::overwrite_postpass::ArrivalStream::new(data, resolver, &arrival_name);
         let stamped_batches = arrival.stamped_batches();
         let batch_superseded = arrival.superseded();
         let data: SendableRecordBatchStream = Box::pin(arrival);
@@ -1243,7 +1244,7 @@ impl<'a> AppendMutationWriter<'a> {
                     file_stats
                         .as_ref()
                         .map(|observer| Arc::clone(observer) as _),
-                    super::overwrite_postpass::with_arrival(&table_schema),
+                    super::overwrite_postpass::with_arrival(&table_schema, &arrival_name),
                 )
                 .await?;
             self.table.sync_local_snapshot_dir(&snapshot_id).await?;

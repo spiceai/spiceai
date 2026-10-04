@@ -422,33 +422,71 @@ fn plan_chunks(
     best
 }
 
-/// `schema` followed by the arrival column.
-pub(crate) fn with_arrival(schema: &SchemaRef) -> SchemaRef {
-    with_hidden(schema, false)
+/// `schema` followed by the arrival column, named `arrival`.
+pub(crate) fn with_arrival(schema: &SchemaRef, arrival: &str) -> SchemaRef {
+    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new(arrival, DataType::UInt32, false)));
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-/// `schema` followed by the arrival column and, when `versioned`, the version
-/// column.
-pub(crate) fn with_hidden(schema: &SchemaRef, versioned: bool) -> SchemaRef {
-    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+/// `schema` followed by the arrival column and the version columns, named per
+/// `hidden`.
+pub(crate) fn with_versions(schema: &SchemaRef, hidden: &HiddenColumns) -> SchemaRef {
+    let mut fields: Vec<FieldRef> = with_arrival(schema, &hidden.arrival)
+        .fields()
+        .iter()
+        .cloned()
+        .collect();
     fields.push(Arc::new(Field::new(
-        ARRIVAL_COLUMN,
-        DataType::UInt32,
+        &hidden.version_time,
+        DataType::Int64,
         false,
     )));
-    if versioned {
-        fields.push(Arc::new(Field::new(
-            VERSION_TIME_COLUMN,
-            DataType::Int64,
-            false,
-        )));
-        fields.push(Arc::new(Field::new(
-            VERSION_HASH_COLUMN,
-            DataType::UInt64,
-            false,
-        )));
-    }
+    fields.push(Arc::new(Field::new(
+        &hidden.version_hash,
+        DataType::UInt64,
+        false,
+    )));
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// The names a table's hidden columns are stored under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HiddenColumns {
+    /// Each row's arrival sequence number ([`ARRIVAL_COLUMN`]).
+    pub(crate) arrival: String,
+    /// Each row's version time ([`VERSION_TIME_COLUMN`]).
+    pub(crate) version_time: String,
+    /// Each row's version hash ([`VERSION_HASH_COLUMN`]).
+    pub(crate) version_hash: String,
+}
+
+/// The names the hidden columns are stored under for a table of `schema`: each the
+/// first of its name and that name with a numeric suffix that no column of the table,
+/// nor an earlier hidden column, already uses, so a user column of the same name is
+/// never shadowed.
+pub(crate) fn hidden_columns(schema: &Schema) -> HiddenColumns {
+    let mut taken: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let mut unused = |base: &str| {
+        // `n` names leave one of the first `n + 1` suffixes free.
+        let name = std::iter::once(base.to_string())
+            .chain((1..=taken.len() + 1).map(|suffix| format!("{base}_{suffix}")))
+            .find(|name| !taken.contains(name))
+            .unwrap_or_else(|| base.to_string());
+        taken.push(name.clone());
+        name
+    };
+    HiddenColumns {
+        arrival: unused(ARRIVAL_COLUMN),
+        version_time: unused(VERSION_TIME_COLUMN),
+        version_hash: unused(VERSION_HASH_COLUMN),
+    }
+}
+
+/// The name the arrival column is stored under for a table of `schema`
+/// ([`hidden_columns`]).
+pub(crate) fn arrival_column(schema: &Schema) -> String {
+    hidden_columns(schema).arrival
 }
 
 /// How the duplicate query orders the copies of a key, keeping the greatest or
@@ -536,8 +574,14 @@ pub(crate) struct ArrivalStream {
 }
 
 impl ArrivalStream {
-    pub(crate) fn new(input: SendableRecordBatchStream, resolver: KeyResolver) -> Self {
-        let schema = with_arrival(&input.schema());
+    /// `arrival` is the name the table stores the column under
+    /// ([`arrival_column`]).
+    pub(crate) fn new(
+        input: SendableRecordBatchStream,
+        resolver: KeyResolver,
+        arrival: &str,
+    ) -> Self {
+        let schema = with_arrival(&input.schema(), arrival);
         Self {
             input,
             resolver,
@@ -556,12 +600,14 @@ impl ArrivalStream {
         Arc::clone(&self.superseded)
     }
 
-    /// Also stamp each row's version from `versions`.
+    /// Also stamp each row's version from `versions`, in the version columns named
+    /// by `hidden` (whose arrival name is the one [`Self::new`] was given).
     pub(crate) fn with_versions(
         mut self,
         versions: Arc<dyn util::session_state::RowVersions>,
+        hidden: &HiddenColumns,
     ) -> Self {
-        self.schema = with_hidden(&self.input.schema(), true);
+        self.schema = with_versions(&self.input.schema(), hidden);
         self.versions = Some(versions);
         self
     }
@@ -687,6 +733,8 @@ struct ReadBack {
     versioned: bool,
     schema: SchemaRef,
     chunk: (u64, u64),
+    /// The names the hidden columns are stored under ([`hidden_columns`]).
+    hidden: Arc<HiddenColumns>,
     /// The key sub-range this step reads, pushed into each file's scan.
     range: Option<KeyRange>,
     /// Rows read back before the chunk filter (diagnostics).
@@ -776,6 +824,7 @@ impl PartitionStream for ReadBack {
             schema: Arc::clone(&self.schema),
             chunk: self.chunk,
             range: self.range.clone(),
+            hidden: Arc::clone(&self.hidden),
             rows_read: Arc::clone(&self.rows_read),
         });
         // `key >= lo AND key < hi` on the stored column, so the scan prunes the
@@ -817,7 +866,10 @@ impl PartitionStream for ReadBack {
                     )
                 })
                 .chain([
-                    (ORDER_COLUMN.to_string(), get_item(ARRIVAL_COLUMN, root())),
+                    (
+                        ORDER_COLUMN.to_string(),
+                        get_item(this.hidden.arrival.as_str(), root()),
+                    ),
                     (POSITION_COLUMN.to_string(), row_idx()),
                 ])
                 .chain(
@@ -826,11 +878,11 @@ impl PartitionStream for ReadBack {
                             [
                                 (
                                     ORDER_TIME_COLUMN.to_string(),
-                                    get_item(VERSION_TIME_COLUMN, root()),
+                                    get_item(this.hidden.version_time.as_str(), root()),
                                 ),
                                 (
                                     ORDER_HASH_COLUMN.to_string(),
-                                    get_item(VERSION_HASH_COLUMN, root()),
+                                    get_item(this.hidden.version_hash.as_str(), root()),
                                 ),
                             ]
                         })
@@ -1114,6 +1166,7 @@ impl CayenneTableProvider {
                 schema: &schema,
                 order,
                 keys: key_columns.len(),
+                hidden: Arc::new(hidden_columns(&table_schema)),
                 group_rows,
             };
             match query.run(&plan.specs).await {
@@ -1165,6 +1218,8 @@ struct DuplicateQuery<'a> {
     schema: &'a SchemaRef,
     order: CopyOrder,
     keys: usize,
+    /// The names the hidden columns are stored under ([`hidden_columns`]).
+    hidden: Arc<HiddenColumns>,
     /// The rows of each cluster split into key ranges, by group: the ranges'
     /// rows must add up to it, or a row was read by no range.
     group_rows: Vec<u64>,
@@ -1206,6 +1261,7 @@ impl DuplicateQuery<'_> {
                         schema: Arc::clone(schema),
                         chunk: spec.hash,
                         range: spec.range.clone(),
+                        hidden: Arc::clone(&self.hidden),
                         rows_read: Arc::clone(&rows_read),
                     }) as Arc<dyn PartitionStream>
                 })
@@ -1469,10 +1525,41 @@ mod tests {
     #[test]
     fn arrival_is_trailing_and_not_null() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let with = with_arrival(&schema);
+        let with = with_arrival(&schema, ARRIVAL_COLUMN);
         assert_eq!(with.fields().len(), 2);
         assert_eq!(with.field(1).name(), ARRIVAL_COLUMN);
         assert!(!with.field(1).is_nullable());
+    }
+
+    #[test]
+    fn the_arrival_column_avoids_the_tables_own_names() {
+        let named = |names: &[&str]| {
+            Schema::new(
+                names
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Int64, false))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(arrival_column(&named(&["id"])), ARRIVAL_COLUMN);
+        assert_eq!(
+            arrival_column(&named(&["id", ARRIVAL_COLUMN])),
+            format!("{ARRIVAL_COLUMN}_1")
+        );
+        assert_eq!(
+            arrival_column(&named(&[ARRIVAL_COLUMN, &format!("{ARRIVAL_COLUMN}_1")])),
+            format!("{ARRIVAL_COLUMN}_2")
+        );
+        // The version columns avoid the table's names and each other's.
+        let version_time_1 = format!("{VERSION_TIME_COLUMN}_1");
+        assert_eq!(
+            hidden_columns(&named(&["id", VERSION_TIME_COLUMN, &version_time_1])),
+            HiddenColumns {
+                arrival: ARRIVAL_COLUMN.to_string(),
+                version_time: format!("{VERSION_TIME_COLUMN}_2"),
+                version_hash: VERSION_HASH_COLUMN.to_string(),
+            }
+        );
     }
 
     fn int_bounds(ranges: &[(i64, i64)]) -> Vec<(ScalarValue, ScalarValue)> {

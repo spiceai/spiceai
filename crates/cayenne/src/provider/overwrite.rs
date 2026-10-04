@@ -692,10 +692,14 @@ impl CayenneTableProvider {
                     order,
                     super::overwrite_postpass::key_column_names(&self.table_schema(), &indices),
                 ));
-                let arrival = super::overwrite_postpass::ArrivalStream::new(data, resolver);
+                let hidden = super::overwrite_postpass::hidden_columns(&self.table_schema());
+                let arrival =
+                    super::overwrite_postpass::ArrivalStream::new(data, resolver, &hidden.arrival);
                 batch_superseded = Some(arrival.superseded());
                 match &self.row_versions {
-                    Some(versions) => Box::pin(arrival.with_versions(Arc::clone(versions))),
+                    Some(versions) => {
+                        Box::pin(arrival.with_versions(Arc::clone(versions), &hidden))
+                    }
                     None => Box::pin(arrival),
                 }
             }
@@ -752,10 +756,15 @@ impl CayenneTableProvider {
         // each still sorts its rows by it, so an equality on the key reads about
         // one zone of every file instead of all of them.
         let write_schema = match &postpass {
-            Some((order, _)) => super::overwrite_postpass::with_hidden(
-                &self.table_schema(),
-                matches!(order, CopyOrder::Version),
-            ),
+            Some((order, _)) => {
+                let table_schema = self.table_schema();
+                let hidden = super::overwrite_postpass::hidden_columns(&table_schema);
+                if matches!(order, CopyOrder::Version) {
+                    super::overwrite_postpass::with_versions(&table_schema, &hidden)
+                } else {
+                    super::overwrite_postpass::with_arrival(&table_schema, &hidden.arrival)
+                }
+            }
             None => self.table_schema(),
         };
         let written: Result<_> = async {
