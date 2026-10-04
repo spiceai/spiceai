@@ -185,7 +185,7 @@ fn referenced_snapshot_ids(slice: &DatasetMetastoreSlice, anchor: &Path) -> Hash
 /// archive: snapshot directories the slice does not reference (retired ones
 /// are removed by the sweep while the archive is being written), staging
 /// state, and `deletions/` directories of unreferenced snapshots. Paths are
-/// relative to `anchor`.
+/// relative to `anchor`. Empty for a partitioned dataset, which is archived whole.
 async fn unreferenced_data_entries(
     anchor: &Path,
     slice: &DatasetMetastoreSlice,
@@ -196,11 +196,18 @@ async fn unreferenced_data_entries(
         .and_then(|rows| rows.first());
     let mut skip = HashSet::new();
     // A partitioned table keeps its partitions directly under the data
-    // directory; archive it as a whole.
-    if table_row
+    // directory; archive it as a whole. The slice's `cayenne_partition` rows are
+    // what say it is partitioned: the accelerator creates a partitioned
+    // acceleration's parent table unpartitioned and wraps it, so the parent row's
+    // `partition_column` is empty in production.
+    let partitioned = table_row
         .and_then(|row| slice_text(row, slice_column("cayenne_table", "partition_column")))
         .is_some()
-    {
+        || slice
+            .tables
+            .get("cayenne_partition")
+            .is_some_and(|rows| !rows.is_empty());
+    if partitioned {
         return Ok(skip);
     }
     let table_id = table_row
@@ -546,6 +553,27 @@ mod tests {
         assert_eq!(slice.dataset_name, "trips");
     }
 
+    /// One row of `table`, with each named column set to its text value and
+    /// every other column `NULL`.
+    fn slice_row(table: &str, values: &[(&str, &str)]) -> Vec<SliceValue> {
+        let columns = EXPECTED_TABLES
+            .iter()
+            .find(|t| t.name == table)
+            .expect("known table")
+            .columns;
+        columns
+            .iter()
+            .map(|c| {
+                values
+                    .iter()
+                    .find(|(name, _)| name == c)
+                    .map_or(SliceValue::Null, |(_, v)| {
+                        SliceValue::Text((*v).to_string())
+                    })
+            })
+            .collect()
+    }
+
     fn slice_with(
         table_id: &str,
         current: &str,
@@ -563,24 +591,6 @@ mod tests {
         partition_column: Option<&str>,
     ) -> DatasetMetastoreSlice {
         use cayenne::metastore::snapshot::{SLICE_ENGINE, SLICE_FORMAT_VERSION};
-        let row = |table: &str, values: &[(&str, &str)]| -> Vec<SliceValue> {
-            let columns = EXPECTED_TABLES
-                .iter()
-                .find(|t| t.name == table)
-                .expect("known table")
-                .columns;
-            columns
-                .iter()
-                .map(|c| {
-                    values
-                        .iter()
-                        .find(|(name, _)| name == c)
-                        .map_or(SliceValue::Null, |(_, v)| {
-                            SliceValue::Text((*v).to_string())
-                        })
-                })
-                .collect()
-        };
         let mut tables = std::collections::BTreeMap::new();
         let mut table_values = vec![("table_id", table_id), ("current_snapshot_id", current)];
         if let Some(column) = partition_column {
@@ -588,20 +598,20 @@ mod tests {
         }
         tables.insert(
             "cayenne_table".to_string(),
-            vec![row("cayenne_table", &table_values)],
+            vec![slice_row("cayenne_table", &table_values)],
         );
         tables.insert(
             "cayenne_snapshot_sequence".to_string(),
             protected
                 .iter()
-                .map(|id| row("cayenne_snapshot_sequence", &[("snapshot_id", id)]))
+                .map(|id| slice_row("cayenne_snapshot_sequence", &[("snapshot_id", id)]))
                 .collect(),
         );
         tables.insert(
             "cayenne_delete_file".to_string(),
             delete_paths
                 .iter()
-                .map(|path| row("cayenne_delete_file", &[("path", path)]))
+                .map(|path| slice_row("cayenne_delete_file", &[("path", path)]))
                 .collect(),
         );
         DatasetMetastoreSlice {
@@ -654,6 +664,51 @@ mod tests {
                 .expect("list")
                 .is_empty()
         );
+    }
+
+    /// The accelerator creates a partitioned acceleration's parent table
+    /// unpartitioned and wraps it, so in production the parent row's
+    /// `partition_column` is empty and only the slice's `cayenne_partition` rows
+    /// say it is partitioned. Its partitions' Hive directories sit directly
+    /// under the data directory, with each child's snapshots inside, and every
+    /// one of them has to reach the archive.
+    #[tokio::test]
+    async fn a_partitioned_slice_keeps_its_partition_directories_without_a_partition_column() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        for dir in [
+            "tid/current",
+            "bucket=alpha/child-a/snap-a",
+            "bucket=beta/child-b/snap-b",
+        ] {
+            std::fs::create_dir_all(anchor.join(dir)).expect("mkdir");
+        }
+        let mut slice = slice_with("tid", "current", &[], &[]);
+        slice.tables.insert(
+            "cayenne_partition".to_string(),
+            ["bucket=alpha", "bucket=beta"]
+                .iter()
+                .map(|dir| {
+                    slice_row(
+                        "cayenne_partition",
+                        &[
+                            ("table_id", "tid"),
+                            ("path", &anchor.join(dir).to_string_lossy()),
+                        ],
+                    )
+                })
+                .collect(),
+        );
+
+        let skip = unreferenced_data_entries(anchor, &slice)
+            .await
+            .expect("list");
+        for dir in ["bucket=alpha", "bucket=beta"] {
+            assert!(
+                !skip.contains(&PathBuf::from(dir)),
+                "partition directory '{dir}' must be archived, but the plan skips it: {skip:?}"
+            );
+        }
     }
 
     /// A full refresh retires the previous snapshot directory; the snapshot
@@ -823,6 +878,204 @@ mod tests {
             .map(RecordBatch::num_rows)
             .sum();
         assert_eq!(rows, 50, "the archive restores the refreshed table");
+    }
+
+    /// A partitioned acceleration round-trips through a real archive, partition
+    /// data included. The parent is created the way the accelerator creates it,
+    /// with `partition_column: None`, and its partitions through
+    /// `CayennePartitionCreator`, so each child table is rooted at its Hive
+    /// directory under the data directory. After the archive is extracted and
+    /// its slice imported, every partition reads back the rows written to it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partitioned_dataset_round_trips_through_an_archive_with_its_partition_data() {
+        use arrow::array::{Int64Array, RecordBatch, StringArray};
+        use cayenne::{CayennePartitionCreator, CayenneTableProviderBuilder};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::{SessionContext, col};
+        use datafusion::scalar::ScalarValue;
+        use datafusion_table_providers::UnsupportedTypeAction;
+        use runtime_acceleration::snapshot::directory_archive::{
+            ExtractOptions, archive_directories_to_file_with_plan,
+            extract_archive_file_with_options,
+        };
+        use runtime_table_partition::creator::PartitionCreator;
+        use runtime_table_partition::expression::PartitionedBy;
+
+        let schema: Arc<arrow_schema::Schema> = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("bucket", arrow_schema::DataType::Utf8, false),
+        ]));
+        // Write-entry inlining off, so each partition's rows land in files under
+        // its Hive directory — the files the archive has to carry.
+        let vortex_config = cayenne::metadata::VortexConfig {
+            inline_max_rows: 0,
+            inline_max_bytes: 0,
+            ..cayenne::metadata::VortexConfig::default()
+        };
+        let ctx = SessionContext::new();
+        let creator_over = |catalog: &Arc<CayenneCatalog>, data_dir: &std::path::Path, table_id| {
+            CayennePartitionCreator::new(
+                "trips".to_string(),
+                data_dir.to_path_buf(),
+                vec![PartitionedBy {
+                    name: "bucket".to_string(),
+                    expression: col("bucket"),
+                }],
+                Arc::clone(&schema),
+                Arc::clone(catalog) as Arc<dyn MetadataCatalog>,
+                table_id,
+                UnsupportedTypeAction::Error,
+                Vec::new(),
+                None,
+                vortex_config.clone(),
+                None,
+                Vec::new(),
+                None,
+                ctx.runtime_env(),
+            )
+        };
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let metadata_dir = tmp.path().join("writer").join("metadata");
+        let data_dir = tmp.path().join("writer").join("trips");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let catalog = fresh_catalog(&metadata_dir).await;
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: "trips".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir.to_string_lossy().into_owned(),
+            // As the accelerator creates a partitioned acceleration's parent.
+            partition_column: None,
+            vortex_config: vortex_config.clone(),
+        })
+        .await
+        .expect("create parent");
+        let table_id = catalog.get_table("trips").await.expect("meta").table_id;
+        let creator = creator_over(&catalog, &data_dir, table_id);
+        for (bucket, rows) in [("alpha", 10_usize), ("beta", 20)] {
+            let partition = creator
+                .create_partition(vec![ScalarValue::Utf8(Some(bucket.to_string()))])
+                .await
+                .expect("create partition");
+            let ids: Vec<i64> = (0..i64::try_from(rows).expect("small")).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(vec![bucket; rows])),
+                ],
+            )
+            .expect("batch");
+            let input = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+                .expect("exec");
+            let plan = partition
+                .table_provider
+                .insert_into(&ctx.state(), input, InsertOp::Append)
+                .await
+                .expect("plan");
+            collect(plan, ctx.task_ctx()).await.expect("write");
+        }
+
+        let dirs = vec![
+            (metadata_dir.clone(), "metadata/".to_string()),
+            (data_dir.clone(), "data/".to_string()),
+        ];
+        let plan = CayenneSnapshotEngine::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            "trips",
+            data_dir.clone(),
+        )
+        .prepare_directory_snapshot(&dirs, "trips")
+        .await
+        .expect("prepare");
+        let tar = tmp.path().join("snapshot.tar");
+        let skip: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
+        let extras: Vec<(String, Vec<u8>)> = plan
+            .extra_entries
+            .into_iter()
+            .map(|e| (e.archive_path, e.bytes))
+            .collect();
+        archive_directories_to_file_with_plan(&dirs, &tar, &skip, &extras)
+            .await
+            .expect("archive");
+
+        let reader_root = tmp.path().join("reader");
+        let reader_metadata = reader_root.join("metadata");
+        let reader_data = reader_root.join("trips");
+        std::fs::create_dir_all(&reader_metadata).expect("mkdir");
+        std::fs::create_dir_all(&reader_data).expect("mkdir");
+        let reader_catalog = fresh_catalog(&reader_metadata).await;
+        extract_archive_file_with_options(
+            &tar,
+            &reader_root,
+            ExtractOptions {
+                prefix_mappings: Some(vec![
+                    ("metadata/".to_string(), reader_metadata.clone()),
+                    ("data/".to_string(), reader_data.clone()),
+                ]),
+                ..ExtractOptions::skip_existing()
+            },
+        )
+        .await
+        .expect("extract");
+        CayenneSnapshotEngine::new(
+            Arc::clone(&reader_catalog) as Arc<dyn MetadataCatalog>,
+            "trips",
+            reader_data.clone(),
+        )
+        .finalize_directory_snapshot(
+            &[
+                (reader_metadata.clone(), "metadata/".to_string()),
+                (reader_data.clone(), "data/".to_string()),
+            ],
+            "trips",
+        )
+        .await
+        .expect("import");
+
+        let reader_table_id = reader_catalog
+            .get_table("trips")
+            .await
+            .expect("the restored parent is registered")
+            .table_id;
+        let mut read_back: Vec<(String, usize)> = Vec::new();
+        for partition in creator_over(&reader_catalog, &reader_data, reader_table_id)
+            .infer_existing_partitions()
+            .await
+            .expect("every restored partition opens")
+        {
+            let [ScalarValue::Utf8(Some(bucket))] = partition.partition_values.as_slice() else {
+                panic!(
+                    "expected one Utf8 partition value, got {:?}",
+                    partition.partition_values
+                );
+            };
+            let rows: usize = SessionContext::new()
+                .read_table(Arc::clone(&partition.table_provider))
+                .expect("read")
+                .collect()
+                .await
+                .expect("collect")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum();
+            read_back.push((bucket.clone(), rows));
+        }
+        read_back.sort();
+        assert_eq!(
+            read_back,
+            vec![("alpha".to_string(), 10), ("beta".to_string(), 20)],
+            "every partition reads back the rows written to it"
+        );
     }
 
     #[tokio::test]
