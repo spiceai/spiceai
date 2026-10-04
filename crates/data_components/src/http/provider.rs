@@ -140,14 +140,22 @@ fn endpoint_label(url: &Url) -> String {
 
 /// The half of an [`Error::ErrorResponse`] message that tells the operator what to do.
 ///
-/// It differs by status class because only one of the two classes is selectable — see
-/// [`ErrorResponseAction`] for why. Offering `warn` for a 5xx would name a remedy that
-/// does not work.
+/// It differs by status class because only client errors are selectable — see
+/// [`ErrorResponseAction`] for why. Offering `warn` for any other status would name a
+/// remedy that does not work.
 fn error_response_remedy(status: u16) -> &'static str {
     if HttpTableProvider::is_retryable_status(status) {
         "The origin did not recover after the configured retries, and a server error is never \
          recorded as a row, so the dataset keeps its previous contents. Fix the origin, or raise \
          `max_retries` if it recovers on its own."
+    } else if (300..400).contains(&status) {
+        "Only a client error can be recorded as a row, so the dataset keeps its previous \
+         contents. A `304` answers a conditional header such as `If-None-Match` sent through \
+         `http_headers` or a `request_headers` filter, and any other `3xx` is a redirect that \
+         was not followed: change the request."
+    } else if !HttpTableProvider::is_recordable_status(status) {
+        "Only a client error can be recorded as a row, so the dataset keeps its previous \
+         contents. Fix the origin or the request."
     } else {
         "`on_error_response` treats it as a failed request. Fix the origin, or set \
          `on_error_response: warn` on this dataset to record the body as a row and log that a \
@@ -163,11 +171,14 @@ fn error_response_remedy(status: u16) -> &'static str {
 /// origin failure substitutes error pages for data without the query result marking it
 /// (spiceai/spiceai#13515).
 ///
-/// [`Warn`] and [`Store`] reach only the statuses this connector does *not* retry. A 5xx
-/// or 429 that outlives the retry ladder fails the request whatever the action says,
-/// because it is a statement about the origin's health rather than about the resource
-/// (RFC 9110 S15.6) — the same line `cache::batches_cacheable` draws when it keeps a row
-/// carrying such a status out of the results cache. Because the status is refused
+/// [`Warn`] and [`Store`] reach only client errors, a 4xx other than 429: the class
+/// whose body answers for the resource. Any other status outside 2xx fails the request
+/// whatever the action says. A `3xx` carries no content to record — a `304` answering
+/// a conditional request would replace the dataset with one empty row on a full
+/// refresh. A 5xx or 429 that outlives the retry ladder is a statement about the
+/// origin's health rather than about the resource (RFC 9110 S15.6) — the same line
+/// `cache::batches_cacheable` draws when it keeps a row carrying such a status out of
+/// the results cache. Because the status is refused
 /// before it becomes a row, a caller that keeps its previous result when the origin
 /// fails tells it apart from other failures with [`is_transient_origin_failure`].
 /// Without that scoping, the setting a dataset picks to keep a meaningful 404 working
@@ -180,11 +191,11 @@ pub enum ErrorResponseAction {
     /// Fail the request, so a refresh fails and the accelerated table keeps what it had.
     #[default]
     Error,
-    /// Record the response as a row, and warn that it happened. A retryable status
-    /// (5xx/429) still fails — see the type's documentation.
+    /// Record a client error's response (a 4xx other than 429) as a row, and warn that
+    /// it happened. Any other status still fails — see the type's documentation.
     Warn,
-    /// Record the response as a row, silently. A retryable status (5xx/429) still
-    /// fails — see the type's documentation.
+    /// Record a client error's response (a 4xx other than 429) as a row, silently. Any
+    /// other status still fails — see the type's documentation.
     Store,
 }
 
@@ -915,7 +926,8 @@ impl HttpTableProvider {
     }
 
     /// Set what a response the origin did not mark successful becomes: a failed
-    /// request, or a row (with or without a warning). See [`ErrorResponseAction`].
+    /// request, or, for a client error, a row (with or without a warning). See
+    /// [`ErrorResponseAction`].
     #[must_use]
     pub fn with_error_response_action(mut self, action: ErrorResponseAction) -> Self {
         self.error_response_action = action;
@@ -1772,6 +1784,13 @@ impl HttpTableProvider {
         (500..600).contains(&status_code) || status_code == 429
     }
 
+    /// Whether `on_error_response: warn` or `store` may record a response with this
+    /// status as a row: a client error (4xx) this connector does not retry. Anything
+    /// else outside 2xx is refused under every action — see [`ErrorResponseAction`].
+    fn is_recordable_status(status_code: u16) -> bool {
+        (400..500).contains(&status_code) && !Self::is_retryable_status(status_code)
+    }
+
     /// Perform a single HTTP request without retry logic.
     ///
     /// A 5xx/429 is returned as a transient error, so the ladder retries it while its
@@ -1847,14 +1866,19 @@ impl HttpTableProvider {
             return Err(RetryError::transient(self.error_response(status_code)));
         }
 
-        // A non-2xx that reaches here is a status this connector does not retry: a 4xx (a
-        // 404 "not found" can be a business fact for an API-shaped dataset), or a 3xx left
-        // by an exhausted redirect chain. `error_response_action` decides whether its body
-        // is data. Anything that is not recorded has to answer here rather than downstream
-        // of the row: the row is what a full refresh writes over good data with.
+        // A non-2xx that reaches here is a status this connector does not retry.
+        // `error_response_action` decides whether a client error's body is data — a 404
+        // "not found" can be a business fact for an API-shaped dataset. Any other status
+        // is refused under every action: a `3xx` (a `304` answering a conditional header,
+        // or a redirect that was not followed) carries no content to record. Anything that
+        // is not recorded has to answer here rather than downstream of the row: the row is
+        // what a full refresh writes over good data with.
         let is_error_response = !(200..300).contains(&status_code);
 
-        if is_error_response && self.error_response_action == ErrorResponseAction::Error {
+        if is_error_response
+            && (self.error_response_action == ErrorResponseAction::Error
+                || !Self::is_recordable_status(status_code))
+        {
             // Permanent: asking again would get the same answer.
             return Err(RetryError::Permanent(self.error_response(status_code)));
         }
@@ -7040,8 +7064,8 @@ mod tests {
             HttpTableProvider::is_retryable_status(429),
             "429 should be retryable"
         );
-        // 2xx/3xx success-ish and 4xx client errors (other than 429) are NOT retried —
-        // they are deterministic responses the caller should see, not transient faults.
+        // 2xx, 3xx and 4xx (other than 429) are NOT retried — asking again would get
+        // the same answer, unlike a transient fault.
         for status in [200_u16, 204, 301, 400, 401, 403, 404, 410, 422, 600] {
             assert!(
                 !HttpTableProvider::is_retryable_status(status),
@@ -9148,6 +9172,59 @@ mod tests {
             !message.contains("`on_error_response: store`"),
             "the failure must not offer the silent form as the remedy: {message}"
         );
+    }
+
+    /// `warn` and `store` record client errors only, as the parameter documents. A
+    /// `304` answers a conditional request header, and a `300` or a `302` without a
+    /// `Location` is a redirect the client did not follow: none carries content to
+    /// record, so none becomes a row under any action, asking again would get the same
+    /// answer, and the failure does not offer `warn` as the remedy.
+    #[tokio::test]
+    async fn a_status_outside_the_client_error_class_is_never_recorded() {
+        use std::sync::atomic::Ordering;
+
+        for status in [300, 302, 304] {
+            for action in ErrorResponseAction::VARIANTS {
+                let (base_url, requests) = start_status_server(status, "").await;
+
+                let error = scan_provider(status_provider(base_url, action).with_max_retries(2))
+                    .await
+                    .expect_err("a status outside the client-error class must not become a row");
+                assert_eq!(
+                    requests.load(Ordering::SeqCst),
+                    1,
+                    "{action}/{status}: a status that is not retried is asked once"
+                );
+
+                let message = error.to_string();
+                assert!(
+                    message.contains(&status.to_string()),
+                    "{action}/{status}: the failure must name the status: {message}"
+                );
+                assert!(
+                    !message.contains("`on_error_response: warn`"),
+                    "{action}/{status}: `warn` cannot record this status, so it must not be offered: {message}"
+                );
+            }
+        }
+    }
+
+    /// The redirect wording belongs to `3xx` only. Any other status outside the
+    /// recordable class still names the remedy that applies, without `warn`.
+    #[test]
+    fn the_remedy_names_redirects_only_for_a_redirect() {
+        for status in [100, 600, 999] {
+            let remedy = error_response_remedy(status);
+            assert!(
+                !remedy.contains("304") && !remedy.contains("redirect"),
+                "{status}: {remedy}"
+            );
+            assert!(
+                !remedy.contains("`on_error_response: warn`"),
+                "{status}: {remedy}"
+            );
+        }
+        assert!(error_response_remedy(304).contains("If-None-Match"));
     }
 
     #[tokio::test]
