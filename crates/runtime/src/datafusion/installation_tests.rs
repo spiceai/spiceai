@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::Table;
+use super::{DatasetPlacement, Table};
 use crate::{
     Runtime,
     component::{
@@ -34,7 +34,10 @@ use async_trait::async_trait;
 use data_connector_api::{
     ConnectorComponent, ConnectorContext, DataConnector, DataConnectorError, DataConnectorResult,
 };
-use datafusion::datasource::TableProvider;
+use datafusion::{
+    common::{DataFusionError, TableReference},
+    datasource::TableProvider,
+};
 use runtime_component::dataset::{DatasetSpec, TimeFormat};
 use std::{any::Any, sync::Arc, time::Duration};
 use tokio::sync::{Notify, Semaphore};
@@ -79,12 +82,25 @@ impl DataConnector for MetadataGate {
             .await
             .expect("release metadata preparation")
             .forget();
-        self.fail.then(|| {
+        Some(if self.fail {
             Err(DataConnectorError::InternalWithSource {
                 dataconnector: "installation-test".into(),
                 connector_component: ConnectorComponent::from(dataset),
                 source: "controlled metadata failure".into(),
             })
+        } else {
+            Ok(Arc::clone(&self.provider))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RefuseInstallation;
+
+impl DatasetPlacement for RefuseInstallation {
+    fn install(&self, _: &TableReference, _: Arc<dyn TableProvider>) -> super::Result<()> {
+        Err(super::Error::UnableToRegisterTableToDataFusion {
+            source: DataFusionError::Execution("controlled catalog refusal".into()),
         })
     }
 }
@@ -94,6 +110,9 @@ enum Outcome {
     CancelMetadata,
     FailMetadata,
     CancelBookkeeping,
+    FailCatalog,
+    RestoreMetadata,
+    FailMetadataPublication,
     Complete,
 }
 
@@ -122,6 +141,20 @@ async fn installation(outcome: Outcome) {
         builder.access = AccessMode::ReadWrite;
         let dataset = Arc::new(builder.build().expect("dataset configuration"));
         let name = dataset.name.clone();
+        let metadata_name = TableReference::partial("metadata", name.to_string());
+        let previous_metadata: Option<Arc<dyn TableProvider>> = if matches!(outcome, Outcome::RestoreMetadata) {
+            let previous: Arc<dyn TableProvider> = Arc::new(
+                data_components::arrow::write::MemTable::try_new(provider.schema(), vec![vec![]]).expect("prior metadata"),
+            );
+            df.ctx.register_table(metadata_name.clone(), Arc::clone(&previous)).expect("install prior metadata");
+            Some(previous)
+        } else { None };
+        if matches!(outcome, Outcome::FailCatalog | Outcome::RestoreMetadata) {
+            df.set_dataset_placement(&name, Arc::new(RefuseInstallation));
+        }
+        if matches!(outcome, Outcome::FailMetadataPublication) {
+            df.ctx.catalog("spice").expect("catalog").deregister_schema("metadata", false).expect("remove empty metadata schema");
+        }
         let table = Table::Accelerated {
             source: Arc::clone(&source) as Arc<dyn DataConnector>,
             federated_read_table: FederatedTable::new_unchecked(provider),
@@ -136,9 +169,10 @@ async fn installation(outcome: Outcome) {
         }
         assert!(!df.table_exists(&name), "metadata preparation cannot expose the catalog entry");
         assert!(!df.is_writable(&name), "metadata preparation cannot expose write access");
+        assert_eq!(df.table_exists(&metadata_name), previous_metadata.is_some());
         match outcome {
             Outcome::CancelMetadata => drop(registration),
-            Outcome::FailMetadata => {
+            Outcome::FailMetadata | Outcome::FailCatalog | Outcome::RestoreMetadata | Outcome::FailMetadataPublication => {
                 source.release.add_permits(1);
                 assert!(registration.await.is_err());
             }
@@ -147,6 +181,7 @@ async fn installation(outcome: Outcome) {
                 source.release.add_permits(1);
                 assert!(futures::poll!(registration.as_mut()).is_pending());
                 assert!(!df.table_exists(&name));
+                assert!(!df.table_exists(&metadata_name));
                 drop(registration);
                 drop(bookkeeping);
             }
@@ -169,7 +204,17 @@ async fn installation(outcome: Outcome) {
             assert!(!df.is_writable(&name));
             assert!(!df.is_accelerated(&name).await);
         }
+        let actual_metadata = df.get_table(&metadata_name).await;
+        let expected_metadata = if matches!(outcome, Outcome::Complete) { Some(&source.provider) } else { previous_metadata.as_ref() };
+        match (actual_metadata, expected_metadata) {
+            (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(&actual, expected)),
+            (None, None) => {},
+            _ => panic!("metadata publication must match the installation outcome"),
+        }
         df.remove_table(&name).await.expect("drain and remove the generation");
+        if !matches!(outcome, Outcome::FailMetadataPublication) {
+            df.ctx.deregister_table(metadata_name).expect("remove fixture metadata");
+        }
         assert!(!df.table_exists(&name));
         assert!(!df.is_writable(&name));
     }).await.expect("installation must complete or cancel without hanging");
@@ -188,6 +233,21 @@ async fn change_sink_installation_failed_metadata_does_not_publish() {
 #[tokio::test]
 async fn change_sink_installation_cancelled_bookkeeping_does_not_publish() {
     installation(Outcome::CancelBookkeeping).await;
+}
+
+#[tokio::test]
+async fn change_sink_installation_failed_catalog_removes_metadata() {
+    installation(Outcome::FailCatalog).await;
+}
+
+#[tokio::test]
+async fn change_sink_installation_failed_catalog_restores_metadata() {
+    installation(Outcome::RestoreMetadata).await;
+}
+
+#[tokio::test]
+async fn change_sink_installation_metadata_publication_failure_does_not_publish() {
+    installation(Outcome::FailMetadataPublication).await;
 }
 
 #[tokio::test]

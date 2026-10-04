@@ -21,7 +21,7 @@ use std::sync::{
 
 use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedRwLockWriteGuard};
 
 use crate::accelerated::AcceleratedTable;
 use crate::accelerated::caching::{
@@ -45,6 +45,23 @@ pub struct SynchronizedTable {
     parent_accelerator: Arc<dyn TableProvider>,
     parent_write_mutex: Arc<Mutex<()>>,
     parent_change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+}
+
+/// Retains the parent fanout fence between the child snapshot and publication.
+pub(crate) struct PreparedCacheChild {
+    parent: SynchronizedTable,
+    children: OwnedRwLockWriteGuard<Vec<SynchronizedCacheTarget>>,
+    child: SynchronizedCacheTarget,
+    rows: usize,
+}
+
+impl PreparedCacheChild {
+    /// The child must have a drain owner before it becomes a fanout target.
+    pub(crate) fn publish(mut self) -> datafusion::error::Result<usize> {
+        self.parent.ensure_parent_accepts_children()?;
+        self.children.push(self.child);
+        Ok(self.rows)
+    }
 }
 
 impl std::fmt::Debug for SynchronizedTable {
@@ -111,14 +128,16 @@ impl SynchronizedTable {
             .retain(|child| !Arc::ptr_eq(&child.in_flight, claims));
     }
 
-    /// Initialize an unpublished child and attach it to parent propagation.
+    /// Initialize a child while fencing parent propagation until publication.
     /// The registry fence precedes the write fence: earlier parent writes are
     /// included in the snapshot, and later fanout sees the registered child.
-    pub async fn initialize_cache_child(
+    pub(crate) async fn prepare_cache_child(
         &self,
         child: SynchronizedCacheTarget,
-    ) -> datafusion::error::Result<usize> {
-        let mut children = self.parent_synchronized_children.write().await;
+    ) -> datafusion::error::Result<PreparedCacheChild> {
+        let children = Arc::clone(&self.parent_synchronized_children)
+            .write_owned()
+            .await;
         self.ensure_parent_accepts_children()?;
         if let Some(sink) = &self.parent_change_sink {
             sink.flush().await?;
@@ -131,8 +150,12 @@ impl SynchronizedTable {
         )
         .await?;
         self.ensure_parent_accepts_children()?;
-        children.push(child);
-        Ok(rows)
+        Ok(PreparedCacheChild {
+            parent: self.clone(),
+            children,
+            child,
+            rows,
+        })
     }
 
     fn ensure_parent_accepts_children(&self) -> datafusion::error::Result<()> {

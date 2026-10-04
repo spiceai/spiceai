@@ -1157,30 +1157,23 @@ impl Builder {
         };
         refresher.with_cache_write_sender(batch_write_tx.clone());
 
-        if let (Some(synchronize_with), Some(writer)) = (&self.synchronize_with, &batch_write_tx) {
+        let prepared_child = if let (Some(synchronize_with), Some(writer)) =
+            (&self.synchronize_with, &batch_write_tx)
+        {
             let child = caching::SynchronizedCacheTarget {
                 accelerator: Arc::clone(&self.accelerator),
                 writer: writer.clone(),
                 in_flight: Arc::clone(&in_flight_revalidations),
             };
-            let rows = synchronize_with
-                .initialize_cache_child(child)
-                .await
-                .map_err(|source| Error::FailedToWriteData { source })?;
-            if rows > 0 {
-                tracing::info!(
-                    "Initialized caching child {} with {} rows from parent {}",
-                    self.dataset_name,
-                    rows,
-                    synchronize_with.parent_dataset_name()
-                );
-            }
-            tracing::info!(
-                "Registered caching child {} with parent {}",
-                self.dataset_name,
-                synchronize_with.parent_dataset_name()
-            );
-        }
+            Some(
+                synchronize_with
+                    .prepare_cache_child(child)
+                    .await
+                    .map_err(|source| Error::FailedToWriteData { source })?,
+            )
+        } else {
+            None
+        };
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
@@ -1367,7 +1360,7 @@ impl Builder {
             handlers.push(worker.start());
         }
 
-        Ok(AcceleratedTable {
+        let table = AcceleratedTable {
             dataset_name: self.dataset_name,
             accelerator: self.accelerator,
             change_sink,
@@ -1395,7 +1388,28 @@ impl Builder {
             batch_write_tx,
             cluster_role: self.cluster_role,
             user_facing_schema: self.user_facing_schema,
-        })
+        };
+        if let Some(prepared_child) = prepared_child {
+            let rows = prepared_child
+                .publish()
+                .map_err(|source| Error::FailedToWriteData { source })?;
+            if let Some(synchronize_with) = &table.synchronized_with {
+                if rows > 0 {
+                    tracing::info!(
+                        "Initialized caching child {} with {} rows from parent {}",
+                        table.dataset_name,
+                        rows,
+                        synchronize_with.parent_dataset_name()
+                    );
+                }
+                tracing::info!(
+                    "Registered caching child {} with parent {}",
+                    table.dataset_name,
+                    synchronize_with.parent_dataset_name()
+                );
+            }
+        }
+        Ok(table)
     }
 }
 
@@ -2823,6 +2837,8 @@ impl Retention {
     }
 }
 
+#[cfg(test)]
+mod construction_tests;
 #[cfg(test)]
 mod drain_tests;
 

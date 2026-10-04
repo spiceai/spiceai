@@ -5094,10 +5094,15 @@ impl DataFusion {
             &dataset.metadata,
             &dataset.columns,
         );
-        if register_metadata {
-            self.register_metadata_table(dataset, Arc::clone(&source))
-                .await?;
-        }
+        let metadata_provider = if register_metadata {
+            source
+                .metadata_provider(dataset)
+                .await
+                .transpose()
+                .context(UnableToResolveTableProviderSnafu)?
+        } else {
+            None
+        };
         let mut accelerated_tables = self.accelerated_tables.write().await;
         let mut writers = if dataset.access().allows_write() {
             Some(
@@ -5128,7 +5133,9 @@ impl DataFusion {
                     dataset_name: dataset.name.to_string(),
                 })?;
         // No await or fallible bookkeeping may separate publication from ownership.
-        if let Err(error) = self.install_table_provider(&dataset.name, table_provider) {
+        if let Err(error) =
+            self.install_acceleration_providers(&dataset.name, table_provider, metadata_provider)
+        {
             permit.installation_failed();
             return Err(error);
         }
@@ -5145,6 +5152,40 @@ impl DataFusion {
                 .update_dataset(&dataset.name, status::ComponentStatus::Ready);
         }
         Ok((notifier, permit))
+    }
+
+    /// Publish without suspension and restore metadata if main installation fails.
+    fn install_acceleration_providers(
+        &self,
+        name: &TableReference,
+        provider: Arc<dyn TableProvider>,
+        metadata: Option<Arc<dyn TableProvider>>,
+    ) -> Result<()> {
+        let Some(metadata) = metadata else {
+            return self.install_table_provider(name, provider);
+        };
+        let metadata_name = TableReference::partial(SPICE_METADATA_SCHEMA, name.to_string());
+        let previous_metadata = self
+            .ctx
+            .register_table(metadata_name.clone(), metadata)
+            .map_err(find_datafusion_root)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
+        if let Err(error) = self.install_table_provider(name, provider) {
+            let rollback = match previous_metadata {
+                Some(previous) => self.ctx.register_table(metadata_name, previous),
+                None => self.ctx.deregister_table(metadata_name),
+            };
+            if let Err(rollback_error) = rollback {
+                return Err(Error::UnableToRegisterTableToDataFusion {
+                    source: DataFusionError::Collection(vec![
+                        DataFusionError::External(Box::new(error)),
+                        rollback_error,
+                    ]),
+                });
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn refresh_table(
