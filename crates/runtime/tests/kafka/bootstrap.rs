@@ -69,7 +69,9 @@ pub async fn start_kafka_docker_container(
         .exec([
             "sh",
             "-c",
-            &format!("printf '%s' '{port}' > /tmp/kafka-host-port"),
+            &format!(
+                "printf '%s' '{port}' > /tmp/kafka-host-port.tmp && mv /tmp/kafka-host-port.tmp /tmp/kafka-host-port"
+            ),
         ])
         .await?;
     running_container
