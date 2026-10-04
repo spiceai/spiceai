@@ -31,15 +31,17 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, new_empty_array};
 use arrow::datatypes::Decimal128Type;
 use arrow_schema::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, FieldRef, SchemaRef};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::ColumnarValue;
+use datafusion::physical_expr_common::physical_expr::{is_dynamic_physical_expr, is_volatile};
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_functions_aggregate_common::utils::DecimalAverager;
-use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
+use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 use datafusion_physical_expr::{Distribution, OrderingRequirements};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use parking_lot::RwLock;
@@ -56,8 +58,10 @@ pub struct MaintainedAggregateSpec {
     /// equivalent of a query `WHERE`. `None` maintains the aggregate over every
     /// row (the original behavior). When set, maintenance applies only rows the
     /// predicate selects, and the optimizer serves a query from this view only
-    /// when the query's filter matches this predicate exactly (see
-    /// [`MaintainedAggregateView::matches_query`]). This is what lets the
+    /// when the predicate the query's scan applies has exactly this predicate's
+    /// conjuncts (see [`PredicateConjuncts`]). A volatile predicate selects
+    /// different rows on every evaluation, so a view declared with one never
+    /// serves. This is what lets the
     /// flagship serve filtered analytical queries (e.g. CH-benCH q1/q6) that
     /// every general-purpose engine must re-scan O(rows) for, while Cayenne
     /// maintains the filtered relation from the CDC delta and serves O(groups).
@@ -149,6 +153,10 @@ struct MaintainedAggregateView {
     /// is treated exactly as an absent row (not indexed, not accumulated), so all
     /// retraction logic is reused unchanged. See [`MaintainedAggregateSpec::filter`].
     filter: Option<Arc<dyn PhysicalExpr>>,
+    /// `filter` as the conjunct set a query's predicate is matched against:
+    /// empty when the view has no filter, `None` when the filter is volatile, so
+    /// the view describes rows no query can reproduce and never serves.
+    filter_conjuncts: Option<PredicateConjuncts>,
     groups: HashMap<Vec<ScalarValue>, GroupAccumulator>,
     /// Primary-key column indices in the input batch. Empty means no per-PK
     /// index is maintained, so retraction is unavailable and the legacy
@@ -456,12 +464,115 @@ impl SortedScalarIndex {
 struct QueryAggregateSpec {
     group_by: Vec<String>,
     aggregates: Vec<QueryAggregateExpr>,
-    /// The query's row predicate (captured from a `FilterExec` between the
-    /// aggregate and the Cayenne scan), or `None` for an unfiltered query. A
-    /// view serves the query only when this matches the view's own filter
-    /// exactly — a filtered view must never answer an unfiltered query, and vice
+    /// The predicate every row reaching the aggregate satisfied — the query's
+    /// `WHERE`, wherever planning put it — or no conjuncts for an unfiltered
+    /// query. A view serves the query only when this equals the view's own
+    /// filter: a filtered view must never answer an unfiltered query, and vice
     /// versa, or the result would be wrong.
-    filter: Option<Arc<dyn PhysicalExpr>>,
+    filter: PredicateConjuncts,
+}
+
+/// A row predicate as the set of its `AND`-ed conjuncts, compared independently
+/// of the plan that carries it.
+///
+/// A query's `WHERE` reaches the physical optimizer in whatever shape planning
+/// left it: a `FilterExec` above the scan, a predicate pushed into a Vortex file
+/// source, a `FilterExec` on the scan's in-memory branch, or several of these at
+/// once. Each copy references columns by the position in its own input, so the
+/// same column is `ol_delivery_d@1` above the scan and `ol_delivery_d@6` in a
+/// file source. Comparing conjunct sets makes the match independent of how the
+/// predicate was split across operators and in what order, and identifying each
+/// column by name alone makes it independent of position. Everything else is
+/// compared structurally, literal types included, so a predicate matches only
+/// one written against the same column types.
+#[derive(Debug, Clone, Default)]
+pub struct PredicateConjuncts(Vec<Arc<dyn PhysicalExpr>>);
+
+impl PredicateConjuncts {
+    /// The conjuncts of `predicate`, or `None` when it is volatile or dynamic. A
+    /// volatile function (`random()`) or a hash join's runtime filter selects
+    /// different rows each time it is evaluated, so no maintained view can
+    /// describe the rows it keeps.
+    #[must_use]
+    pub fn try_from_predicate(predicate: &Arc<dyn PhysicalExpr>) -> Option<Self> {
+        let mut conjuncts = Self::default();
+        conjuncts.try_add_predicate(predicate)?;
+        Some(conjuncts)
+    }
+
+    /// Adds the conjuncts of `predicate`, with the same `None` contract as
+    /// [`Self::try_from_predicate`]. On `None`, `self` may hold some of the
+    /// conjuncts and must be discarded.
+    #[must_use]
+    pub fn try_add_predicate(&mut self, predicate: &Arc<dyn PhysicalExpr>) -> Option<()> {
+        if is_volatile(predicate) || is_dynamic_physical_expr(predicate) {
+            return None;
+        }
+        for conjunct in split_conjunction(predicate) {
+            // A pushed-down filter can leave a literal `true` behind where a
+            // conjunct was absorbed; it selects every row.
+            if conjunct
+                .downcast_ref::<Literal>()
+                .is_some_and(|literal| literal.value() == &ScalarValue::Boolean(Some(true)))
+            {
+                continue;
+            }
+            self.insert(name_columns_only(conjunct).ok()?);
+        }
+        Some(())
+    }
+
+    /// Adds every conjunct of `other`.
+    pub fn extend(&mut self, other: &Self) {
+        for conjunct in &other.0 {
+            self.insert(Arc::clone(conjunct));
+        }
+    }
+
+    /// Whether there are no conjuncts, i.e. the predicate selects every row.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn insert(&mut self, conjunct: Arc<dyn PhysicalExpr>) {
+        if !self.0.contains(&conjunct) {
+            self.0.push(conjunct);
+        }
+    }
+}
+
+/// Set equality: both sides hold each conjunct once, so equal lengths and
+/// containment one way imply containment the other way.
+impl PartialEq for PredicateConjuncts {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .all(|conjunct| other.0.contains(conjunct))
+    }
+}
+
+impl Eq for PredicateConjuncts {}
+
+/// `expr` with every column reference identified by its name alone (position
+/// 0), so two copies of a predicate planned over different input schemas
+/// compare equal.
+fn name_columns_only(expr: &Arc<dyn PhysicalExpr>) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+    Arc::clone(expr)
+        .transform_up(|node| {
+            let Some(column) = node.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(node));
+            };
+            if column.index() == 0 {
+                return Ok(Transformed::no(node));
+            }
+            Ok(Transformed::yes(
+                Arc::new(Column::new(column.name(), 0)) as Arc<dyn PhysicalExpr>
+            ))
+        })
+        .data()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -828,7 +939,12 @@ impl MaintainedAggregateRegistry {
         aggregate: &AggregateExec,
         scan_epoch: u64,
     ) -> DataFusionResult<Option<RecordBatch>> {
-        self.batch_for_aggregate_with_output(aggregate, aggregate, scan_epoch, None)
+        self.batch_for_aggregate_with_output(
+            aggregate,
+            aggregate,
+            scan_epoch,
+            PredicateConjuncts::default(),
+        )
     }
 
     /// Materialize a maintained aggregate batch by matching `query_aggregate`
@@ -836,7 +952,8 @@ impl MaintainedAggregateRegistry {
     ///
     /// This is used for `DataFusion`'s split aggregate plans: the partial
     /// aggregate still names the original input columns, while the final
-    /// aggregate carries the user-visible output schema.
+    /// aggregate carries the user-visible output schema. `filter` is the
+    /// predicate every row reaching `query_aggregate` satisfied.
     ///
     /// # Errors
     ///
@@ -846,7 +963,7 @@ impl MaintainedAggregateRegistry {
         query_aggregate: &AggregateExec,
         output_aggregate: &AggregateExec,
         scan_epoch: u64,
-        filter: Option<Arc<dyn PhysicalExpr>>,
+        filter: PredicateConjuncts,
     ) -> DataFusionResult<Option<RecordBatch>> {
         let Some(mut query) = query_spec_for_aggregate(query_aggregate) else {
             return Ok(None);
@@ -880,6 +997,13 @@ impl MaintainedAggregateRegistry {
         scan_epoch: u64,
         output_schema: SchemaRef,
     ) -> DataFusionResult<Option<RecordBatch>> {
+        let filter = match &spec.filter {
+            None => PredicateConjuncts::default(),
+            Some(filter) => match PredicateConjuncts::try_from_predicate(filter) {
+                Some(filter) => filter,
+                None => return Ok(None),
+            },
+        };
         let query = QueryAggregateSpec {
             group_by: spec.group_by.clone(),
             aggregates: spec
@@ -890,7 +1014,7 @@ impl MaintainedAggregateRegistry {
                     column: aggregate.column.clone(),
                 })
                 .collect(),
-            filter: spec.filter.clone(),
+            filter,
         };
         self.serve(&query, scan_epoch, output_schema)
     }
@@ -939,9 +1063,14 @@ impl MaintainedAggregateView {
                 )));
             }
         }
+        let filter_conjuncts = match &spec.filter {
+            None => Some(PredicateConjuncts::default()),
+            Some(filter) => PredicateConjuncts::try_from_predicate(filter),
+        };
         Ok(Self {
             spec: ResolvedAggregateSpec::try_new(spec, schema)?,
             filter: spec.filter.clone(),
+            filter_conjuncts,
             groups: HashMap::new(),
             pk_columns,
             pk_index: HashMap::new(),
@@ -1170,25 +1299,13 @@ impl MaintainedAggregateView {
     }
 
     fn matches_query(&self, query: &QueryAggregateSpec) -> bool {
-        // Filter must match EXACTLY: an unfiltered view (filter `None`) answers
-        // only unfiltered queries; a filtered view answers only a query carrying
-        // the identical predicate. `Arc<dyn PhysicalExpr>` compares structurally
-        // (DataFusion's `DynEq`), so two equivalent predicates over the same
-        // schema match. A mismatch (or an unrecognized predicate) falls back to
-        // the base-table scan — correct, just not accelerated.
-        //
-        // BOUNDARY (known limitation): the comparison is index- and type-sensitive
-        // (`Column{index}`, typed `Literal`). The view's filter is parsed against
-        // the table schema (config time) while the query's filter is the
-        // `FilterExec` predicate captured from the physical plan. If a projection
-        // or type-coercion sits between the scan and the filter (e.g. a
-        // `SchemaCastScanExec` reordering columns or advertising `Utf8View` over a
-        // stored `Utf8`), the predicates differ structurally and this returns
-        // `false`, so the view SILENTLY does not serve and the query re-scans. A
-        // future slice can normalize both predicates to a schema-independent
-        // (column-name + canonical-literal) form before comparison; until then,
-        // declare the filter so it matches the query's scan-output predicate.
-        self.filter == query.filter
+        // The filter must match exactly: an unfiltered view answers only
+        // unfiltered queries, and a filtered view only a query whose rows
+        // satisfied the same conjuncts. A predicate that is equivalent but
+        // written differently (`a > 1` against `1 < a`), or compares a column
+        // under a different type, does not match and the query re-scans the
+        // table — correct, just not accelerated.
+        self.filter_conjuncts.as_ref() == Some(&query.filter)
             && self
                 .spec
                 .group_by
@@ -2087,10 +2204,10 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
     Some(QueryAggregateSpec {
         group_by,
         aggregates,
-        // The aggregate node carries no filter; the optimizer captures any
-        // `FilterExec` predicate during plan descent and sets it via
+        // The aggregate node carries no filter; the optimizer derives the
+        // predicate its input applied during plan descent and passes it to
         // `batch_for_aggregate_with_output`.
-        filter: None,
+        filter: PredicateConjuncts::default(),
     })
 }
 

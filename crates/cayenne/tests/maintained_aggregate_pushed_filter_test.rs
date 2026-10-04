@@ -72,6 +72,7 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const TABLE: &str = "maintained_pushed_filter";
 const TABLE_DEL: &str = "maintained_pushed_filter_del";
+const TABLE_SERVED: &str = "maintained_pushed_filter_served";
 /// Rows whose `v` clears the filter threshold. With the data below, the correct
 /// FILTERED totals are k10 = 200, k20 = 300; the (wrong) UNFILTERED totals the
 /// bug serves are k10 = 205, k20 = 350.
@@ -95,6 +96,24 @@ fn unfiltered_sum_v_by_k() -> MaintainedAggregateSpec {
             column: Some("v".to_string()),
         }],
         filter: None,
+    }
+}
+
+/// SUM(v) GROUP BY k over the rows with `v >= FILTER_THRESHOLD` — the view a
+/// query with that `WHERE` is answered from.
+fn filtered_sum_v_by_k() -> MaintainedAggregateSpec {
+    let schema = table_schema();
+    let filter = datafusion::physical_expr::expressions::binary(
+        datafusion::physical_expr::expressions::col("v", schema.as_ref())
+            .expect("v is a table column"),
+        datafusion::logical_expr::Operator::GtEq,
+        datafusion::physical_expr::expressions::lit(FILTER_THRESHOLD),
+        schema.as_ref(),
+    )
+    .expect("v >= threshold is a valid predicate");
+    MaintainedAggregateSpec {
+        filter: Some(filter),
+        ..unfiltered_sum_v_by_k()
     }
 }
 
@@ -353,3 +372,133 @@ async fn maintained_aggregate_pushed_filter_with_deletes_impl(
 }
 
 test_with_backends!(maintained_aggregate_pushed_filter_with_deletes_impl);
+
+/// The other half of the pushed-filter contract: a view declared WITH the
+/// query's filter must answer it even though physical `FilterPushdown` moved the
+/// `WHERE` into the scan and removed the `FilterExec` above it — the shape every
+/// filtered query takes against a file-backed table, CH-benCH q1/q6 included.
+/// The table carries a pending key-tombstone, so the predicate also sits below a
+/// deletion-filter exec, as on a merge-on-read CDC table.
+///
+/// - Gate A (shape): the predicate is pushed onto the file source below the
+///   deletion exec, so the served path is the pushed one.
+/// - Gate B: the filtered query is served by `MaintainedAggregateExec`.
+/// - Gate C: the served totals are the correct filtered totals, without the
+///   deleted row.
+/// - Gate D: a query with a different predicate is not served from the view and
+///   still returns its own correct totals.
+async fn maintained_aggregate_filtered_view_serves_pushed_filter_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let ctx = cayenne_ctx();
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+
+    let options = CreateTableOptions {
+        table_name: TABLE_SERVED.to_string(),
+        schema: table_schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        },
+    };
+    let table = Arc::new(
+        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env())
+            .await?,
+    );
+
+    // Filtered (v >= 100) totals: k10 = 200, k20 = 300. The deleted id=5 row
+    // (v = 999) would add 999 to k10 if it were still counted.
+    let batch = RecordBatch::try_new(
+        table_schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5])),
+            Arc::new(Int64Array::from(vec![10_i64, 10, 20, 20, 10])),
+            Arc::new(Int64Array::from(vec![5_i64, 200, 50, 300, 999])),
+        ],
+    )?;
+    let inserted = common::insert_batch(table.as_ref(), batch).await?;
+    assert_eq!(inserted, 5, "all five rows must be written");
+    let delete_ctx = SessionContext::new();
+    let delete_plan = table
+        .delete_from(&delete_ctx.state(), vec![col("id").eq(lit(5_i64))])
+        .await?;
+    let _ = collect(delete_plan, delete_ctx.task_ctx()).await?;
+    drop(table);
+
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_maintained_aggregates(vec![filtered_sum_v_by_k()])
+            .open(TABLE_SERVED)
+            .await?,
+    ) as Arc<dyn TableProvider>;
+    ctx.register_table(TABLE_SERVED, Arc::clone(&reopened))?;
+
+    let filtered_sql =
+        format!("SELECT k, SUM(v) FROM {TABLE_SERVED} WHERE v >= {FILTER_THRESHOLD} GROUP BY k");
+
+    // Gate A — without the rewrite, the WHERE is pushed into the scan: onto the
+    // file source below the deletion exec, with no `FilterExec` left above the
+    // scan. Serving replaces the scan, so the shape is read from a plan built
+    // with `DataFusion`'s rules alone.
+    let plain = SessionContext::new_with_state(
+        SessionStateBuilder::new().with_default_features().build(),
+    );
+    plain.register_table(TABLE_SERVED, reopened)?;
+    let unserved_plan = plan_string(&plain, &filtered_sql).await?;
+    let operators: Vec<&str> = unserved_plan.lines().map(str::trim_start).collect();
+    let scan_at = operators
+        .iter()
+        .position(|operator| operator.starts_with("CayenneAccelerationExec"))
+        .expect("the unserved plan scans the Cayenne table");
+    assert!(
+        unserved_plan.contains("predicate:") && unserved_plan.contains("DeletionFilterExec"),
+        "Gate A: the predicate must be pushed onto the file source below the deletion exec. Plan:\n{unserved_plan}"
+    );
+    assert!(
+        !operators[..scan_at]
+            .iter()
+            .any(|operator| operator.starts_with("FilterExec:")),
+        "Gate A: no FilterExec may remain above the scan, or this does not exercise the pushed shape. Plan:\n{unserved_plan}"
+    );
+
+    let filtered_plan = plan_string(&ctx, &filtered_sql).await?;
+
+    // Gate B — the filtered query is served from the filtered view.
+    assert!(
+        filtered_plan.contains("MaintainedAggregateExec"),
+        "Gate B: a query whose WHERE matches the view's filter must be served from the view even when the WHERE was pushed into the scan. Plan:\n{filtered_plan}"
+    );
+
+    // Gate C — the served totals are the correct filtered totals.
+    let got = rows_k_sum(&ctx, &format!("{filtered_sql} ORDER BY k")).await?;
+    assert_eq!(
+        got,
+        vec![(10, 200), (20, 300)],
+        "Gate C: the filtered view served wrong totals"
+    );
+
+    // Gate D — another predicate is not the view's and runs the real aggregate.
+    let other_sql = format!("SELECT k, SUM(v) FROM {TABLE_SERVED} WHERE v >= 50 GROUP BY k");
+    let other_plan = plan_string(&ctx, &other_sql).await?;
+    assert!(
+        !other_plan.contains("MaintainedAggregateExec"),
+        "Gate D: a query with a different predicate must not be served from the view. Plan:\n{other_plan}"
+    );
+    let other = rows_k_sum(&ctx, &format!("{other_sql} ORDER BY k")).await?;
+    assert_eq!(
+        other,
+        vec![(10, 200), (20, 350)],
+        "Gate D: the query the view declined returned wrong totals"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(maintained_aggregate_filtered_view_serves_pushed_filter_impl);
