@@ -23,11 +23,22 @@ use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
+use parking_lot::RwLock;
 use snafu::ResultExt;
 use std::fmt::Display;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// A cached value, behind a lock an invalidation can take it out of.
+///
+/// moka removes a discarded entry from its map at once, but destroys it later, through
+/// epoch-based reclamation, whenever some later cache operation happens to collect it. A
+/// cached logical plan holds the providers it was planned against, so until then a
+/// discarded plan keeps a removed dataset's provider, and the query memory that provider
+/// has reserved, alive (#14251). Emptying the slot drops the value while the invalidation
+/// runs, and what moka destroys later is an empty slot.
+type Slot<V> = Arc<RwLock<Option<V>>>;
 
 // 'static is required by a bound from moka::Cache
 pub struct SimpleCache<
@@ -35,7 +46,7 @@ pub struct SimpleCache<
     T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
 > {
-    cache: Cache<u64, V, PassthroughHashBuilder<T>>,
+    cache: Cache<u64, Slot<V>, PassthroughHashBuilder<T>>,
     hasher: T,
     max_size: u64,
     ttl: Duration,
@@ -78,7 +89,7 @@ impl<
 > SimpleCache<V, T, H>
 {
     pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
-        let cache: Cache<u64, V, PassthroughHashBuilder<T>> = Cache::builder()
+        let cache: Cache<u64, Slot<V>, PassthroughHashBuilder<T>> = Cache::builder()
             .time_to_live(ttl)
             .max_capacity(cache_max_size)
             .support_invalidation_closures()
@@ -108,6 +119,34 @@ impl<
     V: Clone + Send + Sync + 'static,
     T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
+> SimpleCache<V, T, H>
+{
+    async fn get_value(&self, key: &u64) -> Option<V> {
+        self.cache.get(key).await?.read().clone()
+    }
+
+    /// Drops every cached value `discard` selects, before moka is told to invalidate it.
+    ///
+    /// This runs first because moka's iterator is not documented to visit an entry it has
+    /// already invalidated. An entry inserted after this pass is invalidated by moka but
+    /// not emptied, and is released when moka destroys it, as before.
+    fn empty_slots(&self, discard: impl Fn(&V) -> bool) {
+        for (_, slot) in &self.cache {
+            if !slot.read().as_ref().is_some_and(&discard) {
+                continue;
+            }
+            // Taken under the lock, dropped after it: dropping a plan can release the
+            // providers it holds, and that should not block a reader of this key.
+            let taken = slot.write().take();
+            drop(taken);
+        }
+    }
+}
+
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
 > HashProvider for SimpleCache<V, T, H>
 {
     fn hasher(&self) -> Box<dyn Hasher> {
@@ -123,7 +162,7 @@ impl<
 > CacheProvider<V> for SimpleCache<V, T, H>
 {
     async fn get_raw_key(&self, key: &u64) -> Option<std::sync::Arc<V>> {
-        self.cache.get(key).await.map(std::sync::Arc::new)
+        self.get_value(key).await.map(std::sync::Arc::new)
     }
 
     async fn get_raw_key_validated(
@@ -133,7 +172,7 @@ impl<
     ) -> Option<std::sync::Arc<V>> {
         // This cache records no hit/miss metrics, so there is nothing to
         // misattribute; filtering the value is all that is needed.
-        let value = self.cache.get(key).await.map(std::sync::Arc::new)?;
+        let value = self.get_value(key).await.map(std::sync::Arc::new)?;
         if is_valid(value.as_ref()) {
             Some(value)
         } else {
@@ -142,7 +181,9 @@ impl<
     }
 
     async fn put_raw_key(&self, key: &u64, value: V) {
-        self.cache.insert(*key, value).await;
+        self.cache
+            .insert(*key, Arc::new(RwLock::new(Some(value))))
+            .await;
     }
 
     async fn put_raw_key_with_weight(&self, key: &u64, value: V, _weight: usize) {
@@ -162,9 +203,9 @@ impl<
             .and_compute_with(|current| {
                 let replace = current
                     .as_ref()
-                    .is_some_and(|entry| should_replace(entry.value()));
+                    .is_some_and(|entry| entry.value().read().as_ref().is_some_and(should_replace));
                 std::future::ready(if replace {
-                    moka::ops::compute::Op::Put(value)
+                    moka::ops::compute::Op::Put(Arc::new(RwLock::new(Some(value))))
                 } else {
                     moka::ops::compute::Op::Nop
                 })
@@ -174,6 +215,7 @@ impl<
     }
 
     async fn invalidate_all(&self) {
+        self.empty_slots(|_| true);
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
     }
@@ -206,10 +248,13 @@ impl<
 {
     async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         let table_name = crate::invalidated_table_name(&table_ref);
+        let reads_table = move |value: &V| {
+            crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
+        };
+        self.empty_slots(&reads_table);
+        // An emptied slot was discarded by an invalidation, so it matches too.
         self.cache
-            .invalidate_entries_if(move |_key, value| {
-                crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
-            })
+            .invalidate_entries_if(move |_key, slot| slot.read().as_ref().is_none_or(&reads_table))
             .context(FailedToInvalidateCacheSnafu { table_name })?;
 
         Ok(())
