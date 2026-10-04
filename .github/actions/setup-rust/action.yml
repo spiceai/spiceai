@@ -104,6 +104,12 @@ runs:
         rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
         mkdir -p "$rustup_home"
         lockdir="$rustup_home/setup-rust.lock"
+        # Separate mkdir-atomic lock for stale reaping. Two waiters must not both
+        # decide the main lock is stale, then race: after A removes/recreates the
+        # main lock and writes its PID, B must not execute an already-decided
+        # `rm -rf` that deletes A's live lock. Only the reaper-lock holder may
+        # remove a stale main lock, and it re-checks under that lock.
+        reaperdir="$rustup_home/setup-rust.reaper.lock"
 
         release_rustup_lock() {
           if [ -f "$lockdir/pid" ] && [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$$" ]; then
@@ -112,8 +118,9 @@ runs:
         }
         trap release_rustup_lock EXIT
 
-        waited=0
-        while ! mkdir "$lockdir" 2>/dev/null; do
+        # Classify whether `$lockdir` looks stale (dead holder, or empty+old).
+        # Callers that will remove must re-check under `$reaperdir`.
+        rustup_lock_looks_stale() {
           now=$(date +%s)
           if [ "$(uname)" = "Darwin" ]; then
             mtime=$(stat -f %m "$lockdir" 2>/dev/null || echo "$now")
@@ -126,11 +133,54 @@ runs:
             holder="$(cat "$lockdir/pid" 2>/dev/null || true)"
           fi
           if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-            :
-          elif [ -z "$holder" ] && [ "$age" -lt 15 ]; then
-            :
+            return 1
+          fi
+          if [ -z "$holder" ] && [ "$age" -lt 15 ]; then
+            return 1
+          fi
+          return 0
+        }
+
+        # Stale-reap the main lock only while holding `$reaperdir` (mkdir-atomic).
+        # Clearing a stuck reaper never counts as acquiring it: after `rm` we
+        # return and retry, so two waiters cannot both believe they hold the
+        # reaper and race on removing a live main lock.
+        try_reap_stale_rustup_lock() {
+          if mkdir "$reaperdir" 2>/dev/null; then
+            echo $$ > "$reaperdir/pid"
+            # Re-check under the reaper lock before removing the main lock.
+            if [ -d "$lockdir" ] && rustup_lock_looks_stale; then
+              rm -rf "$lockdir"
+            fi
+            rm -rf "$reaperdir"
+            return 0
+          fi
+          now=$(date +%s)
+          if [ "$(uname)" = "Darwin" ]; then
+            rmtime=$(stat -f %m "$reaperdir" 2>/dev/null || echo "$now")
           else
-            rm -rf "$lockdir"
+            rmtime=$(stat -c %Y "$reaperdir" 2>/dev/null || echo "$now")
+          fi
+          rage=$((now - rmtime))
+          rholder=""
+          if [ -f "$reaperdir/pid" ]; then
+            rholder="$(cat "$reaperdir/pid" 2>/dev/null || true)"
+          fi
+          if [ -n "$rholder" ] && kill -0 "$rholder" 2>/dev/null; then
+            return 1
+          fi
+          if [ -z "$rholder" ] && [ "$rage" -lt 15 ]; then
+            return 1
+          fi
+          # Dead/stuck reaper: clear it, but do not acquire — retry via mkdir.
+          rm -rf "$reaperdir"
+          return 1
+        }
+
+        waited=0
+        while ! mkdir "$lockdir" 2>/dev/null; do
+          if rustup_lock_looks_stale; then
+            try_reap_stale_rustup_lock || true
             continue
           fi
           sleep 2
