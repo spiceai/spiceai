@@ -17,12 +17,17 @@ limitations under the License.
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{
-    Arc, OnceLock,
+    Arc, OnceLock, Weak,
     atomic::{AtomicI64, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
-use arrow::datatypes::SchemaRef;
+use arrow::array::{
+    Array, ArrayData, ArrayDataBuilder, ArrayRef, AsArray, RecordBatch, RecordBatchOptions,
+    make_array,
+};
+use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
+use arrow::datatypes::{DataType, SchemaRef};
 use data_components::http::provider::{HttpExec, HttpFetchCompletion};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, Result, ScalarValue, TableReference};
@@ -54,6 +59,170 @@ use super::{
 
 /// Maximum time a cache fill waits for its writer's queue admission.
 const ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// A frozen buffer charge shared only by consumers admitted to the same pool.
+/// Other pools reserve the full retained capacity and keep the original charge
+/// alive. Weak peers let concurrent consumers reuse an admission without keeping
+/// an idle caller's pool charged for the lifetime of the original response.
+#[derive(Debug)]
+pub(super) struct RetainedBufferCharge {
+    pool: Arc<dyn MemoryPool>,
+    reservation: MemoryReservation,
+    original: Option<Arc<Self>>,
+    peers: Arc<parking_lot::Mutex<PeerRegistry>>,
+}
+
+#[derive(Debug)]
+struct PeerCharge {
+    pool: Weak<dyn MemoryPool>,
+    charge: Weak<RetainedBufferCharge>,
+}
+
+const PEER_NODE_BYTES: usize =
+    std::mem::size_of::<RetainedBufferCharge>() + 2 * std::mem::size_of::<usize>();
+
+#[derive(Debug)]
+struct PeerRegistry {
+    entries: Vec<PeerCharge>,
+    metadata: MemoryReservation,
+}
+
+impl PeerRegistry {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn new(pool: &Arc<dyn MemoryPool>) -> Result<Self> {
+        let metadata = MemoryConsumer::new("cache response sharing metadata").register(pool);
+        metadata.try_grow(
+            std::mem::size_of::<parking_lot::Mutex<Self>>() + 2 * std::mem::size_of::<usize>(),
+        )?;
+        Ok(Self {
+            entries: Vec::new(),
+            metadata,
+        })
+    }
+
+    fn reserve_entry(&mut self) -> Result<()> {
+        if self.entries.len() < self.entries.capacity() {
+            return self.metadata.try_grow(PEER_NODE_BYTES);
+        }
+        let capacity = checked_copy_sum(self.entries.len(), 1)?;
+        let bytes = checked_copy_product(capacity, std::mem::size_of::<PeerCharge>())?;
+        let peak = checked_copy_sum(bytes, PEER_NODE_BYTES)?;
+        self.metadata.try_grow(peak)?;
+        // Allocate separately so refusal cannot leave a larger uncharged vector
+        // attached to the live registry. Both vectors are charged during growth.
+        let mut entries = Vec::new();
+        if let Err(error) = entries.try_reserve_exact(capacity) {
+            self.metadata.shrink(peak);
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "Cache sharing metadata allocation failed: {error}"
+            )));
+        }
+        if entries.capacity() != capacity {
+            drop(entries);
+            self.metadata.shrink(peak);
+            return Err(DataFusionError::ResourcesExhausted(
+                "Cache sharing metadata exceeds its admitted capacity".into(),
+            ));
+        }
+        let old_bytes = self.entries.capacity() * std::mem::size_of::<PeerCharge>();
+        entries.append(&mut self.entries);
+        drop(std::mem::replace(&mut self.entries, entries));
+        self.metadata.shrink(old_bytes);
+        Ok(())
+    }
+}
+
+impl Drop for RetainedBufferCharge {
+    fn drop(&mut self) {
+        let this = std::ptr::from_ref(self);
+        let mut peers = self.peers.lock();
+        let before = peers.entries.len();
+        peers
+            .entries
+            .retain(|peer| !std::ptr::eq(peer.charge.as_ptr(), this));
+        if peers.entries.len() < before {
+            peers.metadata.shrink(PEER_NODE_BYTES);
+        }
+    }
+}
+
+impl RetainedBufferCharge {
+    pub(super) fn new(
+        pool: &Arc<dyn MemoryPool>,
+        reservation: MemoryReservation,
+    ) -> Result<Arc<Self>> {
+        let mut peers = PeerRegistry::new(pool)?;
+        peers.reserve_entry()?;
+        Ok(Arc::new_cyclic(|this| {
+            peers.entries.push(PeerCharge {
+                pool: Arc::downgrade(pool),
+                charge: this.clone(),
+            });
+            Self {
+                pool: Arc::clone(pool),
+                reservation,
+                original: None,
+                peers: Arc::new(parking_lot::Mutex::new(peers)),
+            }
+        }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn metadata_bytes(&self) -> usize {
+        self.peers.lock().metadata.size()
+    }
+
+    pub(super) fn for_batches(
+        pool: &Arc<dyn MemoryPool>,
+        batches: &[arrow::array::RecordBatch],
+    ) -> Result<Arc<Self>> {
+        let reservation = MemoryConsumer::new("cache retained response").register(pool);
+        for batch in batches {
+            reserve_batch(&reservation, batch)?;
+        }
+        Self::new(pool, reservation)
+    }
+
+    pub(super) fn retain_for_pool(
+        self: &Arc<Self>,
+        pool: &Arc<dyn MemoryPool>,
+    ) -> Result<Arc<Self>> {
+        if Arc::ptr_eq(&self.pool, pool) {
+            return Ok(Arc::clone(self));
+        }
+        // Pool identity is deliberately conservative: opaque wrappers over one
+        // underlying pool still require independent admission.
+        let mut peers = self.peers.lock();
+        let identity = Arc::downgrade(pool);
+        // Do not upgrade unrelated peers under the lock: dropping their last
+        // strong reference would re-enter this registry from their destructor.
+        for peer in &peers.entries {
+            if Weak::ptr_eq(&peer.pool, &identity)
+                && let Some(charge) = peer.charge.upgrade()
+            {
+                return Ok(charge);
+            }
+        }
+        let reservation = MemoryConsumer::new("cache shared response").register(pool);
+        reservation.try_grow(self.reservation.size())?;
+        peers.reserve_entry()?;
+        let charge = Arc::new(Self {
+            pool: Arc::clone(pool),
+            reservation,
+            original: Some(Arc::clone(self.original.as_ref().unwrap_or(self))),
+            peers: Arc::clone(&self.peers),
+        });
+        peers.entries.push(PeerCharge {
+            pool: identity,
+            charge: Arc::downgrade(&charge),
+        });
+        Ok(charge)
+    }
+}
 
 /// Cache write admission, bound once to the composed table generation.
 #[derive(Clone)]
@@ -312,35 +481,48 @@ impl CacheWriteSender {
         plan: Arc<dyn ExecutionPlan>,
     ) -> Result<(
         Vec<arrow::array::RecordBatch>,
-        Option<Arc<MemoryReservation>>,
+        Option<Arc<RetainedBufferCharge>>,
     )> {
         let context = self.session_context();
         let task_context = self.task_context(&context.state());
-        let charge = self.reserve_input(&[])?;
+        let charge = self
+            .memory_pool()
+            .map(|pool| MemoryConsumer::new("cache retained response").register(pool));
         let mut stream = datafusion::physical_plan::execute_stream(plan, task_context)?;
         let mut batches = Vec::new();
         while let Some(batch) = stream.try_next().await? {
-            if let Some(charge) = &charge {
-                reserve_batch(charge, &batch)?;
-            }
+            let batch = match &charge {
+                Some(charge) => own_snapshot_batch(batch, charge)?,
+                None => batch,
+            };
             batches.push(batch);
         }
+        let charge = charge
+            .zip(self.memory_pool())
+            .map(|(reservation, pool)| RetainedBufferCharge::new(pool, reservation))
+            .transpose()?;
         Ok((batches, charge))
     }
 
     pub(super) fn reserve_input(
         &self,
         batches: &[arrow::array::RecordBatch],
-    ) -> Result<Option<Arc<MemoryReservation>>> {
-        let Self::Sink(writer) = self else {
-            return Ok(None);
-        };
-        let reservation =
-            MemoryConsumer::new("cache retained response").register(&writer.memory_pool);
-        for batch in batches {
-            reserve_batch(&reservation, batch)?;
+    ) -> Result<Option<Arc<RetainedBufferCharge>>> {
+        self.memory_pool()
+            .map(|pool| RetainedBufferCharge::for_batches(pool, batches))
+            .transpose()
+    }
+
+    pub(super) fn retain_input(
+        &self,
+        batches: &[arrow::array::RecordBatch],
+        charge: Option<&Arc<RetainedBufferCharge>>,
+    ) -> Result<Option<Arc<RetainedBufferCharge>>> {
+        match (self.memory_pool(), charge) {
+            (Some(pool), Some(charge)) => charge.retain_for_pool(pool).map(Some),
+            (None, Some(charge)) => Ok(Some(Arc::clone(charge))),
+            (_, None) => self.reserve_input(batches),
         }
-        Ok(Some(Arc::new(reservation)))
     }
 
     pub(super) fn reserve_work_metadata(
@@ -540,7 +722,7 @@ impl CacheSinkWriter {
         claim: Option<CacheKeyClaim>,
         completed: Option<oneshot::Sender<Result<()>>>,
     ) -> Result<()> {
-        let claim = claim.ok_or_else(|| {
+        let mut claim = claim.ok_or_else(|| {
             DataFusionError::Internal(
                 "Native cache writes require exclusive scope ownership".into(),
             )
@@ -553,6 +735,11 @@ impl CacheSinkWriter {
             }
             return Ok(());
         }
+        claim.input_charge = claim
+            .input_charge
+            .take()
+            .map(|charge| charge.retain_for_pool(&self.memory_pool))
+            .transpose()?;
         let reservation =
             MemoryConsumer::new("cache write preparation").register(&self.memory_pool);
         let input_is_charged = claim.input_charge.is_some();
@@ -727,6 +914,365 @@ fn tracked_http_plan(
     Ok(None)
 }
 
+/// Own snapshot buffers before retaining them past the storage scan. Foreign
+/// buffer lengths size the destination copy, never the producer's allocation.
+/// Decoder memory remains outside this retention budget.
+fn own_snapshot_batch(batch: RecordBatch, reservation: &MemoryReservation) -> Result<RecordBatch> {
+    // Foreign-buffer inspection also constructs ArrayData. Admit descriptors
+    // before invoking it, using only borrowed standard-array child accessors.
+    let descriptors = reservation.new_empty();
+    let mut descriptor_budget = SnapshotDescriptorBudget::default();
+    for column in batch.columns() {
+        descriptor_budget.include(snapshot_descriptor_budget(column.as_ref(), 0)?)?;
+    }
+    descriptors.try_grow(descriptor_budget.bytes)?;
+    if !arrow_tools::record_batch::rests_on_unowned_memory(&batch) {
+        reservation.try_grow(checked_copy_sum(
+            batch.get_array_memory_size(),
+            descriptor_budget.datatype_bytes,
+        )?)?;
+        return Ok(batch);
+    }
+
+    let data: Vec<_> = batch
+        .columns()
+        .iter()
+        .map(|column| column.to_data())
+        .collect();
+    let mut budget = SnapshotCopyBudget::default();
+    let mut array_metadata = 0usize;
+    for (column, data) in batch.columns().iter().zip(&data) {
+        budget.visit(data, 0)?;
+        array_metadata = checked_copy_sum(
+            array_metadata,
+            column
+                .get_array_memory_size()
+                .saturating_sub(column.get_buffer_memory_size()),
+        )?;
+    }
+    // Source and destination array objects coexist with input descriptors,
+    // rebuilt descriptors and validation/build temporaries during preparation.
+    let preparation = checked_copy_sum(
+        checked_copy_product(budget.metadata, 3)?,
+        checked_copy_product(array_metadata, 2)?,
+    )?;
+    let peak = checked_copy_sum(
+        checked_copy_sum(budget.copy, budget.owned_input)?,
+        preparation,
+    )?;
+    reservation.try_grow(peak)?;
+    let copied = (|| -> Result<(RecordBatch, usize)> {
+        let columns = data
+            .into_iter()
+            .map(copy_snapshot_data)
+            .map(|data| data.map(make_array))
+            .collect::<Result<Vec<_>>>()?;
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        let copied = RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
+        drop(batch);
+        if arrow_tools::record_batch::rests_on_unowned_memory(&copied) {
+            return Err(DataFusionError::ResourcesExhausted(
+                "Cache snapshot copy still retains externally owned buffers".into(),
+            ));
+        }
+        let retained = checked_copy_sum(
+            copied.get_array_memory_size(),
+            descriptor_budget.datatype_bytes,
+        )?;
+        if retained > peak {
+            return Err(DataFusionError::ResourcesExhausted(
+                "Cache snapshot copy exceeds its admitted allocation budget".into(),
+            ));
+        }
+        Ok((copied, retained))
+    })();
+    match copied {
+        Ok((batch, retained)) => {
+            // Only the owned result survives; release dropped input and copy
+            // temporaries, not capacity still retained by the result's buffers.
+            reservation.shrink(peak - retained);
+            Ok(batch)
+        }
+        Err(error) => {
+            reservation.shrink(peak);
+            Err(error)
+        }
+    }
+}
+
+#[derive(Default)]
+struct SnapshotDescriptorBudget {
+    bytes: usize,
+    datatype_bytes: usize,
+}
+
+impl SnapshotDescriptorBudget {
+    fn include(&mut self, other: Self) -> Result<()> {
+        self.bytes = checked_copy_sum(self.bytes, other.bytes)?;
+        self.datatype_bytes = checked_copy_sum(self.datatype_bytes, other.datatype_bytes)?;
+        Ok(())
+    }
+}
+
+// Dictionary datatype clones allocate their boxed key/value types recursively.
+// Field and timezone containers are shared Arcs and do not allocate on clone.
+fn datatype_clone_bytes(data_type: &DataType, depth: usize) -> Result<usize> {
+    if depth >= 64 {
+        return Err(snapshot_layout_error(data_type));
+    }
+    let DataType::Dictionary(key, value) = data_type else {
+        return Ok(0);
+    };
+    checked_copy_sum(
+        2 * std::mem::size_of::<DataType>(),
+        checked_copy_sum(
+            datatype_clone_bytes(key, depth + 1)?,
+            datatype_clone_bytes(value, depth + 1)?,
+        )?,
+    )
+}
+
+/// Bounds descriptor construction without allocating ArrayData or cloning a
+/// container. Two descriptor sets cover conversion temporaries plus the stored
+/// set. Variable byte-view buffer counts come from the array, not its row count.
+fn snapshot_descriptor_budget(array: &dyn Array, depth: usize) -> Result<SnapshotDescriptorBudget> {
+    if depth >= 64 {
+        return Err(snapshot_layout_error(array.data_type()));
+    }
+    let mut children = SnapshotDescriptorBudget::default();
+    let buffers = match array.data_type() {
+        DataType::Utf8View => checked_copy_sum(
+            array
+                .as_string_view_opt()
+                .ok_or_else(|| snapshot_layout_error(array.data_type()))?
+                .data_buffers()
+                .len(),
+            1,
+        )?,
+        DataType::BinaryView => checked_copy_sum(
+            array
+                .as_binary_view_opt()
+                .ok_or_else(|| snapshot_layout_error(array.data_type()))?
+                .data_buffers()
+                .len(),
+            1,
+        )?,
+        DataType::List(_) => {
+            children = snapshot_descriptor_budget(
+                array
+                    .as_list_opt::<i32>()
+                    .ok_or_else(|| snapshot_layout_error(array.data_type()))?
+                    .values()
+                    .as_ref(),
+                depth + 1,
+            )?;
+            1
+        }
+        DataType::LargeList(_) => {
+            children = snapshot_descriptor_budget(
+                array
+                    .as_list_opt::<i64>()
+                    .ok_or_else(|| snapshot_layout_error(array.data_type()))?
+                    .values()
+                    .as_ref(),
+                depth + 1,
+            )?;
+            1
+        }
+        DataType::FixedSizeList(_, _) => {
+            children = snapshot_descriptor_budget(
+                array
+                    .as_fixed_size_list_opt()
+                    .ok_or_else(|| snapshot_layout_error(array.data_type()))?
+                    .values()
+                    .as_ref(),
+                depth + 1,
+            )?;
+            0
+        }
+        DataType::Map(_, _) => {
+            children = snapshot_descriptor_budget(
+                array
+                    .as_map_opt()
+                    .ok_or_else(|| snapshot_layout_error(array.data_type()))?
+                    .entries(),
+                depth + 1,
+            )?;
+            1
+        }
+        DataType::Struct(_) => {
+            for column in array
+                .as_struct_opt()
+                .ok_or_else(|| snapshot_layout_error(array.data_type()))?
+                .columns()
+            {
+                children.include(snapshot_descriptor_budget(column.as_ref(), depth + 1)?)?;
+            }
+            0
+        }
+        DataType::Dictionary(_, _) => {
+            children = snapshot_descriptor_budget(
+                array
+                    .as_any_dictionary_opt()
+                    .ok_or_else(|| snapshot_layout_error(array.data_type()))?
+                    .values()
+                    .as_ref(),
+                depth + 1,
+            )?;
+            1
+        }
+        DataType::Null if array.as_any().is::<arrow::array::NullArray>() => 0,
+        DataType::Boolean if array.as_boolean_opt().is_some() => 1,
+        DataType::Utf8 if array.as_string_opt::<i32>().is_some() => 2,
+        DataType::LargeUtf8 if array.as_string_opt::<i64>().is_some() => 2,
+        DataType::Binary if array.as_binary_opt::<i32>().is_some() => 2,
+        DataType::LargeBinary if array.as_binary_opt::<i64>().is_some() => 2,
+        DataType::FixedSizeBinary(_) if array.as_fixed_size_binary_opt().is_some() => 1,
+        _ if standard_primitive_array(array) => 1,
+        data_type => return Err(snapshot_layout_error(data_type)),
+    };
+    let local = checked_copy_sum(
+        std::mem::size_of::<ArrayData>()
+            + std::mem::size_of::<ArrayDataBuilder>()
+            + std::mem::size_of::<DataType>()
+            + std::mem::size_of::<ArrayRef>(),
+        checked_copy_product(buffers, std::mem::size_of::<Buffer>())?,
+    )?;
+    let datatype_bytes = datatype_clone_bytes(array.data_type(), depth)?;
+    Ok(SnapshotDescriptorBudget {
+        bytes: checked_copy_sum(
+            checked_copy_product(checked_copy_sum(local, datatype_bytes)?, 2)?,
+            children.bytes,
+        )?,
+        datatype_bytes: checked_copy_sum(datatype_bytes, children.datatype_bytes)?,
+    })
+}
+
+fn standard_primitive_array(array: &dyn Array) -> bool {
+    macro_rules! supported {
+        ($t:ty, $array:ident) => {
+            $array.as_primitive_opt::<$t>().is_some()
+        };
+    }
+    arrow::array::downcast_primitive!(array.data_type() => (supported, array), _ => false)
+}
+
+fn snapshot_layout_error(data_type: &DataType) -> DataFusionError {
+    DataFusionError::NotImplemented(format!(
+        "Cache snapshot cannot pre-admit this array layout: {data_type}"
+    ))
+}
+
+#[derive(Default)]
+struct SnapshotCopyBudget {
+    copy: usize,
+    owned_input: usize,
+    metadata: usize,
+}
+
+impl SnapshotCopyBudget {
+    fn visit(&mut self, data: &ArrayData, depth: usize) -> Result<()> {
+        if depth >= 64
+            || !(data.data_type().is_primitive()
+                || matches!(
+                    data.data_type(),
+                    DataType::Null
+                        | DataType::Boolean
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Binary
+                        | DataType::LargeBinary
+                        | DataType::FixedSizeBinary(_)
+                        | DataType::Utf8View
+                        | DataType::BinaryView
+                        | DataType::List(_)
+                        | DataType::LargeList(_)
+                        | DataType::FixedSizeList(_, _)
+                        | DataType::Struct(_)
+                        | DataType::Map(_, _)
+                        | DataType::Dictionary(_, _)
+                ))
+        {
+            return Err(DataFusionError::NotImplemented(format!(
+                "Cache snapshot cannot own this array layout: {} at depth {depth}",
+                data.data_type()
+            )));
+        }
+        let descriptors = checked_copy_sum(
+            checked_copy_product(data.buffers().len(), std::mem::size_of::<Buffer>())?,
+            checked_copy_product(data.child_data().len(), std::mem::size_of::<ArrayData>())?,
+        )?;
+        self.metadata = checked_copy_sum(
+            self.metadata,
+            checked_copy_sum(
+                checked_copy_sum(descriptors, datatype_clone_bytes(data.data_type(), depth)?)?,
+                std::mem::size_of::<ArrayData>()
+                    + std::mem::size_of::<ArrayDataBuilder>()
+                    + std::mem::size_of::<ArrayRef>(),
+            )?,
+        )?;
+        for buffer in data
+            .buffers()
+            .iter()
+            .chain(data.nulls().map(NullBuffer::buffer))
+        {
+            // Arrow's pre-sized MutableBuffer rounds once to 64-byte capacity.
+            // It does not grow while copying exactly this many bytes.
+            let aligned = buffer
+                .len()
+                .checked_next_multiple_of(64)
+                .filter(|bytes| isize::try_from(*bytes).is_ok())
+                .ok_or_else(copy_budget_overflow)?;
+            self.copy = checked_copy_sum(self.copy, aligned)?;
+            if !buffer.has_custom_allocation() {
+                self.owned_input = checked_copy_sum(self.owned_input, buffer.capacity())?;
+            }
+        }
+        for child in data.child_data() {
+            self.visit(child, depth + 1)?;
+        }
+        Ok(())
+    }
+}
+
+fn copy_snapshot_data(data: ArrayData) -> Result<ArrayData> {
+    let (data_type, len, nulls, offset, buffers, children) = data.into_parts();
+    let buffers = buffers
+        .into_iter()
+        .map(|buffer| Buffer::from_slice_ref(buffer.as_slice()))
+        .collect();
+    let nulls = nulls.map(|nulls| {
+        NullBuffer::new(BooleanBuffer::new(
+            Buffer::from_slice_ref(nulls.buffer().as_slice()),
+            nulls.offset(),
+            nulls.len(),
+        ))
+    });
+    let children = children
+        .into_iter()
+        .map(copy_snapshot_data)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ArrayData::builder(data_type)
+        .len(len)
+        .offset(offset)
+        .buffers(buffers)
+        .nulls(nulls)
+        .child_data(children)
+        .build()?)
+}
+
+fn checked_copy_sum(left: usize, right: usize) -> Result<usize> {
+    left.checked_add(right).ok_or_else(copy_budget_overflow)
+}
+
+fn checked_copy_product(left: usize, right: usize) -> Result<usize> {
+    left.checked_mul(right).ok_or_else(copy_budget_overflow)
+}
+
+fn copy_budget_overflow() -> DataFusionError {
+    DataFusionError::ResourcesExhausted("Cache snapshot copy allocation size overflow".into())
+}
+
 pub(super) fn reserve_batch(
     reservation: &MemoryReservation,
     batch: &arrow::array::RecordBatch,
@@ -766,6 +1312,506 @@ mod tests {
             _claim: claim,
             _reservation: MemoryConsumer::new("cache publication test").register(&pool),
         }
+    }
+
+    fn foreign_buffer(buffer: Buffer, owners: &mut Vec<Weak<Buffer>>) -> Buffer {
+        let owner = Arc::new(buffer);
+        owners.push(Arc::downgrade(&owner));
+        let ptr = std::ptr::NonNull::new(owner.as_ptr().cast_mut()).expect("buffer pointer");
+        // The owner retains this exact buffer and therefore its aligned bytes
+        // until the custom allocation's final reference is dropped.
+        unsafe { Buffer::from_custom_allocation(ptr, owner.len(), owner) }
+    }
+
+    fn foreign_data(data: ArrayData, owners: &mut Vec<Weak<Buffer>>) -> ArrayData {
+        let (data_type, len, nulls, offset, buffers, children) = data.into_parts();
+        let buffers = buffers
+            .into_iter()
+            .map(|buffer| foreign_buffer(buffer, owners))
+            .collect();
+        let nulls = nulls.map(|nulls| {
+            NullBuffer::new(BooleanBuffer::new(
+                foreign_buffer(nulls.buffer().clone(), owners),
+                nulls.offset(),
+                nulls.len(),
+            ))
+        });
+        let children = children
+            .into_iter()
+            .map(|child| foreign_data(child, owners))
+            .collect();
+        ArrayData::builder(data_type)
+            .len(len)
+            .offset(offset)
+            .buffers(buffers)
+            .nulls(nulls)
+            .child_data(children)
+            .build()
+            .expect("foreign array")
+    }
+
+    fn foreign_batch(batch: &RecordBatch) -> (RecordBatch, Vec<Weak<Buffer>>) {
+        let mut owners = Vec::new();
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| make_array(foreign_data(column.to_data(), &mut owners)))
+            .collect();
+        (
+            RecordBatch::try_new(batch.schema(), columns).expect("foreign batch"),
+            owners,
+        )
+    }
+
+    #[test]
+    fn snapshot_copy_preserves_sliced_nested_nullable_and_dictionary_data() {
+        use arrow::array::{
+            DictionaryArray, Int8Array, ListArray, MapBuilder, StringArray, StringBuilder,
+            StringViewArray, StructArray,
+        };
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{Field, Int8Type, Schema};
+        use std::collections::HashMap;
+
+        let text: ArrayRef = Arc::new(StringArray::from(vec![Some("雪\0"), None, Some("雪\0")]));
+        let view: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("long duplicated view content"),
+            None,
+            Some("long duplicated view content"),
+        ]));
+        let nested: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("value", DataType::Utf8View, true)),
+            view,
+        )]));
+        let list: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            OffsetBuffer::from_lengths([1, 0, 2]),
+            Arc::clone(&text),
+            None,
+        ));
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(vec![Some(1), None, Some(1)]),
+                Arc::new(StringArray::from(vec!["unused", "duplicate"])),
+            )
+            .expect("dictionary"),
+        );
+        let mut map = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for valid in [true, false, true] {
+            if valid {
+                map.keys().append_value("header");
+                map.values().append_value("value");
+            }
+            map.append(valid).expect("map row");
+        }
+        let batch = RecordBatch::try_from_iter(vec![
+            ("text", text),
+            ("nested", nested),
+            ("list", list),
+            ("dictionary", dictionary),
+            ("headers", Arc::new(map.finish()) as ArrayRef),
+        ])
+        .expect("nested snapshot");
+        let schema = Arc::new(Schema::new_with_metadata(
+            batch.schema().fields().clone(),
+            HashMap::from([("snapshot".to_string(), "preserved".to_string())]),
+        ));
+        let batch = RecordBatch::try_new(schema, batch.columns().to_vec()).expect("metadata");
+        for expected in [batch.clone(), batch.slice(1, 2)] {
+            let (foreign, owners) = foreign_batch(&expected);
+            assert!(arrow_tools::record_batch::rests_on_unowned_memory(&foreign));
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let reservation = MemoryConsumer::new("snapshot test").register(&pool);
+            let copied = own_snapshot_batch(foreign, &reservation).expect("owned snapshot");
+            assert_eq!(copied, expected);
+            assert_eq!(copied.schema(), expected.schema());
+            assert!(!arrow_tools::record_batch::rests_on_unowned_memory(&copied));
+            assert!(owners.iter().all(|owner| owner.upgrade().is_none()));
+            assert_eq!(
+                reservation.size(),
+                copied.get_array_memory_size() + 2 * std::mem::size_of::<DataType>()
+            );
+            drop(copied);
+            drop(reservation);
+            assert_eq!(pool.reserved(), 0);
+        }
+    }
+
+    #[test]
+    fn nested_dictionary_descriptor_and_retained_types_are_charged() {
+        use arrow::array::{DictionaryArray, Int8Array, StringViewArray};
+        use arrow::datatypes::Int8Type;
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let depth = 16;
+        let mut array: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("long duplicate view content"),
+            None,
+            Some("long duplicate view content"),
+        ]));
+        for _ in 0..depth {
+            array = Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    Int8Array::from(vec![Some(0), None, Some(2)]),
+                    array,
+                )
+                .expect("nested dictionary"),
+            );
+        }
+        let budget =
+            snapshot_descriptor_budget(array.as_ref(), 0).expect("borrowed descriptor bound");
+        let datatype_bytes = depth * (depth + 1) * std::mem::size_of::<DataType>();
+        assert_eq!(budget.datatype_bytes, datatype_bytes);
+        assert!(budget.bytes > 2 * datatype_bytes);
+        let expected =
+            RecordBatch::try_from_iter(vec![("dictionary", array)]).expect("dictionary batch");
+        for limit in [0, budget.bytes - 1] {
+            let (foreign, owners) = foreign_batch(&expected);
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let reservation = MemoryConsumer::new("dictionary descriptor refusal").register(&pool);
+            assert!(matches!(
+                own_snapshot_batch(foreign, &reservation),
+                Err(DataFusionError::ResourcesExhausted(_))
+            ));
+            assert!(owners.iter().all(|owner| owner.upgrade().is_none()));
+            assert_eq!(pool.reserved(), 0);
+        }
+        for foreign in [false, true] {
+            let (input, owners) = if foreign {
+                foreign_batch(&expected)
+            } else {
+                (expected.clone(), vec![])
+            };
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let reservation = MemoryConsumer::new("dictionary snapshot").register(&pool);
+            let copied = own_snapshot_batch(input, &reservation).expect("owned nested dictionary");
+            assert_eq!(copied, expected);
+            assert!(!arrow_tools::record_batch::rests_on_unowned_memory(&copied));
+            assert!(owners.iter().all(|owner| owner.upgrade().is_none()));
+            assert_eq!(
+                reservation.size(),
+                copied.get_array_memory_size() + datatype_bytes
+            );
+            println!(
+                "nested dictionary: depth={depth} foreign={foreign} descriptor_bound={} datatype_bytes={datatype_bytes} retained={}",
+                budget.bytes,
+                reservation.size()
+            );
+            drop(copied);
+            drop(reservation);
+            assert_eq!(pool.reserved(), 0);
+        }
+    }
+
+    #[derive(Debug)]
+    struct DescriptorWitnessArray {
+        values: arrow::array::Int32Array,
+        constructions: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    // Every operation delegates to the valid primitive array. Its distinct
+    // concrete type lets the snapshot boundary refuse custom representations.
+    unsafe impl Array for DescriptorWitnessArray {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn to_data(&self) -> ArrayData {
+            self.constructions.fetch_add(1, Ordering::Relaxed);
+            self.values.to_data()
+        }
+        fn into_data(self) -> ArrayData {
+            self.to_data()
+        }
+        fn data_type(&self) -> &DataType {
+            self.values.data_type()
+        }
+        fn slice(&self, offset: usize, length: usize) -> ArrayRef {
+            Arc::new(Self {
+                values: self.values.slice(offset, length),
+                constructions: Arc::clone(&self.constructions),
+            })
+        }
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+        fn is_empty(&self) -> bool {
+            self.values.is_empty()
+        }
+        fn offset(&self) -> usize {
+            self.values.offset()
+        }
+        fn nulls(&self) -> Option<&NullBuffer> {
+            self.values.nulls()
+        }
+        fn get_buffer_memory_size(&self) -> usize {
+            self.values.get_buffer_memory_size()
+        }
+        fn get_array_memory_size(&self) -> usize {
+            self.values.get_array_memory_size()
+        }
+    }
+
+    #[test]
+    fn custom_primitive_is_refused_without_constructing_descriptors() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        for limit in [0, 1 << 20] {
+            let constructions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let array: ArrayRef = Arc::new(DescriptorWitnessArray {
+                values: arrow::array::Int32Array::from(vec![1, 2, 3]),
+                constructions: Arc::clone(&constructions),
+            });
+            let batch =
+                RecordBatch::try_from_iter(vec![("custom", array)]).expect("custom array batch");
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let reservation = MemoryConsumer::new("custom array test").register(&pool);
+            assert!(matches!(
+                own_snapshot_batch(batch, &reservation),
+                Err(DataFusionError::NotImplemented(_))
+            ));
+            assert_eq!(constructions.load(Ordering::Relaxed), 0);
+            assert_eq!(pool.reserved(), 0);
+            println!(
+                "custom representation: pool_limit={limit} descriptor_constructions=0 retained=0"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_descriptor_admission_counts_unused_view_buffers() {
+        use arrow::array::StringViewArray;
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let seed = StringViewArray::from(vec!["a view value longer than twelve bytes"]);
+        let narrow = snapshot_descriptor_budget(&seed, 0)
+            .expect("narrow descriptor bound")
+            .bytes;
+        let wide = StringViewArray::new(
+            seed.views().clone(),
+            vec![seed.data_buffers()[0].clone(); 128],
+            None,
+        );
+        let bound = snapshot_descriptor_budget(&wide, 0)
+            .expect("wide descriptor bound")
+            .bytes;
+        assert_eq!(bound - narrow, 127 * std::mem::size_of::<Buffer>() * 2);
+        let batch = RecordBatch::try_from_iter(vec![("v", Arc::new(wide) as ArrayRef)])
+            .expect("many view buffers");
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bound - 1));
+        let reservation = MemoryConsumer::new("descriptor admission").register(&pool);
+        assert!(own_snapshot_batch(batch, &reservation).is_err());
+        assert_eq!(pool.reserved(), 0);
+        println!(
+            "descriptor admission: buffers=129 bound={bound} limit={} retained=0",
+            bound - 1
+        );
+    }
+
+    #[test]
+    fn snapshot_copy_refuses_pool_before_retaining_foreign_buffers() {
+        use arrow::array::StringArray;
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let expected = RecordBatch::try_from_iter(vec![(
+            "v",
+            Arc::new(StringArray::from(vec!["content"])) as ArrayRef,
+        )])
+        .expect("snapshot");
+        let (foreign, owners) = foreign_batch(&expected);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
+        let reservation = MemoryConsumer::new("snapshot test").register(&pool);
+        assert!(own_snapshot_batch(foreign, &reservation).is_err());
+        assert!(owners.iter().all(|owner| owner.upgrade().is_none()));
+        assert_eq!(pool.reserved(), 0);
+        assert!(checked_copy_sum(usize::MAX, 1).is_err());
+        assert!(checked_copy_product(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn sharing_metadata_is_bounded_by_the_original_pool() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let bytes = 4096;
+        let metadata = std::mem::size_of::<parking_lot::Mutex<PeerRegistry>>()
+            + 2 * std::mem::size_of::<usize>()
+            + PEER_NODE_BYTES
+            + std::mem::size_of::<PeerCharge>();
+        let exact: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+        let reservation = MemoryConsumer::new("no metadata room").register(&exact);
+        reservation.try_grow(bytes).expect("buffers fit");
+        assert!(RetainedBufferCharge::new(&exact, reservation).is_err());
+        assert_eq!(exact.reserved(), 0);
+
+        let original_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes + metadata));
+        let second_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+        let reservation = MemoryConsumer::new("one peer only").register(&original_pool);
+        reservation.try_grow(bytes).expect("buffer admission");
+        let original =
+            RetainedBufferCharge::new(&original_pool, reservation).expect("root metadata fits");
+        assert!(original.retain_for_pool(&second_pool).is_err());
+        assert_eq!(
+            second_pool.reserved(),
+            0,
+            "rollback declined secondary admission"
+        );
+        assert_eq!(original.peers.lock().len(), 1);
+        assert_eq!(original.metadata_bytes(), metadata);
+        assert_eq!(original_pool.reserved(), bytes + metadata);
+        drop(original);
+        assert_eq!(original_pool.reserved(), 0);
+        println!(
+            "sharing metadata: buffer_bytes={bytes} root_metadata={metadata} declined_secondary_retained=0 final_original=0"
+        );
+    }
+
+    #[test]
+    fn concurrent_secondary_admissions_share_and_remove_dead_peers() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let bytes = 4096;
+        let original_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes + 16384));
+        let second_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+        let reservation = MemoryConsumer::new("concurrent source").register(&original_pool);
+        reservation.try_grow(bytes).expect("source capacity");
+        let original = RetainedBufferCharge::new(&original_pool, reservation).expect("root charge");
+        let barrier = std::sync::Barrier::new(8);
+        let secondary = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = &barrier;
+                    let original = &original;
+                    let second_pool = &second_pool;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let admitted = original.retain_for_pool(second_pool);
+                        barrier.wait();
+                        admitted
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .expect("admission thread")
+                        .expect("one shared secondary charge")
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            secondary
+                .iter()
+                .all(|charge| Arc::ptr_eq(charge, &secondary[0]))
+        );
+        assert_eq!(second_pool.reserved(), bytes);
+        assert_eq!(original.peers.lock().len(), 2);
+        println!(
+            "concurrent retention: consumers=8 bytes={bytes} original={} secondary={} peer_entries=2",
+            original_pool.reserved(),
+            second_pool.reserved()
+        );
+        let weak = Arc::downgrade(&second_pool);
+        drop(second_pool);
+        drop(secondary);
+        assert!(
+            weak.upgrade().is_none(),
+            "no dead peer keeps its pool alive"
+        );
+        assert_eq!(
+            original.peers.lock().len(),
+            1,
+            "remove without another admission"
+        );
+        assert_eq!(original_pool.reserved(), bytes + original.metadata_bytes());
+        drop(original);
+        assert_eq!(original_pool.reserved(), 0);
+        println!(
+            "concurrent retention released: peer_entries=1 before root drop, secondary_pool_dropped=true original=0"
+        );
+    }
+
+    #[test]
+    fn concurrent_release_with_unrelated_peer_admission() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let bytes = 4096;
+        let original_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes + 16384));
+        let second_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+        let third_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+        let reservation = MemoryConsumer::new("concurrent release").register(&original_pool);
+        reservation.try_grow(bytes).expect("source capacity");
+        let original = RetainedBufferCharge::new(&original_pool, reservation).expect("root charge");
+        let secondary = original.retain_for_pool(&second_pool).expect("secondary");
+        let third = original.retain_for_pool(&third_pool).expect("third");
+        let releases: Vec<_> = (0..8).map(|_| Arc::clone(&secondary)).collect();
+        drop(secondary);
+        let barrier = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            for charge in releases {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    drop(charge);
+                });
+            }
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..100 {
+                    drop(
+                        original
+                            .retain_for_pool(&third_pool)
+                            .expect("reuse live third admission"),
+                    );
+                }
+            });
+        });
+        assert_eq!(second_pool.reserved(), 0);
+        assert_eq!(third_pool.reserved(), bytes);
+        assert_eq!(original.peers.lock().len(), 2);
+        drop(third);
+        assert_eq!(third_pool.reserved(), 0);
+        assert_eq!(original.peers.lock().len(), 1);
+        drop(original);
+        assert_eq!(original_pool.reserved(), 0);
+        println!("concurrent release: readers=8 other_admissions=100 all_reservations=0");
+    }
+
+    #[test]
+    fn shared_charge_requires_full_capacity_in_each_distinct_pool() {
+        use arrow::array::{RecordBatch, StringArray};
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let batch = RecordBatch::try_from_iter(vec![(
+            "content",
+            Arc::new(StringArray::from(vec!["x".repeat(4096), "y".repeat(4096)]))
+                as arrow::array::ArrayRef,
+        )])
+        .expect("large backing buffer")
+        .slice(0, 1);
+        let bytes = batch.get_array_memory_size();
+        assert!(bytes > 8192, "slice retains full backing allocation");
+        let original_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes + 16384));
+        let second_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+        let small_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes - 1));
+        let original = RetainedBufferCharge::for_batches(&original_pool, &[batch])
+            .expect("original admission");
+        let same = original.retain_for_pool(&original_pool).expect("same pool");
+        assert!(Arc::ptr_eq(&same, &original));
+        assert!(original.retain_for_pool(&small_pool).is_err());
+        assert_eq!(small_pool.reserved(), 0);
+        let second = original
+            .retain_for_pool(&second_pool)
+            .expect("second admission");
+        let another = original
+            .retain_for_pool(&second_pool)
+            .expect("shared second admission");
+        assert!(Arc::ptr_eq(&second, &another));
+        assert_eq!(second_pool.reserved(), bytes);
+        drop(another);
+        drop(same);
+        drop(original);
+        assert_eq!(
+            original_pool.reserved(),
+            bytes + second.metadata_bytes(),
+            "secondary retention holds original and charged metadata"
+        );
+        drop(second);
+        assert_eq!(original_pool.reserved(), 0);
+        assert_eq!(second_pool.reserved(), 0);
     }
 
     #[test]

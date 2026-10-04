@@ -31131,17 +31131,63 @@ impl CayenneTableProvider {
     /// or tier clearing fails. The source slot is not advanced on failure.
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
-        let rows = {
+        static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(0);
+        let trace_id = tracing::enabled!(target: "changesink_diagnostic", tracing::Level::DEBUG)
+            .then(|| {
+                NEXT_TRACE_ID
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1)
+            });
+        if trace_id == Some(1025) {
+            tracing::debug!(target: "changesink_diagnostic", limit = 1024, "Cayenne checkpoint phase trace limit reached; further calls are not traced");
+        }
+        let trace_id = trace_id.filter(|id| *id <= 1024);
+        if let Some(id) = trace_id {
+            tracing::debug!(target: "changesink_diagnostic", table = self.table_name(), checkpoint_id = id, "Cayenne checkpoint phase trace started");
+        }
+        let started = Instant::now();
+        let (result, capture_lock_ms, inner_ms) = {
             let mut guards = self.acquire_capture_locks_blocking().await;
+            let capture_lock_ms = started.elapsed().as_secs_f64() * 1000.0;
             // Keep `guards` alive so `mem_checkpoint_lock` spans the whole
             // lifecycle; pass only the capture-scoped `write` guard to `inner`.
             let write = guards.write.take();
-            self.checkpoint_mem_tier_inner(write).await?
+            let inner_start = Instant::now();
+            let result = self.checkpoint_mem_tier_inner(write).await;
+            (
+                result,
+                capture_lock_ms,
+                inner_start.elapsed().as_secs_f64() * 1000.0,
+            )
         };
+        if let Some(id) = trace_id {
+            tracing::debug!(
+                target: "changesink_diagnostic",
+                table = self.table_name(),
+                checkpoint_id = id,
+                capture_lock_ms,
+                inner_ms,
+                failed = result.is_err(),
+                "Cayenne checkpoint inner completed"
+            );
+        }
+        let rows = result?;
         // Recover a stale maintained-aggregate registry, rate-limited. Deliberately
         // OUTSIDE the capture locks: the rebuild scans visible state and must not
         // hold the checkpoint fence while it does.
+        let maintenance_start = Instant::now();
         self.try_rearm_maintained_aggregates().await;
+        if let Some(id) = trace_id {
+            tracing::debug!(
+                target: "changesink_diagnostic",
+                table = self.table_name(),
+                checkpoint_id = id,
+                rows,
+                maintenance_ms = maintenance_start.elapsed().as_secs_f64() * 1000.0,
+                total_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "Cayenne checkpoint phase trace completed"
+            );
+        }
         Ok(rows)
     }
 
@@ -32510,7 +32556,35 @@ impl CayenneTableProvider {
         );
         let advancer = self.slot_advancer.lock().clone();
         if let Some(advancer) = advancer {
-            advancer.on_checkpoint_durable(durable_epoch).await;
+            self.trace_slot_advance(advancer.as_ref(), durable_epoch, "advance")
+                .await;
+        }
+    }
+
+    async fn trace_slot_advance(
+        &self,
+        advancer: &dyn crate::provider::mem_tier::SlotAdvancer,
+        durable_epoch: u64,
+        kind: &'static str,
+    ) {
+        static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(0);
+        let trace_id = tracing::enabled!(target: "changesink_diagnostic", tracing::Level::DEBUG)
+            .then(|| {
+                NEXT_TRACE_ID
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1)
+            });
+        if trace_id == Some(4097) {
+            tracing::debug!(target: "changesink_diagnostic", limit = 4096, "Cayenne slot callback trace limit reached; further calls are not traced");
+        }
+        let trace_id = trace_id.filter(|id| *id <= 4096);
+        if let Some(id) = trace_id {
+            tracing::debug!(target: "changesink_diagnostic", table = self.table_name(), callback_id = id, durable_epoch, kind, "Cayenne slot callback started");
+        }
+        let started = Instant::now();
+        advancer.on_checkpoint_durable(durable_epoch).await;
+        if let Some(id) = trace_id {
+            tracing::debug!(target: "changesink_diagnostic", table = self.table_name(), callback_id = id, elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "Cayenne slot callback completed");
         }
     }
 
@@ -32536,7 +32610,8 @@ impl CayenneTableProvider {
         };
         let advancer = self.slot_advancer.lock().clone();
         if let Some(advancer) = advancer {
-            advancer.on_checkpoint_durable(durable_epoch).await;
+            self.trace_slot_advance(advancer.as_ref(), durable_epoch, "refire")
+                .await;
         }
     }
 

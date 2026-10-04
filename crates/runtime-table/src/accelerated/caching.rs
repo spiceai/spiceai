@@ -57,6 +57,7 @@ use runtime_status::{ComponentStatus, RuntimeStatus};
 use util::expr::combine_exprs_balanced;
 
 mod writer;
+use writer::RetainedBufferCharge;
 pub use writer::{CacheSinkWriter, CacheWorkDrain, CacheWriteSender, SynchronizedCacheTarget};
 
 /// One entry per cache key with a fetch in flight, mapping the key to the
@@ -121,12 +122,12 @@ impl InFlightFetch {
 /// underlying data — so followers replay the leader's already-collected batches
 /// without re-scanning the accelerator and without a second origin call.
 #[derive(Debug, Clone)]
-pub enum FetchState {
+enum FetchState {
     /// The leader is still fetching; no result yet.
     Pending,
     /// The leader collected these batches from the origin — none at all when
     /// the origin had no rows for the key. Followers replay them.
-    Ready(Arc<Vec<RecordBatch>>, Option<Arc<MemoryReservation>>),
+    Ready(Arc<Vec<RecordBatch>>, Option<Arc<RetainedBufferCharge>>),
     /// The leader could not publish a result — it failed, was cancelled, or its
     /// response was not cacheable — so followers stop waiting and fetch the
     /// origin themselves.
@@ -179,7 +180,7 @@ pub struct CacheKeyClaim {
     /// Set once a queued write owns the claim; that write removes the map entry
     /// after it has landed, so dropping this must not.
     queued: bool,
-    input_charge: Option<Arc<MemoryReservation>>,
+    input_charge: Option<Arc<RetainedBufferCharge>>,
     proven_fresh: bool,
 }
 
@@ -235,7 +236,7 @@ impl CacheKeyClaim {
     fn publish_charged(
         &mut self,
         batches: Arc<Vec<RecordBatch>>,
-        charge: Option<Arc<MemoryReservation>>,
+        charge: Option<Arc<RetainedBufferCharge>>,
     ) {
         self.input_charge = charge.clone();
         self.sender.send_replace(FetchState::Ready(batches, charge));
@@ -248,7 +249,7 @@ impl CacheKeyClaim {
     fn publish_if_cacheable(
         &mut self,
         batches: &[RecordBatch],
-        charge: Option<Arc<MemoryReservation>>,
+        charge: Option<Arc<RetainedBufferCharge>>,
         native: bool,
     ) {
         if native && batches.iter().all(|batch| batch.num_rows() == 0) {
@@ -295,7 +296,7 @@ const FOLLOWER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The terminal outcome a follower observes while waiting on a leader's fetch.
 enum FollowerResult {
     /// The leader published batches for the follower to replay.
-    Ready(Arc<Vec<RecordBatch>>, Option<Arc<MemoryReservation>>),
+    Ready(Arc<Vec<RecordBatch>>, Option<Arc<RetainedBufferCharge>>),
     /// The leader published no usable result; the follower fetches for itself.
     Failed,
 }
@@ -1301,7 +1302,7 @@ impl CacheFallback {
 fn charged_response_stream(
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
-    charge: Option<Arc<MemoryReservation>>,
+    charge: Option<Arc<RetainedBufferCharge>>,
 ) -> SendableRecordBatchStream {
     let stream = futures::stream::iter(batches.into_iter().map(Ok)).map(move |batch| {
         let _retained = &charge;
@@ -1313,7 +1314,7 @@ fn charged_response_stream(
 struct CacheFetch {
     batches: Vec<RecordBatch>,
     complete: bool,
-    charge: Option<Arc<MemoryReservation>>,
+    charge: Option<Arc<RetainedBufferCharge>>,
 }
 
 struct NativeCacheWrite {
@@ -1322,7 +1323,7 @@ struct NativeCacheWrite {
     claim: CacheKeyClaim,
     children: SynchronizedChildren,
     dataset_name: String,
-    input_charge: Arc<MemoryReservation>,
+    input_charge: Arc<RetainedBufferCharge>,
     metadata_charge: MemoryReservation,
 }
 
@@ -1333,7 +1334,7 @@ impl NativeCacheWrite {
         claim: CacheKeyClaim,
         children: SynchronizedChildren,
         dataset_name: String,
-        input_charge: Arc<MemoryReservation>,
+        input_charge: Arc<RetainedBufferCharge>,
     ) -> DataFusionResult<Self> {
         let metadata_charge = writer.reserve_work_metadata(&request, &claim)?;
         metadata_charge.try_grow(dataset_name.capacity().saturating_mul(2))?;
@@ -1405,11 +1406,20 @@ impl NativeCacheWrite {
         drop(registered);
 
         for (index, (child, mut claim)) in targets.into_iter().enumerate() {
-            claim.publish_if_cacheable(
-                &batches,
-                Some(Arc::clone(&self.input_charge)),
-                child.writer.requires_complete_fetch(),
-            );
+            let charge = match child
+                .writer
+                .retain_input(&batches, Some(&self.input_charge))
+            {
+                Ok(charge) => charge,
+                Err(error) => {
+                    tracing::debug!(
+                        "Declining child cache population for dataset '{}': {error}",
+                        self.dataset_name
+                    );
+                    continue;
+                }
+            };
+            claim.publish_if_cacheable(&batches, charge, child.writer.requires_complete_fetch());
             let request = CacheWriteRequest {
                 batches: batches.clone(),
                 filters: filters.clone(),
@@ -1544,11 +1554,12 @@ impl CacheRefreshHelper {
                     row_filters.len()
                 );
 
+                let source_filters = Self::periodic_source_filters(federated.as_ref(), &row_filters);
                 let CacheFetch { batches, complete, charge } = Self::fetch_for_population(
                     &federated,
                     &session_state,
                     &dataset_name,
-                    &row_filters,
+                    &source_filters,
                     None,
                     cache_write_tx.task_context(&session_state),
                     cache_write_tx.memory_pool(),
@@ -1653,6 +1664,48 @@ impl CacheRefreshHelper {
         }
 
         Ok(total_refreshed)
+    }
+
+    /// An HTTP cache's stored empty path identifies the configured base URI,
+    /// not a public override. Claims and replacement predicates keep this path.
+    /// Unknown providers receive every original filter.
+    fn periodic_source_filters(source: &dyn TableProvider, row_filters: &[Expr]) -> Vec<Expr> {
+        if !Self::periodic_source_uses_http_paths(source) {
+            return row_filters.to_vec();
+        }
+        row_filters.iter().filter(|filter| {
+            !matches!(filter,
+                Expr::BinaryExpr(binary)
+                    if binary.op == datafusion::logical_expr::Operator::Eq
+                    && matches!(binary.left.as_ref(), Expr::Column(column)
+                        if column.relation.is_none() && column.name == "request_path")
+                    && matches!(binary.right.as_ref(), Expr::Literal(ScalarValue::Utf8(Some(path)), _)
+                        if path.is_empty())
+            )
+        }).cloned().collect()
+    }
+
+    fn periodic_source_uses_http_paths(mut source: &dyn TableProvider) -> bool {
+        for _ in 0..64 {
+            if source
+                .downcast_ref::<data_components::http::provider::HttpTableProvider>()
+                .is_some()
+            {
+                return true;
+            }
+            let Some(table) = source.downcast_ref::<spice_table::SpiceTable>() else {
+                return false;
+            };
+            // A schema-only metadata layer forwards the same scan and filters.
+            if table
+                .layer_as::<data_components::MetadataEnrichedTableProvider>()
+                .is_none()
+            {
+                return false;
+            }
+            source = table.below().as_ref();
+        }
+        false
     }
 
     /// Refreshes specific cache entry by fetching fresh data from the source.
@@ -2236,7 +2289,7 @@ impl CacheRefreshHelper {
         filters: &[Expr],
         batches: &[RecordBatch],
         complete: bool,
-        input_charge: Option<Arc<MemoryReservation>>,
+        input_charge: Option<Arc<RetainedBufferCharge>>,
         namespace_id: &str,
     ) {
         let children = synchronized_children.read().await.clone();
@@ -2266,17 +2319,14 @@ impl CacheRefreshHelper {
             ) else {
                 continue;
             };
-            let charge = match &input_charge {
-                Some(charge) => Some(Arc::clone(charge)),
-                None => match child.writer.reserve_input(batches) {
-                    Ok(charge) => charge,
-                    Err(error) => {
-                        tracing::debug!(
-                            "Declining child cache population for dataset '{dataset_name}': {error}"
-                        );
-                        continue;
-                    }
-                },
+            let charge = match child.writer.retain_input(batches, input_charge.as_ref()) {
+                Ok(charge) => charge,
+                Err(error) => {
+                    tracing::debug!(
+                        "Declining child cache population for dataset '{dataset_name}': {error}"
+                    );
+                    continue;
+                }
             };
             claim.publish_if_cacheable(batches, charge, child.writer.requires_complete_fetch());
             let request = CacheWriteRequest {
@@ -2370,7 +2420,7 @@ impl CacheRefreshHelper {
     async fn initialize_sink_child(
         child: &SynchronizedCacheTarget,
         batches: Vec<RecordBatch>,
-        _snapshot_charge: Option<Arc<MemoryReservation>>,
+        _snapshot_charge: Option<Arc<RetainedBufferCharge>>,
         dataset_name: &str,
     ) -> DataFusionResult<()> {
         let ctx = child.writer.session_context();
@@ -2497,8 +2547,19 @@ impl CacheRefreshHelper {
             }
             all_batches.push(batch);
         }
+        let charge = reservation
+            .zip(memory_pool)
+            .and_then(|(reservation, pool)| {
+                RetainedBufferCharge::new(pool, reservation)
+                    .inspect_err(|error| {
+                        tracing::debug!(
+                            "Declining cache response sharing for dataset '{dataset_name}': {error}"
+                        );
+                    })
+                    .ok()
+            });
         let complete = completion.as_ref().is_some_and(|token| token.is_complete())
-            && (memory_pool.is_none() || reservation.is_some());
+            && (memory_pool.is_none() || charge.is_some());
 
         tracing::debug!(
             "Federated source returned {} batches for dataset={}",
@@ -2509,7 +2570,7 @@ impl CacheRefreshHelper {
         Ok(CacheFetch {
             batches: all_batches,
             complete,
-            charge: reservation.map(Arc::new),
+            charge,
         })
     }
 
@@ -2582,6 +2643,7 @@ impl CacheRefreshHelper {
                     "Cache miss for dataset {dataset_name} found an in-flight fetch for the same key bounded at {fetched:?} rows, below this request's limit {limit:?}; fetching for itself",
                     fetched = in_flight.limit
                 );
+                drop(in_flight);
                 return own_fetch.run().await;
             }
         };
@@ -2803,13 +2865,34 @@ impl CacheRefreshHelper {
             "Cache miss for dataset {dataset_name} is coalescing onto an in-flight fetch for the same key"
         );
 
-        match tokio::time::timeout(
+        let result = tokio::time::timeout(
             FOLLOWER_WAIT_TIMEOUT,
             Self::await_fetch_state(&mut receiver),
         )
-        .await
-        {
+        .await;
+        // No source fallback may keep the leader's watch value alive, including
+        // a Ready value published after this follower timed out.
+        drop(receiver);
+        match result {
             Ok(FollowerResult::Ready(batches, charge)) => {
+                let admitted = match &charge {
+                    Some(charge) => charge.retain_for_pool(own_fetch.task_context.memory_pool()),
+                    None => RetainedBufferCharge::for_batches(
+                        own_fetch.task_context.memory_pool(),
+                        &batches,
+                    ),
+                };
+                let admitted = match admitted {
+                    Ok(admitted) => admitted,
+                    Err(error) => {
+                        tracing::debug!(
+                            "Declining shared cache response for dataset '{dataset_name}': {error}"
+                        );
+                        drop(batches);
+                        drop(charge);
+                        return own_fetch.run().await;
+                    }
+                };
                 if batches.is_empty() {
                     return Box::pin(RecordBatchStreamAdapter::new(
                         own_fetch.schema,
@@ -2823,7 +2906,7 @@ impl CacheRefreshHelper {
                     "Cache miss for dataset {dataset_name} replayed {} shared batch(es) from the in-flight fetch without a second origin call",
                     replay.len()
                 );
-                charged_response_stream(batch_schema, replay, charge)
+                charged_response_stream(batch_schema, replay, Some(admitted))
             }
             Ok(FollowerResult::Failed) => {
                 tracing::debug!(
@@ -3654,6 +3737,654 @@ mod cache_namespace_column_tests {
             .downcast_ref::<StringArray>()
             .expect("utf8");
         assert_eq!(ns_col.value(0), "system");
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use arrow::datatypes::{Field, Schema};
+    use datafusion::execution::context::SessionContext;
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use datafusion::execution::runtime_env::RuntimeEnv;
+    use runtime_acceleration::change_sink::provider::ProviderChangeSinkBackend;
+    use runtime_acceleration::change_sink::{ChangeSink, ChangeSinkContext};
+
+    fn context(pool: &Arc<dyn MemoryPool>) -> SessionContext {
+        SessionContext::new_with_config_rt(
+            util::session_state::session_config(),
+            Arc::new(RuntimeEnv {
+                memory_pool: Arc::clone(pool),
+                ..RuntimeEnv::default()
+            }),
+        )
+    }
+
+    fn row(content: &str) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["/items"])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec![content])),
+            ],
+        )
+        .expect("request row")
+    }
+
+    fn table(batches: Vec<RecordBatch>) -> Arc<dyn TableProvider> {
+        Arc::new(
+            data_components::arrow::write::MemTable::try_new(row("").schema(), vec![batches])
+                .expect("real memory table"),
+        )
+    }
+
+    fn target(
+        pool: &Arc<dyn MemoryPool>,
+        stored: Vec<RecordBatch>,
+    ) -> (SynchronizedCacheTarget, ChangeSink, Arc<Mutex<()>>) {
+        let accelerator = table(stored);
+        let dataset = TableReference::bare("pool_test");
+        let backend = ChangeSinkContext::new(dataset.clone(), Arc::clone(&accelerator));
+        let lock = Arc::clone(&backend.write_lock);
+        let sink = ChangeSink::new(
+            Arc::new(ProviderChangeSinkBackend::new(backend).with_ordered_replacement()),
+            context(pool),
+            &Handle::current(),
+            8,
+        );
+        let writer = CacheWriteSender::from_sink(
+            sink.clone(),
+            accelerator.schema(),
+            dataset,
+            RuntimeStatus::new(),
+            Arc::new(AtomicI64::new(0)),
+            Arc::clone(pool),
+        );
+        (
+            SynchronizedCacheTarget {
+                accelerator,
+                writer,
+                in_flight: InFlightRevalidations::default(),
+            },
+            sink,
+            lock,
+        )
+    }
+
+    async fn contents(provider: &Arc<dyn TableProvider>) -> Vec<String> {
+        let batches = SessionContext::new()
+            .read_table(Arc::clone(provider))
+            .expect("read storage")
+            .collect()
+            .await
+            .expect("collect storage");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("content")
+                    .expect("content")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8")
+                    .iter()
+                    .map(|value| value.expect("non-null content").to_string())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn follower_pools_share_admission_until_last_response_stream_drops() {
+        let batch = row("shared");
+        let bytes = batch.get_array_memory_size();
+        let leader_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes + 16384));
+        let other_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+        let charge = RetainedBufferCharge::for_batches(&leader_pool, std::slice::from_ref(&batch))
+            .expect("leader admission");
+        let ownership = Arc::downgrade(&charge);
+        let (sender, receiver) =
+            watch::channel(FetchState::Ready(Arc::new(vec![batch]), Some(charge)));
+        let filters = [col("request_path").eq(lit("/items"))];
+        let source = table(vec![row("must not fetch")]);
+        let mut streams = Vec::new();
+        for pool in [&leader_pool, &other_pool, &other_pool] {
+            let state = context(pool).state();
+            streams.push(
+                CacheRefreshHelper::follow_cache_miss(
+                    receiver.clone(),
+                    UncoalescedFetch {
+                        federated: Arc::clone(&source),
+                        session_state: &state,
+                        task_context: state.task_ctx(),
+                        dataset_name: "pool_test",
+                        filters: &filters,
+                        limit: None,
+                        schema: source.schema(),
+                        stale_if_error: StaleIfError::Disabled,
+                        max_age: Duration::ZERO,
+                        expired_batches: None,
+                    },
+                )
+                .await,
+            );
+        }
+        drop(sender);
+        drop(receiver);
+        assert_eq!(
+            leader_pool.reserved(),
+            bytes + ownership.upgrade().expect("live streams").metadata_bytes()
+        );
+        assert_eq!(
+            other_pool.reserved(),
+            bytes,
+            "secondary-pool followers share admission"
+        );
+        let first = streams[0].try_next().await.expect("stream").expect("batch");
+        assert_eq!(
+            first
+                .column_by_name("content")
+                .expect("content")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8")
+                .value(0),
+            "shared"
+        );
+        drop(streams.pop());
+        assert_eq!(other_pool.reserved(), bytes);
+        drop(streams.pop());
+        assert_eq!(other_pool.reserved(), 0);
+        assert_eq!(
+            leader_pool.reserved(),
+            bytes + ownership.upgrade().expect("leader stream").metadata_bytes()
+        );
+        drop(streams);
+        assert_eq!(leader_pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn refused_follower_releases_shared_buffers_before_real_http_fallback() {
+        use data_components::http::provider::HttpTableProvider;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for body in [None, Some("")] {
+            let batch = row("leader");
+            let leader_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+            let caller_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
+            let charge =
+                RetainedBufferCharge::for_batches(&leader_pool, std::slice::from_ref(&batch))
+                    .expect("leader charge");
+            let weak = Arc::downgrade(&charge);
+            let (sender, receiver) =
+                watch::channel(FetchState::Ready(Arc::new(vec![batch]), Some(charge)));
+            drop(sender);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let url = format!("http://{}/", listener.local_addr().expect("address"));
+            let pool = Arc::clone(&leader_pool);
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("HTTP request");
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 1024];
+                    let size = socket.read(&mut buffer).await.expect("read request");
+                    assert!(size > 0);
+                    request.extend_from_slice(&buffer[..size]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(request.len() < 8192);
+                }
+                assert!(
+                    weak.upgrade().is_none(),
+                    "fallback must release shared watch and charge"
+                );
+                assert_eq!(pool.reserved(), 0);
+                let payload = "fresh雪\0";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response");
+                String::from_utf8(request).expect("request headers")
+            });
+            let source: Arc<dyn TableProvider> = Arc::new(
+                HttpTableProvider::new(
+                    url.parse().expect("URL"),
+                    Default::default(),
+                    "text".into(),
+                    true,
+                )
+                .with_allowed_paths(["/items"])
+                .expect("allow test endpoint")
+                .enable_body_filters(1024),
+            );
+            let mut filters = vec![col("request_path").eq(lit("/items"))];
+            if let Some(body) = body {
+                filters.push(col("request_body").eq(lit(body)));
+            }
+            let state = context(&caller_pool).state();
+            let batches: Vec<RecordBatch> = tokio::time::timeout(Duration::from_secs(10), async {
+                CacheRefreshHelper::follow_cache_miss(
+                    receiver,
+                    UncoalescedFetch {
+                        federated: Arc::clone(&source),
+                        session_state: &state,
+                        task_context: state.task_ctx(),
+                        dataset_name: "pool_test",
+                        filters: &filters,
+                        limit: None,
+                        schema: source.schema(),
+                        stale_if_error: StaleIfError::Disabled,
+                        max_age: Duration::ZERO,
+                        expired_batches: None,
+                    },
+                )
+                .await
+                .try_collect()
+                .await
+            })
+            .await
+            .expect("bounded HTTP fetch")
+            .expect("fallback response");
+            let wire = server.await.expect("HTTP server");
+            assert!(wire.starts_with(if body.is_some() {
+                "POST /items "
+            } else {
+                "GET /items "
+            }));
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            let strings = |name: &str| {
+                batches[0]
+                    .column_by_name(name)
+                    .expect("column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8")
+            };
+            assert_eq!(
+                strings("request_query").iter().collect::<Vec<_>>(),
+                vec![None]
+            );
+            assert_eq!(
+                strings("request_body").iter().collect::<Vec<_>>(),
+                vec![body]
+            );
+            assert_eq!(strings("content").value(0), "fresh雪\0");
+            assert_eq!(caller_pool.reserved(), 0);
+            assert_eq!(leader_pool.reserved(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_base_uri_and_explicit_path_replay_preserve_scope_and_wire_defaults() {
+        use data_components::http::provider::HttpTableProvider;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (explicit, enriched) in [(false, false), (true, false), (false, true), (true, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let url = format!(
+                "http://{}{}?key=A",
+                listener.local_addr().expect("address"),
+                if explicit { "/" } else { "/items" },
+            );
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for payload in ["v1", "v2"] {
+                    let (mut socket, _) = listener.accept().await.expect("HTTP request");
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0; 1024];
+                        let size = socket.read(&mut buffer).await.expect("read request");
+                        assert!(size > 0);
+                        request.extend_from_slice(&buffer[..size]);
+                        if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            break;
+                        }
+                        assert!(request.len() < 8192);
+                    }
+                    requests.push(String::from_utf8(request).expect("headers"));
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).as_bytes())
+                        .await.expect("response");
+                }
+                requests
+            });
+            let source: Arc<dyn TableProvider> = Arc::new(
+                HttpTableProvider::new(
+                    url.parse().expect("URL"),
+                    Default::default(),
+                    "text".into(),
+                    true,
+                )
+                .with_allowed_paths(["/items"])
+                .expect("allow endpoint")
+                .enable_query_filters(1024)
+                .enable_body_filters(1024)
+                .with_max_retries(0),
+            );
+            let source = if enriched {
+                data_components::metadata_enriched_table_provider(
+                    source,
+                    std::collections::HashMap::from([(
+                        "test_scope".to_string(),
+                        "periodic".to_string(),
+                    )]),
+                    Default::default(),
+                )
+            } else {
+                source
+            };
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+            let state = Arc::new(context(&pool).state());
+            assert!(
+                source
+                    .scan(
+                        state.as_ref(),
+                        None,
+                        &[col("request_path").eq(lit(""))],
+                        None
+                    )
+                    .await
+                    .is_err(),
+                "public empty path stays invalid"
+            );
+            let mut filters = vec![col("request_body").eq(lit(""))];
+            if explicit {
+                filters.push(col("request_path").eq(lit("/items")));
+                filters.push(col("request_query").eq(lit("key=A")));
+            }
+            let initial = CacheRefreshHelper::fetch_for_population(
+                &source,
+                &state,
+                "periodic_test",
+                &filters,
+                None,
+                state.task_ctx(),
+                Some(&pool),
+            )
+            .await
+            .expect("initial HTTP fetch");
+            assert!(initial.complete);
+            let expected_scope =
+                CacheRefreshHelper::extract_filters_from_row(&initial.batches[0], 0)
+                    .expect("initial stored scope");
+            let accelerator: Arc<dyn TableProvider> = Arc::new(
+                data_components::arrow::write::MemTable::try_new(
+                    source.schema(),
+                    vec![
+                        initial
+                            .batches
+                            .into_iter()
+                            .map(|batch| {
+                                arrow_tools::record_batch::try_cast_to(batch, source.schema())
+                                    .expect("cast initial response to storage schema")
+                            })
+                            .collect(),
+                    ],
+                )
+                .expect("stored initial response"),
+            );
+            drop(initial.charge);
+            let dataset = TableReference::bare("periodic_test");
+            let backend = ChangeSinkContext::new(dataset.clone(), Arc::clone(&accelerator));
+            let write_lock = Arc::clone(&backend.write_lock);
+            let sink = ChangeSink::new(
+                Arc::new(ProviderChangeSinkBackend::new(backend).with_ordered_replacement()),
+                context(&pool),
+                &Handle::current(),
+                8,
+            );
+            let writer = CacheWriteSender::from_sink(
+                sink.clone(),
+                source.schema(),
+                dataset,
+                RuntimeStatus::new(),
+                Arc::new(AtomicI64::new(0)),
+                Arc::clone(&pool),
+            );
+            let rows = tokio::time::timeout(
+                Duration::from_secs(10),
+                CacheRefreshHelper::refresh_all_stale_rows(
+                    source,
+                    Arc::clone(&accelerator),
+                    state,
+                    "periodic_test",
+                    Duration::ZERO,
+                    write_lock,
+                    InFlightRevalidations::default(),
+                    writer,
+                ),
+            )
+            .await
+            .expect("bounded periodic refresh")
+            .expect("refresh");
+            assert_eq!(rows, 1);
+            let refreshed = context(&pool)
+                .read_table(Arc::clone(&accelerator))
+                .expect("read")
+                .collect()
+                .await
+                .expect("stored rows");
+            assert_eq!(
+                refreshed.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                1
+            );
+            assert_eq!(
+                CacheRefreshHelper::extract_filters_from_row(&refreshed[0], 0)
+                    .expect("refreshed scope"),
+                expected_scope
+            );
+            assert_eq!(contents(&accelerator).await, vec!["v2"]);
+            let requests = server.await.expect("HTTP server");
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests
+                    .iter()
+                    .all(|wire| wire.starts_with("POST /items?key=A ")),
+                "explicit={explicit} enriched={enriched}: {requests:?}",
+            );
+            println!(
+                "periodic replay: explicit={explicit} enriched={enriched} original_scope={expected_scope:?} wire={:?} stored=v2",
+                requests
+                    .iter()
+                    .map(|wire| wire.lines().next().expect("request line"))
+                    .collect::<Vec<_>>()
+            );
+            sink.close(Duration::from_secs(5))
+                .await
+                .expect("close periodic sink");
+            assert_eq!(pool.reserved(), 0);
+        }
+    }
+
+    #[test]
+    fn periodic_replay_does_not_rewrite_query_body_or_explicit_path_scope() {
+        let source = data_components::http::provider::HttpTableProvider::new(
+            "http://localhost/items?key=A".parse().expect("URL"),
+            Default::default(),
+            "text".into(),
+            true,
+        );
+        for query in [None, Some("")] {
+            for body in [None, Some("")] {
+                let mut filters = vec![col("request_path").eq(lit(""))];
+                for (name, value) in [("request_query", query), ("request_body", body)] {
+                    filters.push(match value {
+                        Some(value) => col(name).eq(lit(value)),
+                        None => col(name).is_null(),
+                    });
+                }
+                assert_eq!(
+                    CacheRefreshHelper::periodic_source_filters(&source, &filters),
+                    filters[1..]
+                );
+                filters[0] = col("request_path").eq(lit("/explicit"));
+                assert_eq!(
+                    CacheRefreshHelper::periodic_source_filters(&source, &filters),
+                    filters
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_http_and_opaque_sources_keep_empty_path_filters() {
+        use data_components::http::provider::HttpTableProvider;
+        let http: Arc<dyn TableProvider> = Arc::new(HttpTableProvider::new(
+            "http://localhost/items?key=A".parse().expect("URL"),
+            Default::default(),
+            "text".into(),
+            true,
+        ));
+        let non_http: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(http.schema(), vec![vec![]])
+                .expect("same schema"),
+        );
+        let enriched = data_components::metadata_enriched_table_provider(
+            Arc::clone(&non_http),
+            std::collections::HashMap::from([("test_scope".to_string(), "periodic".to_string())]),
+            Default::default(),
+        );
+        let opaque: Arc<dyn TableProvider> =
+            Arc::new(runtime_datafusion::execution_plan::schema_cast::EnsureSchema::new(http));
+        let filters = vec![
+            col("request_path").eq(lit("")),
+            col("request_query").is_null(),
+            col("request_body").eq(lit("")),
+        ];
+        for source in [non_http, enriched, opaque] {
+            assert_eq!(
+                CacheRefreshHelper::periodic_source_filters(source.as_ref(), &filters),
+                filters
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn child_admission_and_pending_publication_retain_both_pools() {
+        let parent_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let child_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let (child, sink, lock) = target(&child_pool, vec![row("old")]);
+        let guard = lock.lock().await;
+        let batch = row("new");
+        let bytes = batch.get_array_memory_size();
+        let charge = RetainedBufferCharge::for_batches(&parent_pool, std::slice::from_ref(&batch))
+            .expect("parent admission");
+        let ownership = Arc::downgrade(&charge);
+        let children = Arc::new(tokio::sync::RwLock::new(vec![child.clone()]));
+        CacheRefreshHelper::propagate_to_synchronized_children(
+            &children,
+            "pool_test",
+            &[col("request_path").eq(lit("/items"))],
+            &[batch],
+            true,
+            Some(charge),
+            "public",
+        )
+        .await;
+        assert_eq!(
+            parent_pool.reserved(),
+            bytes
+                + ownership
+                    .upgrade()
+                    .expect("pending publication")
+                    .metadata_bytes()
+        );
+        assert!(
+            child_pool.reserved() >= bytes,
+            "child input plus distinct preparation"
+        );
+        let receiver = child
+            .in_flight
+            .lock()
+            .values()
+            .next()
+            .expect("pending child claim")
+            .state
+            .clone();
+        drop(guard);
+        sink.flush().await.expect("child publication");
+        assert_eq!(contents(&child.accelerator).await, vec!["new"]);
+        assert!(child.in_flight.lock().is_empty());
+        assert_eq!(
+            parent_pool.reserved(),
+            bytes + ownership.upgrade().expect("watch charge").metadata_bytes(),
+            "watch still owns source and metadata charges"
+        );
+        assert_eq!(
+            child_pool.reserved(),
+            bytes,
+            "watch still owns child admission"
+        );
+        drop(receiver);
+        assert_eq!(parent_pool.reserved(), 0);
+        assert_eq!(child_pool.reserved(), 0);
+        sink.close(Duration::from_secs(5))
+            .await
+            .expect("close child");
+    }
+
+    #[tokio::test]
+    async fn native_fanout_declines_stricter_child_without_changing_its_storage() {
+        let parent_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let child_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
+        let (parent, parent_sink, _) = target(&parent_pool, vec![]);
+        let (child, child_sink, _) = target(&child_pool, vec![row("old")]);
+        let filters = vec![col("request_path").eq(lit("/items"))];
+        let key = compute_cache_key_from_filters_and_namespace(&filters, "public");
+        let ClaimOutcome::Leader(mut claim) =
+            CacheKeyClaim::acquire(&parent.in_flight, key.clone(), None)
+        else {
+            panic!("exclusive parent");
+        };
+        let batches = vec![row("new")];
+        let charge =
+            RetainedBufferCharge::for_batches(&parent_pool, &batches).expect("parent charge");
+        claim.publish_if_cacheable(&batches, Some(Arc::clone(&charge)), true);
+        NativeCacheWrite::new(
+            parent.writer.clone(),
+            CacheWriteRequest {
+                batches,
+                filters,
+                cache_key: key,
+                namespace_id: "public".into(),
+                replaces_existing: true,
+            },
+            claim,
+            Arc::new(tokio::sync::RwLock::new(vec![child.clone()])),
+            "pool_test".into(),
+            charge,
+        )
+        .expect("fanout work")
+        .run()
+        .await
+        .expect("parent publication");
+        assert_eq!(contents(&parent.accelerator).await, vec!["new"]);
+        assert_eq!(contents(&child.accelerator).await, vec!["old"]);
+        assert!(child.in_flight.lock().is_empty());
+        assert!(parent.in_flight.lock().is_empty());
+        assert_eq!(child_pool.reserved(), 0);
+        assert_eq!(parent_pool.reserved(), 0);
+        parent_sink
+            .close(Duration::from_secs(5))
+            .await
+            .expect("close parent");
+        child_sink
+            .close(Duration::from_secs(5))
+            .await
+            .expect("close child");
     }
 }
 

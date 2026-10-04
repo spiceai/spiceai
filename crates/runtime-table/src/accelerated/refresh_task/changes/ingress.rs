@@ -157,6 +157,7 @@ impl RefreshTask {
         let mut held: Option<cdc::ChangeEnvelope> = None;
         let mut source_ended = false;
         let mut received_timestamp = None;
+        let mut metadata_flush_count = 0_u64;
         // Bound source metadata as well as storage admission. No source data
         // queue is created, and at most one unaccepted envelope is retained.
         let metadata_limit = config
@@ -182,14 +183,52 @@ impl RefreshTask {
             {
                 // Published-but-not-durable committers are source metadata too.
                 // A durability barrier releases them before more rows are admitted.
-                if let Some(message) = flush_pending_source_commits(
+                metadata_flush_count = metadata_flush_count.saturating_add(1);
+                let trace_enabled = tracing::enabled!(
+                    target: "changesink_diagnostic",
+                    tracing::Level::DEBUG
+                );
+                let trace_start = (trace_enabled && metadata_flush_count <= 128).then(|| {
+                    tracing::debug!(
+                        target: "changesink_diagnostic",
+                        dataset = %dataset_name,
+                        sequence = metadata_flush_count,
+                        pending_sources = pending.len(),
+                        deferred_committers = observer.pending_count(),
+                        retained,
+                        metadata_limit,
+                        received_commit_ms = ?received_timestamp,
+                        "CDC metadata pressure flush started"
+                    );
+                    Instant::now()
+                });
+                if trace_enabled && metadata_flush_count == 129 {
+                    tracing::debug!(
+                        target: "changesink_diagnostic",
+                        dataset = %dataset_name,
+                        limit = 128,
+                        "CDC metadata pressure trace limit reached; further flushes are not traced"
+                    );
+                }
+                let flush_error = flush_pending_source_commits(
                     sink,
                     observer,
                     &dataset_name,
                     &self.runtime_status,
                 )
-                .await
-                {
+                .await;
+                if let Some(start) = trace_start {
+                    tracing::debug!(
+                        target: "changesink_diagnostic",
+                        dataset = %dataset_name,
+                        sequence = metadata_flush_count,
+                        elapsed_ms = start.elapsed().as_secs_f64() * 1000.0,
+                        deferred_committers = observer.pending_count(),
+                        failed = flush_error.is_some(),
+                        "CDC metadata pressure flush completed"
+                    );
+                }
+                if let Some(message) = flush_error {
                     self.set_refresh_status(
                         sql.as_deref(),
                         status::ComponentStatus::error_with_message(message),
