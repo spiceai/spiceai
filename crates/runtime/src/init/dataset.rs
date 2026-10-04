@@ -836,20 +836,24 @@ impl Runtime {
         load: DatasetLoad,
     ) {
         let shutdown_token = self.status.shutdown_token();
-        let load_fut = async {
-            // A dataset that reads snapshots has no acceleration to load them into until
-            // the engine that created them is known, which only their metadata says.
-            let (ds, bootstrap_status) = if ds.is_pending_snapshot_source() {
-                let Some(resolved) = self
-                    .resolve_snapshot_source(&ds, &load_semaphore, &load)
-                    .await
-                else {
-                    return;
-                };
-                resolved
-            } else {
-                (ds, bootstrap_status)
+        // A dataset that reads snapshots has no acceleration to load them into until
+        // the engine that created them is known, which only their metadata says.
+        // Outside the supersede scope below: a supersede waits for a restore that has
+        // started rather than dropping it (see `dataset_loads`), and the resolution
+        // stops on its own while it is only waiting.
+        let (ds, bootstrap_status) = if ds.is_pending_snapshot_source() {
+            let resolved = tokio::select! {
+                resolved = self.resolve_snapshot_source(&ds, &load_semaphore, &load) => resolved,
+                () = shutdown_token.cancelled() => None,
             };
+            let Some(resolved) = resolved else {
+                return;
+            };
+            resolved
+        } else {
+            (ds, bootstrap_status)
+        };
+        let load_fut = async {
             let pending = matches!(bootstrap_status, BootstrapStatus::Pending { .. });
             let bootstrap_status = if pending
                 && ds.ready_state == crate::component::dataset::ReadyState::OnRegistration
@@ -875,6 +879,9 @@ impl Runtime {
             // A restore completed at initialization already updated the cached
             // timestamps there; only one completed here still needs it.
             let restored = pending && bootstrap_status.is_bootstrapped();
+            if restored && ds.is_snapshot_source() && self.refuses_projected_publisher(&ds).await {
+                return;
+            }
             if restored {
                 update_cached_dataset_timestamps(ds.as_ref()).await;
             }

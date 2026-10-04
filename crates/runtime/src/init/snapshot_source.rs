@@ -220,6 +220,11 @@ impl Runtime {
                 .remove(&resolved.name)?
                 // `initialize_datasets_accelerators` reports its own failures.
                 .ok()?
+                // The engines leave a reader's restore pending; it runs here, under
+                // the attempt, so a reload waits for it and the check below reads the
+                // restored copy. One that finds nothing keeps waiting in the load.
+                .restore_once()
+                .await
         };
         // A reload that superseded this resolution while the snapshot was restored loads
         // the dataset as it now is; this load must not also register it.
@@ -228,8 +233,7 @@ impl Runtime {
         }
         // Refused here, before registration: once a snapshot is restored, a failure to
         // describe the dataset's source would serve the restored copy while retrying.
-        if let Some(refresh_sql) = publisher_column_projection(&resolved).await {
-            self.refuse_snapshot_source(&name, &projected_publisher_message(&name, &refresh_sql));
+        if self.refuses_projected_publisher(&resolved).await {
             return None;
         }
 
@@ -429,6 +433,20 @@ impl Runtime {
     }
 
     /// Reports a snapshot dataset that no retry can load.
+    /// Refuses `dataset` when its restored snapshots come from a publisher whose
+    /// `refresh_sql` stores only some of its source's columns. Checked against the
+    /// restored copy, so it runs wherever a restore completes, before registration.
+    pub(super) async fn refuses_projected_publisher(&self, dataset: &Dataset) -> bool {
+        let Some(refresh_sql) = publisher_column_projection(dataset).await else {
+            return false;
+        };
+        self.refuse_snapshot_source(
+            &dataset.name,
+            &projected_publisher_message(&dataset.name, &refresh_sql),
+        );
+        true
+    }
+
     fn refuse_snapshot_source(&self, dataset: &TableReference, message: &str) {
         self.status.update_dataset(
             dataset,

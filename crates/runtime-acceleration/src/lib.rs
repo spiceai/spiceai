@@ -96,54 +96,30 @@ impl BootstrapStatus {
     /// must run this inside its dataset load task's shutdown cancellation scope,
     /// without holding the application lock or a dataset load permit.
     pub async fn complete(self) -> Self {
-        let Self::Pending {
-            manager,
-            mut subscription,
-            poll_interval,
-        } = self
-        else {
-            return self;
-        };
+        let mut status = self;
         let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
         loop {
-            // Times the download that succeeds, not the wait for a snapshot to exist.
-            let start = Instant::now();
-            match manager.download_latest_snapshot().await {
-                Ok(Some(info)) => {
-                    snapshot::metrics::record_bootstrap_metrics(
-                        manager.dataset_name(),
-                        start.elapsed().as_secs_f64() * 1000.0,
-                        info.bytes_downloaded,
-                        &info.checksum,
-                    );
-                    return Self::bootstrapped(info, subscription);
-                }
-                Ok(None) => {
-                    tracing::warn!(
-                        "Snapshot acceleration for dataset '{}' is waiting for its first snapshot. Ensure the snapshot location '{}' is correct and that the writer has published a snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots",
-                        manager.dataset_name(),
-                        manager.snapshot_location()
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "Failed to restore snapshot acceleration for dataset '{}', so snapshot data is unavailable and will be retried. Cause: {error}",
-                        manager.dataset_name()
-                    );
-                }
-            }
+            status = status.restore_once().await;
+            let Self::Pending {
+                subscription,
+                poll_interval,
+                ..
+            } = &mut status
+            else {
+                return status;
+            };
             // A zero refresh interval must still back off when there is no data,
             // as the regular refresh task does after a failed first refresh.
             let delay = if poll_interval.is_zero() {
                 backoff.next_duration().unwrap_or(Duration::from_mins(5))
             } else {
-                poll_interval
+                *poll_interval
             };
             if let Some(notifications) = subscription.as_mut() {
                 tokio::select! {
                     announced = notifications.next_snapshot() => {
                         if announced.is_none() {
-                            subscription = None;
+                            *subscription = None;
                             tokio::time::sleep(delay).await;
                         }
                     }
@@ -152,6 +128,50 @@ impl BootstrapStatus {
             } else {
                 tokio::time::sleep(delay).await;
             }
+        }
+    }
+
+    /// Makes one attempt to restore a pending bootstrap: bootstrapped when a snapshot
+    /// was restored, and otherwise still pending, for [`Self::complete`] to keep waiting.
+    pub async fn restore_once(self) -> Self {
+        let Self::Pending {
+            manager,
+            subscription,
+            poll_interval,
+        } = self
+        else {
+            return self;
+        };
+        // Times the download that succeeds, not the wait for a snapshot to exist.
+        let start = Instant::now();
+        match manager.download_latest_snapshot().await {
+            Ok(Some(info)) => {
+                snapshot::metrics::record_bootstrap_metrics(
+                    manager.dataset_name(),
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    info.bytes_downloaded,
+                    &info.checksum,
+                );
+                return Self::bootstrapped(info, subscription);
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "Snapshot acceleration for dataset '{}' is waiting for its first snapshot. Ensure the snapshot location '{}' is correct and that the writer has published a snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots",
+                    manager.dataset_name(),
+                    manager.snapshot_location()
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to restore snapshot acceleration for dataset '{}', so snapshot data is unavailable and will be retried. Cause: {error}",
+                    manager.dataset_name()
+                );
+            }
+        }
+        Self::Pending {
+            manager,
+            subscription,
+            poll_interval,
         }
     }
 
