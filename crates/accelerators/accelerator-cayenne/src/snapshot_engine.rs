@@ -143,38 +143,56 @@ fn slice_text(row: &[SliceValue], index: Option<usize>) -> Option<&str> {
     }
 }
 
-/// Snapshot ids the slice references: the current snapshot, the protected
-/// snapshots, and the snapshots whose `deletions/` directory holds a
-/// referenced deletion file.
-fn referenced_snapshot_ids(slice: &DatasetMetastoreSlice, anchor: &Path) -> HashSet<String> {
+/// `path` relative to `anchor`, whether the slice stores it relative (as the
+/// export writes it) or absolute. `None` for a path outside `anchor`, or one
+/// that could climb out of it.
+fn relative_to_anchor(path: &str, anchor: &Path) -> Option<PathBuf> {
+    let path = Path::new(path);
+    let relative = path.strip_prefix(anchor).unwrap_or(path);
+    relative
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+        .then(|| relative.to_path_buf())
+}
+
+/// Snapshot ids the slice references for the table `table_id`, whose data is
+/// written under `root` (relative to `anchor`): its current snapshot, its
+/// protected snapshots, and the snapshots whose `deletions/` directory holds
+/// one of its referenced deletion files.
+fn referenced_snapshot_ids(
+    slice: &DatasetMetastoreSlice,
+    anchor: &Path,
+    table_id: &str,
+    root: &Path,
+) -> HashSet<String> {
+    let rows = |table: &str| {
+        let id = slice_column(table, "table_id");
+        slice
+            .tables
+            .get(table)
+            .into_iter()
+            .flatten()
+            .filter(move |row| slice_text(row, id) == Some(table_id))
+    };
     let mut ids = HashSet::new();
     let current = slice_column("cayenne_table", "current_snapshot_id");
-    for row in slice.tables.get("cayenne_table").into_iter().flatten() {
+    for row in rows("cayenne_table") {
         ids.extend(slice_text(row, current).map(str::to_string));
     }
     let snapshot_id = slice_column("cayenne_snapshot_sequence", "snapshot_id");
-    for row in slice
-        .tables
-        .get("cayenne_snapshot_sequence")
-        .into_iter()
-        .flatten()
-    {
+    for row in rows("cayenne_snapshot_sequence") {
         ids.extend(slice_text(row, snapshot_id).map(str::to_string));
     }
     let path = slice_column("cayenne_delete_file", "path");
-    for row in slice
-        .tables
-        .get("cayenne_delete_file")
-        .into_iter()
-        .flatten()
-    {
-        let Some(path) = slice_text(row, path) else {
+    for row in rows("cayenne_delete_file") {
+        let Some(relative) = slice_text(row, path).and_then(|p| relative_to_anchor(p, anchor))
+        else {
             continue;
         };
-        let relative = Path::new(path)
-            .strip_prefix(anchor)
-            .unwrap_or(Path::new(path));
-        if let Some(first) = relative.components().next() {
+        let Ok(in_root) = relative.strip_prefix(root) else {
+            continue;
+        };
+        if let Some(first) = in_root.components().next() {
             ids.insert(first.as_os_str().to_string_lossy().into_owned());
         }
     }
@@ -185,54 +203,115 @@ fn referenced_snapshot_ids(slice: &DatasetMetastoreSlice, anchor: &Path) -> Hash
 /// archive: snapshot directories the slice does not reference (retired ones
 /// are removed by the sweep while the archive is being written), staging
 /// state, and `deletions/` directories of unreferenced snapshots. Paths are
-/// relative to `anchor`. Empty for a partitioned dataset, which is archived whole.
+/// relative to `anchor`.
+///
+/// A partitioned acceleration's partitions are child tables of their own,
+/// each rooted at its Hive directory under the data directory, with the same
+/// layout as the parent: each is pruned against its own references, and a
+/// partition directory is never skipped from the root that encloses it, and
+/// write state such as `_partitioned_wal/` is skipped like `_staging`. A
+/// table partitioned through `partition_column`, or a slice whose tables do
+/// not have distinct roots, is archived whole.
 async fn unreferenced_data_entries(
     anchor: &Path,
     slice: &DatasetMetastoreSlice,
 ) -> std::io::Result<HashSet<PathBuf>> {
-    let table_row = slice
+    let mut skip = HashSet::new();
+    let tables = slice
         .tables
         .get("cayenne_table")
-        .and_then(|rows| rows.first());
-    let mut skip = HashSet::new();
-    // A partitioned table keeps its partitions directly under the data
-    // directory; archive it as a whole. The slice's `cayenne_partition` rows are
-    // what say it is partitioned: the accelerator creates a partitioned
-    // acceleration's parent table unpartitioned and wraps it, so the parent row's
-    // `partition_column` is empty in production.
-    let partitioned = table_row
-        .and_then(|row| slice_text(row, slice_column("cayenne_table", "partition_column")))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let name = slice_column("cayenne_table", "table_name");
+    let parent = tables
+        .iter()
+        .position(|row| slice_text(row, name) == Some(slice.dataset_name.as_str()))
+        .or_else(|| (!tables.is_empty()).then_some(0));
+    if parent
+        .and_then(|i| {
+            slice_text(
+                &tables[i],
+                slice_column("cayenne_table", "partition_column"),
+            )
+        })
         .is_some()
-        || slice
-            .tables
-            .get("cayenne_partition")
-            .is_some_and(|rows| !rows.is_empty());
-    if partitioned {
+    {
         return Ok(skip);
     }
-    let table_id = table_row
-        .and_then(|row| slice_text(row, slice_column("cayenne_table", "table_id")))
-        .map(str::to_string);
-    let referenced = referenced_snapshot_ids(slice, anchor);
-    let mut entries = match tokio::fs::read_dir(anchor).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(skip),
-        Err(err) => return Err(err),
-    };
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if Some(&name) == table_id.as_ref() {
-            // `<table_id>/<snapshot_id>/`: keep the referenced snapshots.
-            let mut children = tokio::fs::read_dir(entry.path()).await?;
-            while let Some(child) = children.next_entry().await? {
-                let child_name = child.file_name().to_string_lossy().into_owned();
-                if !referenced.contains(&child_name) {
-                    skip.insert(PathBuf::from(&name).join(child_name));
-                }
+
+    // Each table's `table_id` and data root. The parent is rooted at `anchor`;
+    // a child at its own `path`, and one outside `anchor` is not archived.
+    let table_id = slice_column("cayenne_table", "table_id");
+    let table_path = slice_column("cayenne_table", "path");
+    let mut roots: Vec<(String, PathBuf)> = Vec::new();
+    for (i, row) in tables.iter().enumerate() {
+        let Some(id) = slice_text(row, table_id) else {
+            continue;
+        };
+        let root = if Some(i) == parent {
+            PathBuf::new()
+        } else {
+            match slice_text(row, table_path).and_then(|p| relative_to_anchor(p, anchor)) {
+                Some(root) => root,
+                None => continue,
             }
-        } else if !referenced.contains(&name) {
-            // `<snapshot_id>/deletions/` of a snapshot nothing references.
-            skip.insert(PathBuf::from(name));
+        };
+        if roots.iter().any(|(_, other)| *other == root) {
+            return Ok(skip);
+        }
+        roots.push((id.to_string(), root));
+    }
+
+    // Partition directories, and every directory above one, stay in the
+    // archive whatever the enclosing table references.
+    let partition_path = slice_column("cayenne_partition", "path");
+    let mut keep: HashSet<PathBuf> = HashSet::new();
+    let partition_roots = slice
+        .tables
+        .get("cayenne_partition")
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            slice_text(row, partition_path).and_then(|p| relative_to_anchor(p, anchor))
+        });
+    for root in roots
+        .iter()
+        .map(|(_, root)| root.clone())
+        .chain(partition_roots)
+    {
+        keep.extend(
+            root.ancestors()
+                .filter(|a| !a.as_os_str().is_empty())
+                .map(Path::to_path_buf),
+        );
+    }
+
+    for (id, root) in &roots {
+        let referenced = referenced_snapshot_ids(slice, anchor, id, root);
+        let mut entries = match tokio::fs::read_dir(anchor.join(root)).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let relative = root.join(&name);
+            if keep.contains(&relative) {
+                continue;
+            }
+            if name == *id {
+                // `<table_id>/<snapshot_id>/`: keep the referenced snapshots.
+                let mut children = tokio::fs::read_dir(entry.path()).await?;
+                while let Some(child) = children.next_entry().await? {
+                    let child_name = child.file_name().to_string_lossy().into_owned();
+                    if !referenced.contains(&child_name) {
+                        skip.insert(relative.join(child_name));
+                    }
+                }
+            } else if !referenced.contains(&name) {
+                // `<snapshot_id>/deletions/` of a snapshot nothing references.
+                skip.insert(relative);
+            }
         }
     }
     Ok(skip)
@@ -604,14 +683,24 @@ mod tests {
             "cayenne_snapshot_sequence".to_string(),
             protected
                 .iter()
-                .map(|id| slice_row("cayenne_snapshot_sequence", &[("snapshot_id", id)]))
+                .map(|id| {
+                    slice_row(
+                        "cayenne_snapshot_sequence",
+                        &[("table_id", table_id), ("snapshot_id", id)],
+                    )
+                })
                 .collect(),
         );
         tables.insert(
             "cayenne_delete_file".to_string(),
             delete_paths
                 .iter()
-                .map(|path| slice_row("cayenne_delete_file", &[("path", path)]))
+                .map(|path| {
+                    slice_row(
+                        "cayenne_delete_file",
+                        &[("table_id", table_id), ("path", path)],
+                    )
+                })
                 .collect(),
         );
         DatasetMetastoreSlice {
@@ -709,6 +798,120 @@ mod tests {
                 "partition directory '{dir}' must be archived, but the plan skips it: {skip:?}"
             );
         }
+    }
+
+    /// A partition child is pruned against its own references, under its own
+    /// root: its retired snapshot, staging state and unreferenced `deletions/`
+    /// are skipped, and nothing it or the parent references is. The partition
+    /// directory itself is never skipped from the parent's root, although the
+    /// parent references nothing by that name.
+    #[tokio::test]
+    async fn a_partition_child_is_pruned_against_its_own_references() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        for dir in [
+            "tid/current",
+            "tid/retired",
+            "_partitioned_wal",
+            "region=eu/cid/child-current",
+            "region=eu/cid/child-protected",
+            "region=eu/cid/child-retired",
+            "region=eu/cid/_staging",
+            "region=eu/child-current/deletions",
+            "region=eu/child-retired/deletions",
+            "region=us/did/us-current",
+            "region=us/did/us-retired",
+        ] {
+            std::fs::create_dir_all(anchor.join(dir)).expect("mkdir");
+        }
+        let mut slice = slice_with("tid", "current", &[], &[]);
+        let child = |id: &str, root: &str, current: &str| {
+            slice_row(
+                "cayenne_table",
+                &[
+                    ("table_id", id),
+                    ("path", root),
+                    ("current_snapshot_id", current),
+                ],
+            )
+        };
+        let cayenne_table = slice.tables.get_mut("cayenne_table").expect("parent");
+        // One child path as the export writes it (relative), one absolute.
+        cayenne_table.push(child("cid", "region=eu", "child-current"));
+        cayenne_table.push(child(
+            "did",
+            &anchor.join("region=us").to_string_lossy(),
+            "us-current",
+        ));
+        slice
+            .tables
+            .get_mut("cayenne_snapshot_sequence")
+            .expect("sequence")
+            .push(slice_row(
+                "cayenne_snapshot_sequence",
+                &[("table_id", "cid"), ("snapshot_id", "child-protected")],
+            ));
+        slice
+            .tables
+            .get_mut("cayenne_delete_file")
+            .expect("deletes")
+            .push(slice_row(
+                "cayenne_delete_file",
+                &[
+                    ("table_id", "cid"),
+                    ("path", "region=eu/child-current/deletions/delete_1.arrow"),
+                ],
+            ));
+
+        let skip = unreferenced_data_entries(anchor, &slice)
+            .await
+            .expect("list");
+        let expected: HashSet<PathBuf> = [
+            "tid/retired",
+            // An in-flight cross-partition commit anchor is write state, like
+            // `_staging`: restored beside a committed slice, it would describe
+            // a commit the slice does not hold.
+            "_partitioned_wal",
+            "region=eu/cid/child-retired",
+            "region=eu/cid/_staging",
+            "region=eu/child-retired",
+            "region=us/did/us-retired",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(skip, expected);
+    }
+
+    /// Two tables in one slice with the same data root cannot be pruned
+    /// separately (each would skip the other's snapshots), so the dataset is
+    /// archived whole.
+    #[tokio::test]
+    async fn tables_sharing_a_root_are_archived_whole() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        for dir in ["tid/current", "tid/retired", "cid/child-current"] {
+            std::fs::create_dir_all(anchor.join(dir)).expect("mkdir");
+        }
+        let mut slice = slice_with("tid", "current", &[], &[]);
+        slice
+            .tables
+            .get_mut("cayenne_table")
+            .expect("parent")
+            .push(slice_row(
+                "cayenne_table",
+                &[
+                    ("table_id", "cid"),
+                    ("path", &anchor.to_string_lossy()),
+                    ("current_snapshot_id", "child-current"),
+                ],
+            ));
+        assert!(
+            unreferenced_data_entries(anchor, &slice)
+                .await
+                .expect("list")
+                .is_empty()
+        );
     }
 
     /// A full refresh retires the previous snapshot directory; the snapshot
@@ -884,8 +1087,11 @@ mod tests {
     /// data included. The parent is created the way the accelerator creates it,
     /// with `partition_column: None`, and its partitions through
     /// `CayennePartitionCreator`, so each child table is rooted at its Hive
-    /// directory under the data directory. After the archive is extracted and
-    /// its slice imported, every partition reads back the rows written to it.
+    /// directory under the data directory. One partition is then fully
+    /// refreshed, which retires its first snapshot directory: the plan must skip
+    /// it, as it does for an unpartitioned table, because the sweep removes it
+    /// while the archive is written. After the archive is extracted and its
+    /// slice imported, every partition reads back its current rows.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_partitioned_dataset_round_trips_through_an_archive_with_its_partition_data() {
         use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -961,7 +1167,53 @@ mod tests {
         .expect("create parent");
         let table_id = catalog.get_table("trips").await.expect("meta").table_id;
         let creator = creator_over(&catalog, &data_dir, table_id);
-        for (bucket, rows) in [("alpha", 10_usize), ("beta", 20)] {
+        // The Hive directory a `bucket` partition is written under.
+        let partition_dir = |bucket: &str| -> PathBuf {
+            runtime_table_partition::creator::filename::to_hive_partition_dir(&[(
+                PartitionedBy {
+                    name: "bucket".to_string(),
+                    expression: col("bucket"),
+                },
+                ScalarValue::Utf8(Some(bucket.to_string())),
+            )])
+            .expect("partition dir")
+        };
+        // `<partition dir>/<child table_id>/<snapshot_id>` directories on disk.
+        let snapshot_dirs = |bucket: &str| -> HashSet<PathBuf> {
+            let partition_dir = partition_dir(bucket);
+            let mut dirs = HashSet::new();
+            for child in std::fs::read_dir(data_dir.join(&partition_dir)).expect("read partition") {
+                let child = child.expect("entry");
+                if !child.path().is_dir() {
+                    continue;
+                }
+                for snapshot in std::fs::read_dir(child.path()).expect("read child") {
+                    let snapshot = snapshot.expect("entry");
+                    // `_staging` is write state, not a snapshot.
+                    if snapshot.path().is_dir()
+                        && !snapshot.file_name().to_string_lossy().starts_with('_')
+                    {
+                        dirs.insert(
+                            partition_dir
+                                .join(child.file_name())
+                                .join(snapshot.file_name()),
+                        );
+                    }
+                }
+            }
+            dirs
+        };
+        let mut retired = HashSet::new();
+        for (bucket, rows, op) in [
+            ("alpha", 10_usize, InsertOp::Append),
+            ("beta", 20, InsertOp::Append),
+            // The full refresh of `alpha` retires its first snapshot directory.
+            ("alpha", 5, InsertOp::Overwrite),
+        ] {
+            if op == InsertOp::Overwrite {
+                retired = snapshot_dirs("alpha");
+                assert_eq!(retired.len(), 1, "alpha has one snapshot: {retired:?}");
+            }
             let partition = creator
                 .create_partition(vec![ScalarValue::Utf8(Some(bucket.to_string()))])
                 .await
@@ -979,11 +1231,20 @@ mod tests {
                 .expect("exec");
             let plan = partition
                 .table_provider
-                .insert_into(&ctx.state(), input, InsertOp::Append)
+                .insert_into(&ctx.state(), input, op)
                 .await
                 .expect("plan");
             collect(plan, ctx.task_ctx()).await.expect("write");
         }
+        let current: HashSet<PathBuf> = snapshot_dirs("alpha")
+            .difference(&retired)
+            .cloned()
+            .collect();
+        assert_eq!(
+            current.len(),
+            1,
+            "the refresh wrote one new snapshot and the retired one is still on disk"
+        );
 
         let dirs = vec![
             (metadata_dir.clone(), "metadata/".to_string()),
@@ -997,6 +1258,23 @@ mod tests {
         .prepare_directory_snapshot(&dirs, "trips")
         .await
         .expect("prepare");
+        for dir in &retired {
+            assert!(
+                plan.skip_relative_paths.contains(dir),
+                "the retired partition snapshot {dir:?} must be skipped: {:?}",
+                plan.skip_relative_paths
+            );
+        }
+        for dir in current.iter().chain(&snapshot_dirs("beta")) {
+            assert!(
+                !plan
+                    .skip_relative_paths
+                    .iter()
+                    .any(|skipped| dir.starts_with(skipped)),
+                "the current partition snapshot {dir:?} must be archived: {:?}",
+                plan.skip_relative_paths
+            );
+        }
         let tar = tmp.path().join("snapshot.tar");
         let skip: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
         let extras: Vec<(String, Vec<u8>)> = plan
@@ -1027,6 +1305,12 @@ mod tests {
         )
         .await
         .expect("extract");
+        for dir in &retired {
+            assert!(
+                !reader_data.join(dir).exists(),
+                "the retired partition snapshot {dir:?} must not be in the archive"
+            );
+        }
         CayenneSnapshotEngine::new(
             Arc::clone(&reader_catalog) as Arc<dyn MetadataCatalog>,
             "trips",
@@ -1073,8 +1357,8 @@ mod tests {
         read_back.sort();
         assert_eq!(
             read_back,
-            vec![("alpha".to_string(), 10), ("beta".to_string(), 20)],
-            "every partition reads back the rows written to it"
+            vec![("alpha".to_string(), 5), ("beta".to_string(), 20)],
+            "every partition reads back its current rows"
         );
     }
 
