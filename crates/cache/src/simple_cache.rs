@@ -201,7 +201,19 @@ impl<
 
     async fn invalidate_all(&self) {
         self.cache.invalidate_all();
-        self.cache.run_pending_tasks().await;
+        // With an eviction listener installed, moka ends a maintenance pass after 100 ms and
+        // leaves the rest for the next one, so one pass may not reach every entry when values
+        // are slow to drop. Repeat while passes still remove entries; what a pass cannot
+        // remove was inserted after the invalidation and is valid.
+        let mut remaining = u64::MAX;
+        loop {
+            self.cache.run_pending_tasks().await;
+            let now = self.cache.entry_count();
+            if now == 0 || now >= remaining {
+                break;
+            }
+            remaining = now;
+        }
     }
 
     async fn size_bytes(&self) -> u64 {
@@ -544,6 +556,37 @@ mod tests {
         assert!(
             alive.upgrade().is_none(),
             "a plan moka has removed must not keep its provider alive"
+        );
+    }
+
+    /// A value whose last drop takes a while, as dropping a provider that owns real state can.
+    struct SlowDrop;
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // moka bounds each maintenance pass to 100 ms once an eviction listener is installed, so
+    // a cache whose values are slow to drop is not emptied by a single pass.
+    #[tokio::test]
+    async fn invalidate_all_releases_every_value_even_when_dropping_them_is_slow() {
+        let cache: SimpleCache<Arc<SlowDrop>, _, _> =
+            SimpleCache::new(2_000, Duration::from_hours(1), RandomState::default());
+        let mut alive = Vec::new();
+        for key in 0..1_000u64 {
+            let value = Arc::new(SlowDrop);
+            alive.push(Arc::downgrade(&value));
+            cache.put_raw_key(&key, value).await;
+        }
+        cache.checkpoint().await;
+
+        cache.invalidate_all().await;
+
+        let still_alive = alive.iter().filter(|w| w.upgrade().is_some()).count();
+        assert_eq!(
+            still_alive, 0,
+            "values still alive after invalidate_all returned"
         );
     }
 }
