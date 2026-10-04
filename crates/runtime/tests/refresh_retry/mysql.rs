@@ -39,8 +39,13 @@ use runtime::{
     accelerated::{AcceleratedTable, refresh::Refresh, refresh_task::RefreshTask},
 };
 use spicepod::acceleration::Acceleration;
-use tokio::runtime::Handle;
-use tokio::time;
+use tokio::{
+    io::copy_bidirectional,
+    net::{TcpListener, TcpStream},
+    runtime::Handle,
+    task::JoinSet,
+    time,
+};
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
@@ -140,17 +145,45 @@ async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn Table
     Ok(Arc::clone(&accelerated_table.get_accelerator()))
 }
 
+/// Keep the clients' loopback endpoint bound while Docker remaps the backend on restart.
+/// Dropping the task set closes the listener and all forwarded connections.
+async fn mysql_restart_proxy(
+    container: Arc<RunningContainer>,
+) -> Result<(u16, JoinSet<()>), String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let mut proxy = JoinSet::new();
+    proxy.spawn(async move {
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut client, _) = accepted.expect("proxy accepts MySQL connections");
+                    let backend_port = container.host_port(3306).expect("MySQL port is published");
+                    connections.spawn(async move {
+                        // Connection failures are the outage that the refresh task must retry.
+                        if let Ok(mut backend) = TcpStream::connect(("127.0.0.1", backend_port)).await {
+                            let _ = copy_bidirectional(&mut client, &mut backend).await;
+                        }
+                    });
+                }
+                Some(_) = connections.join_next() => {}
+            }
+        }
+    });
+    Ok((port, proxy))
+}
+
 #[tokio::test]
 async fn mysql_refresh_retries() -> Result<(), String> {
     register_test_connectors().await;
 
     test_request_context()
         .scope(async {
-            let running_container = prepare_test_environment().await?;
-            let port = running_container
-                .host_port(3306)
-                .map_err(|e| e.to_string())?;
-            let running_container = Arc::new(running_container);
+            let running_container = Arc::new(prepare_test_environment().await?);
+            let (port, mut proxy) = mysql_restart_proxy(Arc::clone(&running_container)).await?;
 
             let mut ds_no_retries =
                 make_mysql_dataset("lineitem", "lineitem_no_retries", port, false);
@@ -246,6 +279,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 }
             };
 
+            proxy.shutdown().await;
             running_container.remove().await.map_err(|e| {
                 tracing::error!("running_container.remove: {e}");
                 e.to_string()
