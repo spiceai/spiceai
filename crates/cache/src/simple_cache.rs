@@ -37,8 +37,13 @@ use std::time::Duration;
 /// cached logical plan holds the providers it was planned against, so until then a
 /// discarded plan keeps a removed dataset's provider, and the query memory that provider
 /// has reserved, alive (#14251). Emptying the slot drops the value while the invalidation
-/// runs, and what moka destroys later is an empty slot.
+/// runs, and what moka destroys later is an empty slot. An entry moka evicts for capacity
+/// or TTL is still released whenever moka destroys it.
 type Slot<V> = Arc<RwLock<Option<V>>>;
+
+fn slot<V>(value: V) -> Slot<V> {
+    Arc::new(RwLock::new(Some(value)))
+}
 
 // 'static is required by a bound from moka::Cache
 pub struct SimpleCache<
@@ -102,25 +107,7 @@ impl<
             max_size: cache_max_size,
         }
     }
-}
 
-impl<
-    V: AsTableRefs + Clone + Send + Sync + 'static,
-    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
-    H: Hasher + Send + Sync + 'static,
-> SimpleCache<V, T, H>
-{
-    pub fn as_tabled_provider(self: Arc<Self>) -> Arc<dyn TabledCacheProvider<V> + Send + Sync> {
-        self
-    }
-}
-
-impl<
-    V: Clone + Send + Sync + 'static,
-    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
-    H: Hasher + Send + Sync + 'static,
-> SimpleCache<V, T, H>
-{
     async fn get_value(&self, key: &u64) -> Option<V> {
         self.cache.get(key).await?.read().clone()
     }
@@ -140,6 +127,17 @@ impl<
             let taken = slot.write().take();
             drop(taken);
         }
+    }
+}
+
+impl<
+    V: AsTableRefs + Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> SimpleCache<V, T, H>
+{
+    pub fn as_tabled_provider(self: Arc<Self>) -> Arc<dyn TabledCacheProvider<V> + Send + Sync> {
+        self
     }
 }
 
@@ -181,9 +179,7 @@ impl<
     }
 
     async fn put_raw_key(&self, key: &u64, value: V) {
-        self.cache
-            .insert(*key, Arc::new(RwLock::new(Some(value))))
-            .await;
+        self.cache.insert(*key, slot(value)).await;
     }
 
     async fn put_raw_key_with_weight(&self, key: &u64, value: V, _weight: usize) {
@@ -205,7 +201,7 @@ impl<
                     .as_ref()
                     .is_some_and(|entry| entry.value().read().as_ref().is_some_and(should_replace));
                 std::future::ready(if replace {
-                    moka::ops::compute::Op::Put(Arc::new(RwLock::new(Some(value))))
+                    moka::ops::compute::Op::Put(slot(value))
                 } else {
                     moka::ops::compute::Op::Nop
                 })
@@ -288,12 +284,12 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::{MemTable, provider_as_source};
-    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
     use datafusion::sql::TableReference;
     use rstest::rstest;
     use std::collections::HashSet;
     use std::hash::RandomState;
-    use std::sync::Arc;
+    use std::sync::{Arc, Weak};
     use std::time::Duration;
 
     fn create_test_record_batch() -> RecordBatch {
@@ -478,12 +474,7 @@ mod tests {
 
     /// A logical plan scanning `table`, and a handle that reports whether the provider
     /// it was planned against is still alive.
-    fn plan_over(
-        table: &str,
-    ) -> (
-        datafusion::logical_expr::LogicalPlan,
-        std::sync::Weak<MemTable>,
-    ) {
+    fn plan_over(table: &str) -> (LogicalPlan, Weak<MemTable>) {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let provider =
             Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("empty MemTable"));
