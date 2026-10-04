@@ -242,6 +242,8 @@ mod tests {
     use crate::CachedQueryResult;
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::{MemTable, provider_as_source};
+    use datafusion::logical_expr::LogicalPlanBuilder;
     use datafusion::sql::TableReference;
     use rstest::rstest;
     use std::collections::HashSet;
@@ -427,5 +429,77 @@ mod tests {
             .is_none()
             .then_some(())
             .expect("cache should not contain key after TTL expiry");
+    }
+
+    /// A logical plan scanning `table`, and a handle that reports whether the provider
+    /// it was planned against is still alive.
+    fn plan_over(
+        table: &str,
+    ) -> (
+        datafusion::logical_expr::LogicalPlan,
+        std::sync::Weak<MemTable>,
+    ) {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let provider =
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("empty MemTable"));
+        let alive = Arc::downgrade(&provider);
+        let plan = LogicalPlanBuilder::scan(table, provider_as_source(provider), None)
+            .expect("scan builds")
+            .build()
+            .expect("plan builds");
+        (plan, alive)
+    }
+
+    // Regression test for #14251. A cached plan holds the providers it was planned
+    // against, so a discard that leaves the plan alive keeps a removed dataset's
+    // provider, and the memory it has reserved, alive with it.
+    #[tokio::test]
+    async fn invalidate_all_releases_the_providers_of_discarded_plans() {
+        let cache = SimpleCache::new(10, Duration::from_hours(1), RandomState::default());
+        let (plan, alive) = plan_over("removed");
+        cache.put_raw_key(&1, plan).await;
+        cache.checkpoint().await;
+        assert!(
+            alive.upgrade().is_some(),
+            "the cached plan holds its provider"
+        );
+
+        cache.invalidate_all().await;
+
+        assert!(
+            alive.upgrade().is_none(),
+            "a discarded plan must not keep its provider alive once invalidate_all returns"
+        );
+        assert!(cache.get_raw_key(&1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalidate_for_table_releases_only_the_plans_over_that_table() {
+        let cache = SimpleCache::new(10, Duration::from_hours(1), RandomState::default());
+        let (removed_plan, removed_alive) = plan_over("removed");
+        let (kept_plan, kept_alive) = plan_over("kept");
+        cache.put_raw_key(&1, removed_plan).await;
+        cache.put_raw_key(&2, kept_plan).await;
+        cache.checkpoint().await;
+
+        cache
+            .invalidate_for_table(TableReference::bare("removed"))
+            .await
+            .expect("invalidation succeeds");
+
+        assert!(
+            removed_alive.upgrade().is_none(),
+            "a plan over the invalidated table must not keep its provider alive"
+        );
+        assert!(cache.get_raw_key(&1).await.is_none());
+        assert!(kept_alive.upgrade().is_some());
+        let kept = cache
+            .get_raw_key(&2)
+            .await
+            .expect("the other plan stays cached");
+        assert_eq!(
+            kept.as_table_refs().as_ref(),
+            &HashSet::from([TableReference::bare("kept")])
+        );
     }
 }
