@@ -41,13 +41,7 @@ struct ScopedAppend {
     identity: usize,
 }
 
-#[derive(Clone, Copy)]
-struct InputRow {
-    batch: usize,
-    row: usize,
-}
-
-type InputKeyRows = HashMap<Vec<ScalarValue>, HashMap<usize, Vec<InputRow>>>;
+type InputKeyScopes = HashMap<Vec<ScalarValue>, usize>;
 
 /// Validate every member before a coalesced append reaches provider planning.
 /// Ranges describe whole transport chunks, never rows or a merged logical set.
@@ -129,9 +123,14 @@ async fn validate_incoming_scopes(
                 "Unique key columns do not match the scoped append schema".into(),
             )));
         }
-        if all_grouping_columns
+        // Equal grouping shapes distinguish scopes by key values. A union of
+        // different shapes does not prove that the scopes are disjoint.
+        if scopes
             .iter()
-            .all(|column| columns.contains(column))
+            .all(|scope| scope.filters.len() == all_grouping_columns.len())
+            && all_grouping_columns
+                .iter()
+                .all(|column| columns.contains(column))
         {
             continue;
         }
@@ -147,7 +146,7 @@ async fn validate_incoming_scopes(
         let task = ctx.task_ctx();
         let reservation =
             MemoryConsumer::new("ChangeSink scoped append keys").register(task.memory_pool());
-        let mut keys = InputKeyRows::new();
+        let mut keys = InputKeyScopes::new();
         for scoped in scopes {
             for batch_index in scoped.batches.clone() {
                 let batch = &batches[batch_index];
@@ -165,21 +164,12 @@ async fn validate_incoming_scopes(
                             context.dataset_name,
                         ))));
                     }
-                    if let Some(previous_scopes) = keys.get(&key) {
-                        for (&identity, previous_rows) in previous_scopes {
-                            if identity == scoped.identity {
-                                continue;
-                            }
-                            for previous in previous_rows {
-                                let other = &scopes[identity].scope;
-                                let previous_batch = batches[previous.batch].slice(previous.row, 1);
-                                scoped.scope.validate_batch(&previous_batch)
-                                    .and_then(|()| other.validate_batch(&batch.slice(row, 1)))
-                                    .map_err(|error| before_mutation(DataFusionError::Context(
-                                        format!("Unique key conflicts between scoped appends for dataset '{}'", context.dataset_name),
-                                        Box::new(error),
-                                    )))?;
-                            }
+                    if let Some(&identity) = keys.get(&key) {
+                        if identity != scoped.identity {
+                            return Err(before_mutation(DataFusionError::Plan(format!(
+                                "Unique key conflicts between scoped appends for dataset '{}'",
+                                context.dataset_name,
+                            ))));
                         }
                     } else {
                         // Account for retained scalar values and hash-table spare capacity.
@@ -187,27 +177,10 @@ async fn validate_incoming_scopes(
                             .iter()
                             .map(ScalarValue::size)
                             .fold(0_usize, usize::saturating_add)
-                            .saturating_add(
-                                4 * size_of::<(Vec<ScalarValue>, HashMap<usize, Vec<InputRow>>)>(),
-                            );
+                            .saturating_add(4 * size_of::<(Vec<ScalarValue>, usize)>());
                         reservation.try_grow(bytes).map_err(before_mutation)?;
+                        keys.insert(key, scoped.identity);
                     }
-                    let previous_scopes = keys.entry(key).or_default();
-                    if !previous_scopes.contains_key(&scoped.identity) {
-                        reservation
-                            .try_grow(4 * size_of::<(usize, Vec<InputRow>)>())
-                            .map_err(before_mutation)?;
-                    }
-                    reservation
-                        .try_grow(2 * size_of::<InputRow>())
-                        .map_err(before_mutation)?;
-                    previous_scopes
-                        .entry(scoped.identity)
-                        .or_default()
-                        .push(InputRow {
-                            batch: batch_index,
-                            row,
-                        });
                     if row % 128 == 127 {
                         tokio::task::yield_now().await;
                     }

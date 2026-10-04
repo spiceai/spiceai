@@ -1242,7 +1242,8 @@ impl Runtime {
         ds_acceleration: Option<&Acceleration>,
         bootstrap: &AcceleratorBootstrap,
     ) -> bool {
-        if self.df.table_exists(&ds_name) {
+        let was_registered = self.df.table_exists(&ds_name);
+        if was_registered {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                 datasets_health_monitor
                     .deregister_dataset(&ds_name.to_string())
@@ -1283,7 +1284,9 @@ impl Runtime {
             tracing::warn!("Unable to remove dataset schedule for {}: {e}", &ds_name);
         }
 
-        metrics::datasets::COUNT.add(-1, &[KeyValue::new("engine", engine)]);
+        if was_registered {
+            metrics::datasets::COUNT.add(-1, &[KeyValue::new("engine", engine)]);
+        }
         true
     }
 

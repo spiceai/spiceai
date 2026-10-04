@@ -2509,14 +2509,8 @@ impl DataFusion {
         self.pending_initializations_count
             .fetch_add(1, std::sync::atomic::Ordering::Release);
 
-        if !dataset
-            .acceleration
-            .as_ref()
-            .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Caching))
-        {
-            self.runtime_status
-                .update_dataset(&dataset.name, status::ComponentStatus::Ready);
-        }
+        self.runtime_status
+            .update_dataset(&dataset.name, status::ComponentStatus::Ready);
 
         Ok(())
     }
