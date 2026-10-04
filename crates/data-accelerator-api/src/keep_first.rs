@@ -28,10 +28,12 @@ limitations under the License.
 use std::{collections::HashMap, hash::BuildHasher, sync::Arc};
 
 use arrow::{
-    array::{Array, ArrayRef, BooleanArray, RecordBatch},
-    buffer::{Buffer, NullBuffer},
+    array::{Array, ArrayRef, AsArray, BooleanArray, RecordBatch},
+    buffer::{BooleanBuffer, Buffer, NullBuffer},
     compute::filter_record_batch,
-    datatypes::{DataType, Schema, SchemaRef},
+    datatypes::{
+        ArrowPrimitiveType, DataType, Float16Type, Float32Type, Float64Type, Schema, SchemaRef,
+    },
     row::{RowConverter, Rows, SortField},
 };
 use async_trait::async_trait;
@@ -61,6 +63,8 @@ use spice_table::{LayerWalk, SpiceTable, TableLayer};
 /// key. An append under several `drop` targets is left to the table; see
 /// [`KeepFirst`]'s `insert_into`.
 ///
+/// `nan` is how the engine below stores a NaN in a key column.
+///
 /// Returns `provider` unchanged for any other `on_conflict` (or none).
 #[must_use]
 pub fn wrap_with_keep_first_if_needed<S: BuildHasher>(
@@ -68,6 +72,7 @@ pub fn wrap_with_keep_first_if_needed<S: BuildHasher>(
     options: &HashMap<String, String, S>,
     schema: &Schema,
     constraints: &Constraints,
+    nan: NanKey,
 ) -> Arc<dyn TableProvider> {
     let key_sets = drop_key_sets(
         options.get("on_conflict").map(String::as_str),
@@ -77,8 +82,18 @@ pub fn wrap_with_keep_first_if_needed<S: BuildHasher>(
     if key_sets.is_empty() {
         provider
     } else {
-        SpiceTable::over(Arc::new(KeepFirst { key_sets }), provider)
+        SpiceTable::over(Arc::new(KeepFirst { key_sets, nan }), provider)
     }
+}
+
+/// How an engine stores a NaN in a key column, and so whether two NaN keys
+/// conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NanKey {
+    /// A NaN is a value, and every NaN is the same one (`DuckDB`).
+    Value,
+    /// A NaN is stored as NULL, so like NULL it never conflicts (`SQLite`).
+    Null,
 }
 
 /// The column sets `on_conflict` drops repeats of: the configured target for a
@@ -139,6 +154,7 @@ fn field_name(schema: &Schema, column: &str) -> Option<String> {
 #[derive(Debug)]
 pub struct KeepFirst {
     key_sets: Vec<Vec<String>>,
+    nan: NanKey,
 }
 
 #[async_trait]
@@ -178,7 +194,7 @@ impl TableLayer for KeepFirst {
         if self.key_sets.len() > 1 && op != InsertOp::Overwrite {
             return below.insert_into(state, input, op).await;
         }
-        let exec = KeepFirstExec::try_new(input, &self.key_sets)?;
+        let exec = KeepFirstExec::try_new(input, &self.key_sets, self.nan)?;
         below.insert_into(state, Arc::new(exec), op).await
     }
 }
@@ -190,6 +206,7 @@ impl TableLayer for KeepFirst {
 struct KeepFirstExec {
     input: Arc<dyn ExecutionPlan>,
     key_indices: Arc<[Vec<usize>]>,
+    nan: NanKey,
     properties: Arc<PlanProperties>,
 }
 
@@ -197,6 +214,7 @@ impl KeepFirstExec {
     fn try_new(
         input: Arc<dyn ExecutionPlan>,
         key_sets: &[Vec<String>],
+        nan: NanKey,
     ) -> datafusion::error::Result<Self> {
         let schema = input.schema();
         let key_indices = key_sets
@@ -208,10 +226,14 @@ impl KeepFirstExec {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Arc<[_]>, _>>()?;
-        Ok(Self::with_indices(input, key_indices))
+        Ok(Self::with_indices(input, key_indices, nan))
     }
 
-    fn with_indices(input: Arc<dyn ExecutionPlan>, key_indices: Arc<[Vec<usize>]>) -> Self {
+    fn with_indices(
+        input: Arc<dyn ExecutionPlan>,
+        key_indices: Arc<[Vec<usize>]>,
+        nan: NanKey,
+    ) -> Self {
         let input = if input.output_partitioning().partition_count() > 1 {
             Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
         } else {
@@ -222,6 +244,7 @@ impl KeepFirstExec {
             properties: Arc::clone(input.properties()),
             input,
             key_indices,
+            nan,
         }
     }
 }
@@ -281,6 +304,7 @@ impl ExecutionPlan for KeepFirstExec {
         Ok(Arc::new(Self::with_indices(
             child,
             Arc::clone(&self.key_indices),
+            self.nan,
         )))
     }
 
@@ -293,7 +317,7 @@ impl ExecutionPlan for KeepFirstExec {
         let schema = self.schema();
         let reservation = MemoryConsumer::new(format!("KeepFirstExec[{partition}]"))
             .register(context.memory_pool());
-        let mut seen = SeenKeys::try_new(&schema, &self.key_indices, reservation)?;
+        let mut seen = SeenKeys::try_new(&schema, &self.key_indices, self.nan, reservation)?;
         // The filter runs on a task of its own, so it filters the next batch
         // while whatever drains this stream (the engine's write) handles the
         // last one, rather than the two taking turns.
@@ -326,6 +350,7 @@ struct SeenKeys {
 /// written, a dropped row or a row with a NULL in its key costs nothing.
 struct KeyColumns {
     indices: Vec<usize>,
+    nan: NanKey,
     hasher: DefaultHashBuilder,
     admitted: Admitted,
 }
@@ -333,9 +358,10 @@ struct KeyColumns {
 /// How one key's admitted values are held: as cheaply as its type allows.
 enum Admitted {
     /// A single column at most eight bytes wide, held as each value's bits.
-    /// Two values are equal exactly when their bits are, which is also how
-    /// arrow's row format compares them, so this drops the same rows as
-    /// `Encoded` without encoding a key or storing it twice.
+    /// Once floats are made canonical (`canonical_key_column`), two values are
+    /// equal exactly when their bits are, which is also how arrow's row format
+    /// compares them, so this drops the same rows as `Encoded` without
+    /// encoding a key or storing it twice.
     Bits {
         data_type: DataType,
         width: usize,
@@ -351,7 +377,7 @@ enum Admitted {
 }
 
 impl KeyColumns {
-    fn try_new(schema: &Schema, indices: &[usize]) -> datafusion::error::Result<Self> {
+    fn try_new(schema: &Schema, indices: &[usize], nan: NanKey) -> datafusion::error::Result<Self> {
         let bits = match indices {
             [index] => {
                 let data_type = schema.field(*index).data_type();
@@ -381,6 +407,7 @@ impl KeyColumns {
         };
         Ok(Self {
             indices: indices.to_vec(),
+            nan,
             hasher: DefaultHashBuilder::default(),
             admitted,
         })
@@ -388,7 +415,7 @@ impl KeyColumns {
 
     /// This batch's values of the key, borrowed with the key's admitted
     /// values, and which rows have a NULL in the key: such a key never
-    /// conflicts, as in SQL.
+    /// conflicts, as in SQL. Under [`NanKey::Null`] a NaN counts as a NULL.
     fn batch_keys(
         &mut self,
         batch: &RecordBatch,
@@ -396,12 +423,18 @@ impl KeyColumns {
         let columns: Vec<ArrayRef> = self
             .indices
             .iter()
-            .map(|&index| Arc::clone(batch.column(index)))
+            .map(|&index| canonical_key_column(Arc::clone(batch.column(index))))
             .collect();
         let nulls = columns
             .iter()
             .fold(None, |acc: Option<NullBuffer>, column| {
-                NullBuffer::union(acc.as_ref(), column.logical_nulls().as_ref())
+                let nulls = NullBuffer::union(acc.as_ref(), column.logical_nulls().as_ref());
+                match self.nan {
+                    NanKey::Value => nulls,
+                    NanKey::Null => {
+                        NullBuffer::union(nulls.as_ref(), nans_as_nulls(column).as_ref())
+                    }
+                }
             });
         let keys = match &mut self.admitted {
             Admitted::Bits {
@@ -535,6 +568,69 @@ impl BatchKeys<'_> {
     }
 }
 
+/// `column` with each float the engines hold as one key written one way:
+/// `-0.0` as `0.0`, and every NaN as the same NaN. `DuckDB` and `SQLite` both
+/// treat `-0.0` as a repeat of a stored `0.0`, and `DuckDB` every NaN as one
+/// key, while their bits, and arrow's row format, tell them apart. The write
+/// still carries the values it was given; only the keys compared change. Any
+/// other column is returned as is.
+fn canonical_key_column(column: ArrayRef) -> ArrayRef {
+    type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+    match column.data_type() {
+        DataType::Float16 => Arc::new(
+            column
+                .as_primitive::<Float16Type>()
+                .unary::<_, Float16Type>(|value| match value {
+                    value if value.is_nan() => F16::NAN,
+                    value if value == F16::ZERO => F16::ZERO,
+                    value => value,
+                }),
+        ),
+        DataType::Float32 => Arc::new(
+            column
+                .as_primitive::<Float32Type>()
+                .unary::<_, Float32Type>(|value| match value {
+                    value if value.is_nan() => f32::NAN,
+                    0.0 => 0.0,
+                    value => value,
+                }),
+        ),
+        DataType::Float64 => Arc::new(
+            column
+                .as_primitive::<Float64Type>()
+                .unary::<_, Float64Type>(|value| match value {
+                    value if value.is_nan() => f64::NAN,
+                    0.0 => 0.0,
+                    value => value,
+                }),
+        ),
+        _ => column,
+    }
+}
+
+/// Which rows of a float `column` hold a NaN, as a null buffer: valid where
+/// the value is not NaN. `None` for any other column.
+fn nans_as_nulls(column: &ArrayRef) -> Option<NullBuffer> {
+    fn not_nan<T: ArrowPrimitiveType>(
+        column: &ArrayRef,
+        is_nan: impl Fn(T::Native) -> bool,
+    ) -> NullBuffer {
+        let values = column.as_primitive::<T>().values();
+        NullBuffer::new(BooleanBuffer::collect_bool(values.len(), |row| {
+            !is_nan(values[row])
+        }))
+    }
+    match column.data_type() {
+        DataType::Float16 => Some(not_nan::<Float16Type>(
+            column,
+            <Float16Type as ArrowPrimitiveType>::Native::is_nan,
+        )),
+        DataType::Float32 => Some(not_nan::<Float32Type>(column, f32::is_nan)),
+        DataType::Float64 => Some(not_nan::<Float64Type>(column, f64::is_nan)),
+        _ => None,
+    }
+}
+
 /// The bits of the value at `row` of a column `width` bytes wide.
 fn bits(values: &[u8], width: usize, row: usize) -> u64 {
     let mut bits = [0; 8];
@@ -607,11 +703,12 @@ impl SeenKeys {
     fn try_new(
         schema: &Schema,
         key_indices: &[Vec<usize>],
+        nan: NanKey,
         reservation: MemoryReservation,
     ) -> datafusion::error::Result<Self> {
         let keys = key_indices
             .iter()
-            .map(|indices| KeyColumns::try_new(schema, indices))
+            .map(|indices| KeyColumns::try_new(schema, indices, nan))
             .collect::<datafusion::error::Result<_>>()?;
         Ok(Self { keys, reservation })
     }
@@ -669,14 +766,16 @@ impl SeenKeys {
 #[cfg(test)]
 mod tests {
     use super::{
-        Admitted, AdmittedKeys, KeepFirst, KeepFirstExec, KeyColumns, KeyLayout, SeenKeys,
+        Admitted, AdmittedKeys, KeepFirst, KeepFirstExec, KeyColumns, KeyLayout, NanKey, SeenKeys,
         wrap_with_keep_first_if_needed,
     };
     use spice_table::{LayerWalk, find_layer};
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow::array::{
+        Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::MemTable;
     use datafusion::common::{Constraint, Constraints};
@@ -731,7 +830,7 @@ mod tests {
 
     /// The ids `KeepFirstExec` keeps from `input`, filtering on `key_sets`.
     async fn filter_ids(input: Arc<dyn ExecutionPlan>, key_sets: &[Vec<String>]) -> Vec<i32> {
-        let exec = KeepFirstExec::try_new(input, key_sets).expect("plan");
+        let exec = KeepFirstExec::try_new(input, key_sets, NanKey::Value).expect("plan");
         let batches = collect(Arc::new(exec), Arc::new(TaskContext::default()))
             .await
             .expect("filter runs");
@@ -744,6 +843,7 @@ mod tests {
         SeenKeys::try_new(
             &schema(),
             key_indices,
+            NanKey::Value,
             MemoryConsumer::new("test").register(&pool),
         )
         .expect("key set")
@@ -779,6 +879,7 @@ mod tests {
             options,
             &schema(),
             constraints,
+            NanKey::Value,
         );
         (inner, table)
     }
@@ -1052,9 +1153,10 @@ mod tests {
     }
 
     /// A key held as its bits drops exactly the rows the same key drops in
-    /// arrow's row format, including floats whose bits differ while they
-    /// compare equal in SQL: `-0.0` and `0.0`, and NaNs with different
-    /// payloads. A constant second column puts the same key in the row format.
+    /// arrow's row format, including floats whose bits differ while the
+    /// engines treat them as one key: `-0.0` and `0.0`, and NaNs with
+    /// different payloads. A constant second column puts the same key in the
+    /// row format.
     #[test]
     fn a_key_held_as_bits_drops_what_the_row_format_drops() {
         let schema = Arc::new(Schema::new(vec![
@@ -1088,12 +1190,14 @@ mod tests {
         let mut as_bits = SeenKeys::try_new(
             &schema,
             &[vec![0]],
+            NanKey::Value,
             MemoryConsumer::new("bits").register(&pool),
         )
         .expect("key set");
         let mut as_rows = SeenKeys::try_new(
             &schema,
             &[vec![0, 1]],
+            NanKey::Value,
             MemoryConsumer::new("rows").register(&pool),
         )
         .expect("key set");
@@ -1102,8 +1206,108 @@ mod tests {
 
         let kept = as_bits.keep_first(batch.clone()).expect("filter");
         assert_eq!(kept, as_rows.keep_first(batch).expect("filter"));
-        // 0.0, -0.0, NaN, the other NaN, 1.5, infinity, and both NULLs.
-        assert_eq!(kept.num_rows(), 8);
+        // 0.0, NaN, 1.5, infinity, and both NULLs.
+        assert_eq!(kept.num_rows(), 6);
+    }
+
+    /// `DuckDB` and `SQLite` both treat `-0.0` as a repeat of a stored `0.0`
+    /// key, and `DuckDB` treats NaNs with different payloads as one key, so
+    /// the filter keeps only the first of them, whether the key is held as
+    /// its bits or in the row format.
+    #[test]
+    fn floats_the_engines_treat_as_one_key_keep_their_first_copy() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("f", DataType::Float64, true),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let other_nan = f64::from_bits(f64::NAN.to_bits() ^ 1);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Float64Array::from(vec![
+                    Some(-0.0),
+                    Some(0.0),
+                    Some(other_nan),
+                    Some(f64::NAN),
+                ])),
+                Arc::new(Int32Array::from(vec![7; 4])),
+            ],
+        )
+        .expect("build batch");
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let as_bits = SeenKeys::try_new(
+            &schema,
+            &[vec![1]],
+            NanKey::Value,
+            MemoryConsumer::new("bits").register(&pool),
+        )
+        .expect("key set");
+        let as_rows = SeenKeys::try_new(
+            &schema,
+            &[vec![1, 2]],
+            NanKey::Value,
+            MemoryConsumer::new("rows").register(&pool),
+        )
+        .expect("key set");
+        assert!(matches!(as_bits.keys[0].admitted, Admitted::Bits { .. }));
+        assert!(matches!(as_rows.keys[0].admitted, Admitted::Encoded { .. }));
+
+        for mut seen in [as_bits, as_rows] {
+            let kept = seen.keep_first(batch.clone()).expect("filter");
+            assert_eq!(ids(std::slice::from_ref(&kept)), vec![1, 3]);
+            // The kept rows are the ones written, not their canonical form.
+            let floats = kept
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64 column");
+            assert!(floats.value(0).is_sign_negative());
+            assert_eq!(floats.value(1).to_bits(), other_nan.to_bits());
+        }
+    }
+
+    /// `SQLite` stores a NaN as NULL, so under [`NanKey::Null`] a NaN key never
+    /// conflicts, alone or in a composite key, while `-0.0` still repeats
+    /// `0.0`.
+    #[test]
+    fn under_nan_as_null_a_nan_key_never_repeats() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("f", DataType::Float32, true),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Float32Array::from(vec![
+                    Some(f32::NAN),
+                    Some(f32::NAN),
+                    Some(0.0),
+                    Some(-0.0),
+                ])),
+                Arc::new(Int32Array::from(vec![7; 4])),
+            ],
+        )
+        .expect("build batch");
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        for indices in [vec![1], vec![1, 2]] {
+            let mut seen = SeenKeys::try_new(
+                &schema,
+                std::slice::from_ref(&indices),
+                NanKey::Null,
+                MemoryConsumer::new("nan").register(&pool),
+            )
+            .expect("key set");
+            let kept = seen.keep_first(batch.clone()).expect("filter");
+            assert_eq!(
+                ids(std::slice::from_ref(&kept)),
+                vec![1, 2, 3],
+                "{indices:?}"
+            );
+        }
     }
 
     /// A batch whose key column is not the type the write declared is refused

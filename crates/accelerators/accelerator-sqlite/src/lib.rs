@@ -634,6 +634,7 @@ impl DataAccelerator for SqliteAccelerator {
             &cmd.options,
             cmd.schema.as_arrow(),
             &cmd.constraints,
+            keep_first::NanKey::Null,
         );
 
         let table_provider =

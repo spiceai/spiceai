@@ -1734,6 +1734,7 @@ pub(crate) async fn create_table_provider(
         &cmd.options,
         cmd.schema.as_arrow(),
         &cmd.constraints,
+        keep_first::NanKey::Value,
     );
 
     let mut schema_metadata = HashMap::new();
