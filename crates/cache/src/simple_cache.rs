@@ -116,7 +116,7 @@ impl<
     ///
     /// This runs first because moka's iterator is not documented to visit an entry it has
     /// already invalidated. An entry inserted after this pass is invalidated by moka but
-    /// not emptied, and is released when moka destroys it, as before.
+    /// not emptied, and is released only when moka destroys it.
     fn empty_slots(&self, discard: impl Fn(&V) -> bool) {
         for (_, slot) in &self.cache {
             if !slot.read().as_ref().is_some_and(&discard) {
