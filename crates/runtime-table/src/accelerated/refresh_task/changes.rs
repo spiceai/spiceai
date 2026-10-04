@@ -1210,6 +1210,10 @@ impl RefreshTask {
         let reader_handle = tokio::spawn(async move {
             let mut stream = changes_stream;
             let send_labels = reader_metric_labels.dataset();
+            // Envelope that would have overflowed the previous prebuild group's
+            // byte budget; must be the next group's `first` so source order is
+            // preserved when the combined size check refuses an append.
+            let mut carry: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
             // `select!` on `tx.closed()` lets the reader exit promptly even
             // when it is parked in `stream.next()`. This matters at shutdown:
             // when the parent task is aborted, its locals (including `rx`)
@@ -1219,6 +1223,16 @@ impl RefreshTask {
             // happens to arrive. With it, the reader notices the consumer is
             // gone and tears down its source connection immediately.
             loop {
+                // Prefer a carried overflow over polling the source so an
+                // over-budget envelope stays ahead of anything still in the
+                // stream.
+                let next_item = async {
+                    if let Some(item) = carry.take() {
+                        Some(item)
+                    } else {
+                        stream.next().await
+                    }
+                };
                 tokio::select! {
                     biased;
                     () = tx.closed() => {
@@ -1227,7 +1241,7 @@ impl RefreshTask {
                         );
                         return;
                     }
-                    item = stream.next() => {
+                    item = next_item => {
                         let Some(item) = item else { return; };
                         // While the apply loop is applying a burst, build deferred
                         // change rows here, so the build overlaps that apply instead
@@ -1239,12 +1253,12 @@ impl RefreshTask {
                         // for, so what is in flight stays within
                         // `cdc_prefetch_buffer` (plus the one envelope a reader
                         // parked on `send` always held).
-                        let (group, ended) = if reader_applying.load(Ordering::Acquire) {
+                        let (group, ended, overflow) = if reader_applying.load(Ordering::Acquire) {
                             let room = tx.capacity().clamp(1, PREBUILD_GROUP_MAX_ENVELOPES);
-                            let (group, ended) = take_ready_group(item, &mut stream, room);
-                            (cdc::prebuild_offloaded(group).await, ended)
+                            let (group, ended, overflow) = take_ready_group(item, &mut stream, room);
+                            (cdc::prebuild_offloaded(group).await, ended, overflow)
                         } else {
-                            (vec![item], false)
+                            (vec![item], false, None)
                         };
                         for item in group {
                             // Charge the envelope before handing it over: once `send`
@@ -1271,6 +1285,9 @@ impl RefreshTask {
                                 );
                                 return;
                             }
+                        }
+                        if let Some(item) = overflow {
+                            carry = Some(item);
                         }
                         if ended {
                             return;
@@ -3538,35 +3555,51 @@ const PREBUILD_GROUP_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// `first` plus whatever else `stream` has ready right now, without waiting,
 /// as one [`cdc::prebuild_offloaded`] group of at most `max_envelopes`
-/// envelopes and [`PREBUILD_GROUP_MAX_BYTES`]; and whether the stream ended
-/// while gathering.
+/// envelopes and [`PREBUILD_GROUP_MAX_BYTES`]; whether the stream ended while
+/// gathering; and an overflowing envelope that must start the next group (in
+/// source order) when the combined size would exceed the byte budget.
 ///
 /// The group grows only when `first` has a deferred batch to build, so an eager
-/// source's envelopes reach the apply loop one at a time, as they arrive.
+/// source's envelopes reach the apply loop one at a time, as they arrive. An
+/// envelope that alone exceeds the budget is still allowed when it is the only
+/// member of the group.
 fn take_ready_group(
     first: Result<cdc::ChangeEnvelope, cdc::StreamError>,
     stream: &mut cdc::ChangesStream,
     max_envelopes: usize,
-) -> (Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>, bool) {
+) -> (
+    Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+    bool,
+    Option<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+) {
     let needs_build = first
         .as_ref()
         .is_ok_and(|envelope| !envelope.is_materialized());
     let mut bytes = cdc_item_budget_bytes(&first);
     let mut group = vec![first];
     if !needs_build {
-        return (group, false);
+        return (group, false, None);
     }
     while group.len() < max_envelopes && bytes < PREBUILD_GROUP_MAX_BYTES {
         match stream.next().now_or_never() {
             Some(Some(item)) => {
-                bytes = bytes.saturating_add(cdc_item_budget_bytes(&item));
+                let item_bytes = cdc_item_budget_bytes(&item);
+                // Check the combined size before appending. Two ready envelopes
+                // each under the budget must not form an over-budget group; carry
+                // the overflowing one to the next group. An individually oversized
+                // envelope is allowed only when alone (already in `group` as
+                // `first`, or as the overflow that becomes the next `first`).
+                if bytes.saturating_add(item_bytes) > PREBUILD_GROUP_MAX_BYTES {
+                    return (group, false, Some(item));
+                }
+                bytes = bytes.saturating_add(item_bytes);
                 group.push(item);
             }
-            Some(None) => return (group, true),
+            Some(None) => return (group, true, None),
             None => break,
         }
     }
-    (group, false)
+    (group, false, None)
 }
 
 /// Zeroes `cdc_prefetch_buffer_bytes` for one dataset when the CDC stream that
@@ -9012,7 +9045,7 @@ mod tests {
             Ok(deferred_envelope()),
             Ok(deferred_envelope()),
         ]));
-        let (group, ended) = take_ready_group(
+        let (group, ended, _overflow) = take_ready_group(
             Ok(eager_envelope()),
             &mut stream,
             PREBUILD_GROUP_MAX_ENVELOPES,
@@ -9028,7 +9061,7 @@ mod tests {
             Err(cdc::StreamError::External("transient".to_string())),
             Ok(eager_envelope()),
         ]));
-        let (group, ended) = take_ready_group(
+        let (group, ended, _overflow) = take_ready_group(
             Ok(deferred_envelope()),
             &mut stream,
             PREBUILD_GROUP_MAX_ENVELOPES,
@@ -9045,7 +9078,7 @@ mod tests {
     fn a_build_group_stops_at_what_is_not_ready_yet() {
         let ready = futures::stream::iter(vec![Ok(deferred_envelope()), Ok(deferred_envelope())]);
         let mut stream: cdc::ChangesStream = Box::pin(ready.chain(futures::stream::pending()));
-        let (group, ended) = take_ready_group(
+        let (group, ended, _overflow) = take_ready_group(
             Ok(deferred_envelope()),
             &mut stream,
             PREBUILD_GROUP_MAX_ENVELOPES,
@@ -9059,26 +9092,71 @@ mod tests {
         let mut stream: cdc::ChangesStream = Box::pin(futures::stream::iter(
             (0..10).map(|_| Ok(deferred_envelope())),
         ));
-        let (group, ended) = take_ready_group(Ok(deferred_envelope()), &mut stream, 4);
+        let (group, ended, _overflow) = take_ready_group(Ok(deferred_envelope()), &mut stream, 4);
         assert_eq!(group.len(), 4);
         assert!(!ended);
     }
 
     #[test]
     fn a_build_group_stops_at_its_byte_budget() {
-        // Each envelope estimates a third of the budget: the group closes once
-        // the running total reaches it.
+        // Each envelope estimates a third of the budget: the group closes before
+        // appending an envelope that would push the combined size over the limit,
+        // and carries that envelope for the next group.
         let third = PREBUILD_GROUP_MAX_BYTES / 3 + 1;
         let mut stream: cdc::ChangesStream = Box::pin(futures::stream::iter(
             (0..10).map(move |_| Ok(deferred_envelope_of(third))),
         ));
-        let (group, ended) = take_ready_group(
+        let (group, ended, overflow) = take_ready_group(
             Ok(deferred_envelope_of(third)),
             &mut stream,
             PREBUILD_GROUP_MAX_ENVELOPES,
         );
-        assert_eq!(group.len(), 3);
+        assert_eq!(group.len(), 2);
+        assert!(overflow.is_some(), "third envelope is carried for the next group");
         assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_does_not_combine_two_near_limit_envelopes() {
+        // Two ready ~7 MiB envelopes must not form a 14 MiB group over the 8 MiB
+        // bound; the second is carried alone into the next group.
+        let near = 7 * 1024 * 1024;
+        let mut stream: cdc::ChangesStream =
+            Box::pin(futures::stream::iter(vec![Ok(deferred_envelope_of(near))]));
+        let (group, ended, overflow) = take_ready_group(
+            Ok(deferred_envelope_of(near)),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 1);
+        assert!(overflow.is_some());
+        assert!(!ended);
+        let (group2, ended2, overflow2) = take_ready_group(
+            overflow.expect("carried"),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group2.len(), 1);
+        assert!(overflow2.is_none());
+        assert!(!ended2);
+    }
+
+    #[test]
+    fn a_build_group_allows_an_individually_oversized_envelope_alone() {
+        let over = PREBUILD_GROUP_MAX_BYTES + 1;
+        let mut stream: cdc::ChangesStream =
+            Box::pin(futures::stream::iter(vec![Ok(deferred_envelope_of(8))]));
+        let (group, ended, overflow) = take_ready_group(
+            Ok(deferred_envelope_of(over)),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 1);
+        // `first` alone already meets the budget, so the loop does not poll; the
+        // follow-on stays in the stream for the next group.
+        assert!(overflow.is_none());
+        assert!(!ended);
+        assert!(stream.next().now_or_never().flatten().is_some());
     }
 
     /// What a deferred envelope's build does in the pipeline tests below.
