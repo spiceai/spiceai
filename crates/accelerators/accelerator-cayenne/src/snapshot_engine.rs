@@ -244,6 +244,7 @@ async fn unreferenced_data_entries(
     let table_id = slice_column("cayenne_table", "table_id");
     let table_path = slice_column("cayenne_table", "path");
     let mut roots: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen_roots: HashSet<PathBuf> = HashSet::new();
     for (i, row) in tables.iter().enumerate() {
         let Some(id) = slice_text(row, table_id) else {
             continue;
@@ -256,7 +257,7 @@ async fn unreferenced_data_entries(
                 None => continue,
             }
         };
-        if roots.iter().any(|(_, other)| *other == root) {
+        if !seen_roots.insert(root.clone()) {
             return Ok(skip);
         }
         roots.push((id.to_string(), root));
