@@ -40,7 +40,10 @@ limitations under the License.
 //! [`BinlogPosition`] into its own `spice_sys_mysql_binlog` sidecar row, and the
 //! shared dump's resume position is the **minimum** committed position across
 //! all members ([`AckTable::flush_position`]). On (re)start the pump resumes
-//! from that min; members ahead of it replay idempotently.
+//! from that min and routes each member only the commits past what it was
+//! already delivered ([`AckSlot::routes`]). A member that stays attached across
+//! a reconnect still holds its delivered commits in its channel, so sending
+//! them again would not be idempotent: see [`AckSlot::routes`].
 //!
 //! A member takes an initial snapshot when it has no usable persisted position
 //! (cold, or an incompatible/purged checkpoint resolved by
@@ -50,7 +53,7 @@ limitations under the License.
 //! clean snapshot completion the pump reconnects from the held min and
 //! *promotes* every snapshot-complete member; a connection that provably starts
 //! at/below a member's floor makes it routable, and members already ahead
-//! suppress the replay via [`AckSlot::already_committed`].
+//! skip the replay via [`AckSlot::routes`].
 //!
 //! # WAL-retention caveat (differs from Postgres)
 //!
@@ -296,10 +299,21 @@ impl AckSlot {
         advance_position(&self.delivered, to);
     }
 
-    /// Whether the member has already durably applied this commit — used to
-    /// suppress re-delivery during a reconnect replay from the shared min.
-    fn already_committed(&self, at: &BinlogPosition) -> bool {
-        *lock(&self.committed) >= *at
+    /// Whether the pump routes the commit at `at` to this member: the member is
+    /// streaming and was not already delivered it.
+    ///
+    /// After a reconnect the pump replays from the shared min, and a member that
+    /// stayed attached still holds every commit it was delivered in its channel,
+    /// applied or not. Sending those again would not be idempotent. The member
+    /// keeps acknowledging its in-flight commits while the replay runs, so a
+    /// check against its *committed* floor re-sends an earlier commit and then
+    /// drops a later one the member acknowledged in between. The member then
+    /// applies the earlier commit last, and every row both commits changed is
+    /// left at the earlier version. `delivered` does not move under the replay.
+    /// It resets with `committed` whenever the member's channel is replaced, on
+    /// (re)registration.
+    fn routes(&self, at: &BinlogPosition) -> bool {
+        self.has(STREAMING) && *lock(&self.delivered) < *at
     }
 
     fn has(&self, flag: u8) -> bool {
@@ -1949,7 +1963,7 @@ fn current_file_pos(file: &str) -> BinlogPosition {
 /// (normally 4, just past the magic number). Pairing the new name with the
 /// closing file's offset yields a coordinate far beyond anything the new file
 /// holds — an idle member credited there has every later commit in that file
-/// suppressed by [`AckSlot::already_committed`], silently and for as long as the
+/// skipped by [`AckSlot::routes`], silently and for as long as the
 /// new file stays smaller than the old one (#12042).
 fn rotate_target(rotate: &RotateEvent<'_>) -> Option<BinlogPosition> {
     (!rotate.is_fake()).then(|| BinlogPosition::new(rotate.name(), rotate.position()))
@@ -1984,7 +1998,7 @@ async fn deliver_commit(
         else {
             continue;
         };
-        if !slot.has(STREAMING) || slot.already_committed(commit_pos) {
+        if !slot.routes(commit_pos) {
             continue;
         }
         // O(1), no decode: freshness watermark + transaction count. The per-row
@@ -2066,7 +2080,7 @@ async fn handle_statement(
         match kind {
             StatementKind::Truncate => {
                 let commit_pos = BinlogPosition::new(current_file.to_string(), event_end_pos);
-                if slot.already_committed(&commit_pos) {
+                if !slot.routes(&commit_pos) {
                     continue;
                 }
                 member.metrics.inc_truncate();
@@ -2900,7 +2914,7 @@ mod tests {
     /// advances the stream to. When a `ROTATE` contributed the *closing* file's
     /// end offset under the *opening* file's name, an idle member's committed
     /// floor jumped ~1 GiB past the new file's real offsets and `deliver_commit`
-    /// then dropped every following transaction as `already_committed` — with no
+    /// then skipped every following transaction as already delivered — with no
     /// error, no detach, and no backpressure warning, for the rest of the run.
     #[test]
     fn a_rotate_credit_does_not_suppress_the_new_files_commits() {
@@ -2924,7 +2938,7 @@ mod tests {
         let next_commit = pos("binlog.000042", 1_182);
         let slot = ack.slot(&member).expect("registered member has a slot");
         assert!(
-            !slot.already_committed(&next_commit),
+            slot.routes(&next_commit),
             "commit at {next_commit} was suppressed as already-applied, so its rows are lost"
         );
     }
@@ -3073,13 +3087,14 @@ mod tests {
     fn replayed_older_commits_never_regress() {
         // On a reconnect from the shared min, a member ahead of the min re-sees
         // commits it already applied. `AckSlot::commit` is a monotonic-max, so an
-        // older replayed commit is a no-op, and `already_committed` reports it as
-        // applied so the pump suppresses the re-delivery.
+        // older replayed commit is a no-op, and `routes` skips anything the member
+        // was already delivered.
         let ack = AckTable::default();
         ack.register(&key("db", "a"), pos("binlog.000001", 500), false);
         ack.promote_ready_members();
         let slot = ack.slot(&key("db", "a")).expect("slot");
 
+        slot.deliver(&pos("binlog.000010", 900));
         slot.commit(&pos("binlog.000010", 900));
         assert_eq!(slot.committed(), pos("binlog.000010", 900));
 
@@ -3091,11 +3106,68 @@ mod tests {
             "an older replayed commit must not regress the floor"
         );
 
-        // The replay is reported already-applied (suppressed), only a strictly
-        // newer position is not.
-        assert!(slot.already_committed(&pos("binlog.000005", 100)));
-        assert!(slot.already_committed(&pos("binlog.000010", 900)));
-        assert!(!slot.already_committed(&pos("binlog.000010", 901)));
+        // The replay is skipped, and only a strictly newer position is routed.
+        assert!(!slot.routes(&pos("binlog.000005", 100)));
+        assert!(!slot.routes(&pos("binlog.000010", 900)));
+        assert!(slot.routes(&pos("binlog.000010", 901)));
+    }
+
+    /// A reconnect replay must not leave a row at an older version.
+    ///
+    /// Before the connection drops, the member is delivered `t1` and `t2` (both
+    /// changing one row) and has applied neither. The pump reconnects at the
+    /// shared min and replays both. The member's consumer acknowledges `t2` while
+    /// the replay is running. Every commit the member then applies must leave the
+    /// row at its newest version: a replayed `t1` after `t2`, with the replayed
+    /// `t2` dropped, leaves it at `t1`.
+    #[tokio::test]
+    async fn a_reconnect_replay_never_leaves_a_member_on_an_older_commit() {
+        let ack = AckTable::default();
+        let member = key("tpcc", "stock");
+        ack.register(&member, pos("binlog.000001", 100), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+        let t1 = pos("binlog.000001", 200);
+        let t2 = pos("binlog.000001", 300);
+
+        // The pump's routing in `deliver_commit`: what the member's channel
+        // receives, in order.
+        let mut channel = Vec::new();
+        let route = |at: &BinlogPosition, channel: &mut Vec<BinlogPosition>| {
+            if slot.routes(at) {
+                slot.deliver(at);
+                channel.push(at.clone());
+            }
+        };
+
+        route(&t1, &mut channel);
+        route(&t2, &mut channel);
+
+        // The connection drops and the pump reconnects at the shared min.
+        assert_eq!(ack.flush_position(), Some(pos("binlog.000001", 100)));
+        route(&t1, &mut channel);
+        SharedPositionCommitter {
+            slot: Arc::clone(&slot),
+            flush_to: t2.clone(),
+            dataset: "stock".into(),
+            source_commit_ts_ms: None,
+            gtids: Vec::new(),
+        }
+        .commit()
+        .await
+        .expect("the consumer acknowledges t2");
+        route(&t2, &mut channel);
+
+        assert_eq!(
+            channel.last(),
+            Some(&t2),
+            "the member applies {channel:?} in that order, so the row ends at an older commit"
+        );
+        assert_eq!(
+            channel,
+            vec![t1, t2],
+            "a member that stayed attached must not be sent what it already holds"
+        );
     }
 
     #[tokio::test]
