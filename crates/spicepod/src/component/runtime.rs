@@ -100,6 +100,13 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
+    /// Shared object-store location for runtime state (`file://`, `s3://`,
+    /// `abfs://`, `abfss://`). Used for SQL results-cache warmup, source
+    /// rate-control, and distributed query state when those sections do not
+    /// set their own `state_location`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RuntimeState>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
 
@@ -111,6 +118,30 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Scheduler config with field-level fallback onto [`Self::state`].
+    ///
+    /// `runtime.scheduler.state_location` (and params) may be omitted when
+    /// `runtime.state` is set; other scheduler tuning fields are preserved.
+    #[must_use]
+    pub fn resolved_scheduler(&self) -> Option<Scheduler> {
+        match (&self.scheduler, &self.state) {
+            (Some(scheduler), state) => {
+                let mut resolved = scheduler.clone();
+                if resolved.state_location.is_none()
+                    && let Some(state) = state
+                {
+                    resolved.state_location = Some(state.location.clone());
+                    if resolved.params.is_none() {
+                        resolved.params.clone_from(&state.params);
+                    }
+                }
+                Some(resolved)
+            }
+            (None, Some(state)) => Some(Scheduler::from_shared_state(state)),
+            (None, None) => None,
+        }
+    }
+
     pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
         if let Some(timeout_str) = &self.shutdown_timeout {
             let duration = duration_parse::parse_duration(timeout_str)
@@ -1328,12 +1359,27 @@ pub enum SpillCompression {
     Uncompressed,
 }
 
+/// Shared object-store location for runtime state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct RuntimeState {
+    /// Root URI (`file://`, `s3://`, `abfs://`, `abfss://`).
+    pub location: String,
+
+    /// Optional object store params (for example S3 `s3_region` / `s3_auth`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Scheduler {
-    /// Root URI for shared cluster state.
-    pub state_location: String,
+    /// Root URI for shared cluster state. Optional when [`Runtime::state`]
+    /// provides the location via [`Runtime::resolved_scheduler`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_location: Option<String>,
 
     /// Optional object store params for the shared cluster state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1354,6 +1400,22 @@ pub struct Scheduler {
     /// How long to wait for partition discovery before timing out.
     #[serde(default = "default_partition_discovery_timeout")]
     pub partition_discovery_timeout: String,
+}
+
+impl Scheduler {
+    /// Build scheduler config that stores cluster state at the shared runtime location.
+    #[must_use]
+    pub fn from_shared_state(state: &RuntimeState) -> Self {
+        Self {
+            state_location: Some(state.location.clone()),
+            params: state.params.clone(),
+            partition_assignment_interval: default_partition_assignment_interval(),
+            max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(
+            ),
+            max_partitions_per_executor: default_max_partitions_per_executor(),
+            partition_discovery_timeout: default_partition_discovery_timeout(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1475,6 +1537,8 @@ pub struct RuntimeDeserializer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RuntimeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_rate_control: Option<SourceRateControl>,
@@ -1540,6 +1604,10 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             validate_metric_prefix(prefix)?;
         }
 
+        if let Some(sql_results) = &caching.sql_results {
+            crate::component::caching::validate_sql_results_warmup_config(sql_results)?;
+        }
+
         Ok(Runtime {
             caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
@@ -1563,6 +1631,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             },
             cpu: deserializer.cpu,
             metrics: deserializer.metrics,
+            state: deserializer.state,
             scheduler: deserializer.scheduler,
             source_rate_control: deserializer.source_rate_control,
             functions: deserializer.functions,
@@ -1589,6 +1658,24 @@ mod tests {
         assert!(
             value.get("oneOf").is_none(),
             "ApiKey must not use externally-tagged object oneOf: {value}"
+        );
+    }
+
+    #[test]
+    fn test_runtime_rejects_warmup_with_sql_cache_key_type() {
+        let yaml = r"
+            caching:
+              sql_results:
+                enabled: true
+                cache_key_type: sql
+                warmup: on_first_refresh
+        ";
+        let err = yaml::from_str::<Runtime>(yaml)
+            .expect_err("warmup + cache_key_type: sql must fail spicepod load");
+        let message = err.to_string();
+        assert!(
+            message.contains("cache_key_type: plan") || message.contains("warmup"),
+            "error must name the corrective action, got: {message}"
         );
     }
 

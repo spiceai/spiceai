@@ -36,6 +36,7 @@ members = [
     "crates/repl",
     "crates/google-genai",
     "crates/hash-index",
+    "crates/key-index",
     "crates/llms",
     "crates/chat-api",
     "crates/embed-api",
@@ -476,6 +477,12 @@ url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util", default-features = false }
 utoipa = { version = "5" }
 uuid = "1"
+# Specification and proof vocabulary for every crate that opts into
+# `[package.metadata.verus]`. A normal `cargo build` erases the specifications,
+# so it carries no runtime cost. Pinned to the Verus release CI runs: the
+# verifier and `vstd` ship together, so this moves with `VERUS_VSTD_VERSION` in
+# `.github/workflows/verus_verify.yml`.
+vstd = "=0.0.0-2026-09-20-0158"
 wasmtime = { version = "47.0.3", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.248.0"
 

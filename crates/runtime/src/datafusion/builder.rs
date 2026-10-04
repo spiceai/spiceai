@@ -339,6 +339,9 @@ pub enum OutputPreview {
     Skip,
 }
 
+// Independent construction switches (task history, URL tables, dedicated
+// thread pools, results-cache warmup). A flag bag is the natural shape.
+#[expect(clippy::struct_excessive_bools)]
 pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
@@ -356,6 +359,9 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     output_preview: OutputPreview,
     caching: Option<Arc<Caching>>,
+    results_cache_warmup_store: Option<std::path::PathBuf>,
+    results_cache_warmup_enabled: bool,
+    results_cache_warmer: Option<super::query::ResultsCacheWarmer>,
     spill_compression: Option<SpillCompression>,
     cluster_config: Option<Arc<ResolvedClusterConfig>>,
     metrics: Option<Metrics>,
@@ -447,6 +453,9 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             output_preview: OutputPreview::Build,
             caching: None,
+            results_cache_warmup_store: None,
+            results_cache_warmup_enabled: false,
+            results_cache_warmer: None,
             spill_compression: None,
             cluster_config: None,
             metrics: None,
@@ -486,6 +495,27 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_caching(mut self, caching: Arc<Caching>) -> Self {
         self.caching = Some(caching);
+        self
+    }
+
+    #[must_use]
+    pub fn with_results_cache_warmup_store(mut self, path: std::path::PathBuf) -> Self {
+        self.results_cache_warmup_store = Some(path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_results_cache_warmup_enabled(mut self, enabled: bool) -> Self {
+        self.results_cache_warmup_enabled = enabled;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_results_cache_warmer(
+        mut self,
+        warmer: super::query::ResultsCacheWarmer,
+    ) -> Self {
+        self.results_cache_warmer = Some(warmer);
         self
     }
 
@@ -1334,6 +1364,13 @@ impl DataFusionBuilder {
             ddl_extension_store,
             datafusion_ref,
             caching,
+            results_cache_warmer: self.results_cache_warmer.unwrap_or_else(|| {
+                super::query::ResultsCacheWarmer::new_unloaded(
+                    self.results_cache_warmup_store
+                        .unwrap_or_else(super::query::default_warmup_store_path),
+                    self.results_cache_warmup_enabled,
+                )
+            }),
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
             pending_sink_tables: TokioRwLock::new(HashMap::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
@@ -1345,8 +1382,9 @@ impl DataFusionBuilder {
             drasi_forwarders: OnceLock::new(),
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
-            snapshot_notifications:
+            snapshot_notifications: Arc::new(
                 runtime_acceleration::snapshot::notifications::SnapshotNotifications::default(),
+            ),
             dataset_placements: dashmap::DashMap::new(),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,

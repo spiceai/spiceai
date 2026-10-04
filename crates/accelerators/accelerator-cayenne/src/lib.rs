@@ -52,7 +52,9 @@ use util::concat_arrays;
 
 use crate::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use data_accelerator_api::FilePathError;
-use data_accelerator_api::snapshots::{download_snapshot, should_download_snapshot};
+use data_accelerator_api::snapshots::{
+    download_snapshot, refuses_datalake_bootstrap, snapshot_bootstrap_enabled,
+};
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
@@ -3338,16 +3340,6 @@ impl DataAccelerator for CayenneAccelerator {
         }
     }
 
-    fn shared_store_key(
-        &self,
-        acceleration: &runtime_acceleration::acceleration::Acceleration,
-    ) -> Option<String> {
-        // Every Cayenne dataset in one metadata directory shares its SQLite catalog, so
-        // the directory is the identity `validate_snapshot_consistency` groups by. Absent
-        // this, that validation silently passes for every Cayenne dataset.
-        Some(Self::resolve_metadata_dir(Some(acceleration)))
-    }
-
     fn spicepod_write_profile(
         &self,
         acceleration: &spicepod::acceleration::Acceleration,
@@ -3777,57 +3769,42 @@ impl DataAccelerator for CayenneAccelerator {
             );
             let refresh_mode = resolved_refresh_mode(source, acceleration);
 
-            // Decide whether to bootstrap from a snapshot before `get_or_create_catalog`
-            // below opens the local metastore: that call creates `metadata_dir` as a
-            // side effect (it's a fresh SQLite connection), and this decision's "does an
-            // acceleration already exist here" check reads that same directory's
-            // existence. Deciding first means the check sees the true pre-startup state
-            // instead of a directory the catalog open just created.
-            let should_bootstrap =
-                should_download_snapshot(acceleration, source, &snapshot_adapter, refresh_mode);
-
-            // Build a CayenneSnapshotEngine so the snapshot tar uses the
-            // per-dataset metastore-slice format (no raw cayenne.db file)
-            // and so `download_latest_snapshot` imports the slice into the
-            // local metastore as the final extraction step.
             let metastore_type = acceleration
                 .params
                 .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str)
-                .to_string();
-            // The catalog is opened unconditionally: normal operation needs it
-            // regardless of the snapshot decision above.
-            let snapshot_engine = match self
-                .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
-                .await
-            {
-                Ok(catalog) => Some(Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
-                    catalog,
-                    source.name().to_string(),
-                    path_buf.clone(),
-                ))
-                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>),
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to build CayenneSnapshotEngine for snapshot bootstrap, \
-                         falling back to default engine: {err}"
-                    );
-                    None
-                }
-            };
+                .map_or("sqlite", String::as_str);
+            let catalog = self
+                .get_or_create_catalog(&metadata_dir.to_string_lossy(), metastore_type)
+                .await?;
 
-            if !should_bootstrap {
+            if !snapshot_bootstrap_enabled(acceleration, source, refresh_mode) {
                 return Ok(BootstrapStatus::none());
             }
+
+            // The metastore is shared across datasets. Its existence does not
+            // establish that this dataset has a local acceleration to reopen.
+            match catalog.get_table(&source.name().to_string()).await {
+                Ok(_) => return Ok(BootstrapStatus::none()),
+                Err(cayenne::CatalogError::TableNotFound { .. }) => {}
+                Err(err) => return Err(Box::new(err)),
+            }
+            if refuses_datalake_bootstrap(acceleration, source) {
+                return Ok(BootstrapStatus::none());
+            }
+            let snapshot_engine = Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
+                catalog,
+                source.name().to_string(),
+                path_buf.clone(),
+            ));
 
             Ok(download_snapshot(
                 acceleration,
                 source,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
-                snapshot_engine,
+                Some(snapshot_engine),
             )
-            .await)
+            .await?)
         } else {
             Ok(BootstrapStatus::none())
         }
@@ -5846,6 +5823,136 @@ mod tests {
 
         assert_eq!(path_exists(&present).await, present.exists());
         assert_eq!(path_exists(&missing).await, missing.exists());
+    }
+
+    #[tokio::test]
+    async fn snapshot_bootstrap_checks_the_table_in_a_shared_catalog() {
+        use runtime_acceleration::snapshot::SnapshotBehavior;
+        use runtime_secrets::Secrets;
+        use spicepod::component::snapshot::Snapshots;
+        use tokio::sync::RwLock;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let metadata_dir = temp.path().join("metadata");
+        let data_dir = temp.path().join("orders");
+        let snapshots_dir = temp.path().join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir).expect("snapshot directory");
+        let accelerator = CayenneAccelerator::new();
+        let catalog = accelerator
+            .get_or_create_catalog(&metadata_dir.to_string_lossy(), "sqlite")
+            .await
+            .expect("shared catalog");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        catalog
+            .create_table(cayenne::metadata::CreateTableOptions {
+                table_name: "orders".to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("existing local orders table");
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let acceleration = Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Snapshot),
+            params: HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    data_dir.to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+            ]),
+            snapshot_behavior: SnapshotBehavior::BootstrapOnly(
+                Arc::new(Snapshots {
+                    enabled: true,
+                    location: Some(format!("file://{}/", snapshots_dir.display())),
+                    ..Default::default()
+                }),
+                Arc::downgrade(&secrets),
+                tokio::runtime::Handle::current(),
+            ),
+            ..Default::default()
+        };
+        let orders = TestAccelerationSource::new("orders").with_acceleration(acceleration.clone());
+        assert_eq!(
+            accelerator.init(&orders).await.expect("open local table"),
+            BootstrapStatus::None
+        );
+        let customers = TestAccelerationSource::new("customers").with_acceleration(acceleration);
+        assert!(
+            matches!(
+                accelerator
+                    .init(&customers)
+                    .await
+                    .expect("prepare missing table"),
+                BootstrapStatus::Pending { .. }
+            ),
+            "an existing shared catalog must not suppress bootstrap of a missing table"
+        );
+    }
+
+    /// A copy restored from a snapshot shares its writer's datalake prefix, and each
+    /// instance's cleanup deletes the other's files, so a dataset with a datalake tier
+    /// loads from its source instead.
+    #[tokio::test]
+    async fn snapshot_bootstrap_skips_a_dataset_with_a_datalake_tier() {
+        use runtime_acceleration::snapshot::SnapshotBehavior;
+        use runtime_secrets::Secrets;
+        use spicepod::component::snapshot::Snapshots;
+        use tokio::sync::RwLock;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let metadata_dir = temp.path().join("metadata");
+        let data_dir = temp.path().join("orders");
+        let snapshots_dir = temp.path().join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir).expect("snapshot directory");
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let acceleration = Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Snapshot),
+            params: HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    data_dir.to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_datalake_location".to_string(),
+                    "s3://lake/orders".to_string(),
+                ),
+            ]),
+            snapshot_behavior: SnapshotBehavior::BootstrapOnly(
+                Arc::new(Snapshots {
+                    enabled: true,
+                    location: Some(format!("file://{}/", snapshots_dir.display())),
+                    ..Default::default()
+                }),
+                Arc::downgrade(&secrets),
+                tokio::runtime::Handle::current(),
+            ),
+            ..Default::default()
+        };
+        let orders = TestAccelerationSource::new("orders").with_acceleration(acceleration);
+        assert_eq!(
+            CayenneAccelerator::new()
+                .init(&orders)
+                .await
+                .expect("prepare missing table"),
+            BootstrapStatus::None,
+            "a dataset with a datalake tier must not be restored from a snapshot"
+        );
     }
 
     /// `mode: file_create` must refuse the configuration at open time, before the
@@ -8101,73 +8208,6 @@ mod tests {
                 .await
                 .is_disabled(),
             "an unpartitioned dataset keeps in-place evolution"
-        );
-    }
-    /// Datasets sharing one metadata directory share its `SQLite` catalog, so a pod where
-    /// some snapshot and others do not cannot be restored consistently and must be refused
-    /// up front. That check is generic — it groups by
-    /// [`DataAccelerator::shared_store_key`] — so it silently passes for every Cayenne
-    /// dataset if this engine does not answer that question. Regression test for exactly
-    /// that: the validation moved out of `runtime` when the engine did, and an unimplemented
-    /// `shared_store_key` would leave it looking green while checking nothing.
-    #[tokio::test]
-    async fn mixed_snapshot_settings_in_one_metadata_dir_are_refused() {
-        use data_accelerator_api::validate_snapshot_consistency;
-        use runtime_acceleration::snapshot::SnapshotBehavior;
-        use runtime_acceleration::testing::TestAccelerationSource;
-        use spicepod::acceleration::SnapshotsCompaction;
-        use spicepod::component::snapshot::Snapshots;
-        use std::sync::Weak;
-
-        let dir = std::env::temp_dir()
-            .join("spice_cayenne_shared_metastore")
-            .to_string_lossy()
-            .to_string();
-        let acceleration = |snapshots: bool| {
-            let mut acceleration = Acceleration {
-                engine: Engine::Cayenne,
-                mode: Mode::File,
-                params: [("cayenne_metadata_dir".to_string(), dir.clone())]
-                    .into_iter()
-                    .collect(),
-                ..Default::default()
-            };
-            // `Disabled` is the default, so the *enabled* side is what has to be built
-            // explicitly — a test that left both at the default would compare nothing.
-            if snapshots {
-                acceleration.snapshot_behavior = SnapshotBehavior::Enabled(
-                    Arc::new(Snapshots::default()),
-                    Weak::new(),
-                    tokio::runtime::Handle::current(),
-                    SnapshotsCompaction::Disabled,
-                );
-            }
-            acceleration
-        };
-
-        // Both sides of the disagreement, in the same directory.
-        let sources: Vec<Arc<dyn AccelerationSource>> = vec![
-            Arc::new(
-                TestAccelerationSource::new("snapshotting").with_acceleration(acceleration(true)),
-            ),
-            Arc::new(
-                TestAccelerationSource::new("not_snapshotting")
-                    .with_acceleration(acceleration(false)),
-            ),
-        ];
-        assert!(
-            validate_snapshot_consistency(&sources).is_err(),
-            "a metadata directory with both snapshotting and non-snapshotting datasets must be refused"
-        );
-
-        // Agreeing datasets in the same directory are supported.
-        let agreeing: Vec<Arc<dyn AccelerationSource>> = vec![
-            Arc::new(TestAccelerationSource::new("a").with_acceleration(acceleration(true))),
-            Arc::new(TestAccelerationSource::new("b").with_acceleration(acceleration(true))),
-        ];
-        assert!(
-            validate_snapshot_consistency(&agreeing).is_ok(),
-            "datasets that agree may share a metadata directory"
         );
     }
 

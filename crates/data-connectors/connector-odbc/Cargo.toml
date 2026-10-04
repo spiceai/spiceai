@@ -23,6 +23,7 @@ license-file.workspace = true
 description = "ODBC data connector for Spice.ai runtime"
 
 [dependencies]
+runtime-datafusion = { path = "../../runtime-datafusion" }
 arrow.workspace = true
 arrow-odbc.workspace = true
 async-stream.workspace = true

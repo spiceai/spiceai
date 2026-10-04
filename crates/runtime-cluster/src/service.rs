@@ -250,7 +250,7 @@ impl PartitionService {
     }
 
     fn config_from_app(app: &App) -> AssignmentConfig {
-        let Some(scheduler) = app.runtime.scheduler.clone() else {
+        let Some(scheduler) = app.runtime.resolved_scheduler() else {
             return AssignmentConfig::default();
         };
         match PartitionAssignmentConfig::try_from(scheduler) {
