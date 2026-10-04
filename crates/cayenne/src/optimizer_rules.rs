@@ -2762,9 +2762,7 @@ mod tests {
 
     /// A registry with one `COUNT(*) GROUP BY name` view filtered on
     /// `value > 1`, fresh at epoch 1.
-    fn filtered_count_registry(
-        schema: &Arc<Schema>,
-    ) -> DFResult<Arc<MaintainedAggregateRegistry>> {
+    fn filtered_count_registry(schema: &Arc<Schema>) -> DFResult<Arc<MaintainedAggregateRegistry>> {
         let registry = Arc::new(MaintainedAggregateRegistry::try_new(
             &[MaintainedAggregateSpec {
                 filter: Some(value_gt_one(schema)?),
@@ -2796,10 +2794,11 @@ mod tests {
             )?) as Arc<dyn ExecutionPlan>,
             None => memory,
         };
-        let union = UnionExec::try_new(vec![file_exec(schema, "f.vortex", file_predicate), memory])?;
-        Ok(Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
-            union, registry, 1,
-        )))
+        let union =
+            UnionExec::try_new(vec![file_exec(schema, "f.vortex", file_predicate), memory])?;
+        Ok(Arc::new(
+            CayenneAccelerationExec::new_with_maintained_aggregates(union, registry, 1),
+        ))
     }
 
     fn rewrite(plan: Arc<dyn ExecutionPlan>) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -2929,9 +2928,10 @@ mod tests {
     #[test]
     fn maintained_aggregate_rewriter_joins_a_surviving_filter_to_the_pushed_one() -> DFResult<()> {
         let schema = maintained_aggregate_test_schema();
-        let name_not_null: Arc<dyn PhysicalExpr> = Arc::new(
-            datafusion_physical_expr::expressions::IsNotNullExpr::new(col("name", schema.as_ref())?),
-        );
+        let name_not_null: Arc<dyn PhysicalExpr> =
+            Arc::new(datafusion_physical_expr::expressions::IsNotNullExpr::new(
+                col("name", schema.as_ref())?,
+            ));
         let registry = Arc::new(MaintainedAggregateRegistry::try_new(
             &[MaintainedAggregateSpec {
                 filter: Some(conjunction([value_gt(1, 1), Arc::clone(&name_not_null)])),
@@ -3016,10 +3016,15 @@ mod tests {
             lit(1_i64),
             schema.as_ref(),
         )?;
-        for (value_expr, served) in [(col("value", schema.as_ref())?, true), (value_plus_one, false)]
-        {
-            let memory =
-                MemorySourceConfig::try_new_exec(&[vec![maintained_aggregate_test_batch()]], Arc::clone(&schema), None)?;
+        for (value_expr, served) in [
+            (col("value", schema.as_ref())?, true),
+            (value_plus_one, false),
+        ] {
+            let memory = MemorySourceConfig::try_new_exec(
+                &[vec![maintained_aggregate_test_batch()]],
+                Arc::clone(&schema),
+                None,
+            )?;
             let scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
                 memory,
                 Arc::clone(&registry),
@@ -3055,7 +3060,11 @@ mod tests {
                 optimized.is::<MaintainedAggregateExec>(),
                 served,
                 "served through a projection of {}",
-                if served { "the stored column" } else { "a computed column" }
+                if served {
+                    "the stored column"
+                } else {
+                    "a computed column"
+                }
             );
         }
         Ok(())

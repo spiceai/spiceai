@@ -317,13 +317,11 @@ fn parse_maintained_aggregate_filter(
     // and `BETWEEN` becomes the two comparisons the planner rewrites it to. A
     // predicate that does not fold is kept as written; it is maintained the same
     // way and only ever loses the match.
-    let logical = util::expr::coerce_and_simplify_exprs(
-        [logical.clone()],
-        &Arc::new(schema.clone()),
-    )
-    .ok()
-    .and_then(|mut folded| folded.pop())
-    .unwrap_or(logical);
+    let logical =
+        util::expr::coerce_and_simplify_exprs([logical.clone()], &Arc::new(schema.clone()))
+            .ok()
+            .and_then(|mut folded| folded.pop())
+            .unwrap_or(logical);
     // Plan through the session rather than calling `create_physical_expr`
     // directly: the session coerces the expression against the schema first, and
     // a filter written the way SQL is normally written needs that. A predicate

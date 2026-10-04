@@ -19,9 +19,10 @@ limitations under the License.
 //! The implementation follows a conservative DBSP-style delta contract: rows
 //! are applied as positive deltas only while the view is known fresh. Any
 //! operation that needs a retraction but cannot provide the old row values marks
-//! the view stale. The physical optimizer may only serve this state when its
-//! freshness epoch exactly matches the scan snapshot epoch captured by
-//! [`crate::provider::CayenneAccelerationExec`].
+//! the view stale. The physical optimizer may only serve this state when it is
+//! fresh and has taken in at least the scan snapshot epoch captured by
+//! [`crate::provider::CayenneAccelerationExec`], so it is never older than the
+//! rows the scan would read.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -41,8 +42,8 @@ use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_functions_aggregate_common::utils::DecimalAverager;
 use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
-use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 use datafusion_physical_expr::{Distribution, OrderingRequirements};
+use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use parking_lot::RwLock;
 
@@ -546,11 +547,7 @@ impl PredicateConjuncts {
 /// containment one way imply containment the other way.
 impl PartialEq for PredicateConjuncts {
     fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len()
-            && self
-                .0
-                .iter()
-                .all(|conjunct| other.0.contains(conjunct))
+        self.0.len() == other.0.len() && self.0.iter().all(|conjunct| other.0.contains(conjunct))
     }
 }
 
@@ -929,7 +926,8 @@ impl MaintainedAggregateRegistry {
     /// Materialize a maintained aggregate batch matching `aggregate`, if fresh.
     ///
     /// Returns `None` when the aggregate shape is unsupported, no declared view
-    /// matches it, or the registry is stale for the scan snapshot epoch.
+    /// matches it, or the registry is stale or has not yet taken in the scan
+    /// snapshot epoch.
     ///
     /// # Errors
     ///
@@ -974,17 +972,17 @@ impl MaintainedAggregateRegistry {
 
     /// Serve a maintained view directly from a declared [`MaintainedAggregateSpec`]
     /// (group-by + aggregates + optional filter) into `output_schema`, without an
-    /// `AggregateExec`. Exercises the exact fresh/epoch gate, view match (incl.
+    /// `AggregateExec`. Exercises the same fresh/epoch gate, view match (incl.
     /// filter equality), and O(groups) materialize the optimizer rewrite uses —
     /// the entry point for benches/tests that measure the maintained serve cost.
     ///
     /// # Returns
     ///
-    /// `Ok(Some(batch))` when the registry is fresh at `scan_epoch`, a view
-    /// matches `spec` exactly, and it materializes into `output_schema`.
+    /// `Ok(Some(batch))` when the registry is fresh at `scan_epoch` or later, a
+    /// view matches `spec` exactly, and it materializes into `output_schema`.
     /// `Ok(None)` is the fallback signal (the caller should run normal
-    /// execution) when the registry is stale at `scan_epoch`, no view matches
-    /// `spec`, or the matched view does not fit `output_schema`.
+    /// execution) when the registry is stale or behind `scan_epoch`, no view
+    /// matches `spec`, or the matched view does not fit `output_schema`.
     ///
     /// # Errors
     ///
@@ -1020,7 +1018,16 @@ impl MaintainedAggregateRegistry {
     }
 
     /// Shared serve path: only answer from a maintained view when the registry is
-    /// fresh at the scan epoch and a view matches the query shape exactly.
+    /// fresh, has taken in the scan's epoch, and a view matches the query shape
+    /// exactly.
+    ///
+    /// The registry can be ahead of the scan: a read-only CDC table reuses a scan
+    /// view for up to its freshness lag across later writes, so the scan's
+    /// snapshot can predate deltas the registry has already applied. Every delta
+    /// reaches the registry only after its write is visible, so the views then
+    /// hold a published state of the table newer than the scan's snapshot, and
+    /// answering from them is answering from that state. A registry behind the
+    /// scan is never used: it would drop rows the scan's snapshot contains.
     fn serve(
         &self,
         query: &QueryAggregateSpec,
@@ -1028,7 +1035,7 @@ impl MaintainedAggregateRegistry {
         output_schema: SchemaRef,
     ) -> DataFusionResult<Option<RecordBatch>> {
         let state = self.state.read();
-        if state.status != RegistryStatus::Fresh || state.epoch != scan_epoch {
+        if state.status != RegistryStatus::Fresh || state.epoch < scan_epoch {
             return Ok(None);
         }
 
@@ -2686,6 +2693,44 @@ mod tests {
             Some(&(1, 1, Some(-2), Some(2.5)))
         );
         assert_eq!(rows.get(&None), Some(&(1, 1, Some(3), Some(4.5))));
+        Ok(())
+    }
+
+    /// A scan may carry an older snapshot than the registry: a read-only CDC
+    /// table reuses a scan view across later writes. The registry has then
+    /// taken in writes the snapshot predates, all of them already visible, so
+    /// it answers with that newer state; a registry behind the scan's snapshot
+    /// would miss rows the scan reads, so it never answers.
+    #[test]
+    fn serves_a_scan_no_newer_than_the_registry() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema())?;
+        registry.apply_insert_batches(1, &[batch()])?;
+        registry.apply_insert_batches(2, &[batch()])?;
+        let aggregate =
+            aggregate_exec_for(&[("count(*)", MaintainedAggregateFunction::Count, None)])?;
+
+        let served = registry
+            .batch_for_aggregate(&aggregate, 1)?
+            .expect("a registry ahead of the scan's snapshot serves it");
+        let counts = as_int64_array(served.column(1))?;
+        assert_eq!(
+            counts.iter().flatten().sum::<i64>(),
+            8,
+            "the newer state, with both batches, is served"
+        );
+        assert!(registry.batch_for_aggregate(&aggregate, 2)?.is_some());
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 3)?.is_none(),
+            "a registry behind the scan's snapshot must not serve it"
+        );
         Ok(())
     }
 

@@ -448,9 +448,8 @@ async fn maintained_aggregate_filtered_view_serves_pushed_filter_impl(
     // file source below the deletion exec, with no `FilterExec` left above the
     // scan. Serving replaces the scan, so the shape is read from a plan built
     // with `DataFusion`'s rules alone.
-    let plain = SessionContext::new_with_state(
-        SessionStateBuilder::new().with_default_features().build(),
-    );
+    let plain =
+        SessionContext::new_with_state(SessionStateBuilder::new().with_default_features().build());
     plain.register_table(TABLE_SERVED, reopened)?;
     let unserved_plan = plan_string(&plain, &filtered_sql).await?;
     let operators: Vec<&str> = unserved_plan.lines().map(str::trim_start).collect();
@@ -507,7 +506,10 @@ test_with_backends!(maintained_aggregate_filtered_view_serves_pushed_filter_impl
 /// A maintained filter as the Cayenne accelerator builds it from `filter_sql`:
 /// parsed against the table schema, coerced and folded the way the planner
 /// folds a query's `WHERE`, then planned.
-fn filter_from_sql(sql: &str, schema: &Arc<Schema>) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
+fn filter_from_sql(
+    sql: &str,
+    schema: &Arc<Schema>,
+) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
     use datafusion::common::ToDFSchema;
     let df_schema = schema
         .as_ref()
@@ -636,9 +638,8 @@ async fn chbench_q1_and_q6_are_served_by_their_views_impl(fixture: TestFixture) 
             .await?,
     ) as Arc<dyn TableProvider>;
     ctx.register_table(TABLE_CHBENCH, Arc::clone(&reopened))?;
-    let scan_only = SessionContext::new_with_state(
-        SessionStateBuilder::new().with_default_features().build(),
-    );
+    let scan_only =
+        SessionContext::new_with_state(SessionStateBuilder::new().with_default_features().build());
     scan_only.register_table(TABLE_CHBENCH, reopened)?;
 
     let q1 = "SELECT ol_number, sum(ol_quantity) as sum_qty, sum(ol_amount) as sum_amount, avg(ol_quantity) as avg_qty, avg(ol_amount) as avg_amount, count(*) as count_order FROM order_line WHERE ol_delivery_d > '2007-01-02 00:00:00.000000' GROUP BY ol_number ORDER BY ol_number";
@@ -661,4 +662,3 @@ async fn chbench_q1_and_q6_are_served_by_their_views_impl(fixture: TestFixture) 
 }
 
 test_with_backends!(chbench_q1_and_q6_are_served_by_their_views_impl);
-
