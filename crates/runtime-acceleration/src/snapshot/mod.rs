@@ -2238,7 +2238,8 @@ impl SnapshotManager {
                 "Skipped creating a snapshot of '{}', so its snapshot series keeps the previously published contents and a cold start will bootstrap those: {reason}",
                 self.dataset_name
             );
-            metrics::record_snapshot_skipped(&self.dataset_name);
+            // Not counted in `dataset_acceleration_snapshot_skipped_count`, which counts
+            // snapshots skipped because no data changed; this warning records the refusal.
             // A holder that cannot publish lets another instance take over, as a failed
             // attempt does: renewing the lease while refused would keep every other
             // instance on standby for as long as the refusal lasts.

@@ -788,6 +788,16 @@ pub(crate) fn view_definition_closure_with_live_refresh_sql(
             if let Some(live_sql) = live_dataset_refresh_sql.get(&dataset.name) {
                 apply_live_refresh_sql_to_identity_fields(&mut fields, live_sql.as_deref());
             }
+            // The view stores what a query of this dataset returns, and over an empty
+            // acceleration that is the source's rows under `use_source` but none under
+            // `return_empty`. The dataset's own identity leaves this out: it decides how a
+            // query answers, not which rows the dataset copies.
+            if let Some(acceleration) = &dataset.acceleration {
+                fields.insert(
+                    "acceleration.on_zero_results".to_string(),
+                    acceleration.on_zero_results.to_string(),
+                );
+            }
             closure.insert(
                 dataset.name.clone(),
                 dataset_definition_identity(&dataset.from, &fields),
@@ -2839,6 +2849,56 @@ mod tests {
                 definition_fingerprint(&old),
                 definition_fingerprint(&new),
                 "rebinding a dataset the view reads must change the view's identity"
+            );
+        }
+
+        /// A view stores what its query returns, and a query of a dataset whose acceleration
+        /// is empty returns nothing under `on_zero_results: return_empty` but the source's
+        /// rows under `use_source`. Switching it changes what the view materializes while the
+        /// dataset's own copy stays the same, so the view's identity follows it and the
+        /// dataset's does not.
+        #[test]
+        fn closure_follows_a_dependency_datasets_on_zero_results() {
+            fn orders(
+                on_zero_results: spicepod::acceleration::ZeroResultsAction,
+            ) -> spicepod::component::dataset::Dataset {
+                let mut orders = spicepod::component::dataset::Dataset::new(
+                    "postgres:orders".to_string(),
+                    "orders".to_string(),
+                );
+                orders.acceleration = Some(spicepod::acceleration::Acceleration {
+                    enabled: true,
+                    on_zero_results,
+                    ..Default::default()
+                });
+                orders
+            }
+            let view_identity = |orders: spicepod::component::dataset::Dataset| {
+                definition_fingerprint(&view_definition_closure(
+                    &TableReference::bare("v"),
+                    "SELECT * FROM orders",
+                    &[],
+                    &HashMap::new(),
+                    &app::AppBuilder::new("closure_test")
+                        .with_dataset(orders)
+                        .build(),
+                ))
+            };
+            let dataset_identity = |orders: &spicepod::component::dataset::Dataset| {
+                dataset_definition_identity(&orders.from, &dataset_identity_fields(orders))
+            };
+            let return_empty = orders(spicepod::acceleration::ZeroResultsAction::ReturnEmpty);
+            let use_source = orders(spicepod::acceleration::ZeroResultsAction::UseSource);
+
+            assert_eq!(
+                dataset_identity(&return_empty),
+                dataset_identity(&use_source),
+                "on_zero_results decides how a query of the dataset answers, not which rows it copies"
+            );
+            assert_ne!(
+                view_identity(return_empty),
+                view_identity(use_source),
+                "a view over an empty acceleration stores the source's rows only under use_source"
             );
         }
 
