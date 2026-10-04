@@ -49,7 +49,7 @@ limitations under the License.
 //! on import, making the snapshot portable across nodes with different
 //! local layouts.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -155,48 +155,72 @@ fn relative_to_anchor(path: &str, anchor: &Path) -> Option<PathBuf> {
         .then(|| relative.to_path_buf())
 }
 
-/// Snapshot ids the slice references for the table `table_id`, whose data is
-/// written under `root` (relative to `anchor`): its current snapshot, its
-/// protected snapshots, and the snapshots whose `deletions/` directory holds
-/// one of its referenced deletion files.
-fn referenced_snapshot_ids(
-    slice: &DatasetMetastoreSlice,
-    anchor: &Path,
-    table_id: &str,
-    root: &Path,
-) -> HashSet<String> {
-    let rows = |table: &str| {
-        let id = slice_column(table, "table_id");
-        slice
-            .tables
-            .get(table)
+/// The snapshots a slice references, grouped by `table_id` in one pass over
+/// its rows, so that a slice with many partition tables is not rescanned once
+/// per table.
+struct SnapshotReferences<'a> {
+    /// Each table's current and protected snapshot ids.
+    ids: HashMap<&'a str, HashSet<&'a str>>,
+    /// Each table's deletion files, relative to the anchor.
+    delete_files: HashMap<&'a str, Vec<PathBuf>>,
+}
+
+impl<'a> SnapshotReferences<'a> {
+    fn new(slice: &'a DatasetMetastoreSlice, anchor: &Path) -> Self {
+        let rows = |table: &str| {
+            let id = slice_column(table, "table_id");
+            slice
+                .tables
+                .get(table)
+                .into_iter()
+                .flatten()
+                .filter_map(move |row| slice_text(row, id).map(|id| (id, row)))
+        };
+        let mut ids: HashMap<&str, HashSet<&str>> = HashMap::new();
+        let current = slice_column("cayenne_table", "current_snapshot_id");
+        for (id, row) in rows("cayenne_table") {
+            let entry = ids.entry(id).or_default();
+            entry.extend(slice_text(row, current));
+        }
+        let snapshot_id = slice_column("cayenne_snapshot_sequence", "snapshot_id");
+        for (id, row) in rows("cayenne_snapshot_sequence") {
+            let entry = ids.entry(id).or_default();
+            entry.extend(slice_text(row, snapshot_id));
+        }
+        let mut delete_files: HashMap<&str, Vec<PathBuf>> = HashMap::new();
+        let path = slice_column("cayenne_delete_file", "path");
+        for (id, row) in rows("cayenne_delete_file") {
+            if let Some(relative) =
+                slice_text(row, path).and_then(|p| relative_to_anchor(p, anchor))
+            {
+                delete_files.entry(id).or_default().push(relative);
+            }
+        }
+        Self { ids, delete_files }
+    }
+
+    /// Snapshot ids the slice references for the table `table_id`, whose data
+    /// is written under `root` (relative to the anchor): its current snapshot,
+    /// its protected snapshots, and the snapshots whose `deletions/` directory
+    /// holds one of its referenced deletion files.
+    fn for_table(&self, table_id: &str, root: &Path) -> HashSet<String> {
+        let mut ids: HashSet<String> = self
+            .ids
+            .get(table_id)
             .into_iter()
             .flatten()
-            .filter(move |row| slice_text(row, id) == Some(table_id))
-    };
-    let mut ids = HashSet::new();
-    let current = slice_column("cayenne_table", "current_snapshot_id");
-    for row in rows("cayenne_table") {
-        ids.extend(slice_text(row, current).map(str::to_string));
-    }
-    let snapshot_id = slice_column("cayenne_snapshot_sequence", "snapshot_id");
-    for row in rows("cayenne_snapshot_sequence") {
-        ids.extend(slice_text(row, snapshot_id).map(str::to_string));
-    }
-    let path = slice_column("cayenne_delete_file", "path");
-    for row in rows("cayenne_delete_file") {
-        let Some(relative) = slice_text(row, path).and_then(|p| relative_to_anchor(p, anchor))
-        else {
-            continue;
-        };
-        let Ok(in_root) = relative.strip_prefix(root) else {
-            continue;
-        };
-        if let Some(first) = in_root.components().next() {
-            ids.insert(first.as_os_str().to_string_lossy().into_owned());
+            .map(|id| (*id).to_string())
+            .collect();
+        for relative in self.delete_files.get(table_id).into_iter().flatten() {
+            let Ok(in_root) = relative.strip_prefix(root) else {
+                continue;
+            };
+            if let Some(first) = in_root.components().next() {
+                ids.insert(first.as_os_str().to_string_lossy().into_owned());
+            }
         }
+        ids
     }
-    ids
 }
 
 /// Entries under the dataset's data directory that its snapshot must not
@@ -287,8 +311,9 @@ async fn unreferenced_data_entries(
         );
     }
 
+    let slice_references = SnapshotReferences::new(slice, anchor);
     for (id, root) in &roots {
-        let referenced = referenced_snapshot_ids(slice, anchor, id, root);
+        let referenced = slice_references.for_table(id, root);
         let mut entries = match tokio::fs::read_dir(anchor.join(root)).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
