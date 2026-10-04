@@ -442,6 +442,11 @@ impl RefreshTaskRunner {
         }
     }
 
+    /// Transfer the worker to the table generation's cancellation and drain owner.
+    pub(crate) fn take_task(&mut self) -> Option<JoinHandle<()>> {
+        self.task.take()
+    }
+
     pub fn abort(&mut self) {
         if let Some(task) = &self.task {
             task.abort();

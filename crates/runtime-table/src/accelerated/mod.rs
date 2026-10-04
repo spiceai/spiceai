@@ -17,8 +17,8 @@ limitations under the License.
 use runtime_component::ClusterRole;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -290,11 +290,12 @@ pub struct AcceleratedTable {
     dataset_name: TableReference,
     accelerator: Arc<dyn TableProvider>,
     change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    changes_drain: OnceLock<runtime_acceleration::change_sink::Publication>,
     federated: Arc<FederatedTable>,
     refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>,
 
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
-    pub handlers: Vec<JoinHandle<()>>,
+    pub handlers: parking_lot::Mutex<Vec<JoinHandle<()>>>,
     zero_results_action: ZeroResultsAction,
     ready_state: ReadyState,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
@@ -1130,9 +1131,8 @@ impl Builder {
                     refresh_trigger,
                 )
             };
+        let mut handlers = refresher.take_background_tasks();
         let refresher = Arc::new(refresher);
-
-        let mut handlers = vec![];
         if let Some(refresh_handle) = refresh_handle {
             handlers.push(refresh_handle);
         }
@@ -1357,9 +1357,10 @@ impl Builder {
             dataset_name: self.dataset_name,
             accelerator: self.accelerator,
             change_sink,
+            changes_drain: OnceLock::new(),
             federated: self.federated,
             refresh_trigger,
-            handlers,
+            handlers: parking_lot::Mutex::new(handlers),
             zero_results_action: self.zero_results_action,
             ready_state: self.ready_state,
             refresh_params,
@@ -1389,15 +1390,55 @@ impl AcceleratedTable {
         self.change_sink.as_ref()
     }
 
+    /// Fence sink admission and join all producers independently of callers.
+    /// Repeated calls observe the same drain result.
+    #[must_use]
+    pub fn begin_changes_drain(&self) -> runtime_acceleration::change_sink::Publication {
+        self.changes_drain
+            .get_or_init(|| {
+                let publication = self.change_sink.as_ref().map(|sink| sink.begin_close());
+                let handlers = std::mem::take(&mut *self.handlers.lock());
+                for handler in &handlers {
+                    handler.abort();
+                }
+                let dataset = self.dataset_name.clone();
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                self.io_runtime.spawn(async move {
+                    let mut producer_failure = None;
+                    for handler in handlers {
+                        if let Err(error) = handler.await
+                            && !error.is_cancelled()
+                        {
+                            producer_failure = Some(DataFusionError::Execution(format!(
+                                "Failed to stop change ingestion for dataset '{dataset}': {error}"
+                            )));
+                        }
+                    }
+                    let storage_result = match publication {
+                        Some(publication) => publication.wait().await,
+                        None => Ok(()),
+                    };
+                    let result = match storage_result {
+                        Err(error) => Err(error),
+                        Ok(()) => producer_failure.map_or(Ok(()), Err),
+                    };
+                    sender.send_replace(Some(result.map_err(Arc::new)));
+                });
+                runtime_acceleration::change_sink::Publication::Pending(receiver)
+            })
+            .clone()
+    }
+
     /// Stop producers and drain accepted changes before the storage target can
-    /// be removed or rebound. A failed drain leaves admission fenced.
+    /// be removed or rebound. Cancellation stops waiting, not the owned drain.
     pub async fn drain_changes(&self, timeout: Duration) -> DataFusionResult<()> {
-        if let Some(sink) = &self.change_sink {
-            for handler in &self.handlers {
-                handler.abort();
-            }
-            sink.close(timeout).await?;
-        }
+        let publication = self.begin_changes_drain();
+        tokio::time::timeout(timeout, publication.wait()).await.map_err(|_| {
+            DataFusionError::Execution(format!(
+                "Change ingestion for dataset '{}' is still draining; its storage remains fenced",
+                self.dataset_name,
+            ))
+        })??;
         Ok(())
     }
 
@@ -1705,12 +1746,7 @@ impl AcceleratedTable {
 
 impl Drop for AcceleratedTable {
     fn drop(&mut self) {
-        for handler in self.handlers.drain(..) {
-            handler.abort();
-        }
-        if let Some(sink) = &self.change_sink {
-            sink.begin_close();
-        }
+        let _ = self.begin_changes_drain();
     }
 }
 
@@ -1732,7 +1768,7 @@ impl RegisteredAcceleratedTable for AcceleratedTable {
     }
 
     fn attach_task(&mut self, task: JoinHandle<()>) {
-        self.handlers.push(task);
+        self.handlers.lock().push(task);
     }
 }
 

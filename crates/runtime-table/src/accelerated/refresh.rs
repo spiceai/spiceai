@@ -1231,6 +1231,22 @@ impl Refresher {
         }
     }
 
+    /// Transfer every nested worker to the table generation's drain owner.
+    pub(crate) fn take_background_tasks(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut tasks = Vec::with_capacity(2);
+        if let Some(task) = self
+            .refresh_task_runner
+            .as_mut()
+            .and_then(RefreshTaskRunner::take_task)
+        {
+            tasks.push(task);
+        }
+        if let Some(task) = self.snapshot_interval_task.take() {
+            tasks.push(task);
+        }
+        tasks
+    }
+
     fn start_changes_stream(
         &mut self,
         changes_stream: ChangesStream,
