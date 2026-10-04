@@ -26,16 +26,19 @@ limitations under the License.
 //!
 //! **Concurrency model**: a lock file under the local state root serializes
 //! conditional writes across [`LocalConditionalPut`] instances and across local
-//! processes that use this wrapper for the same directory.
+//! processes that use this wrapper for the same directory. A dedicated filesystem
+//! worker retains the lock through publication after caller cancellation or Tokio
+//! shutdown. Accepted writes may finish after their caller stops waiting.
 //!
 //! [`LocalFileSystem`]: object_store::local::LocalFileSystem
 //! [`Error::NotImplemented`]: object_store::Error::NotImplemented
 
 use std::fmt::{self, Display, Formatter};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -61,51 +64,82 @@ use object_store::{
 ///
 /// [`UpdateVersion`]: object_store::UpdateVersion
 pub struct LocalConditionalPut {
-    inner: LocalFileSystem,
+    inner: Arc<LocalFileSystem>,
     root: PathBuf,
-    semaphore: LocalFileSemaphore,
+    writes: tokio::sync::mpsc::Sender<ConditionalWrite>,
 }
 
-#[derive(Debug, Clone)]
-struct LocalFileSemaphore {
-    lock_path: PathBuf,
+struct ConditionalWrite {
+    location: Path,
+    payload: PutPayload,
+    options: PutOptions,
+    reply: tokio::sync::oneshot::Sender<Result<PutResult, ObjectStoreError>>,
 }
 
-struct LocalFileSemaphoreGuard {
-    _file: File,
+fn worker_error(source: impl std::error::Error + Send + Sync + 'static) -> ObjectStoreError {
+    ObjectStoreError::Generic {
+        store: "LocalConditionalPut",
+        source: Box::new(source),
+    }
 }
 
-impl LocalFileSemaphore {
-    fn new(root: &std::path::Path) -> Self {
-        Self {
-            lock_path: root.join(".spice-object-store-occ.lock"),
+/// Runs outside any Tokio runtime so `LocalFileSystem` performs its filesystem
+/// calls synchronously. The lock and publication have one owner, even when the
+/// caller drops its future or shuts its runtime down. The bounded queue limits
+/// pending payloads; closing all senders drains accepted writes and exits.
+fn write_worker(
+    inner: &LocalFileSystem,
+    lock_path: &std::path::Path,
+    mut receive: tokio::sync::mpsc::Receiver<ConditionalWrite>,
+) {
+    while let Some(request) = receive.blocking_recv() {
+        let result = conditional_write(
+            inner,
+            lock_path,
+            &request.location,
+            request.payload,
+            request.options,
+        );
+        // A dropped receiver means an unknown outcome for the caller, not abort.
+        let _ = request.reply.send(result);
+    }
+}
+
+fn conditional_write(
+    inner: &LocalFileSystem,
+    lock_path: &std::path::Path,
+    location: &Path,
+    payload: PutPayload,
+    mut options: PutOptions,
+) -> Result<PutResult, ObjectStoreError> {
+    let guard = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(worker_error)?;
+    guard.lock().map_err(worker_error)?;
+    // No async executor task owns this guard: every filesystem operation runs
+    // to completion on this thread before its file descriptor releases the lock.
+    futures::executor::block_on(async {
+        if let PutMode::Update(expected) = &options.mode {
+            let current = inner.head(location).await?;
+            // LocalFileSystem supplies ETags but no object version IDs.
+            if current.e_tag != expected.e_tag {
+                return Err(ObjectStoreError::Precondition {
+                    path: location.to_string(),
+                    source: format!(
+                        "ETag mismatch: expected {:?}, found {:?}",
+                        expected.e_tag, current.e_tag
+                    )
+                    .into(),
+                });
+            }
+            options.mode = PutMode::Overwrite;
         }
-    }
-
-    async fn acquire(&self) -> Result<LocalFileSemaphoreGuard, ObjectStoreError> {
-        let lock_path = self.lock_path.clone();
-        let file = tokio::task::spawn_blocking(move || -> io::Result<File> {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)?;
-            file.lock()?;
-            Ok(file)
-        })
-        .await
-        .map_err(|source| ObjectStoreError::Generic {
-            store: "LocalConditionalPut",
-            source: Box::new(source),
-        })?
-        .map_err(|source| ObjectStoreError::Generic {
-            store: "LocalConditionalPut",
-            source: Box::new(source),
-        })?;
-
-        Ok(LocalFileSemaphoreGuard { _file: file })
-    }
+        inner.put_opts(location, payload, options).await
+    })
 }
 
 impl std::fmt::Debug for LocalConditionalPut {
@@ -128,12 +162,18 @@ impl LocalConditionalPut {
     /// (e.g. `root` does not exist or is not a directory).
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
         let root = root.into();
-        let inner = LocalFileSystem::new_with_prefix(&root)?;
-        let semaphore = LocalFileSemaphore::new(&root);
+        let inner = Arc::new(LocalFileSystem::new_with_prefix(&root)?);
+        let (writes, receive) = tokio::sync::mpsc::channel(1);
+        let worker_store = Arc::clone(&inner);
+        let lock_path = root.join(".spice-object-store-occ.lock");
+        std::thread::Builder::new()
+            .name("local-state-writer".to_owned())
+            .spawn(move || write_worker(&worker_store, &lock_path, receive))
+            .map_err(worker_error)?;
         Ok(Self {
             inner,
             root,
-            semaphore,
+            writes,
         })
     }
 }
@@ -153,32 +193,18 @@ impl ObjectStore for LocalConditionalPut {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult, ObjectStoreError> {
-        if let PutMode::Update(expected) = &opts.mode {
-            let expected = expected.clone();
-            let _guard = self.semaphore.acquire().await?;
-
-            // Read current ETag.
-            // Note: only `e_tag` is compared because `LocalFileSystem` does not
-            // support object versioning — `PutResult::version` is always `None`.
-            let current_meta = self.inner.head(location).await?;
-
-            if current_meta.e_tag != expected.e_tag {
-                return Err(ObjectStoreError::Precondition {
-                    path: location.to_string(),
-                    source: format!(
-                        "ETag mismatch: expected {:?}, found {:?}",
-                        expected.e_tag, current_meta.e_tag
-                    )
-                    .into(),
-                });
-            }
-
-            // ETag matches — write with overwrite mode.
-            let overwrite_opts = PutOptions {
-                mode: PutMode::Overwrite,
-                ..opts
-            };
-            self.inner.put_opts(location, payload, overwrite_opts).await
+        if matches!(opts.mode, PutMode::Update(_)) {
+            let (reply, result) = tokio::sync::oneshot::channel();
+            self.writes
+                .send(ConditionalWrite {
+                    location: location.clone(),
+                    payload,
+                    options: opts,
+                    reply,
+                })
+                .await
+                .map_err(|_| worker_error(io::Error::other("local state writer stopped")))?;
+            result.await.map_err(worker_error)?
         } else {
             self.inner.put_opts(location, payload, opts).await
         }

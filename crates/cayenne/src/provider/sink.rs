@@ -176,7 +176,7 @@ impl DataSink for CayenneDataSink {
         if self.table.is_memory_resident_mode() {
             let overwrite = self.overwrite == InsertOp::Overwrite;
             let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
-            let mut incoming_bytes: u64 = 0;
+            let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
             // Acquire the write lock BEFORE draining so memory-mode writes are
             // serialized during buffering: two concurrent writes must not each buffer
             // a large payload while both pass `enforce_memory_limit` against the same
@@ -190,8 +190,8 @@ impl DataSink for CayenneDataSink {
             let mut raw = normalized;
             while let Some(batch) = raw.next().await {
                 let batch = batch?;
-                incoming_bytes =
-                    incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+                incoming.add(&batch);
+                let incoming_bytes = incoming.total();
                 // Enforce the hard RAM bound while buffering so an oversized refresh
                 // fails fast with a structured error instead of OOMing during
                 // collection (memory mode never spills). Always count resident +
@@ -223,10 +223,7 @@ impl DataSink for CayenneDataSink {
                 let validated = prepared.stream.try_collect::<Vec<_>>().await?;
                 (validated, Some(state))
             };
-            incoming_bytes = batches
-                .iter()
-                .map(|batch| batch.get_array_memory_size() as u64)
-                .fold(0_u64, u64::saturating_add);
+            let incoming_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
             let (deletions, validated_keys) = post_validation
                 .map(|state| {
                     let super::on_conflict::PostValidationState {

@@ -841,12 +841,13 @@ impl<'a> AppendMutationWriter<'a> {
         // Buffer the raw write before any primary-key validation observes it.
         let schema = raw_stream.schema();
         let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut incoming_bytes: u64 = 0;
+        let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
         let mut incoming_rows: u64 = 0;
         let drain_start = Instant::now();
         while let Some(batch) = StreamExt::next(&mut raw_stream).await {
             let batch = batch?;
-            incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+            incoming.add(&batch);
+            let incoming_bytes = incoming.total();
             incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
             // Memory mode never spills, so enforce the per-table RAM bound AS the
             // burst is buffered: an oversized burst fails fast with the structured
@@ -870,13 +871,13 @@ impl<'a> AppendMutationWriter<'a> {
             Arc::clone(&schema),
             futures::stream::iter(raw_batches.clone().into_iter().map(Ok)),
         ));
+        // Validating the resolved batches RUNS the deferred PK-conflict
+        // validation; the tier holds what it yields, so size the admission from
+        // those batches, not the raw burst.
         let prepared = self.table.prepare_stream_for_insert(raw).await?;
         let post_validation = prepared.post_validation();
         let batches: Vec<RecordBatch> = prepared.stream.try_collect().await?;
-        incoming_bytes = batches
-            .iter()
-            .map(|batch| batch.get_array_memory_size() as u64)
-            .fold(0_u64, u64::saturating_add);
+        let incoming_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
         incoming_rows = batches
             .iter()
             .map(|batch| batch.num_rows() as u64)
@@ -988,10 +989,11 @@ impl<'a> AppendMutationWriter<'a> {
     }
 
     /// Sharded (N>1) in-memory CDC write path (§5 Phase 3, step b). Drains and
-    /// collapses the raw decoded stream, applies the whole-apply OOM-safety
-    /// caps/budget exactly as [`Self::write_cdc_in_memory`], then validates:
-    /// each batch is split by PK shard and the per-batch on-conflict validation
-    /// runs PER SHARD ([`CayenneTableProvider::validate_and_append_sharded`]),
+    /// collapses the RAW decoded stream and splits each batch by PK shard,
+    /// applies the whole-apply OOM-safety caps/budget exactly as
+    /// [`Self::write_cdc_in_memory`] to the shards' bytes, then DECOUPLES decode
+    /// from validation: the per-batch on-conflict validation runs PER SHARD
+    /// ([`CayenneTableProvider::validate_and_append_sharded`]),
     /// with the N shard appends joined concurrently. The combined post-validation
     /// state is published for the durable fallback.
     ///
@@ -1020,21 +1022,15 @@ impl<'a> AppendMutationWriter<'a> {
         // deferred to the per-shard step below).
         let schema = stream.schema();
         let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut incoming_bytes: u64 = 0;
         let mut incoming_rows: u64 = 0;
         let drain_start = Instant::now();
         while let Some(batch) = StreamExt::next(&mut stream).await {
             let batch = batch?;
-            incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
             incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
             batches.push(batch);
         }
         drop(stream);
         batches = self.table.collapse_buffered_changes(batches)?;
-        incoming_bytes = batches
-            .iter()
-            .map(|batch| batch.get_array_memory_size() as u64)
-            .fold(0_u64, u64::saturating_add);
         incoming_rows = batches
             .iter()
             .map(|batch| batch.num_rows() as u64)
@@ -1044,6 +1040,16 @@ impl<'a> AppendMutationWriter<'a> {
             "inmemory_stream_drain",
             drain_start,
         );
+
+        // Split by PK shard BEFORE budgeting: the tier retains the shards, not the
+        // raw batches, and the split copies every column into per-shard
+        // allocations whose bytes can exceed the raw batches'. Reserving the
+        // shards' own total keeps the reservation equal to what their segments
+        // record and a checkpoint releases.
+        let split = self
+            .table
+            .split_apply_by_pk_shard(&batches, &pk_indices, &converter)?;
+        let incoming_bytes = split.total_bytes();
 
         // Whole-apply (whole-tier) OOM-safety: per-table byte cap spill + global
         // budget reservation, identical to the serial path. The byte trigger is
@@ -1075,12 +1081,14 @@ impl<'a> AppendMutationWriter<'a> {
                 // the tier. Instead run validation only to produce the combined
                 // on-conflict deletions for the durable path. The simplest correct
                 // route: re-run validation through the standard serial prepare on
-                // the durable side (it rebuilds the single index). We therefore
+                // the durable side, against the table-wide index (current: every
+                // sharded apply records its keys there too). We therefore
                 // hand back the raw batches with an EMPTY post-validation; the
                 // durable `write_prepared_stream` re-validates via its own
                 // `prepare_stream_for_insert`. To keep that contract, the fallback
                 // re-streams the raw batches into a FRESH `prepare_stream_for_insert`
                 // at the caller.
+                drop(split);
                 return Ok(MemShardedOutcome::FallBackToDurable {
                     batches,
                     schema,
@@ -1088,18 +1096,19 @@ impl<'a> AppendMutationWriter<'a> {
                 });
             }
         }
+        // Admitted: the tier keeps only the shards.
+        drop(batches);
 
         // Validate + append per shard. On error, release the byte reservation so
         // the global budget doesn't leak (matching the serial path).
         let apply = match self
             .table
             .validate_and_append_sharded(
-                batches,
+                split,
                 sharded_index,
                 &pk_indices,
                 &converter,
                 &on_conflict,
-                incoming_bytes,
             )
             .await
         {

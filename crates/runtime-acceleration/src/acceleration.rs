@@ -471,6 +471,11 @@ impl Display for StaleIfError {
 
 // ── Acceleration struct ───────────────────────────────────────────────────────
 
+/// Why snapshots are neither created nor restored for an acceleration that
+/// [uses a Cayenne datalake tier](Acceleration::uses_cayenne_datalake), worded as the
+/// cause that follows a log line's consequence.
+pub const CAYENNE_DATALAKE_SNAPSHOT_REASON: &str = "it uses a Cayenne datalake tier, which snapshots do not cover: a snapshot refers to datalake files that the instance that created it later deletes, and a copy restored from it would share that instance's datalake, where each instance's cleanup deletes the other's files. See: https://spiceai.org/docs/components/data-accelerators/cayenne";
+
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Acceleration {
@@ -607,6 +612,30 @@ pub fn classify_durable_write_back_key(columns: &[String]) -> DurableWriteBackKe
 }
 
 impl Acceleration {
+    /// Whether this is a Cayenne acceleration with a datalake (cold object-store) tier.
+    ///
+    /// Snapshots do not cover the datalake tier. A snapshot's metastore slice refers to
+    /// datalake files by URL, the instance that owns the datalake deletes the files it
+    /// supersedes, and a copy restored from the snapshot inherits the owner's table id —
+    /// and with it the same datalake prefix, whose cleanup each instance runs against its
+    /// own file list, deleting the other's files. Snapshot creation and bootstrap are
+    /// therefore skipped for these accelerations.
+    /// See [`CAYENNE_DATALAKE_SNAPSHOT_REASON`] for the wording that explains it.
+    #[must_use]
+    pub fn uses_cayenne_datalake(&self) -> bool {
+        self.engine == Engine::Cayenne && self.cayenne_datalake_location().is_some()
+    }
+
+    /// The `cayenne_datalake_location` parameter, trimmed, when it is set. A non-empty
+    /// location is what enables a Cayenne acceleration's datalake tier.
+    #[must_use]
+    pub fn cayenne_datalake_location(&self) -> Option<&str> {
+        self.params
+            .get("cayenne_datalake_location")
+            .map(|location| location.trim())
+            .filter(|location| !location.is_empty())
+    }
+
     #[must_use]
     pub fn with_primary_key(mut self, primary_key: ColumnReference) -> Self {
         self.primary_key = Some(primary_key);
@@ -1383,6 +1412,38 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use spicepod::param::ParamValue;
     use std::sync::Arc;
+
+    #[test]
+    fn only_a_cayenne_acceleration_with_a_datalake_location_uses_the_datalake() {
+        let mut acceleration = Acceleration {
+            engine: Engine::Cayenne,
+            ..Acceleration::default()
+        };
+        assert!(
+            !acceleration.uses_cayenne_datalake(),
+            "no location configured"
+        );
+
+        acceleration
+            .params
+            .insert("cayenne_datalake_location".to_string(), "  ".to_string());
+        assert!(
+            !acceleration.uses_cayenne_datalake(),
+            "a blank location leaves the tier disabled"
+        );
+
+        acceleration.params.insert(
+            "cayenne_datalake_location".to_string(),
+            "s3://lake/prefix".to_string(),
+        );
+        assert!(acceleration.uses_cayenne_datalake());
+
+        acceleration.engine = Engine::Arrow;
+        assert!(
+            !acceleration.uses_cayenne_datalake(),
+            "only Cayenne has a datalake tier"
+        );
+    }
 
     /// The three connectors that override `DataConnector::resolve_refresh_mode`, plus
     /// the default. Asserted directly rather than only through a caller, because a
