@@ -1995,7 +1995,9 @@ impl SnapshotManager {
     /// store before its first snapshot. A probe that cannot tell — after a transient
     /// error, or because it may not write its probe object — refuses the publish too,
     /// since only the probe can tell a store that ignores conditions from one that
-    /// enforces them. That result is not kept, so the next attempt probes again.
+    /// enforces them. A lasting refusal (`Ignored` / `Unsupported`, even when the other
+    /// check is still `Unknown`) is kept so later publishes do not re-probe a known-bad
+    /// store; a genuinely unknown result is not kept, so the next attempt probes again.
     async fn ensure_conditional_writes(&self) -> Result<(), SnapshotUploadError> {
         let probed = self
             .conditional_write_check
@@ -2004,7 +2006,9 @@ impl SnapshotManager {
                 let support =
                     probe_conditional_writes(self.object_store.as_ref(), &self.snapshots_location)
                         .await;
-                if support.is_conclusive() {
+                // Cache conclusive answers and partial refusals (Ignored/Unsupported on
+                // either side). Retry only when both sides are still Unknown.
+                if support.is_conclusive() || support.refusal_reason().is_some() {
                     Ok(support)
                 } else {
                     Err(support)
@@ -5507,6 +5511,14 @@ mod tests {
             .await
             .expect("list");
         assert!(listed.is_empty(), "nothing may be uploaded: {listed:?}");
+        assert!(
+            manager
+                .conditional_write_check
+                .conclusive
+                .get()
+                .is_some_and(|s| s.refusal_reason().is_some()),
+            "a lasting refusal is kept so later publishes do not re-probe"
+        );
     }
 
     /// A store that cannot update conditionally, as a plain `LocalFileSystem` cannot, is

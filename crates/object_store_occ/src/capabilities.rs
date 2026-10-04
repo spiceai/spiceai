@@ -343,4 +343,43 @@ mod tests {
         assert!(support.ignores_conditions());
         assert!(!support.is_enforced());
     }
+
+    /// A partial probe that already saw Ignored or Unsupported is enough to refuse the
+    /// store, even when the other check is still Unknown. Callers that cache only
+    /// `is_conclusive()` would keep re-probing; they must also cache when
+    /// `refusal_reason()` is set.
+    #[test]
+    fn a_partial_refusal_is_cacheable_even_when_inconclusive() {
+        let ignored_unknown = ConditionalWriteSupport {
+            create: Enforcement::Ignored,
+            update: Enforcement::Unknown("update not tried".into()),
+        };
+        assert!(!ignored_unknown.is_conclusive(), "{ignored_unknown:?}");
+        assert_eq!(
+            ignored_unknown.refusal_reason(),
+            Some("accepted a write whose If-None-Match or If-Match condition did not hold"),
+            "{ignored_unknown:?}"
+        );
+
+        let unsupported_unknown = ConditionalWriteSupport {
+            create: Enforcement::Unsupported,
+            update: Enforcement::Unknown("update not tried".into()),
+        };
+        assert!(!unsupported_unknown.is_conclusive(), "{unsupported_unknown:?}");
+        assert_eq!(
+            unsupported_unknown.refusal_reason(),
+            Some("does not support conditional writes"),
+            "{unsupported_unknown:?}"
+        );
+
+        let unknown_unknown = ConditionalWriteSupport {
+            create: Enforcement::Unknown("create failed".into()),
+            update: Enforcement::Unknown("update not tried".into()),
+        };
+        assert!(!unknown_unknown.is_conclusive(), "{unknown_unknown:?}");
+        assert!(
+            unknown_unknown.refusal_reason().is_none(),
+            "genuinely unknown must keep retrying: {unknown_unknown:?}"
+        );
+    }
 }
