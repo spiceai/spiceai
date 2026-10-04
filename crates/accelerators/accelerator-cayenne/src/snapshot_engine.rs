@@ -197,11 +197,15 @@ async fn unreferenced_data_entries(
         .and_then(|rows| rows.first());
     let mut skip = HashSet::new();
     // A partitioned table keeps its partitions directly under the data
-    // directory; archive it as a whole.
+    // directory; archive it as a whole, except the partitions' persisted
+    // index runs. The slice registers none of them, so they cannot be
+    // listed one by one, and the background sync deletes their files while
+    // the archive is written; a restored partition rebuilds its index.
     if table_row
         .and_then(|row| slice_text(row, slice_column("cayenne_table", "partition_column")))
         .is_some()
     {
+        lookup_index_dirs(anchor, Path::new(""), &mut skip).await?;
         return Ok(skip);
     }
     let table_id = table_row
@@ -232,6 +236,35 @@ async fn unreferenced_data_entries(
         }
     }
     Ok(skip)
+}
+
+/// Every `_lookup_index` directory under `anchor`, relative to it, added to
+/// `found`. `relative` is the directory being searched.
+async fn lookup_index_dirs(
+    anchor: &Path,
+    relative: &Path,
+    found: &mut HashSet<PathBuf>,
+) -> std::io::Result<()> {
+    let mut pending = vec![relative.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let mut entries = match tokio::fs::read_dir(anchor.join(&dir)).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let path = dir.join(entry.file_name());
+            if entry.file_name() == cayenne::LOOKUP_INDEX_DIR_NAME {
+                found.insert(path);
+            } else {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The persisted secondary index runs the slice registers, as files the
@@ -692,13 +725,32 @@ mod tests {
             .collect();
         assert_eq!(skip, expected);
 
-        // A partitioned table is archived as a whole.
+        // A partitioned table is archived as a whole, except each
+        // partition's persisted index runs: the slice registers none of them,
+        // and the background sync deletes their files while the archive is
+        // written, so they are left out and rebuilt after a restore.
+        for dir in [
+            "us/ptid/current",
+            "us/ptid/_lookup_index/key",
+            "eu/_lookup_index",
+        ] {
+            std::fs::create_dir_all(anchor.join("partitioned").join(dir)).expect("mkdir");
+        }
+        std::fs::write(
+            anchor.join("partitioned/us/ptid/_lookup_index/key/run.run"),
+            b"run",
+        )
+        .expect("write");
         let partitioned = slice_with_partition("tid", "current", &[], &[], Some("region"));
-        assert!(
-            unreferenced_data_entries(anchor, &partitioned)
+        let expected: HashSet<PathBuf> = ["us/ptid/_lookup_index", "eu/_lookup_index"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(
+            unreferenced_data_entries(&anchor.join("partitioned"), &partitioned)
                 .await
-                .expect("list")
-                .is_empty()
+                .expect("list"),
+            expected
         );
     }
 

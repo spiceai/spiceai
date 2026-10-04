@@ -1113,16 +1113,44 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
 /// Walks `dir_path` recursively and appends each file to `archive` under
 /// `archive_prefix`, skipping any file whose path *relative to `dir_path`*
 /// is contained in `skip_relative_paths`.
+/// Opens `path` for reading without following a symbolic link in its place:
+/// `Ok(None)` when it is a link, which the archive leaves out as the
+/// directory walk does.
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Opens `path` for reading unless it is a symbolic link. The check and the
+/// open are separate steps here, so a link swapped in between is followed.
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Ok(None);
+    }
+    std::fs::File::open(path).map(Some)
+}
+
 /// Appends each `(source, archive_path)` file that still exists. A file
 /// deleted before it is opened is left out; one deleted after is archived
-/// whole, from the handle opened before.
+/// whole, from the handle opened before. A symbolic link or anything else
+/// that is not a regular file is left out, as the directory walk leaves it.
 fn append_optional_files<W: std::io::Write>(
     archive: &mut tar::Builder<W>,
     files: &[(PathBuf, String)],
 ) -> Result<()> {
     for (source, archive_path) in files {
-        let mut file = match std::fs::File::open(source) {
-            Ok(file) => file,
+        let opened = match open_no_follow(source) {
+            Ok(opened) => opened,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!(
                     "Leaving {} out of the archive: it was deleted before the archive reached it",
@@ -1136,6 +1164,23 @@ fn append_optional_files<W: std::io::Write>(
                     source: err,
                 });
             }
+        };
+        let regular = match &opened {
+            Some(file) => file
+                .metadata()
+                .map_err(|err| ArchiveError::CreateArchive {
+                    path: source.clone(),
+                    source: err,
+                })?
+                .is_file(),
+            None => false,
+        };
+        let Some(mut file) = opened.filter(|_| regular) else {
+            tracing::debug!(
+                "Leaving {} out of the archive: it is not a regular file",
+                source.display()
+            );
+            continue;
         };
         archive
             .append_file(archive_path, &mut file)
@@ -1314,6 +1359,52 @@ mod tests {
             "ordinary permission bits must be preserved"
         );
 
+        Ok(())
+    }
+
+    /// An optional file is archived when it exists and left out when it does
+    /// not. One that is a symbolic link is left out too, as the directory walk
+    /// leaves out links: archiving its target would copy any file `spiced`
+    /// can read into the snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn optional_files_skip_missing_files_and_symbolic_links() -> Result<()> {
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let data_dir = test_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let secret = test_dir.path().join("secret.txt");
+        std::fs::write(&secret, b"SECRET_OUTSIDE_DATA_DIR").expect("write secret");
+        std::fs::write(data_dir.join("kept.run"), b"run bytes").expect("write run");
+        std::os::unix::fs::symlink(&secret, data_dir.join("linked.run")).expect("symlink");
+        let optional = vec![
+            (data_dir.join("kept.run"), "data/kept.run".to_string()),
+            (data_dir.join("missing.run"), "data/missing.run".to_string()),
+            (data_dir.join("linked.run"), "data/linked.run".to_string()),
+        ];
+        let archive_path = test_dir.path().join("snapshot.tar");
+        archive_directories_to_file_with_plan(&[], &archive_path, &[], &[], &optional).await?;
+
+        let bytes = std::fs::read(&archive_path).expect("read archive");
+        let mut entries: Vec<String> = tar::Archive::new(bytes.as_slice())
+            .entries()
+            .expect("entries")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .path()
+                    .expect("path")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec!["data/kept.run".to_string()]);
+        assert!(
+            !bytes
+                .windows(b"SECRET_OUTSIDE_DATA_DIR".len())
+                .any(|window| window == b"SECRET_OUTSIDE_DATA_DIR"),
+            "a linked file's target must not be archived"
+        );
         Ok(())
     }
 

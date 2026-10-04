@@ -17447,6 +17447,7 @@ dependencies = [
  "futures",
  "gethostname",
  "hex",
+ "libc",
  "object_store 0.13.2",
  "opentelemetry",
  "parking_lot",
