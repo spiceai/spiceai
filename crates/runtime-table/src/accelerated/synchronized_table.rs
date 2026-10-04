@@ -29,6 +29,9 @@ use crate::accelerated::caching::{
 };
 use crate::accelerated::refresh::Refresher;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone)]
 pub struct SynchronizedTable {
     parent_dataset_name: TableReference,
