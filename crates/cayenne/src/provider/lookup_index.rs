@@ -1606,7 +1606,16 @@ impl LookupIndexState {
         {
             return;
         }
-        let (runs, bytes) = persisted_runs.load().await;
+        // A failed load leaves syncing off for this open, as if the table did
+        // not persist: its files are indexed in the background, and the runs
+        // stay where they are for the next open.
+        let (runs, bytes) = match persisted_runs.load().await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::debug!(table = %self.table_name, %error, "Secondary index runs were not loaded, and are not persisted until the table reopens");
+                return;
+            }
+        };
         let live: HashSet<&str> = live.iter().map(|path| file_name(path)).collect();
         *self.live_files.lock() = Some(Arc::new(
             live.iter().map(|&name| name.to_string()).collect(),
@@ -2638,17 +2647,17 @@ impl PersistedRuns {
 
     /// Every key's persisted runs. A registered run whose file cannot be read
     /// is unregistered and deleted, and a file no run is registered for, left
-    /// by a write that stopped before registering it, is deleted.
-    async fn load(&self) -> (Vec<Vec<IndexRun>>, u64) {
+    /// by a write that stopped before registering it, is deleted. An error
+    /// when the registered runs cannot be listed: nothing is loaded, and
+    /// nothing may be synced, since every run would then look unwanted.
+    async fn load(&self) -> Result<(Vec<Vec<IndexRun>>, u64), String> {
         let mut all: Vec<Vec<IndexRun>> = self.keys.iter().map(|_| Vec::new()).collect();
         let mut bytes = 0_u64;
-        let registered = match self.catalog.list_index_runs(&self.table_id).await {
-            Ok(registered) => registered,
-            Err(error) => {
-                tracing::debug!(table = %self.table_name, %error, "Secondary index runs were not loaded: the persisted runs could not be listed");
-                return (all, bytes);
-            }
-        };
+        let registered = self
+            .catalog
+            .list_index_runs(&self.table_id)
+            .await
+            .map_err(|e| format!("list persisted runs: {e}"))?;
         let mut kept: HashSet<object_store::path::Path> = HashSet::new();
         for record in registered {
             let path = self.path(&record.index_key, &record.run_name);
@@ -2674,7 +2683,7 @@ impl PersistedRuns {
             }
         }
         self.delete_unregistered(&kept).await;
-        (all, bytes)
+        Ok((all, bytes))
     }
 
     async fn read(&self, path: &object_store::path::Path) -> Result<IndexRun, String> {

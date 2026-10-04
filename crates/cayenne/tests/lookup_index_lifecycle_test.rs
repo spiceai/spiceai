@@ -894,6 +894,87 @@ async fn a_reopened_table_loads_its_persisted_runs() {
     );
 }
 
+/// A table that cannot list its persisted runs when it opens loads none of
+/// them, and must not then delete them as unwanted: they are still valid,
+/// and the next open loads them. The listing is made to fail by hiding the
+/// metastore table that registers the runs while the table opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_load_of_the_persisted_runs_deletes_none_of_them() {
+    const ROWS: usize = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "load_failure";
+    let config = || VortexConfig {
+        target_vortex_file_size_mb: 1,
+        ..VortexConfig::default()
+    };
+    let open_persisted = || {
+        open_configured(
+            &fixture,
+            Arc::clone(&env),
+            name,
+            &[&KEY],
+            config(),
+            IndexPersistence::Enabled,
+        )
+    };
+    let table = open_persisted().await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
+    let rows_i64 = i64::try_from(ROWS).expect("fits");
+    insert(&table, name, rows(rows_i64, 3_000)).await;
+    wait_for_persisted_runs(&fixture, name, 2).await;
+    drop(table);
+    let mut persisted: Vec<String> = registered_runs(&fixture, name)
+        .await
+        .into_iter()
+        .map(|run| run.run_name)
+        .collect();
+    persisted.sort();
+
+    let metastore = rusqlite::Connection::open(fixture.temp_dir.path().join("test.db"))
+        .expect("open metastore");
+    metastore
+        .execute_batch("ALTER TABLE cayenne_index_run RENAME TO cayenne_index_run_hidden")
+        .expect("hide the registered runs");
+    let reopened = open_persisted().await;
+    metastore
+        .execute_batch("ALTER TABLE cayenne_index_run_hidden RENAME TO cayenne_index_run")
+        .expect("restore the registered runs");
+    // A change that would sync the runs: had the failed load enabled syncing,
+    // this write's run would be persisted and the unloaded runs deleted. An
+    // absence has to be waited out, so the wait is bounded.
+    insert(&reopened, name, rows(rows_i64 * 2, 3_000)).await;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && registered_runs(&fixture, name).await.len() <= 2 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut after: Vec<String> = registered_runs(&fixture, name)
+        .await
+        .into_iter()
+        .map(|run| run.run_name)
+        .collect();
+    after.sort();
+    assert!(
+        persisted.iter().all(|run| after.contains(run)),
+        "the runs the table could not load were deleted: {persisted:?} -> {after:?}"
+    );
+    drop(reopened);
+
+    let next = open_persisted().await;
+    let verification = next
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    assert!(
+        verification.agrees() && verification.files > 0,
+        "the next open loads the runs the failed load left in place: {verification:?}"
+    );
+    lookup(&next, name, 7).await;
+    lookup(&next, name, rows_i64 * 2 + 7).await;
+}
+
 /// Relaxing a key column from `NOT NULL` to nullable is an in-place schema
 /// evolution: the table keeps its id and its persisted runs. A nullable column
 /// encodes each value behind a validity byte, so a run built while the column
