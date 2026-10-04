@@ -392,27 +392,43 @@ pub(crate) async fn clear_blob_keyed_marker_rows(
     Ok(())
 }
 
+/// Which of a partition's candidate child tables [`partition_child_table_ids`]
+/// returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PartitionChildren {
+    /// The table each partition opens: its current-scheme name if a table by
+    /// that name exists, else its legacy one if that is rooted at the
+    /// partition's directory. What a snapshot exports.
+    Opened,
+    /// The current-scheme table wherever it is rooted, plus the legacy one if
+    /// it is rooted at the partition's directory. What a drop, or an import's
+    /// clear of the reader's own copy, removes.
+    All,
+}
+
 /// Resolve the `table_id`s of `parent_name`'s per-partition child tables.
 ///
 /// A partitioned Cayenne table's partitions are catalog tables of their own:
 /// each has its own `cayenne_table` row, its own `table_id`, and its own
-/// dependent rows. Three callers need that set and must agree on it — the
-/// catalog drops the children with their parent, the metastore snapshot exports
-/// them with it, and the snapshot's import clears the reader's own before
-/// replacing them. A second copy of this rule is how a dataset comes to be
-/// dropped by one definition of "child" and exported by another, so it lives
-/// here once.
+/// dependent rows. Three callers need that set — the catalog drops the children
+/// with their parent, the metastore snapshot exports them with it, and the
+/// snapshot's import clears the reader's own before replacing them — and each
+/// takes the part of it [`PartitionChildren`] names. What counts as a child is
+/// decided here once, so a drop and a snapshot cannot disagree about it.
 ///
-/// A name match alone is not enough: the legacy convention
-/// (`{parent}_{values}`) can also spell an unrelated table an operator happens
-/// to have accelerated into the same metastore — partitioning `events` by year
-/// spells `events_2024`. A child is rooted at its partition's own directory
-/// ([`crate::partition_creator`] passes one path to both the partition row and
-/// the child table), so the row's `path` must equal the partition's before it
-/// counts as one. A child whose path somehow differs is left behind rather than
-/// matched, which is the safe direction to be wrong in for a drop and the loud
-/// one for an export, where [`snapshot::DatasetMetastoreSlice::validate`]
-/// refuses the resulting slice.
+/// A table under the partition's current-scheme name is its child wherever it
+/// is rooted: `infer_existing_partitions` opens that name first and never looks
+/// at the path. A legacy-scheme name (`{parent}_{values}`) is matched only at the
+/// partition's own directory ([`crate::partition_creator`] passes one path to
+/// both the partition row and the child table), because that convention can
+/// also spell an unrelated table an operator happens to have accelerated into
+/// the same metastore — partitioning `events` by year spells `events_2024`.
+///
+/// `children` picks between them: an export takes the one table each partition
+/// opens, so a restore reads what the source reads, and a current-scheme child
+/// rooted elsewhere reaches [`snapshot::DatasetMetastoreSlice::validate`], which
+/// refuses it; a drop or an import's clear takes both candidates, so nothing is
+/// left for a recreated partition to open.
 ///
 /// The key is **derived** from the partition's stored values rather than read
 /// from `cayenne_partition.partition_key`, because deriving is what
@@ -432,6 +448,7 @@ pub(crate) async fn partition_child_table_ids(
     metastore: &impl MetastoreBackend,
     parent_name: &str,
     parent_table_id: &str,
+    children: PartitionChildren,
 ) -> CatalogResult<Vec<String>> {
     // `ORDER BY partition_id` so the child set — and therefore a slice built
     // from it — is the same on every read of the same metastore.
@@ -457,26 +474,39 @@ pub(crate) async fn partition_child_table_ids(
                     "cannot resolve the partition child tables of '{parent_name}': a partition's stored values are unreadable: {e}"
                 ),
             })?;
-        let [composite_name, legacy_name] =
+        let [current_name, legacy_name] =
             crate::partition_naming::partition_child_candidate_names(parent_name, &values);
-        let matched: Vec<String> = metastore
+        let candidates: Vec<(String, String, String)> = metastore
             .query(
                 QueryParams {
-                    sql: "SELECT table_id FROM cayenne_table \
-                          WHERE table_name IN (?1, ?2) AND path = ?3",
+                    sql: "SELECT table_id, table_name, path FROM cayenne_table \
+                          WHERE table_name IN (?1, ?2)",
                     params: vec![
-                        MetastoreValue::Text(composite_name),
-                        MetastoreValue::Text(legacy_name),
-                        MetastoreValue::Text(path),
+                        MetastoreValue::Text(current_name.clone()),
+                        MetastoreValue::Text(legacy_name.clone()),
                     ],
                 },
-                |row| row.get_string(0),
+                |row| Ok((row.get_string(0)?, row.get_string(1)?, row.get_string(2)?)),
             )
             .await?;
-        // `cayenne_table(table_name)` is unique and a partition owns its
-        // directory, so a child matches at most one partition — but matching
-        // one twice would export its rows twice and fail the import's INSERT on
-        // that same uniqueness, so do not depend on it holding.
+        // `cayenne_table(table_name)` is unique, so each name has at most one row.
+        let (mut current, mut legacy) = (None, None);
+        for (id, name, child_path) in candidates {
+            if name == current_name {
+                current = Some(id);
+            } else if name == legacy_name && child_path == path {
+                legacy = Some(id);
+            }
+        }
+        let matched: Vec<String> = match children {
+            PartitionChildren::Opened => current.or(legacy).into_iter().collect(),
+            PartitionChildren::All => current.into_iter().chain(legacy).collect(),
+        };
+        // One table can answer two partitions: a current-scheme name is matched
+        // wherever it is rooted, and one partition's current-scheme name can be
+        // another's legacy name (see `DatasetMetastoreSlice::validate`). Listing
+        // it twice would export its rows twice and fail the import's INSERT on
+        // `cayenne_table(table_name)`, so keep each id once.
         for id in matched {
             if seen_child_ids.insert(id.clone()) {
                 child_ids.push(id);

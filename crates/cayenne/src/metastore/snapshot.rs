@@ -393,11 +393,17 @@ pub async fn export_dataset(
         })?;
 
     // A partitioned table's partitions are catalog tables of their own, so the
-    // slice must span the parent *and* every child: restoring the parent alone
+    // slice must span the parent *and* each partition's child: restoring the parent alone
     // leaves `cayenne_partition` rows whose child tables do not exist, and the
     // dataset then fails to open at `infer_existing_partitions` with
     // `TableNotFound`.
-    let child_ids = super::partition_child_table_ids(metastore, dataset_name, &table_id).await?;
+    let child_ids = super::partition_child_table_ids(
+        metastore,
+        dataset_name,
+        &table_id,
+        super::PartitionChildren::Opened,
+    )
+    .await?;
 
     // Parent first, so the parent's `cayenne_table` row leads the slice.
     let table_ids: Vec<&str> = std::iter::once(table_id.as_str())
@@ -840,9 +846,13 @@ pub async fn import_dataset(
     // concurrently with a restore can still be missed.
     let mut stale_child_ids: Vec<String> = Vec::new();
     if let Some(local_parent_id) = lookup_table_id(metastore, &slice.dataset_name).await? {
-        stale_child_ids =
-            super::partition_child_table_ids(metastore, &slice.dataset_name, &local_parent_id)
-                .await?;
+        stale_child_ids = super::partition_child_table_ids(
+            metastore,
+            &slice.dataset_name,
+            &local_parent_id,
+            super::PartitionChildren::All,
+        )
+        .await?;
     }
 
     let txn = metastore.begin_transaction().await?;
@@ -889,8 +899,8 @@ pub async fn import_dataset(
         //
         // The two sides do not derive it the same way, and that asymmetry is
         // deliberate on the discovery side: `partition_child_table_ids` requires
-        // the local row's `path` to equal the partition's before it counts as a
-        // child, precisely because the legacy naming convention
+        // a legacy-named local row's `path` to equal the partition's before it
+        // counts as a child, precisely because the legacy naming convention
         // (`{parent}_{values}`) can also spell an unrelated table an operator
         // happens to have accelerated into the same metastore — partitioning
         // `events` by year spells `events_2024`. `validate` cannot apply that
@@ -2675,6 +2685,134 @@ mod tests {
         import_dataset(ms.as_ref(), &slice, tmp.path())
             .await
             .expect("both ways of splitting one legacy name must each keep their own partition");
+    }
+
+    /// The child a snapshot exports for a partition is the one the runtime
+    /// opens. `infer_existing_partitions` opens a table under the partition's
+    /// current-scheme name wherever it is rooted, and falls back to the legacy
+    /// name only when there is none. Exporting the legacy child in its place
+    /// would restore a dataset that reads different rows from the one exported,
+    /// so a current-scheme child rooted away from its partition is exported and
+    /// the slice is refused.
+    ///
+    /// Reported by Copilot on #14238.
+    #[tokio::test]
+    async fn exports_the_child_the_runtime_opens_and_refuses_one_rooted_elsewhere() {
+        let (ms, tmp) = fresh_metastore().await;
+        insert_dataset_without_children(&ms, "events", tmp.path(), &[("p1", "x", "events.dir/kx")])
+            .await;
+        // The current-scheme child, rooted away from its partition.
+        insert_partition_child(&ms, "events", "x", tmp.path(), "events.dir/stale").await;
+        // The legacy-scheme child, rooted at the partition.
+        let partition_dir = tmp.path().join("events.dir/kx");
+        insert_bare_table(
+            &ms,
+            "tid-legacy",
+            "events_x",
+            &partition_dir.to_string_lossy(),
+        )
+        .await;
+
+        let message = export_dataset(ms.as_ref(), "events", tmp.path())
+            .await
+            .expect_err(
+                "the child the runtime opens is rooted elsewhere, so the export must refuse",
+            )
+            .to_string();
+        assert!(
+            message.contains(&format!(
+                "child table '{}' is rooted at",
+                child_table_name("events", "x")
+            )),
+            "err={message}"
+        );
+    }
+
+    /// A partition holding both a current-scheme and a legacy-scheme child
+    /// opens the current one, so that is the one a snapshot carries. Exporting
+    /// both would hand the restore a child no partition opens.
+    #[tokio::test]
+    async fn exports_only_the_child_a_partition_opens_when_it_has_both() {
+        let (ms, tmp) = fresh_metastore().await;
+        insert_dataset_without_children(&ms, "events", tmp.path(), &[("p1", "x", "events.dir/kx")])
+            .await;
+        insert_partition_child(&ms, "events", "x", tmp.path(), "events.dir/kx").await;
+        let partition_dir = tmp.path().join("events.dir/kx");
+        insert_bare_table(
+            &ms,
+            "tid-legacy",
+            "events_x",
+            &partition_dir.to_string_lossy(),
+        )
+        .await;
+
+        let slice = export_dataset(ms.as_ref(), "events", tmp.path())
+            .await
+            .expect("the partition's own child is exported");
+        let names: Vec<&str> = slice.tables["cayenne_table"]
+            .iter()
+            .filter_map(|row| text_at(row, CAYENNE_TABLE_NAME_INDEX))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["events", child_table_name("events", "x").as_str()],
+            "the parent and the child the partition opens, and nothing else"
+        );
+    }
+
+    /// Import clears the reader's own children before replacing them, and a
+    /// table under a partition's current-scheme name is that partition's child
+    /// wherever it is rooted — it is what the runtime opens. Left behind, it
+    /// would be what the restored partition opens instead of the child the
+    /// slice restores.
+    #[tokio::test]
+    async fn import_clears_a_current_scheme_child_rooted_away_from_its_partition() {
+        let (reader, reader_tmp) = fresh_metastore().await;
+        insert_dataset_without_children(
+            &reader,
+            "events",
+            reader_tmp.path(),
+            &[("p1", "x", "events.dir/kx")],
+        )
+        .await;
+        insert_partition_child(
+            &reader,
+            "events",
+            "x",
+            reader_tmp.path(),
+            "events.dir/stale",
+        )
+        .await;
+
+        let (exporter, exporter_tmp) = fresh_metastore().await;
+        insert_dataset_without_children(
+            &exporter,
+            "events",
+            exporter_tmp.path(),
+            &[("p1", "x", "events.dir/kx")],
+        )
+        .await;
+        let partition_dir = exporter_tmp.path().join("events.dir/kx");
+        insert_bare_table(
+            &exporter,
+            "tid-legacy",
+            "events_x",
+            &partition_dir.to_string_lossy(),
+        )
+        .await;
+        let slice = export_dataset(exporter.as_ref(), "events", exporter_tmp.path())
+            .await
+            .expect("a legacy child rooted at its partition exports");
+
+        import_dataset(reader.as_ref(), &slice, reader_tmp.path())
+            .await
+            .expect("the slice imports");
+        let names = table_names(reader.as_ref()).await;
+        assert!(
+            !names.contains(&child_table_name("events", "x")),
+            "the reader's stale current-scheme child must be cleared: {names:?}"
+        );
+        assert!(names.contains(&"events_x".to_string()), "{names:?}");
     }
 
     /// Two partitions may name one directory — `cayenne_partition` puts no

@@ -2076,12 +2076,13 @@ impl CayenneCatalog {
         Ok(ids.pop())
     }
 
-    /// `table_id`s of the per-partition child tables of `table_name`.
+    /// `table_id`s of every per-partition child table of `table_name`, for a
+    /// drop to remove with it.
     ///
-    /// Delegates to [`crate::metastore::partition_child_table_ids`], which is
-    /// shared with the metastore snapshot's export and import so a dataset
-    /// cannot be dropped by one definition of "child" and exported by another.
-    /// Its doc comment carries the matching rule.
+    /// Delegates to [`crate::metastore::partition_child_table_ids`] with
+    /// [`crate::metastore::PartitionChildren::All`]; the snapshot's export and
+    /// import call the same function, so they share its rule for what a child
+    /// is. Its doc comment carries the matching rule.
     async fn partition_child_table_ids(
         &self,
         table_name: &str,
@@ -2090,11 +2091,23 @@ impl CayenneCatalog {
         self.metastore.note_query();
         match &self.metastore.backend {
             MetastoreBackendImpl::Sqlite(m) => {
-                crate::metastore::partition_child_table_ids(m, table_name, table_id).await
+                crate::metastore::partition_child_table_ids(
+                    m,
+                    table_name,
+                    table_id,
+                    crate::metastore::PartitionChildren::All,
+                )
+                .await
             }
             #[cfg(feature = "turso")]
             MetastoreBackendImpl::Turso(m) => {
-                crate::metastore::partition_child_table_ids(m, table_name, table_id).await
+                crate::metastore::partition_child_table_ids(
+                    m,
+                    table_name,
+                    table_id,
+                    crate::metastore::PartitionChildren::All,
+                )
+                .await
             }
         }
         .map_err(|e| CatalogError::FailedToGetPartitions {
