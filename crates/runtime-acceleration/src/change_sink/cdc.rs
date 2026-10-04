@@ -22,9 +22,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{
-    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
+    Array, ArrayRef, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{ArrowNativeType, DataType};
 use data_components::cdc::{ChangeBatch, ChangeOperation};
 use datafusion::error::Result;
 use datafusion::sql::TableReference;
@@ -172,6 +172,34 @@ impl OpBatchAccumulator {
     }
 }
 
+fn primary_key_lists_are_uniform(change_batch: &ChangeBatch) -> bool {
+    let Some(keys) = change_batch
+        .record
+        .column_by_name("primary_keys")
+        .and_then(|column| column.as_any().downcast_ref::<ListArray>())
+    else {
+        return false;
+    };
+    let Some(names) = keys.values().as_any().downcast_ref::<StringArray>() else {
+        return false;
+    };
+    if keys.null_count() > 0 || names.null_count() > 0 {
+        return false;
+    }
+    let offsets = keys.value_offsets();
+    let Some(first) = offsets.windows(2).next() else {
+        return true;
+    };
+    let first = first[0].as_usize()..first[1].as_usize();
+    offsets.windows(2).all(|pair| {
+        let row = pair[0].as_usize()..pair[1].as_usize();
+        row.len() == first.len()
+            && row
+                .zip(first.clone())
+                .all(|(row, first)| names.value(row) == names.value(first))
+    })
+}
+
 /// Groups rows into sub-batches based on operation type and primary key
 /// conflicts across active operation buckets.
 ///
@@ -197,6 +225,18 @@ pub fn group_into_sub_batches(
     let num_rows = change_batch.record.num_rows();
     if num_rows == 0 {
         return vec![];
+    }
+
+    // Different key definitions cannot share conflict buckets or delete filters.
+    if !primary_key_lists_are_uniform(change_batch) {
+        return (0..num_rows)
+            .map(|row| {
+                (
+                    ChangeOperationType::from_operation(&change_batch.op(row)),
+                    vec![row],
+                )
+            })
+            .collect();
     }
 
     // Extract data batch and PK column indices once, instead of per-row.

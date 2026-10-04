@@ -165,6 +165,130 @@ async fn same_scope_preserves_duplicate_inputs() {
     .expect("duplicates inside the same scope belong to the provider conflict policy");
 }
 
+#[tokio::test]
+async fn mixed_primary_key_lists_preserve_deletes() {
+    use super::provider::cdc::{ChangeOperationType, group_into_sub_batches};
+
+    let cases = [
+        ([Some("id"), None, None], vec![vec![0], vec![1], vec![2]]),
+        (
+            [None, Some("id"), Some("id")],
+            vec![vec![0], vec![1], vec![2]],
+        ),
+        (
+            [Some("id"), Some("payload"), Some("payload")],
+            vec![vec![0], vec![1], vec![2]],
+        ),
+        ([Some("id"); 3], vec![vec![0, 2]]),
+        ([None; 3], vec![vec![0, 1, 2]]),
+    ];
+    for (key_names, expected_groups) in cases {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![9, 9, 42])),
+                Arc::new(StringArray::from(vec!["old-a", "old-b", "unrelated"])),
+            ],
+        )
+        .expect("initial rows");
+        let table = Arc::new(
+            data_components::arrow::write::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![initial]],
+            )
+            .expect("Arrow accelerator"),
+        );
+        let mut offsets = vec![0_i32];
+        let mut names = Vec::new();
+        for name in key_names {
+            names.extend(name);
+            offsets.push(i32::try_from(names.len()).expect("three keys fit i32"));
+        }
+        let keys = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::Utf8, false)),
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(StringArray::from(names)),
+            None,
+        )
+        .expect("row-specific keys");
+        let data: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![99, 9, 9])),
+            Arc::new(StringArray::from(vec!["absent", "old-a", "old-b"])),
+        ];
+        let changes = SourceBatch::try_new(
+            RecordBatch::try_new(
+                Arc::new(changes_schema(&schema)),
+                vec![
+                    Arc::new(StringArray::from(vec!["d", "d", "d"])),
+                    Arc::new(keys),
+                    Arc::new(StructArray::new(schema.fields().clone(), data, None)),
+                ],
+            )
+            .expect("CDC rows"),
+        )
+        .expect("valid CDC batch");
+        let groups = group_into_sub_batches(&changes);
+        assert!(
+            groups
+                .iter()
+                .all(|(op, _)| *op == ChangeOperationType::Delete)
+        );
+        assert_eq!(
+            groups.into_iter().map(|(_, rows)| rows).collect::<Vec<_>>(),
+            expected_groups,
+            "key definitions: {key_names:?}",
+        );
+        let context = SessionContext::new();
+        context
+            .register_table("target", Arc::clone(&table) as Arc<dyn TableProvider>)
+            .expect("register Arrow accelerator");
+        let backend = ProviderChangeSinkBackend::new(ChangeSinkContext::new(
+            TableReference::bare("target"),
+            table,
+        ));
+        backend
+            .apply(ChangeBatch::cdc(changes), WriteOptions::default(), &context)
+            .await
+            .expect("mixed-key deletes must execute");
+        let rows = context
+            .sql("SELECT id, payload FROM target")
+            .await
+            .expect("plan read")
+            .collect()
+            .await
+            .expect("read Arrow accelerator");
+        assert_eq!(
+            rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1,
+            "key definitions: {key_names:?}; actual rows: {rows:?}"
+        );
+        let row = rows
+            .iter()
+            .find(|batch| batch.num_rows() > 0)
+            .expect("one remaining row");
+        assert_eq!(
+            row.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id")
+                .value(0),
+            42
+        );
+        assert_eq!(
+            row.column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("payload")
+                .value(0),
+            "unrelated"
+        );
+    }
+}
+
 fn zero_changes(values: ArrayRef) -> (SchemaRef, SourceBatch) {
     let field = Arc::new(Field::new("id", values.data_type().clone(), false));
     let schema = Arc::new(Schema::new(vec![Arc::clone(&field)]));
