@@ -13887,15 +13887,18 @@ name = "object_store_occ"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "bytes",
  "futures",
  "object_store 0.13.2",
  "parking_lot",
+ "rayon",
  "serde",
  "serde_json",
  "snafu",
  "tempfile",
  "tokio",
+ "uuid 1.23.2",
 ]
 
 [[package]]

@@ -23,7 +23,7 @@ on:
 concurrency:
   # A newer run cancels the one in progress for the same pull request, merge group, non-trunk
   # branch or manually dispatched trunk commit. Trunk pushes share one group and never cancel
-  # the running check on `spiceai-macos`: a newer push replaces only the run still waiting.
+  # the running check on `spiceai-macos-large`: a newer push replaces only the run still waiting.
   # The trunk commit is the merge-group commit that already passed this workflow.
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ (github.ref_name == 'trunk' && github.event_name != 'push') && github.sha || 'any-sha' }}
   cancel-in-progress: ${{ github.ref_name != 'trunk' || github.event_name != 'push' }}
@@ -47,7 +47,7 @@ jobs:
     # Emit the required context on pull requests without running the expensive
     # feature matrix; the real check runs on the merge-group commit.
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/trunk' && 'spiceai-macos' || 'spiceai-macos-large' }}
+    runs-on: spiceai-macos-large
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
