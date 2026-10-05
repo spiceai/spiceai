@@ -1170,15 +1170,16 @@ fn open_no_follow(root: &Path, path: &Path) -> std::io::Result<Option<std::fs::F
     Ok(Some(parent))
 }
 
-/// Opens `path` for reading unless it is a symbolic link. The check and the
-/// open are separate steps here, so a link swapped in between is followed.
+/// Optional index runs are rebuildable. Without a race-free directory-relative
+/// open, omit them rather than following a link introduced between a path check
+/// and the open. Their restored registrations are healed by rebuilding the index.
 #[cfg(not(unix))]
-fn open_no_follow(root: &Path, path: &Path) -> std::io::Result<Option<std::fs::File>> {
-    let path = root.join(path);
-    if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
-        return Ok(None);
-    }
-    std::fs::File::open(path).map(Some)
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Platform implementations share the Unix fallible-open interface"
+)]
+fn open_no_follow(_root: &Path, _path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    Ok(None)
 }
 
 /// Appends each `(source, archive_path)` file that still exists. A file
@@ -1417,6 +1418,47 @@ mod tests {
             "ordinary permission bits must be preserved"
         );
 
+        Ok(())
+    }
+
+    /// Without a race-free open, snapshots retain their data files while
+    /// leaving rebuildable optional index files out.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn optional_files_are_omitted_without_a_race_free_open() -> Result<()> {
+        let fixture = TempDir::new().expect("fixture");
+        let data = fixture.path().join("data");
+        let index = data.join("_lookup_index");
+        std::fs::create_dir_all(&index).expect("index directory");
+        std::fs::write(data.join("rows.vortex"), b"table rows").expect("data file");
+        let run = index.join("key.run");
+        std::fs::write(&run, b"optional run").expect("index file");
+        let destination = fixture.path().join("snapshot.tar");
+        archive_directories_to_file_with_plan(
+            &[(data, "data/".to_string())],
+            &destination,
+            &[PathBuf::from("_lookup_index")],
+            &[],
+            &[(run, "data/_lookup_index/key.run".to_string())],
+        )
+        .await?;
+        let bytes = std::fs::read(destination).expect("archive");
+        let entries: Vec<_> = tar::Archive::new(bytes.as_slice())
+            .entries()
+            .expect("entries")
+            .map(|entry| entry.expect("entry").path().expect("path").into_owned())
+            .collect();
+        assert_eq!(entries, vec![PathBuf::from("data/rows.vortex")]);
+        assert!(
+            bytes
+                .windows(b"table rows".len())
+                .any(|window| window == b"table rows")
+        );
+        assert!(
+            !bytes
+                .windows(b"optional run".len())
+                .any(|window| window == b"optional run")
+        );
         Ok(())
     }
 

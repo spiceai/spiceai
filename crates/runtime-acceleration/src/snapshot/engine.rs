@@ -258,11 +258,13 @@ pub struct DirectorySnapshotPlan {
     /// Files archived only if they still exist when the archive reaches
     /// them: one deleted before is left out rather than failing the snapshot,
     /// and one deleted while it is copied is archived whole. For files the
-    /// engine may delete at any time and a restore tolerates missing.
+    /// engine may delete at any time and a restore tolerates missing. These
+    /// files are also omitted on platforms without a race-free open that
+    /// rejects symbolic links.
     pub optional_files: Vec<DirectoryArchiveFile>,
 }
 
-/// An on-disk file a snapshot archives at `archive_path` if it still exists
+/// An on-disk file a snapshot may archive at `archive_path` if it still exists
 /// (see [`DirectorySnapshotPlan::optional_files`]).
 #[derive(Debug, Clone)]
 pub struct DirectoryArchiveFile {

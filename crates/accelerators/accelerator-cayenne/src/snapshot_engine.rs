@@ -977,7 +977,8 @@ mod tests {
         //! Persisted secondary index runs across an acceleration snapshot,
         //! written and restored the way the runtime does it: the engine's plan
         //! applied to the layout's two directories, archived, and extracted
-        //! into a reader's own directories.
+        //! into a reader's own directories. Optional run files travel on Unix;
+        //! other platforms omit them and rebuild from the restored data files.
 
         use super::*;
         use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -1266,8 +1267,9 @@ mod tests {
         /// acceleration snapshot: the run files are archived with the data
         /// directory, their registrations with the metastore slice, and a
         /// reader that bootstraps into directories of its own reopens covered
-        /// by them — no build, and a first lookup answered from the index. The
-        /// same restore without persistence starts uncovered.
+        /// by them on Unix — no build, and a first lookup answered from the index.
+        /// Other platforms omit optional run files and answer correctly from the
+        /// restored data. The same restore without persistence starts uncovered.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn persisted_index_runs_travel_with_a_snapshot() {
             let env = Arc::new(RuntimeEnv::default());
@@ -1288,11 +1290,19 @@ mod tests {
                 table_id,
                 "the restore keeps the table's id, which its run files are filed under"
             );
-            assert_eq!(
-                persisted(&reader_catalog, &reader_data, expected.len()).await,
-                expected,
-                "the snapshot carries every run, registered and on disk"
-            );
+            if cfg!(unix) {
+                assert_eq!(
+                    persisted(&reader_catalog, &reader_data, expected.len()).await,
+                    expected,
+                    "the snapshot carries every run, registered and on disk"
+                );
+            } else {
+                assert_eq!(
+                    run_files(&reader_data),
+                    0,
+                    "optional run files are omitted without a race-free open"
+                );
+            }
             let reader = open(
                 &env,
                 reader_catalog,
@@ -1306,18 +1316,27 @@ mod tests {
                 .expect("verify");
             assert!(verification.agrees(), "{verification:?}");
             let counters = reader.lookup_index_counters().expect("indexed");
-            assert_eq!(
-                (verification.uncovered_files, counters.builds_started),
-                (0, 0),
-                "a restored table must be covered by its persisted runs, not by a build: {verification:?}"
-            );
+            if cfg!(unix) {
+                assert_eq!(
+                    (verification.uncovered_files, counters.builds_started),
+                    (0, 0),
+                    "a restored table must be covered by its persisted runs, not by a build: {verification:?}"
+                );
+            } else {
+                assert!(
+                    verification.files == 0 && verification.uncovered_files > 0,
+                    "a restore without optional runs must start uncovered: {verification:?}"
+                );
+            }
             assert_eq!(lookup(&reader, 24_007).await, 1);
             let after = reader.lookup_index_counters().expect("indexed");
-            assert_eq!(
-                (after.full - counters.full, after.none - counters.none),
-                (1, 0),
-                "the first lookup after the restore did not use the loaded index: {after:?}"
-            );
+            if cfg!(unix) {
+                assert_eq!(
+                    (after.full - counters.full, after.none - counters.none),
+                    (1, 0),
+                    "the first lookup after the restore did not use the loaded index: {after:?}"
+                );
+            }
             drop(reader);
 
             let (control_catalog, control_data) = restore(&archive, &tmp.path().join("c")).await;
@@ -1396,7 +1415,8 @@ mod tests {
         /// restored table then holds a registration with no file: it drops
         /// that registration, answers lookups correctly by reading the lost
         /// run's files in full, and indexes them again in the background
-        /// until every file is covered.
+        /// until every file is covered. Platforms without a race-free optional
+        /// file open omit every run, so all restored files start uncovered.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_snapshot_missing_a_registered_run_file_restores_and_heals() {
             let env = Arc::new(RuntimeEnv::default());
@@ -1429,7 +1449,12 @@ mod tests {
                 2,
                 "the slice still registers the lost run"
             );
-            assert_eq!(run_files(&reader_data), 1, "the archive holds one run file");
+            let retained_runs = usize::from(cfg!(unix));
+            assert_eq!(
+                run_files(&reader_data),
+                retained_runs,
+                "only safely opened run files are archived"
+            );
             let reader = open(
                 &env,
                 Arc::clone(&reader_catalog),
@@ -1438,17 +1463,25 @@ mod tests {
             )
             .await;
             assert_eq!(
-                persisted(&reader_catalog, &reader_data, 1).await.len(),
-                1,
-                "opening drops the registration whose file is missing"
+                persisted(&reader_catalog, &reader_data, retained_runs)
+                    .await
+                    .len(),
+                retained_runs,
+                "opening drops registrations whose files are missing"
             );
             let restored = reader
                 .verify_lookup_index_against_read_back()
                 .await
                 .expect("verify");
             assert!(
-                restored.agrees() && restored.files > 0 && restored.uncovered_files > 0,
-                "the remaining run covers its files and the lost run's are uncovered: {restored:?}"
+                restored.agrees()
+                    && (if cfg!(unix) {
+                        restored.files > 0
+                    } else {
+                        restored.files == 0
+                    })
+                    && restored.uncovered_files > 0,
+                "retained runs cover their files and missing runs leave files uncovered: {restored:?}"
             );
             // A key from each write: correct whether its files are covered or
             // read in full, and the lookups request the missing files' build.
@@ -1479,8 +1512,12 @@ mod tests {
                     "lookup of row {id} after healing"
                 );
             }
+            let expected_runs = if cfg!(unix) { 2 } else { 1 };
             assert!(
-                persisted(&reader_catalog, &reader_data, 2).await.len() >= 2,
+                persisted(&reader_catalog, &reader_data, expected_runs)
+                    .await
+                    .len()
+                    >= expected_runs,
                 "the rebuilt runs are persisted again"
             );
         }
@@ -1527,8 +1564,12 @@ mod tests {
                 .await
                 .expect("verify");
             assert!(
-                restored.files > 0 && restored.uncovered_files > 0,
-                "the restored runs cover the persisted writes only: {restored:?}"
+                (if cfg!(unix) {
+                    restored.files > 0
+                } else {
+                    restored.files == 0
+                }) && restored.uncovered_files > 0,
+                "only safely archived runs cover restored files: {restored:?}"
             );
 
             // A key the unpersisted write holds: found by reading its files in
