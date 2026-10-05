@@ -57,14 +57,17 @@ pub struct DatasetInfo {
     pub error_message: Option<String>,
 
     /// When the dataset's last successful refresh completed (RFC 3339), read from its
-    /// acceleration's checkpoint at startup. Only included when `status=true`, for an
-    /// accelerated dataset that has been refreshed.
+    /// acceleration's checkpoint at startup unless the dataset creates snapshots or
+    /// was restored from one. Those datasets report it once a refresh completes.
+    /// Only included when `status=true`, for an accelerated dataset with a known
+    /// refresh completion time.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_refresh: Option<String>,
 
-    /// When the dataset's next scheduled refresh is due (RFC 3339): `last_refresh` plus
-    /// `refresh_check_interval` (and jitter), or the first `refresh_cron` time after
-    /// `last_refresh`. It stays at that time, in the past, until a refresh completes.
+    /// When the dataset's next scheduled refresh is due (RFC 3339). Interval schedules
+    /// include jitter. Cron schedules initially report the next cron time, then the
+    /// jittered start time once the event fires, if jitter applies. A pending or
+    /// unsuccessful refresh retains its due time even after that time passes.
     /// Only included when `status=true`, for an accelerated dataset with a refresh
     /// schedule.
     #[serde(skip_serializing_if = "Option::is_none", default)]
