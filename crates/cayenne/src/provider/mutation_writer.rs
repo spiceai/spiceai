@@ -1234,12 +1234,35 @@ impl<'a> AppendMutationWriter<'a> {
         let table_schema = self.table.table_schema();
         let indices = self.table.primary_key_indices()?.unwrap_or_default();
         let key_columns = super::overwrite_postpass::key_column_names(&table_schema, &indices);
-        let arrival_name = super::overwrite_postpass::arrival_column(&table_schema);
+        let hidden = super::overwrite_postpass::hidden_columns(&table_schema);
+        // A writer's row versions order a key's copies only against the copies this
+        // write holds, which are all of them only in a load into an empty table.
+        let versions = self.table.row_versions.clone();
+        if versions.is_some() && !self.into_empty_table {
+            return Err(super::Error::DataFusion {
+                source: datafusion_common::DataFusionError::Internal(format!(
+                    "an append carrying row versions reached a table '{}' that holds rows",
+                    self.table.table_name()
+                )),
+            });
+        }
         let dedup_share = super::overwrite_postpass::DedupShare::claim();
-        let arrival = super::overwrite_postpass::ArrivalStream::new(data, resolver, &arrival_name);
+        let arrival =
+            super::overwrite_postpass::ArrivalStream::new(data, resolver, &hidden.arrival);
         let stamped_batches = arrival.stamped_batches();
         let batch_superseded = arrival.superseded();
-        let data: SendableRecordBatchStream = Box::pin(arrival);
+        let (order, write_schema, data): (_, _, SendableRecordBatchStream) = match versions {
+            Some(versions) => (
+                super::overwrite_postpass::CopyOrder::Version,
+                super::overwrite_postpass::with_versions(&table_schema, &hidden),
+                Box::pin(arrival.with_versions(versions, &hidden)),
+            ),
+            None => (
+                super::overwrite_postpass::CopyOrder::Arrival(survivor),
+                super::overwrite_postpass::with_arrival(&table_schema, &hidden.arrival),
+                Box::pin(arrival),
+            ),
+        };
         // Into an empty table there is no stored key to supersede or keep, so the
         // conflict check, and the set of every incoming key it builds, is skipped;
         // the keys the append repeats are resolved after the write as usual.
@@ -1284,7 +1307,7 @@ impl<'a> AppendMutationWriter<'a> {
                     file_stats
                         .as_ref()
                         .map(|observer| Arc::clone(observer) as _),
-                    super::overwrite_postpass::with_arrival(&table_schema, &arrival_name),
+                    write_schema,
                 )
                 .await?;
             self.table.sync_local_snapshot_dir(&snapshot_id).await?;
@@ -1295,12 +1318,7 @@ impl<'a> AppendMutationWriter<'a> {
             }
             let (superseded, mut counts) = self
                 .table
-                .find_superseded_by_arrival(
-                    &snapshot_id,
-                    super::overwrite_postpass::CopyOrder::Arrival(survivor),
-                    &key_columns,
-                    rows,
-                )
+                .find_superseded_by_arrival(&snapshot_id, order, &key_columns, rows)
                 .await?;
             counts.add(&batch_superseded.lock());
             self.table.report_superseded(&counts);

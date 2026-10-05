@@ -19,7 +19,7 @@ limitations under the License.
 //!
 //! Each engine that supports the mode is run in memory and file mode:
 //!
-//! - a full refresh over two files, each holding the newest version of one key and an
+//! - a full refresh, and an append's first load, over two files, each holding the newest version of one key and an
 //!   older version of the other, so whichever file is read first one key's older
 //!   version arrives first; a key repeated within one batch; and a filler large enough
 //!   that the files span several record batches;
@@ -51,8 +51,9 @@ use crate::utils::{
 
 const TABLE: &str = "events";
 
-/// Keys that only fill record batches, so a key's versions land in different batches.
-const FILLER_KEYS: i64 = 10_000;
+/// Keys that only fill record batches, so a key's versions land in different batches,
+/// and enough of them (well over Cayenne's 4 MiB write buffer) that a load streams.
+const FILLER_KEYS: i64 = 300_000;
 
 #[derive(Clone, Copy, Debug)]
 enum Engine {
@@ -187,8 +188,12 @@ async fn rows(rt: &Arc<Runtime>) -> i64 {
 async fn full_refresh_keeps_the_newest_version_of_each_key() {
     test_request_context()
         .scope(async {
-            for (engine, mode) in engines() {
-                let label = format!("full_{engine:?}_{mode:?}");
+            // An append's first load reads the whole source too, so it must resolve the
+            // same way.
+            for (engine, mode, refresh) in engines().into_iter().flat_map(|(engine, mode)| {
+                [RefreshMode::Full, RefreshMode::Append].map(move |r| (engine, mode.clone(), r))
+            }) {
+                let label = format!("first_load_{refresh:?}_{engine:?}_{mode:?}");
                 let source = tempfile::tempdir().expect("source dir");
                 let accel = tempfile::tempdir().expect("acceleration dir");
 
@@ -212,15 +217,8 @@ async fn full_refresh_keeps_the_newest_version_of_each_key() {
                     ]),
                 );
 
-                let (rt, ready) = load(
-                    source.path(),
-                    accel.path(),
-                    engine,
-                    &mode,
-                    RefreshMode::Full,
-                    &label,
-                )
-                .await;
+                let (rt, ready) =
+                    load(source.path(), accel.path(), engine, &mode, refresh, &label).await;
                 assert!(ready, "{label}: the dataset should load");
 
                 assert_eq!(values_of(&rt, 1).await, ["id1-newest"], "{label}: key 1");

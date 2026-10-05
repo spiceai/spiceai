@@ -516,12 +516,6 @@ pub(crate) fn hidden_columns(schema: &Schema) -> HiddenColumns {
     }
 }
 
-/// The name the arrival column is stored under for a table of `schema`
-/// ([`hidden_columns`]).
-pub(crate) fn arrival_column(schema: &Schema) -> String {
-    hidden_columns(schema).arrival
-}
-
 /// How the duplicate query orders the copies of a key, keeping the greatest or
 /// least.
 #[derive(Debug, Clone, Copy)]
@@ -608,7 +602,7 @@ pub(crate) struct ArrivalStream {
 
 impl ArrivalStream {
     /// `arrival` is the name the table stores the column under
-    /// ([`arrival_column`]).
+    /// ([`hidden_columns`]).
     pub(crate) fn new(
         input: SendableRecordBatchStream,
         resolver: KeyResolver,
@@ -1575,13 +1569,13 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
         };
-        assert_eq!(arrival_column(&named(&["id"])), ARRIVAL_COLUMN);
+        assert_eq!(hidden_columns(&named(&["id"])).arrival, ARRIVAL_COLUMN);
         assert_eq!(
-            arrival_column(&named(&["id", ARRIVAL_COLUMN])),
+            hidden_columns(&named(&["id", ARRIVAL_COLUMN])).arrival,
             format!("{ARRIVAL_COLUMN}_1")
         );
         assert_eq!(
-            arrival_column(&named(&[ARRIVAL_COLUMN, &format!("{ARRIVAL_COLUMN}_1")])),
+            hidden_columns(&named(&[ARRIVAL_COLUMN, &format!("{ARRIVAL_COLUMN}_1")])).arrival,
             format!("{ARRIVAL_COLUMN}_2")
         );
         // The version columns avoid the table's names and each other's.
