@@ -184,9 +184,14 @@ impl DataSink for CayenneDataSink {
             // OOM) before either appends. Reads use `ArcSwap` (lock-free), so this only
             // serializes writers.
             //
-            // Preparation snapshots the primary-key index after buffering, while
-            // this lock keeps that snapshot current for validation and commit.
-            let _write_guard = self.table.write_lock().lock().await;
+            // Taken before preparation, too: preparation snapshots the primary-key
+            // index the validation below decides conflicts against, and memory-mode
+            // writers are serialized on exactly this lock, so taking it first keeps
+            // that snapshot current through validation and commit. The write's own
+            // repeated keys are resolved before validation sees them (an APPEND's
+            // validation then supersedes the resident rows its keys meet, as the
+            // appended segment's own tombstones; an OVERWRITE replaces the tier).
+            let write_guard = self.table.write_lock().lock().await;
             let mut raw = normalized;
             while let Some(batch) = raw.next().await {
                 let batch = batch?;
@@ -247,6 +252,10 @@ impl DataSink for CayenneDataSink {
                 let record_seq = self.table.sequence_high_water().await;
                 self.table.record_mem_tier_pk_keys(&keys, record_seq);
             }
+            drop(write_guard);
+            // Memory mode arms retention here — see the method's own doc for why nowhere
+            // else can (#14045).
+            self.table.arm_retention_after_memory_resident_write();
             return Ok(rows);
         }
 
