@@ -225,10 +225,13 @@ impl S3ObjectStoreBuilder {
     /// - `session_token`: Session token
     /// - `client_timeout`: Request timeout (parsed by fundu)
     /// - `allow_http`: Whether to allow HTTP connections
+    /// - `auth`: Authentication mode. With `key`, both `key` and `secret` must be set
     ///
     /// # Errors
     ///
-    /// Returns an error if the `client_timeout` parameter cannot be parsed.
+    /// Returns an error if the `client_timeout` parameter cannot be parsed, or
+    /// [`S3ObjectStoreBuilderError::MissingKeyCredentials`] if `auth` is `key` and
+    /// `key` and `secret` are not both set.
     pub fn with_secret_params(mut self, params: &HashMap<String, SecretString>) -> Result<Self> {
         if let Some(region) = params.get("region") {
             self.region = Some(region.expose_secret().to_string());
