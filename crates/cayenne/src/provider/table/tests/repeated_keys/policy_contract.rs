@@ -532,3 +532,78 @@ async fn a_cancelled_append_publishes_before_releasing_the_write_lock() {
         assert_eq!(visible(&reopened).await, expected, "{mode:?}: reopened");
     }
 }
+
+/// Strict `upsert` names how many keys hold different versions in the whole
+/// statement, whatever its batch boundaries and write path: versions within one
+/// batch, across batches, or both, each count once.
+#[tokio::test(flavor = "multi_thread")]
+async fn conflicting_key_counts_cover_the_whole_statement() {
+    // Keys 1-4 hold different versions (within a batch, across, and both);
+    // key 5 repeats one version; key 6 appears once.
+    let rows: [(i64, &str); 11] = [
+        (1, "a"),
+        (1, "b"),
+        (2, "a"),
+        (2, "b"),
+        (2, "c"),
+        (3, "a"),
+        (4, "a"),
+        (4, "b"),
+        (5, "a"),
+        (6, "a"),
+        (5, "a"),
+    ];
+    let splits: [&[usize]; 3] = [&[11], &[1; 11], &[6, 5]];
+    let late: [(i64, &str); 2] = [(3, "b"), (4, "c")];
+    let mut failures = Vec::new();
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        for inline_max_rows in [0, 1_000] {
+            for op in [InsertOp::Append, InsertOp::Overwrite] {
+                for split in splits {
+                    let label = format!("{mode:?}/inline={inline_max_rows}/{op:?}/{split:?}");
+                    let runtime_env = SessionContext::new().runtime_env();
+                    let (mut provider, catalog, _dir) = create_cdc_table_with_schema(
+                        "t",
+                        Arc::clone(&runtime_env),
+                        schema(),
+                        vec!["id".to_string()],
+                        VortexConfig {
+                            deletion_mode: mode,
+                            inline_max_rows,
+                            stream_publish_interval_ms: 0,
+                            compaction_background_interval_ms: 3_600_000,
+                            ..VortexConfig::default()
+                        },
+                        upsert_on_id(),
+                    )
+                    .await;
+                    provider.upsert_dedup = UpsertDedup::None;
+                    write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
+                        .await
+                        .expect("seed");
+                    let mut batches = Vec::new();
+                    let mut start = 0;
+                    for &len in split {
+                        batches.push(batch(&rows[start..start + len]));
+                        start += len;
+                    }
+                    batches.push(batch(&late));
+                    match apply(&provider, op, batches, false).await {
+                        Ok(()) => failures.push(format!("{label}: accepted")),
+                        Err(error)
+                            if error
+                                .to_string()
+                                .contains("different versions of 4 values of 'id'") => {}
+                        Err(error) => failures.push(format!("{label}: {error}")),
+                    }
+                    let actual = visible(&provider).await;
+                    if actual != (owned(&[(9, "old")]), 1) {
+                        failures.push(format!("{label}: rows changed: {actual:?}"));
+                    }
+                    drop(catalog);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

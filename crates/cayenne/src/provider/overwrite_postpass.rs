@@ -74,8 +74,7 @@ use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex_session::VortexSession;
 
-use super::key_conflicts::KeyResolver;
-use super::key_conflicts::Survivor;
+use super::key_conflicts::{ConflictPolicy, KeyResolver, Survivor};
 use super::table::CayenneTableProvider;
 
 /// The trailing column a refresh resolved after its write carries: each row's
@@ -485,13 +484,17 @@ fn available_column(schema: &Schema, prefix: &str) -> String {
 }
 
 /// Resolves each batch's own repeats per the policy and stamps every surviving
-/// row with its batch's arrival sequence number.
+/// row with its batch's arrival sequence number. Under strict `upsert` a batch
+/// holding different versions of a key is split, one version per batch, so the
+/// post-write resolution counts the key with the rest of the write.
 pub(crate) struct ArrivalStream {
     input: SendableRecordBatchStream,
     resolver: KeyResolver,
     schema: SchemaRef,
     next: u64,
     stamped: Arc<std::sync::atomic::AtomicU64>,
+    /// Resolved batches waiting to be stamped and emitted.
+    pending: std::collections::VecDeque<RecordBatch>,
 }
 
 impl ArrivalStream {
@@ -509,6 +512,7 @@ impl ArrivalStream {
             schema,
             next: 0,
             stamped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pending: std::collections::VecDeque::new(),
         }
     }
 
@@ -520,11 +524,44 @@ impl ArrivalStream {
 }
 
 impl ArrivalStream {
-    fn resolve(&self, batch: RecordBatch) -> super::Result<RecordBatch> {
+    fn resolve(&self, batch: RecordBatch) -> super::Result<Vec<RecordBatch>> {
+        // Most batches hold no key twice; only one that may pays for the exact
+        // resolution. A null key fails either way.
         if !self.resolver.has_null_key(&batch) && !self.resolver.may_repeat_within(&batch)? {
-            return Ok(batch);
+            return Ok(vec![batch]);
         }
-        Ok(self.resolver.resolve_batch(&batch)?.batch)
+        if self.resolver.policy() == ConflictPolicy::UpsertIdentical {
+            return self.resolver.split_versions(&batch);
+        }
+        Ok(vec![self.resolver.resolve_batch(&batch)?.batch])
+    }
+
+    fn stamp(&mut self, resolved: &RecordBatch) -> datafusion_common::Result<RecordBatch> {
+        // A batch holds each key once, so its sequence number orders the copies
+        // of a key as well as a per-row ordinal would.
+        let Ok(sequence) = u32::try_from(self.next) else {
+            return Err(datafusion_common::DataFusionError::Execution(
+                "a refresh of more than 4,294,967,295 record batches cannot resolve the primary \
+                 keys it repeats"
+                    .to_string(),
+            ));
+        };
+        let arrival = UInt32Array::from_value(sequence, resolved.num_rows());
+        self.next += 1;
+        self.stamped
+            .store(self.next, std::sync::atomic::Ordering::Relaxed);
+        let contents = self.resolver.content_digests(resolved)?;
+        let mut columns = resolved.columns().to_vec();
+        columns.push(Arc::new(arrival));
+        // Store both halves without narrowing the content identity.
+        for half in 0..2 {
+            columns.push(Arc::new(UInt64Array::from_iter_values(
+                contents.iter().map(|digest| {
+                    u64::from_le_bytes(digest.to_le_bytes().as_chunks::<8>().0[half])
+                }),
+            )));
+        }
+        Ok(RecordBatch::try_new(Arc::clone(&self.schema), columns)?)
     }
 }
 
@@ -533,46 +570,17 @@ impl Stream for ArrivalStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match this.input.poll_next_unpin(cx) {
-            Poll::Ready(Some(Ok(batch))) => {
-                // Most batches hold no key twice; only one that may pays for the
-                // exact resolution. A null key fails either way.
-                let resolved = match this.resolve(batch) {
-                    Ok(resolved) => resolved,
-                    Err(error) => return Poll::Ready(Some(Err(error.into()))),
-                };
-                // A batch holds each key once, so its sequence number orders the
-                // copies of a key as well as a per-row ordinal would.
-                let Ok(sequence) = u32::try_from(this.next) else {
-                    return Poll::Ready(Some(Err(datafusion_common::DataFusionError::Execution(
-                        "a refresh of more than 4,294,967,295 record batches cannot resolve \
-                         the primary keys it repeats"
-                            .to_string(),
-                    ))));
-                };
-                let arrival = UInt32Array::from_value(sequence, resolved.num_rows());
-                this.next += 1;
-                this.stamped
-                    .store(this.next, std::sync::atomic::Ordering::Relaxed);
-                let contents = match this.resolver.content_digests(&resolved) {
-                    Ok(contents) => contents,
-                    Err(error) => return Poll::Ready(Some(Err(error.into()))),
-                };
-                let mut columns = resolved.columns().to_vec();
-                columns.push(Arc::new(arrival));
-                // Store both halves without narrowing the content identity.
-                for half in 0..2 {
-                    columns.push(Arc::new(UInt64Array::from_iter_values(
-                        contents.iter().map(|digest| {
-                            u64::from_le_bytes(digest.to_le_bytes().as_chunks::<8>().0[half])
-                        }),
-                    )));
-                }
-                Poll::Ready(Some(
-                    RecordBatch::try_new(Arc::clone(&this.schema), columns).map_err(Into::into),
-                ))
+        loop {
+            if let Some(resolved) = this.pending.pop_front() {
+                return Poll::Ready(Some(this.stamp(&resolved)));
             }
-            other => other,
+            match this.input.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(batch))) => match this.resolve(batch) {
+                    Ok(resolved) => this.pending.extend(resolved),
+                    Err(error) => return Poll::Ready(Some(Err(error.into()))),
+                },
+                other => return other,
+            }
         }
     }
 }

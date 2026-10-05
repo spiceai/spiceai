@@ -229,16 +229,7 @@ impl KeyResolver {
     ///
     /// Returns an error if a primary key is null, or the policy rejects a repeat.
     pub(crate) fn resolve_batch(&self, batch: &RecordBatch) -> Result<ResolvedBatch> {
-        if self
-            .primary_key
-            .iter()
-            .any(|&index| batch.column(index).null_count() > 0)
-        {
-            return Err(Error::DataValidation {
-                table: self.table_name.to_string(),
-                message: null_primary_key_message(batch, &self.primary_key),
-            });
-        }
+        self.ensure_no_null_key(batch)?;
         let digests = self.digests(batch)?;
         let contents = self.content_digests(batch)?;
         let mut conflicts = HashSet::with_hasher(PrehashedBuildHasher);
@@ -301,26 +292,28 @@ impl KeyResolver {
     }
 
     /// Resolve every repeated key of a write whose batches are all in memory:
-    /// within each batch per the policy, then across batches (the first copy
-    /// under `drop`, the last otherwise). Row order is preserved.
+    /// the first copy under `drop`, the last otherwise. Under `upsert` the write
+    /// fails when any key holds different versions, counting every such key.
+    /// Row order is preserved.
     ///
     /// # Errors
     ///
     /// Returns an error if a primary key is null, or the policy rejects a repeat.
     pub(crate) fn collapse_write(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
-        let resolved = batches
-            .into_iter()
-            .map(|batch| self.resolve_batch(&batch))
-            .collect::<Result<Vec<_>>>()?;
+        let mut encoded = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            self.ensure_no_null_key(batch)?;
+            encoded.push((self.digests(batch)?, self.content_digests(batch)?));
+        }
         // The (batch, row) each key keeps across the write.
-        let rows: usize = resolved.iter().map(|batch| batch.digests.len()).sum();
+        let rows: usize = encoded.iter().map(|(digests, _)| digests.len()).sum();
         let mut survivor: HashMap<u128, (usize, usize), PrehashedBuildHasher> =
             HashMap::with_capacity_and_hasher(rows, PrehashedBuildHasher);
-        let last_batch_wins = self.policy.last_batch_wins();
+        let last_wins = self.policy.last_batch_wins();
         let mut conflicts = HashSet::with_hasher(PrehashedBuildHasher);
         let mut repeated = false;
-        for (index, batch) in resolved.iter().enumerate() {
-            for (row, &digest) in batch.digests.iter().enumerate() {
+        for (index, (digests, contents)) in encoded.iter().enumerate() {
+            for (row, &digest) in digests.iter().enumerate() {
                 match survivor.entry(digest) {
                     Entry::Vacant(entry) => {
                         entry.insert((index, row));
@@ -329,12 +322,11 @@ impl KeyResolver {
                         repeated = true;
                         let (previous_batch, previous_row) = *entry.get();
                         if self.policy == ConflictPolicy::UpsertIdentical
-                            && resolved[previous_batch].contents[previous_row]
-                                != batch.contents[row]
+                            && encoded[previous_batch].1[previous_row] != contents[row]
                         {
                             conflicts.insert(digest);
                         }
-                        if last_batch_wins {
+                        if last_wins {
                             entry.insert((index, row));
                         }
                     }
@@ -345,26 +337,80 @@ impl KeyResolver {
             return Err(self.conflicting_versions(conflicts.len()));
         }
         if !repeated {
-            return Ok(resolved.into_iter().map(|batch| batch.batch).collect());
+            return Ok(batches);
         }
-        resolved
+        batches
             .into_iter()
+            .zip(&encoded)
             .enumerate()
-            .map(|(index, batch)| {
-                let keep: BooleanArray = batch
-                    .digests
+            .map(|(index, (batch, (digests, _)))| {
+                let keep: BooleanArray = digests
                     .iter()
                     .enumerate()
                     .map(|(row, digest)| Some(survivor.get(digest) == Some(&(index, row))))
                     .collect();
                 if keep.true_count() == keep.len() {
-                    Ok(batch.batch)
+                    Ok(batch)
                 } else {
-                    Ok(filter_record_batch(&batch.batch, &keep)?)
+                    Ok(filter_record_batch(&batch, &keep)?)
                 }
             })
             .filter(|batch| !matches!(batch, Ok(batch) if batch.num_rows() == 0))
             .collect()
+    }
+
+    /// One batch of a strict `upsert` resolved after its write, as batches that
+    /// each hold a key once: identical copies collapse, and each further version
+    /// of a key goes to a batch of its own, so the post-write resolution finds,
+    /// and counts once, every key with different versions anywhere in the write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a primary key is null.
+    pub(crate) fn split_versions(&self, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        self.ensure_no_null_key(batch)?;
+        let digests = self.digests(batch)?;
+        let contents = self.content_digests(batch)?;
+        // Each key's distinct contents, in arrival order; a row's level is the
+        // position of its content there, or `None` for a repeated copy.
+        let mut versions: HashMap<u128, Vec<u128>, PrehashedBuildHasher> =
+            HashMap::with_capacity_and_hasher(digests.len(), PrehashedBuildHasher);
+        let levels: Vec<Option<usize>> = digests
+            .iter()
+            .zip(&contents)
+            .map(|(digest, content)| {
+                let seen = versions.entry(*digest).or_default();
+                if seen.contains(content) {
+                    None
+                } else {
+                    seen.push(*content);
+                    Some(seen.len() - 1)
+                }
+            })
+            .collect();
+        let deepest = levels.iter().flatten().copied().max().unwrap_or(0);
+        if deepest == 0 && levels.iter().all(Option::is_some) {
+            return Ok(vec![batch.clone()]);
+        }
+        (0..=deepest)
+            .map(|level| {
+                let keep: BooleanArray = levels
+                    .iter()
+                    .map(|row| Some(*row == Some(level)))
+                    .collect();
+                Ok(filter_record_batch(batch, &keep)?)
+            })
+            .collect()
+    }
+
+    fn ensure_no_null_key(&self, batch: &RecordBatch) -> Result<()> {
+        if self.has_null_key(batch) {
+            return Err(Error::DataValidation {
+                table: self.table_name.to_string(),
+                message: null_primary_key_message(batch, &self.primary_key),
+            });
+        }
+        Ok(())
     }
 
     /// The table's encoding of each row's primary key (the `RowConverter` bytes
