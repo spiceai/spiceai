@@ -3534,7 +3534,12 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<
         })
 }
 
-fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
+/// One item from a CDC change stream: a change envelope, or the stream error
+/// that stopped it. Named so [`take_ready_group`]'s return type stays under
+/// `clippy::type_complexity`.
+type ChangeStreamItem = Result<cdc::ChangeEnvelope, cdc::StreamError>;
+
+fn cdc_item_budget_bytes(item: &ChangeStreamItem) -> usize {
     // A coalescing byte-budget proxy, NOT a true in-memory Arrow size:
     // `encoded_len` answers WITHOUT forcing a build — a deferred (e.g. Postgres)
     // envelope from a schema-aware estimate of its buffered wire size, a built
@@ -3564,14 +3569,10 @@ const PREBUILD_GROUP_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// envelope that alone exceeds the budget is still allowed when it is the only
 /// member of the group.
 fn take_ready_group(
-    first: Result<cdc::ChangeEnvelope, cdc::StreamError>,
+    first: ChangeStreamItem,
     stream: &mut cdc::ChangesStream,
     max_envelopes: usize,
-) -> (
-    Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
-    bool,
-    Option<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
-) {
+) -> (Vec<ChangeStreamItem>, bool, Option<ChangeStreamItem>) {
     let needs_build = first
         .as_ref()
         .is_ok_and(|envelope| !envelope.is_materialized());
