@@ -47,6 +47,24 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     ]
 });
 
+/// The GCS data connector's object-store parameters, so a `gs://` location takes the
+/// same names (`gcs_skip_signature`, `gcs_service_account_path`, ...).
+static GCS_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    vec![
+        ParameterSpec::component("service_account_path").secret(),
+        ParameterSpec::component("service_account_key").secret(),
+        ParameterSpec::component("application_default_credentials").is_boolean(),
+        ParameterSpec::component("skip_signature").is_boolean(),
+        ParameterSpec::component("max_retries"),
+        ParameterSpec::component("retry_timeout"),
+        ParameterSpec::component("backoff_initial_duration"),
+        ParameterSpec::component("backoff_max_duration"),
+        ParameterSpec::component("backoff_base"),
+        ParameterSpec::runtime("client_timeout"),
+        ParameterSpec::runtime("allow_http").is_boolean(),
+    ]
+});
+
 #[derive(Debug, Snafu)]
 pub(crate) enum Error {
     #[snafu(display("Failed to parse {usage} location {location}: {source}"))]
@@ -72,6 +90,12 @@ pub(crate) enum Error {
 
     #[snafu(display("Failed to validate S3 parameters for {usage}: {source}"))]
     S3ParameterValidation {
+        usage: &'static str,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to validate GCS parameters for {usage}: {source}"))]
+    GcsParameterValidation {
         usage: &'static str,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -182,7 +206,7 @@ pub(crate) async fn build_object_store(
             location: url.to_string(),
         })?;
         let params = params.map(Params::as_string_map);
-        let gcs_params = build_secret_resolved_parameters(secrets, params.as_ref()).await;
+        let gcs_params = build_gcs_parameters(secrets, params.as_ref(), usage).await?;
         build_gcs_object_store(bucket, &gcs_params, io_runtime).context(ObjectStoreInitSnafu {
             usage,
             location: url.to_string(),
@@ -220,6 +244,33 @@ async fn build_s3_parameters(
         }
         None => Ok(default_params()),
     }
+}
+
+/// Resolves a `gs://` location's `params`, given under the GCS data connector's
+/// names, to the names [`build_gcs_object_store`] reads.
+async fn build_gcs_parameters(
+    secrets: Arc<RwLock<Secrets>>,
+    params: Option<&HashMap<String, String>>,
+    usage: &'static str,
+) -> Result<HashMap<String, String>> {
+    let Some(params) = params else {
+        return Ok(HashMap::new());
+    };
+    let secret_params = get_params_with_secrets(Arc::clone(&secrets), params).await;
+    let params = Parameters::try_new(
+        usage,
+        secret_params.into_iter().collect(),
+        "gcs",
+        secrets,
+        &GCS_PARAMETERS,
+    )
+    .await
+    .map_err(|source| Error::GcsParameterValidation { usage, source })?;
+    Ok(params
+        .to_secret_map()
+        .into_iter()
+        .map(|(key, value)| (key, value.expose_secret().to_string()))
+        .collect())
 }
 
 async fn build_secret_resolved_parameters(
@@ -472,40 +523,47 @@ mod tests {
         assert_eq!(prefix, "");
     }
 
-    /// A `gs://` location honors `params` (and keeps its path as the prefix) instead
-    /// of building a store from the environment alone.
+    /// A `gs://` location honors the GCS data connector's parameter names (and keeps
+    /// its path as the prefix) instead of building a store from the environment alone.
     #[tokio::test]
     async fn build_object_store_accepts_gcs_location_with_params() {
-        let mut params = HashMap::new();
-        params.insert("skip_signature".to_string(), "true".to_string());
-        let params = Params::from_string_map(params);
+        let params = Params::from_string_map(HashMap::from([(
+            "gcs_skip_signature".to_string(),
+            "true".to_string(),
+        )]));
 
-        let result = build_object_store(
+        let (store, prefix) = build_object_store(
             secrets(),
             Handle::current(),
             "gs://state-bucket/runtime/rate-control/",
             Some(&params),
             "test state",
         )
-        .await;
-
-        let (_, prefix) = result.expect("gcs state store should build");
+        .await
+        .expect("gcs state store should build");
         assert_eq!(prefix, "runtime/rate-control");
+        // The store has no accessor for its signing mode; its `Debug` output carries
+        // the configuration it was built with.
+        assert!(
+            format!("{store:?}").contains("skip_signature: true"),
+            "`gcs_skip_signature: true` must build an unsigned store: {store:?}"
+        );
 
         let invalid = build_object_store(
             secrets(),
             Handle::current(),
             "gs://state-bucket/",
             Some(&Params::from_string_map(HashMap::from([(
-                "skip_signature".to_string(),
+                "gcs_skip_signature".to_string(),
                 "not-a-bool".to_string(),
             )]))),
             "test state",
         )
-        .await;
-        assert!(
-            invalid.is_err(),
-            "an invalid GCS parameter is reported, not ignored"
+        .await
+        .expect_err("an invalid GCS parameter is reported, not ignored");
+        assert_eq!(
+            invalid.to_string(),
+            "Failed to validate GCS parameters for test state: Invalid configuration for test state. 'gcs_skip_signature' parameter must be one of: true, false. Found not-a-bool."
         );
     }
 
