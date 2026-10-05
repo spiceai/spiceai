@@ -17979,6 +17979,7 @@ dependencies = [
 name = "runtime-rate-control"
 version = "2.4.0-unstable"
 dependencies = [
+ "async-trait",
  "futures",
  "governor",
  "object_store 0.13.2",
@@ -17990,6 +17991,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
