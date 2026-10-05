@@ -105,9 +105,11 @@ async fn rebuildable_composed_rows_use_native_ram_without_source_callback() {
         let (table, _dir) = table(&ctx, shards).await;
         let target = data_components::metadata_enriched_table_provider(
             Arc::clone(&table) as Arc<dyn TableProvider>,
-            Default::default(),
+            std::collections::HashMap::from([("test_marker".into(), "wrapped".into())]),
             Default::default(),
         );
+        assert!(!target.is::<CayenneTableProvider>());
+        assert_eq!(target.schema().metadata()["test_marker"], "wrapped");
         let backend = CayenneChangeSinkBackend::try_new(ChangeSinkContext::new(
             TableReference::bare("rebuildable"),
             target,
