@@ -713,7 +713,7 @@ mod tests {
     /// `later` is seven days after `earlier`, within the few seconds that
     /// one-second timestamps and the statements between them account for.
     fn assert_a_week_apart(earlier: SystemTime, later: SystemTime) {
-        const WEEK: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        const WEEK: std::time::Duration = std::time::Duration::from_hours(7 * 24);
         let gap = later
             .duration_since(earlier)
             .expect("the later time is after the earlier one");

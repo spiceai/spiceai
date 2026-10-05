@@ -730,7 +730,7 @@ mod tests {
         for metric in collected
             .scope_metrics()
             .filter(|scope| scope.scope().name() == "cluster")
-            .flat_map(|scope| scope.metrics())
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
         {
             let mut push = |kind: &str, attributes: Vec<&KeyValue>, value: String| {
                 let mut labels: Vec<String> = attributes

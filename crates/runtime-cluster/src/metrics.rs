@@ -471,7 +471,7 @@ mod tests {
         let mut series = BTreeMap::new();
         for metric in resource_metrics
             .scope_metrics()
-            .flat_map(|scope| scope.metrics())
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
         {
             let name = metric.name();
             match metric.data() {

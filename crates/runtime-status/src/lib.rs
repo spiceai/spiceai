@@ -1034,7 +1034,7 @@ mod tests {
         status.update_dataset(&dataset, ComponentStatus::Initializing);
 
         let waiter = spawn_parked_waiter(&status, &dataset).await;
-        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        tokio::time::advance(Duration::from_hours(1)).await;
         assert!(
             !waiter.is_finished(),
             "the wait must not give up while the runtime is running"

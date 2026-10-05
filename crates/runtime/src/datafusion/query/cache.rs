@@ -2115,7 +2115,7 @@ mod tests {
     /// A one-row table whose value is the cache namespace of the request that
     /// planned the scan. It reads the namespace the way the caching accelerator
     /// scopes its rows: from the `RequestContext` that `Query::run_internal`
-    /// attaches to the session, since DataFusion does not carry the task-local
+    /// attaches to the session, since `DataFusion` does not carry the task-local
     /// across `scan`.
     #[derive(Debug)]
     struct NamespaceEchoTable {

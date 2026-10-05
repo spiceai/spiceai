@@ -336,10 +336,10 @@ mod tests {
         // Wrap in MockUdtfExec
         let udtf_exec: Arc<dyn ExecutionPlan> = Arc::new(MockUdtfExec::new(data_source_exec));
 
-        let optimizer = EnsureSupportedFileScan::new();
+        let rule = EnsureSupportedFileScan::new();
         let config = ConfigOptions::default();
 
-        let optimized = optimizer
+        let optimized = rule
             .optimize(Arc::clone(&udtf_exec), &config)
             .expect("a memory scan wrapped in UdtfExec must be accepted");
         assert!(

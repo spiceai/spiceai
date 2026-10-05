@@ -5862,8 +5862,8 @@ mod tests {
             MailboxSendOutcome::Full(_)
         ));
 
-        let wakes = Arc::new(WakeCounter::default());
-        let waker = std::task::Waker::from(Arc::clone(&wakes));
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = std::task::Waker::from(Arc::clone(&wake_counter));
         let mut cx = std::task::Context::from_waker(&waker);
         let second =
             crate::cdc::build_ready_signal_envelope(&tiny_schema()).expect("second heartbeat");
@@ -5873,7 +5873,7 @@ mod tests {
             "a control send into a full mailbox must park waiting for capacity"
         );
         assert_eq!(
-            wakes.count(),
+            wake_counter.count(),
             0,
             "nothing has freed capacity or closed the mailbox yet, so the parked sender must stay asleep"
         );
@@ -5881,7 +5881,7 @@ mod tests {
         // The receiver never drains: only `close` can release the sender.
         tx.close();
         assert_eq!(
-            wakes.count(),
+            wake_counter.count(),
             1,
             "close must wake the sender parked on capacity exactly once"
         );
