@@ -30,7 +30,7 @@ use datafusion::{
     logical_expr::{Expr, ExprSchemable as _},
     scalar::ScalarValue,
 };
-use datafusion_table_providers::util::supported_functions::FunctionSupport;
+use datafusion_table_providers::util::supported_functions::{ExpressionSupport, FunctionSupport};
 use runtime_udfs_api::{FunctionSupportBuilder, datafusion_nested_function_names};
 
 /// The [`FunctionSupport`] for `DuckDB` connectors and accelerators: allows
@@ -201,9 +201,40 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
 /// `LOWER` is not known to preserve Unicode, collation, pattern, and escape
 /// semantics, so either positive or negated case-insensitive `LIKE` stays
 /// local. Binary operator variants are intentionally outside this policy.
+///
+/// A cast from a fractional value into an integer stays local too: `BigQuery`
+/// documents that it rounds one where `DataFusion` truncates
+/// ([`crate::dialect::integer_cast_is_renderable`]).
 #[must_use]
-pub fn bigquery_can_evaluate_expression(expr: &Expr, _schema: Option<&DFSchema>) -> bool {
+pub fn bigquery_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
     !matches!(expr, Expr::Like(like) if like.case_insensitive)
+        && crate::dialect::integer_cast_is_renderable(expr, schema)
+}
+
+/// The per-expression gate for an engine reached through a generic driver,
+/// keyed by the name the driver is configured with — an ADBC `adbc_driver`
+/// value, or an ODBC profile — for a connector whose dialect is generic and
+/// whose policy is therefore the plain deny-list. The gate is what keeps a
+/// cast the engine evaluates differently from `DataFusion` (a fractional value
+/// into an integer, which these engines round where `DataFusion` truncates)
+/// out of the pushdown on that route too; without it the same statement
+/// answered differently through ADBC or ODBC than through the engine's own
+/// connector (issue #14482). `None` for an engine with no such shape, or one
+/// this crate has no gate for, which keeps the plain policy.
+#[must_use]
+pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> {
+    match engine {
+        "bigquery" => Some(Arc::new(bigquery_can_evaluate_expression)),
+        "duckdb" => Some(Arc::new(crate::dialect::duckdb_can_evaluate_expression)),
+        "postgres" | "postgresql" => {
+            Some(Arc::new(crate::dialect::postgres_can_evaluate_expression))
+        }
+        "mysql" => Some(Arc::new(crate::dialect::mysql_can_evaluate_expression)),
+        // Documented to round a fractional value cast into an integer, like the
+        // engines above; the gate costs them only the cast's pushdown.
+        "snowflake" | "athena" => Some(Arc::new(crate::dialect::integer_cast_is_renderable)),
+        _ => None,
+    }
 }
 
 /// `SQLite`-flavored deny-list as a value, for
@@ -316,11 +347,16 @@ fn sqlite_cast_is_faithful(from: &DataType, to: &DataType) -> bool {
 /// `TRIM` has no two-argument form at all, and its `TRIM(BOTH chars FROM str)`
 /// strips repetitions of `chars` as a *string*, where `btrim` strips any
 /// character in it — so a rewrite would trade a failed query for wrong rows.
+///
+/// A cast from a fractional value into an integer stays local too, because
+/// `MySQL` rounds it where `DataFusion` truncates
+/// ([`crate::dialect::mysql_can_evaluate_expression`]).
 #[must_use]
 pub fn deny_spice_functions_for_mysql_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also([crate::dialect::BTRIM_NAME.to_string()])
         .build()
+        .with_expression_support(Arc::new(crate::dialect::mysql_can_evaluate_expression))
 }
 
 /// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot
@@ -348,6 +384,10 @@ pub const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
 /// `DataFusion` array functions `PostgreSQL` can't execute. Used with
 /// `PostgresTableProviderFactory::with_function_support` (accelerator) and the
 /// `PostgreSQL` connector's federation deny-list. See issue #10703.
+///
+/// A cast from a fractional value into an integer stays local too, because
+/// `PostgreSQL` rounds it where `DataFusion` truncates
+/// ([`crate::dialect::postgres_can_evaluate_expression`]).
 #[must_use]
 pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
     let unsupported_arrays = datafusion_nested_function_names()
@@ -357,6 +397,7 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also(unsupported_arrays)
         .build()
+        .with_expression_support(Arc::new(crate::dialect::postgres_can_evaluate_expression))
 }
 
 #[cfg(test)]
@@ -365,30 +406,107 @@ mod tests {
         deny_spice_functions_for_bigquery_table_providers,
         deny_spice_functions_for_duckdb_dialect_without_carve_out,
         deny_spice_functions_for_duckdb_table_providers,
-        deny_spice_functions_for_sqlite_table_providers,
+        deny_spice_functions_for_mysql_table_providers,
+        deny_spice_functions_for_postgres_table_providers,
+        deny_spice_functions_for_sqlite_table_providers, expression_support_for_engine,
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::DFSchema;
+    use datafusion::functions::core::expr_fn::{
+        arrow_cast, arrow_field, arrow_metadata, arrow_try_cast, arrow_typeof, cast_to_type,
+        try_cast_to_type, with_metadata,
+    };
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
-    use datafusion::logical_expr::{LogicalPlan, table_scan};
+    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, table_scan};
     use datafusion::prelude::{Expr, cast, col, lit, try_cast};
     use datafusion::scalar::ScalarValue;
     use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
-    use runtime_udfs_api::{add_user_function, remove_user_function};
+    use runtime_udfs_api::{add_user_function, function_support, remove_user_function};
 
     /// A scan of `t(s, start)` projecting `expr`, which is the shape federation
     /// is asked to decide about.
     fn plan_projecting(expr: Expr) -> LogicalPlan {
-        let schema = Schema::new(vec![
-            Field::new("s", DataType::Utf8, true),
-            Field::new("start", DataType::Int64, true),
-        ]);
-        table_scan(Some("t"), &schema, None)
-            .expect("scan t")
+        scan_t()
             .project(vec![expr])
             .expect("project")
             .build()
             .expect("build plan")
+    }
+
+    /// A scan of `t(s, start)` filtered by `predicate`.
+    fn plan_filtering(predicate: Expr) -> LogicalPlan {
+        scan_t()
+            .filter(predicate)
+            .expect("filter")
+            .build()
+            .expect("build plan")
+    }
+
+    fn scan_t() -> LogicalPlanBuilder {
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("start", DataType::Int64, true),
+        ]);
+        table_scan(Some("t"), &schema, None).expect("scan t")
+    }
+
+    /// Regression test for #14444. `DataFusion`'s own cast built-ins must be
+    /// evaluated locally under every backend policy — as a projection and as a
+    /// filter — because each backend either lacks the function (`DuckDB` and
+    /// `SQLite` failed the query as an unknown function) or, like `DuckDB`'s
+    /// `cast_to_type`, casts by its own rules rather than Arrow's.
+    #[test]
+    fn a_datafusion_cast_builtin_stays_local_on_every_backend() {
+        let plans: Vec<(&str, LogicalPlan)> = [
+            ("arrow_cast", arrow_cast(col("start"), lit("LargeUtf8"))),
+            ("arrow_try_cast", arrow_try_cast(col("s"), lit("Int64"))),
+            ("cast_to_type", cast_to_type(col("start"), lit(1_i32))),
+            ("try_cast_to_type", try_cast_to_type(col("s"), lit(1_i64))),
+        ]
+        .into_iter()
+        .flat_map(|(name, cast)| {
+            [
+                (name, plan_projecting(cast.clone())),
+                (name, plan_filtering(cast.is_not_null())),
+            ]
+        })
+        .collect();
+        // The column itself still federates: the refusal costs only the casts
+        // it is about.
+        let plain_column = plan_projecting(col("start"));
+        let policies = [
+            ("plain", function_support()),
+            ("DuckDB", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "DuckLake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+            (
+                "BigQuery",
+                deny_spice_functions_for_bigquery_table_providers(),
+            ),
+            (
+                "PostgreSQL",
+                deny_spice_functions_for_postgres_table_providers(),
+            ),
+            ("SQLite", deny_spice_functions_for_sqlite_table_providers()),
+            ("MySQL", deny_spice_functions_for_mysql_table_providers()),
+        ];
+
+        for (policy, support) in &policies {
+            for (name, plan) in &plans {
+                assert!(
+                    contains_unsupported_functions(plan, support)
+                        .expect("the support check must not error"),
+                    "the {policy} policy must evaluate {name} locally rather than federate it:\n{plan}"
+                );
+            }
+            assert!(
+                !contains_unsupported_functions(&plain_column, support)
+                    .expect("the support check must not error"),
+                "the {policy} policy must still federate a plain column"
+            );
+        }
     }
 
     /// Whether federation would push this plan into `DuckDB`, which is what
@@ -412,6 +530,54 @@ mod tests {
             !federates(regexp_count(col("s"), lit("a"), Some(col("start")), None)),
             "a column start position has no DuckDB rendering, so this plan must stay local"
         );
+    }
+
+    /// Regression test for #14334. `arrow_typeof` must not be unparsed into the
+    /// SQL sent to a `DuckDB` accelerator, which has no function of that name;
+    /// the call describes the `DataFusion` plan's type, so no backend can
+    /// answer it and every policy must keep it local. The three siblings from
+    /// the same `DataFusion` module are the same class, and the plain policy
+    /// every catalog connector takes is covered alongside the backend ones.
+    #[test]
+    fn a_plan_introspection_builtin_stays_local_on_every_backend() {
+        let calls = [
+            ("arrow_typeof", arrow_typeof(col("s"))),
+            ("arrow_field", arrow_field(col("s"))),
+            ("arrow_metadata", arrow_metadata(vec![col("s")])),
+            (
+                "with_metadata",
+                with_metadata(vec![col("s"), lit("k"), lit("v")]),
+            ),
+        ];
+        let policies = [
+            ("plain", function_support()),
+            ("DuckDB", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "DuckLake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+            (
+                "BigQuery",
+                deny_spice_functions_for_bigquery_table_providers(),
+            ),
+            (
+                "PostgreSQL",
+                deny_spice_functions_for_postgres_table_providers(),
+            ),
+            ("SQLite", deny_spice_functions_for_sqlite_table_providers()),
+            ("MySQL", deny_spice_functions_for_mysql_table_providers()),
+        ];
+
+        for (policy, support) in &policies {
+            for (name, call) in &calls {
+                assert!(
+                    contains_unsupported_functions(&plan_projecting(call.clone()), support)
+                        .expect("the support check must not error"),
+                    "{name} answers about the DataFusion plan, not the data, so the {policy} \
+                     policy must evaluate it locally rather than federate it"
+                );
+            }
+        }
     }
 
     /// The complement: the per-call check must not cost a pushdown that works.
@@ -753,14 +919,25 @@ mod tests {
         );
     }
 
-    /// A scan of `t(id, a)` with `a` binary, filtered by `predicate` and
-    /// projecting `projection` — the shapes #14355 measured.
+    /// A scan of `t(id, s, a)` with `s` text and `a` binary, filtered by
+    /// `predicate` and projecting `projection` — the shapes #14355 and #14397
+    /// measured.
     fn plan_over_binary(predicate: Option<Expr>, projection: Expr) -> LogicalPlan {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("a", DataType::Binary, true),
-        ]);
-        let mut plan = table_scan(Some("t"), &schema, None).expect("scan t");
+        plan_over(
+            vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("s", DataType::Utf8, true),
+                Field::new("a", DataType::Binary, true),
+            ],
+            predicate,
+            projection,
+        )
+    }
+
+    /// A scan of `t` with `fields`, filtered by `predicate` and projecting
+    /// `projection`.
+    fn plan_over(fields: Vec<Field>, predicate: Option<Expr>, projection: Expr) -> LogicalPlan {
+        let mut plan = table_scan(Some("t"), &Schema::new(fields), None).expect("scan t");
         if let Some(predicate) = predicate {
             plan = plan.filter(predicate).expect("filter");
         }
@@ -770,13 +947,9 @@ mod tests {
             .expect("build plan")
     }
 
-    /// Regression test for #14355, through both `DuckDB` accessors: a cast of a
-    /// binary column into text answers with a row on `DuckDB` where
-    /// `DataFusion` raises (`CAST`) or answers NULL (`TRY_CAST`), so a plan
-    /// holding one, in a projection or a filter, must stay local.
-    #[test]
-    fn a_duckdb_text_cast_over_a_binary_column_is_not_federated() {
-        use datafusion::prelude::{cast, try_cast};
+    /// Asserts, through both `DuckDB` accessors, that every plan in `local`
+    /// stays local and every plan in `federated` still federates.
+    fn assert_duckdb_federation(local: &[LogicalPlan], federated: &[LogicalPlan]) {
         for (accessor, support) in [
             (
                 "table providers",
@@ -787,7 +960,61 @@ mod tests {
                 deny_spice_functions_for_duckdb_dialect_without_carve_out(),
             ),
         ] {
-            for plan in [
+            for plan in local {
+                assert!(
+                    contains_unsupported_functions(plan, &support)
+                        .expect("the support check must not error"),
+                    "the {accessor} accessor must keep this plan local:\n{plan}"
+                );
+            }
+            for plan in federated {
+                assert!(
+                    !contains_unsupported_functions(plan, &support)
+                        .expect("the support check must not error"),
+                    "the {accessor} accessor must still federate:\n{plan}"
+                );
+            }
+        }
+    }
+
+    /// Regression test for #14397, through both `DuckDB` accessors: no cast into
+    /// a binary type has a `DuckDB` rendering that answers what `DataFusion`
+    /// does, so a plan holding one, in a projection or a filter, stays local.
+    #[test]
+    fn a_duckdb_cast_into_binary_is_not_federated() {
+        assert_duckdb_federation(
+            &[
+                plan_over_binary(None, cast(col("s"), DataType::Binary)),
+                plan_over_binary(None, try_cast(col("s"), DataType::Binary)),
+                plan_over_binary(
+                    Some(cast(col("s"), DataType::Binary).eq(col("a"))),
+                    col("id"),
+                ),
+                // A literal cast is sent as the bare string, which `DuckDB`
+                // reads under its own escape rules.
+                plan_over_binary(
+                    Some(col("a").eq(cast(lit("\\xFF"), DataType::Binary))),
+                    col("id"),
+                ),
+            ],
+            // Casts into other types, and the binary column itself, still
+            // federate: the refusal costs only the casts it is about.
+            &[
+                plan_over_binary(None, col("a")),
+                plan_over_binary(None, cast(col("s"), DataType::Utf8View)),
+                plan_over_binary(Some(col("a").is_not_null()), col("id")),
+            ],
+        );
+    }
+
+    /// Regression test for #14355, through both `DuckDB` accessors: a cast of a
+    /// binary column into text answers with a row on `DuckDB` where
+    /// `DataFusion` raises (`CAST`) or answers NULL (`TRY_CAST`), so a plan
+    /// holding one, in a projection or a filter, must stay local.
+    #[test]
+    fn a_duckdb_text_cast_over_a_binary_column_is_not_federated() {
+        assert_duckdb_federation(
+            &[
                 plan_over_binary(None, cast(col("a"), DataType::Utf8)),
                 plan_over_binary(None, try_cast(col("a"), DataType::Utf8)),
                 plan_over_binary(None, cast(col("a"), DataType::Utf8View)),
@@ -795,28 +1022,165 @@ mod tests {
                     Some(cast(col("a"), DataType::Utf8).like(lit("%bad%"))),
                     col("id"),
                 ),
+            ],
+            // The binary column itself, and a text cast over a non-binary
+            // column, still federate: the refusal costs only the casts it is
+            // about.
+            &[
+                plan_over_binary(None, col("a")),
+                plan_over_binary(None, cast(col("id"), DataType::Utf8)),
+                plan_over_binary(Some(col("a").is_not_null()), col("id")),
+            ],
+        );
+    }
+
+    /// A scan of `t(id, f, d)` with `f` a float and `d` a decimal, filtered by
+    /// `predicate` and projecting `projection` — the shapes #14482 measured.
+    fn plan_over_fractions(predicate: Option<Expr>, projection: Expr) -> LogicalPlan {
+        plan_over(
+            vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("f", DataType::Float64, true),
+                Field::new("d", DataType::Decimal128(10, 2), true),
+            ],
+            predicate,
+            projection,
+        )
+    }
+
+    /// Regression test for #14482, through every policy whose engine rounds a
+    /// fractional value cast into an integer where `DataFusion` truncates: a
+    /// plan holding such a cast, in a projection or a filter, must stay local
+    /// on `DuckDB` (both accessors), `PostgreSQL` and `MySQL`. The same policies
+    /// decide the scan-level filter pushdown, so a filter over the cast is kept
+    /// out of the pushed-down scan too rather than pre-applied by the engine
+    /// with its own rounding.
+    #[test]
+    fn a_fractional_to_integer_cast_is_not_federated_to_an_engine_that_rounds() {
+        for (policy, support) in [
+            (
+                "DuckDB table providers",
+                deny_spice_functions_for_duckdb_table_providers(),
+            ),
+            (
+                "DuckLake catalog",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+            (
+                "PostgreSQL",
+                deny_spice_functions_for_postgres_table_providers(),
+            ),
+            ("MySQL", deny_spice_functions_for_mysql_table_providers()),
+            (
+                "BigQuery",
+                deny_spice_functions_for_bigquery_table_providers(),
+            ),
+        ] {
+            for plan in [
+                plan_over_fractions(None, cast(col("f"), DataType::Int32)),
+                plan_over_fractions(None, try_cast(col("f"), DataType::Int64)),
+                plan_over_fractions(None, cast(col("d"), DataType::Int16)),
+                plan_over_fractions(None, cast(col("id") * lit(1.5_f64), DataType::Int32)),
+                plan_over_fractions(
+                    Some(cast(col("id") * lit(1.5_f64), DataType::Int32).eq(lit(2))),
+                    col("id"),
+                ),
+                plan_over_fractions(
+                    Some(try_cast(col("d"), DataType::Int64).gt(lit(1))),
+                    col("id"),
+                ),
             ] {
                 assert!(
                     contains_unsupported_functions(&plan, &support)
                         .expect("the support check must not error"),
-                    "the {accessor} accessor must keep this plan local:\n{plan}"
+                    "the {policy} policy must keep this plan local:\n{plan}"
                 );
             }
 
-            // The binary column itself, and a text cast over a non-binary
-            // column, still federate: the refusal costs only the casts it is
-            // about.
+            // The fractional columns themselves, a cast between integers, a
+            // cast into a fractional type and a comparison over a fraction
+            // still federate: the refusal costs only the casts it is about.
             for plan in [
-                plan_over_binary(None, col("a")),
-                plan_over_binary(None, cast(col("id"), DataType::Utf8)),
-                plan_over_binary(Some(col("a").is_not_null()), col("id")),
+                plan_over_fractions(None, col("f")),
+                plan_over_fractions(None, col("d")),
+                plan_over_fractions(None, cast(col("id"), DataType::Int32)),
+                plan_over_fractions(None, cast(col("id"), DataType::Float64)),
+                plan_over_fractions(None, cast(col("f"), DataType::Float32)),
+                plan_over_fractions(Some(col("f").gt(lit(1.5_f64))), col("id")),
             ] {
                 assert!(
                     !contains_unsupported_functions(&plan, &support)
                         .expect("the support check must not error"),
-                    "the {accessor} accessor must still federate:\n{plan}"
+                    "the {policy} policy must still federate:\n{plan}"
                 );
             }
         }
+    }
+
+    /// Regression test for #14482 on the generic-driver routes: the gate an ADBC
+    /// driver name or an ODBC profile resolves to must refuse the same cast the
+    /// engine's own connector refuses, and an engine that truncates like
+    /// `DataFusion`, or one with no gate, keeps the plain policy.
+    #[test]
+    fn the_engine_gate_refuses_a_fractional_to_integer_cast_where_the_engine_rounds() {
+        use datafusion::prelude::cast;
+        let rounding = cast(lit(1.5_f64), DataType::Int64);
+        let harmless = cast(lit(1_i64), DataType::Int32);
+        for engine in [
+            "bigquery",
+            "duckdb",
+            "postgres",
+            "postgresql",
+            "mysql",
+            "snowflake",
+            "athena",
+        ] {
+            let gate = expression_support_for_engine(engine)
+                .unwrap_or_else(|| panic!("{engine} rounds the cast, so it needs a gate"));
+            assert!(
+                !gate(&rounding, None),
+                "{engine} rounds {rounding}, so its gate must keep it local"
+            );
+            assert!(
+                gate(&harmless, None),
+                "{engine} evaluates {harmless} as DataFusion does, so its gate must let it federate"
+            );
+        }
+        for engine in ["sqlite", "databricks", "flightsql", "unknown"] {
+            assert!(
+                expression_support_for_engine(engine).is_none(),
+                "{engine} has no gate: it truncates like DataFusion, or no policy exists for it"
+            );
+        }
+    }
+
+    /// The local half of #14482, pinned so the refusal above cannot outlive
+    /// the divergence it exists for: `DataFusion` truncates a fractional value
+    /// cast into an integer — toward zero for a float, and by integer division
+    /// for a decimal — where the engines above round it.
+    #[tokio::test]
+    async fn datafusion_truncates_a_fractional_value_cast_into_an_integer() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches = ctx
+            .sql(
+                "SELECT CAST(1.5 AS INT) AS a, CAST(-1.5 AS INT) AS b, CAST(2.5 AS BIGINT) AS c, \
+                 TRY_CAST(2.49 AS SMALLINT) AS d, CAST(CAST(2.49 AS DECIMAL(4, 2)) AS INT) AS e, \
+                 CAST(CAST(-2.5 AS DECIMAL(4, 1)) AS INT) AS f",
+            )
+            .await
+            .expect("the casts plan")
+            .collect()
+            .await
+            .expect("the casts run");
+        datafusion::assert_batches_eq!(
+            [
+                "+---+----+---+---+---+----+",
+                "| a | b  | c | d | e | f  |",
+                "+---+----+---+---+---+----+",
+                "| 1 | -1 | 2 | 2 | 2 | -2 |",
+                "+---+----+---+---+---+----+",
+            ],
+            &batches
+        );
     }
 }

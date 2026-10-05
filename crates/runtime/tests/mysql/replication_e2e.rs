@@ -836,9 +836,10 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_E2E_RECONNECT_PORT)
-                .await
-                .map_err(|e| anyhow!("start container: {e}"))?;
+            let _container =
+                common::start_mysql_docker_container_retrying_startup(MYSQL_E2E_RECONNECT_PORT)
+                    .await
+                    .map_err(|e| anyhow!("start container: {e}"))?;
 
             let pool = common::get_mysql_conn(MYSQL_E2E_RECONNECT_PORT)?;
             exec(&pool, RECONNECT_DDL).await?;
@@ -1247,9 +1248,10 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_E2E_TYPES_PORT)
-                .await
-                .map_err(|e| anyhow!("start container: {e}"))?;
+            let _container =
+                common::start_mysql_docker_container_retrying_startup(MYSQL_E2E_TYPES_PORT)
+                    .await
+                    .map_err(|e| anyhow!("start container: {e}"))?;
 
             let pool = common::get_mysql_conn(MYSQL_E2E_TYPES_PORT)?;
             exec(&pool, TYPES_DDL).await?;
