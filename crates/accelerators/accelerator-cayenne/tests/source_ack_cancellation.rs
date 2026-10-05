@@ -66,11 +66,13 @@ struct FileCommitter {
     entered: Arc<Notify>,
     release: Arc<Semaphore>,
     dropped: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
 impl CommitChange for FileCommitter {
     async fn commit(&self) -> Result<(), CommitError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         let permit = self.release.acquire().await.expect("source commit gate");
         let result = async {
@@ -182,9 +184,9 @@ async fn native_checkpoint_retains_source_ack_after_producer_cancellation() {
         .await
         .expect("bind native backend")
         .expect("native sink");
-    let checkpoint_epoch = Arc::new(AtomicU64::new(0));
+    let checkpoint_rows = Arc::new(AtomicU64::new(0));
     let callback_table = Arc::clone(&table);
-    let callback_epoch = Arc::clone(&checkpoint_epoch);
+    let callback_rows = Arc::clone(&checkpoint_rows);
     let task = RefreshTaskBuilder::new(
         Arc::default(),
         TableReference::bare("source_ack"),
@@ -197,9 +199,9 @@ async fn native_checkpoint_retains_source_ack_after_producer_cancellation() {
     .with_change_sink(Some(sink.clone()))
     .with_on_stream_batch_process_callback(Some(Arc::new(Mutex::new(Box::new(move || {
         let table = Arc::clone(&callback_table);
-        let epoch = Arc::clone(&callback_epoch);
+        let rows = Arc::clone(&callback_rows);
         Box::pin(async move {
-            epoch.store(
+            rows.store(
                 table
                     .checkpoint_mem_tier()
                     .await
@@ -212,6 +214,7 @@ async fn native_checkpoint_retains_source_ack_after_producer_cancellation() {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Semaphore::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
     let envelope = ChangeEnvelope::from_parts(
         Box::new(FileCommitter {
             checkpoint: checkpoint.clone(),
@@ -219,6 +222,7 @@ async fn native_checkpoint_retains_source_ack_after_producer_cancellation() {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
             dropped: Arc::clone(&dropped),
+            calls: Arc::clone(&calls),
         }),
         change(&table, first_id),
         true,
@@ -237,7 +241,7 @@ async fn native_checkpoint_retains_source_ack_after_producer_cancellation() {
     tokio::time::timeout(Duration::from_secs(30), entered.notified())
         .await
         .expect("published row reached the suspended source acknowledgement");
-    assert!(checkpoint_epoch.load(Ordering::SeqCst) > 0);
+    assert_eq!(checkpoint_rows.load(Ordering::SeqCst), 1);
     assert!(table.has_slot_advancer(), "native CDC durability observer");
     producer.abort();
     assert!(
@@ -303,7 +307,8 @@ async fn native_checkpoint_retains_source_ack_after_producer_cancellation() {
     let result = serde_json::json!({
         "source": input,
         "first_source_byte_offset": first_offset,
-        "native_checkpoint_epoch": checkpoint_epoch.load(Ordering::SeqCst),
+        "native_checkpoint_rows": checkpoint_rows.load(Ordering::SeqCst),
+        "source_commit_calls": calls.load(Ordering::SeqCst),
         "native_rows": actual_ids,
         "committer_dropped_after_cancel": dropped_after_cancel,
         "checkpoint_after_cancel": checkpoint_after_cancel,
@@ -320,6 +325,11 @@ async fn native_checkpoint_retains_source_ack_after_producer_cancellation() {
     println!("{result}");
     assert_eq!(actual_ids, [first_id, second_id]);
     assert_eq!(checkpoint_after_cancel, "0");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "resume the in-flight source call"
+    );
     assert_eq!(
         dropped_after_cancel, 0,
         "accepted source acknowledgement remains owned"

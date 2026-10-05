@@ -110,14 +110,17 @@ struct PendingFinalizeCommit {
 type DeferredCommitQueue =
     Arc<tokio::sync::Mutex<VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>>>;
 
+type DeferredCommitDrain =
+    futures::future::BoxFuture<'static, std::result::Result<(), cdc::CommitError>>;
+
 struct SourceDurabilityObserver {
     queue: DeferredCommitQueue,
     durable_fence: AtomicU64,
     durability_known: AtomicBool,
-    pending_count: AtomicUsize,
-    // Serialize acknowledgement, including retries, without holding the queue lock
-    // during a source network call.
-    drain: tokio::sync::Mutex<()>,
+    pending_count: Arc<AtomicUsize>,
+    // Retain the in-flight source call and its durable prefix across waiter
+    // cancellation. The queue lock is never held during a source network call.
+    drain: tokio::sync::Mutex<Option<DeferredCommitDrain>>,
     dataset_name: TableReference,
     runtime_status: Arc<status::RuntimeStatus>,
 }
@@ -128,8 +131,8 @@ impl SourceDurabilityObserver {
             queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             durable_fence: AtomicU64::new(0),
             durability_known: AtomicBool::new(false),
-            pending_count: AtomicUsize::new(0),
-            drain: tokio::sync::Mutex::new(()),
+            pending_count: Arc::new(AtomicUsize::new(0)),
+            drain: tokio::sync::Mutex::new(None),
             dataset_name,
             runtime_status,
         }
@@ -183,15 +186,34 @@ impl SourceDurabilityObserver {
         }
     }
 
+    async fn finish_drain(&self, drain: &mut Option<DeferredCommitDrain>) -> bool {
+        let Some(pending) = drain.as_mut() else {
+            return true;
+        };
+        let result = pending.await;
+        *drain = None;
+        if let Err(e) = result {
+            if !self.runtime_status.is_shutdown() {
+                tracing::warn!(
+                    "Deferred CDC commit failed for {} (source slot will retry before any later immediate commit): {e}",
+                    self.dataset_name
+                );
+            }
+            return false;
+        }
+        true
+    }
+
     async fn is_empty(&self, trace: Option<&CdcFlushTrace<'_>>, stage: &'static str) -> bool {
         // A detached ready prefix still counts as pending acknowledgement.
         let drain_start = Instant::now();
-        let _drain = self.drain.lock().await;
+        let drain = self.drain.lock().await;
         if let Some(trace) = trace {
             trace.record(stage, "observer_drain_lock", drain_start);
         }
         let queue_start = Instant::now();
-        let empty = self.queue.lock().await.is_empty();
+        // A retained requeue future can already own the next queue-lock permit.
+        let empty = drain.is_none() && self.queue.lock().await.is_empty();
         if let Some(trace) = trace {
             trace.record(stage, "observer_queue_lock", queue_start);
         }
@@ -204,7 +226,10 @@ impl DurabilityObserver for SourceDurabilityObserver {
     async fn on_durable(&self, fence: u64) {
         self.durable_fence.fetch_max(fence, Ordering::AcqRel);
         self.durability_known.store(true, Ordering::Release);
-        let _drain = self.drain.lock().await;
+        let mut drain = self.drain.lock().await;
+        if !self.finish_drain(&mut drain).await {
+            return;
+        }
         let durable_epoch = self.durable_fence.load(Ordering::Acquire);
         // Pull out every committer whose epoch is now durable, preserving FIFO
         // order. Hold the lock only to splice out the ready prefix, not across
@@ -232,7 +257,7 @@ impl DurabilityObserver for SourceDurabilityObserver {
         // Order-sensitive or fallible sources are left with their per-epoch
         // structure completely untouched, preserving the in-order,
         // requeue-on-failure drain byte for byte.
-        let mut ready = if prefix_is_coalescable(&ready) {
+        let ready = if prefix_is_coalescable(&ready) {
             // `prefix_is_coalescable` guaranteed a non-empty prefix, so `max` is
             // always `Some` here; `unwrap_or(0)` is just the lint-clean spelling
             // of that (this crate denies `unwrap`/`expect` in non-test code). The
@@ -250,37 +275,44 @@ impl DurabilityObserver for SourceDurabilityObserver {
             ready
         };
 
-        while let Some((epoch, committers)) = ready.pop_front() {
-            let mut committers = committers.into_iter();
-            while let Some(committer) = committers.next() {
-                if let Err(e) = committer.commit().await {
-                    let mut uncommitted = vec![committer];
-                    uncommitted.extend(committers);
-                    let mut to_requeue = VecDeque::new();
-                    to_requeue.push_back((epoch, uncommitted));
-                    to_requeue.append(&mut ready);
-
-                    let mut queue = self.queue.lock().await;
-                    while let Some(item) = to_requeue.pop_back() {
-                        queue.push_front(item);
-                    }
-
-                    // A failed source ack must remain queued. A later immediate
-                    // commit is required to observe the non-empty queue and stop
-                    // rather than advancing the source past this durable-but-not-
-                    // acked checkpoint.
-                    if !self.runtime_status.is_shutdown() {
-                        tracing::warn!(
-                            "Deferred CDC commit failed for {} (source slot will retry before any later immediate commit): {e}",
-                            self.dataset_name
-                        );
-                    }
-                    return;
-                }
-                self.pending_count.fetch_sub(1, Ordering::AcqRel);
-            }
+        if !ready.is_empty() {
+            *drain = Some(Box::pin(commit_deferred_prefix(
+                Arc::clone(&self.queue),
+                Arc::clone(&self.pending_count),
+                ready,
+            )));
+            self.finish_drain(&mut drain).await;
         }
     }
+}
+
+async fn commit_deferred_prefix(
+    queue: DeferredCommitQueue,
+    pending_count: Arc<AtomicUsize>,
+    mut ready: VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>,
+) -> std::result::Result<(), cdc::CommitError> {
+    while let Some((epoch, committers)) = ready.pop_front() {
+        let mut committers = committers.into_iter();
+        while let Some(committer) = committers.next() {
+            if let Err(error) = committer.commit().await {
+                let mut uncommitted = vec![committer];
+                uncommitted.extend(committers);
+                let mut to_requeue = VecDeque::new();
+                to_requeue.push_back((epoch, uncommitted));
+                to_requeue.append(&mut ready);
+
+                // Requeue before reporting the failure so no later source
+                // acknowledgement can skip the failed durable prefix.
+                let mut queue = queue.lock().await;
+                while let Some(item) = to_requeue.pop_back() {
+                    queue.push_front(item);
+                }
+                return Err(error);
+            }
+            pending_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    Ok(())
 }
 
 /// Whether the whole deferred-drain prefix opts into coalescing — i.e. every
@@ -4355,6 +4387,179 @@ mod tests {
         }
     }
 
+    struct SuspendedDeferredCommitter {
+        id: i32,
+        log: Arc<CommitLog>,
+        attempts: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        failed: Arc<tokio::sync::Notify>,
+        fail_first: bool,
+    }
+
+    #[async_trait]
+    impl CommitChange for SuspendedDeferredCommitter {
+        async fn commit(&self) -> Result<(), CommitError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            let fails = self.fail_first && attempt == 0;
+            self.log.events.lock().await.push((
+                self.id,
+                if fails {
+                    Err("retry source".into())
+                } else {
+                    Ok(())
+                },
+            ));
+            if fails {
+                self.failed.notify_one();
+                return Err(CommitError::UnableToCommitChange {
+                    source: "retry source".into(),
+                });
+            }
+            Ok(())
+        }
+
+        fn supports_deferral(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_cancelled_drain_resumes_source_future_in_order() {
+        let observer = Arc::new(deferred_observer());
+        let log = CommitLog::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        for id in 1..=4 {
+            let committer: Box<dyn CommitChange + Send + Sync> = if id == 2 {
+                Box::new(SuspendedDeferredCommitter {
+                    id,
+                    log: Arc::clone(&log),
+                    attempts: Arc::clone(&attempts),
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    failed: Arc::new(tokio::sync::Notify::new()),
+                    fail_first: false,
+                })
+            } else {
+                Box::new(DeferrableTrackingCommitter {
+                    id,
+                    log: Arc::clone(&log),
+                    outcome: Ok(()),
+                })
+            };
+            observer
+                .enqueue(u64::try_from(id).expect("fence"), vec![committer])
+                .await;
+        }
+        let task_observer = Arc::clone(&observer);
+        let task = tokio::spawn(async move { task_observer.on_durable(3).await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("second source call suspends");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("cancelled drain waiter")
+                .is_cancelled()
+        );
+        assert_eq!(log.ids().await, [1]);
+        assert_eq!(observer.pending_count(), 3);
+        assert!(!observer.is_empty(None, "cancelled").await);
+        release.notify_one();
+        observer.retry().await;
+        assert_eq!(log.ids().await, [1, 2, 3]);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "resume, do not restart the source call"
+        );
+        assert_eq!(observer.pending_count(), 1);
+        assert!(!observer.is_empty(None, "not_durable").await);
+        observer.on_durable(4).await;
+        assert_eq!(log.ids().await, [1, 2, 3, 4]);
+        assert_eq!(observer.pending_count(), 0);
+        assert!(observer.is_empty(None, "complete").await);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_cancelled_failure_requeue_retains_prefix() {
+        let observer = Arc::new(deferred_observer());
+        let log = CommitLog::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let failed = Arc::new(tokio::sync::Notify::new());
+        observer
+            .enqueue(
+                1,
+                vec![Box::new(SuspendedDeferredCommitter {
+                    id: 1,
+                    log: Arc::clone(&log),
+                    attempts: Arc::clone(&attempts),
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    failed: Arc::clone(&failed),
+                    fail_first: true,
+                })],
+            )
+            .await;
+        observer
+            .enqueue(
+                2,
+                vec![Box::new(DeferrableTrackingCommitter {
+                    id: 2,
+                    log: Arc::clone(&log),
+                    outcome: Ok(()),
+                })],
+            )
+            .await;
+        let task_observer = Arc::clone(&observer);
+        let task = tokio::spawn(async move { task_observer.on_durable(2).await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("source call suspends");
+        let queue = observer.queue.lock().await;
+        assert!(queue.is_empty(), "durable prefix is owned by the drain");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), failed.notified())
+            .await
+            .expect("source call failed before requeue");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("cancelled requeue waiter")
+                .is_cancelled()
+        );
+        drop(queue);
+        assert_eq!(observer.pending_count(), 2);
+        assert!(!observer.is_empty(None, "requeue_pending").await);
+        observer.retry().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "finish the interrupted requeue first"
+        );
+        assert_eq!(observer.pending_count(), 2);
+        {
+            let queue = observer.queue.lock().await;
+            assert_eq!(
+                queue.iter().map(|(fence, _)| *fence).collect::<Vec<_>>(),
+                [1, 2]
+            );
+        }
+        observer.retry().await;
+        assert_eq!(log.ids().await, [1, 1, 2]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(observer.pending_count(), 0);
+        assert!(observer.is_empty(None, "complete").await);
+    }
+
     #[tokio::test]
     async fn deferred_metadata_cancelled_enqueue_retains_published_acknowledgement() {
         let observer = Arc::new(deferred_observer());
@@ -4500,7 +4705,7 @@ mod tests {
         }
         let advancer = SourceDurabilityObserver {
             queue: Arc::clone(&queue),
-            pending_count: AtomicUsize::new(4),
+            pending_count: Arc::new(AtomicUsize::new(4)),
             ..SourceDurabilityObserver::new(
                 TableReference::bare("test"),
                 runtime_status::RuntimeStatus::new(),
@@ -4655,7 +4860,7 @@ mod tests {
 
         let advancer = SourceDurabilityObserver {
             queue: Arc::clone(&queue),
-            pending_count: AtomicUsize::new(4),
+            pending_count: Arc::new(AtomicUsize::new(4)),
             ..SourceDurabilityObserver::new(
                 TableReference::bare("test"),
                 runtime_status::RuntimeStatus::new(),
