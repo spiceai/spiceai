@@ -9527,9 +9527,6 @@ impl CayenneTableProvider {
     /// every later change to them. Best-effort: the files no loaded run covers
     /// are indexed as usual.
     async fn open_persisted_lookup_index(&self) {
-        let Some(state) = &self.lookup_index else {
-            return;
-        };
         let Ok(url) = ListingTableUrl::parse(Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -9538,6 +9535,17 @@ impl CayenneTableProvider {
             return;
         };
         let Ok(store) = self.context.runtime_env().object_store(&url) else {
+            return;
+        };
+        let Some(state) = &self.lookup_index else {
+            super::lookup_index::PersistedRuns::remove_all(
+                self.table_metadata.table_name.clone(),
+                store,
+                Arc::clone(&self.catalog),
+                self.table_metadata.table_id.clone(),
+                url.prefix().clone(),
+            )
+            .await;
             return;
         };
         // The files a reader sees: the current snapshot's and the protected

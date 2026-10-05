@@ -18,6 +18,11 @@ limitations under the License.
 //! and querying it, reading its index counters and plans, and waiting for its
 //! index to cover every file.
 
+#![expect(
+    clippy::expect_used,
+    reason = "Integration test helpers panic when fixture setup or queries fail"
+)]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

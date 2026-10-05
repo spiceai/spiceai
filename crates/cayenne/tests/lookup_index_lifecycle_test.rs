@@ -888,6 +888,52 @@ async fn composite_keys_with_the_same_label_do_not_reuse_persisted_runs() {
     assert_eq!(counters(&reopened).full - before.full, 1);
 }
 
+/// Removing the last configured index removes its registrations and run files,
+/// including files left without a registration, while the table remains readable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_every_index_cleans_up_its_persisted_runs() {
+    const NAME: &str = "removed_indexes";
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let table = open_table(
+        &fixture,
+        Arc::clone(&env),
+        TableSpec::new(NAME, schema(), &[&KEY]).persistence(IndexPersistence::Enabled),
+    )
+    .await;
+    overwrite(&table, vec![rows(0, 20_000)]).await;
+    wait_for_persisted_runs(&fixture, NAME, 1).await;
+    drop(table);
+    let mut files = Vec::new();
+    run_files(&fixture.data_path, &mut files);
+    let registered_file = files.first().expect("a persisted run file");
+    std::fs::copy(
+        registered_file,
+        registered_file.with_file_name("00000000deadbeef.run"),
+    )
+    .expect("create an unregistered run file");
+
+    let reopened = open_table(
+        &fixture,
+        env,
+        TableSpec::new(NAME, schema(), &[]).persistence(IndexPersistence::Enabled),
+    )
+    .await;
+    let registered = registered_runs(&fixture, NAME).await;
+    let remaining_files = run_file_count(&fixture.data_path);
+    println!(
+        "after removing every index: registrations={registered:?}, run_files={remaining_files}"
+    );
+    assert!(
+        registered.is_empty() && remaining_files == 0,
+        "removing every index must clean up registered and orphan runs: {registered:?}, {remaining_files} files"
+    );
+    lookup(&reopened, NAME, 7).await;
+    assert!(reopened.lookup_index_counters().is_none());
+}
+
 /// With persisted runs, a reopened table loads its index runs instead of reading
 /// its files back: on reopen every file is covered before any build runs, and
 /// the loaded runs agree row for row with a read-back. Without them the same

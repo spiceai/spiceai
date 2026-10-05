@@ -1590,17 +1590,14 @@ impl LookupIndexState {
             tracing::debug!(table = %self.table_name, "Secondary index runs are not persisted: two keys share a run directory");
             return;
         }
-        let persisted_runs = Arc::new(PersistedRuns {
-            table_name: self.table_name.clone(),
+        let persisted_runs = Arc::new(PersistedRuns::new(
+            self.table_name.clone(),
             store,
             catalog,
             table_id,
-            root: root.clone(),
+            root.clone(),
             keys,
-            loaded: AtomicBool::new(false),
-            pending: Mutex::new(None),
-            syncing: AtomicBool::new(false),
-        });
+        ));
         if self
             .persisted_runs
             .set(Arc::clone(&persisted_runs))
@@ -2548,6 +2545,43 @@ pub(crate) struct PersistedRuns {
 }
 
 impl PersistedRuns {
+    fn new(
+        table_name: String,
+        store: Arc<dyn ObjectStore>,
+        catalog: Arc<dyn MetadataCatalog>,
+        table_id: String,
+        root: object_store::path::Path,
+        keys: Vec<String>,
+    ) -> Self {
+        Self {
+            table_name,
+            store,
+            catalog,
+            table_id,
+            root,
+            keys,
+            loaded: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            syncing: AtomicBool::new(false),
+        }
+    }
+
+    /// Removes every registered and orphan run when the table has no file-backed indexes.
+    /// Loading with no configured keys applies the same cleanup as removing
+    /// individual keys, without reading any run into memory.
+    pub(crate) async fn remove_all(
+        table_name: String,
+        store: Arc<dyn ObjectStore>,
+        catalog: Arc<dyn MetadataCatalog>,
+        table_id: String,
+        root: object_store::path::Path,
+    ) {
+        let runs = Self::new(table_name, store, catalog, table_id, root, Vec::new());
+        if let Err(error) = runs.load().await {
+            tracing::debug!(table = %runs.table_name, %error, "Persisted secondary index runs of removed indexes were not deleted; the next open retries");
+        }
+    }
+
     /// Persists `views`' runs in the background, coalescing with any sync
     /// already running.
     fn schedule(self: &Arc<Self>, views: Vec<(String, IndexView)>) {

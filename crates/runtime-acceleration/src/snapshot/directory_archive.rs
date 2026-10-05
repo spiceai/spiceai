@@ -319,7 +319,7 @@ where
                     })?;
             }
 
-            append_optional_files(&mut archive, &optional_files)?;
+            append_optional_files(&mut archive, &optional_files, &dirs)?;
 
             // Append in-memory extras after the on-disk content.
             for (archive_path, bytes) in &extras {
@@ -416,7 +416,7 @@ pub async fn archive_directories_to_file_with_plan(
                 })?;
         }
 
-        append_optional_files(&mut archive, &optional_files)?;
+        append_optional_files(&mut archive, &optional_files, &dirs)?;
 
         for (archive_path, bytes) in &extras {
             let mut header = tar::Header::new_gnu();
@@ -1115,31 +1115,67 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
     Ok(())
 }
 
-/// Walks `dir_path` recursively and appends each file to `archive` under
-/// `archive_prefix`, skipping any file whose path *relative to `dir_path`*
-/// is contained in `skip_relative_paths`.
-/// Opens `path` for reading without following a symbolic link in its place:
-/// `Ok(None)` when it is a link, which the archive leaves out as the
-/// directory walk does.
+/// Opens a file through directory handles, rejecting symbolic links in every
+/// component below a trusted archive root. Each opened directory pins the parent
+/// used by the next `openat`,
+/// so replacing a path component cannot redirect the traversal.
 #[cfg(unix)]
-fn open_no_follow(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+fn open_no_follow(root: &Path, path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
-    match std::fs::OpenOptions::new()
+    let mut parent = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)
     {
-        Ok(file) => Ok(Some(file)),
-        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => Ok(None),
-        Err(err) => Err(err),
+        Ok(parent) => parent,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::Prefix(_) => return Ok(None),
+        };
+        let name = CString::new(name.as_bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if components.peek().is_some() {
+                libc::O_DIRECTORY
+            } else {
+                libc::O_NONBLOCK
+            };
+        // SAFETY: the parent descriptor and NUL-terminated name remain valid
+        // throughout the call. No mode argument is needed without O_CREAT.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ELOOP | libc::ENOTDIR) => Ok(None),
+                _ => Err(error),
+            };
+        }
+        // SAFETY: openat returned a new owned descriptor, transferred exactly
+        // once to File, whose drop closes it.
+        parent = unsafe { std::fs::File::from_raw_fd(fd) };
     }
+    Ok(Some(parent))
 }
 
 /// Opens `path` for reading unless it is a symbolic link. The check and the
 /// open are separate steps here, so a link swapped in between is followed.
 #[cfg(not(unix))]
-fn open_no_follow(path: &Path) -> std::io::Result<Option<std::fs::File>> {
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+fn open_no_follow(root: &Path, path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let path = root.join(path);
+    if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
         return Ok(None);
     }
     std::fs::File::open(path).map(Some)
@@ -1152,9 +1188,26 @@ fn open_no_follow(path: &Path) -> std::io::Result<Option<std::fs::File>> {
 fn append_optional_files<W: std::io::Write>(
     archive: &mut tar::Builder<W>,
     files: &[(PathBuf, String)],
+    dirs: &[(PathBuf, String)],
 ) -> Result<()> {
     for (source, archive_path) in files {
-        let opened = match open_no_follow(source) {
+        // Configured archive directories are trusted anchors; components below
+        // them must never follow links. Ancestors of the anchor may contain
+        // platform aliases such as macOS `/var`.
+        let root = dirs
+            .iter()
+            .map(|(path, _)| path.as_path())
+            .filter(|root| source.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .unwrap_or_else(|| {
+                if source.is_absolute() {
+                    Path::new("/")
+                } else {
+                    Path::new(".")
+                }
+            });
+        let relative = source.strip_prefix(root).unwrap_or(source);
+        let opened = match open_no_follow(root, relative) {
             Ok(opened) => opened,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!(
@@ -1375,19 +1428,52 @@ mod tests {
     #[tokio::test]
     async fn optional_files_skip_missing_files_and_symbolic_links() -> Result<()> {
         let test_dir = TempDir::new().expect("Failed to create temp dir");
-        let data_dir = test_dir.path().join("data");
+        let root = std::fs::canonicalize(test_dir.path()).expect("canonical fixture root");
+        let data_dir = root.join("data");
         std::fs::create_dir_all(&data_dir).expect("create data dir");
-        let secret = test_dir.path().join("secret.txt");
+        let secret = root.join("secret.txt");
         std::fs::write(&secret, b"SECRET_OUTSIDE_DATA_DIR").expect("write secret");
         std::fs::write(data_dir.join("kept.run"), b"run bytes").expect("write run");
         std::os::unix::fs::symlink(&secret, data_dir.join("linked.run")).expect("symlink");
+        std::os::unix::fs::symlink(test_dir.path(), data_dir.join("linked_parent"))
+            .expect("parent symlink");
         let optional = vec![
             (data_dir.join("kept.run"), "data/kept.run".to_string()),
             (data_dir.join("missing.run"), "data/missing.run".to_string()),
             (data_dir.join("linked.run"), "data/linked.run".to_string()),
+            (
+                data_dir.join("linked_parent/secret.txt"),
+                "data/parent.run".to_string(),
+            ),
         ];
         let archive_path = test_dir.path().join("snapshot.tar");
         archive_directories_to_file_with_plan(&[], &archive_path, &[], &[], &optional).await?;
+
+        // The configured root may have platform aliases above it, such as
+        // `/var` on macOS. Links below that root must still be rejected.
+        let raw_data_dir = test_dir.path().join("data");
+        let raw_optional: Vec<_> = optional
+            .iter()
+            .map(|(source, path)| {
+                (
+                    raw_data_dir.join(source.strip_prefix(&data_dir).expect("fixture child")),
+                    path.clone(),
+                )
+            })
+            .collect();
+        let mut anchored = tar::Builder::new(Vec::new());
+        append_optional_files(
+            &mut anchored,
+            &raw_optional,
+            &[(raw_data_dir, "data/".to_string())],
+        )?;
+        let anchored_bytes = anchored.into_inner().expect("finish anchored archive");
+        let anchored_entries: Vec<_> = tar::Archive::new(anchored_bytes.as_slice())
+            .entries()
+            .expect("entries")
+            .map(|entry| entry.expect("entry").path().expect("path").into_owned())
+            .collect();
+        assert_eq!(anchored_entries, vec![PathBuf::from("data/kept.run")]);
 
         let bytes = std::fs::read(&archive_path).expect("read archive");
         let mut entries: Vec<String> = tar::Archive::new(bytes.as_slice())
