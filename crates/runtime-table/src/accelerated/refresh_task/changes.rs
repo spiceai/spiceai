@@ -1274,12 +1274,10 @@ impl RefreshTask {
                             // full and the apply loop can't drain fast enough (apply-bound).
                             let send_start = Instant::now();
                             let send_res = tx.send(item).await;
+                            metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), send_labels);
                             if send_res.is_err() {
                                 // Nobody will receive it, so nobody will subtract it.
                                 discharge_prefetch_bytes(&reader_prefetch_bytes, queued_bytes);
-                            }
-                            metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), send_labels);
-                            if send_res.is_err() {
                                 tracing::debug!(
                                     "CDC consumer for {reader_dataset} dropped; reader exiting"
                                 );
