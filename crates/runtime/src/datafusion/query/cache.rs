@@ -19,7 +19,7 @@ use super::{
 };
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
-    EntryValidity, QueryResultsCacheProvider, RevalidationOutcome, Sizeable,
+    EntryValidity, QueryResultsCacheProvider, RevalidationOutcome,
     key::{CacheKey, RawCacheKey},
     result::CacheStatus,
     result::query::CachedQueryResult,
@@ -1214,22 +1214,12 @@ impl Query {
     ) {
         let cache_key_u64 = cache_key.as_u64();
         if let Some(cache_provider) = df.results_cache_provider() {
-            // A revalidation runs asynchronously, so an accelerated refresh or
-            // DML may have invalidated one of its tables while it was
-            // executing. Without a stale window that result cannot be served,
-            // and storing it would recreate the entry the invalidation just
-            // removed. With `stale_while_revalidate_ttl` the hit path serves
-            // it stale and never as fresh, so it is stored below unless a
-            // later read is already cached.
-            //
-            // This is only an early exit that avoids encoding a result already
-            // known to be unservable; correctness comes from the check every
-            // cache hit performs against the entry's `read_started_at`.
-            let admission = cache_provider.result_admission(&input_tables, revalidation_started_at);
-            if admission == cache::ResultAdmission::Skip {
+            // Skips encoding a result no lookup could serve; correctness comes
+            // from the check every cache hit performs.
+            if !cache_provider.is_servable(&input_tables, revalidation_started_at) {
                 tracing::debug!(
                     cache_key = cache_key_u64,
-                    "An input table was invalidated during background revalidation, discarding the result rather than repopulating the cache"
+                    "An input table was invalidated during background revalidation and no stale-while-revalidate window could serve the result, discarding it"
                 );
                 record_revalidation_outcome(RevalidationOutcome::InvalidatedMidFlight);
                 return;
@@ -1310,27 +1300,21 @@ impl Query {
             .await
             {
                 Ok(cached_result) => {
-                    let put_result = if admission == cache::ResultAdmission::StoreUnlessOlderRead {
-                        let weight = cached_result.get_memory_size();
-                        cache_provider
-                            .put_raw_key_unless_older_read(cache_key, cached_result, weight)
-                            .await
-                            .map(|stored| {
-                                if !stored {
-                                    tracing::debug!(
-                                        cache_key = cache_key_u64,
-                                        "A later read of this query is already cached, leaving it"
-                                    );
-                                }
-                                stored
-                            })
-                    } else {
-                        cache_provider
-                            .put_raw_key(cache_key, cached_result)
-                            .await
-                            .map(|()| true)
-                    };
-                    match put_result {
+                    match cache_provider
+                        .store_raw_key(cache_key, cached_result, None)
+                        .await
+                    {
+                        Ok(true) => {
+                            tracing::debug!(
+                                cache_key = cache_key_u64,
+                                "Background revalidation completed successfully and cached"
+                            );
+                            record_revalidation_outcome(RevalidationOutcome::Stored);
+                        }
+                        // `store_raw_key` logs the reason.
+                        Ok(false) => {
+                            record_revalidation_outcome(RevalidationOutcome::InvalidatedMidFlight);
+                        }
                         Err(e) => {
                             tracing::debug!(
                                 cache_key = cache_key_u64,
@@ -1338,14 +1322,6 @@ impl Query {
                                 e
                             );
                             record_revalidation_outcome(RevalidationOutcome::PutFailed);
-                        }
-                        Ok(false) => {}
-                        Ok(true) => {
-                            tracing::debug!(
-                                cache_key = cache_key_u64,
-                                "Background revalidation completed successfully and cached"
-                            );
-                            record_revalidation_outcome(RevalidationOutcome::Stored);
                         }
                     }
                 }
@@ -2458,14 +2434,7 @@ mod tests {
             .results_cache_provider()
             .expect("results cache should be configured");
 
-        let schema: arrow::datatypes::SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
-        ]));
-        let batch = arrow::array::RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![1_i64]))],
-        )
-        .expect("valid record batch");
+        let (schema, batch) = one_row_batch();
 
         // The revalidation begins its read here...
         let revalidation_started_at = std::time::Instant::now();
@@ -2523,23 +2492,151 @@ mod tests {
         );
     }
 
-    /// Regression test for #14686. The same mid-flight invalidation is servable
-    /// once `stale_while_revalidate_ttl` is set: the hit path classifies the
-    /// entry stale, so discarding the revalidation leaves nothing to serve
-    /// under a CDC feed that commits while the query runs.
-    #[tokio::test]
-    async fn test_swr_revalidation_stores_stale_result_invalidated_mid_flight() {
-        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+    /// A config where nothing expires on `item_ttl` during a test.
+    fn sql_cache_config(stale_while_revalidate_ttl: Option<&str>) -> SQLResultsCacheConfig {
+        SQLResultsCacheConfig {
             item_ttl: Some("10m".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
-            stale_while_revalidate_ttl: Some("5m".to_string()),
+            stale_while_revalidate_ttl: stale_while_revalidate_ttl.map(str::to_string),
             ..Default::default()
-        }))
-        .await;
-        let cache_provider = df
-            .results_cache_provider()
-            .expect("results cache should be configured");
+        }
+    }
 
+    /// Keeps two instants a test orders distinct: a tie counts as changed.
+    async fn tick() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    /// A table invalidated during every scan, as under CDC. Each scan returns
+    /// its sequence number.
+    #[derive(Debug)]
+    struct ChangesDuringEveryScan {
+        name: TableReference,
+        schema: arrow::datatypes::SchemaRef,
+        scans: Arc<std::sync::atomic::AtomicI64>,
+        caching: Arc<cache::Caching>,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for ChangesDuringEveryScan {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            datafusion::datasource::TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[datafusion::logical_expr::Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            let scan = self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            self.caching
+                .invalidate_for_table(self.name.clone())
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+            let batch = arrow::array::RecordBatch::try_new(
+                Arc::clone(&self.schema),
+                vec![Arc::new(Int64Array::from(vec![scan]))],
+            )?;
+            datafusion::datasource::MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?
+                .scan(state, projection, filters, limit)
+                .await
+        }
+    }
+
+    fn register_table_changing_during_every_scan(df: &Arc<DataFusion>, name: &'static str) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("scan", arrow::datatypes::DataType::Int64, false),
+        ]));
+        df.ctx
+            .register_table(
+                TableReference::bare(name),
+                Arc::new(ChangesDuringEveryScan {
+                    name: TableReference::bare(name),
+                    schema,
+                    scans: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                    caching: df.caching(),
+                }),
+            )
+            .expect("should register table");
+    }
+
+    /// Regression test for #14686 through the full query path: with a stale
+    /// window, results overtaken by every change are served stale, never as a
+    /// hit, and background revalidation keeps advancing them.
+    #[tokio::test]
+    async fn test_results_overtaken_by_every_change_are_served_stale_and_advance() {
+        const SQL: &str = "SELECT scan FROM changing_table";
+
+        let df = prepare_runtime(Some(sql_cache_config(Some("5m")))).await;
+        register_table_changing_during_every_scan(&df, "changing_table");
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
+
+        let (status, first) = Arc::clone(&request_context)
+            .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+            .await;
+        assert_eq!(status, CacheStatus::CacheMiss);
+
+        let (status, served) = Arc::clone(&request_context)
+            .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+            .await;
+        assert_eq!(
+            (status, served),
+            (CacheStatus::CacheStaleWhileRevalidate, first),
+            "the first result must be stored and served stale, not dropped"
+        );
+
+        // Poll until the background revalidation replaces the first result.
+        let mut advanced = None;
+        for _ in 0..100 {
+            let (status, served) = Arc::clone(&request_context)
+                .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+                .await;
+            assert_eq!(
+                status,
+                CacheStatus::CacheStaleWhileRevalidate,
+                "a result overtaken by a change must never be served as a fresh hit"
+            );
+            if served > first {
+                advanced = Some(served);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            advanced.is_some(),
+            "background revalidation never replaced the first result; it was discarded because the table changed while it ran"
+        );
+    }
+
+    /// Without a stale window, nothing is cached and every request runs.
+    #[tokio::test]
+    async fn test_results_overtaken_by_every_change_are_not_cached_without_a_window() {
+        const SQL: &str = "SELECT scan FROM changing_table_no_window";
+
+        let df = prepare_runtime(Some(sql_cache_config(None))).await;
+        register_table_changing_during_every_scan(&df, "changing_table_no_window");
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
+
+        let mut previous = 0;
+        for _ in 0..3 {
+            let (status, served) = Arc::clone(&request_context)
+                .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+                .await;
+            assert_eq!(status, CacheStatus::CacheMiss);
+            assert!(served > previous, "every request must read the table again");
+            previous = served;
+        }
+    }
+
+    fn one_row_batch() -> (arrow::datatypes::SchemaRef, arrow::array::RecordBatch) {
         let schema: arrow::datatypes::SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
         ]));
@@ -2548,100 +2645,128 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64]))],
         )
         .expect("valid record batch");
+        (schema, batch)
+    }
 
-        let revalidation_started_at = std::time::Instant::now();
-        df.caching()
-            .invalidate_for_table(TableReference::bare("revalidated_table"))
-            .await
-            .expect("invalidation should succeed");
+    /// Regression test for #14686: each revalidation overtaken by a change
+    /// replaces the older stale entry, and an older one never replaces a newer.
+    #[tokio::test]
+    async fn test_swr_revalidation_advances_a_stale_entry_under_continuous_changes() {
+        let df = prepare_runtime(Some(sql_cache_config(Some("5m")))).await;
+        let cache_provider = df
+            .results_cache_provider()
+            .expect("results cache should be configured");
+        let (schema, batch) = one_row_batch();
+        let table = TableReference::bare("cdc_table");
+        let tables = Arc::new(HashSet::from([table.clone()]));
+        let key = RawCacheKey::new(44);
 
-        let key = RawCacheKey::new(31);
+        let mut reads = Vec::new();
+        for _ in 0..3 {
+            tick().await;
+            let revalidation_started_at = std::time::Instant::now();
+            df.caching()
+                .invalidate_for_table(table.clone())
+                .await
+                .expect("invalidation should succeed");
+            Query::cache_revalidation_result(
+                &df,
+                &key,
+                vec![batch.clone()],
+                Arc::clone(&schema),
+                Arc::clone(&tables),
+                revalidation_started_at,
+                None,
+            )
+            .await;
+            cache_provider.run_pending_tasks().await;
+
+            let (entry, validity) = cache_provider
+                .get_raw_key_with_validity(&key)
+                .await
+                .expect("cache access should succeed")
+                .expect("servable inside the window");
+            assert_eq!(validity, cache::EntryValidity::StaleWhileRevalidate);
+            assert_eq!(
+                entry.read_started_at, revalidation_started_at,
+                "each revalidation must replace the older entry"
+            );
+            assert!(
+                cache_provider
+                    .get_raw_key(&key)
+                    .await
+                    .expect("cache access should succeed")
+                    .is_none(),
+                "a result overtaken by a change must never be served as fresh"
+            );
+            reads.push(revalidation_started_at);
+        }
+
+        // An older revalidation must not replace the newest result.
+        let straggler_started_at = reads[0];
         Query::cache_revalidation_result(
             &df,
             &key,
             vec![batch],
-            Arc::clone(&schema),
-            Arc::new(HashSet::from([TableReference::bare("revalidated_table")])),
-            revalidation_started_at,
+            schema,
+            tables,
+            straggler_started_at,
             None,
         )
         .await;
         cache_provider.run_pending_tasks().await;
-
-        let found = cache_provider
+        let (entry, _) = cache_provider
             .get_raw_key_with_validity(&key)
             .await
-            .expect("cache access should succeed");
-        let Some((_, validity)) = found else {
-            panic!(
-                "a revalidation invalidated mid-flight must still be stored when stale_while_revalidate_ttl is set"
-            );
-        };
-        assert_eq!(validity, EntryValidity::StaleWhileRevalidate);
-        assert!(
-            cache_provider
-                .get_raw_key(&key)
-                .await
-                .expect("cache access should succeed")
-                .is_none(),
-            "the stored revalidation must not be served as a fresh hit"
+            .expect("cache access should succeed")
+            .expect("servable inside the window");
+        assert_eq!(
+            Some(&entry.read_started_at),
+            reads.last(),
+            "an older revalidation must not replace a newer result"
         );
     }
 
-    /// A revalidation that began before the invalidation must not replace a
-    /// result whose read began after it.
+    /// Both revalidations are still fresh — no table change — so this is the
+    /// admission that used an unconditional insert. The later resident must
+    /// stay.
     #[tokio::test]
-    async fn test_swr_revalidation_keeps_a_later_read() {
-        let df = prepare_runtime(Some(SQLResultsCacheConfig {
-            item_ttl: Some("10m".to_string()),
-            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
-            stale_while_revalidate_ttl: Some("5m".to_string()),
-            ..Default::default()
-        }))
-        .await;
+    async fn test_swr_revalidation_keeps_a_newer_fresh_resident() {
+        let df = prepare_runtime(Some(sql_cache_config(Some("5m")))).await;
         let cache_provider = df
             .results_cache_provider()
             .expect("results cache should be configured");
+        let (schema, batch) = one_row_batch();
+        let tables = Arc::new(HashSet::from([TableReference::bare("fresh_table")]));
+        let key = RawCacheKey::new(45);
 
-        let schema: arrow::datatypes::SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
-        ]));
-        let batch = arrow::array::RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![1_i64]))],
-        )
-        .expect("valid record batch");
+        let older = std::time::Instant::now();
+        tick().await;
+        let newer = std::time::Instant::now();
 
-        let earlier = std::time::Instant::now();
-        df.caching()
-            .invalidate_for_table(TableReference::bare("revalidated_table"))
-            .await
-            .expect("invalidation should succeed");
-        let later = std::time::Instant::now();
-
-        let key = RawCacheKey::new(32);
-        let tables = Arc::new(HashSet::from([TableReference::bare("revalidated_table")]));
         Query::cache_revalidation_result(
             &df,
             &key,
             vec![batch.clone()],
             Arc::clone(&schema),
             Arc::clone(&tables),
-            later,
+            newer,
             None,
         )
         .await;
-        Query::cache_revalidation_result(&df, &key, vec![batch], schema, tables, earlier, None)
-            .await;
+        Query::cache_revalidation_result(&df, &key, vec![batch], schema, tables, older, None).await;
         cache_provider.run_pending_tasks().await;
 
-        let found = cache_provider
+        let (entry, validity) = cache_provider
             .get_raw_key_with_validity(&key)
             .await
             .expect("cache access should succeed")
-            .expect("the later read must still be cached");
-        assert_eq!(found.0.read_started_at, later);
-        assert_eq!(found.1, EntryValidity::Valid);
+            .expect("the newer result must still be cached");
+        assert_eq!(
+            entry.read_started_at, newer,
+            "a fresh admission must not replace a resident that began reading later"
+        );
+        assert_eq!(validity, cache::EntryValidity::Valid);
     }
 
     /// Reports a fixed [`MetricsSet`], standing in for an `HttpExec` whose

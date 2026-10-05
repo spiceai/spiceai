@@ -172,7 +172,7 @@ pub trait MetastoreTransaction: Send + Sync {
 }
 ```
 
-Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Null`) to and from native column types. The starting BEGIN statement is sent by the backend itself: `BEGIN IMMEDIATE` for SQLite (takes the reserved write lock up front so a subsequent `UPDATE`/`INSERT` cannot upgrade-deadlock against a concurrent writer), and `BEGIN CONCURRENT` for Turso (MVCC writers serialize at commit time on actual conflicts).
+Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Null`) to and from native column types. The starting BEGIN statement is sent by the backend itself: `BEGIN IMMEDIATE` for SQLite (takes the reserved write lock up front so a subsequent `UPDATE`/`INSERT` cannot upgrade-deadlock against a concurrent writer), and `BEGIN CONCURRENT` for Turso (MVCC writers proceed optimistically and conflict on the statement that writes a row another transaction has changed, or on `COMMIT`).
 
 **Schema validation.** `metastore::EXPECTED_TABLES` is the canonical list of expected metadata tables and their ordered column names; `validate_existing_schema` is invoked after `init_schema` and returns `CatalogError::SchemaMismatch` (with an actionable "clear your acceleration data" message) when the on-disk schema does not match. Types and constraints are not compared — SQLite/libSQL type affinity makes exact type matching unreliable — but column names and ordering are.
 
@@ -396,7 +396,7 @@ pub struct CayenneTableProvider {
     new_files_since_last_compaction: Arc<AtomicUsize>,
     staging_wal_present: Arc<AtomicBool>,
     staging_may_have_files: Arc<AtomicBool>,
-    post_write_compaction_scheduled: Arc<AtomicBool>,
+    post_write_compaction_state: Arc<AtomicU8>,
     post_write_maintenance: Arc<PostWriteMaintenance>,
     background_compactor: Arc<OnceLock<BackgroundCompactor>>,
 }
@@ -469,7 +469,7 @@ Snapshots of a Cayenne dataset are taken using a **per-dataset metastore slice**
 
 `import_dataset` runs inside a single `BEGIN IMMEDIATE` transaction; FK `ON DELETE CASCADE` clears any prior dependent rows when the existing `cayenne_table` row is deleted.
 
-The runtime engine (`CayenneSnapshotEngine`) excludes `cayenne.db`, `cayenne.db-wal`, and `cayenne.db-shm` from the tar; it inserts the slice at the well-known archive path `metadata/<dataset_name>.slice.json`. This avoids the path-portability, multi-dataset clobbering, and init-race / sidecar problems that motivated the design.
+The runtime engine (`CayenneSnapshotEngine`) excludes `cayenne.db`, `cayenne.db-wal`, and `cayenne.db-shm` from the tar; it inserts the slice at the well-known archive path `metadata/<dataset_name>.slice.json`. This avoids the path-portability, multi-dataset clobbering, and init-race / sidecar problems that motivated the design. Of the data directory it archives only what the slice references — the current and protected snapshot directories and the `deletions/` directories they use. Retired snapshot directories, staging state, and the `deletions/` directories of unreferenced snapshots are skipped: maintenance removes them while the archive is being written, and the reader never needs them.
 
 ### 9. Catalog provider (`catalog_provider.rs`)
 
@@ -909,7 +909,7 @@ The `cayenne_unsupported_type_action` parameter controls handling:
 
 Cayenne honors dataset `indexes` as in-memory point-lookup accelerators in both file and memory modes. A planned lookup uses an index when equality predicates on bare columns pin every column in one index entry. File mode can also batch-probe a published index from a completed collect-left hash join's exact scalar or correlated composite key set. Partitioned or oversized runtime key sets scan normally. Every predicate and join still runs on the candidate rows. `unique` builds the same lookup index and emits a warning because it does not constrain writes—use `primary_key` plus `on_conflict` for write-time uniqueness.
 
-Floating-point columns (`Float16`, `Float32`, and `Float64`) are rejected as index columns because equal values such as signed zero do not have a unique byte representation. `EXPLAIN` surfaces planning-time shape, outcome, and candidate counts on `CayenneAccelerationExec`; unsupported predicate shapes and runtime-only lookups report `lookup_index_outcome=not_applicable`. Actual runtime index probes are reported by the lookup-index probe metrics. See [Secondary indexes](../../docs/cayenne/cayenne.md#secondary-indexes-indexes) for the design and lifecycle details.
+Floating-point columns (`Float16`, `Float32`, and `Float64`) can be index columns: `-0.0` and `0.0` share an index entry, as does every NaN, so a lookup never misses a row the predicate would select. `EXPLAIN` names the index that served a lookup on `CayenneAccelerationExec` (`lookup_index`), with candidate counts and `uncovered_files` (candidate files read in full because the index does not cover them yet; `uncovered_batches` in memory mode); unsupported predicate shapes and runtime-only lookups report `lookup_index=none`, with `lookup_index_reason` saying why an indexed table's lookup scanned. `cayenne_lookup_index_files` reports how many data files each index covers. Actual runtime index probes are reported by the lookup-index probe metrics. See [Secondary indexes](../../docs/cayenne/cayenne.md#secondary-indexes-indexes) for the design and lifecycle details.
 
 #### Concurrency / MVCC
 
@@ -1023,7 +1023,7 @@ Cayenne synthesizes several established database/storage techniques. The list be
 - **SQLite WAL mode** for the metastore. Allows concurrent readers and a single writer at the engine level; combined with Cayenne's connection pool this lifts the read-side concurrency ceiling.
   - SQLite WAL documentation: <https://www.sqlite.org/wal.html>
 
-- **libSQL `BEGIN CONCURRENT`** (MVCC writers) on Turso. Lets multiple writers run in parallel and serialize at commit time on actual conflicts, rather than at BEGIN time.
+- **libSQL `BEGIN CONCURRENT`** (MVCC writers) on Turso. Lets multiple writers run in parallel and conflict on the statement that writes a row another transaction has changed, or on `COMMIT`, rather than at `BEGIN` time.
   - Turso `BEGIN CONCURRENT`: <https://github.com/tursodatabase/libsql/blob/main/docs/BEGIN_CONCURRENT.md>
 
 - **UUIDv7** for `table_id`, `delete_file_id`, snapshot ids, and other catalog IDs. Time-ordered UUIDs keep newly-created rows clustered in B-tree-ordered SQLite primary indexes, reducing page splits on insert-heavy workloads.

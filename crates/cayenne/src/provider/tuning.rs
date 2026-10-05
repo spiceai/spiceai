@@ -744,18 +744,13 @@ fn parse_mountinfo_cgroup_v1(contents: &str, controller: &str) -> Option<String>
 
 /// This process's resident set size, where the platform exposes it cheaply.
 #[cfg(target_os = "linux")]
-pub(crate) fn proc_self_rss_bytes() -> Option<u64> {
+fn proc_self_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     status.lines().find_map(|line| {
         let rest = line.strip_prefix("VmRSS:")?.trim();
         let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
         kb.checked_mul(1024)
     })
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn proc_self_rss_bytes() -> Option<u64> {
-    None
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2925,6 +2920,13 @@ fn decide_goal(
     // (2) Query-health tier: a violated latency/QPH goal. Larger/fewer files and
     // more compaction help queries; shedding write shards cuts file fan-out.
     if query_violated {
+        // A bake that cannot get the deletion index under its trigger leaves the
+        // probe exactly as large as before, so re-baking the prefix every tick only
+        // spends the CPU the queries are short of. Back the trigger off first — the
+        // same move the ladder makes when no query goal is violated (3c).
+        if let Some(adjustment) = futile_bake_step(s, cur, b) {
+            return Some(adjustment);
+        }
         if mem_ok
             && let Some(v) = clamp_move_i64(
                 cur.inline_flush_max_bytes,
@@ -3007,7 +3009,12 @@ fn decide_goal(
         // cheap (read-amp low), baking sooner would only add write-amp without a
         // query payoff, so leave the trigger where it is. No CPU/memory gate is
         // needed — lowering the trigger spends a future compaction CPU slice the
-        // background compactor already schedules, not a new resource.
+        // background compactor already schedules, not a new resource. Never below
+        // the level the last bake showed it can reach (`futile_bake_step`'s target):
+        // under that, every tick re-bakes without shrinking the index a probe walks.
+        let futility_floor = s.bake_residual.map_or(0, |residual| {
+            residual.saturating_mul(BAKE_TRIGGER_RESIDUAL_HEADROOM)
+        });
         if s.read_amp > READ_AMP_LOW
             && let Some(v) = clamp_move_usize(
                 cur.bake_deletion_index_trigger,
@@ -3015,9 +3022,11 @@ fn decide_goal(
                     cur.bake_deletion_index_trigger,
                     b.bake_deletion_index_trigger,
                     query_v,
-                ),
+                )
+                .max(futility_floor),
                 b.bake_deletion_index_trigger,
             )
+            && v < cur.bake_deletion_index_trigger
         {
             return Some(Adjustment {
                 actuator: Actuator::BakeDeletionIndexTrigger,
@@ -3269,9 +3278,8 @@ fn decide_goal(
         });
     }
 
-    // (3c) Futile-bake backoff (see `futile_bake_step`). Withheld while a query goal
-    // is violated, so it never fights the query tier's LOWER move above (queries
-    // win).
+    // (3c) Futile-bake backoff (see `futile_bake_step`). Under a violated query goal
+    // the query tier (2) has already run this check, first.
     if !query_violated && let Some(adjustment) = futile_bake_step(s, cur, b) {
         return Some(adjustment);
     }
@@ -5030,23 +5038,77 @@ mod tests {
         }
     }
 
+    /// A futile bake shrinks nothing a query probes, so a violated query goal is no
+    /// reason to keep it: re-baking the prefix every tick only takes CPU from the
+    /// queries. On a local CH-benCH run with a 1 s query-latency goal, holding the
+    /// trigger under the residual meant 229 bakes in 600 s (942 s of bake time,
+    /// against 46 at the 10 s goal) while `order_line`'s deletion index stayed at
+    /// its ~400 K residual, and the query geomean was 46 % slower.
     #[test]
-    fn futile_bake_backoff_yields_to_a_violated_query_goal() {
+    fn a_violated_query_goal_still_backs_off_a_futile_bake() {
         let s = IngestSnapshot {
             bake_residual: Some(FUTILE_BAKE_RESIDUAL),
             query_latency_p99_ms: Some(60_000.0),
             ..snap()
         };
-        let cur = actuators();
-        if let Some(v) = raised_bake_trigger(goal_decide(
-            &s,
-            &cur,
-            &bounds(),
-            &latency_goal_for_test(100.0),
-        )) {
+        let expected = u64::try_from(FUTILE_BAKE_RESIDUAL * BAKE_TRIGGER_RESIDUAL_HEADROOM)
+            .expect("fits in u64");
+        assert_eq!(
+            raised_bake_trigger(goal_decide(
+                &s,
+                &actuators(),
+                &bounds(),
+                &latency_goal_for_test(100.0),
+            )),
+            Some(expected),
+            "a violated query goal must still raise a futile bake trigger over the residual"
+        );
+    }
+
+    /// The query tier lowers the bake trigger to shrink the deletion index a probe
+    /// walks, but never below the level the last bake showed it can reach — there the
+    /// lowering would only bring the futile re-bakes back.
+    #[test]
+    fn the_query_tier_never_lowers_the_bake_trigger_into_futility() {
+        let floor = FUTILE_BAKE_RESIDUAL * BAKE_TRIGGER_RESIDUAL_HEADROOM;
+        // Every earlier query-tier lever is at its bound, so the bake trigger is the
+        // move left, with read-amp high enough to ask for it.
+        let exhausted = ActuatorValues {
+            inline_flush_max_bytes: 128 * 1024 * 1024,
+            compaction_background_interval_ms: 2_000,
+            compaction_trigger_files: 2,
+            target_vortex_file_size_bytes: 1024 * 1024 * 1024,
+            ..actuators()
+        };
+        let s = IngestSnapshot {
+            bake_residual: Some(FUTILE_BAKE_RESIDUAL),
+            query_latency_p99_ms: Some(60_000.0),
+            read_amp: READ_AMP_LOW + 1,
+            ..snap()
+        };
+        let goal = latency_goal_for_test(100.0);
+
+        // Well above the floor: the tier lowers the trigger, but not below the floor.
+        let high = ActuatorValues {
+            bake_deletion_index_trigger: 4_000_000,
+            ..exhausted
+        };
+        let lowered = raised_bake_trigger(goal_decide(&s, &high, &bounds(), &goal))
+            .expect("the query tier lowers a trigger well above the futility floor");
+        assert!(
+            lowered < 4_000_000 && lowered >= u64::try_from(floor).expect("fits in u64"),
+            "lowered to {lowered}, outside [{floor}, 4000000)"
+        );
+
+        // At the floor: no further lowering.
+        let at_floor = ActuatorValues {
+            bake_deletion_index_trigger: floor,
+            ..exhausted
+        };
+        if let Some(v) = raised_bake_trigger(goal_decide(&s, &at_floor, &bounds(), &goal)) {
             assert!(
-                v < current_value(&cur, Actuator::BakeDeletionIndexTrigger),
-                "a violated query goal may only lower the bake trigger, got {v}"
+                v >= u64::try_from(floor).expect("fits in u64"),
+                "the query tier must not lower the trigger under the futility floor, got {v}"
             );
         }
     }

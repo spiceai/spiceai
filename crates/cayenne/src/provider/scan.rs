@@ -983,17 +983,26 @@ impl DisplayAs for CayenneAccelerationExec {
             "CayenneAccelerationExec: snapshots_scanned={snapshots_scanned}, files_scanned={files_scanned}"
         )?;
         if let Some(lookup) = &self.lookup_index {
-            write!(
-                f,
-                ", lookup_index={}, lookup_index_outcome={}",
-                lookup.shape.as_deref().unwrap_or("none"),
-                lookup.outcome.as_str()
-            )?;
+            // The index that served the lookup, or `none`; the counts say how
+            // much of what it read the index covered.
+            write!(f, ", lookup_index={}", lookup.served_by().unwrap_or("none"))?;
             if let Some(candidate_files) = lookup.candidate_files {
                 write!(f, ", candidate_files={candidate_files}")?;
             }
+            if let Some(uncovered_files) = lookup.uncovered_files {
+                write!(f, ", uncovered_files={uncovered_files}")?;
+            }
+            if let Some(candidate_batches) = lookup.candidate_batches {
+                write!(f, ", candidate_batches={candidate_batches}")?;
+            }
+            if let Some(uncovered_batches) = lookup.uncovered_batches {
+                write!(f, ", uncovered_batches={uncovered_batches}")?;
+            }
             if let Some(candidate_rows) = lookup.candidate_rows {
                 write!(f, ", candidate_rows={candidate_rows}")?;
+            }
+            if let Some(reason) = lookup.reason {
+                write!(f, ", lookup_index_reason={}", reason.as_str())?;
             }
         }
         Ok(())

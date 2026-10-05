@@ -44,8 +44,6 @@ use crate::utils::{
 };
 use crate::{configure_test_datafusion, init_tracing};
 
-const PORT: u16 = 27041;
-
 /// The documents schema inference samples, before the ones that stray from
 /// the inferred types.
 const SAMPLED: usize = 4;
@@ -210,12 +208,13 @@ async fn seed(port: u16) -> Result<(), anyhow::Error> {
 }
 
 fn dataset(
+    port: u16,
     collection: &str,
     name: &str,
     accelerated: bool,
     params: &[(&str, &str)],
 ) -> spicepod::component::dataset::Dataset {
-    let mut dataset = make_mongodb_dataset(collection, name, PORT, accelerated);
+    let mut dataset = make_mongodb_dataset(collection, name, port, accelerated);
     let mut all: HashMap<String, String> = dataset
         .params
         .as_ref()
@@ -499,10 +498,11 @@ async fn mongodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let _container = start_mongodb_docker_container(PORT).await?;
+            let container = start_mongodb_docker_container().await?;
+            let port = container.host_port(27017)?;
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                seed(PORT).await.map_err(RetryError::transient)
+                seed(port).await.map_err(RetryError::transient)
             })
             .await?;
 
@@ -515,38 +515,60 @@ async fn mongodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
                 metadata.insert("json_object".to_string(), serde_json::json!("*"));
                 Column::new("data").with_metadata(metadata)
             };
-            let mut catch_all = dataset("roundtrip", "catch_all", false, &inference);
-            let mut catch_all_local = dataset("roundtrip", "catch_all_local", true, &inference);
+            let mut catch_all = dataset(port, "roundtrip", "catch_all", false, &inference);
+            let mut catch_all_local =
+                dataset(port, "roundtrip", "catch_all_local", true, &inference);
             for d in [&mut catch_all, &mut catch_all_local] {
                 d.columns = vec![Column::new("_id"), Column::new("i32"), catch_all_column()];
             }
-            let mut dotted = dataset("roundtrip_dotted", "dotted", false, &unnested);
-            let mut dotted_local = dataset("roundtrip_dotted", "dotted_local", true, &unnested);
+            let mut dotted = dataset(port, "roundtrip_dotted", "dotted", false, &unnested);
+            let mut dotted_local =
+                dataset(port, "roundtrip_dotted", "dotted_local", true, &unnested);
             for d in [&mut dotted, &mut dotted_local] {
                 d.columns = vec![Column::new("_id"), Column::new("a.b"), catch_all_column()];
             }
-            let mut distant = dataset("roundtrip_distant", "distant", false, &[]);
-            let mut distant_local = dataset("roundtrip_distant", "distant_local", true, &[]);
+            let mut distant = dataset(port, "roundtrip_distant", "distant", false, &[]);
+            let mut distant_local = dataset(port, "roundtrip_distant", "distant_local", true, &[]);
             for d in [&mut distant, &mut distant_local] {
                 d.columns = vec![Column::new("_id"), Column::new("t").with_type("timestamp")];
             }
 
             let app = AppBuilder::new("mongodb_pushdown_round_trips")
-                .with_dataset(dataset("roundtrip", "federated", false, &inference))
-                .with_dataset(dataset("roundtrip", "local", true, &inference))
-                .with_dataset(dataset("roundtrip_nested", "nested", false, &unnested))
-                .with_dataset(dataset("roundtrip_nested", "nested_local", true, &unnested))
+                .with_dataset(dataset(port, "roundtrip", "federated", false, &inference))
+                .with_dataset(dataset(port, "roundtrip", "local", true, &inference))
+                .with_dataset(dataset(
+                    port,
+                    "roundtrip_nested",
+                    "nested",
+                    false,
+                    &unnested,
+                ))
+                .with_dataset(dataset(
+                    port,
+                    "roundtrip_nested",
+                    "nested_local",
+                    true,
+                    &unnested,
+                ))
                 .with_dataset(catch_all)
                 .with_dataset(catch_all_local)
-                .with_dataset(dataset("roundtrip_collated", "collated", false, &[]))
-                .with_dataset(dataset("roundtrip_collated", "collated_local", true, &[]))
+                .with_dataset(dataset(port, "roundtrip_collated", "collated", false, &[]))
                 .with_dataset(dataset(
+                    port,
+                    "roundtrip_collated",
+                    "collated_local",
+                    true,
+                    &[],
+                ))
+                .with_dataset(dataset(
+                    port,
                     "roundtrip_collated_view",
                     "collated_view",
                     false,
                     &[],
                 ))
                 .with_dataset(dataset(
+                    port,
                     "roundtrip_collated_view",
                     "collated_view_local",
                     true,
@@ -556,8 +578,14 @@ async fn mongodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
                 .with_dataset(dotted_local)
                 .with_dataset(distant)
                 .with_dataset(distant_local)
-                .with_dataset(dataset("roundtrip_noid", "noid", false, &inference))
-                .with_dataset(dataset("roundtrip_noid", "noid_local", true, &inference))
+                .with_dataset(dataset(port, "roundtrip_noid", "noid", false, &inference))
+                .with_dataset(dataset(
+                    port,
+                    "roundtrip_noid",
+                    "noid_local",
+                    true,
+                    &inference,
+                ))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()

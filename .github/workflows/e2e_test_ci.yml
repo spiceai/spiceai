@@ -48,9 +48,13 @@ on:
         default: false
 
 concurrency:
-  # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
-  cancel-in-progress: true
+  # A newer run cancels the one in progress for the same pull request, merge group, non-trunk
+  # branch or manually dispatched trunk commit. Trunk pushes share one group and never cancel
+  # the running build on `spiceai-macos-large`: a newer push replaces only the run still waiting.
+  # The trunk commit is the merge-group commit that already passed this workflow;
+  # the jobs that run only on push cover the first and latest commit of a burst of merges.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ (github.ref_name == 'trunk' && github.event_name != 'push') && github.sha || 'any-sha' }}
+  cancel-in-progress: ${{ github.ref_name != 'trunk' || github.event_name != 'push' }}
 
 env:
   # CI performance optimizations
@@ -108,6 +112,10 @@ jobs:
                 target_arch: "x86_64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
+                // `spiceai-macos-large` on every event, trunk pushes included. A three-hour
+                // build on a `spiceai-macos` mini runs past its 180-minute step bound where
+                // the host is shared (#14557), and starves the short macOS test jobs below
+                // that sit on that pool to avoid exactly this neighbour (#13761).
                 builder: "spiceai-macos-large",
                 runner: "macos-15",
                 target_os: "darwin",
@@ -163,7 +171,7 @@ jobs:
         uses: ./.github/actions/install-protoc
 
       - name: Set up spiceio
-        if: matrix.target.builder == 'spiceai-macos-large' && env.HAS_SPICEIO_SECRET == 'true'
+        if: matrix.target.target_os == 'darwin' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
@@ -199,7 +207,7 @@ jobs:
         # that a wedge here is cut by *this step* — which attributes the failure to the
         # compile — rather than by the job bound, which GitHub renders as the whole job
         # being cancelled. It buys no diagnostics on this leg: the `always()` steps below
-        # are all gated to `spiceai-macos-large`, so a Linux build has none to run.
+        # are all gated to macOS, so a Linux build has none to run.
         timeout-minutes: 150
         uses: ./.github/actions/build-spiced
         with:
@@ -225,7 +233,7 @@ jobs:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Show sccache stats
-        if: always() && matrix.target.builder == 'spiceai-macos-large' && env.SCCACHE_SETUP == 'true'
+        if: always() && matrix.target.target_os == 'darwin' && env.SCCACHE_SETUP == 'true'
         # `always()`: this is the one step that reports cache health, and without it
         # it is skipped on exactly the failures it would explain (#12420). The `||`
         # keeps a diagnostic from ever deciding a verdict — when the cache backend is
@@ -234,11 +242,11 @@ jobs:
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
-        if: always() && matrix.target.builder == 'spiceai-macos-large' && steps.setup-spiceio.outputs.pid != ''
+        if: always() && matrix.target.target_os == 'darwin' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
-        if: always() && matrix.target.builder == 'spiceai-macos-large'
+        if: always() && matrix.target.target_os == 'darwin'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-e2e-build-logs
