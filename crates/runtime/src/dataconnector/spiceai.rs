@@ -69,6 +69,11 @@ pub enum Error {
     ))]
     MissingRequiredParameter { parameter: String },
 
+    #[snafu(display(
+        "Missing required parameter: spiceai_region. Set it to the region of the Spice Cloud app the dataset reads from, for example 'spiceai_region: us-east-1'. To list available regions, run: 'spice cloud regions'. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
+    ))]
+    MissingRegion,
+
     #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}". {source} Ensure the endpoint is valid and reachable"#))]
     UnableToVerifyEndpointConnection {
         source: ns_lookup::Error,
@@ -302,18 +307,8 @@ fn get_region(params: &ConnectorParams) -> Option<&str> {
 }
 
 fn require_valid_region(region: Option<&str>) -> Result<&str> {
-    let region = region.ok_or_else(|| {
-        MissingRequiredParameterSnafu {
-            parameter: "region".to_string(),
-        }
-        .build()
-    })?;
-    ensure!(
-        !region.is_empty(),
-        MissingRequiredParameterSnafu {
-            parameter: "region".to_string()
-        }
-    );
+    let region = region.context(MissingRegionSnafu)?;
+    ensure!(!region.is_empty(), MissingRegionSnafu);
     ensure!(
         is_valid_region(region),
         InvalidRegionSnafu {
@@ -372,7 +367,7 @@ fn get_credentials(params: &ConnectorParams, endpoint: &str) -> Result<Credentia
 
     if is_spice_cloud_endpoint(endpoint) {
         return MissingRequiredParameterSnafu {
-            parameter: "api_key or token".to_string(),
+            parameter: "spiceai_api_key or spiceai_token".to_string(),
         }
         .fail();
     }
