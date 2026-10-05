@@ -9112,7 +9112,10 @@ mod tests {
             PREBUILD_GROUP_MAX_ENVELOPES,
         );
         assert_eq!(group.len(), 2);
-        assert!(overflow.is_some(), "third envelope is carried for the next group");
+        assert!(
+            overflow.is_some(),
+            "third envelope is carried for the next group"
+        );
         assert!(!ended);
     }
 
@@ -9138,7 +9141,9 @@ mod tests {
         );
         assert_eq!(group2.len(), 1);
         assert!(overflow2.is_none());
-        assert!(!ended2);
+        // The carried envelope alone is under the byte budget, so the second call
+        // polls the stream again and observes it is exhausted.
+        assert!(ended2);
     }
 
     #[test]
