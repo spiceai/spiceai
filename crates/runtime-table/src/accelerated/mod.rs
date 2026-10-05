@@ -1419,8 +1419,8 @@ impl AcceleratedTable {
         self.change_sink.as_ref()
     }
 
-    /// Fence cache and sink admission, stop producers, and retain their complete
-    /// drain independently of callers. Repeated calls observe the same result.
+    /// Fence new cache work, stop producers, and drain accepted work before
+    /// closing storage. Repeated callers observe the same cancellation-independent result.
     #[must_use]
     pub fn begin_changes_drain(&self) -> runtime_acceleration::change_sink::Publication {
         self.changes_drain
@@ -1431,7 +1431,14 @@ impl AcceleratedTable {
                     .batch_write_tx
                     .as_ref()
                     .and_then(caching::CacheWriteSender::begin_drain);
-                let publication = self.change_sink.as_ref().map(|sink| sink.begin_close());
+                let sink = self.change_sink.clone();
+                // Accepted cache jobs can still be fetching or preparing input.
+                // Their sink must remain open until they have published.
+                let publication = if cache_work.is_none() {
+                    sink.as_ref().map(|sink| sink.begin_close())
+                } else {
+                    None
+                };
                 let handlers = std::mem::take(&mut *self.handlers.lock());
                 for handler in &handlers {
                     handler.abort();
@@ -1453,22 +1460,31 @@ impl AcceleratedTable {
                             )));
                         }
                     }
+                    let cache_result = match cache_work {
+                        Some(cache_work) => cache_work.wait().await,
+                        None => Ok(()),
+                    };
+                    let publication =
+                        publication.or_else(|| sink.as_ref().map(|sink| sink.begin_close()));
                     let storage_result = match publication {
                         Some(publication) => publication.wait().await,
                         None => Ok(()),
                     };
-                    if let Some(cache_work) = cache_work {
-                        cache_work.wait().await;
-                    }
                     // Initialization owns the registry write guard. The admission
                     // fence prevents a later initializer from attaching a child.
                     drop(children.write().await);
                     if let Some(synchronized) = synchronized {
                         synchronized.unregister_cache_child(&claims).await;
                     }
-                    let result = match storage_result {
-                        Err(error) => Err(error),
-                        Ok(()) => producer_failure.map_or(Ok(()), Err),
+                    let failures: Vec<_> =
+                        [storage_result.err(), cache_result.err(), producer_failure]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                    let result = if failures.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(DataFusionError::Collection(failures))
                     };
                     sender.send_replace(Some(result.map_err(Arc::new)));
                 });

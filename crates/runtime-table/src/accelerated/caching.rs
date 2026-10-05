@@ -2694,11 +2694,13 @@ impl CacheRefreshHelper {
                                 ).and_then(|job| {
                                     let dataset = dataset_name.to_string();
                                     batch_write_tx.spawn_owned(io_runtime, async move {
-                                        if let Err(error) = job.run().await {
+                                        let result = job.run().await;
+                                        if let Err(error) = &result {
                                             tracing::warn!(
                                                 "Failed to complete cache population for dataset '{dataset}', so later queries may need to fetch the response again. Cause: {error}"
                                             );
                                         }
+                                        result
                                     })
                                 });
                                 if let Err(error) = result {
@@ -2990,9 +2992,11 @@ impl CacheRefreshHelper {
                                     tracing::warn!(
                                         "Background revalidation for dataset '{dataset_name_clone}' could not reach a healthy origin, so the cached response is being served past its `caching_ttl` until the origin recovers or the entry falls out of its `caching_stale_while_revalidate_ttl` window."
                                     );
+                                    Ok(())
                                 }
                                 Ok(outcome) => {
                                     tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows", rows = outcome.rows());
+                                    Ok(())
                                 }
                                 Err(e) => {
                                     // The claim was dropped with the failed
@@ -3000,6 +3004,7 @@ impl CacheRefreshHelper {
                                     tracing::error!(
                                         "Background refresh task failed for dataset={dataset_name_clone}: {e}"
                                     );
+                                    Err(e)
                                 }
                             }
                         }) {
@@ -3774,6 +3779,154 @@ mod pool_tests {
                     .map(|value| value.expect("non-null content").to_string())
             })
             .collect()
+    }
+
+    async fn cache_drain_table(
+        target: &SynchronizedCacheTarget,
+        sink: &ChangeSink,
+    ) -> super::super::AcceleratedTable {
+        let mut table = super::super::Builder::new(
+            RuntimeStatus::new(),
+            TableReference::bare("pool_test"),
+            Arc::new(crate::federated::FederatedTable::new_unchecked(Arc::clone(
+                &target.accelerator,
+            ))),
+            "arrow".into(),
+            Arc::clone(&target.accelerator),
+            super::super::refresh::Refresh::new(
+                runtime_component::dataset::acceleration::RefreshMode::Disabled,
+            ),
+            Handle::current(),
+        )
+        .build()
+        .await
+        .expect("drain owner");
+        table.change_sink = Some(sink.clone());
+        table.batch_write_tx = Some(target.writer.clone());
+        table
+    }
+
+    #[tokio::test]
+    async fn drain_retains_accepted_cache_preparation_and_fences_new_jobs() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+            let (target, sink, _) = target(&pool, vec![row("old")]);
+            let table = cache_drain_table(&target, &sink).await;
+            let filters = vec![col("request_path").eq(lit("/items"))];
+            let key = compute_cache_key_from_filters_and_namespace(&filters, "public");
+            let ClaimOutcome::Leader(claim) =
+                CacheKeyClaim::acquire(&target.in_flight, key.clone(), None)
+            else {
+                panic!("exclusive claim");
+            };
+            let batches = vec![row("new")];
+            let charge = RetainedBufferCharge::for_batches(&pool, &batches).expect("input charge");
+            let job = NativeCacheWrite::new(
+                target.writer.clone(),
+                CacheWriteRequest {
+                    batches,
+                    filters,
+                    cache_key: key,
+                    namespace_id: "public".into(),
+                    replaces_existing: true,
+                },
+                claim,
+                Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                "pool_test".into(),
+                charge,
+            )
+            .expect("owned cache input");
+            let (release, held) = tokio::sync::oneshot::channel();
+            target
+                .writer
+                .spawn_owned(&Handle::current(), async move {
+                    held.await.expect("release accepted preparation");
+                    job.run().await
+                })
+                .expect("admitted cache job");
+            let first = table.begin_changes_drain();
+            let second = table.begin_changes_drain();
+            let mut cancelled_waiter = Box::pin(first.wait());
+            assert!(futures::poll!(cancelled_waiter.as_mut()).is_pending());
+            drop(cancelled_waiter);
+            assert!(
+                target
+                    .writer
+                    .spawn_owned(&Handle::current(), async { Ok(()) })
+                    .is_err()
+            );
+            assert_eq!(contents(&target.accelerator).await, vec!["old"]);
+            assert!(pool.reserved() > 0);
+            assert_eq!(target.in_flight.lock().len(), 1);
+            release.send(()).expect("finish accepted work");
+            second.wait().await.expect("generation drain");
+            table
+                .drain_changes()
+                .await
+                .expect("repeated successful drain");
+            assert_eq!(contents(&target.accelerator).await, vec!["new"]);
+            assert!(target.in_flight.lock().is_empty());
+            assert_eq!(pool.reserved(), 0);
+            assert!(
+                sink.reserve().await.is_err(),
+                "storage closes after publication"
+            );
+        })
+        .await
+        .expect("accepted cache drain must settle");
+    }
+
+    #[tokio::test]
+    async fn drain_reports_cache_job_failure_and_still_closes_storage() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for panics in [false, true] {
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+                let (target, sink, _) = target(&pool, vec![row("old")]);
+                let table = cache_drain_table(&target, &sink).await;
+                let (release, held) = tokio::sync::oneshot::channel();
+                target
+                    .writer
+                    .spawn_owned(&Handle::current(), async move {
+                        held.await.expect("release accepted job");
+                        assert!(!panics, "controlled cache task panic");
+                        Err(DataFusionError::Execution(
+                            "controlled cache preparation failure".into(),
+                        ))
+                    })
+                    .expect("accepted job");
+                let first = table.begin_changes_drain();
+                let second = table.begin_changes_drain();
+                release.send(()).expect("release failed work");
+                let error = first.wait().await.expect_err("accepted job failure");
+                assert_eq!(
+                    error.to_string(),
+                    second
+                        .wait()
+                        .await
+                        .expect_err("latched failure")
+                        .to_string()
+                );
+                let expected = if panics {
+                    "task panicked"
+                } else {
+                    "controlled cache preparation failure"
+                };
+                assert!(error.to_string().contains(expected), "{error}");
+                assert!(
+                    sink.reserve().await.is_err(),
+                    "failed cache work must not skip storage close"
+                );
+                assert_eq!(contents(&target.accelerator).await, vec!["old"]);
+                assert!(
+                    target
+                        .writer
+                        .spawn_owned(&Handle::current(), async { Ok(()) })
+                        .is_err()
+                );
+            }
+        })
+        .await
+        .expect("failed cache drains must settle");
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{
     Arc, OnceLock, Weak,
     atomic::{AtomicI64, AtomicU64, Ordering},
@@ -42,7 +43,7 @@ use datafusion::logical_expr::{Expr, Operator, col, lit};
 use datafusion::physical_plan::{
     ExecutionPlan, coalesce_partitions::CoalescePartitionsExec, projection::ProjectionExec,
 };
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use runtime_acceleration::change_sink::batching::{AppendIngress, CoalescingLimits};
 use runtime_acceleration::change_sink::{ChangeBatch, ChangeSink, Recovery, SetKey, WriteOptions};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
@@ -243,18 +244,29 @@ pub struct SynchronizedCacheTarget {
 /// was fenced. Waiting does not stop or take ownership of those jobs.
 #[derive(Clone)]
 pub struct CacheWorkDrain {
-    tasks: TaskTracker,
+    work: Arc<CacheWork>,
 }
 
 impl CacheWorkDrain {
-    pub async fn wait(&self) {
-        self.tasks.wait().await;
+    /// Wait for all accepted cache jobs, preserving their first failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns a preparation, publication, or task failure from an accepted job.
+    pub async fn wait(&self) -> Result<()> {
+        self.work.tasks.wait().await;
+        self.work
+            .failure
+            .lock()
+            .clone()
+            .map_or(Ok(()), |error| Err(DataFusionError::Shared(error)))
     }
 }
 
 struct CacheWork {
     tasks: TaskTracker,
     closed: parking_lot::Mutex<bool>,
+    failure: parking_lot::Mutex<Option<Arc<DataFusionError>>>,
 }
 
 /// Cache policy and completion effects for an already-bound table owner.
@@ -353,6 +365,7 @@ impl CacheWriteSender {
             work: Arc::new(CacheWork {
                 tasks: TaskTracker::new(),
                 closed: parking_lot::Mutex::new(false),
+                failure: parking_lot::Mutex::new(None),
             }),
             append_ingress,
             freshness: Arc::new(CacheFreshness::default()),
@@ -384,8 +397,8 @@ impl CacheWriteSender {
     }
 
     /// Fence preparation and fanout before closing the generation's sink.
-    /// The generation owner must await this drain as well as sink completion,
-    /// outside registry and accelerator locks. Sink flush does not await it.
+    /// The generation owner must await these jobs before closing the sink,
+    /// outside registry and accelerator locks. Sink flush does not await them.
     #[must_use]
     pub fn begin_drain(&self) -> Option<CacheWorkDrain> {
         let Self::Sink(writer) = self else {
@@ -395,14 +408,14 @@ impl CacheWriteSender {
         *closed = true;
         writer.work.tasks.close();
         Some(CacheWorkDrain {
-            tasks: writer.work.tasks.clone(),
+            work: Arc::clone(&writer.work),
         })
     }
 
     pub(super) fn spawn_owned(
         &self,
         runtime: &Handle,
-        work: impl Future<Output = ()> + Send + 'static,
+        work: impl Future<Output = Result<()>> + Send + 'static,
     ) -> Result<()> {
         match self {
             Self::Batched(_) => {
@@ -415,7 +428,24 @@ impl CacheWriteSender {
                         "Cache generation is draining; new cache preparation is refused".into(),
                     ));
                 }
-                drop(writer.work.tasks.spawn_on(work, runtime));
+                let owner = Arc::clone(&writer.work);
+                drop(writer.work.tasks.spawn_on(
+                    async move {
+                        let result =
+                            AssertUnwindSafe(work)
+                                .catch_unwind()
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(DataFusionError::Execution(
+                                        "Cache preparation or publication task panicked".into(),
+                                    ))
+                                });
+                        if let Err(error) = result {
+                            owner.failure.lock().get_or_insert_with(|| Arc::new(error));
+                        }
+                    },
+                    runtime,
+                ));
             }
         }
         Ok(())
