@@ -16,25 +16,16 @@ limitations under the License.
 
 //! Primary keys repeated inside the incoming data of one write.
 //!
-//! Each incoming record batch is one upsert statement:
+//! A refresh or user statement resolves repeated keys across all its batches.
+//! Identical rows collapse under every policy. Different versions fail under
+//! `upsert`, keep the last arrival under `upsert_by_arrival`, and keep the first
+//! under `drop`. Change streams apply versions in arrival order.
 //!
-//! | policy                   | repeat within a batch        | repeat across batches |
-//! |--------------------------|------------------------------|-----------------------|
-//! | `drop`                   | first copy kept              | first copy kept       |
-//! | `upsert`                 | last copy wins               | last copy wins        |
-//! | `upsert_dedup`           | last copy wins               | last copy wins        |
-//! | `upsert_dedup_by_row_id` | last copy wins               | last copy wins        |
-//!
-//! A refresh never fails on a key its data repeats, whatever the policy and
-//! wherever the copies fall: every upsert policy keeps the last copy, as conflict
-//! validation does for a statement's batch (`UpsertOptions::last_write_wins`).
-//!
-//! [`KeyResolver::resolve_batch`] applies the within-batch column, and
-//! [`KeyResolver::collapse_write`] applies both columns to a write whose batches
-//! are all in memory.
+//! [`KeyResolver::resolve_batch`] resolves one batch, and
+//! [`KeyResolver::collapse_write`] resolves a buffered statement.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
@@ -51,17 +42,15 @@ use super::{Error, Result};
 const REPEAT_CHECK_SEED: u64 = 0x6361_7965_6e6e_6502;
 use crate::row_converter::{RowConverter, SortField};
 
-/// The `upsert` refinement a dataset's `on_conflict` selects, which the table's
-/// stored `OnConflict` cannot express. A refresh resolves every key it repeats
-/// whichever is selected (see [`ConflictPolicy::new`]).
+/// The upsert policy carried separately from the catalog's `OnConflict`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UpsertDedup {
     /// Plain `upsert` (or `drop`, which has no refinement).
     #[default]
     None,
-    /// `upsert_dedup`: identical rows within a batch collapse to one.
+    /// `upsert_dedup`: the deprecated alias of strict `upsert`.
     DropIdentical,
-    /// `upsert_dedup_by_row_id`: the last row for a key within a batch wins.
+    /// `upsert_by_arrival` and its deprecated alias `upsert_dedup_by_row_id`.
     KeepLast,
 }
 
@@ -71,8 +60,9 @@ pub enum UpsertDedup {
 pub(crate) enum ConflictPolicy {
     /// `drop`: the first copy of a key is kept, within and across batches.
     KeepFirst,
-    /// `upsert`, `upsert_dedup` and `upsert_dedup_by_row_id`: the last copy wins,
-    /// within and across batches.
+    /// `upsert`: identical rows collapse; different versions are ambiguous.
+    UpsertIdentical,
+    /// `upsert_by_arrival`: the last copy wins, within and across batches.
     UpsertKeepLast,
 }
 
@@ -81,12 +71,9 @@ impl ConflictPolicy {
     pub(crate) fn new(on_conflict: Option<&OnConflict>, dedup: UpsertDedup) -> Option<Self> {
         Some(match on_conflict? {
             OnConflict::DoNothing(_) | OnConflict::DoNothingAll => Self::KeepFirst,
-            // A refresh resolves every repeat, so the refinements that only
-            // decide which within-batch repeats a statement tolerates do not apply.
             OnConflict::Upsert(_) => match dedup {
-                UpsertDedup::None | UpsertDedup::DropIdentical | UpsertDedup::KeepLast => {
-                    Self::UpsertKeepLast
-                }
+                UpsertDedup::None | UpsertDedup::DropIdentical => Self::UpsertIdentical,
+                UpsertDedup::KeepLast => Self::UpsertKeepLast,
             },
         })
     }
@@ -98,18 +85,19 @@ impl ConflictPolicy {
     }
 }
 
-/// Which copy of a repeated key a write keeps: the last (the upsert policies)
-/// or the first (`drop`).
+/// Which incoming version a write keeps, including strict equality validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Survivor {
     Latest,
     Earliest,
+    Identical,
 }
 
 impl Survivor {
     pub(crate) fn for_policy(policy: ConflictPolicy) -> Self {
         match policy {
             ConflictPolicy::KeepFirst => Self::Earliest,
+            ConflictPolicy::UpsertIdentical => Self::Identical,
             ConflictPolicy::UpsertKeepLast => Self::Latest,
         }
     }
@@ -121,14 +109,18 @@ pub(crate) struct ResolvedBatch {
     pub(crate) batch: RecordBatch,
     /// The key digest of each row of `batch`, in row order; all distinct.
     pub(crate) digests: Vec<u128>,
+    /// Content identity in row order, with NULL equal to NULL.
+    pub(crate) contents: Vec<u128>,
 }
 
 /// Resolves repeated primary keys for one table under one [`ConflictPolicy`].
 pub(crate) struct KeyResolver {
     table_name: Arc<str>,
+    key_names: Arc<str>,
     primary_key: Arc<[usize]>,
     policy: ConflictPolicy,
     keys: RowConverter,
+    contents: arrow::row::RowConverter,
 }
 
 impl std::fmt::Debug for KeyResolver {
@@ -159,15 +151,50 @@ impl KeyResolver {
         )?;
         Ok(Self {
             table_name: Arc::from(table_name),
+            key_names: primary_key
+                .iter()
+                .map(|&index| schema.field(index).name().as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+                .into(),
             primary_key: primary_key.into(),
             policy,
             keys,
+            contents: arrow::row::RowConverter::new(
+                schema
+                    .fields()
+                    .iter()
+                    .map(|field| arrow::row::SortField::new(field.data_type().clone()))
+                    .collect(),
+            )?,
         })
     }
 
-
     pub(crate) fn policy(&self) -> ConflictPolicy {
         self.policy
+    }
+
+    /// Change streams apply each successive version rather than rejecting it.
+    pub(crate) fn for_changes(mut self) -> Self {
+        if self.policy == ConflictPolicy::UpsertIdentical {
+            self.policy = ConflictPolicy::UpsertKeepLast;
+        }
+        self
+    }
+
+    pub(crate) fn conflicting_versions(&self, count: usize) -> Error {
+        conflicting_versions(&self.table_name, &self.key_names, count)
+    }
+
+    /// Content identities for this write's normalized acceleration schema.
+    /// Row encoding preserves column boundaries and NULL positions, including
+    /// nested values. The encoding itself is private to this write.
+    pub(crate) fn content_digests(&self, batch: &RecordBatch) -> Result<Vec<u128>> {
+        let rows = self.contents.convert_columns(batch.columns())?;
+        Ok(rows
+            .iter()
+            .map(|row| pk_digest_bytes(row.as_ref()))
+            .collect())
     }
 
     /// Whether a primary key column of `batch` holds a null.
@@ -219,6 +246,8 @@ impl KeyResolver {
             });
         }
         let digests = self.digests(batch)?;
+        let contents = self.content_digests(batch)?;
+        let mut conflicts = HashSet::with_hasher(PrehashedBuildHasher);
         // The row each key keeps: its first copy under `drop`, else its last.
         let mut survivor: HashMap<u128, usize, PrehashedBuildHasher> =
             HashMap::with_capacity_and_hasher(digests.len(), PrehashedBuildHasher);
@@ -232,6 +261,12 @@ impl KeyResolver {
                     repeated = true;
                     match self.policy {
                         ConflictPolicy::KeepFirst => {}
+                        ConflictPolicy::UpsertIdentical => {
+                            if contents[*entry.get()] != contents[row] {
+                                conflicts.insert(digest);
+                            }
+                            entry.insert(row);
+                        }
                         ConflictPolicy::UpsertKeepLast => {
                             entry.insert(row);
                         }
@@ -239,10 +274,14 @@ impl KeyResolver {
                 }
             }
         }
+        if !conflicts.is_empty() {
+            return Err(self.conflicting_versions(conflicts.len()));
+        }
         if !repeated {
             return Ok(ResolvedBatch {
                 batch: batch.clone(),
                 digests,
+                contents,
             });
         }
         let keep: BooleanArray = digests
@@ -255,9 +294,15 @@ impl KeyResolver {
             .zip(keep.values().iter())
             .filter_map(|(digest, kept)| kept.then_some(digest))
             .collect();
+        let contents = contents
+            .into_iter()
+            .zip(keep.values().iter())
+            .filter_map(|(content, kept)| kept.then_some(content))
+            .collect();
         Ok(ResolvedBatch {
             batch: filter_record_batch(batch, &keep)?,
             digests,
+            contents,
         })
     }
 
@@ -278,6 +323,7 @@ impl KeyResolver {
         let mut survivor: HashMap<u128, (usize, usize), PrehashedBuildHasher> =
             HashMap::with_capacity_and_hasher(rows, PrehashedBuildHasher);
         let last_batch_wins = self.policy.last_batch_wins();
+        let mut conflicts = HashSet::with_hasher(PrehashedBuildHasher);
         let mut repeated = false;
         for (index, batch) in resolved.iter().enumerate() {
             for (row, &digest) in batch.digests.iter().enumerate() {
@@ -287,12 +333,22 @@ impl KeyResolver {
                     }
                     Entry::Occupied(mut entry) => {
                         repeated = true;
+                        let (previous_batch, previous_row) = *entry.get();
+                        if self.policy == ConflictPolicy::UpsertIdentical
+                            && resolved[previous_batch].contents[previous_row]
+                                != batch.contents[row]
+                        {
+                            conflicts.insert(digest);
+                        }
                         if last_batch_wins {
                             entry.insert((index, row));
                         }
                     }
                 }
             }
+        }
+        if !conflicts.is_empty() {
+            return Err(self.conflicting_versions(conflicts.len()));
         }
         if !repeated {
             return Ok(resolved.into_iter().map(|batch| batch.batch).collect());
@@ -334,6 +390,24 @@ impl KeyResolver {
             .iter()
             .map(|key| pk_digest_bytes(key.as_ref()))
             .collect())
+    }
+}
+
+pub(crate) fn conflicting_versions(table: &str, key_names: &str, count: usize) -> Error {
+    let digits = count.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    let noun = if count == 1 { "value" } else { "values" };
+    Error::DataValidation {
+        table: table.to_string(),
+        message: format!(
+            "its data holds different versions of {formatted} {noun} of '{key_names}', and `on_conflict: upsert` does not choose between versions. Set `on_conflict` to `upsert_by_time` to keep the newest by `time_column`, or `upsert_by_arrival` to keep the version that arrived last. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+        ),
     }
 }
 
@@ -397,11 +471,11 @@ mod tests {
         );
         assert_eq!(
             ConflictPolicy::new(Some(&upsert), UpsertDedup::None),
-            Some(ConflictPolicy::UpsertKeepLast)
+            Some(ConflictPolicy::UpsertIdentical)
         );
         assert_eq!(
             ConflictPolicy::new(Some(&upsert), UpsertDedup::DropIdentical),
-            Some(ConflictPolicy::UpsertKeepLast)
+            Some(ConflictPolicy::UpsertIdentical)
         );
         assert_eq!(
             ConflictPolicy::new(Some(&upsert), UpsertDedup::KeepLast),
@@ -451,10 +525,7 @@ mod tests {
             ],
         )
         .expect("batch");
-        for policy in [
-            ConflictPolicy::KeepFirst,
-            ConflictPolicy::UpsertKeepLast,
-        ] {
+        for policy in [ConflictPolicy::KeepFirst, ConflictPolicy::UpsertKeepLast] {
             let error = resolver(policy)
                 .resolve_batch(&nulls)
                 .expect_err("null key");

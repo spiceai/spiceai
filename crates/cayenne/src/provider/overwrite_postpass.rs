@@ -90,6 +90,12 @@ const FILE_COLUMN: &str = "__cayenne_file";
 const BEST_COLUMN: &str = "__cayenne_best";
 const COPIES_COLUMN: &str = "__cayenne_copies";
 const HASH_COLUMN: &str = "__cayenne_key_hash";
+const CONTENT_LO_COLUMN: &str = "__cayenne_content_lo";
+const CONTENT_HI_COLUMN: &str = "__cayenne_content_hi";
+const MIN_CONTENT_LO: &str = "__cayenne_min_content_lo";
+const MAX_CONTENT_LO: &str = "__cayenne_max_content_lo";
+const MIN_CONTENT_HI: &str = "__cayenne_min_content_hi";
+const MAX_CONTENT_HI: &str = "__cayenne_max_content_hi";
 
 /// Seeds the hash that assigns each key to a chunk of the duplicate query.
 const CHUNK_HASH_SEED: u64 = 0x6361_7965_6e6e_6501;
@@ -442,26 +448,40 @@ fn plan_chunks(
     best
 }
 
-/// `schema` followed by the arrival column, named `arrival`.
+/// `schema` followed by the arrival ordinal and content identity.
 pub(crate) fn with_arrival(schema: &SchemaRef, arrival: &str) -> SchemaRef {
     let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(arrival, DataType::UInt32, false)));
+    for name in content_columns(schema) {
+        fields.push(Arc::new(Field::new(name, DataType::UInt64, false)));
+    }
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+fn content_columns(schema: &Schema) -> [String; 2] {
+    [
+        available_column(schema, CONTENT_LO_COLUMN),
+        available_column(schema, CONTENT_HI_COLUMN),
+    ]
 }
 
 /// The name the arrival column is stored under for a table of `schema`:
 /// [`ARRIVAL_COLUMN`], or that with the first numeric suffix no column of the
 /// table already uses, so a user column of the same name is never shadowed.
 pub(crate) fn arrival_column(schema: &Schema) -> String {
+    available_column(schema, ARRIVAL_COLUMN)
+}
+
+fn available_column(schema: &Schema, prefix: &str) -> String {
     let taken = |name: &str| schema.fields().iter().any(|field| field.name() == name);
-    if !taken(ARRIVAL_COLUMN) {
-        return ARRIVAL_COLUMN.to_string();
+    if !taken(prefix) {
+        return prefix.to_string();
     }
     // `n` columns leave one of the first `n + 1` suffixes free.
     (1..=schema.fields().len() + 1)
-        .map(|suffix| format!("{ARRIVAL_COLUMN}_{suffix}"))
+        .map(|suffix| format!("{prefix}_{suffix}"))
         .find(|name| !taken(name))
-        .unwrap_or_else(|| ARRIVAL_COLUMN.to_string())
+        .unwrap_or_else(|| prefix.to_string())
 }
 
 /// Resolves each batch's own repeats per the policy and stamps every surviving
@@ -534,8 +554,20 @@ impl Stream for ArrivalStream {
                 this.next += 1;
                 this.stamped
                     .store(this.next, std::sync::atomic::Ordering::Relaxed);
+                let contents = match this.resolver.content_digests(&resolved) {
+                    Ok(contents) => contents,
+                    Err(error) => return Poll::Ready(Some(Err(error.into()))),
+                };
                 let mut columns = resolved.columns().to_vec();
                 columns.push(Arc::new(arrival));
+                // Store both halves without narrowing the content identity.
+                for half in 0..2 {
+                    columns.push(Arc::new(UInt64Array::from_iter_values(
+                        contents.iter().map(|digest| {
+                            u64::from_le_bytes(digest.to_le_bytes().as_chunks::<8>().0[half])
+                        }),
+                    )));
+                }
                 Poll::Ready(Some(
                     RecordBatch::try_new(Arc::clone(&this.schema), columns).map_err(Into::into),
                 ))
@@ -563,12 +595,13 @@ struct ReadBack {
     /// `(file id, path)` of each file this partition reads.
     files: Vec<ReadBackFile>,
     key_names: Arc<[String]>,
-    /// The key columns as stored, then the arrival column.
+    /// Key columns, arrival ordinal, content identity, and physical row position.
     stored: Arc<Field>,
     schema: SchemaRef,
     chunk: (u64, u64),
     /// The name the arrival column is stored under ([`arrival_column`]).
     arrival_source: Arc<str>,
+    content_sources: [String; 2],
     /// The key sub-range this step reads, pushed into each file's scan.
     range: Option<KeyRange>,
     /// Rows read back before the chunk filter (diagnostics).
@@ -585,7 +618,7 @@ impl ReadBack {
         self.rows_read
             .fetch_add(stored.num_rows() as u64, Ordering::Relaxed);
         let positions = stored
-            .column(keys + 1)
+            .column(keys + 3)
             .as_primitive_opt::<UInt64Type>()
             .ok_or_else(|| {
                 datafusion_common::DataFusionError::Internal(
@@ -602,7 +635,7 @@ impl ReadBack {
             &state,
             |hashes| Ok(UInt64Array::from(hashes.to_vec())),
         )?;
-        let mut columns: Vec<ArrayRef> = stored.columns()[..=keys].to_vec();
+        let mut columns: Vec<ArrayRef> = stored.columns()[..keys + 3].to_vec();
         columns.push(Arc::new(positions));
         columns.push(Arc::new(UInt32Array::from_value(file, stored.num_rows())));
         columns.push(Arc::new(hashes));
@@ -612,7 +645,7 @@ impl ReadBack {
             return Ok(Some(batch));
         }
         let keep: BooleanArray = batch
-            .column(keys + 3)
+            .column(keys + 5)
             .as_primitive::<UInt64Type>()
             .values()
             .iter()
@@ -641,6 +674,7 @@ impl PartitionStream for ReadBack {
             chunk: self.chunk,
             range: self.range.clone(),
             arrival_source: Arc::clone(&self.arrival_source),
+            content_sources: self.content_sources.clone(),
             rows_read: Arc::clone(&self.rows_read),
         });
         // `key >= lo AND key < hi` on the stored column, so the scan prunes the
@@ -685,6 +719,14 @@ impl PartitionStream for ReadBack {
                     (
                         ARRIVAL_COLUMN.to_string(),
                         get_item(this.arrival_source.as_ref(), root()),
+                    ),
+                    (
+                        CONTENT_LO_COLUMN.to_string(),
+                        get_item(this.content_sources[0].as_str(), root()),
+                    ),
+                    (
+                        CONTENT_HI_COLUMN.to_string(),
+                        get_item(this.content_sources[1].as_str(), root()),
                     ),
                     (POSITION_COLUMN.to_string(), row_idx()),
                 ]),
@@ -857,8 +899,8 @@ impl CayenneTableProvider {
             return Ok(HashMap::new());
         }
         let table_schema = self.table_schema();
-        let mut stored_fields: Vec<FieldRef> = Vec::with_capacity(key_columns.len() + 2);
-        let mut fields: Vec<FieldRef> = Vec::with_capacity(key_columns.len() + 3);
+        let mut stored_fields: Vec<FieldRef> = Vec::with_capacity(key_columns.len() + 4);
+        let mut fields: Vec<FieldRef> = Vec::with_capacity(key_columns.len() + 6);
         for (index, name) in key_columns.iter().enumerate() {
             let field =
                 table_schema
@@ -877,12 +919,18 @@ impl CayenneTableProvider {
         }
         let arrival = Arc::new(Field::new(ARRIVAL_COLUMN, DataType::UInt32, false));
         stored_fields.push(Arc::clone(&arrival));
+        for name in [CONTENT_LO_COLUMN, CONTENT_HI_COLUMN] {
+            stored_fields.push(Arc::new(Field::new(name, DataType::UInt64, false)));
+        }
         stored_fields.push(Arc::new(Field::new(
             POSITION_COLUMN,
             DataType::UInt64,
             false,
         )));
         fields.push(arrival);
+        for name in [CONTENT_LO_COLUMN, CONTENT_HI_COLUMN] {
+            fields.push(Arc::new(Field::new(name, DataType::UInt64, false)));
+        }
         fields.push(Arc::new(Field::new(
             POSITION_COLUMN,
             DataType::UInt64,
@@ -948,6 +996,8 @@ impl CayenneTableProvider {
                 survivor,
                 keys: key_columns.len(),
                 arrival_source: Arc::from(arrival_column(&table_schema)),
+                content_sources: content_columns(&table_schema),
+                table_name: self.table_name(),
                 group_rows,
             };
             match query.run(&plan.specs).await {
@@ -1000,6 +1050,8 @@ struct DuplicateQuery<'a> {
     keys: usize,
     /// The name the arrival column is stored under.
     arrival_source: Arc<str>,
+    content_sources: [String; 2],
+    table_name: &'a str,
     /// The rows of each cluster split into key ranges, by group: the ranges'
     /// rows must add up to it, or a row was read by no range.
     group_rows: Vec<u64>,
@@ -1017,6 +1069,7 @@ impl DuplicateQuery<'_> {
         // since the join's build side holds each repeated key once.
         let mut superseded: Vec<Vec<u32>> = vec![Vec::new(); self.paths.len()];
         let mut group_read: Vec<u64> = vec![0; self.group_rows.len()];
+        let mut conflicting_keys = 0;
         for spec in specs {
             let rows_read = Arc::new(AtomicU64::new(0));
             let mut groups: Vec<Vec<ReadBackFile>> = vec![Vec::new(); partitions];
@@ -1036,6 +1089,7 @@ impl DuplicateQuery<'_> {
                         chunk: spec.hash,
                         range: spec.range.clone(),
                         arrival_source: Arc::clone(&self.arrival_source),
+                        content_sources: self.content_sources.clone(),
                         rows_read: Arc::clone(&rows_read),
                     }) as Arc<dyn PartitionStream>
                 })
@@ -1048,22 +1102,38 @@ impl DuplicateQuery<'_> {
                 .map(|i| format!("{BEST_KEY_PREFIX}{i}"))
                 .collect();
             let best = match survivor {
-                Survivor::Latest => max(column(ARRIVAL_COLUMN)),
+                Survivor::Latest | Survivor::Identical => max(column(ARRIVAL_COLUMN)),
                 Survivor::Earliest => min(column(ARRIVAL_COLUMN)),
             };
+            let mut aggregates = vec![best.alias(BEST_COLUMN), count(lit(1)).alias(COPIES_COLUMN)];
+            let mut selected: Vec<Expr> = keys
+                .iter()
+                .zip(&best_keys)
+                .map(|(key, best_key)| column(key).alias(best_key))
+                .collect();
+            selected.push(column(BEST_COLUMN));
+            if survivor == Survivor::Identical {
+                aggregates.extend([
+                    min(column(CONTENT_LO_COLUMN)).alias(MIN_CONTENT_LO),
+                    max(column(CONTENT_LO_COLUMN)).alias(MAX_CONTENT_LO),
+                    min(column(CONTENT_HI_COLUMN)).alias(MIN_CONTENT_HI),
+                    max(column(CONTENT_HI_COLUMN)).alias(MAX_CONTENT_HI),
+                ]);
+                selected.extend(
+                    [
+                        MIN_CONTENT_LO,
+                        MAX_CONTENT_LO,
+                        MIN_CONTENT_HI,
+                        MAX_CONTENT_HI,
+                    ]
+                    .map(column),
+                );
+            }
             let repeated = ctx
                 .read_table(Arc::clone(&table) as _)?
-                .aggregate(
-                    keys.iter().map(|key| column(key)).collect(),
-                    vec![best.alias(BEST_COLUMN), count(lit(1)).alias(COPIES_COLUMN)],
-                )?
+                .aggregate(keys.iter().map(|key| column(key)).collect(), aggregates)?
                 .filter(column(COPIES_COLUMN).gt(lit(1_i64)))?
-                .select(
-                    keys.iter()
-                        .zip(&best_keys)
-                        .map(|(key, best_key)| column(key).alias(best_key))
-                        .chain(std::iter::once(column(BEST_COLUMN))),
-                )?;
+                .select(selected)?;
             // The repeated keys are the join's build side either way; holding them
             // here lets a chunk with none skip reading its rows a second time.
             let repeated_batches = repeated.collect().await?;
@@ -1073,13 +1143,31 @@ impl DuplicateQuery<'_> {
             {
                 *read += aggregate_rows;
             }
+            if survivor == Survivor::Identical {
+                for batch in &repeated_batches {
+                    let parts: Vec<_> = (self.keys + 1..self.keys + 5)
+                        .map(|index| batch.column(index).as_primitive::<UInt64Type>())
+                        .collect();
+                    conflicting_keys += (0..batch.num_rows())
+                        .filter(|&row| {
+                            parts[0].value(row) != parts[1].value(row)
+                                || parts[2].value(row) != parts[3].value(row)
+                        })
+                        .count();
+                }
+                if conflicting_keys > 0 {
+                    continue;
+                }
+            }
             let repeated_keys: usize = repeated_batches.iter().map(RecordBatch::num_rows).sum();
             if repeated_keys == 0 {
                 continue;
             }
             let repeated = ctx.read_batches(repeated_batches)?;
             let superseded_copy = match survivor {
-                Survivor::Latest => column(ARRIVAL_COLUMN).lt(column(BEST_COLUMN)),
+                Survivor::Latest | Survivor::Identical => {
+                    column(ARRIVAL_COLUMN).lt(column(BEST_COLUMN))
+                }
                 Survivor::Earliest => column(ARRIVAL_COLUMN).gt(column(BEST_COLUMN)),
             };
             let left: Vec<&str> = keys.iter().map(String::as_str).collect();
@@ -1118,6 +1206,14 @@ impl DuplicateQuery<'_> {
                     "the key ranges of cluster {group} read {read} of its {expected} rows"
                 )));
             }
+        }
+        if conflicting_keys > 0 {
+            return Err(super::key_conflicts::conflicting_versions(
+                self.table_name,
+                &self.key_names.join(", "),
+                conflicting_keys,
+            )
+            .into());
         }
         Ok(superseded)
     }

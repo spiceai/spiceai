@@ -80,9 +80,6 @@ pub(super) struct CayennePartitionedOverwriteSink {
     partitions: Arc<tokio::sync::RwLock<HashMap<CompositePartitionKey, Partition>>>,
     schema: SchemaRef,
     physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
-    /// Whether the insert is a user's statement; see
-    /// [`util::session_state::UserStatementWrite`].
-    user_statement: bool,
 }
 
 impl std::fmt::Debug for CayennePartitionedOverwriteSink {
@@ -301,7 +298,6 @@ impl CayennePartitionedOverwriteSink {
         partitions: Arc<tokio::sync::RwLock<HashMap<CompositePartitionKey, Partition>>>,
         schema: SchemaRef,
         physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
-        user_statement: bool,
     ) -> Self {
         Self {
             catalog,
@@ -310,7 +306,6 @@ impl CayennePartitionedOverwriteSink {
             partitions,
             schema,
             physical_exprs,
-            user_statement,
         }
     }
 
@@ -417,9 +412,7 @@ impl CayennePartitionedOverwriteSink {
             )
         })?;
 
-        let cayenne_owned = cayenne
-            .clone_for_write_operations()
-            .for_user_statement(self.user_statement);
+        let cayenne_owned = cayenne.clone_for_write_operations();
         let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
             PARTITION_WRITER_CHANNEL_DEPTH,
         );

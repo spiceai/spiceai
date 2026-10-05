@@ -72,9 +72,16 @@ impl CollapseWindow {
         }
     }
 
-    fn push(&mut self, resolved: ResolvedBatch) -> super::Result<()> {
+    fn push(&mut self, resolved: ResolvedBatch, resolver: &KeyResolver) -> super::Result<()> {
         let index = self.batches.len();
+        let mut conflicts = 0;
         for (row, &digest) in resolved.digests.iter().enumerate() {
+            if self.keeps == Survivor::Identical
+                && let Some(&(batch, previous_row)) = self.survivor.get(&digest)
+                && self.batches[batch].contents[previous_row] != resolved.contents[row]
+            {
+                conflicts += 1;
+            }
             if self.keeps == Survivor::Earliest {
                 match self.survivor.entry(digest) {
                     std::collections::hash_map::Entry::Occupied(_) => self.repeats = true,
@@ -85,6 +92,10 @@ impl CollapseWindow {
             } else {
                 self.repeats |= self.survivor.insert(digest, (index, row)).is_some();
             }
+        }
+        if conflicts > 0 {
+            self.reset();
+            return Err(resolver.conflicting_versions(conflicts));
         }
         self.bytes += resolved_bytes(&resolved);
         self.batches.push(resolved);
@@ -174,9 +185,16 @@ impl CollapseWindow {
                 .zip(keep.values().iter())
                 .filter_map(|(&digest, kept)| kept.then_some(digest))
                 .collect();
+            let contents = resolved
+                .contents
+                .iter()
+                .zip(keep.values().iter())
+                .filter_map(|(&content, kept)| kept.then_some(content))
+                .collect();
             out.push_back(ResolvedBatch {
                 batch: filter_record_batch(&resolved.batch, &keep)?,
                 digests,
+                contents,
             });
         }
         Ok(out)
@@ -184,7 +202,8 @@ impl CollapseWindow {
 }
 
 fn resolved_bytes(resolved: &ResolvedBatch) -> usize {
-    resolved.batch.get_array_memory_size() + resolved.digests.capacity() * size_of::<u128>()
+    resolved.batch.get_array_memory_size()
+        + (resolved.digests.capacity() + resolved.contents.capacity()) * size_of::<u128>()
 }
 
 /// Resolves each input batch's own repeats and, with a window, the repeats a
@@ -262,7 +281,7 @@ impl Collapser {
                                 Ok(())
                             }
                             Some(window) => {
-                                window.push(resolved)?;
+                                window.push(resolved, &self.resolver)?;
                                 if window.is_full() {
                                     self.drain_window()?;
                                 }
@@ -439,7 +458,9 @@ mod tests {
         resolved.digests.reserve(1024);
         let retained_digests = resolved.digests.capacity() * size_of::<u128>();
         let arrays = resolved.batch.get_array_memory_size();
-        window.push(resolved).expect("reserve window");
+        window
+            .push(resolved, &resolver(ConflictPolicy::UpsertKeepLast))
+            .expect("reserve window");
         assert!(
             pool.reserved() >= arrays + retained_digests,
             "the retained digest capacity must remain charged: {} reserved for at least {} bytes",
@@ -567,7 +588,10 @@ mod tests {
             next_id += rows;
             let rows: Vec<(i64, &str)> = ids.iter().map(|(id, v)| (*id, v.as_str())).collect();
             window
-                .push(resolver.resolve_batch(&batch(&rows)).expect("resolve"))
+                .push(
+                    resolver.resolve_batch(&batch(&rows)).expect("resolve"),
+                    &resolver,
+                )
                 .expect("reserve window");
         };
         while !window.is_full() {

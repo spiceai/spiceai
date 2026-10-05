@@ -1865,13 +1865,6 @@ pub struct CayenneTableProvider {
     /// The `upsert` refinement of the dataset's `on_conflict`, which decides how a
     /// write resolves a key it repeats; see [`super::key_conflicts`].
     upsert_dedup: super::key_conflicts::UpsertDedup,
-    /// Whether this provider's writes resolve the keys their data repeats per
-    /// `on_conflict` ([`Self::key_resolver`]). True for the accelerator's own
-    /// writes — refreshes and change streams; [`TableProvider::insert_into`]
-    /// clears it for a user's statement
-    /// ([`util::session_state::UserStatementWrite`]), which keeps its own
-    /// semantics.
-    resolves_repeated_keys: bool,
     /// Bytes of input a streaming write that resolves repeated keys collapses in
     /// memory at a time, before it splits them into layers or, for a partition's
     /// append, writes them; see [`super::collapse_window::CollapseWindow`].
@@ -5740,16 +5733,6 @@ impl CayenneTableProvider {
         self.clone_for_write()
     }
 
-    /// This provider, writing a user's statement when `user_statement` is set:
-    /// its writes then keep statement semantics instead of resolving the keys
-    /// their data repeats per `on_conflict`
-    /// ([`util::session_state::UserStatementWrite`]).
-    #[must_use]
-    pub fn for_user_statement(mut self, user_statement: bool) -> Self {
-        self.resolves_repeated_keys &= !user_statement;
-        self
-    }
-
     /// Append a CDC upsert stream using Cayenne's native writer path.
     ///
     /// This bypasses `TableProvider::insert_into`/`DataSinkExec` construction
@@ -9342,7 +9325,6 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             upsert_dedup,
-            resolves_repeated_keys: true,
             collapse_window_bytes: super::collapse_window::COLLAPSE_WINDOW_BYTES,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -11459,7 +11441,6 @@ impl CayenneTableProvider {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             upsert_dedup: self.upsert_dedup,
-            resolves_repeated_keys: self.resolves_repeated_keys,
             collapse_window_bytes: self.collapse_window_bytes,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
@@ -13332,9 +13313,6 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if a primary key column is missing or cannot be encoded.
     pub(crate) fn key_resolver(&self) -> Result<Option<super::key_conflicts::KeyResolver>> {
-        if !self.resolves_repeated_keys {
-            return Ok(None);
-        }
         let Some(policy) = super::key_conflicts::ConflictPolicy::new(
             self.table_metadata.on_conflict.as_ref(),
             self.upsert_dedup,
@@ -13381,7 +13359,7 @@ impl CayenneTableProvider {
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>> {
         match self.key_resolver()? {
-            Some(resolver) => resolver.collapse_write(batches),
+            Some(resolver) => resolver.for_changes().collapse_write(batches),
             None => Ok(batches),
         }
     }
@@ -37985,14 +37963,8 @@ impl TableProvider for CayenneTableProvider {
         // - Overwrite: new snapshot creation, catalog commit, state updates, cleanup
         // - Append: write lock, PK validation, on-conflict deletions, new snapshot
         //   when needed, retention filters, sort-and-rewrite, listing table refresh
-        // A user's statement keeps its own semantics; every other write — the
-        // accelerator's refreshes — resolves the keys its data repeats per
-        // `on_conflict`.
-        let mut table = self.clone_for_write();
-        table.resolves_repeated_keys =
-            self.resolves_repeated_keys && !util::session_state::is_user_statement(state.config());
         let sink = Arc::new(CayenneDataSink::new(
-            table,
+            self.clone_for_write(),
             overwrite,
             self.table_schema(),
             Arc::clone(&self.context),

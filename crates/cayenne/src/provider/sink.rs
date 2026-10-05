@@ -296,7 +296,12 @@ impl DataSink for CayenneDataSink {
                 }
             });
             Ok(rows)
-        } else if let Some(interval) = self.context.stream_publish_interval() {
+        } else if let Some(interval) = self.context.stream_publish_interval()
+            && self.table.key_resolver()?.is_none()
+        {
+            // A keyed conflict-policy write is one statement: validation must
+            // finish before any part is visible. Other streams may publish in
+            // segments to bound latency.
             // Append path with bounded publish latency: cut the input stream
             // into age/size-bounded segments and run a complete
             // prepare→stage→publish write per segment, so rows on a long-lived
