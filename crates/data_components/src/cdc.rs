@@ -375,9 +375,11 @@ pub struct LazyChangeBatch {
     /// it on an async task still occupies that worker for the build's duration —
     /// see the `build` doc — this just means the *lock* adds no await-blocking.)
     source: Mutex<Option<Box<dyn ChangeRows>>>,
-    /// Set by [`Self::prebuild`], which builds ahead of consumption. See
-    /// [`Prebuilt`].
-    prebuilt: Option<Prebuilt>,
+    /// Set by [`Self::prebuild`], which builds ahead of consumption. Boxed
+    /// so [`ChangeBatchError::Arrow`] is not laid out in every envelope —
+    /// an inline [`Prebuilt`] made the `ChangeSink` `Command::Apply` variant
+    /// trip `clippy::large_enum_variant`. See [`Prebuilt`].
+    prebuilt: Option<Box<Prebuilt>>,
 }
 
 /// What [`LazyChangeBatch::prebuild`] keeps from the source it consumed.
@@ -489,7 +491,7 @@ impl LazyChangeBatch {
             // variant for the same failed prebuild.
             Err(e) => Some(reported_again(&e)),
         };
-        self.prebuilt = Some(Prebuilt { metadata, error });
+        self.prebuilt = Some(Box::new(Prebuilt { metadata, error }));
     }
 
     /// Return the built batch, running the deferred build on first access.
@@ -2447,6 +2449,31 @@ mod deferred_tests {
     }
 
     // ----- build ahead of consumption -----
+
+    #[test]
+    fn prebuilt_stays_behind_a_pointer_so_the_arrow_error_is_not_in_every_envelope() {
+        // An inline `Option<Prebuilt>` on every `LazyChangeBatch` grew the
+        // ChangeSink `Command::Apply` variant past `clippy::large_enum_variant`
+        // (sign-off 37368765686). Boxing keeps unbuilt envelopes at the
+        // source-only size.
+        let lazy = std::mem::size_of::<LazyChangeBatch>();
+        let once = std::mem::size_of::<OnceLock<ChangeBatch>>();
+        let mutex = std::mem::size_of::<Mutex<Option<Box<dyn ChangeRows>>>>();
+        let boxed = std::mem::size_of::<Option<Box<Prebuilt>>>();
+        let inline = std::mem::size_of::<Option<Prebuilt>>();
+        assert!(
+            lazy <= once + mutex + boxed + 16,
+            "LazyChangeBatch is {lazy} bytes; boxed Prebuilt should keep it near {} \
+             (OnceLock {once} + Mutex {mutex} + pointer {boxed})",
+            once + mutex + boxed
+        );
+        assert!(
+            lazy < once + mutex + inline,
+            "LazyChangeBatch is {lazy} bytes; an inline Prebuilt would be at least {} \
+             and re-inflates Command::Apply",
+            once + mutex + inline
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prebuilt_envelopes_reach_the_consumer_built_once_and_in_order() {
