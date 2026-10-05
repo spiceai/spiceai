@@ -10005,6 +10005,27 @@ impl CayenneTableProvider {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
 
+        /// Feeds each written batch to the secondary index and to the caller.
+        #[derive(Debug)]
+        struct WriteObservers {
+            index: Arc<dyn VortexWriteObserver>,
+            caller: Arc<dyn VortexWriteObserver>,
+        }
+
+        impl VortexWriteObserver for WriteObservers {
+            fn batch_written(
+                &self,
+                file_path: &object_store::path::Path,
+                first_row_position: u64,
+                batch: &RecordBatch,
+            ) {
+                self.index
+                    .batch_written(file_path, first_row_position, batch);
+                self.caller
+                    .batch_written(file_path, first_row_position, batch);
+            }
+        }
+
         let super::delta_encoding::WritePolicy {
             class: write_class,
             fan_out,
@@ -10143,29 +10164,12 @@ impl CayenneTableProvider {
             let replaces = matches!(write_class, super::delta_encoding::WriteClass::Maintenance);
             (Arc::clone(state), state.write_observer(replaces))
         });
-        #[derive(Debug)]
-        struct WriteObservers {
-            index: Arc<dyn VortexWriteObserver>,
-            caller: Arc<dyn VortexWriteObserver>,
-        }
-
-        impl VortexWriteObserver for WriteObservers {
-            fn batch_written(
-                &self,
-                file_path: &object_store::path::Path,
-                first_row_position: u64,
-                batch: &RecordBatch,
-            ) {
-                self.index.batch_written(file_path, first_row_position, batch);
-                self.caller.batch_written(file_path, first_row_position, batch);
-            }
-        }
-
         let observer = match (&index_observer, write_observer) {
             (Some((_, index)), Some(caller)) => Some(Arc::new(WriteObservers {
                 index: Arc::clone(index) as Arc<dyn VortexWriteObserver>,
                 caller,
-            }) as Arc<dyn VortexWriteObserver>),
+            })
+                as Arc<dyn VortexWriteObserver>),
             (Some((_, index)), None) => Some(Arc::clone(index) as Arc<dyn VortexWriteObserver>),
             (None, caller) => caller,
         };
@@ -13371,7 +13375,11 @@ impl CayenneTableProvider {
     }
 
     /// Count `rows` received rows this write does not keep, for `reason`.
-    pub(crate) fn count_superseded(&self, reason: util::session_state::SupersededReason, rows: u64) {
+    pub(crate) fn count_superseded(
+        &self,
+        reason: util::session_state::SupersededReason,
+        rows: u64,
+    ) {
         if let Some(counter) = &self.superseded_rows {
             counter.add(reason, rows);
         }
@@ -14582,7 +14590,8 @@ impl CayenneTableProvider {
         &self,
         stream: SendableRecordBatchStream,
     ) -> Result<PreparedInsertStream> {
-        self.prepare_stream_for_insert_inner(stream, true, true).await
+        self.prepare_stream_for_insert_inner(stream, true, true)
+            .await
     }
 
     async fn prepare_stream_for_insert_inner(

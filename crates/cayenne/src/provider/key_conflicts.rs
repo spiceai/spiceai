@@ -369,10 +369,8 @@ impl KeyResolver {
         }
         (0..=deepest)
             .map(|level| {
-                let keep: BooleanArray = levels
-                    .iter()
-                    .map(|row| Some(*row == Some(level)))
-                    .collect();
+                let keep: BooleanArray =
+                    levels.iter().map(|row| Some(*row == Some(level))).collect();
                 Ok(filter_record_batch(batch, &keep)?)
             })
             .collect()
@@ -526,7 +524,10 @@ fn encodable_field(field: &FieldRef) -> Option<FieldRef> {
 
 /// `array` as `target`, the type [`encodable_type`] gave for it or for a
 /// column it nests.
-fn encodable_array(array: &ArrayRef, target: &DataType) -> std::result::Result<ArrayRef, ArrowError> {
+fn encodable_array(
+    array: &ArrayRef,
+    target: &DataType,
+) -> std::result::Result<ArrayRef, ArrowError> {
     if array.data_type() == target {
         return Ok(Arc::clone(array));
     }
@@ -746,8 +747,10 @@ mod tests {
         use arrow::buffer::{NullBuffer, OffsetBuffer};
         use arrow::datatypes::Int32Type;
 
-        let int32 = |values: &[Option<i32>]| Arc::new(Int32Array::from(values.to_vec())) as ArrayRef;
-        let utf8 = |values: &[Option<&str>]| Arc::new(StringArray::from(values.to_vec())) as ArrayRef;
+        let int32 =
+            |values: &[Option<i32>]| Arc::new(Int32Array::from(values.to_vec())) as ArrayRef;
+        let utf8 =
+            |values: &[Option<&str>]| Arc::new(StringArray::from(values.to_vec())) as ArrayRef;
         let null = |valid: bool| (!valid).then(|| NullBuffer::new_null(1));
         let item = Arc::new(Field::new("item", DataType::Int32, true));
         let list = |values: &[Option<i32>], valid: bool| {
@@ -773,7 +776,11 @@ mod tests {
             Arc::new(MapArray::new(
                 Arc::clone(&entries_field),
                 OffsetBuffer::from_lengths([entries.len()]),
-                StructArray::new(entry_fields.clone(), vec![utf8(&keys), int32(&values)], None),
+                StructArray::new(
+                    entry_fields.clone(),
+                    vec![utf8(&keys), int32(&values)],
+                    None,
+                ),
                 null(valid),
                 false,
             )) as ArrayRef
@@ -794,7 +801,12 @@ mod tests {
             Arc::new(
                 DictionaryArray::<Int32Type>::try_new(
                     Int32Array::from(vec![key]),
-                    Arc::new(StringArray::from(vec![Some("x"), Some("y"), Some("x"), None])),
+                    Arc::new(StringArray::from(vec![
+                        Some("x"),
+                        Some("y"),
+                        Some("x"),
+                        None,
+                    ])),
                 )
                 .expect("dictionary"),
             ) as ArrayRef
@@ -905,7 +917,7 @@ mod tests {
     }
 
     /// Content identity, which strict `upsert` collapses identical copies by,
-    /// agrees with DataFusion's `IS NOT DISTINCT FROM` on every pair of rows,
+    /// agrees with `DataFusion`'s `IS NOT DISTINCT FROM` on every pair of rows,
     /// column by column and over whole rows.
     #[tokio::test]
     async fn content_identity_agrees_with_is_not_distinct_from() {
@@ -920,13 +932,17 @@ mod tests {
             state ^= state >> 12;
             state ^= state << 25;
             state ^= state >> 27;
-            usize::try_from(state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33).expect("fits")
-                % bound
+            usize::try_from(state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33).expect("fits") % bound
         };
         let variants = content_variants();
         // Rows built from a few templates, so whole rows repeat too.
         let templates: Vec<Vec<usize>> = (0..4)
-            .map(|_| variants.iter().map(|(_, column)| next(column.len())).collect())
+            .map(|_| {
+                variants
+                    .iter()
+                    .map(|(_, column)| next(column.len()))
+                    .collect()
+            })
             .collect();
         let mut chosen: Vec<Vec<usize>> = vec![Vec::with_capacity(ROWS); variants.len()];
         for _ in 0..ROWS {
@@ -957,7 +973,12 @@ mod tests {
 
         let (left, right): (Vec<u32>, Vec<u32>) = (0..ROWS)
             .flat_map(|i| (i + 1..ROWS).map(move |j| (i, j)))
-            .map(|(i, j)| (u32::try_from(i).expect("row"), u32::try_from(j).expect("row")))
+            .map(|(i, j)| {
+                (
+                    u32::try_from(i).expect("row"),
+                    u32::try_from(j).expect("row"),
+                )
+            })
             .unzip();
         let (left, right) = (UInt32Array::from(left), UInt32Array::from(right));
         let mut pair_fields = Vec::new();
@@ -969,9 +990,8 @@ mod tests {
                     field.data_type().clone(),
                     true,
                 ));
-                pair_columns.push(
-                    arrow::compute::take(rows.column(index), take, None).expect("take"),
-                );
+                pair_columns
+                    .push(arrow::compute::take(rows.column(index), take, None).expect("take"));
             }
         }
         let pairs =
@@ -1082,13 +1102,10 @@ mod tests {
         let resolver = KeyResolver::new("t", &schema, &[0], ConflictPolicy::UpsertIdentical)
             .expect("a Map payload is supported");
         // NULL maps over different entries are one value.
-        let resolved = resolver
+        let kept = resolver
             .collapse_write(vec![batch(&[1, 2], &[3, 0]), batch(&[1, 2], &[3, 1])])
             .expect("identical copies collapse");
-        assert_eq!(
-            resolved.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            2
-        );
+        assert_eq!(kept.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
         let error = resolver
             .collapse_write(vec![batch(&[1], &[5]), batch(&[1], &[6])])
             .expect_err("entry order makes a different map");

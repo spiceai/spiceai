@@ -202,7 +202,7 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
             .expect("seed");
         assert_eq!(
             provider.cached_inlined_row_count(),
-            if inline_max_rows == 0 { 0 } else { 1 },
+            i64::from(inline_max_rows != 0),
             "{label}: seed storage tier",
         );
         let concrete = catalog
@@ -386,23 +386,23 @@ async fn a_failed_commit_is_resolved_by_its_durable_outcome() {
     let replacement = || vec![batch(&[(9, "new"), (10, "new")])];
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         for fault in [
-            CommitFault::FailAfterCommit,
-            CommitFault::FailWithoutCommit,
-            CommitFault::FailAfterCommitUnreadable,
+            CommitFault::CommittedButReported,
+            CommitFault::RolledBack,
+            CommitFault::CommittedUnreadable,
         ] {
             let label = format!("{mode:?}/{fault:?}");
             let (provider, catalog, runtime_env, _dir) = seeded_streaming_table(mode).await;
             test_seams::inject(provider.table_id(), fault);
             let result = write(&provider, InsertOp::Append, replacement()).await;
             let durable = match fault {
-                CommitFault::FailAfterCommit => {
+                CommitFault::CommittedButReported => {
                     result.unwrap_or_else(|error| {
                         panic!("{label}: a commit that happened is published: {error}")
                     });
                     assert_eq!(visible(&provider).await, new, "{label}: live rows");
                     new.clone()
                 }
-                CommitFault::FailWithoutCommit => {
+                CommitFault::RolledBack => {
                     let error = result.expect_err("a commit that did not happen fails");
                     assert!(
                         error.to_string().contains("injected commit failure"),
@@ -415,7 +415,7 @@ async fn a_failed_commit_is_resolved_by_its_durable_outcome() {
                     assert_eq!(visible(&provider).await, new, "{label}: retried");
                     new.clone()
                 }
-                CommitFault::FailAfterCommitUnreadable => {
+                CommitFault::CommittedUnreadable => {
                     let error = result.expect_err("an unknown outcome fails");
                     assert!(
                         error
@@ -614,12 +614,14 @@ async fn a_transaction_resolves_each_statement_and_commits_them_together() {
             };
             let mut tables = vec![first];
             for name in ["u", "empty"] {
-                let table =
-                    CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
-                        .with_upsert_dedup(dedup)
-                        .create(create(name))
-                        .await
-                        .expect("create table");
+                let table = CayenneTableProviderBuilder::new(
+                    Arc::clone(&catalog),
+                    Arc::clone(&runtime_env),
+                )
+                .with_upsert_dedup(dedup)
+                .create(create(name))
+                .await
+                .expect("create table");
                 write(&table, InsertOp::Append, vec![batch(&[(9, "old")])])
                     .await
                     .expect("seed");
@@ -673,12 +675,14 @@ async fn a_transaction_resolves_each_statement_and_commits_them_together() {
                 ("empty", &tables[2], &untouched),
             ] {
                 assert_eq!(&visible(table).await, expected, "{label}: {name} live");
-                let reopened =
-                    CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
-                        .with_upsert_dedup(dedup)
-                        .open(name)
-                        .await
-                        .expect("reopen");
+                let reopened = CayenneTableProviderBuilder::new(
+                    Arc::clone(&catalog),
+                    Arc::clone(&runtime_env),
+                )
+                .with_upsert_dedup(dedup)
+                .open(name)
+                .await
+                .expect("reopen");
                 assert_eq!(
                     &visible(&reopened).await,
                     expected,
@@ -708,9 +712,9 @@ async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
     let new = (owned(&[(9, "new"), (10, "new")]), 2);
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         for fault in [
-            CommitFault::FailAfterCommit,
-            CommitFault::FailWithoutCommit,
-            CommitFault::FailAfterCommitUnreadable,
+            CommitFault::CommittedButReported,
+            CommitFault::RolledBack,
+            CommitFault::CommittedUnreadable,
         ] {
             let label = format!("{mode:?}/{fault:?}");
             let (first, catalog, runtime_env, dir) = seeded_streaming_table(mode).await;
@@ -769,11 +773,11 @@ async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
             test_seams::inject(&first_id, fault);
             let result = commit().await;
             let durable = match fault {
-                CommitFault::FailAfterCommit => {
+                CommitFault::CommittedButReported => {
                     result.unwrap_or_else(|error| panic!("{label}: published: {error}"));
                     new.clone()
                 }
-                CommitFault::FailWithoutCommit => {
+                CommitFault::RolledBack => {
                     let error = result.expect_err("an uncommitted transaction fails");
                     assert!(
                         error.to_string().contains("injected commit failure"),
@@ -787,7 +791,7 @@ async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
                         .unwrap_or_else(|error| panic!("{label}: retry: {error}"));
                     new.clone()
                 }
-                CommitFault::FailAfterCommitUnreadable => {
+                CommitFault::CommittedUnreadable => {
                     let error = result.expect_err("an unknown outcome fails");
                     assert!(
                         error
@@ -810,13 +814,19 @@ async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
                 }
             };
             for name in ["t", "u"] {
-                let reopened =
-                    CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
-                        .with_upsert_dedup(UpsertDedup::KeepLast)
-                        .open(name)
-                        .await
-                        .unwrap_or_else(|error| panic!("{label}: reopen {name}: {error}"));
-                assert_eq!(visible(&reopened).await, durable, "{label}: {name} reopened");
+                let reopened = CayenneTableProviderBuilder::new(
+                    Arc::clone(&catalog),
+                    Arc::clone(&runtime_env),
+                )
+                .with_upsert_dedup(UpsertDedup::KeepLast)
+                .open(name)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: reopen {name}: {error}"));
+                assert_eq!(
+                    visible(&reopened).await,
+                    durable,
+                    "{label}: {name} reopened"
+                );
             }
         }
     }

@@ -1258,9 +1258,9 @@ async fn user_columns_named_like_the_helper_columns_are_left_alone() {
                     ..VortexConfig::default()
                 },
                 OnConflict::Upsert(
-                    datafusion_table_providers::util::column_reference::ColumnReference::new(
-                        vec!["id".to_string()],
-                    ),
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]),
                 ),
             )
             .await;
@@ -1502,7 +1502,10 @@ async fn a_partition_append_resolves_its_whole_input() {
                     assert!(error.to_string().contains(cause), "{label}: {error}");
                 }
                 (Ok(prepared), Err(cause)) => {
-                    panic!("{label}: staged {} rows, expected {cause}", prepared.row_count())
+                    panic!(
+                        "{label}: staged {} rows, expected {cause}",
+                        prepared.row_count()
+                    )
                 }
                 (Err(error), Ok(_)) => panic!("{label}: {error}"),
             }

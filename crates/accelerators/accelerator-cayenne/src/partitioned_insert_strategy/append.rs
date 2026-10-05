@@ -259,7 +259,11 @@ impl DataSink for CayennePartitionedAppendSink {
                     s
                 } else {
                     let (handle, tx) = self
-                        .prepare_new_provider_for_partition(values, target_partitions, superseded.clone())
+                        .prepare_new_provider_for_partition(
+                            values,
+                            target_partitions,
+                            superseded.clone(),
+                        )
                         .await?;
 
                     senders.insert(key.clone(), tx.clone());

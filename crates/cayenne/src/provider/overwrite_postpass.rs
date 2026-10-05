@@ -1027,7 +1027,10 @@ impl CayenneTableProvider {
             positions: superseded,
             identical,
         } = superseded;
-        let copies: u64 = superseded.iter().map(|positions| positions.len() as u64).sum();
+        let copies: u64 = superseded
+            .iter()
+            .map(|positions| positions.len() as u64)
+            .sum();
         self.count_superseded(util::session_state::SupersededReason::Unchanged, identical);
         self.count_superseded(
             util::session_state::SupersededReason::Arrival,
@@ -1136,9 +1139,11 @@ impl DuplicateQuery<'_> {
             selected.push(column(BEST_COLUMN));
             if survivor != Survivor::Identical {
                 // The kept copy's content, to tell identical copies from versions.
-                let kept_first = vec![column(ARRIVAL_COLUMN).sort(survivor == Survivor::Earliest, true)];
+                let kept_first =
+                    vec![column(ARRIVAL_COLUMN).sort(survivor == Survivor::Earliest, true)];
                 aggregates.extend([
-                    first_value(column(CONTENT_LO_COLUMN), kept_first.clone()).alias(BEST_CONTENT_LO),
+                    first_value(column(CONTENT_LO_COLUMN), kept_first.clone())
+                        .alias(BEST_CONTENT_LO),
                     first_value(column(CONTENT_HI_COLUMN), kept_first).alias(BEST_CONTENT_HI),
                 ]);
                 selected.extend([BEST_CONTENT_LO, BEST_CONTENT_HI].map(column));
@@ -1470,7 +1475,11 @@ mod tests {
         };
         let plain = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let mut expected = vec![("id".to_string(), DataType::Int64, false)];
-        expected.extend(helpers([ARRIVAL_COLUMN, CONTENT_LO_COLUMN, CONTENT_HI_COLUMN]));
+        expected.extend(helpers([
+            ARRIVAL_COLUMN,
+            CONTENT_LO_COLUMN,
+            CONTENT_HI_COLUMN,
+        ]));
         assert_eq!(layout(&plain), expected);
 
         let taken = [ARRIVAL_COLUMN, CONTENT_LO_COLUMN, CONTENT_HI_COLUMN];

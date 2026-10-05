@@ -152,7 +152,11 @@ impl DataSink for CayennePartitionedOverwriteSink {
                     s.clone()
                 } else {
                     let (handle, tx) = self
-                        .prepare_new_provider_for_partition(partition_values, target_partitions, superseded.clone())
+                        .prepare_new_provider_for_partition(
+                            partition_values,
+                            target_partitions,
+                            superseded.clone(),
+                        )
                         .await?;
                     senders.insert(partition_key.clone(), tx.clone());
                     handles.push(handle);
@@ -186,7 +190,11 @@ impl DataSink for CayennePartitionedOverwriteSink {
             };
             for partition_values in unreached {
                 match self
-                    .prepare_new_provider_for_partition(partition_values, target_partitions, superseded.clone())
+                    .prepare_new_provider_for_partition(
+                        partition_values,
+                        target_partitions,
+                        superseded.clone(),
+                    )
                     .await
                 {
                     Ok((handle, sender)) => {

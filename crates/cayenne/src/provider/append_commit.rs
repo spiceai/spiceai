@@ -247,7 +247,10 @@ async fn resolve_failed_commit(
 }
 
 #[cfg(not(test))]
-pub(super) async fn commit_transaction(txn: Box<dyn MetastoreTransaction>, _table_id: &str) -> CatalogResult<()> {
+pub(super) async fn commit_transaction(
+    txn: Box<dyn MetastoreTransaction>,
+    _table_id: &str,
+) -> CatalogResult<()> {
     txn.commit().await
 }
 
@@ -261,10 +264,13 @@ pub(super) async fn snapshot_sequence(
 }
 
 #[cfg(test)]
-pub(super) async fn commit_transaction(txn: Box<dyn MetastoreTransaction>, table_id: &str) -> CatalogResult<()> {
+pub(super) async fn commit_transaction(
+    txn: Box<dyn MetastoreTransaction>,
+    table_id: &str,
+) -> CatalogResult<()> {
     use test_seams::CommitFault;
     let fault = test_seams::commit_fault(table_id);
-    let committed = if fault == Some(CommitFault::FailWithoutCommit) {
+    let committed = if fault == Some(CommitFault::RolledBack) {
         txn.rollback().await
     } else {
         txn.commit().await
@@ -302,11 +308,11 @@ pub(crate) mod test_seams {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum CommitFault {
         /// The catalog transaction commits, then reports a failure.
-        FailAfterCommit,
-        /// As [`Self::FailAfterCommit`], and reading the outcome back fails.
-        FailAfterCommitUnreadable,
+        CommittedButReported,
+        /// As [`Self::CommittedButReported`], and reading the outcome back fails.
+        CommittedUnreadable,
         /// The catalog transaction rolls back, then reports a failure.
-        FailWithoutCommit,
+        RolledBack,
     }
 
     pub(crate) type Pause = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
@@ -330,7 +336,7 @@ pub(crate) mod test_seams {
     }
 
     pub(super) fn read_back_fails(table_id: &str) -> bool {
-        FAULTS.lock().remove(table_id) == Some(CommitFault::FailAfterCommitUnreadable)
+        FAULTS.lock().remove(table_id) == Some(CommitFault::CommittedUnreadable)
     }
 
     pub(super) fn take_pause(table_id: &str) -> Option<Pause> {

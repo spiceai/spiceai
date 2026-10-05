@@ -408,7 +408,9 @@ async fn main() {
     }
     // A later, smaller append over the first keys: what the next refresh pays
     // to check its keys against the rows the first load left.
-    let second_keys: usize = arg("--second-append-keys", "0").parse().expect("second keys");
+    let second_keys: usize = arg("--second-append-keys", "0")
+        .parse()
+        .expect("second keys");
     if second_keys > 0 {
         let start = Instant::now();
         let rows = append(&provider, &ctx, source(second_keys, 1, 0)).await;

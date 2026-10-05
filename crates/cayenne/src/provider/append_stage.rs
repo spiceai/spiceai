@@ -204,9 +204,7 @@ impl CayenneTableProvider {
                 )
                 .await?;
             self.sync_local_snapshot_dir(&new_snapshot_id).await?;
-            let superseded = resolution
-                .superseded(self, &new_snapshot_id, rows)
-                .await?;
+            let superseded = resolution.superseded(self, &new_snapshot_id, rows).await?;
             match file_stats.as_deref() {
                 Some(file_stats) if !superseded.is_empty() => {
                     let dropped: u64 = superseded.values().map(|rows| rows.len() as u64).sum();

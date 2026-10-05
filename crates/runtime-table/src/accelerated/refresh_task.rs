@@ -1078,7 +1078,11 @@ impl RefreshTask {
         let _lock_guard = self.accelerator_write_mutex.lock().await;
         let superseded = Arc::new(util::session_state::SupersededRows::default());
         if let Err(e) = sink
-            .insert_into(record_batch_stream, overwrite, Some(Arc::clone(&superseded)))
+            .insert_into(
+                record_batch_stream,
+                overwrite,
+                Some(Arc::clone(&superseded)),
+            )
             .await
         {
             let error_message = format_datafusion_error(&e);

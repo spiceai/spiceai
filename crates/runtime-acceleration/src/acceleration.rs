@@ -1440,8 +1440,8 @@ mod tests {
             UpsertOptions::default().with_last_write_wins(true)
         );
         for engine in ["arrow", "duckdb", "sqlite"] {
-            let error = Acceleration::try_from(acceleration(engine))
-                .expect_err("other engines refuse it");
+            let error =
+                Acceleration::try_from(acceleration(engine)).expect_err("other engines refuse it");
             assert_eq!(
                 error.to_string(),
                 "`on_conflict: upsert_by_arrival` requires `acceleration.engine: cayenne`. Set it, or use `upsert`. See: https://spiceai.org/docs/features/data-acceleration/constraints",

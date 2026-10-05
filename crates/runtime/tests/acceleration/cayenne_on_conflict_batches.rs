@@ -61,9 +61,7 @@ fn kept<'a>(behavior: OnConflictBehavior, first: &'a str, last: &'a str) -> Opti
     match behavior {
         OnConflictBehavior::Drop => Some(first),
         OnConflictBehavior::Upsert | OnConflictBehavior::UpsertDedup => None,
-        OnConflictBehavior::UpsertByArrival | OnConflictBehavior::UpsertDedupByRowId => {
-            Some(last)
-        }
+        OnConflictBehavior::UpsertByArrival | OnConflictBehavior::UpsertDedupByRowId => Some(last),
     }
 }
 
@@ -276,7 +274,9 @@ async fn check_load(
                 if ok { "ok" } else { "WRONG" }
             );
             if !ok {
-                failures.push(format!("{label}: key {id} = {values:?}, COUNT(*) = {count}"));
+                failures.push(format!(
+                    "{label}: key {id} = {values:?}, COUNT(*) = {count}"
+                ));
             }
         }
         (Some(_), false) => failures.push(format!(
@@ -290,7 +290,10 @@ async fn check_load(
         (None, false) => {
             let error = dataset_error(rt).await.unwrap_or_default();
             let ok = error.contains(&conflict_cause(key));
-            eprintln!("{label}: failed: {error}: {}", if ok { "ok" } else { "WRONG" });
+            eprintln!(
+                "{label}: failed: {error}: {}",
+                if ok { "ok" } else { "WRONG" }
+            );
             if !ok {
                 failures.push(format!("{label}: wrong failure: {error}"));
             }
@@ -369,7 +372,11 @@ async fn an_update_repeating_a_key_follows_upsert() {
             for differ in [false, true] {
                 let rows: String = std::iter::once("id,region,ts,v\n".to_string())
                     .chain((0..8_193).map(|id| {
-                        let v = if differ { id.to_string() } else { "same".to_string() };
+                        let v = if differ {
+                            id.to_string()
+                        } else {
+                            "same".to_string()
+                        };
                         format!("{id},us,2026-01-01T00:00:00,{v}\n")
                     }))
                     .collect();

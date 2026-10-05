@@ -543,7 +543,12 @@ async fn resolve_failed_fused_commit(
                 pc.retain_after_unknown_outcome();
             }
             let read_back = unreadable.map_or_else(
-                || format!("{committed} of {} tables read back as committed", prepared.len()),
+                || {
+                    format!(
+                        "{committed} of {} tables read back as committed",
+                        prepared.len()
+                    )
+                },
                 |read_error| format!("reading back whether it committed failed too ({read_error})"),
             );
             Err(FusedFailure::Unknown(Error::IncompleteWrite {

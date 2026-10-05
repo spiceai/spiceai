@@ -1391,7 +1391,10 @@ async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
             params: Some(Params::from_string_map(
                 [(
                     "cayenne_file_path".to_string(),
-                    dir.path().join(format!("{name}-cayenne")).display().to_string(),
+                    dir.path()
+                        .join(format!("{name}-cayenne"))
+                        .display()
+                        .to_string(),
                 )]
                 .into_iter()
                 .collect(),
