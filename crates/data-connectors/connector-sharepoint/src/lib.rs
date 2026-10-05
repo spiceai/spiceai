@@ -1045,6 +1045,58 @@ mod tests {
         );
     }
 
+    fn auth_error(params: &[(&str, &str)]) -> String {
+        let params = Parameters::new(
+            params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), SecretString::from((*v).to_string())))
+                .collect(),
+            CONNECTOR_NAME,
+            PARAMETERS.as_slice(),
+        );
+        match build_auth_from_params(&params) {
+            Ok(_) => panic!("authentication should be refused"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn missing_parameter_errors_name_the_spicepod_keys() {
+        assert_eq!(
+            auth_error(&[("auth_code", "code")]),
+            "Missing required parameter: `sharepoint_tenant_id`. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[("auth_code", "code"), ("tenant_id", "t")]),
+            "Missing required parameter: `sharepoint_client_id`. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[
+                ("auth_code", "code"),
+                ("tenant_id", "t"),
+                ("client_id", "c")
+            ]),
+            "Missing required parameter: `sharepoint_client_secret` (required with `sharepoint_auth_code`). Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[
+                ("auth_code", "code"),
+                ("tenant_id", "t"),
+                ("client_id", "c"),
+                ("client_secret", "s"),
+            ]),
+            "Missing required parameter: `sharepoint_redirect_uri` (required with `sharepoint_auth_code`). Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[
+                ("refresh_token", "r"),
+                ("tenant_id", "t"),
+                ("client_id", "c")
+            ]),
+            "Missing required parameter: `sharepoint_client_secret` (required with `sharepoint_refresh_token`). Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+    }
+
     #[test]
     fn url_extension_none_when_no_dot() {
         assert!(url_extension("sharepoint://me/Documents/folder").is_none());
