@@ -3144,6 +3144,24 @@ fn retention_deleted_message(table_name: &str, deleted: u64) -> String {
 /// task; larger ones hash and sort their keys on the blocking pool.
 const MEM_TIER_INDEX_INLINE_ROWS: usize = 1_024;
 
+/// Refuse a write of `table` once `outcome_unknown` is set: an earlier write
+/// could not learn whether its catalog transaction committed, so the table's
+/// in-memory view may miss rows the catalog holds, which only reloading the table
+/// from the catalog restores.
+///
+/// # Errors
+///
+/// Returns [`Error::IncompleteWrite`] after such a write.
+pub(crate) fn ensure_outcome_known(outcome_unknown: &AtomicBool, table: &str) -> Result<()> {
+    if outcome_unknown.load(Ordering::Acquire) {
+        return Err(Error::IncompleteWrite {
+            table: table.to_string(),
+            message: "an earlier write could not confirm whether it committed, so writes are refused until the table is reloaded from its catalog. Restart Spice to reload it".to_string(),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
     let elapsed = start.elapsed();
     tracing::debug!(
@@ -5737,13 +5755,7 @@ impl CayenneTableProvider {
     ///
     /// Returns [`Error::IncompleteWrite`] after such a write.
     pub(crate) fn ensure_publication_outcome_known(&self) -> Result<()> {
-        if self.publication_outcome_unknown.load(Ordering::Acquire) {
-            return Err(Error::IncompleteWrite {
-                table: self.table_name().to_string(),
-                message: "an earlier write could not confirm whether it committed, so writes are refused until the table is reloaded from its catalog. Restart Spice to reload it".to_string(),
-            });
-        }
-        Ok(())
+        ensure_outcome_known(&self.publication_outcome_unknown, self.table_name())
     }
 
     #[must_use]
@@ -13131,7 +13143,8 @@ impl CayenneTableProvider {
             Arc::clone(self.context.runtime_env()),
             None,
             Arc::clone(&self.seq_allocator),
-        );
+        )
+        .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown));
 
         for file_group in &listed.file_groups {
             for partitioned_file in file_group.iter() {
@@ -17786,6 +17799,7 @@ impl CayenneTableProvider {
                 None,
                 Arc::clone(&self.seq_allocator),
             )
+            .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
             .with_scan_input_version(Arc::clone(&self.scan_input_version));
             sink.persist_position_based_deletions(position_specs)
                 .await
@@ -31954,6 +31968,7 @@ impl CayenneTableProvider {
         &self,
         mut owned_capture_write_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<u64> {
+        self.ensure_publication_outcome_known()?;
         // Memory mode (`mode: memory`) never checkpoints to Vortex — the mem-tier
         // is the permanent in-RAM store, so this is a no-op.
         if self.is_memory_resident_mode() {
@@ -33657,6 +33672,7 @@ impl CayenneTableProvider {
     /// directly trigger a checkpoint and observe the generation bump.
     #[doc(hidden)]
     pub async fn checkpoint_inlined_data(&self) -> Result<u64> {
+        self.ensure_publication_outcome_known()?;
         let batches = self.read_inlined_batches().await?;
         if batches.is_empty() {
             let stats = self
@@ -38470,6 +38486,7 @@ impl CayenneTableProvider {
             write_lock,
             Arc::clone(&self.seq_allocator),
         )
+        .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
         .with_capture_locks(capture_locks)
         .with_exact_count(source.requires_exact_count());
@@ -38543,6 +38560,7 @@ impl CayenneTableProvider {
         key_columns: &[String],
     ) -> datafusion_common::Result<u64> {
         let _write_guard = self.write_lock.lock().await;
+        self.ensure_publication_outcome_known()?;
         self.mark_maintained_aggregates_stale();
 
         // MERGE key-probe deletes operate on listing-table files only, so
@@ -38578,6 +38596,7 @@ impl CayenneTableProvider {
             None, // write lock already held above
             Arc::clone(&self.seq_allocator),
         )
+        .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
         .with_scan_input_version(Arc::clone(&self.scan_input_version));
 
         let deleted = sink
@@ -38718,6 +38737,11 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 #[async_trait::async_trait]
 impl super::compaction::CompactionRunner for CayenneTableProvider {
     async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
+        // Compaction rewrites the table from its in-memory view, which may miss
+        // rows after a write whose commit outcome is unknown.
+        if self.ensure_publication_outcome_known().is_err() {
+            return Ok(false);
+        }
         let Some(_pass) = super::compaction::try_track_compaction_pass() else {
             return Ok(false);
         };
@@ -39144,6 +39168,11 @@ impl CayenneTableProvider {
 #[async_trait::async_trait]
 impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
     async fn run_cold_tier_promotion_tick(&self) {
+        // Moving data rewrites the table from its in-memory view, which may miss
+        // rows after a write whose commit outcome is unknown.
+        if self.ensure_publication_outcome_known().is_err() {
+            return;
+        }
         match self.promote_warm_to_cold().await {
             Ok(true) => {
                 tracing::debug!(

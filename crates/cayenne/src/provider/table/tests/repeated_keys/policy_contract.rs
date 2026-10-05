@@ -376,7 +376,8 @@ async fn seeded_streaming_table(
 /// A catalog commit that reports a failure is resolved by reading back
 /// whether it committed: a commit that happened is published, one that did
 /// not leaves the prior rows, and one whose outcome cannot be read keeps its
-/// files and refuses writes until the table is reloaded, which then serves it.
+/// files and refuses writes, deletes and checkpoints until the table is
+/// reloaded, which then serves it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_commit_is_resolved_by_its_durable_outcome() {
     use crate::provider::append_commit::test_seams::{self, CommitFault};
@@ -423,15 +424,36 @@ async fn a_failed_commit_is_resolved_by_its_durable_outcome() {
                             .contains("reading back whether it committed failed too"),
                         "{label}: {error}"
                     );
+                    let refused = "writes are refused until the table is reloaded";
                     let error = write(&provider, InsertOp::Append, vec![batch(&[(11, "x")])])
                         .await
                         .expect_err("writes are refused after an unknown outcome");
-                    assert!(
-                        error
-                            .to_string()
-                            .contains("writes are refused until the table is reloaded"),
-                        "{label}: {error}"
-                    );
+                    assert!(error.to_string().contains(refused), "{label}: {error}");
+                    // Deletes and maintenance change the table too, so they refuse
+                    // as well: a statement `DELETE`, a retention `DELETE` that
+                    // removes whole files, and an inline checkpoint.
+                    let ctx = datafusion::prelude::SessionContext::new();
+                    let id = || datafusion_expr::col("id");
+                    let deletes = [
+                        provider
+                            .delete_from(&ctx.state(), vec![id().eq(datafusion_expr::lit(9_i64))])
+                            .await
+                            .expect("statement delete plan"),
+                        provider
+                            .delete_using_files(&[id().lt(datafusion_expr::lit(100_i64))])
+                            .expect("file delete plan"),
+                    ];
+                    for delete in deletes {
+                        let error = datafusion::physical_plan::collect(delete, ctx.task_ctx())
+                            .await
+                            .expect_err("deletes are refused after an unknown outcome");
+                        assert!(error.to_string().contains(refused), "{label}: {error}");
+                    }
+                    let error = provider
+                        .checkpoint_inlined_data()
+                        .await
+                        .expect_err("checkpoints are refused after an unknown outcome");
+                    assert!(error.to_string().contains(refused), "{label}: {error}");
                     new.clone()
                 }
             };
