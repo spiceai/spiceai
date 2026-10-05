@@ -774,14 +774,20 @@ pub(crate) fn view_definition_closure_with_live_refresh_sql(
             // the root view's is carried: a view whose rows are read through another
             // view's archive can change its embedding model or file format without
             // touching a line of SQL.
-            closure.insert(
-                spec.name.clone(),
-                view_definition_identity(
-                    sql,
-                    &spec.columns,
-                    &spicepod_params_map(spec.params.as_ref()),
-                ),
+            let mut identity = view_definition_identity(
+                sql,
+                &spec.columns,
+                &spicepod_params_map(spec.params.as_ref()),
             );
+            // Read through its acceleration, so what an empty one answers is part of what
+            // the root view stores, as for a dataset dependency below.
+            if let Some(acceleration) = &spec.acceleration {
+                identity.push('\n');
+                push_len_prefixed(&mut identity, "acceleration.on_zero_results");
+                identity.push('=');
+                push_len_prefixed(&mut identity, &acceleration.on_zero_results.to_string());
+            }
+            closure.insert(spec.name.clone(), identity);
         }
         ViewClosureMember::Dataset(dataset) => {
             let mut fields = dataset_identity_fields(dataset);
@@ -2899,6 +2905,50 @@ mod tests {
                 view_identity(return_empty),
                 view_identity(use_source),
                 "a view over an empty acceleration stores the source's rows only under use_source"
+            );
+        }
+
+        /// The nested case of `closure_follows_a_dependency_datasets_on_zero_results`: a view
+        /// that reads another accelerated view stores what that view answers when its
+        /// acceleration is empty.
+        #[test]
+        fn closure_follows_a_dependency_views_on_zero_results() {
+            fn inner_view(
+                on_zero_results: spicepod::acceleration::ZeroResultsAction,
+            ) -> spicepod::component::view::View {
+                let mut inner = spicepod::component::view::View::new("inner_view".to_string());
+                inner.sql = Some("SELECT * FROM orders".to_string());
+                inner.acceleration = Some(spicepod::acceleration::Acceleration {
+                    enabled: true,
+                    on_zero_results,
+                    ..Default::default()
+                });
+                inner
+            }
+            let outer_identity = |inner: spicepod::component::view::View| {
+                definition_fingerprint(&view_definition_closure(
+                    &TableReference::bare("v"),
+                    "SELECT * FROM inner_view",
+                    &[],
+                    &HashMap::new(),
+                    &app::AppBuilder::new("closure_test")
+                        .with_view(inner)
+                        .with_dataset(spicepod::component::dataset::Dataset::new(
+                            "postgres:orders".to_string(),
+                            "orders".to_string(),
+                        ))
+                        .build(),
+                ))
+            };
+
+            assert_ne!(
+                outer_identity(inner_view(
+                    spicepod::acceleration::ZeroResultsAction::ReturnEmpty
+                )),
+                outer_identity(inner_view(
+                    spicepod::acceleration::ZeroResultsAction::UseSource
+                )),
+                "a view over an empty accelerated view stores that view's rows only under use_source"
             );
         }
 
