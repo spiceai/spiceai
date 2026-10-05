@@ -714,12 +714,12 @@ mod tests {
                     (
                         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
                         UpsertDedup::None,
-                        Some(vec![(1, 40), (2, 20)]),
+                        None,
                     ),
                     (
                         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
                         UpsertDedup::DropIdentical,
-                        Some(vec![(1, 40), (2, 20)]),
+                        None,
                     ),
                     (
                         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
@@ -784,14 +784,7 @@ mod tests {
                         Arc::clone(&context),
                     );
                     let batches = vec![
-                        keyed_batch(
-                            &schema,
-                            &[
-                                (1, 10),
-                                (1, 30),
-                                (2, 20),
-                            ],
-                        ),
+                        keyed_batch(&schema, &[(1, 10), (1, 30), (2, 20)]),
                         keyed_batch(&schema, &[(1, 40)]),
                     ];
                     let stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -799,6 +792,7 @@ mod tests {
                         futures::stream::iter(batches.into_iter().map(Ok)),
                     ));
                     let result = sink.write_all(stream, &ctx.task_ctx()).await;
+                    let strict = expected.is_none();
                     if let Some(mut rows) = expected {
                         result.expect("accepted write");
                         if !overwrite {
@@ -821,7 +815,7 @@ mod tests {
                         assert_eq!(keyed_rows(&ctx, &provider).await, vec![(9, 90)]);
                         assert_eq!(keyed_count_sql(&ctx, &provider).await, 1);
                     }
-                    if dedup == UpsertDedup::DropIdentical {
+                    if strict {
                         let sink = CayenneDataSink::new(
                             provider.clone_for_write(),
                             if overwrite {
@@ -836,22 +830,21 @@ mod tests {
                             Arc::clone(&schema),
                             futures::stream::iter(
                                 vec![
-                                    keyed_batch(&schema, &[(1, 50), (1, 60)]),
-                                    keyed_batch(&schema, &[(1, 70)]),
+                                    keyed_batch(&schema, &[(1, 50), (1, 50)]),
+                                    keyed_batch(&schema, &[(1, 50), (2, 60)]),
                                 ]
                                 .into_iter()
                                 .map(Ok),
                             ),
                         ));
-                        // A refresh never fails on a key it repeats: `upsert_dedup`
-                        // keeps the last copy of differing ones too.
                         sink.write_all(stream, &ctx.task_ctx())
                             .await
-                            .expect("different rows under one key keep the last");
-                        assert_eq!(
-                            keyed_rows(&ctx, &provider).await.first(),
-                            Some(&(1, 70))
-                        );
+                            .expect("strict upsert collapses identical copies");
+                        let mut rows = vec![(1, 50), (2, 60)];
+                        if !overwrite {
+                            rows.push((9, 90));
+                        }
+                        assert_eq!(keyed_rows(&ctx, &provider).await, rows);
                     }
                     if !memory_mode {
                         let before_reopen = keyed_rows(&ctx, &provider).await;
@@ -875,12 +868,17 @@ mod tests {
         }
     }
 
-    /// The age-bounded segment cut: rows streamed on a still-open append stream
-    /// become queryable within ~`stream_publish_interval_ms`, without waiting
-    /// for the stream to end. Guards the events-mode ingest-to-queryable
-    /// latency fix (long-lived ADBC bulk-ingest streams).
     #[tokio::test(flavor = "multi_thread")]
-    async fn stream_publish_interval_publishes_before_stream_end() {
+    async fn unkeyed_stream_publish_interval_publishes_before_stream_end() {
+        assert_segment_visibility(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keyed_append_waits_for_stream_end() {
+        assert_segment_visibility(true).await;
+    }
+
+    async fn assert_segment_visibility(keyed: bool) {
         let ctx = SessionContext::new();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
@@ -901,10 +899,13 @@ mod tests {
         let options = CreateTableOptions {
             table_name: "seg_pub".to_string(),
             schema: Arc::clone(&schema),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                "id".to_string(),
-            ]))),
+            primary_key: if keyed {
+                vec!["id".to_string()]
+            } else {
+                vec![]
+            },
+            on_conflict: keyed
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
             base_path: data_dir,
             partition_column: None,
             vortex_config,
@@ -914,8 +915,7 @@ mod tests {
             .create(options)
             .await
             .expect("table created");
-        // A stored row, so the stream appends in segments rather than loading an
-        // empty table as one replace.
+        // Exercise append validation against a stored row.
         append_rows(
             &provider,
             &sink_context,
@@ -926,10 +926,13 @@ mod tests {
         .await
         .expect("seed");
 
+        let first_consumed = Arc::new(Notify::new());
+        let consumed_for_stream = Arc::clone(&first_consumed);
         let release_second = Arc::new(Notify::new());
         let release_for_stream = Arc::clone(&release_second);
         let stream_schema = Arc::clone(&schema);
         let batches = futures::stream::unfold(0_i64, move |i| {
+            let consumed = Arc::clone(&consumed_for_stream);
             let release = Arc::clone(&release_for_stream);
             let schema = Arc::clone(&stream_schema);
             async move {
@@ -943,8 +946,7 @@ mod tests {
                         Some((Ok(batch), 1))
                     }
                     1 => {
-                        // Hold the stream open until the test observes the
-                        // first segment's rows.
+                        consumed.notify_one();
                         release.notified().await;
                         let batch = RecordBatch::try_new(
                             Arc::clone(&schema),
@@ -968,18 +970,32 @@ mod tests {
         let task_ctx = ctx.task_ctx();
         let write = tokio::spawn(async move { sink.write_all(stream, &task_ctx).await });
 
-        // Rows from the first batch must become visible while the stream is
-        // still open (the second batch is gated on `release_second`).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            if visible_rows(&ctx, &provider).await == 3 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "first segment was not published while the stream was open"
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            first_consumed.notified(),
+        )
+        .await
+        .expect("the sink consumed the first input batch");
+        if keyed {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                visible_rows(&ctx, &provider).await,
+                1,
+                "only prior data is visible"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(!write.is_finished(), "the statement is still reading input");
+        } else {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if visible_rows(&ctx, &provider).await == 3 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first segment was not published while the stream was open"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
 
         release_second.notify_one();

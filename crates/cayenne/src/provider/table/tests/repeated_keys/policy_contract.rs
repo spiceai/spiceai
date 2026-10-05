@@ -130,11 +130,38 @@ async fn identical_copies_collapse_for_refreshes_and_statements() {
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
     let mut failures = Vec::new();
-    for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
+    for (mode, inline_max_rows) in [
+        (DeletionMode::Key, 0),
+        (DeletionMode::Key, 1),
+        (DeletionMode::Position, 0),
+        (DeletionMode::Position, 1),
+    ] {
+        let label = format!("{mode:?}/inline={inline_max_rows}");
+        let runtime_env = SessionContext::new().runtime_env();
+        let (mut provider, catalog, _dir) = create_cdc_table_with_schema(
+            "t",
+            Arc::clone(&runtime_env),
+            schema(),
+            vec!["id".to_string()],
+            VortexConfig {
+                deletion_mode: mode,
+                inline_max_rows,
+                stream_publish_interval_ms: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+            upsert_on_id(),
+        )
+        .await;
+        provider.upsert_dedup = UpsertDedup::KeepLast;
         write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            if inline_max_rows == 0 { 0 } else { 1 },
+            "{label}: seed storage tier",
+        );
         let concrete = catalog
             .as_any()
             .downcast_ref::<CayenneCatalog>()
@@ -150,14 +177,16 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
         .expect("install fixture fault");
         txn.commit().await.expect("commit fault setup");
 
-        let error = write(&provider, InsertOp::Append, vec![batch(&[(9, "new")])])
+        // Two rows exceed the inline row limit, forcing a file replacement.
+        let replacement = || vec![batch(&[(9, "new"), (10, "new")])];
+        let error = write(&provider, InsertOp::Append, replacement())
             .await
             .expect_err("the snapshot metadata write must reach the fault");
         assert!(
             error
                 .to_string()
                 .contains("injected snapshot publish failure"),
-            "{mode:?}: unexpected error: {error}",
+            "{label}: unexpected error: {error}",
         );
         let txn = concrete
             .begin_transaction()
@@ -172,16 +201,44 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
         let actual = visible(&provider).await;
         if actual != expected {
             failures.push(format!(
-                "{mode:?}: live data changed after failure: {actual:?}"
+                "{label}: live data changed after failure: {actual:?}"
             ));
         }
         let reopened = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
         let actual = visible(&reopened).await;
         if actual != expected {
             failures.push(format!(
-                "{mode:?}: durable data changed after failure: {actual:?}"
+                "{label}: durable data changed after failure: {actual:?}"
             ));
         }
+        write(&provider, InsertOp::Append, replacement())
+            .await
+            .expect("publish the replacement without the fault");
+        let expected = (owned(&[(9, "new"), (10, "new")]), 2);
+        assert_eq!(visible(&provider).await, expected, "{label}: published");
+        let reopened = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+        assert_eq!(
+            visible(&reopened).await,
+            expected,
+            "{label}: published and reopened"
+        );
+
+        let snapshots = catalog
+            .get_all_snapshot_sequences(provider.table_id())
+            .await
+            .expect("snapshots");
+        write(&provider, InsertOp::Append, vec![])
+            .await
+            .expect("empty append");
+        assert_eq!(visible(&provider).await, expected, "{label}: empty append");
+        assert_eq!(
+            catalog
+                .get_all_snapshot_sequences(provider.table_id())
+                .await
+                .expect("snapshots"),
+            snapshots,
+            "{label}: an empty append must not publish a phantom snapshot",
+        );
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A file-backed overwrite whose incoming data repeats keys across record
-//! batches keeps the last copy of each key under every upsert policy, through
-//! its whole lifecycle, in both deletion modes (regression tests for #14578).
+//! Repeated-key policies across batches, publication, restart, and compaction
+//! in both deletion modes.
 
 use super::*;
 use crate::metadata::DeletionMode;
@@ -155,7 +154,7 @@ async fn reopen(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn streaming_append_keeps_last_copy_through_reopen_and_compaction() {
+async fn streaming_append_resolves_copies_through_reopen_and_compaction() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         for dedup in [
             UpsertDedup::None,
@@ -171,7 +170,7 @@ async fn streaming_append_keeps_last_copy_through_reopen_and_compaction() {
             )
             .await
             .expect("seed");
-            write(&provider, InsertOp::Append, repeated_across_batches())
+            write(&provider, InsertOp::Append, copies_for_policy(dedup))
                 .await
                 .expect("streaming append");
             let expected = (
@@ -306,12 +305,25 @@ fn repeated_across_batches() -> Vec<RecordBatch> {
     ]
 }
 
+fn copies_for_policy(dedup: UpsertDedup) -> Vec<RecordBatch> {
+    if matches!(dedup, UpsertDedup::KeepLast) {
+        repeated_across_batches()
+    } else {
+        vec![
+            batch(&[(1, "c"), (2, "c"), (3, "a")]),
+            batch(&[(4, "b"), (2, "c")]),
+            batch(&[(2, "c"), (5, "c"), (1, "c")]),
+            batch(&[(6, "d")]),
+        ]
+    }
+}
+
 fn last_copies() -> Vec<(i64, String)> {
     owned(&[(1, "c"), (2, "c"), (3, "a"), (4, "b"), (5, "c"), (6, "d")])
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn overwrite_keeps_the_last_copy_across_batches_through_its_lifecycle() {
+async fn overwrite_resolves_copies_across_batches_through_its_lifecycle() {
     let mut failures = Vec::new();
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         for dedup in [
@@ -324,7 +336,7 @@ async fn overwrite_keeps_the_last_copy_across_batches_through_its_lifecycle() {
             write(&provider, InsertOp::Overwrite, vec![batch(&[(9, "old")])])
                 .await
                 .expect("seed");
-            write(&provider, InsertOp::Overwrite, repeated_across_batches())
+            write(&provider, InsertOp::Overwrite, copies_for_policy(dedup))
                 .await
                 .expect("overwrite repeating keys");
             let expected = last_copies();
@@ -408,7 +420,7 @@ fn assert_resolved_shape(provider: &CayenneTableProvider, mode: DeletionMode) {
 #[tokio::test(flavor = "multi_thread")]
 async fn position_capture_after_an_overwrite_repeating_keys_locates_the_live_copy() {
     let (provider, _catalog, _runtime_env, _dir) =
-        table(DeletionMode::Position, UpsertDedup::None).await;
+        table(DeletionMode::Position, UpsertDedup::KeepLast).await;
     write(&provider, InsertOp::Overwrite, repeated_across_batches())
         .await
         .expect("overwrite repeating keys");
@@ -478,6 +490,7 @@ async fn an_overwrite_repeating_a_string_key_resolves_it_in_both_modes() {
             ),
         )
         .await;
+        provider.upsert_dedup = UpsertDedup::KeepLast;
         provider.collapse_window_bytes = 1;
         let ctx = SessionContext::new();
         let source = MemorySourceConfig::try_new_exec(
@@ -529,7 +542,7 @@ async fn an_overwrite_repeating_a_string_key_resolves_it_in_both_modes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_overwrite_repeating_keys_is_superseded_by_a_later_upsert_and_overwrite() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
         write(&provider, InsertOp::Overwrite, repeated_across_batches())
             .await
             .expect("overwrite repeating keys");
@@ -658,7 +671,7 @@ async fn drop_keeps_the_first_copy_across_batches() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeats_within_the_collapse_window_publish_one_snapshot() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (mut provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        let (mut provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
         provider.collapse_window_bytes =
             super::super::super::collapse_window::COLLAPSE_WINDOW_BYTES;
         write(&provider, InsertOp::Overwrite, repeated_across_batches())
@@ -680,7 +693,7 @@ async fn repeats_within_the_collapse_window_publish_one_snapshot() {
 async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies() {
     let mut failures = Vec::new();
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
         write(
             &provider,
             InsertOp::Overwrite,
@@ -745,13 +758,11 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// A user's statement keeps its own semantics: `on_conflict` resolves only the
-/// keys a refresh repeats, so a key a plain `INSERT` or a transaction's write
-/// repeats across record batches still fails the statement.
+/// Arrival ordering applies to both an INSERT and a transaction's write.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_statement_repeating_a_key_across_batches_still_fails() {
+async fn an_arrival_statement_resolves_repeated_keys_across_batches() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
+        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
         let repeated = || {
             MemorySourceConfig::try_new_exec(
                 &[vec![batch(&[(1, "a"), (2, "a")]), batch(&[(1, "b")])]],
@@ -766,33 +777,24 @@ async fn a_statement_repeating_a_key_across_batches_still_fails() {
             .insert_into(&statement, repeated(), InsertOp::Append)
             .await
             .expect("plan");
-        let error = collect(plan, ctx.task_ctx())
+        collect(plan, ctx.task_ctx())
             .await
-            .expect_err("a statement repeating a key across batches must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate primary key across batches"),
-            "{mode:?} INSERT: {error}"
-        );
+            .expect("a statement resolves repeated keys by arrival");
+        assert_eq!(visible(&provider).await, (owned(&[(1, "b"), (2, "a")]), 2));
 
         let token = provider.transaction_write_token().await;
         let stream = repeated().execute(0, ctx.task_ctx()).expect("stream");
-        let error = provider
+        let staged = provider
             .begin_staged_upsert_occ(token, stream, 4)
             .await
-            .expect_err("a transaction repeating a key across batches must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate primary key across batches"),
-            "{mode:?} transaction: {error}"
-        );
-        assert_eq!(
-            visible(&provider).await,
-            (Vec::new(), 0),
-            "{mode:?}: nothing written"
-        );
+            .expect("stage a statement resolving repeated keys by arrival");
+        staged
+            .commit(std::collections::HashSet::new(), true)
+            .await
+            .expect("commit");
+        assert_eq!(visible(&provider).await, (owned(&[(1, "b"), (2, "a")]), 2));
+        let provider = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+        assert_eq!(visible(&provider).await, (owned(&[(1, "b"), (2, "a")]), 2));
     }
 }
 
@@ -826,6 +828,8 @@ async fn a_refresh_in_a_small_memory_pool_spills_and_keeps_the_last_copy() {
             ),
         )
         .await;
+        let mut provider = provider;
+        provider.upsert_dedup = UpsertDedup::KeepLast;
         let rows: Vec<(i64, &str)> = ["first", "last"]
             .iter()
             .flat_map(|value| (0..KEYS).map(move |id| (id, *value)))
@@ -899,6 +903,7 @@ async fn upsert_table(
     )
     .await;
     provider.collapse_window_bytes = 1;
+    provider.upsert_dedup = UpsertDedup::KeepLast;
     (provider, catalog, runtime_env, dir)
 }
 
@@ -994,10 +999,9 @@ async fn streaming_append_drop_keeps_stored_then_first_copies() {
     }
 }
 
-/// `upsert_dedup` collapses an identical repeat within a batch and keeps the
-/// last copy of a key repeated across batches.
+/// `upsert_dedup` rejects different versions even when some copies are identical.
 #[tokio::test(flavor = "multi_thread")]
-async fn streaming_append_upsert_dedup_keeps_the_last_copy_across_batches() {
+async fn streaming_append_upsert_dedup_rejects_different_copies_across_batches() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         let (provider, _catalog, _runtime_env, _dir) =
             table(mode, UpsertDedup::DropIdentical).await;
@@ -1014,13 +1018,13 @@ async fn streaming_append_upsert_dedup_keeps_the_last_copy_across_batches() {
             ],
         )
         .await
-        .expect("streaming upsert_dedup append");
+        .expect_err("strict upsert rejects different versions across batches");
         assert_eq!(
             visible(&provider).await,
-            (owned(&[(1, "c"), (2, "b"), (3, "c")]), 3),
+            (owned(&[(1, "old")]), 1),
             "{mode:?}"
         );
-        assert_eq!(statistics_rows(&provider).await.unwrap_or(3), 3, "{mode:?}");
+        assert_eq!(statistics_rows(&provider).await.unwrap_or(1), 1, "{mode:?}");
     }
 }
 
@@ -1139,6 +1143,8 @@ async fn a_refresh_cut_into_many_key_ranges_keeps_the_last_copy_of_every_key() {
                 ),
             )
             .await;
+            let mut provider = provider;
+            provider.upsert_dedup = UpsertDedup::KeepLast;
             let ctx = SessionContext::new();
             let source = MemorySourceConfig::try_new_exec(&[batches], Arc::clone(&schema), None)
                 .expect("source");
@@ -1172,11 +1178,7 @@ async fn a_refresh_cut_into_many_key_ranges_keeps_the_last_copy_of_every_key() {
     super::super::super::overwrite_postpass::TEST_CHUNK_ROWS.store(0, Ordering::Relaxed);
 }
 
-/// A staged append — the path dual-write takes for a user's `INSERT` — refuses a
-/// table with a primary key in either deletion mode, so it never reaches the
-/// repeated-key resolution a refresh runs: a user statement through dual-write
-/// cannot take refresh semantics. A staged append that started accepting keyed
-/// tables would need to keep statement semantics; this test would fail first.
+/// The staged dual-write append path rejects primary-key deletion handling.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_staged_append_refuses_a_keyed_table() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
@@ -1242,6 +1244,8 @@ async fn a_user_column_named_like_the_arrival_column_is_left_alone() {
             ),
         )
         .await;
+        let mut provider = provider;
+        provider.upsert_dedup = UpsertDedup::KeepLast;
         let ctx = SessionContext::new();
         let source = MemorySourceConfig::try_new_exec(
             &[vec![
@@ -1326,9 +1330,13 @@ async fn a_load_into_an_empty_table_appends_and_the_next_supersedes() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
 
-            write(&provider, InsertOp::Append, vec![batch(&[(1, "z"), (7, "z")])])
-                .await
-                .expect("second load");
+            write(
+                &provider,
+                InsertOp::Append,
+                vec![batch(&[(1, "z"), (7, "z")])],
+            )
+            .await
+            .expect("second load");
             assert_eq!(
                 provider.current_snapshot_id(),
                 loaded,
@@ -1365,18 +1373,26 @@ async fn a_load_into_a_table_holding_only_inline_rows_appends() {
             upsert_on_id(),
         )
         .await;
-        write(&provider, InsertOp::Append, vec![batch(&[(1, "a"), (2, "a")])])
-            .await
-            .expect("first load");
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![batch(&[(1, "a"), (2, "a")])],
+        )
+        .await
+        .expect("first load");
         assert_eq!(
             provider.cached_inlined_row_count(),
             2,
             "{mode:?}: the first load sits in the inline tier"
         );
         let loaded = provider.current_snapshot_id();
-        write(&provider, InsertOp::Append, vec![batch(&[(2, "b"), (3, "b")])])
-            .await
-            .expect("second load");
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![batch(&[(2, "b"), (3, "b")])],
+        )
+        .await
+        .expect("second load");
         assert_eq!(
             provider.current_snapshot_id(),
             loaded,
@@ -1397,9 +1413,8 @@ async fn a_load_into_a_table_holding_only_inline_rows_appends() {
 async fn a_load_into_an_empty_table_drops_a_cached_index_it_did_not_fill() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         let (provider, _catalog, _runtime_env, _dir) = upsert_table(mode, upsert_on_id()).await;
-        *provider.pk_keyset_cache.lock() = Some(CachedPkIndex::Exact(
-            CachedPkKeyset::with_capacity(0),
-        ));
+        *provider.pk_keyset_cache.lock() =
+            Some(CachedPkIndex::Exact(CachedPkKeyset::with_capacity(0)));
         write(&provider, InsertOp::Append, repeated_across_batches())
             .await
             .expect("first load");
