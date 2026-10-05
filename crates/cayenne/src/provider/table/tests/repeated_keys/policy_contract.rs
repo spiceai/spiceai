@@ -139,7 +139,7 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
             .as_any()
             .downcast_ref::<CayenneCatalog>()
             .expect("concrete fixture catalog");
-        let mut txn = concrete
+        let txn = concrete
             .begin_transaction()
             .await
             .expect("begin fault setup");
@@ -159,7 +159,7 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
                 .contains("injected snapshot publish failure"),
             "{mode:?}: unexpected error: {error}",
         );
-        let mut txn = concrete
+        let txn = concrete
             .begin_transaction()
             .await
             .expect("begin fault removal");

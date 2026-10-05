@@ -1169,7 +1169,11 @@ impl<'a> AppendMutationWriter<'a> {
         )))
     }
 
-    pub(super) async fn write(&self, data: SendableRecordBatchStream) -> Result<u64> {
+    pub(super) async fn write(
+        &self,
+        data: SendableRecordBatchStream,
+        write_guard: OwnedMutexGuard<()>,
+    ) -> Result<u64> {
         self.table.ensure_no_incomplete_write().await?;
 
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
@@ -1198,7 +1202,9 @@ impl<'a> AppendMutationWriter<'a> {
             && self.table.metadata().partition_column.is_none()
             && let Some(resolver) = self.table.key_resolver()?
         {
-            return self.write_resolving_repeats_after(data, resolver).await;
+            return self
+                .write_resolving_repeats_after(data, resolver, write_guard)
+                .await;
         }
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         let post_validation = prepared.post_validation();
@@ -1229,6 +1235,7 @@ impl<'a> AppendMutationWriter<'a> {
         &self,
         data: SendableRecordBatchStream,
         resolver: super::key_conflicts::KeyResolver,
+        write_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
         let survivor = Survivor::for_policy(resolver.policy());
         let table_schema = self.table.table_schema();
@@ -1347,39 +1354,25 @@ impl<'a> AppendMutationWriter<'a> {
                 .extend(positions.into_iter().map(u64::from));
         }
 
-        let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
-        if let Err(error) = self
-            .publish_written_snapshot(&snapshot_id, rows, on_conflict_deletions)
-            .await
-        {
-            self.table.clear_cached_pk_keyset();
-            return Err(error);
-        }
         if rows == 0 {
             self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
                 .await;
+            return Ok(0);
         }
-        let published_live_rows_delta = reserved_live_rows_delta.published();
-        let retention_requested = self.table.has_retention_delete_filters();
-        let live_rows_delta = i64::try_from(rows)
-            .unwrap_or(i64::MAX)
-            .saturating_sub(i64::try_from(superseded_rows).unwrap_or(i64::MAX));
-        self.table.schedule_post_write_maintenance(
-            Some(stats),
-            true,
-            retention_requested,
-            live_rows_delta,
-            published_live_rows_delta,
-        );
-        // An unchecked load recorded no keys, so a cached index (an empty one, say)
-        // would miss every key it wrote: drop it, and the next validation rebuilds.
-        if retention_requested || self.into_empty_table {
-            self.table.clear_cached_pk_keyset();
-        } else {
-            let record_seq = self.table.sequence_high_water().await;
-            self.table.record_file_pk_keys(&validated_keys, record_seq);
+        super::append_commit::PreparedResolvedAppend {
+            table: self.table.clone_for_write(),
+            context: Arc::clone(self.context),
+            _write_guard: write_guard,
+            snapshot_id,
+            rows,
+            stats,
+            deletions: on_conflict_deletions,
+            validated_keys,
+            superseded: superseded_rows,
+            into_empty_table: self.into_empty_table,
         }
-        Ok(rows)
+        .commit()
+        .await
     }
 
     async fn cleanup_layered_append_dirs(&self, snapshot_ids: &[String]) {

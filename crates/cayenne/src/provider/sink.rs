@@ -280,9 +280,8 @@ impl DataSink for CayenneDataSink {
             );
             let rows = AppendMutationWriter::new(&self.table, &self.context, context)
                 .into_empty_table()
-                .write(normalized)
+                .write(normalized, write_guard)
                 .await?;
-            drop(write_guard);
             // The load recorded no primary-key index; warm the one the next
             // refresh validates against now, rather than on that refresh's path.
             let table = self.table.clone_for_write();
@@ -313,8 +312,8 @@ impl DataSink for CayenneDataSink {
         } else {
             // Append path: `write_all_append` uses the existing-staging helpers
             // that assume the caller already holds the write lock.
-            let _write_guard = self.table.write_lock().lock().await;
-            self.write_all_append(normalized, context)
+            let write_guard = self.table.write_lock_arc().lock_owned().await;
+            self.write_all_append(normalized, context, write_guard)
                 .await
                 .map_err(Into::into)
         }
@@ -483,9 +482,11 @@ impl CayenneDataSink {
                     futures::stream::iter(segment.into_iter().map(Ok)),
                 ));
             let segment_start = std::time::Instant::now();
-            let _write_guard = self.table.write_lock().lock().await;
+            let write_guard = self.table.write_lock_arc().lock_owned().await;
             let lock_wait_ms = segment_start.elapsed().as_millis();
-            let segment_rows = self.write_all_append(segment_stream, context).await?;
+            let segment_rows = self
+                .write_all_append(segment_stream, context, write_guard)
+                .await?;
             total_rows += segment_rows;
             tracing::debug!(
                 table = self.table.table_name(),
@@ -512,8 +513,7 @@ impl CayenneDataSink {
     /// that holds no rows, so it can skip the conflict check that finds nothing
     /// to conflict with.
     ///
-    /// Only a refresh qualifies: a user statement keeps statement semantics. The
-    /// table must resolve repeated keys after the write (a primary key, an
+    /// The table must resolve repeated keys after the write (a primary key, an
     /// `on_conflict`, no partition column) and have no retention filter, the
     /// conditions under which an append takes that path; a keyed table also never
     /// takes a staged append, so no staged publish can land beneath the load.
@@ -553,9 +553,10 @@ impl CayenneDataSink {
         &self,
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
+        write_guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> super::Result<u64> {
         AppendMutationWriter::new(&self.table, &self.context, context)
-            .write(data)
+            .write(data, write_guard)
             .await
     }
 

@@ -598,7 +598,7 @@ impl CayenneTableProvider {
 /// row, `current_snapshot_id` unchanged), so leaving it is safe; object stores
 /// (S3) have no atomic "remove dir" and are left to the next successful
 /// snapshot-cleanup cycle, mirroring [`super::overwrite::PreparedOverwrite::rollback`].
-async fn cleanup_orphan_snapshot_dir(table: &CayenneTableProvider, snapshot_id: &str) {
+pub(super) async fn cleanup_orphan_snapshot_dir(table: &CayenneTableProvider, snapshot_id: &str) {
     if table.table_path().starts_with("s3://") {
         return;
     }
