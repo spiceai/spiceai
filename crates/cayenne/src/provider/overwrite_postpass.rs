@@ -1376,13 +1376,61 @@ mod tests {
         );
     }
 
+    /// The table's columns, then the arrival ordinal and both halves of the
+    /// content identity, all non-null, under names no table column holds.
     #[test]
-    fn arrival_is_trailing_and_not_null() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let with = with_arrival(&schema, ARRIVAL_COLUMN);
-        assert_eq!(with.fields().len(), 2);
-        assert_eq!(with.field(1).name(), ARRIVAL_COLUMN);
-        assert!(!with.field(1).is_nullable());
+    fn helper_columns_trail_the_table_and_are_not_null() {
+        let layout = |schema: &SchemaRef| {
+            let arrival = arrival_column(schema);
+            with_arrival(schema, &arrival)
+                .fields()
+                .iter()
+                .map(|field| {
+                    (
+                        field.name().clone(),
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let helpers = |names: [&str; 3]| {
+            vec![
+                (names[0].to_string(), DataType::UInt32, false),
+                (names[1].to_string(), DataType::UInt64, false),
+                (names[2].to_string(), DataType::UInt64, false),
+            ]
+        };
+        let plain = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mut expected = vec![("id".to_string(), DataType::Int64, false)];
+        expected.extend(helpers([ARRIVAL_COLUMN, CONTENT_LO_COLUMN, CONTENT_HI_COLUMN]));
+        assert_eq!(layout(&plain), expected);
+
+        let taken = [ARRIVAL_COLUMN, CONTENT_LO_COLUMN, CONTENT_HI_COLUMN];
+        let colliding = Arc::new(Schema::new(
+            taken
+                .iter()
+                .map(|name| Field::new(*name, DataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ));
+        let mut expected: Vec<_> = taken
+            .iter()
+            .map(|name| ((*name).to_string(), DataType::Utf8, true))
+            .collect();
+        expected.extend(helpers([
+            &format!("{ARRIVAL_COLUMN}_1"),
+            &format!("{CONTENT_LO_COLUMN}_1"),
+            &format!("{CONTENT_HI_COLUMN}_1"),
+        ]));
+        assert_eq!(layout(&colliding), expected);
+        assert_eq!(
+            content_columns(&colliding),
+            [
+                format!("{CONTENT_LO_COLUMN}_1"),
+                format!("{CONTENT_HI_COLUMN}_1")
+            ],
+            "the read-back projects the columns the write named"
+        );
     }
 
     #[test]
