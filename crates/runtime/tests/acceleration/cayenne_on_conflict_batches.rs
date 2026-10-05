@@ -434,3 +434,53 @@ async fn a_localpod_parents_refresh_resolves_repeated_keys() {
         })
         .await;
 }
+
+/// An append refresh's first load into an empty table skips the conflict check,
+/// so the refresh after it must still find the stored rows: a key it repeats is
+/// superseded (`upsert`) or kept (`drop`), never stored twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_refresh_after_a_first_append_load_finds_the_stored_keys() {
+    test_request_context()
+        .scope(async {
+            let case = Case {
+                mode: Mode::File,
+                refresh: RefreshMode::Append,
+                partitioned: false,
+            };
+            let mut failures = Vec::new();
+            for (name, behavior, key_0) in [
+                ("upsert", OnConflictBehavior::Upsert, "newer"),
+                ("drop", OnConflictBehavior::Drop, "first"),
+            ] {
+                let label = format!("{}/{name}/second_refresh", case.label());
+                let (rt, dir) = load(&repeated_across_batches(), &case, behavior, &label).await;
+                let rt = Arc::new(rt.unwrap_or_else(|| panic!("{label}: did not load")));
+                std::fs::write(
+                    dir.path().join("rows.csv"),
+                    "id,region,ts,v\n0,us,2026-01-02T00:00:00,newer\n9000,us,2026-01-02T00:00:00,new\n",
+                )
+                .expect("csv");
+                crate::acceleration::trigger_refresh(&rt, "t")
+                    .await
+                    .expect("refresh");
+                let deadline = std::time::Instant::now() + Duration::from_mins(1);
+                let (values, count) = loop {
+                    let landed = !value_of(&rt, 9_000).await.is_empty();
+                    if landed || std::time::Instant::now() >= deadline {
+                        break (value_of(&rt, 0).await, count(&rt).await);
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                };
+                let ok = values == [key_0] && count == 8_193;
+                eprintln!(
+                    "{label}: key 0 = {values:?}, COUNT(*) = {count}: {}",
+                    if ok { "ok" } else { "WRONG" }
+                );
+                if !ok {
+                    failures.push(format!("{label}: key 0 = {values:?}, COUNT(*) = {count}"));
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        })
+        .await;
+}

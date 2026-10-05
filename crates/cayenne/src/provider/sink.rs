@@ -258,6 +258,35 @@ impl DataSink for CayenneDataSink {
             self.write_all_overwrite(normalized, context)
                 .await
                 .map_err(Into::into)
+        } else if let Some(write_guard) = self.lock_for_first_load().await {
+            // A refresh appending into a table that holds no rows has nothing to
+            // check its keys against, so it is written as one append without the
+            // conflict check or the segments: segments would each check their
+            // keys against the rows the previous ones published, and the check
+            // holds every incoming key in memory. The keys the load repeats are
+            // still resolved after the write, and it publishes as any append does.
+            tracing::debug!(
+                table = self.table.table_name(),
+                "Writing the first load into an empty table as one append"
+            );
+            let rows = AppendMutationWriter::new(&self.table, &self.context, context)
+                .into_empty_table()
+                .write(normalized)
+                .await?;
+            drop(write_guard);
+            // The load recorded no primary-key index; warm the one the next
+            // refresh validates against now, rather than on that refresh's path.
+            let table = self.table.clone_for_write();
+            tokio::spawn(async move {
+                if let Err(error) = table.warm_pk_index().await {
+                    tracing::debug!(
+                        table = table.table_name(),
+                        %error,
+                        "Failed to build the primary-key index after a first load; the next append builds it"
+                    );
+                }
+            });
+            Ok(rows)
         } else if let Some(interval) = self.context.stream_publish_interval() {
             // Append path with bounded publish latency: cut the input stream
             // into age/size-bounded segments and run a complete
@@ -463,6 +492,28 @@ impl CayenneDataSink {
             );
         }
         Ok(total_rows)
+    }
+
+    /// The write lock, held, when this append is a refresh's load into a table
+    /// that holds no rows, so it can skip the conflict check that finds nothing
+    /// to conflict with.
+    ///
+    /// Only a refresh qualifies: a user statement keeps statement semantics. The
+    /// table must resolve repeated keys after the write (a primary key, an
+    /// `on_conflict`, no partition column) and have no retention filter, the
+    /// conditions under which an append takes that path; a keyed table also never
+    /// takes a staged append, so no staged publish can land beneath the load.
+    /// Emptiness is observed under the lock this returns, which the load holds
+    /// until it publishes.
+    async fn lock_for_first_load(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if self.table.metadata().partition_column.is_some()
+            || self.table.has_retention_delete_filters()
+            || !matches!(self.table.key_resolver(), Ok(Some(_)))
+        {
+            return None;
+        }
+        let write_guard = self.table.write_lock_arc().lock_owned().await;
+        self.table.holds_no_rows().await.then_some(write_guard)
     }
 
     /// Append data from a record batch stream into the Cayenne table.
@@ -851,6 +902,17 @@ mod tests {
             .create(options)
             .await
             .expect("table created");
+        // A stored row, so the stream appends in segments rather than loading an
+        // empty table as one replace.
+        append_rows(
+            &provider,
+            &sink_context,
+            &schema,
+            &ctx,
+            vec![int64_batch(&schema, vec![100])],
+        )
+        .await
+        .expect("seed");
 
         let release_second = Arc::new(Notify::new());
         let release_for_stream = Arc::clone(&release_second);
@@ -898,7 +960,7 @@ mod tests {
         // still open (the second batch is gated on `release_second`).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
-            if visible_rows(&ctx, &provider).await == 2 {
+            if visible_rows(&ctx, &provider).await == 3 {
                 break;
             }
             assert!(
@@ -913,7 +975,7 @@ mod tests {
         assert_eq!(written, 3, "all rows accounted across segments");
         assert_eq!(
             visible_rows(&ctx, &provider).await,
-            3,
+            4,
             "all rows visible after stream end"
         );
     }

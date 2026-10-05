@@ -12288,6 +12288,63 @@ impl CayenneTableProvider {
         self.mem_tier.is_empty() && self.inlined_row_count.load(Ordering::Acquire) == 0
     }
 
+    /// Build and cache the primary-key index the next append validates against,
+    /// exactly as that append would on finding none: validating an empty stream
+    /// builds the index (from the persisted checkpoint or a scan, converting to a
+    /// bloom over budget) and stores it back when the stream ends. A table loaded
+    /// by one replace keeps no index, so its first load warms one here, off the
+    /// next refresh's path; an append that arrives first waits on the write lock
+    /// and reuses the index instead of building its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index cannot be built.
+    pub(crate) async fn warm_pk_index(&self) -> Result<()> {
+        let _write_guard = self.write_lock().lock().await;
+        if self.pk_keyset_cache.lock().is_some() {
+            return Ok(());
+        }
+        let empty: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            self.table_schema(),
+            futures::stream::empty(),
+        ));
+        let prepared = self.prepare_stream_for_insert(empty).await?;
+        prepared
+            .stream
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|source| Error::DataFusion { source })?;
+        Ok(())
+    }
+
+    /// Whether this table holds no rows at all, by observing every place a row
+    /// can sit: a staged append's private directory, a registered protected
+    /// snapshot, the in-memory CDC tier, the inline tier, any snapshot's data
+    /// files and the cold tier. The in-flight staged-append check precedes the
+    /// protected-snapshot read for the reason `pk_caches_absent_and_memory_empty`
+    /// gives.
+    ///
+    /// A `true` licenses replacing the table outright, so the caller must hold
+    /// the write lock from this check until that replace commits; anything that
+    /// cannot be read answers `false`, which costs only the slower append.
+    pub(crate) async fn holds_no_rows(&self) -> bool {
+        if self.has_inflight_staging_appends()
+            || !self.protected_snapshots.load().is_empty()
+            || !self.mem_tier.is_empty()
+            || self.inlined_row_count.load(Ordering::Acquire) != 0
+        {
+            return false;
+        }
+        let table_id = &self.table_metadata.table_id;
+        matches!(
+            self.catalog.get_all_snapshot_files(table_id).await,
+            Ok(files) if files.is_empty()
+        ) && matches!(
+            self.catalog.list_cold_tier_files(table_id).await,
+            Ok(files) if files.is_empty()
+        )
+    }
+
     pub(crate) fn clear_cached_pk_keyset(&self) {
         {
             let mut guard = self.pk_keyset_cache.lock();
@@ -51642,8 +51699,11 @@ mod tests {
         let mem_exec = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
             .expect("memory exec created");
 
+        // A user's `INSERT`: it appends even into an empty table, which a
+        // refresh would load as one replace.
+        let statement = util::session_state::mark_user_statement(&ctx.state());
         let insert_plan = provider
-            .insert_into(&ctx.state(), mem_exec, InsertOp::Append)
+            .insert_into(&statement, mem_exec, InsertOp::Append)
             .await
             .expect("insert plan created");
 

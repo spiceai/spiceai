@@ -312,6 +312,10 @@ pub(super) struct AppendMutationWriter<'a> {
     table: &'a CayenneTableProvider,
     context: &'a Arc<CayenneContext>,
     task_context: &'a Arc<TaskContext>,
+    /// The caller holds the write lock over a table it observed to hold no rows
+    /// (`CayenneTableProvider::holds_no_rows`), so a streaming append has no
+    /// stored key to check its own against.
+    into_empty_table: bool,
 }
 
 impl<'a> AppendMutationWriter<'a> {
@@ -325,7 +329,16 @@ impl<'a> AppendMutationWriter<'a> {
             table,
             context,
             task_context,
+            into_empty_table: false,
         }
+    }
+
+    /// Write into a table the caller observed, under the write lock it still
+    /// holds, to hold no rows: a streaming append skips the conflict check.
+    #[must_use]
+    pub(super) fn into_empty_table(mut self) -> Self {
+        self.into_empty_table = true;
+        self
     }
 
     pub(super) async fn write_cdc_pipelined(
@@ -1216,11 +1229,19 @@ impl<'a> AppendMutationWriter<'a> {
         let arrival = super::overwrite_postpass::ArrivalStream::new(data, resolver, &arrival_name);
         let stamped_batches = arrival.stamped_batches();
         let data: SendableRecordBatchStream = Box::pin(arrival);
-        let prepared = self
-            .table
-            .prepare_stream_for_insert_resolving_repeats(data)
-            .await?;
-        let post_validation = prepared.post_validation();
+        // Into an empty table there is no stored key to supersede or keep, so the
+        // conflict check, and the set of every incoming key it builds, is skipped;
+        // the keys the append repeats are resolved after the write as usual.
+        let (data, post_validation) = if self.into_empty_table {
+            (data, Arc::new(ParkingMutex::new(None)))
+        } else {
+            let prepared = self
+                .table
+                .prepare_stream_for_insert_resolving_repeats(data)
+                .await?;
+            let post_validation = prepared.post_validation();
+            (prepared.stream, post_validation)
+        };
 
         let snapshot_id = uuid::Uuid::now_v7().to_string();
         let write = super::overwrite::WriteShape {
@@ -1242,7 +1263,7 @@ impl<'a> AppendMutationWriter<'a> {
             let (rows, _, stats) = self
                 .table
                 .write_to_snapshot_with_schema(
-                    prepared.stream,
+                    data,
                     write.target_size_bytes,
                     &snapshot_id,
                     write.target_partitions,
@@ -1338,7 +1359,9 @@ impl<'a> AppendMutationWriter<'a> {
             live_rows_delta,
             published_live_rows_delta,
         );
-        if retention_requested {
+        // An unchecked load recorded no keys, so a cached index (an empty one, say)
+        // would miss every key it wrote: drop it, and the next validation rebuilds.
+        if retention_requested || self.into_empty_table {
             self.table.clear_cached_pk_keyset();
         } else {
             let record_seq = self.table.sequence_high_water().await;
