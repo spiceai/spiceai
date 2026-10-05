@@ -538,8 +538,8 @@ async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Resul
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_tables(port).await?;
 
@@ -637,8 +637,8 @@ async fn test_catalog_acceleration_excludes_views_and_still_loads() -> Result<()
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_table_and_views(port).await?;
 
@@ -688,8 +688,8 @@ async fn test_catalog_acceleration_respects_exclude_filter() -> Result<(), anyho
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_tables(port).await?;
 
@@ -722,10 +722,10 @@ async fn test_check_cdc_prerequisites_rejects_non_logical_wal_level() -> Result<
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
             // Deliberately the plain container (default wal_level, not
             // `logical`) rather than `..._with_logical_wal`.
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
 
@@ -752,8 +752,8 @@ async fn test_replication_slot_capacity_rejects_exhausted_server() -> Result<(),
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
 
@@ -817,8 +817,8 @@ async fn test_catalog_acceleration_converges_after_source_mutation() -> Result<(
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_tables(port).await?;
 
@@ -890,8 +890,8 @@ async fn test_catalog_acceleration_replica_identity_matrix() -> Result<(), anyho
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_replica_identity_tables(port).await?;
 
@@ -950,8 +950,8 @@ async fn test_catalog_acceleration_using_index_cdc_converges() -> Result<(), any
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_replica_identity_tables(port).await?;
 
@@ -1015,8 +1015,8 @@ async fn test_catalog_acceleration_respects_include_filter() -> Result<(), anyho
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_tables(port).await?;
 
@@ -1055,8 +1055,8 @@ async fn test_catalog_acceleration_fails_loudly_when_no_tables_eligible()
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_only_ineligible_tables(port).await?;
 
@@ -1127,10 +1127,10 @@ async fn test_check_cdc_prerequisites_rejects_non_replication_role() -> Result<(
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
             // Needs wal_level=logical so the check gets PAST the wal_level gate
             // and reaches the replication-privilege check.
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             let pool = pool_for_non_replication_role(port).await?;
 
@@ -1161,8 +1161,8 @@ async fn test_catalog_acceleration_releases_the_slot_when_the_acceleration_is_no
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
             seed_tables(port).await?;
 
             let expected_slot = catalog_slot_name(CATALOG_NAME);
@@ -1227,8 +1227,8 @@ async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), an
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_tables(port).await?;
 
@@ -1344,8 +1344,8 @@ async fn test_durable_acceleration_is_rebuilt_when_its_slot_is_gone() -> Result<
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_tables(port).await?;
 
@@ -1519,8 +1519,8 @@ async fn test_catalog_acceleration_fails_loud_when_slot_already_active() -> Resu
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_tables(port).await?;
 
