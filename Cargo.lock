@@ -10502,7 +10502,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e02547cb43e2c3cee65cb4f3b19bd033134f84f8#e02547cb43e2c3cee65cb4f3b19bd033134f84f8"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6317d03eae6e6da45104f07dfe20cd736657c827#6317d03eae6e6da45104f07dfe20cd736657c827"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10561,7 +10561,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e02547cb43e2c3cee65cb4f3b19bd033134f84f8#e02547cb43e2c3cee65cb4f3b19bd033134f84f8"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6317d03eae6e6da45104f07dfe20cd736657c827#6317d03eae6e6da45104f07dfe20cd736657c827"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10576,7 +10576,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e02547cb43e2c3cee65cb4f3b19bd033134f84f8#e02547cb43e2c3cee65cb4f3b19bd033134f84f8"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6317d03eae6e6da45104f07dfe20cd736657c827#6317d03eae6e6da45104f07dfe20cd736657c827"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -10599,7 +10599,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e02547cb43e2c3cee65cb4f3b19bd033134f84f8#e02547cb43e2c3cee65cb4f3b19bd033134f84f8"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6317d03eae6e6da45104f07dfe20cd736657c827#6317d03eae6e6da45104f07dfe20cd736657c827"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10615,7 +10615,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e02547cb43e2c3cee65cb4f3b19bd033134f84f8#e02547cb43e2c3cee65cb4f3b19bd033134f84f8"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6317d03eae6e6da45104f07dfe20cd736657c827#6317d03eae6e6da45104f07dfe20cd736657c827"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10625,7 +10625,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e02547cb43e2c3cee65cb4f3b19bd033134f84f8#e02547cb43e2c3cee65cb4f3b19bd033134f84f8"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6317d03eae6e6da45104f07dfe20cd736657c827#6317d03eae6e6da45104f07dfe20cd736657c827"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10644,7 +10644,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e02547cb43e2c3cee65cb4f3b19bd033134f84f8#e02547cb43e2c3cee65cb4f3b19bd033134f84f8"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6317d03eae6e6da45104f07dfe20cd736657c827#6317d03eae6e6da45104f07dfe20cd736657c827"
 dependencies = [
  "iceberg",
  "tracing-subscriber",
@@ -15352,7 +15352,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6705a26ad89d241a989a5395641931ba37076f5ab5fbd19ee92402414a43af32"
 dependencies = [
  "arrayvec",
- "hashbrown 0.17.1",
+ "hashbrown 0.5.0",
  "parking_lot",
  "rand 0.8.6",
 ]
@@ -15850,7 +15850,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -19357,7 +19357,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -19915,7 +19915,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -21616,7 +21616,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark 0.12.2",
