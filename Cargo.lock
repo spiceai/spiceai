@@ -6227,7 +6227,6 @@ dependencies = [
  "sysinfo 0.38.4",
  "tokio",
  "tracing",
- "util",
 ]
 
 [[package]]

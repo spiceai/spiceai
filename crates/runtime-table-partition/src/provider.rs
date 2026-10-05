@@ -526,7 +526,7 @@ impl TableProvider for PartitionTableProvider {
 
     async fn insert_into(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
@@ -535,7 +535,6 @@ impl TableProvider for PartitionTableProvider {
             partition_by: self.partition_by.clone(),
             partitions: Arc::clone(&self.partitions),
             schema: Arc::clone(&self.schema),
-            user_statement: util::session_state::is_user_statement(state.config()),
         };
 
         self.insert_strategy

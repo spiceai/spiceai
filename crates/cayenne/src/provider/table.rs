@@ -52153,11 +52153,8 @@ mod tests {
         let mem_exec = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
             .expect("memory exec created");
 
-        // A user's `INSERT`: it appends even into an empty table, which a
-        // refresh would load as one replace.
-        let statement = util::session_state::mark_user_statement(&ctx.state());
         let insert_plan = provider
-            .insert_into(&statement, mem_exec, InsertOp::Append)
+            .insert_into(&ctx.state(), mem_exec, InsertOp::Append)
             .await
             .expect("insert plan created");
 

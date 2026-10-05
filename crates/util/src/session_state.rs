@@ -46,35 +46,6 @@ pub fn session_context() -> SessionContext {
     SessionContext::new_with_config(session_config())
 }
 
-/// Marks a session as a user's statement writing into an acceleration (an
-/// `INSERT`, or a write inside `BEGIN … COMMIT`), as opposed to the
-/// accelerator's own writes: refreshes and change streams.
-///
-/// An accelerator applies a dataset's `on_conflict` to the keys its own writes'
-/// incoming data repeats (each record batch one upsert); a user's statement
-/// keeps its own semantics. Every other write is the accelerator's own, so a
-/// write path that forgets the marker still resolves repeats rather than
-/// storing them. [`mark_user_statement`] sets it, and [`is_user_statement`]
-/// reads it.
-#[derive(Debug, Default)]
-pub struct UserStatementWrite;
-
-/// `state` marked as a user's statement; see [`UserStatementWrite`].
-#[must_use]
-pub fn mark_user_statement(state: &SessionState) -> SessionState {
-    let mut state = state.clone();
-    state
-        .config_mut()
-        .set_extension(Arc::new(UserStatementWrite));
-    state
-}
-
-/// Whether `config` belongs to a user's statement; see [`UserStatementWrite`].
-#[must_use]
-pub fn is_user_statement(config: &SessionConfig) -> bool {
-    config.get_extension::<UserStatementWrite>().is_some()
-}
-
 /// A [`TaskContext`] carrying [`session_config`], for executing a plan outside
 /// any session.
 #[must_use]

@@ -772,9 +772,8 @@ async fn an_arrival_statement_resolves_repeated_keys_across_batches() {
             .expect("source")
         };
         let ctx = SessionContext::new();
-        let statement = util::session_state::mark_user_statement(&ctx.state());
         let plan = provider
-            .insert_into(&statement, repeated(), InsertOp::Append)
+            .insert_into(&ctx.state(), repeated(), InsertOp::Append)
             .await
             .expect("plan");
         collect(plan, ctx.task_ctx())
