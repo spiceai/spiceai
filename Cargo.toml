@@ -617,12 +617,12 @@ duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "8ee430737cb6
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6317d03eae6e6da45104f07dfe20cd736657c827" } # branch: spiceai-0.11.0-df-55
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6317d03eae6e6da45104f07dfe20cd736657c827" } # branch: spiceai-0.11.0-df-55
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6317d03eae6e6da45104f07dfe20cd736657c827" } # branch: spiceai-0.11.0-df-55
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6317d03eae6e6da45104f07dfe20cd736657c827" } # branch: spiceai-0.11.0-df-55
-iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6317d03eae6e6da45104f07dfe20cd736657c827" } # branch: spiceai-0.11.0-df-55
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6317d03eae6e6da45104f07dfe20cd736657c827" } # branch: spiceai-0.11.0-df-55
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7735caa2d9a839ad81aa6a1316932c99ea3019c5" } # branch: spiceai-0.11.0-df-55
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7735caa2d9a839ad81aa6a1316932c99ea3019c5" } # branch: spiceai-0.11.0-df-55
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7735caa2d9a839ad81aa6a1316932c99ea3019c5" } # branch: spiceai-0.11.0-df-55
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7735caa2d9a839ad81aa6a1316932c99ea3019c5" } # branch: spiceai-0.11.0-df-55
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7735caa2d9a839ad81aa6a1316932c99ea3019c5" } # branch: spiceai-0.11.0-df-55
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7735caa2d9a839ad81aa6a1316932c99ea3019c5" } # branch: spiceai-0.11.0-df-55
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be

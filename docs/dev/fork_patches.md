@@ -122,7 +122,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `8ee430737cb6999025d0b29672ec6cb92df19b6d` | `spiceai-1.4.4-patches-2` (spiceai/duckdb-rs#49 was squash-merged into `spiceai-1.4.4`, so this revision is the head of the protected `-patches-2` branch rather than a `spiceai-1.4.4` commit. datafusion-table-providers pins this exact revision, so the two move to `spiceai-1.4.4` together, which also brings spiceai/duckdb-rs#50 and #51) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
-| [iceberg-rust](#iceberg-rust) | `6317d03eae6e6da45104f07dfe20cd736657c827` | `spiceai-0.11.0-df-55` |
+| [iceberg-rust](#iceberg-rust) | `7735caa2d9a839ad81aa6a1316932c99ea3019c5` | `spiceai-0.11.0-df-55` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
