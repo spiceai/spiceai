@@ -311,7 +311,10 @@ impl AckSlot {
     /// applies the earlier commit last, and every row both commits changed is
     /// left at the earlier version. `delivered` does not move under the replay.
     /// It resets with `committed` whenever the member's channel is replaced, on
-    /// (re)registration.
+    /// (re)registration. A consumer that drops a delivered window without
+    /// acknowledging it must therefore stop the stream (so this member
+    /// detaches and re-registers) rather than continue with `delivered` still
+    /// ahead of the gap.
     fn routes(&self, at: &BinlogPosition) -> bool {
         self.has(STREAMING) && *lock(&self.delivered) < *at
     }
@@ -3167,6 +3170,80 @@ mod tests {
             channel,
             vec![t1, t2],
             "a member that stayed attached must not be sent what it already holds"
+        );
+    }
+
+    /// A delivered window dropped without ack is lost unless the member
+    /// re-registers and resets `delivered`.
+    ///
+    /// `routes` assumes every delivered-but-uncommitted envelope is still in
+    /// the member's channel. If the consumer drops `[200, 300]` unacked while
+    /// staying attached (`committed=100`, `delivered=300`), reconnect replay
+    /// from the committed floor routes nothing. Stopping the stream drops the
+    /// receiver, detaches the member, and re-registration resets `delivered`
+    /// with `committed` so the window is sent again.
+    #[test]
+    fn a_discarded_unacked_window_is_replayed_after_reregistration() {
+        let ack = AckTable::default();
+        let member = key("tpcc", "stock");
+        ack.register(&member, pos("binlog.000001", 100), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+        let t1 = pos("binlog.000001", 200);
+        let t2 = pos("binlog.000001", 300);
+
+        let mut channel = Vec::new();
+        let route = |at: &BinlogPosition, slot: &AckSlot, channel: &mut Vec<BinlogPosition>| {
+            if slot.routes(at) {
+                slot.deliver(at);
+                channel.push(at.clone());
+            }
+        };
+
+        route(&t1, &slot, &mut channel);
+        route(&t2, &slot, &mut channel);
+        assert_eq!(channel, vec![t1.clone(), t2.clone()]);
+        assert_eq!(slot.committed(), pos("binlog.000001", 100));
+        assert_eq!(slot.delivered(), t2);
+
+        // Still attached: reconnect replay from the committed floor skips both.
+        channel.clear();
+        route(&t1, &slot, &mut channel);
+        route(&t2, &slot, &mut channel);
+        assert_eq!(
+            channel,
+            Vec::<BinlogPosition>::new(),
+            "an attached member with delivered=300 must not be re-sent [200, 300]"
+        );
+
+        // Stop → receiver dropped → detach holds committed and clears STREAMING.
+        ack.detach(&member);
+        channel.clear();
+        route(&t1, &slot, &mut channel);
+        route(&t2, &slot, &mut channel);
+        assert_eq!(
+            channel,
+            Vec::<BinlogPosition>::new(),
+            "a detached member is not routed"
+        );
+        assert_eq!(
+            ack.committed(&member),
+            Some(pos("binlog.000001", 100)),
+            "detach holds the committed floor"
+        );
+
+        // Re-subscribe resets delivered with committed (sidecar floor).
+        ack.register(&member, pos("binlog.000001", 100), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("revived slot");
+        assert_eq!(slot.delivered(), pos("binlog.000001", 100));
+        channel.clear();
+        route(&t1, &slot, &mut channel);
+        route(&t2, &slot, &mut channel);
+        assert_eq!(
+            channel,
+            vec![t1, t2],
+            "after re-registration the discarded window must be replayed"
         );
     }
 
