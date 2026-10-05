@@ -32,10 +32,10 @@ use std::sync::Arc;
 
 use arrow_tools::schema_evolution::WideningPlan;
 use async_trait::async_trait;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
-use datafusion::sql::TableReference;
 use futures::future::BoxFuture;
 use tokio::sync::Mutex;
 
