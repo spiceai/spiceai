@@ -30,6 +30,10 @@ pub enum SchemaDecision {
 /// Policy data must not retain the sink, refresh task, or source committers.
 /// Classification is synchronous and must not submit work to the owner.
 pub trait CdcPolicy: Send + Sync {
+    /// Classify the incoming schema against the target and backend capabilities.
+    ///
+    /// # Errors
+    /// Returns an error if the source policy refuses the incoming schema.
     fn classify(
         &self,
         incoming: &SchemaRef,

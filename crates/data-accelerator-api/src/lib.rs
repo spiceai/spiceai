@@ -577,6 +577,9 @@ pub trait DataAccelerator: Send + Sync {
     /// Binds engine-specific change capabilities to the composed write target.
     /// Wrappers must preserve every write transformation. The caller supplies
     /// a default provider-backed sink when the engine provides no binding.
+    ///
+    /// # Errors
+    /// Returns an error if the engine cannot bind a writer to the supplied context.
     async fn change_sink(
         &self,
         _context: runtime_acceleration::change_sink::ChangeSinkContext,

@@ -17,6 +17,7 @@ limitations under the License.
 //! Compatible CDC burst preparation for the table owner. Source acknowledgement
 //! and source control remain outside this module.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,11 +65,8 @@ pub(crate) trait CoalescingBurst: Send {
     fn len(&self) -> usize;
     fn bytes(&self) -> usize;
     fn is_full(&self) -> bool;
-    fn push(
-        &mut self,
-        next: ChangeBatch,
-        options: WriteOptions,
-    ) -> std::result::Result<(), ChangeBatch>;
+    /// Returns `Break` with the unconsumed input when this burst must end.
+    fn push(&mut self, next: ChangeBatch, options: WriteOptions) -> ControlFlow<ChangeBatch>;
     fn cdc_metrics(&self) -> Option<&Arc<CdcIngress>>;
 }
 
@@ -127,11 +125,7 @@ impl CoalescingBurst for AppendBurst {
             || self.bytes >= self.ingress.limits.max_bytes.max(1)
     }
 
-    fn push(
-        &mut self,
-        next: ChangeBatch,
-        options: WriteOptions,
-    ) -> std::result::Result<(), ChangeBatch> {
+    fn push(&mut self, next: ChangeBatch, options: WriteOptions) -> ControlFlow<ChangeBatch> {
         let bytes = next.estimated_bytes();
         if self.is_full()
             || self.options.recovery != options.recovery
@@ -141,12 +135,12 @@ impl CoalescingBurst for AppendBurst {
                 .is_some_and(|ingress| Arc::ptr_eq(&self.ingress, ingress))
             || self.bytes.saturating_add(bytes) > self.ingress.limits.max_bytes.max(1)
         {
-            return Err(next);
+            return ControlFlow::Break(next);
         }
         self.batch.merge_append(next)?;
         self.count += 1;
         self.bytes = self.bytes.saturating_add(bytes);
-        Ok(())
+        ControlFlow::Continue(())
     }
 
     fn cdc_metrics(&self) -> Option<&Arc<CdcIngress>> {
@@ -277,6 +271,10 @@ pub struct CdcBurst {
 }
 
 impl CdcBurst {
+    /// Start a burst with one CDC input.
+    ///
+    /// # Errors
+    /// Returns an error if the first input is not CDC data.
     pub fn new(first: ChangeBatch, options: WriteOptions) -> Result<Self> {
         let ChangePayload::Cdc(rows) = first.payload() else {
             return Err(DataFusionError::Internal(
@@ -352,25 +350,26 @@ impl CdcBurst {
         self.bytes.saturating_add(next.estimated_bytes()) <= ingress.limits.max_bytes.max(1)
     }
 
-    /// Call only after `accepts`; returns the unconsumed input on a mismatch.
-    pub fn push(
-        &mut self,
-        next: ChangeBatch,
-        options: WriteOptions,
-    ) -> std::result::Result<(), ChangeBatch> {
+    /// Returns `Continue` after accepting input, or `Break` with the unchanged
+    /// input when a limit or compatibility boundary ends this burst.
+    pub fn push(&mut self, next: ChangeBatch, options: WriteOptions) -> ControlFlow<ChangeBatch> {
         if !self.accepts(&next, options) {
-            return Err(next);
+            return ControlFlow::Break(next);
         }
         self.bytes = self.bytes.saturating_add(next.estimated_bytes());
         if options.recovery == Recovery::Durable {
             self.options.recovery = Recovery::Durable;
         }
         self.inputs.push(next);
-        Ok(())
+        ControlFlow::Continue(())
     }
 
     /// Decode every input before classification or mutation. Deferred sources
     /// share one blocking-pool handoff; eager sources take no task hop.
+    ///
+    /// # Errors
+    /// Returns an error if decoding or schema classification fails, an input has
+    /// an unknown operation or rebuild marker, or Arrow batches cannot be combined.
     pub async fn prepare(
         self,
         target: SchemaRef,
@@ -517,11 +516,7 @@ impl CoalescingBurst for CdcBurst {
         self.is_full()
     }
 
-    fn push(
-        &mut self,
-        next: ChangeBatch,
-        options: WriteOptions,
-    ) -> std::result::Result<(), ChangeBatch> {
+    fn push(&mut self, next: ChangeBatch, options: WriteOptions) -> ControlFlow<ChangeBatch> {
         self.push(next, options)
     }
 
