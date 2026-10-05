@@ -1039,7 +1039,14 @@ mod tests {
             lease_expires_at_ms > now_ms && lease_expires_at_ms <= now_ms + 2_000,
             "the lease must end with the next window: expires at {lease_expires_at_ms} ms, now {now_ms} ms"
         );
+        // A monotonic deadline bounds the wait even if the wall clock steps backwards.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while unix_millis_now() <= lease_expires_at_ms {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wall clock did not pass the lease expiry within 5 s: expires at {lease_expires_at_ms} ms, now {} ms",
+                unix_millis_now()
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 

@@ -41,8 +41,9 @@ impl Validator for GcsAuthValidator {
     }
 }
 
-/// Ensures at most one GCS authentication method is set in `parameters`, which are
-/// resolved under the `gcs` prefix (`service_account_path`, `skip_signature`, ...).
+/// Ensures at most one GCS authentication method is set in `parameters`. Their keys
+/// carry no `gcs_` prefix (`service_account_path`, `skip_signature`, ...), as
+/// [`Parameters`] built for the `gcs` prefix stores them.
 ///
 /// # Errors
 ///
