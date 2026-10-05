@@ -43,7 +43,11 @@ limitations under the License.
 //! from that min and routes each member only the commits past what it was
 //! already delivered ([`AckSlot::routes`]). A member that stays attached across
 //! a reconnect still holds its delivered commits in its channel, so sending
-//! them again would not be idempotent: see [`AckSlot::routes`].
+//! them again would not be idempotent. Checking the *committed* floor instead
+//! re-sends an earlier in-flight commit after a later one is acknowledged
+//! mid-replay, and the member applies the older commit last. A consumer that
+//! drops a delivered window without acknowledging it must stop the stream so
+//! re-registration resets `delivered` with `committed`.
 //!
 //! A member takes an initial snapshot when it has no usable persisted position
 //! (cold, or an incompatible/purged checkpoint resolved by
@@ -299,22 +303,16 @@ impl AckSlot {
         advance_position(&self.delivered, to);
     }
 
-    /// Whether the pump routes the commit at `at` to this member: the member is
-    /// streaming and was not already delivered it.
+    /// Whether the pump routes the commit at `at` to this member: streaming,
+    /// and `delivered < at`.
     ///
-    /// After a reconnect the pump replays from the shared min, and a member that
-    /// stayed attached still holds every commit it was delivered in its channel,
-    /// applied or not. Sending those again would not be idempotent. The member
-    /// keeps acknowledging its in-flight commits while the replay runs, so a
-    /// check against its *committed* floor re-sends an earlier commit and then
-    /// drops a later one the member acknowledged in between. The member then
-    /// applies the earlier commit last, and every row both commits changed is
-    /// left at the earlier version. `delivered` does not move under the replay.
-    /// It resets with `committed` whenever the member's channel is replaced, on
-    /// (re)registration. A consumer that drops a delivered window without
-    /// acknowledging it must therefore stop the stream (so this member
-    /// detaches and re-registers) rather than continue with `delivered` still
-    /// ahead of the gap.
+    /// Invariants for every caller that gets `true`:
+    /// - call [`Self::deliver`] with `at` before the next `routes` check
+    ///   (row commits and `TRUNCATE` both do)
+    /// - a discarded unacked window must stop the stream so (re)registration
+    ///   resets `delivered` with `committed`
+    ///
+    /// Why `delivered` and not `committed` is the module-level consistency note.
     fn routes(&self, at: &BinlogPosition) -> bool {
         self.has(STREAMING) && *lock(&self.delivered) < *at
     }
