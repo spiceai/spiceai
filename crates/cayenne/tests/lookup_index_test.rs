@@ -844,9 +844,63 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
         "a declined partitioned filter must not record candidate rows"
     );
 
+    // A fully covered index selection sizes the build by candidate rows,
+    // rather than by all rows in the files that contain those candidates.
+    let mut selective_config = SessionConfig::new().with_target_partitions(4);
+    selective_config
+        .options_mut()
+        .optimizer
+        .hash_join_single_partition_threshold = 1024;
+    selective_config
+        .options_mut()
+        .optimizer
+        .hash_join_single_partition_threshold_rows = 128;
+    let selective_ctx = SessionContext::new_with_config(selective_config);
+    selective_ctx
+        .register_table(
+            INDEXED_EVIDENCE,
+            Arc::clone(&indexed) as Arc<dyn TableProvider>,
+        )
+        .expect("register indexed table for selective join");
+    let selective_sql = format!(
+        "SELECT s.\"AutoId\" FROM {INDEXED_EVIDENCE} s \
+         INNER JOIN {INDEXED_EVIDENCE} b ON s.\"AutoId\" = b.\"AutoId\" \
+         WHERE b.\"TenantId\" = 'AC{:032x}' AND b.\"ServiceId\" = 'MG{:032x}'",
+        7 % ACCOUNTS,
+        7
+    );
+    let selective_plan = selective_ctx
+        .sql(&selective_sql)
+        .await
+        .expect("selective join dataframe")
+        .create_physical_plan()
+        .await
+        .expect("selective join physical plan");
+    let selective_display = datafusion::physical_plan::displayable(selective_plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(
+        selective_display.contains("HashJoinExec: mode=CollectLeft"),
+        "the single-candidate build should use a collected hash join:\n{selective_display}"
+    );
+    let selective_rows =
+        datafusion::physical_plan::collect(Arc::clone(&selective_plan), selective_ctx.task_ctx())
+            .await
+            .expect("selective join execution");
+    assert_eq!(rendered(&selective_rows), vec!["7"]);
+    let repeated_rows = selective_ctx
+        .sql(&selective_sql)
+        .await
+        .expect("repeated selective join plan")
+        .collect()
+        .await
+        .expect("repeated selective join execution");
+    assert_eq!(rendered(&repeated_rows), vec!["7"]);
+
     println!("=== dynamic indexed join ===\n{plan}");
     println!("=== dynamic composite indexed join ===\n{composite_plan}");
     println!("=== partitioned dynamic fallback ===\n{partitioned_plan}");
+    println!("=== selective indexed build ===\n{selective_display}");
     println!("lookup-index counters: {before:?} -> {after:?}");
     println!("composite lookup-index counters: {composite_before:?} -> {composite_after:?}");
 }

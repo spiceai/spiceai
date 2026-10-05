@@ -828,7 +828,7 @@ struct LookupAccessPlanProvider {
 }
 
 /// Runtime row selection derived from a completed hash-join dynamic filter.
-struct RuntimeLookupSelection {
+pub(crate) struct RuntimeLookupSelection {
     index: Arc<LookupIndexView>,
     /// The ready-made plan for each covered file holding a candidate row, by
     /// file name, so a file open shares it instead of copying the positions.
@@ -838,6 +838,13 @@ struct RuntimeLookupSelection {
 }
 
 impl RuntimeLookupSelection {
+    /// Whether the file `path` names may hold a row of the selection: a file
+    /// the index does not cover is read as planned, and a covered one only
+    /// when it holds a candidate.
+    pub(crate) fn may_hold(&self, path: &str) -> bool {
+        !self.index.covers(path) || self.plans.contains_key(file_name(path))
+    }
+
     fn new(index: Arc<LookupIndexView>, per_file: HashMap<String, Vec<u64>>) -> Self {
         let plans = per_file
             .into_iter()
@@ -921,6 +928,15 @@ impl DynamicLookupAccessPlanProvider {
             request_build,
             selection: Mutex::default(),
         }
+    }
+
+    /// The selection a completed dynamic filter in `predicate` resolves to,
+    /// or `None` when no index can answer it.
+    pub(crate) async fn selection(
+        &self,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Option<Arc<RuntimeLookupSelection>> {
+        self.resolve(predicate).await
     }
 
     /// The selection for the scan's completed dynamic filter, probed at most
