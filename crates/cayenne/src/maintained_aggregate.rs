@@ -20,9 +20,9 @@ limitations under the License.
 //! are applied as positive deltas only while the view is known fresh. Any
 //! operation that needs a retraction but cannot provide the old row values marks
 //! the view stale. The physical optimizer may only serve this state when it is
-//! fresh and has taken in at least the scan snapshot epoch captured by
-//! [`crate::provider::CayenneAccelerationExec`], so it is never older than the
-//! rows the scan would read.
+//! fresh at the scan snapshot epoch captured by
+//! [`crate::provider::CayenneAccelerationExec`], so the served batch is the
+//! aggregate of the rows that scan would read.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -926,8 +926,7 @@ impl MaintainedAggregateRegistry {
     /// Materialize a maintained aggregate batch matching `aggregate`, if fresh.
     ///
     /// Returns `None` when the aggregate shape is unsupported, no declared view
-    /// matches it, or the registry is stale or has not yet taken in the scan
-    /// snapshot epoch.
+    /// matches it, or the registry is stale or not at the scan snapshot epoch.
     ///
     /// # Errors
     ///
@@ -978,11 +977,12 @@ impl MaintainedAggregateRegistry {
     ///
     /// # Returns
     ///
-    /// `Ok(Some(batch))` when the registry is fresh at `scan_epoch` or later, a
+    /// `Ok(Some(batch))` when the registry is fresh at `scan_epoch`, a
     /// view matches `spec` exactly, and it materializes into `output_schema`.
     /// `Ok(None)` is the fallback signal (the caller should run normal
-    /// execution) when the registry is stale or behind `scan_epoch`, no view
-    /// matches `spec`, or the matched view does not fit `output_schema`.
+    /// execution) when the registry is stale or at a different epoch than
+    /// `scan_epoch`, no view matches `spec`, or the matched view does not fit
+    /// `output_schema`.
     ///
     /// # Errors
     ///
@@ -1018,16 +1018,15 @@ impl MaintainedAggregateRegistry {
     }
 
     /// Shared serve path: only answer from a maintained view when the registry is
-    /// fresh, has taken in the scan's epoch, and a view matches the query shape
-    /// exactly.
+    /// fresh at the scan's epoch and a view matches the query shape exactly.
     ///
-    /// The registry can be ahead of the scan: a read-only CDC table reuses a scan
-    /// view for up to its freshness lag across later writes, so the scan's
-    /// snapshot can predate deltas the registry has already applied. Every delta
-    /// reaches the registry only after its write is visible, so the views then
-    /// hold a published state of the table newer than the scan's snapshot, and
-    /// answering from them is answering from that state. A registry behind the
-    /// scan is never used: it would drop rows the scan's snapshot contains.
+    /// The rewrite replaces an immutable scan snapshot. A registry at a different
+    /// epoch holds a different published state of the table, so serving it would
+    /// make this aggregate disagree with other scans of the same snapshot. A
+    /// read-only CDC table may reuse a scan view across later writes; when that
+    /// happens the registry is ahead and this path falls back to the captured
+    /// scan. A registry behind the scan also falls back: it would drop rows the
+    /// snapshot contains.
     fn serve(
         &self,
         query: &QueryAggregateSpec,
@@ -1035,7 +1034,7 @@ impl MaintainedAggregateRegistry {
         output_schema: SchemaRef,
     ) -> DataFusionResult<Option<RecordBatch>> {
         let state = self.state.read();
-        if state.status != RegistryStatus::Fresh || state.epoch < scan_epoch {
+        if state.status != RegistryStatus::Fresh || state.epoch != scan_epoch {
             return Ok(None);
         }
 
@@ -2696,13 +2695,13 @@ mod tests {
         Ok(())
     }
 
-    /// A scan may carry an older snapshot than the registry: a read-only CDC
-    /// table reuses a scan view across later writes. The registry has then
-    /// taken in writes the snapshot predates, all of them already visible, so
-    /// it answers with that newer state; a registry behind the scan's snapshot
-    /// would miss rows the scan reads, so it never answers.
+    /// The rewrite replaces an immutable scan snapshot, so it may serve only the
+    /// registry state taken at that snapshot's epoch. A reused CDC scan view can
+    /// trail the registry; serving the newer state would count writes the scan
+    /// does not contain (`base_scan_count_at_epoch_1=4`,
+    /// `maintained_count_at_epoch_2=8`).
     #[test]
-    fn serves_a_scan_no_newer_than_the_registry() -> DataFusionResult<()> {
+    fn serves_only_the_matching_scan_epoch() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
             filter: None,
             group_by: vec!["name".to_string()],
@@ -2717,19 +2716,22 @@ mod tests {
         let aggregate =
             aggregate_exec_for(&[("count(*)", MaintainedAggregateFunction::Count, None)])?;
 
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
+            "a registry ahead of the scan snapshot must not serve it"
+        );
         let served = registry
-            .batch_for_aggregate(&aggregate, 1)?
-            .expect("a registry ahead of the scan's snapshot serves it");
+            .batch_for_aggregate(&aggregate, 2)?
+            .expect("a registry at the scan snapshot serves it");
         let counts = as_int64_array(served.column(1))?;
         assert_eq!(
             counts.iter().flatten().sum::<i64>(),
             8,
-            "the newer state, with both batches, is served"
+            "the matching epoch includes both batches"
         );
-        assert!(registry.batch_for_aggregate(&aggregate, 2)?.is_some());
         assert!(
             registry.batch_for_aggregate(&aggregate, 3)?.is_none(),
-            "a registry behind the scan's snapshot must not serve it"
+            "a registry behind the scan snapshot must not serve it"
         );
         Ok(())
     }
