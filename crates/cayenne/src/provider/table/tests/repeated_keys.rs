@@ -24,6 +24,8 @@ use crate::provider::key_conflicts::UpsertDedup;
 use crate::provider::pk_index::{CachedPkIndex, CachedPkKeyset};
 use arrow::array::{AsArray, StringArray};
 
+mod policy_contract;
+
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, true),
