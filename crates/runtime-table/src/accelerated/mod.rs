@@ -1431,15 +1431,8 @@ impl AcceleratedTable {
 
     /// Stop producers and drain accepted changes before the storage target can
     /// be removed or rebound. Cancellation stops waiting, not the owned drain.
-    pub async fn drain_changes(&self, timeout: Duration) -> DataFusionResult<()> {
-        let publication = self.begin_changes_drain();
-        tokio::time::timeout(timeout, publication.wait()).await.map_err(|_| {
-            DataFusionError::Execution(format!(
-                "Change ingestion for dataset '{}' is still draining; its storage remains fenced",
-                self.dataset_name,
-            ))
-        })??;
-        Ok(())
+    pub async fn drain_changes(&self) -> DataFusionResult<()> {
+        self.begin_changes_drain().wait().await
     }
 
     pub fn builder(

@@ -2891,11 +2891,12 @@ impl DataFusion {
                     "Registered acceleration has no table-generation owner".into(),
                 ),
             })?;
-            table.drain_changes(Duration::from_secs(30)).await.context(
-                UnableToDrainChangesSnafu {
+            table
+                .drain_changes()
+                .await
+                .context(UnableToDrainChangesSnafu {
                     dataset_name: dataset_name.to_string(),
-                },
-            )?;
+                })?;
         }
         Ok(())
     }
