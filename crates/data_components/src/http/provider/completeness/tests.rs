@@ -81,6 +81,92 @@ async fn only_eof_in_every_partition_completes() {
 }
 
 #[tokio::test]
+async fn single_request_proof_requires_eof_without_a_followed_page() {
+    for followed in [false, true] {
+        let completion = HttpFetchCompletion::new(1);
+        let (mut response, progress) = tracked(&completion, 0, false, vec![Ok(batch())]);
+        assert!(!completion.is_complete_single_request());
+        response.next().await.expect("row").expect("response");
+        if followed {
+            progress.followed_page();
+        }
+        assert!(!completion.is_complete_single_request());
+        assert!(response.next().await.is_none());
+        assert!(completion.is_complete());
+        assert_eq!(completion.is_complete_single_request(), !followed);
+    }
+    let completion = HttpFetchCompletion::new(2);
+    for partition in 0..2 {
+        let (mut response, _) = tracked(&completion, partition, false, vec![]);
+        assert!(response.next().await.is_none());
+    }
+    assert!(completion.is_complete());
+    assert!(!completion.is_complete_single_request());
+}
+
+#[tokio::test]
+async fn actual_http_pagination_tracks_followed_pages_not_configuration() {
+    use super::super::{HttpExec, HttpTableProvider, PaginationConfig};
+    use datafusion::{
+        datasource::TableProvider, execution::context::SessionContext, physical_plan::ExecutionPlan,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for pages in [1, 2] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await.expect("HTTP listener");
+            let url = format!("http://{}", listener.local_addr().expect("address"));
+            let server = tokio::spawn(async move {
+                for page in 0..pages {
+                    let (mut socket, _) = listener.accept().await.expect("request");
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0; 1024];
+                        let size = socket.read(&mut buffer).await.expect("request bytes");
+                        assert!(size > 0);
+                        request.extend_from_slice(&buffer[..size]);
+                        assert!(request.len() < 8192);
+                        if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8(request).expect("HTTP headers");
+                    assert!(request.starts_with(if page == 0 {
+                        "GET /items HTTP/1.1\r\n"
+                    } else {
+                        "GET /items?page=2 HTTP/1.1\r\n"
+                    }));
+                    let link = if page + 1 < pages {
+                        "Link: </items?page=2>; rel=\"next\"\r\n"
+                    } else {
+                        ""
+                    };
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Type: text/plain\r\n{link}Connection: close\r\n\r\nx").as_bytes())
+                        .await.expect("HTTP response");
+                }
+            });
+            let provider = HttpTableProvider::new(url.parse().expect("URL"), Default::default(), "text".into(), true)
+                .with_allowed_paths(["/items"]).expect("allowed path")
+                .with_max_retries(0)
+                .with_pagination(PaginationConfig::default()).expect("automatic pagination");
+            let exec = HttpExec::new(provider.schema(), Arc::new(provider), vec![(Some("/items".into()), None, None, None)], None);
+            let (exec, completion) = exec.for_cache_fetch();
+            let mut response = exec.execute(0, SessionContext::new().task_ctx()).expect("stream");
+            let mut rows = 0;
+            while let Some(batch) = response.next().await {
+                assert!(!completion.is_complete_single_request(), "EOF is required");
+                rows += batch.expect("response batch").num_rows();
+            }
+            server.await.expect("origin stopped");
+            assert_eq!(rows, pages);
+            assert!(completion.is_complete());
+            assert_eq!(completion.is_complete_single_request(), pages == 1);
+        }
+    }).await.expect("bounded HTTP execution");
+}
+
+#[tokio::test]
 async fn empty_response_requires_eof() {
     let completion = HttpFetchCompletion::new(1);
     let (mut response, _) = tracked(&completion, 0, false, vec![]);

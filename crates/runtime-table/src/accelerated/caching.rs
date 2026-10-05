@@ -2491,7 +2491,9 @@ impl CacheRefreshHelper {
                     })
                     .ok()
             });
-        let complete = completion.as_ref().is_some_and(|token| token.is_complete())
+        let complete = completion
+            .as_ref()
+            .is_some_and(|token| token.is_complete_single_request())
             && (memory_pool.is_none() || charge.is_some());
 
         tracing::debug!(

@@ -17,7 +17,7 @@ limitations under the License.
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::task::{Context, Poll};
 
@@ -45,6 +45,7 @@ const REUSED: u8 = 7;
 #[derive(Clone, Debug)]
 pub struct HttpFetchCompletion {
     partitions: Arc<[AtomicU8]>,
+    followed_page: Arc<AtomicBool>,
 }
 
 impl HttpFetchCompletion {
@@ -53,6 +54,7 @@ impl HttpFetchCompletion {
             partitions: (0..partitions)
                 .map(|_| AtomicU8::new(NOT_STARTED))
                 .collect(),
+            followed_page: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -64,6 +66,15 @@ impl HttpFetchCompletion {
                 .partitions
                 .iter()
                 .all(|state| state.load(Ordering::Acquire) == COMPLETE)
+    }
+
+    /// True after one request partition reaches EOF without following another page.
+    /// Pagination configuration alone does not imply that multiple pages were fetched.
+    #[must_use]
+    pub fn is_complete_single_request(&self) -> bool {
+        self.partitions.len() == 1
+            && self.is_complete()
+            && !self.followed_page.load(Ordering::Acquire)
     }
 
     pub(super) fn start(&self, partition: usize, limited: bool) -> CompletionGuard {
@@ -105,6 +116,10 @@ impl Progress {
                 Some(outcome)
             }
         });
+    }
+
+    pub(super) fn followed_page(&self) {
+        self.completion.followed_page.store(true, Ordering::Release);
     }
 
     pub(super) fn truncated(&self) {

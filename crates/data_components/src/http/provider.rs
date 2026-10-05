@@ -2904,6 +2904,9 @@ impl ExecutionPlan for HttpExec {
                                 .await
                                 .map_err(DataFusionError::from)?
                         } else {
+                            if let Some(progress) = &progress {
+                                progress.followed_page();
+                            }
                             let parsed_request_headers = state
                                 .request_headers
                                 .as_deref()

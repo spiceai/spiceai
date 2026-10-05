@@ -887,11 +887,9 @@ fn tracked_http_plan(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Option<(Arc<dyn ExecutionPlan>, HttpFetchCompletion, bool)>> {
     if let Some(http) = plan.downcast_ref::<HttpExec>() {
-        // Page metadata can describe different storage keys. Exhausting those
-        // pages does not prove one replaceable set under the request filters.
-        let eligible = http.limit().is_none()
-            && http.partitions().len() == 1
-            && !http.provider().is_paginated();
+        // The completion token must also prove that execution did not follow
+        // another page: page metadata can describe different storage keys.
+        let eligible = http.limit().is_none() && http.partitions().len() == 1;
         let (plan, completion) = http.for_cache_fetch();
         return Ok(Some((Arc::new(plan), completion, eligible)));
     }
@@ -1878,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn paginated_fetch_does_not_authorize_single_scope_replacement() {
+    fn pagination_configuration_requires_execution_proof() {
         use data_components::http::provider::{HttpTableProvider, PaginationConfig};
         for paginated in [false, true] {
             let provider = HttpTableProvider::new(
@@ -1906,7 +1904,8 @@ mod tests {
                 None,
             )
             .expect("tracked plan");
-            assert_eq!(completion.is_some(), !paginated);
+            let completion = completion.expect("track both configured and plain requests");
+            assert!(!completion.is_complete_single_request());
         }
     }
 
