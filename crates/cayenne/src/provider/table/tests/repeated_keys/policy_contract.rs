@@ -128,6 +128,65 @@ async fn identical_copies_collapse_for_refreshes_and_statements() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
+    let mut failures = Vec::new();
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
+        write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
+            .await
+            .expect("seed");
+        let concrete = catalog
+            .as_any()
+            .downcast_ref::<CayenneCatalog>()
+            .expect("concrete fixture catalog");
+        let mut txn = concrete
+            .begin_transaction()
+            .await
+            .expect("begin fault setup");
+        txn.execute_batch(
+            "CREATE TRIGGER fail_snapshot_publish BEFORE INSERT ON cayenne_snapshot_sequence BEGIN SELECT RAISE(ABORT, 'injected snapshot publish failure'); END;",
+        )
+        .await
+        .expect("install fixture fault");
+        txn.commit().await.expect("commit fault setup");
+
+        let error = write(&provider, InsertOp::Append, vec![batch(&[(9, "new")])])
+            .await
+            .expect_err("the snapshot metadata write must reach the fault");
+        assert!(
+            error
+                .to_string()
+                .contains("injected snapshot publish failure"),
+            "{mode:?}: unexpected error: {error}",
+        );
+        let mut txn = concrete
+            .begin_transaction()
+            .await
+            .expect("begin fault removal");
+        txn.execute_batch("DROP TRIGGER fail_snapshot_publish;")
+            .await
+            .expect("remove fixture fault");
+        txn.commit().await.expect("commit fault removal");
+
+        let expected = (owned(&[(9, "old")]), 1);
+        let actual = visible(&provider).await;
+        if actual != expected {
+            failures.push(format!(
+                "{mode:?}: live data changed after failure: {actual:?}"
+            ));
+        }
+        let reopened = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+        let actual = visible(&reopened).await;
+        if actual != expected {
+            failures.push(format!(
+                "{mode:?}: durable data changed after failure: {actual:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn late_append_error_does_not_publish_an_earlier_segment() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         let runtime_env = SessionContext::new().runtime_env();
