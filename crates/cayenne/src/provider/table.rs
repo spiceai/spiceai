@@ -48357,7 +48357,10 @@ mod tests {
                         vec![(9, 90)]
                     );
                 }
-                if upsert_policy == UpsertPolicy::Upsert {
+                if matches!(
+                    provider.table_metadata.on_conflict.as_ref(),
+                    Some(OnConflict::Upsert(_))
+                ) {
                     // A change stream's later change supersedes an earlier one even
                     // when they differ, within a batch and across batches.
                     let schema = provider.table_schema();
