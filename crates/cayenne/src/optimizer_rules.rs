@@ -2312,6 +2312,40 @@ mod tests {
         .expect("test batch should be valid")
     }
 
+    fn four_row_count_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            maintained_aggregate_test_schema(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("b"),
+                    Some("c"),
+                ])),
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])),
+            ],
+        )
+        .expect("four-row count batch should be valid")
+    }
+
+    fn maintained_global_count_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        schema: Arc<Schema>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let aggregate_expr = AggregateExprBuilder::new(count_udaf(), vec![lit(1_i8)])
+            .schema(Arc::clone(&schema))
+            .alias("count(*)".to_string())
+            .build()?;
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new(vec![], vec![], vec![], false),
+            vec![Arc::new(aggregate_expr)],
+            vec![None],
+            input,
+            schema,
+        )?))
+    }
+
     fn maintained_count_aggregate(
         input: Arc<dyn ExecutionPlan>,
         schema: Arc<Schema>,
@@ -2849,6 +2883,97 @@ mod tests {
         assert!(
             optimized.is::<MaintainedAggregateExec>(),
             "an aggregate without GROUP BY must be served from a view without one"
+        );
+        Ok(())
+    }
+
+    fn scan_with_maintained_count(
+        registry: Arc<MaintainedAggregateRegistry>,
+        batch: RecordBatch,
+        epoch: u64,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let schema = batch.schema();
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        Ok(Arc::new(
+            CayenneAccelerationExec::new_with_maintained_aggregates(memory, registry, epoch),
+        ))
+    }
+
+    fn count_values(batch: &RecordBatch) -> Vec<i64> {
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) is Int64");
+        let mut values = counts
+            .iter()
+            .map(|value| value.expect("COUNT(*) is non-null"))
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    }
+
+    // A reused CDC scan view can trail the registry. Serving the newer view
+    // would make COUNT(*) disagree with another scan of the same snapshot in
+    // the same plan: the scan at epoch 1 holds 4 rows, the registry at epoch 2
+    // holds 8. The rewrite must keep both arms on the scan snapshot.
+    #[tokio::test]
+    async fn maintained_aggregate_rewriter_does_not_serve_a_newer_registry_than_the_scan()
+    -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let first = four_row_count_batch();
+        let second = four_row_count_batch();
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec![],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&first))?;
+        registry.apply_insert_batches(2, std::slice::from_ref(&second))?;
+
+        let matching = scan_with_maintained_count(Arc::clone(&registry), first.clone(), 2)?;
+        // The matching-epoch scan still carries only the first batch so the
+        // served 8 can only come from the registry, not from rescanning.
+        let matching_count = maintained_global_count_aggregate(matching, Arc::clone(&schema))?;
+        let matching_plan = rewrite(matching_count)?;
+        assert!(
+            matching_plan.is::<MaintainedAggregateExec>(),
+            "a scan at the registry epoch must be served from the view"
+        );
+        let task = datafusion::execution::context::SessionContext::new().task_ctx();
+        let matching_rows = collect_plan_rows(Arc::clone(&matching_plan), Arc::clone(&task)).await;
+        assert_eq!(
+            count_values(&matching_rows),
+            vec![8],
+            "maintained_count_at_epoch_2 must be 8"
+        );
+
+        let scan = scan_with_maintained_count(Arc::clone(&registry), first.clone(), 1)?;
+        let unfiltered = maintained_global_count_aggregate(Arc::clone(&scan), Arc::clone(&schema))?;
+        let filtered_scan = Arc::new(datafusion_physical_plan::filter::FilterExec::try_new(
+            value_gt(1, -1_000),
+            scan,
+        )?) as Arc<dyn ExecutionPlan>;
+        let filtered = maintained_global_count_aggregate(filtered_scan, schema)?;
+        let mixed = UnionExec::try_new(vec![unfiltered, filtered])?;
+        let optimized = rewrite(mixed)?;
+        let plan = displayable(optimized.as_ref()).indent(true).to_string();
+        assert!(
+            !plan.contains("MaintainedAggregateExec"),
+            "an epoch-1 scan must not be replaced by the epoch-2 view. Plan:\n{plan}"
+        );
+
+        let mixed_rows = collect_plan_rows(optimized, task).await;
+        assert_eq!(
+            count_values(&mixed_rows),
+            vec![4, 4],
+            "both COUNT(*) arms must see the scan snapshot (4 rows), not the newer registry (8 rows)"
         );
         Ok(())
     }

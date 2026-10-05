@@ -61,22 +61,14 @@ const SECRET_KEY: &str = "spiceintegrationsecret";
 const WRITER_BUCKET: &str = "writer";
 const READER_BUCKET: &str = "reader";
 
-/// The rustfs container one test runs against. Each test has its own, on its own port,
-/// so the tests can run in parallel.
+/// The Docker-assigned endpoint of one test's `RustFS` container.
 #[derive(Clone, Copy)]
 struct Rustfs {
-    name: &'static str,
     port: u16,
 }
 
-const REPLICATED: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_replicated",
-    port: 19124,
-};
-const FIRST_SNAPSHOT: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_first",
-    port: 19125,
-};
+const REPLICATED: &str = "spice_test_rustfs_snapshot_source_replicated";
+const FIRST_SNAPSHOT: &str = "spice_test_rustfs_snapshot_source_first";
 
 const INITIAL_CSV: &str = "id,name\n1,alpha\n2,bravo\n3,charlie\n";
 const GROWN_CSV: &str = "id,name\n1,alpha\n2,bravo\n3,charlie\n4,delta\n5,echo\n";
@@ -108,12 +100,12 @@ fn s3_params(rustfs: Rustfs) -> HashMap<String, String> {
     ])
 }
 
-async fn start_rustfs(rustfs: Rustfs) -> Result<RunningContainer<'static>> {
+async fn start_rustfs(name: &str) -> Result<(Rustfs, RunningContainer)> {
     use bollard::secret::HealthConfig;
 
-    let container = ContainerRunnerBuilder::new(rustfs.name)
+    let container = ContainerRunnerBuilder::new(name)
         .image("rustfs/rustfs:latest".to_string())
-        .add_port_binding(9000, rustfs.port)
+        .publish_port(9000)
         .add_env_var("RUSTFS_ACCESS_KEY", ACCESS_KEY)
         .add_env_var("RUSTFS_SECRET_KEY", SECRET_KEY)
         .command(["/data"])
@@ -131,12 +123,15 @@ async fn start_rustfs(rustfs: Rustfs) -> Result<RunningContainer<'static>> {
         .build()?
         .run(Some(Duration::from_mins(1)))
         .await?;
+    let rustfs = Rustfs {
+        port: container.host_port(9000)?,
+    };
     wait_for_tcp_port("127.0.0.1", rustfs.port, Duration::from_secs(30)).await?;
 
     for bucket in [WRITER_BUCKET, READER_BUCKET] {
         create_bucket(rustfs, bucket).await?;
     }
-    Ok(container)
+    Ok((rustfs, container))
 }
 
 async fn create_bucket(rustfs: Rustfs, bucket: &str) -> Result<()> {
@@ -188,16 +183,31 @@ async fn replicate_snapshots(rustfs: Rustfs, prefix: &str) -> Result<()> {
     let source = bucket_store(rustfs, WRITER_BUCKET)?;
     let target = bucket_store(rustfs, READER_BUCKET)?;
 
+    // Read before listing: the writer keeps publishing, so a `metadata.json` read after
+    // the listing can name a snapshot the listing missed, and the copy would point the
+    // reader at an object it does not hold.
+    let metadata_key = ObjectPath::from(format!("{prefix}/metadata.json"));
+    let metadata = match source.get(&metadata_key).await {
+        Ok(result) => Some(result.bytes().await?),
+        Err(object_store::Error::NotFound { .. }) => None,
+        Err(err) => return Err(err.into()),
+    };
+
     let mut listed = source.list(Some(&ObjectPath::from(prefix)));
     let mut keys = Vec::new();
     while let Some(meta) = listed.next().await {
-        keys.push(meta.context("listing the writer's snapshots")?.location);
+        let key = meta.context("listing the writer's snapshots")?.location;
+        if key != metadata_key {
+            keys.push(key);
+        }
     }
-    keys.sort_by_key(|key| key.as_ref().ends_with("metadata.json"));
 
     for key in keys {
         let bytes = source.get(&key).await?.bytes().await?;
         target.put(&key, bytes.into()).await?;
+    }
+    if let Some(metadata) = metadata {
+        target.put(&metadata_key, metadata.into()).await?;
     }
     Ok(())
 }
@@ -374,8 +384,8 @@ async fn reads_replicated_snapshots_in_the_engine_that_created_them() -> Result<
     let orders = unique("orders");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(REPLICATED).await?;
-            let result = replicated_snapshots_scenario(REPLICATED, &modules, &orders).await;
+            let (rustfs, container) = start_rustfs(REPLICATED).await?;
+            let result = replicated_snapshots_scenario(rustfs, &modules, &orders).await;
             remove_local_copies(&[&modules, &orders]);
             container.remove().await?;
             result
@@ -489,8 +499,8 @@ async fn waits_for_the_first_snapshot_to_be_published() -> Result<()> {
     let modules = unique("modules");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(FIRST_SNAPSHOT).await?;
-            let result = first_snapshot_scenario(FIRST_SNAPSHOT, &modules).await;
+            let (rustfs, container) = start_rustfs(FIRST_SNAPSHOT).await?;
+            let result = first_snapshot_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result
@@ -569,14 +579,8 @@ async fn first_snapshot_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     Ok(())
 }
 
-const RELOAD: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_reload",
-    port: 19126,
-};
-const MOVED: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_moved",
-    port: 19127,
-};
+const RELOAD: &str = "spice_test_rustfs_snapshot_source_reload";
+const MOVED: &str = "spice_test_rustfs_snapshot_source_moved";
 
 /// Publishes a `DuckDB` snapshot of `modules` to `prefix` and copies it to the reader
 /// bucket, returning the writer.
@@ -632,8 +636,8 @@ async fn loads_a_snapshot_dataset_that_a_reload_adds() -> Result<()> {
     let modules = unique("modules");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(RELOAD).await?;
-            let result = reload_scenario(RELOAD, &modules).await;
+            let (rustfs, container) = start_rustfs(RELOAD).await?;
+            let result = reload_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result
@@ -681,8 +685,8 @@ async fn a_moved_dataset_never_serves_the_previous_locations_rows() -> Result<()
     let modules = unique("modules");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(MOVED).await?;
-            let result = moved_scenario(MOVED, &modules).await;
+            let (rustfs, container) = start_rustfs(MOVED).await?;
+            let result = moved_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result
@@ -754,10 +758,7 @@ async fn moved_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     Ok(())
 }
 
-const PROJECTED: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_projected",
-    port: 19128,
-};
+const PROJECTED: &str = "spice_test_rustfs_snapshot_source_projected";
 
 /// A publisher whose `refresh_sql` stores only some of its columns records every column
 /// in its snapshots' metadata, so no schema describes both its stored table and its
@@ -769,8 +770,8 @@ async fn refuses_snapshots_of_a_publisher_that_stores_some_columns() -> Result<(
     let modules = unique("modules");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(PROJECTED).await?;
-            let result = projected_scenario(PROJECTED, &modules).await;
+            let (rustfs, container) = start_rustfs(PROJECTED).await?;
+            let result = projected_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result
@@ -846,10 +847,7 @@ async fn projected_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     Ok(())
 }
 
-const REPLACED: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_replaced",
-    port: 19129,
-};
+const REPLACED: &str = "spice_test_rustfs_snapshot_source_replaced";
 
 /// A dataset that waits for its first snapshot, and that a reload replaces with another
 /// source, stops waiting. Nothing reports the replacement as waiting for a snapshot,
@@ -861,8 +859,8 @@ async fn a_replaced_snapshot_dataset_stops_waiting_for_its_snapshot() -> Result<
     let modules = unique("modules");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(REPLACED).await?;
-            let result = replaced_scenario(REPLACED, &modules).await;
+            let (rustfs, container) = start_rustfs(REPLACED).await?;
+            let result = replaced_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result
@@ -1007,10 +1005,7 @@ async fn other_statuses_than_ready(
     reported
 }
 
-const RESTORE_HELD: Rustfs = Rustfs {
-    name: "spice_test_rustfs_snapshot_source_restore_held",
-    port: 19130,
-};
+const RESTORE_HELD: &str = "spice_test_rustfs_snapshot_source_restore_held";
 
 /// A reload that replaces a snapshot dataset while that dataset is restoring its
 /// first snapshot waits for the restore, then does not register it. The
@@ -1021,8 +1016,8 @@ async fn a_replaced_snapshot_dataset_waits_for_its_in_progress_restore() -> Resu
     let modules = unique("modules");
     test_request_context()
         .scope(async {
-            let container = start_rustfs(RESTORE_HELD).await?;
-            let result = restore_held_scenario(RESTORE_HELD, &modules).await;
+            let (rustfs, container) = start_rustfs(RESTORE_HELD).await?;
+            let result = restore_held_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result
@@ -1128,5 +1123,175 @@ async fn restore_held_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
         "the in-progress restore was not superseded cleanly:\n{}",
         failures.join("\n")
     );
+    Ok(())
+}
+
+const CUSTOM_PATHS: &str = "spice_test_rustfs_snapshot_source_custom_paths";
+
+/// A Cayenne snapshot dataset that sets `cayenne_file_path` and `cayenne_metadata_dir`
+/// restores its copy there, not under `.spice/data`.
+#[tokio::test]
+async fn restores_cayenne_snapshots_to_the_paths_the_dataset_sets() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let (rustfs, container) = start_rustfs(CUSTOM_PATHS).await?;
+            let result = custom_paths_scenario(rustfs, &modules).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+async fn custom_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let modules_csv = dir.path().join("modules.csv");
+    std::fs::write(&modules_csv, INITIAL_CSV)?;
+    let writer = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_custom_paths_writer")
+                    .with_snapshots(writer_snapshots(rustfs, &prefix))
+                    .with_dataset(writer_dataset(modules, &modules_csv, "cayenne", dir.path()))
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&writer).await?;
+    wait_for_writer_snapshot(rustfs, &prefix, modules, 0).await?;
+    replicate_snapshots(rustfs, &prefix).await?;
+
+    let data_dir = dir.path().join("reader").join(modules);
+    let metadata_dir = dir.path().join("reader").join("metadata");
+    let mut dataset = reader_dataset(rustfs, modules, &prefix);
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        acceleration.params = Some(Params::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".to_string(),
+                data_dir.display().to_string(),
+            ),
+            (
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
+            ),
+        ])));
+    }
+    let reader = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_custom_paths_reader")
+                    .with_dataset(dataset)
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&reader).await?;
+
+    wait_for_rows(&reader, modules, 3).await?;
+    assert_eq!(rows(&reader, modules).await?, rows(&writer, modules).await?);
+    assert!(
+        std::fs::read_dir(&data_dir)?.next().is_some(),
+        "the copy is restored under `cayenne_file_path` ({})",
+        data_dir.display()
+    );
+    assert!(
+        metadata_dir.join("cayenne.db").is_file(),
+        "the metastore is restored under `cayenne_metadata_dir` ({})",
+        metadata_dir.display()
+    );
+    assert_eq!(
+        local_copies(modules),
+        Vec::<PathBuf>::new(),
+        "nothing is restored under `.spice/data`"
+    );
+
+    reader.shutdown().await;
+    writer.shutdown().await;
+    Ok(())
+}
+
+const OTHER_ENGINE_PATHS: &str = "spice_test_rustfs_snapshot_source_other_engine_paths";
+
+/// A snapshot dataset that sets a Cayenne path but reads another engine's snapshots is
+/// refused, by name, rather than silently keeping its copy under `.spice/data`.
+#[tokio::test]
+async fn refuses_cayenne_paths_for_another_engines_snapshots() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let (rustfs, container) = start_rustfs(OTHER_ENGINE_PATHS).await?;
+            let result = other_engine_paths_scenario(rustfs, &modules).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+async fn other_engine_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
+    writer.shutdown().await;
+
+    let mut dataset = reader_dataset(rustfs, modules, &prefix);
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        acceleration.params = Some(Params::from_string_map(HashMap::from([(
+            "cayenne_file_path".to_string(),
+            dir.path().join("reader").display().to_string(),
+        )])));
+    }
+    let reader = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_other_engine_paths_reader")
+                    .with_dataset(dataset)
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    let load = tokio::spawn(Arc::clone(&reader).load_components());
+
+    let table = datafusion::sql::TableReference::bare(modules);
+    let expected = format!(
+        "Dataset '{modules}' reads snapshots from 's3://{READER_BUCKET}/{prefix}/' that were created with the 'duckdb' engine, so `acceleration.params.cayenne_file_path`, which sets where a Cayenne copy is kept, does not apply"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut status = None;
+    while Instant::now() < deadline {
+        status = reader.status().get_dataset_status(&table);
+        if status
+            .as_ref()
+            .and_then(ComponentStatus::error_message)
+            .is_some_and(|message| message.contains(&expected))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let message = status
+        .as_ref()
+        .and_then(ComponentStatus::error_message)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        message.contains(&expected),
+        "the dataset is refused, naming the param, got {status:?}"
+    );
+    assert_eq!(
+        local_copies(modules),
+        Vec::<PathBuf>::new(),
+        "nothing is restored under `.spice/data`"
+    );
+
+    load.abort();
+    reader.shutdown().await;
     Ok(())
 }

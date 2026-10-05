@@ -36,6 +36,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         update_snapshots,
         max_concurrent,
         max_concurrent_wait_timeout_mins,
+        schedule,
         ..
     } = args;
     if !path.is_dir() && !path.is_file() {
@@ -66,6 +67,14 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
     let mut tests_to_dispatch = Vec::new();
 
     for (path, test_file) in tests {
+        if !test_file.is_on_schedule(schedule) {
+            println!(
+                "Skipping {}: it runs on the {} schedule",
+                path.display(),
+                test_file.schedule
+            );
+            continue;
+        }
         match test_type {
             TestType::Benchmark => {
                 for bench in &test_file.tests.bench {
