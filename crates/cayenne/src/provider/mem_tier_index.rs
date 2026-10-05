@@ -37,16 +37,16 @@ limitations under the License.
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
+use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow::datatypes::DataType;
 use datafusion_common::ScalarValue;
 
 use super::lookup_index::{
     Counters, Coverage, KeyColumn, KeySpec, LookupIndexCounters, LookupIndexScanReason, WarnOnce,
-    cast_to, key_converter, key_tuples, record_probe_outcome,
+    cast_to, key_tuples, record_probe_outcome,
 };
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
-use crate::row_converter::RowConverter;
+use key_index::{KeyEncoder, KeyField};
 
 /// What one indexed row costs per key: its hash and its row number.
 const BYTES_PER_ENTRY: usize = size_of::<u64>() + size_of::<u32>();
@@ -55,21 +55,33 @@ const BYTES_PER_ENTRY: usize = size_of::<u64>() + size_of::<u32>();
 struct ResolvedKey {
     label: String,
     columns: Vec<KeyColumn>,
-    /// Per column, the type `converter` encodes it in (see [`row_type`]).
-    row_types: Vec<DataType>,
-    converter: RowConverter,
+    /// Per column, the type `encoder` encodes it in: its own, or a
+    /// dictionary's value type (see [`key_index::key_type`]). Build and probe
+    /// both cast a value to the column's own type first, then to this one, so
+    /// they encode it identically.
+    encoded_types: Vec<DataType>,
+    /// The file-mode index's encoding, so SQL-equal floats (`-0.0` and `0.0`,
+    /// every NaN) share a hash and a lookup never misses a row its predicate
+    /// keeps.
+    encoder: KeyEncoder,
 }
 
-/// The type a key column of `data_type` is row-encoded in: its own, except
-/// `Float16`, which the row encoding lacks and which widens to `Float32`
-/// exactly, so distinct values stay distinct. Build and probe both cast a
-/// value to the column's own type first, then to this one, so they encode it
-/// identically.
-fn row_type(data_type: &DataType) -> DataType {
-    match data_type {
-        DataType::Float16 => DataType::Float32,
-        other => other.clone(),
-    }
+/// The hash of every row of `columns` under `encoder`, `None` for a row with a
+/// NULL key value, which no equality predicate matches.
+fn key_hashes(encoder: &KeyEncoder, columns: &[ArrayRef]) -> Option<Vec<Option<u64>>> {
+    let bound = encoder.bind(columns).ok()?;
+    let mut key = Vec::new();
+    Some(
+        (0..bound.num_rows())
+            .map(|row| {
+                (!bound.has_null(row)).then(|| {
+                    key.clear();
+                    bound.encode_row(row, &mut key);
+                    hash_index::hash_key_bytes_oneshot(&key)
+                })
+            })
+            .collect(),
+    )
 }
 
 /// A memory-mode table's secondary indexes: its keys, and the account every
@@ -112,15 +124,22 @@ impl MemTierIndexer {
                 .map(|column| KeyColumn::resolve(schema, column))
                 .collect::<Result<Vec<_>, String>>()
                 .and_then(|columns| {
-                    let encoded: Vec<KeyColumn> = columns
+                    let encoded_types: Vec<DataType> = columns
                         .iter()
-                        .map(|column| column.encoded_as(row_type(&column.data_type)))
+                        .map(|column| key_index::key_type(&column.data_type).clone())
                         .collect();
-                    key_converter(&encoded).map(|converter| ResolvedKey {
+                    let encoder = KeyEncoder::new(
+                        encoded_types
+                            .iter()
+                            .map(|data_type| KeyField::new(data_type.clone(), true))
+                            .collect(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(ResolvedKey {
                         label: spec.label().to_string(),
-                        row_types: encoded.into_iter().map(|column| column.data_type).collect(),
+                        encoded_types,
                         columns,
-                        converter,
+                        encoder,
                     })
                 });
             match resolved {
@@ -162,27 +181,20 @@ impl MemTierIndexer {
             let columns = key
                 .columns
                 .iter()
-                .zip(&key.row_types)
-                .map(|(column, row_type)| {
+                .zip(&key.encoded_types)
+                .map(|(column, encoded_type)| {
                     let array = batch.column_by_name(&column.name)?;
                     let array = cast_to(array, &column.data_type).ok()?;
-                    cast_to(&array, row_type).ok()
+                    cast_to(&array, encoded_type).ok()
                 })
                 .collect::<Option<Vec<ArrayRef>>>()?;
-            let encoded = key.converter.convert_columns(&columns).ok()?;
-            let mut entries: Vec<(u64, u32)> = Vec::with_capacity(num_rows as usize);
-            for row in 0..num_rows {
-                let at = row as usize;
-                // A NULL never satisfies an equality predicate, so an incomplete
-                // key is not indexed.
-                if columns.iter().any(|column| column.is_null(at)) {
-                    continue;
-                }
-                entries.push((
-                    hash_index::hash_key_bytes_oneshot(encoded.row(at).as_ref()),
-                    row,
-                ));
-            }
+            // A NULL never satisfies an equality predicate, so an incomplete
+            // key is not indexed.
+            let mut entries: Vec<(u64, u32)> = key_hashes(&key.encoder, &columns)?
+                .into_iter()
+                .zip(0..num_rows)
+                .filter_map(|(hash, row)| hash.map(|hash| (hash, row)))
+                .collect();
             entries.sort_unstable();
             let (hashes, rows): (Vec<u64>, Vec<u32>) = entries.into_iter().unzip();
             keys.push(BatchKeyIndex {
@@ -275,25 +287,24 @@ impl MemTierIndexer {
         let columns = key
             .columns
             .iter()
-            .zip(&key.row_types)
+            .zip(&key.encoded_types)
             .enumerate()
-            .map(|(at, (column, row_type))| {
+            .map(|(at, (column, encoded_type))| {
                 let values = tuples
                     .iter()
                     .map(|tuple| {
                         tuple[at]
                             .cast_to(&column.data_type)
-                            .and_then(|value| value.cast_to(row_type))
+                            .and_then(|value| value.cast_to(encoded_type))
                             .ok()
                     })
                     .collect::<Option<Vec<_>>>()?;
                 ScalarValue::iter_to_array(values).ok()
             })
             .collect::<Option<Vec<ArrayRef>>>()?;
-        let encoded = key.converter.convert_columns(&columns).ok()?;
-        let mut hashes: Vec<u64> = (0..tuples.len())
-            .filter(|&row| columns.iter().all(|column| !column.is_null(row)))
-            .map(|row| hash_index::hash_key_bytes_oneshot(encoded.row(row).as_ref()))
+        let mut hashes: Vec<u64> = key_hashes(&key.encoder, &columns)?
+            .into_iter()
+            .flatten()
             .collect();
         hashes.sort_unstable();
         hashes.dedup();
@@ -429,7 +440,7 @@ impl SegmentIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, UnboundedMemoryPool};
 

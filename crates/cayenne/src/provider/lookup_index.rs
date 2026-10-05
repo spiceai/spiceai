@@ -82,7 +82,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
-use crate::row_converter::{RowConverter, SortField};
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::UInt64Type;
@@ -391,14 +390,6 @@ pub(crate) struct KeyColumn {
 }
 
 impl KeyColumn {
-    /// This column, encoded in `data_type` instead of its stored type.
-    pub(crate) fn encoded_as(&self, data_type: DataType) -> Self {
-        Self {
-            data_type,
-            ..self.clone()
-        }
-    }
-
     /// Resolves a configured key column: an exact name wins, then a unique
     /// case-insensitive match. Two case-insensitive candidates are an error
     /// rather than a guess, because building from one column and probing with
@@ -436,20 +427,6 @@ impl KeyColumn {
             self.nullable,
         ))
     }
-}
-
-/// The byte-comparable encoding of one key's columns.
-pub(crate) fn key_converter(columns: &[KeyColumn]) -> Result<RowConverter, String> {
-    RowConverter::new(
-        columns
-            .iter()
-            .map(|column| SortField::new(column.data_type.clone()))
-            .collect(),
-    )
-    .map_err(|e| {
-        let types: Vec<String> = columns.iter().map(|c| c.data_type.to_string()).collect();
-        format!("key ({}) cannot be row-encoded: {e}", types.join(", "))
-    })
 }
 
 /// Casts `array` to `data_type`, or returns it unchanged when it already matches.
