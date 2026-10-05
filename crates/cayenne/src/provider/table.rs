@@ -2466,6 +2466,10 @@ pub struct CayenneTableProvider {
     /// staging. The `write_lock` serializes writers, so the flag is a reliable
     /// "we left it clean" signal between appends in the same process.
     staging_may_have_files: Arc<AtomicBool>,
+    /// Set when a write could not learn whether its catalog transaction
+    /// committed. Its files are kept, and every later write fails until the
+    /// table is reopened from the catalog.
+    publication_outcome_unknown: Arc<AtomicBool>,
     /// Staging snapshot IDs whose WALs belong to prepared appends in this
     /// process. `ensure_no_incomplete_write` ignores these WALs so CDC Stage A
     /// can continue while a previous Stage B is pending; after restart the set
@@ -5720,6 +5724,27 @@ impl CayenneTableProvider {
 
     pub(crate) fn staging_may_have_files(&self) -> &AtomicBool {
         &self.staging_may_have_files
+    }
+
+    pub(crate) fn publication_outcome_unknown(&self) -> &AtomicBool {
+        &self.publication_outcome_unknown
+    }
+
+    /// Refuse a write once an earlier one could not learn whether its catalog
+    /// transaction committed: this table's in-memory view may then miss rows the
+    /// catalog holds, which only reloading the table from the catalog restores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::IncompleteWrite`] after such a write.
+    pub(crate) fn ensure_publication_outcome_known(&self) -> Result<()> {
+        if self.publication_outcome_unknown.load(Ordering::Acquire) {
+            return Err(Error::IncompleteWrite {
+                table: self.table_name().to_string(),
+                message: "an earlier write could not confirm whether it committed, so writes are refused until the table is reloaded from its catalog. Restart Spice to reload it".to_string(),
+            });
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -9416,6 +9441,7 @@ impl CayenneTableProvider {
             // list when both flags are clear.
             staging_wal_present: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             staging_may_have_files: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
+            publication_outcome_unknown: Arc::new(AtomicBool::new(false)),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
             retired_snapshot_dirs: Arc::new(ParkingMutex::new(HashMap::new())),
             snapshot_last_listed: Arc::new(ParkingMutex::new(HashMap::new())),
@@ -11532,6 +11558,7 @@ impl CayenneTableProvider {
             last_slot_advance_at: Arc::clone(&self.last_slot_advance_at),
             staging_wal_present: Arc::clone(&self.staging_wal_present),
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
+            publication_outcome_unknown: Arc::clone(&self.publication_outcome_unknown),
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
             retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),

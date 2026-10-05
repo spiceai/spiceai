@@ -631,6 +631,7 @@ impl DeletionSink for InlineAwareDeletionSink {
         _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let _write_guard = self.table.write_lock.lock().await;
+        self.table.ensure_publication_outcome_known()?;
         self.table.mark_maintained_aggregates_stale();
 
         // Make the in-memory CDC tier durable and capture the scan sources inside

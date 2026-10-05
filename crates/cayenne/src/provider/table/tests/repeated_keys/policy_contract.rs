@@ -365,3 +365,170 @@ async fn late_append_error_does_not_publish_an_earlier_segment() {
         assert_unchanged(visible(&reopened).await);
     }
 }
+
+/// A file-backed keyed table of `mode` whose writes always stream, holding
+/// `(9, "old")`.
+async fn seeded_streaming_table(
+    mode: DeletionMode,
+) -> (
+    CayenneTableProvider,
+    Arc<dyn MetadataCatalog>,
+    Arc<RuntimeEnv>,
+    TempDir,
+) {
+    let runtime_env = SessionContext::new().runtime_env();
+    let (mut provider, catalog, dir) = create_cdc_table_with_schema(
+        "t",
+        Arc::clone(&runtime_env),
+        schema(),
+        vec!["id".to_string()],
+        VortexConfig {
+            deletion_mode: mode,
+            inline_max_rows: 0,
+            stream_publish_interval_ms: 0,
+            compaction_background_interval_ms: 3_600_000,
+            ..VortexConfig::default()
+        },
+        upsert_on_id(),
+    )
+    .await;
+    provider.upsert_dedup = UpsertDedup::KeepLast;
+    write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
+        .await
+        .expect("seed");
+    (provider, catalog, runtime_env, dir)
+}
+
+/// A catalog commit that reports a failure is resolved by reading back
+/// whether it committed: a commit that happened is published, one that did
+/// not leaves the prior rows, and one whose outcome cannot be read keeps its
+/// files and refuses writes until the table is reloaded, which then serves it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_commit_is_resolved_by_its_durable_outcome() {
+    use crate::provider::append_commit::test_seams::{self, CommitFault};
+
+    let old = (owned(&[(9, "old")]), 1);
+    let new = (owned(&[(9, "new"), (10, "new")]), 2);
+    let replacement = || vec![batch(&[(9, "new"), (10, "new")])];
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        for fault in [
+            CommitFault::FailAfterCommit,
+            CommitFault::FailWithoutCommit,
+            CommitFault::FailAfterCommitUnreadable,
+        ] {
+            let label = format!("{mode:?}/{fault:?}");
+            let (provider, catalog, runtime_env, _dir) = seeded_streaming_table(mode).await;
+            test_seams::inject(provider.table_id(), fault);
+            let result = write(&provider, InsertOp::Append, replacement()).await;
+            let durable = match fault {
+                CommitFault::FailAfterCommit => {
+                    result.unwrap_or_else(|error| {
+                        panic!("{label}: a commit that happened is published: {error}")
+                    });
+                    assert_eq!(visible(&provider).await, new, "{label}: live rows");
+                    new.clone()
+                }
+                CommitFault::FailWithoutCommit => {
+                    let error = result.expect_err("a commit that did not happen fails");
+                    assert!(
+                        error.to_string().contains("injected commit failure"),
+                        "{label}: {error}"
+                    );
+                    assert_eq!(visible(&provider).await, old, "{label}: live rows");
+                    write(&provider, InsertOp::Append, replacement())
+                        .await
+                        .unwrap_or_else(|error| panic!("{label}: retry: {error}"));
+                    assert_eq!(visible(&provider).await, new, "{label}: retried");
+                    new.clone()
+                }
+                CommitFault::FailAfterCommitUnreadable => {
+                    let error = result.expect_err("an unknown outcome fails");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("reading back whether it committed failed too"),
+                        "{label}: {error}"
+                    );
+                    let error = write(&provider, InsertOp::Append, vec![batch(&[(11, "x")])])
+                        .await
+                        .expect_err("writes are refused after an unknown outcome");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("writes are refused until the table is reloaded"),
+                        "{label}: {error}"
+                    );
+                    new.clone()
+                }
+            };
+            let reopened = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+            assert_eq!(visible(&reopened).await, durable, "{label}: reopened");
+            write(&reopened, InsertOp::Append, vec![batch(&[(11, "x")])])
+                .await
+                .unwrap_or_else(|error| panic!("{label}: the reloaded table writes: {error}"));
+        }
+    }
+}
+
+/// Cancelling a write after its commit began does not release the write lock
+/// early or abandon the commit: the next writer waits until the snapshot is
+/// published, and it survives reopening.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_append_publishes_before_releasing_the_write_lock() {
+    use crate::provider::append_commit::test_seams;
+
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = seeded_streaming_table(mode).await;
+        let (reached_tx, reached) = tokio::sync::oneshot::channel::<()>();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_in_commit = Arc::clone(&release);
+        test_seams::pause_before_commit(
+            provider.table_id(),
+            Box::new(move || {
+                Box::pin(async move {
+                    let _ = reached_tx.send(());
+                    release_in_commit.notified().await;
+                })
+            }),
+        );
+        let writer = provider.clone_for_write();
+        let caller = tokio::spawn(async move {
+            write(
+                &writer,
+                InsertOp::Append,
+                vec![batch(&[(9, "new"), (10, "new")])],
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), reached)
+            .await
+            .expect("the commit starts")
+            .expect("the commit signals");
+        caller.abort();
+        assert!(
+            caller.await.expect_err("the caller is cancelled").is_cancelled(),
+            "{mode:?}"
+        );
+        assert!(
+            provider.write_lock_arc().try_lock_owned().is_err(),
+            "{mode:?}: the commit still holds the write lock"
+        );
+        assert_eq!(
+            visible(&provider).await,
+            (owned(&[(9, "old")]), 1),
+            "{mode:?}: nothing is published before the commit"
+        );
+        release.notify_one();
+        let next_writer = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.write_lock_arc().lock_owned(),
+        )
+        .await
+        .expect("the commit releases the write lock");
+        let expected = (owned(&[(9, "new"), (10, "new")]), 2);
+        assert_eq!(visible(&provider).await, expected, "{mode:?}: published");
+        drop(next_writer);
+        let reopened = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+        assert_eq!(visible(&reopened).await, expected, "{mode:?}: reopened");
+    }
+}

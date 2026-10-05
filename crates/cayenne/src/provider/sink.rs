@@ -143,6 +143,9 @@ impl DataSink for CayenneDataSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
+        self.table
+            .ensure_publication_outcome_known()
+            .map_err(datafusion_common::DataFusionError::from)?;
         // Normalize incoming batches to the table schema (e.g. CDC nullability mismatches)
         // causing Vortex assertion failures.
         let target_schema = Arc::clone(&self.schema);

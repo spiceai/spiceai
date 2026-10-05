@@ -1763,6 +1763,7 @@ impl CayenneTableProvider {
     /// missing from both staging and the target snapshot, or the WAL removal
     /// after a successful move fails.
     pub(crate) async fn ensure_no_incomplete_write(&self) -> Result<()> {
+        self.ensure_publication_outcome_known()?;
         if !self.staging_wal_present().load(Ordering::Acquire)
             && !self.staging_may_have_files().load(Ordering::Acquire)
         {
