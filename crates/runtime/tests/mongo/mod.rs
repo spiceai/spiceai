@@ -47,17 +47,6 @@ use app::AppBuilder;
 use runtime::Runtime;
 use tracing::instrument;
 
-const MONGODB_PORT1: u16 = 27019;
-const MONGODB_JSON_NESTING_PORT: u16 = 27038;
-#[cfg(feature = "duckdb")]
-const MONGODB_CHANGE_STREAM_PORT: u16 = 27020;
-#[cfg(feature = "duckdb")]
-const MONGODB_CHANGE_STREAM_INFERENCE_PORT: u16 = 27035;
-#[cfg(feature = "duckdb")]
-const MONGODB_INFERENCE_PORT: u16 = 27036;
-#[cfg(feature = "duckdb")]
-const MONGODB_WIDEN_PORT: u16 = 27037;
-
 #[instrument]
 async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
     tracing::debug!("INIT DB: test");
@@ -222,16 +211,17 @@ async fn mongodb_integration_test() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_mongodb_docker_container(MONGODB_PORT1)
-                .await
-                .map_err(|e| {
-                    tracing::error!("start_mongodb_docker_container: {e}");
-                    e.to_string()
-                })?;
+            let running_container = start_mongodb_docker_container().await.map_err(|e| {
+                tracing::error!("start_mongodb_docker_container: {e}");
+                e.to_string()
+            })?;
+            let port = running_container
+                .host_port(27017)
+                .map_err(|e| e.to_string())?;
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mongodb_db(MONGODB_PORT1).await.map_err(|e| {
+                init_mongodb_db(port).await.map_err(|e| {
                     tracing::error!("Failed transiently to initialize MongoDB database: {e}");
                     RetryError::transient(e)
                 })
@@ -242,7 +232,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mongodb_integration_test")
-                .with_dataset(make_mongodb_dataset("test", "test", MONGODB_PORT1, false))
+                .with_dataset(make_mongodb_dataset("test", "test", port, false))
                 .build();
 
             configure_test_datafusion();
@@ -348,12 +338,12 @@ async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_mongodb_docker_container(MONGODB_JSON_NESTING_PORT).await?;
+            let running_container = start_mongodb_docker_container().await?;
+            let port = running_container.host_port(27017)?;
 
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mongodb_json_nesting_db(MONGODB_JSON_NESTING_PORT)
+                init_mongodb_json_nesting_db(port)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -361,8 +351,7 @@ async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error
 
             let mut metadata = HashMap::new();
             metadata.insert("json_object".to_string(), json!("*"));
-            let mut dataset =
-                make_mongodb_dataset("nested", "nested", MONGODB_JSON_NESTING_PORT, false);
+            let mut dataset = make_mongodb_dataset("nested", "nested", port, false);
             dataset.columns = vec![
                 Column::new("_id"),
                 Column::new("name"),
@@ -466,10 +455,11 @@ async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Erro
 
     test_request_context()
         .scope(async {
-            let running_container = start_mongodb_docker_container(MONGODB_INFERENCE_PORT).await?;
+            let running_container = start_mongodb_docker_container().await?;
+            let port = running_container.host_port(27017)?;
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mongodb_inventory_db(MONGODB_INFERENCE_PORT)
+                init_mongodb_inventory_db(port)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -479,7 +469,7 @@ async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Erro
                 .with_dataset(make_mongodb_inference_dataset(
                     "inventory",
                     "inventory",
-                    MONGODB_INFERENCE_PORT,
+                    port,
                 ))
                 .build();
 
@@ -532,10 +522,11 @@ async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyho
     test_request_context()
         .scope(async {
             let running_container =
-                start_mongodb_replica_set_docker_container(MONGODB_CHANGE_STREAM_PORT).await?;
+                start_mongodb_replica_set_docker_container().await?;
+            let port = running_container.host_port(27017)?;
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mongodb_change_stream_db(MONGODB_CHANGE_STREAM_PORT)
+                init_mongodb_change_stream_db(port)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -545,7 +536,7 @@ async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyho
                 .with_dataset(make_mongodb_change_stream_dataset(
                     "change_stream_users",
                     "change_stream_users",
-                    MONGODB_CHANGE_STREAM_PORT,
+                    port,
                 ))
                 .build();
 
@@ -574,7 +565,7 @@ async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyho
             .await;
             assert!(initial_rows_loaded, "initial MongoDB snapshot should load");
 
-            let client = get_mongodb_replica_set_client(MONGODB_CHANGE_STREAM_PORT).await?;
+            let client = get_mongodb_replica_set_client(port).await?;
             let collection: Collection<mongodb::bson::Document> = client
                 .database("testdb")
                 .collection("change_stream_users");
@@ -629,11 +620,12 @@ async fn mongodb_change_streams_infer_primary_key() -> Result<(), anyhow::Error>
     test_request_context()
         .scope(async {
             let running_container =
-                start_mongodb_replica_set_docker_container(MONGODB_CHANGE_STREAM_INFERENCE_PORT)
+                start_mongodb_replica_set_docker_container()
                     .await?;
+            let port = running_container.host_port(27017)?;
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mongodb_change_stream_db(MONGODB_CHANGE_STREAM_INFERENCE_PORT)
+                init_mongodb_change_stream_db(port)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -643,7 +635,7 @@ async fn mongodb_change_streams_infer_primary_key() -> Result<(), anyhow::Error>
                 .with_dataset(make_mongodb_change_stream_dataset_inferred(
                     "change_stream_users",
                     "change_stream_users",
-                    MONGODB_CHANGE_STREAM_INFERENCE_PORT,
+                    port,
                 ))
                 .build();
 
@@ -680,7 +672,7 @@ async fn mongodb_change_streams_infer_primary_key() -> Result<(), anyhow::Error>
 
             // An UPDATE should upsert in place (inferred on_conflict), not append.
             let client =
-                get_mongodb_replica_set_client(MONGODB_CHANGE_STREAM_INFERENCE_PORT).await?;
+                get_mongodb_replica_set_client(port).await?;
             let collection: Collection<mongodb::bson::Document> =
                 client.database("testdb").collection("change_stream_users");
             collection
@@ -741,13 +733,16 @@ async fn seed_mongodb_widen_collection(port: u16, with_country: bool) -> Result<
 /// `DuckDB` so the acceleration survives the restart). Re-registers connectors
 /// each call since a prior `shutdown()` clears them.
 #[cfg(feature = "duckdb")]
-async fn build_mongodb_widen_runtime(duckdb_file: &str) -> Result<Arc<Runtime>, anyhow::Error> {
+async fn build_mongodb_widen_runtime(
+    port: u16,
+    duckdb_file: &str,
+) -> Result<Arc<Runtime>, anyhow::Error> {
     register_test_connectors().await;
     let app = AppBuilder::new("mongodb_schema_evolution_widening")
         .with_dataset(make_mongodb_widen_dataset(
             "widen",
             "widen",
-            MONGODB_WIDEN_PORT,
+            port,
             duckdb_file,
         ))
         .build();
@@ -784,19 +779,20 @@ async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::E
                 .to_string_lossy()
                 .to_string();
 
-            let running_container = start_mongodb_docker_container(MONGODB_WIDEN_PORT).await?;
+            let running_container = start_mongodb_docker_container().await?;
+            let port = running_container.host_port(27017)?;
 
             // Seed two documents with only {_id, name}.
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                seed_mongodb_widen_collection(MONGODB_WIDEN_PORT, false)
+                seed_mongodb_widen_collection(port, false)
                     .await
                     .map_err(RetryError::transient)
             })
             .await?;
 
             // Phase 1: initial load infers {_id, name}.
-            let rt = build_mongodb_widen_runtime(&duckdb_file).await?;
+            let rt = build_mongodb_widen_runtime(port, &duckdb_file).await?;
             let batches = run_query(&rt, "SELECT _id, name FROM widen ORDER BY _id").await?;
             let rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
             assert_eq!(rows, 2, "expected 2 rows in the initial MongoDB load");
@@ -804,14 +800,14 @@ async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::E
             drop(rt);
 
             // A document carrying the new `country` field arrives.
-            seed_mongodb_widen_collection(MONGODB_WIDEN_PORT, true).await?;
+            seed_mongodb_widen_collection(port, true).await?;
 
             // Phase 2: restart re-infers the wider schema and adopts `country` into the
             // acceleration under sync_all_columns. The restart evolves the schema in place
             // (existing rows preserved) rather than re-fetching, so the proof is that the
             // column is now in the registered schema and queryable — under `block` this
             // query would error (the column would not be registered).
-            let rt = build_mongodb_widen_runtime(&duckdb_file).await?;
+            let rt = build_mongodb_widen_runtime(port, &duckdb_file).await?;
             let batches =
                 run_query(&rt, "SELECT _id, name, country FROM widen ORDER BY _id").await?;
             let has_country = batches

@@ -25,6 +25,11 @@ limitations under the License.
 
 mod common;
 
+use common::lookup_index::{
+    TableSpec, counters, insert, int64_column, open_table, overwrite, poll_until, query,
+    runtime_with_pool, until_covered,
+};
+
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -34,14 +39,12 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use cayenne::CayenneTableProvider;
 use cayenne::lookup_index::LookupIndexCounters;
-use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::provider::CayenneContext;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::metadata::VortexConfig;
 
 use datafusion::datasource::TableProvider;
-use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
 
 const KEY: [&str; 2] = ["TenantId", "ServiceId"];
@@ -89,115 +92,26 @@ fn lookup_sql(table: &str, id: i64) -> String {
     )
 }
 
-fn runtime_with_pool(bytes: usize) -> (Arc<RuntimeEnv>, Arc<dyn MemoryPool>) {
-    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
-    let runtime_env = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::clone(&pool))
-        .build_arc()
-        .expect("runtime env");
-    (runtime_env, pool)
-}
-
-/// Creates the table, or reopens it when the catalog already holds one of this
-/// name — the same call the accelerator makes on every registration.
+/// Creates the file-mode table, or reopens it when the catalog already holds
+/// one of this name — the same call the accelerator makes on every
+/// registration.
 async fn open(
     fixture: &common::TestFixture,
     runtime_env: Arc<RuntimeEnv>,
     name: &str,
     indexes: &[&[&str]],
 ) -> Arc<CayenneTableProvider> {
-    let vortex_config = VortexConfig {
-        target_vortex_file_size_mb: 1,
-        ..VortexConfig::default()
-    };
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
-    let options = CreateTableOptions {
-        table_name: name.to_string(),
-        schema: schema(),
-        primary_key: vec![],
-        on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
-        partition_column: None,
-        vortex_config,
-    };
-    let catalog = Arc::clone(&fixture.catalog);
-    let catalog: Arc<dyn MetadataCatalog> = catalog;
-    Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .with_context(context)
-            .with_secondary_indexes(
-                indexes
-                    .iter()
-                    .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
-                    .collect(),
-            )
-            .create(options)
-            .await
-            .expect("create or reopen table"),
+    open_table(
+        fixture,
+        runtime_env,
+        TableSpec::new(name, schema(), indexes),
     )
-}
-
-async fn overwrite(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
-    let ctx = SessionContext::new();
-    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-        &[vec![batch]],
-        schema(),
-        None,
-    )
-    .expect("overwrite source");
-    let plan = provider
-        .insert_into(
-            &ctx.state(),
-            exec,
-            datafusion_expr::dml::InsertOp::Overwrite,
-        )
-        .await
-        .expect("overwrite plan");
-    datafusion_physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("overwrite");
-}
-
-async fn insert(provider: &Arc<CayenneTableProvider>, name: &str, batch: RecordBatch) {
-    let ctx = SessionContext::new();
-    ctx.register_table(name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("register target");
-    let mem =
-        datafusion::datasource::MemTable::try_new(schema(), vec![vec![batch]]).expect("memtable");
-    ctx.register_table("src", Arc::new(mem))
-        .expect("register src");
-    ctx.sql(&format!("INSERT INTO {name} SELECT * FROM src"))
-        .await
-        .expect("insert plan")
-        .collect()
-        .await
-        .expect("insert");
+    .await
 }
 
 /// Looks up `id` and checks the table returns exactly its one row.
 async fn lookup(provider: &Arc<CayenneTableProvider>, name: &str, id: i64) {
-    let ctx = SessionContext::new();
-    ctx.register_table(name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("register");
-    let batches = ctx
-        .sql(&lookup_sql(name, id))
-        .await
-        .expect("plan lookup")
-        .collect()
-        .await
-        .expect("run lookup");
-    let found: Vec<i64> = batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("AutoId is i64")
-                .values()
-                .to_vec()
-        })
-        .collect();
+    let found = int64_column(&query(provider, name, &lookup_sql(name, id)).await);
     assert_eq!(
         found,
         vec![id],
@@ -237,29 +151,14 @@ async fn dynamic_lookup(provider: &Arc<CayenneTableProvider>, name: &str, ids: &
          ORDER BY s.\"AutoId\""
     );
 
-    ctx.sql(&sql)
-        .await
-        .expect("dynamic lookup plan")
-        .collect()
-        .await
-        .expect("dynamic lookup")
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("AutoId")
-                .values()
-                .to_vec()
-        })
-        .collect()
-}
-
-fn counters(provider: &Arc<CayenneTableProvider>) -> LookupIndexCounters {
-    provider
-        .lookup_index_counters()
-        .expect("the table declares an index")
+    int64_column(
+        &ctx.sql(&sql)
+            .await
+            .expect("dynamic lookup plan")
+            .collect()
+            .await
+            .expect("dynamic lookup"),
+    )
 }
 
 /// Runs lookups over ids `0..rows` until `done` holds, failing with the last
@@ -271,21 +170,19 @@ async fn lookups_until(
     timeout: Duration,
     done: impl Fn(&LookupIndexCounters) -> bool,
 ) -> LookupIndexCounters {
-    let deadline = Instant::now() + timeout;
     let mut i = 0i64;
-    loop {
-        lookup(provider, name, (i * 7919) % rows).await;
-        i += 1;
-        let now = counters(provider);
-        if done(&now) {
-            return now;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "'{name}' did not reach the expected index state within {timeout:?}: {now:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    poll_until(
+        timeout,
+        Duration::from_millis(20),
+        async || {
+            lookup(provider, name, (i * 7919) % rows).await;
+            i += 1;
+            let now = counters(provider);
+            if done(&now) { Ok(now) } else { Err(now) }
+        },
+        |now| format!("'{name}' did not reach the expected index state: {now:?}"),
+    )
+    .await
 }
 
 /// The index follows the `indexes` each registration passes, not whatever the
@@ -302,7 +199,7 @@ async fn indexes_follow_each_registration_not_the_stored_table() {
 
     {
         let first = open(&fixture, Arc::clone(&env), name, &[]).await;
-        overwrite(&first, rows(0, ROWS)).await;
+        overwrite(&first, vec![rows(0, ROWS)]).await;
         assert!(first.lookup_index_counters().is_none());
     }
 
@@ -312,7 +209,7 @@ async fn indexes_follow_each_registration_not_the_stored_table() {
         name,
         i64::try_from(ROWS).expect("fits"),
         Duration::from_secs(30),
-        |c| c.selected > 0,
+        |c| c.full > 0,
     )
     .await;
     assert!(indexed.builds_published >= 1, "{indexed:?}");
@@ -339,68 +236,19 @@ async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
     let name = "dynamic_rebuild";
 
     let initial = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
-    overwrite(&initial, rows(0, ROWS)).await;
+    overwrite(&initial, vec![rows(0, ROWS)]).await;
     drop(initial);
 
     let reopened = open(&fixture, env, name, &[&KEY]).await;
     reopened.init_scan_view_cache();
     assert_eq!(counters(&reopened).index_bytes, 0);
 
-    let ctx = SessionContext::new();
-    ctx.register_table(name, Arc::clone(&reopened) as Arc<dyn TableProvider>)
-        .expect("register target");
-    let key_schema = Arc::new(Schema::new(vec![
-        Field::new("tenant", DataType::Int64, false),
-        Field::new("service", DataType::Utf8, false),
-    ]));
     let ids = [7i64, 1_234, 3_999];
-    let key_batch = RecordBatch::try_new(
-        Arc::clone(&key_schema),
-        vec![
-            Arc::new(Int64Array::from(
-                ids.iter().map(|id| id % 997).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                ids.iter()
-                    .map(|id| format!("SV{id:032x}"))
-                    .collect::<Vec<_>>(),
-            )),
-        ],
-    )
-    .expect("key batch");
-    let keys = datafusion::datasource::MemTable::try_new(key_schema, vec![vec![key_batch]])
-        .expect("key table");
-    ctx.register_table("dynamic_keys", Arc::new(keys))
-        .expect("register keys");
-    let sql = format!(
-        "SELECT s.\"AutoId\" FROM dynamic_keys k INNER JOIN {name} s \
-         ON k.tenant = s.\"TenantId\" AND k.service = s.\"ServiceId\" \
-         ORDER BY s.\"AutoId\""
-    );
-
-    let first = ctx
-        .sql(&sql)
-        .await
-        .expect("first plan")
-        .collect()
-        .await
-        .expect("first execution");
-    let first = first
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("AutoId")
-                .values()
-                .to_vec()
-        })
-        .collect::<Vec<_>>();
+    let first = dynamic_lookup(&reopened, name, &ids).await;
     assert_eq!(first, ids);
     let after_first = counters(&reopened);
     assert!(
-        after_first.unbuilt > 0,
+        after_first.none > 0,
         "first lookup should scan: {after_first:?}"
     );
     assert_eq!(
@@ -408,31 +256,27 @@ async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
         "the dynamic lookup should claim one background build: {after_first:?}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while counters(&reopened).builds_published == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "dynamic lookup build did not publish: {:?}",
-            counters(&reopened)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(20),
+        async || {
+            let now = counters(&reopened);
+            if now.builds_published == 0 {
+                Err(now)
+            } else {
+                Ok(())
+            }
+        },
+        |now| format!("dynamic lookup build did not publish: {now:?}"),
+    )
+    .await;
 
-    let selected_before = counters(&reopened).selected;
-    let second = ctx
-        .sql(&sql)
-        .await
-        .expect("second plan")
-        .collect()
-        .await
-        .expect("second execution");
+    let full_before = counters(&reopened).full;
+    let second = dynamic_lookup(&reopened, name, &ids).await;
+    assert_eq!(second.len(), ids.len());
     assert_eq!(
-        second.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        ids.len()
-    );
-    assert_eq!(
-        counters(&reopened).selected,
-        selected_before + 1,
+        counters(&reopened).full,
+        full_before + 1,
         "the next dynamic lookup should use the rebuilt index"
     );
 }
@@ -453,7 +297,7 @@ async fn a_build_the_pool_cannot_fit_is_not_retried_on_every_lookup() {
     let (env, _pool) = runtime_with_pool(MIB);
     let name = "refused";
     let initial = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
-    overwrite(&initial, rows(0, ROWS)).await;
+    overwrite(&initial, vec![rows(0, ROWS)]).await;
     // The overwrite's own write-time build is refused by this pool too, and a
     // refused write-time build seeds the very schedule the loop below measures:
     // the next build waits `2 * max(1s, 10 * write_build_time)`, which passes the
@@ -478,17 +322,21 @@ async fn a_build_the_pool_cannot_fit_is_not_retried_on_every_lookup() {
     }
     let after = counters(&table);
     assert_eq!(
-        after.selected, 0,
+        after.full, 0,
         "nothing was published to select from: {after:?}"
     );
     assert!(
         after.builds_started >= 1,
-        "the first lookup on an unbuilt index must claim a build: {after:?}"
+        "the first lookup on an index that covers nothing must claim a build: {after:?}"
     );
     assert!(
         after.builds_started <= MAX_BUILDS,
         "{lookups} lookups in {window:?} started {} background builds; a refused build must back off: {after:?}",
         after.builds_started
+    );
+    assert!(
+        after.builds_unpublished <= after.builds_started,
+        "each refused build is counted once as unpublished: {after:?}"
     );
     // How often the loop got to run is not the subject, so the floor stays well
     // clear of what a loaded runner can deliver: an absolute floor high enough
@@ -547,7 +395,7 @@ async fn a_lookup_dropped_mid_build_claim_does_not_strand_the_index() {
             &name,
             i64::try_from(ROWS).expect("fits"),
             Duration::from_secs(30),
-            |c| c.builds_published >= 1 && c.selected > 0,
+            |c| c.builds_published >= 1 && c.full > 0,
         )
         .await;
         println!("polls={polls} completed_before_drop={completed} counters={indexed:?}");
@@ -567,13 +415,13 @@ async fn dropping_an_indexed_table_releases_its_memory() {
     let (env, pool) = runtime_with_pool(1024 * MIB);
     let name = "dropped";
     let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
-    overwrite(&table, rows(0, ROWS)).await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
     let used = lookups_until(
         &table,
         name,
         i64::try_from(ROWS).expect("fits"),
         Duration::from_secs(30),
-        |c| c.selected > 0,
+        |c| c.full > 0,
     )
     .await;
     assert!(used.index_bytes > 0, "{used:?}");
@@ -585,73 +433,321 @@ async fn dropping_an_indexed_table_releases_its_memory() {
 
     drop(table);
     drop(env);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while pool.reserved() > 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        pool.reserved(),
-        0,
-        "a dropped table must release its reservation ({reserved} bytes before the drop)"
-    );
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        async || match pool.reserved() {
+            0 => Ok(()),
+            still => Err(still),
+        },
+        |still| {
+            format!(
+                "a dropped table must release its reservation: {still} bytes still reserved, \
+                 {reserved} before the drop"
+            )
+        },
+    )
+    .await;
 }
 
-/// Rows appended after the build make the index stale for the snapshot it was
-/// built on: a dynamic lookup drops it, scans safely, requests a replacement,
-/// and uses that replacement for later lookups of the appended rows.
-///
-/// An append keeps the snapshot id, so runtime probes must also compare the file
-/// set captured by the scan with the one covered by the index.
+/// Every write indexes the files it writes, so appends and compactions never
+/// leave the index stale: the first lookups after each, literal and join
+/// alike, are answered from the index with no rebuild, and the index still
+/// agrees row for row with a read-back of the files.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_append_drops_the_stale_index_and_dynamic_lookups_rebuild_it() {
+async fn appends_and_compactions_keep_the_index_current() {
     const ROWS: usize = 20_000;
+    const ROUNDS: usize = 6;
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
     let env = Arc::new(RuntimeEnv::default());
     let name = "appended";
-    let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
-    table.init_scan_view_cache();
-    overwrite(&table, rows(0, ROWS)).await;
-    let before = lookups_until(
-        &table,
-        name,
-        i64::try_from(ROWS).expect("fits"),
-        Duration::from_secs(30),
-        |c| c.selected > 0,
+    // Small files compact after four, so the test can drive a compaction.
+    let config = VortexConfig {
+        target_vortex_file_size_mb: 1,
+        compaction_trigger_files: 4,
+        compaction_background_interval_ms: 0,
+        ..VortexConfig::default()
+    };
+    let table = open_table(
+        &fixture,
+        Arc::clone(&env),
+        TableSpec::new(name, schema(), &[&KEY]).config(config),
     )
     .await;
+    table.init_scan_view_cache();
+    overwrite(&table, vec![rows(0, ROWS)]).await;
+    let rows_i64 = i64::try_from(ROWS).expect("fits");
+    // Above the inline cap, so each append writes a file, and small.
+    let appended_rows: i64 = 3_000;
+    lookups_until(&table, name, rows_i64, Duration::from_secs(30), |c| {
+        c.full > 0
+    })
+    .await;
+    // The table's current data files, indexed or not.
+    let file_count = |table: &Arc<CayenneTableProvider>| {
+        let table = Arc::clone(table);
+        async move {
+            let verification = table
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            verification.files + verification.uncovered_files
+        }
+    };
+    let base_files = file_count(&table).await;
 
-    let appended = i64::try_from(ROWS).expect("fits");
-    insert(&table, name, rows(appended, ROWS)).await;
-    let ids = [appended, appended + 1, appended * 2 - 1];
-    assert_eq!(dynamic_lookup(&table, name, &ids).await, ids);
-    let after_first = counters(&table);
-    assert!(
-        after_first.snapshot_mismatch > before.snapshot_mismatch,
-        "the stale runtime index must be refused: {before:?} -> {after_first:?}"
-    );
-
-    let deadline = Instant::now() + Duration::from_mins(1);
-    while counters(&table).builds_published <= before.builds_published {
-        assert!(
-            Instant::now() < deadline,
-            "the replacement index did not publish: {:?}",
-            counters(&table)
+    let check = |label: &str, before: &LookupIndexCounters, after: &LookupIndexCounters| {
+        assert_eq!(
+            (
+                after.full - before.full,
+                after.none - before.none,
+                after.builds_started - before.builds_started,
+            ),
+            (2, 0, 0),
+            "the literal and join lookups right after {label} were not both answered from the index: {before:?} -> {after:?}"
         );
+    };
+    for round in 1..=i64::try_from(ROUNDS).expect("fits") {
+        let appended = rows_i64 * round;
+        insert(
+            &table,
+            name,
+            rows(appended, usize::try_from(appended_rows).expect("fits")),
+        )
+        .await;
+        let before = counters(&table);
+        lookup(&table, name, appended + 7).await;
+        let ids = [appended, appended + 1, appended + appended_rows - 1];
         assert_eq!(dynamic_lookup(&table, name, &ids).await, ids);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        check(&format!("append {round}"), &before, &counters(&table));
     }
-    assert!(
-        counters(&table).builds_started > before.builds_started,
-        "a paced dynamic lookup must claim the replacement build"
-    );
 
-    let selected_before = counters(&table).selected;
+    // A compaction replaces the appended files. One may already be running
+    // after the last append, or have finished: each append wrote at least one
+    // file, so fewer files than the appends left means one already ran.
+    let snapshot = |table: &Arc<CayenneTableProvider>| {
+        let table = Arc::clone(table);
+        async move {
+            table
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify")
+                .snapshot_id
+        }
+    };
+    let appended_snapshot = snapshot(&table).await;
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        async || {
+            let pending = !table
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("compaction")
+                && snapshot(&table).await == appended_snapshot
+                && file_count(&table).await >= base_files + ROUNDS;
+            if pending { Err(()) } else { Ok(()) }
+        },
+        |()| "the appended small files were never compacted".to_string(),
+    )
+    .await;
+    let before = counters(&table);
+    lookup(&table, name, 7).await;
+    let ids = [3, rows_i64 + 5, rows_i64 * 6 + appended_rows - 1];
     assert_eq!(dynamic_lookup(&table, name, &ids).await, ids);
+    check("a compaction", &before, &counters(&table));
+
+    let verification = table
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    assert!(verification.agrees(), "{verification:?}");
     assert_eq!(
-        counters(&table).selected,
-        selected_before + 1,
-        "the later dynamic lookup should use the replacement index"
+        verification.uncovered_files, 0,
+        "every file is indexed by the write that produced it: {verification:?}"
+    );
+    println!("verification after appends and a compaction: {verification:?}");
+
+    // The index identifies a file by its name alone, across the moves and
+    // hardlinks between snapshot directories: two data files may share a
+    // name only when they are the same rows.
+    let mut by_name: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    vortex_files(&fixture.data_path, &mut by_name);
+    assert!(
+        by_name.len() >= 2,
+        "the table wrote data files: {by_name:?}"
+    );
+    for (name, paths) in &by_name {
+        let first = std::fs::read(&paths[0]).expect("read data file");
+        for other in &paths[1..] {
+            assert!(
+                std::fs::read(other).expect("read data file") == first,
+                "two different data files are both named {name}: {paths:?}"
+            );
+        }
+    }
+}
+
+/// Every Vortex data file under `dir`, grouped by file name.
+fn vortex_files(
+    dir: &std::path::Path,
+    by_name: &mut std::collections::HashMap<String, Vec<std::path::PathBuf>>,
+) {
+    for entry in std::fs::read_dir(dir).expect("read dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            vortex_files(&path, by_name);
+        } else if path.extension().is_some_and(|ext| ext == "vortex") {
+            let name = path
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .to_string();
+            by_name.entry(name).or_default().push(path);
+        }
+    }
+}
+
+/// A key column relaxed to nullable on an open table: rows written after it,
+/// including one whose key column is NULL, are found by their keys, and the
+/// rows written before it still are. The change alters the key's encoding, so
+/// the index built before it is dropped and rebuilt from the table's files by
+/// the next lookups, and then covers the files written before and after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_column_relaxed_to_nullable_on_an_open_table_keeps_lookups_exact() {
+    use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
+    const ROWS: usize = 20_000;
+    // Rows written after relaxing: enough for files of their own, the last
+    // with a NULL key column.
+    const AFTER: i64 = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "relaxed_live";
+    let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
+    lookup(&table, name, 11).await;
+
+    let relaxed = Arc::new(Schema::new(vec![
+        Field::new("AutoId", DataType::Int64, false),
+        Field::new("TenantId", DataType::Int64, false),
+        Field::new("ServiceId", DataType::Utf8, true),
+        Field::new("Payload", DataType::Utf8, false),
+    ]));
+    let SchemaEvolution::Widening(plan) = classify(
+        table.schema().as_ref(),
+        &relaxed,
+        &EvolutionContext {
+            constraint_columns: &[],
+        },
+    ) else {
+        panic!("relaxing ServiceId to nullable must be a widening");
+    };
+    table
+        .evolve_schema_live(&plan)
+        .await
+        .expect("relax ServiceId to nullable");
+
+    let first = i64::try_from(ROWS).expect("fits");
+    let ids: Vec<i64> = (first..first + AFTER).collect();
+    let (id, null_id) = (first + 1, first + AFTER - 1);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&relaxed),
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(Int64Array::from(
+                ids.iter().map(|i| i % 997).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                ids.iter()
+                    .map(|&i| (i != null_id).then(|| format!("SV{i:032x}")))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                ids.iter().map(|i| format!("after-{i}")).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("batch after relaxing");
+    let ctx = SessionContext::new();
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register target");
+    let mem =
+        datafusion::datasource::MemTable::try_new(relaxed, vec![vec![batch]]).expect("memtable");
+    ctx.register_table("src", Arc::new(mem))
+        .expect("register src");
+    let inserted = ctx
+        .sql(&format!("INSERT INTO {name} SELECT * FROM src"))
+        .await
+        .expect("insert plan")
+        .collect()
+        .await;
+    println!("insert after relaxing: {:?}", inserted.as_ref().map(|_| ()));
+    inserted.expect("insert after relaxing");
+
+    lookup(&table, name, id).await;
+    lookup(&table, name, 11).await;
+    let nulls = ctx
+        .sql(&format!(
+            "SELECT \"AutoId\" FROM {name} WHERE \"TenantId\" = {} AND \"ServiceId\" IS NULL",
+            null_id % 997
+        ))
+        .await
+        .expect("plan null lookup")
+        .collect()
+        .await
+        .expect("run null lookup");
+    let found: usize = nulls.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(found, 1, "the row with a NULL key column must be read");
+    let verification = table
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    println!("after relaxing on an open table: {verification:?}");
+    assert!(verification.agrees(), "{verification:?}");
+    // The index heals: a lookup over the uncovered files rebuilds it, after
+    // which every file is covered again and lookups use it.
+    let healed = until_covered(&table, async || lookup(&table, name, 7).await).await;
+    println!("after the rebuild: {healed:?}");
+    assert!(healed.agrees(), "{healed:?}");
+    let before = counters(&table);
+    lookup(&table, name, 7).await;
+    assert_eq!(
+        counters(&table).full - before.full,
+        1,
+        "a lookup after the rebuild must use the index"
+    );
+}
+
+/// An `indexes` entry may spell a column in another case than the table does;
+/// the key resolves to the table's column, and a lookup filtering on it uses
+/// the index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_spelled_in_another_case_is_used_by_lookups() {
+    const ROWS: usize = 4_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "cased";
+    let table = open(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&["tenantid", "SERVICEID"]],
+    )
+    .await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
+    let before = counters(&table);
+    lookup(&table, name, 7).await;
+    let after = counters(&table);
+    assert_eq!(
+        after.full - before.full,
+        1,
+        "the lookup did not use the index: {before:?} -> {after:?}"
     );
 }
