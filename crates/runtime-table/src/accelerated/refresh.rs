@@ -553,7 +553,7 @@ pub struct Refresher {
     synchronize_with: Option<SynchronizedTable>,
     snapshot_config: Option<SnapshotCreationConfig>,
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
-    snapshot_interval_task: Option<tokio::task::JoinHandle<()>>,
+    snapshot_task: Option<tokio::task::JoinHandle<()>>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -629,7 +629,7 @@ impl Refresher {
             refresh_completion: None,
             snapshot_config: None,
             snapshot_refresh_state: None,
-            snapshot_interval_task: None,
+            snapshot_task: None,
             metrics: None,
             cpu_runtime,
             cdc_apply_runtime,
@@ -882,7 +882,7 @@ impl Refresher {
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
-                let (snapshot_interval_task, on_batch_process_callback) = match snapshot_trigger {
+                let (snapshot_task, on_batch_process_callback) = match snapshot_trigger {
                     None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
                     Some(SnapshotCreateTrigger::Interval(duration)) => (
                         spawn_snapshot_interval_task(
@@ -901,8 +901,7 @@ impl Refresher {
                         ),
                         None,
                     ),
-                    Some(SnapshotCreateTrigger::Batches(batches)) => (
-                        None,
+                    Some(SnapshotCreateTrigger::Batches(batches)) => {
                         create_periodic_snapshot_callback(
                             *batches,
                             checkpointer.clone(),
@@ -916,10 +915,11 @@ impl Refresher {
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
                             Arc::clone(&self.refresh),
-                        ),
-                    ),
+                        )
+                        .unzip()
+                    }
                 };
-                self.snapshot_interval_task = snapshot_interval_task;
+                self.snapshot_task = snapshot_task;
 
                 return Ok(Some(
                     self.start_changes_stream(stream, on_batch_process_callback),
@@ -995,32 +995,31 @@ impl Refresher {
 
         let synchronize_with = self.synchronize_with.clone();
 
-        let (snapshot_interval_task, create_checkpoint_snapshot_after_refresh) =
-            match snapshot_trigger {
-                // This will only create checkpoint - default behavior when snapshots are not configured
-                #[expect(clippy::match_same_arms)]
-                None => (None, true),
-                Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
-                Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
-                Some(SnapshotCreateTrigger::Interval(duration)) => (
-                    spawn_snapshot_interval_task(
-                        Some(*duration),
-                        checkpointer.clone(),
-                        snapshot_manager.clone(),
-                        Arc::clone(&self.accelerator_write_mutex),
-                        dataset_name.clone(),
-                        Arc::clone(&checkpoint_schema),
-                        Arc::clone(&federated_schema),
-                        Arc::clone(&self.runtime_status),
-                        self.bootstrap_status.clone(),
-                        Arc::clone(&self.last_updated_at),
-                        Some(Arc::clone(&self.accelerator)),
-                        Arc::clone(&self.refresh),
-                    ),
-                    false,
+        let (snapshot_task, create_checkpoint_snapshot_after_refresh) = match snapshot_trigger {
+            // This will only create checkpoint - default behavior when snapshots are not configured
+            #[expect(clippy::match_same_arms)]
+            None => (None, true),
+            Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
+            Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
+            Some(SnapshotCreateTrigger::Interval(duration)) => (
+                spawn_snapshot_interval_task(
+                    Some(*duration),
+                    checkpointer.clone(),
+                    snapshot_manager.clone(),
+                    Arc::clone(&self.accelerator_write_mutex),
+                    dataset_name.clone(),
+                    Arc::clone(&checkpoint_schema),
+                    Arc::clone(&federated_schema),
+                    Arc::clone(&self.runtime_status),
+                    self.bootstrap_status.clone(),
+                    Arc::clone(&self.last_updated_at),
+                    Some(Arc::clone(&self.accelerator)),
+                    Arc::clone(&self.refresh),
                 ),
-            };
-        self.snapshot_interval_task = snapshot_interval_task;
+                false,
+            ),
+        };
+        self.snapshot_task = snapshot_task;
 
         // Gates when checkpoint counting/creation can start after runtime is ready.
         // Set to true immediately when snapshots are not configured, or after the initial
@@ -1045,7 +1044,7 @@ impl Refresher {
                 let accelerator_clone = Arc::clone(&self.accelerator);
                 let refresh_clone = Arc::clone(&self.refresh);
 
-                tokio::spawn(async move {
+                self.snapshot_task = Some(tokio::spawn(async move {
                     // A shutdown before readiness means the initial load never
                     // completed — checkpointing a partial accelerator would
                     // publish it as a complete snapshot.
@@ -1081,7 +1080,7 @@ impl Refresher {
                     tracing::debug!(
                         "Refresh-based snapshot creation for {dataset_name_clone} starting after runtime ready"
                     );
-                });
+                }));
             }
         }
 
@@ -1241,7 +1240,7 @@ impl Refresher {
         {
             tasks.push(task);
         }
-        if let Some(task) = self.snapshot_interval_task.take() {
+        if let Some(task) = self.snapshot_task.take() {
             tasks.push(task);
         }
         tasks
@@ -1313,7 +1312,7 @@ impl Drop for Refresher {
         if let Some(mut refresh_task_runner) = self.refresh_task_runner.take() {
             refresh_task_runner.abort();
         }
-        if let Some(task) = self.snapshot_interval_task.take() {
+        if let Some(task) = self.snapshot_task.take() {
             task.abort();
         }
     }
@@ -1605,6 +1604,63 @@ mod tests {
             trigger,
             refresh_handle,
         )
+    }
+
+    #[tokio::test]
+    async fn snapshot_task_ownership_transfers_once_or_aborts_on_drop() {
+        timeout(Duration::from_secs(5), async {
+            for transfer in [false, true] {
+                let (mut refresher, _, _, outer) =
+                    started_full_refresher(status::RuntimeStatus::new()).await;
+                let (started_tx, started) = tokio::sync::oneshot::channel();
+                let (lifetime, cancelled) = tokio::sync::oneshot::channel::<()>();
+                let (ping, receive_ping) =
+                    tokio::sync::oneshot::channel::<tokio::sync::oneshot::Sender<()>>();
+                let snapshot = tokio::spawn(async move {
+                    let _lifetime = lifetime;
+                    started_tx.send(()).expect("snapshot started");
+                    if let Ok(reply) = receive_ping.await {
+                        let _ = reply.send(());
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let snapshot_id = snapshot.id();
+                let refresher_mut = Arc::get_mut(&mut refresher).expect("unique refresher");
+                refresher_mut.snapshot_task = Some(snapshot);
+                started.await.expect("snapshot is running");
+                let tasks = if transfer {
+                    let tasks = refresher_mut.take_background_tasks();
+                    assert_eq!(tasks.len(), 2, "refresh and snapshot workers");
+                    assert!(tasks.iter().any(|task| task.id() == snapshot_id));
+                    assert!(refresher_mut.take_background_tasks().is_empty());
+                    tasks
+                } else {
+                    Vec::new()
+                };
+                drop(refresher);
+                if transfer {
+                    let (reply, alive) = tokio::sync::oneshot::channel();
+                    ping.send(reply)
+                        .expect("transferred snapshot remains owned");
+                    alive.await.expect("snapshot survives refresher drop");
+                    for task in tasks {
+                        let is_snapshot = task.id() == snapshot_id;
+                        task.abort();
+                        let result = task.await;
+                        if is_snapshot {
+                            assert!(result.expect_err("aborted snapshot").is_cancelled());
+                        }
+                    }
+                }
+                assert!(cancelled.await.is_err(), "snapshot future is destroyed");
+                if let Some(task) = outer {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        })
+        .await
+        .expect("snapshot ownership must settle");
     }
 
     /// A source that holds its scan open until the test lets it through, and
