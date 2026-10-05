@@ -367,7 +367,7 @@ impl ChangeRows for ChangeBatch {
 /// `get`/`into_built` runs [`ChangeRows::build`] and caches the result. A build
 /// failure is terminal for the batch (the source is consumed); a retry reports
 /// the consumed source as an error rather than silently yielding no data.
-struct LazyChangeBatch {
+pub struct LazyChangeBatch {
     built: OnceLock<ChangeBatch>,
     /// `Some` until consumed by the first (successful or failed) build. The
     /// mutex guards only the take/build handoff and is never held across an
@@ -431,8 +431,18 @@ fn reported_again(error: &ChangeBatchError) -> ChangeBatchError {
     }
 }
 
+impl std::fmt::Debug for LazyChangeBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyChangeBatch")
+            .field("materialized", &self.is_materialized())
+            .field("encoded_len", &self.encoded_len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl LazyChangeBatch {
-    fn from_rows(source: Box<dyn ChangeRows>) -> Self {
+    #[must_use]
+    pub fn from_rows(source: Box<dyn ChangeRows>) -> Self {
         Self {
             built: OnceLock::new(),
             source: Mutex::new(Some(source)),
@@ -440,7 +450,8 @@ impl LazyChangeBatch {
         }
     }
 
-    fn ready(batch: ChangeBatch) -> Self {
+    #[must_use]
+    pub fn ready(batch: ChangeBatch) -> Self {
         // Pre-populate `built` so an eagerly-built envelope (every non-deferred
         // connector — Kafka/MongoDB/DynamoDB/Debezium/MySQL, ready signals) reads
         // metadata and the batch itself lock-free via `built.get()`, never boxing
@@ -503,12 +514,20 @@ impl LazyChangeBatch {
     /// metadata accessors resolve without running a (possibly expensive)
     /// deferred build. Lets callers skip a `spawn_blocking` offload they'd
     /// only pay overhead for.
-    fn is_materialized(&self) -> bool {
+    #[must_use]
+    pub fn is_materialized(&self) -> bool {
         self.built.get().is_some()
     }
 
+    /// Borrow a materialized batch without triggering a deferred build.
+    #[must_use]
+    pub fn as_built(&self) -> Option<&ChangeBatch> {
+        self.built.get()
+    }
+
     /// Consume into the owned built batch, building if needed.
-    fn into_built(self) -> Result<ChangeBatch, ChangeBatchError> {
+    /// Deferred builds are CPU work and must be offloaded by async callers.
+    pub fn into_built(self) -> Result<ChangeBatch, ChangeBatchError> {
         if let Some(batch) = self.built.into_inner() {
             return Ok(batch);
         }
@@ -529,7 +548,8 @@ impl LazyChangeBatch {
     // higher-order helper — the built and source branches borrow at different
     // lifetimes, which a single `FnOnce(&dyn ChangeRows)` helper can't satisfy.
 
-    fn is_empty(&self) -> bool {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
         if let Some(prebuilt) = &self.prebuilt {
             return prebuilt.metadata.is_empty;
         }
@@ -547,7 +567,8 @@ impl LazyChangeBatch {
             .is_some_and(ChangeRows::is_empty)
     }
 
-    fn num_rows_hint(&self) -> usize {
+    #[must_use]
+    pub fn num_rows_hint(&self) -> usize {
         if let Some(prebuilt) = &self.prebuilt {
             return prebuilt.metadata.num_rows_hint;
         }
@@ -560,7 +581,8 @@ impl LazyChangeBatch {
             .map_or(0, ChangeRows::num_rows_hint)
     }
 
-    fn encoded_len(&self) -> usize {
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
         if let Some(prebuilt) = &self.prebuilt {
             return prebuilt.metadata.encoded_len;
         }
@@ -573,7 +595,8 @@ impl LazyChangeBatch {
             .map_or(0, ChangeRows::encoded_len)
     }
 
-    fn source_commit_ts_ms(&self) -> Option<i64> {
+    #[must_use]
+    pub fn source_commit_ts_ms(&self) -> Option<i64> {
         if let Some(prebuilt) = &self.prebuilt {
             return prebuilt.metadata.source_commit_ts_ms;
         }
@@ -586,7 +609,8 @@ impl LazyChangeBatch {
             .and_then(ChangeRows::source_commit_ts_ms)
     }
 
-    fn is_heartbeat(&self) -> bool {
+    #[must_use]
+    pub fn is_heartbeat(&self) -> bool {
         if let Some(prebuilt) = &self.prebuilt {
             return prebuilt.metadata.is_heartbeat;
         }
@@ -707,6 +731,18 @@ impl ChangeEnvelope {
     /// dataset's changes stream rather than skipping the batch.
     pub fn change_batch(&self) -> Result<&ChangeBatch, ChangeBatchError> {
         self.change_batch.get()
+    }
+
+    /// Separate source acknowledgement and control from row storage without
+    /// decoding. The source retains the committer and both control flags.
+    #[must_use]
+    pub fn into_lazy_parts(self) -> LazyChangeEnvelopeParts {
+        (
+            self.change_committer,
+            self.change_batch,
+            self.is_dataset_ready,
+            self.history_unavailable,
+        )
     }
 
     /// Consume the envelope into its parts, building a deferred batch if needed.
@@ -834,6 +870,14 @@ impl ChangeEnvelope {
 /// correctness bug rather than a compile error if the tuple hides it. See
 /// [`ChangeEnvelope::history_unavailable`].
 pub type ChangeEnvelopeParts = (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool, bool);
+
+/// Source acknowledgement, lazy row payload, readiness, and rebuild control.
+pub type LazyChangeEnvelopeParts = (
+    Box<dyn CommitChange + Send + Sync>,
+    LazyChangeBatch,
+    bool,
+    bool,
+);
 
 /// Run a CDC batch build off the async worker, but only when it would actually
 /// block: an already-materialized build is a no-op, and `spawn_blocking`

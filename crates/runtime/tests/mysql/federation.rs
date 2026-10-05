@@ -36,10 +36,6 @@ use spicepod::component::catalog::Catalog;
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
-const MYSQL_PORT1: u16 = 13306;
-const MYSQL_PORT2: u16 = 13308;
-const MYSQL_PORT3: u16 = 13310;
-
 #[instrument]
 async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
     let pool = get_mysql_conn(port)?;
@@ -108,19 +104,17 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_mysql_docker_container(MYSQL_PORT1)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("start_mysql_docker_container: {e}");
-                        e.to_string()
-                    })?;
+            let running_container = start_mysql_docker_container().await.map_err(|e| {
+                tracing::error!("start_mysql_docker_container: {e}");
+                e.to_string()
+            })?;
+            let port = running_container
+                .host_port(3306)
+                .map_err(|e| e.to_string())?;
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mysql_db(MYSQL_PORT1)
-                    .await
-                    .map_err(RetryError::transient)
+                init_mysql_db(port).await.map_err(RetryError::transient)
             })
             .await
             .map_err(|e| {
@@ -128,7 +122,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mysql_federation_push_down")
-                .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT1, false))
+                .with_dataset(make_mysql_dataset("lineitem", "line", port, false))
                 .build();
 
             configure_test_datafusion();
@@ -205,18 +199,17 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     register_test_connectors().await;
 
     test_request_context().scope_retry(3, || async {
-        let running_container = start_mysql_docker_container(
-            MYSQL_PORT2,
-        )
+        let running_container = start_mysql_docker_container()
         .await
         .map_err(|e| {
             tracing::error!("start_mysql_docker_container: {e}");
             e.to_string()
         })?;
+        let port = running_container.host_port(3306).map_err(|e| e.to_string())?;
         tracing::debug!("Container started");
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
         retry(retry_strategy, || async {
-            init_mysql_db(MYSQL_PORT2)
+            init_mysql_db(port)
                 .await
                 .map_err(RetryError::transient)
         })
@@ -226,8 +219,8 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             e.to_string()
         })?;
         let app = AppBuilder::new("mysql_federation_inner_join_with_accelerated_dataset")
-            .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT2, false))
-            .with_dataset(make_mysql_dataset("lineitem", "acc_line", MYSQL_PORT2, true))
+            .with_dataset(make_mysql_dataset("lineitem", "line", port, false))
+            .with_dataset(make_mysql_dataset("lineitem", "acc_line", port, true))
             .build();
 
         configure_test_datafusion();
@@ -311,16 +304,17 @@ async fn mysql_btrim_evaluates_locally_on_both_registration_paths() -> Result<()
 
     test_request_context()
         .scope(async {
-            let running_container = start_mysql_docker_container(MYSQL_PORT3)
+            let running_container = start_mysql_docker_container()
                 .await
                 .map_err(|e| {
                     tracing::error!("start_mysql_docker_container: {e}");
                     e.to_string()
                 })?;
+            let port = running_container.host_port(3306).map_err(|e| e.to_string())?;
 
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_trim_table(MYSQL_PORT3)
+                init_trim_table(port)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -329,11 +323,11 @@ async fn mysql_btrim_evaluates_locally_on_both_registration_paths() -> Result<()
 
             let mut catalog = Catalog::new("mysql".to_string(), "mycat".to_string());
             catalog.params = Some(spicepod::param::Params::from_string_map(
-                mysql_connection_params(MYSQL_PORT3),
+                mysql_connection_params(port),
             ));
 
             let app = AppBuilder::new("mysql_btrim")
-                .with_dataset(make_mysql_dataset("trim_src", "myds", MYSQL_PORT3, false))
+                .with_dataset(make_mysql_dataset("trim_src", "myds", port, false))
                 .with_catalog(catalog)
                 .build();
 

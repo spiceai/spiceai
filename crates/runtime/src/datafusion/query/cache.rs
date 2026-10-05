@@ -111,6 +111,24 @@ fn record_revalidation_outcome(outcome: RevalidationOutcome) {
     cache::metrics::sql_results::SWR_REVALIDATIONS.add(1, &[outcome.key_value()]);
 }
 
+/// The outcome a revalidation that failed outright is counted under.
+///
+/// The HTTP connector refuses a 5xx/429 that outlives its retries instead of returning a
+/// row carrying the status, so a revalidation against a failing origin ends here rather
+/// than in [`cache::batches_cacheable`]. It kept the previous entry for the same reason a
+/// result carrying such a row does, so it is counted as `TransientErrors` too; any other
+/// failure keeps `otherwise`.
+fn failed_revalidation_outcome(
+    error: &(dyn std::error::Error + 'static),
+    otherwise: RevalidationOutcome,
+) -> RevalidationOutcome {
+    if data_components::http::provider::is_transient_origin_failure(error) {
+        RevalidationOutcome::TransientErrors
+    } else {
+        otherwise
+    }
+}
+
 impl CacheResponse {
     /// Nothing servable was found under `raw_key`.
     fn miss(raw_key: RawCacheKey, tracker: Option<QueryTracker>) -> Self {
@@ -1439,7 +1457,10 @@ impl Query {
                                         "Background revalidation failed during collection: {}",
                                         e
                                     );
-                                    record_revalidation_outcome(RevalidationOutcome::CollectFailed);
+                                    record_revalidation_outcome(failed_revalidation_outcome(
+                                        &e,
+                                        RevalidationOutcome::CollectFailed,
+                                    ));
                                 }
                             }
                         }
@@ -1449,7 +1470,10 @@ impl Query {
                                 "Background revalidation query failed: {}",
                                 e
                             );
-                            record_revalidation_outcome(RevalidationOutcome::QueryFailed);
+                            record_revalidation_outcome(failed_revalidation_outcome(
+                                &e,
+                                RevalidationOutcome::QueryFailed,
+                            ));
                         }
                     }
 
@@ -2800,6 +2824,40 @@ mod tests {
         ) -> datafusion::common::Result<datafusion::execution::SendableRecordBatchStream> {
             unimplemented!("not used in tests")
         }
+    }
+
+    /// A revalidation the HTTP connector failed because the origin was down is
+    /// counted as `transient_errors`, as a result carrying the origin's 5xx
+    /// would be; any other failure keeps the outcome of the arm it failed in.
+    #[test]
+    fn a_revalidation_failed_by_a_transient_origin_status_counts_as_transient_errors() {
+        use datafusion::error::DataFusionError;
+
+        let refused = |status| -> DataFusionError {
+            data_components::http::provider::Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into()
+        };
+        let wrapped = DataFusionError::Context("revalidation".to_string(), Box::new(refused(503)));
+        assert_eq!(
+            failed_revalidation_outcome(&wrapped, RevalidationOutcome::CollectFailed),
+            RevalidationOutcome::TransientErrors
+        );
+        assert_eq!(
+            failed_revalidation_outcome(&refused(404), RevalidationOutcome::CollectFailed),
+            RevalidationOutcome::CollectFailed,
+            "a 404 is an answer about the resource, not an origin that is down"
+        );
+        assert_eq!(
+            failed_revalidation_outcome(
+                &DataFusionError::Execution("connection reset".to_string()),
+                RevalidationOutcome::QueryFailed
+            ),
+            RevalidationOutcome::QueryFailed
+        );
     }
 
     /// The narrow-projection counterpart to
