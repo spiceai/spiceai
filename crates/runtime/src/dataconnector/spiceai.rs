@@ -70,7 +70,7 @@ pub enum Error {
     MissingRequiredParameter { parameter: String },
 
     #[snafu(display(
-        "Missing required parameter: {parameter}. Set it to the region of the Spice Cloud app the dataset reads from, for example '{parameter}: us-east-1'. To list available regions, run: 'spice cloud regions'. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
+        "Missing required parameter `{parameter}`. Set it to the region of the Spice Cloud app the dataset reads from, for example `{parameter}: us-east-1`. To list available regions, run `spice cloud regions`. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
     ))]
     MissingRegion { parameter: String },
 
@@ -369,7 +369,7 @@ fn get_credentials(params: &ConnectorParams, endpoint: &str) -> Result<Credentia
     if is_spice_cloud_endpoint(endpoint) {
         return MissingRequiredParameterSnafu {
             parameter: format!(
-                "{} or {}",
+                "`{}` or `{}`",
                 params.parameters.user_param("api_key"),
                 params.parameters.user_param("token")
             ),
@@ -729,7 +729,7 @@ mod tests {
     use tokio::runtime::Handle;
     use tokio::sync::RwLock;
 
-    const MISSING_REGION_MESSAGE: &str = "Missing required parameter: spiceai_region. Set it to the region of the Spice Cloud app the dataset reads from, for example 'spiceai_region: us-east-1'. To list available regions, run: 'spice cloud regions'. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration";
+    const MISSING_REGION_MESSAGE: &str = "Missing required parameter `spiceai_region`. Set it to the region of the Spice Cloud app the dataset reads from, for example `spiceai_region: us-east-1`. To list available regions, run `spice cloud regions`. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration";
 
     async fn make_params(params: Vec<(String, SecretString)>) -> ConnectorParams {
         make_params_for_from("spice.ai/test.table", params).await
@@ -976,7 +976,7 @@ mod tests {
             .expect_err("missing cloud credentials should return an error");
         assert_eq!(
             error.to_string(),
-            "Missing required parameter: spiceai_api_key or spiceai_token. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
+            "Missing required parameter: `spiceai_api_key` or `spiceai_token`. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
         );
     }
 
@@ -1086,6 +1086,14 @@ mod tests {
         let params = make_params(vec![]).await;
 
         let error = get_endpoint(&params).expect_err("missing cloud region should error");
+        assert_eq!(error.to_string(), MISSING_REGION_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_requires_a_non_empty_region() {
+        let params = make_params(vec![("spiceai_region".to_string(), String::new().into())]).await;
+
+        let error = get_endpoint(&params).expect_err("an empty cloud region should error");
         assert_eq!(error.to_string(), MISSING_REGION_MESSAGE);
     }
 
