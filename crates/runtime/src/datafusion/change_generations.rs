@@ -358,7 +358,7 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(5);
 
     impl ChangeGenerations {
-        async fn acquire(
+        pub(in crate::datafusion) async fn acquire(
             &self,
             name: &TableReference,
             timeout: Duration,
