@@ -472,12 +472,17 @@ mod tests {
         let p2 = rc.acquire().await.expect("p2 should be acquired");
         assert_eq!(rc.available_permits(), Some(0));
 
-        // A third request waits on the concurrency cap: it is not admitted on its
-        // first poll while both permits are held.
+        // Bounded by time rather than checked on its first poll: acquire ends
+        // in its jitter sleep, and even a zero-length sleep is pending on that
+        // first poll, so a first-poll check would pass whether or not the cap
+        // held. Keep this future pinned so the later admission is the same
+        // request that stayed blocked.
         let mut third = std::pin::pin!(rc.acquire());
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(50), third.as_mut()).await;
         assert!(
-            futures::poll!(third.as_mut()).is_pending(),
-            "Expected the semaphore to block a third request with concurrency=2"
+            blocked.is_err(),
+            "Expected the semaphore to block a third request with concurrency=2, got {blocked:?}"
         );
 
         // Releasing one permit admits the waiting request, which then holds it.
