@@ -3180,25 +3180,42 @@ pub mod cayenne {
 
     static LOOKUP_INDEX_PROBE: OnceLock<Counter<u64>> = OnceLock::new();
 
-    /// Counts secondary index probes by outcome, so an indexed run can be told
-    /// apart from one that silently fell back to the ordinary scan. Outcomes (the
-    /// `outcome` dimension): `selected` (row selection attached), `empty`
-    /// (complete index miss, no candidate rows), `unbuilt` (no index for the
-    /// table's data yet), `snapshot_mismatch` (the index no longer matches the
-    /// table's data). `dimensions` carries `table`, `shape` (the indexed columns,
-    /// as the `indexes` entry names them) and `outcome`.
+    /// Counts lookups a secondary index served. How much of a table each index
+    /// covers is on `cayenne_lookup_index_files`. `dimensions` carries `table`
+    /// and `shape` (the indexed columns, as the `indexes` entry names them).
     pub fn track_lookup_index_probe(dimensions: &[KeyValue]) {
         LOOKUP_INDEX_PROBE
             .get_or_init(|| {
                 operational_meter()
                     .u64_counter("cayenne_lookup_index_probe_total")
                     .with_description(
-                        "Cayenne secondary index probes, labelled by table, indexed columns and outcome.",
+                        "Cayenne lookups served by a secondary index, labelled by table and indexed columns.",
                     )
                     .with_unit("probes")
                     .build()
             })
             .add(1, dimensions);
+    }
+
+    static LOOKUP_INDEX_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Records how many of a table's current data files its secondary index
+    /// covers, and how many it does not yet, so an operator can tell a fully
+    /// built index from one still catching up. `dimensions` carries `table`,
+    /// `shape` (the indexed columns, as the `indexes` entry names them) and
+    /// `coverage` (`covered` or `uncovered`).
+    pub fn track_lookup_index_files(files: u64, dimensions: &[KeyValue]) {
+        LOOKUP_INDEX_FILES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_lookup_index_files")
+                    .with_description(
+                        "Data files of a Cayenne table that its secondary index covers or does not yet cover, labelled by table, indexed columns and coverage.",
+                    )
+                    .with_unit("files")
+                    .build()
+            })
+            .record(files, dimensions);
     }
 }
 

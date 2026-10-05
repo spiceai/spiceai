@@ -158,9 +158,20 @@ test-group = 'github-api-tests'
 retries = 0
 
 # Same reasoning for the MySQL CDC convergence tests: a retry that passes hides a lost update.
+#
+# Without nextest retries, a Docker stall while the container starts would be a
+# hard failure, so the tests retry that one step themselves
+# (`start_mysql_docker_container_retrying_startup`, up to 3 attempts) and
+# nothing after it. `slow-timeout` gives that room: a failed startup attempt has
+# taken up to 330s and a passing run up to 285s, so two failed attempts and a
+# slow pass come to 945s, and 1200s keeps 1.25x headroom over that. A genuine
+# hang is still killed, at 20 minutes instead of 6. Unlike the binary overrides
+# above, `.github/scripts/check_nextest_config.py` does not check this one: it
+# resolves `binary(=...)` filters only.
 [[profile.default.overrides]]
 filter = 'test(=mysql::replication_e2e::mysql_binlog_replication_survives_a_dump_reconnect_cayenne) | test(=mysql::replication_e2e::mysql_binlog_replication_decodes_every_column_type_cayenne)'
 retries = 0
+slow-timeout = { period = "120s", terminate-after = 10 }
 
 # Result-correctness parity lanes: Cayenne (and the Spice accelerators) against
 # standalone DuckDB/SQLite on the same rows.
