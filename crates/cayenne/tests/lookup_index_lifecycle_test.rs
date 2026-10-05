@@ -934,6 +934,94 @@ async fn removing_every_index_cleans_up_its_persisted_runs() {
     assert!(reopened.lookup_index_counters().is_none());
 }
 
+/// Failed unregistering must retain the file while the metastore still owns it;
+/// the orphan sweep can remove unrelated files and a later open retries cleanup.
+async fn failed_unregistration_retains_run_file(corrupt: bool) {
+    const NAME: &str = "failed_unregistration";
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let table = open_table(
+        &fixture,
+        Arc::clone(&env),
+        TableSpec::new(NAME, schema(), &[&KEY]).persistence(IndexPersistence::Enabled),
+    )
+    .await;
+    overwrite(&table, vec![rows(0, 20_000)]).await;
+    wait_for_persisted_runs(&fixture, NAME, 1).await;
+    drop(table);
+    let registered = registered_runs(&fixture, NAME).await;
+    let mut files = Vec::new();
+    run_files(&fixture.data_path, &mut files);
+    let run_file = files.first().expect("a persisted run file");
+    let orphan = run_file.with_file_name("00000000deadbeef.run");
+    std::fs::copy(run_file, &orphan).expect("create an orphan run");
+    if corrupt {
+        std::fs::write(run_file, b"unreadable run").expect("corrupt registered run");
+    }
+    let expected_bytes = std::fs::read(run_file).expect("read registered file");
+    let metastore = rusqlite::Connection::open(fixture.db_path()).expect("open SQLite metastore");
+    metastore
+        .execute_batch(
+            "CREATE TRIGGER reject_index_run_delete BEFORE DELETE ON cayenne_index_run BEGIN SELECT RAISE(ABORT, 'injected unregister failure'); END;",
+        )
+        .expect("install failing unregister trigger");
+    let indexes: &[&[&str]] = if corrupt { &[&KEY] } else { &[] };
+    let reopened = open_table(
+        &fixture,
+        Arc::clone(&env),
+        TableSpec::new(NAME, schema(), indexes).persistence(IndexPersistence::Enabled),
+    )
+    .await;
+    let retained = registered_runs(&fixture, NAME).await;
+    let file_exists = run_file.exists();
+    println!(
+        "after rejected unregister (corrupt={corrupt}): registrations={retained:?}, registered_file_exists={file_exists}, orphan_exists={}",
+        orphan.exists()
+    );
+    assert_eq!(
+        retained, registered,
+        "the trigger must retain the registration"
+    );
+    assert!(
+        file_exists,
+        "a run must retain its file when unregistering fails"
+    );
+    assert_eq!(
+        std::fs::read(run_file).expect("retained registered file"),
+        expected_bytes,
+        "failed cleanup must not change the registered file"
+    );
+    assert!(
+        !orphan.exists(),
+        "unregistered files must still be cleaned up"
+    );
+    drop(reopened);
+    metastore
+        .execute_batch("DROP TRIGGER reject_index_run_delete")
+        .expect("allow cleanup retry");
+    let retried = open_table(
+        &fixture,
+        env,
+        TableSpec::new(NAME, schema(), &[]).persistence(IndexPersistence::Enabled),
+    )
+    .await;
+    assert!(registered_runs(&fixture, NAME).await.is_empty());
+    assert_eq!(run_file_count(&fixture.data_path), 0);
+    lookup(&retried, NAME, 7).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_unregistration_keeps_a_removed_index_run_file() {
+    failed_unregistration_retains_run_file(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_unregistration_keeps_an_unreadable_index_run_file() {
+    failed_unregistration_retains_run_file(true).await;
+}
+
 /// With persisted runs, a reopened table loads its index runs instead of reading
 /// its files back: on reopen every file is covered before any build runs, and
 /// the loaded runs agree row for row with a read-back. Without them the same

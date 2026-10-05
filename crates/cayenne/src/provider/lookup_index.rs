@@ -2695,6 +2695,8 @@ impl PersistedRuns {
             .list_index_runs(&self.table_id)
             .await
             .map_err(|e| format!("list persisted runs: {e}"))?;
+        // A run whose removal failed may still be registered, so the orphan
+        // sweep must retain its file even when the run is not loaded.
         let mut kept: HashSet<object_store::path::Path> = HashSet::new();
         for record in registered {
             let path = self.path(&record.index_key, &record.run_name);
@@ -2702,6 +2704,7 @@ impl PersistedRuns {
                 // Persisted for a key the table no longer has.
                 if let Err(error) = self.remove(&record.index_key, &record.run_name).await {
                     tracing::debug!(table = %self.table_name, run_file = %path, %error, "A persisted secondary index run of a removed index was not deleted; the next sync retries");
+                    kept.insert(path);
                 }
                 continue;
             };
@@ -2715,6 +2718,7 @@ impl PersistedRuns {
                     tracing::debug!(table = %self.table_name, run_file = %path, %error, "Deleting a persisted secondary index run that cannot be read; its files are indexed again");
                     if let Err(error) = self.remove(&record.index_key, &record.run_name).await {
                         tracing::debug!(table = %self.table_name, run_file = %path, %error, "An unreadable persisted secondary index run was not deleted; the next sync retries");
+                        kept.insert(path);
                     }
                 }
             }
