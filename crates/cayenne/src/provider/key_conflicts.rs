@@ -51,14 +51,12 @@ const REPEAT_CHECK_SEED: u64 = 0x6361_7965_6e6e_6502;
 
 /// The upsert policy carried separately from the catalog's `OnConflict`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum UpsertDedup {
-    /// Plain `upsert` (or `drop`, which has no refinement).
+pub enum UpsertPolicy {
+    /// Collapse identical copies and reject different versions under `upsert`.
     #[default]
-    None,
-    /// `upsert_dedup`: the deprecated alias of strict `upsert`.
-    DropIdentical,
-    /// `upsert_by_arrival` and its deprecated alias `upsert_dedup_by_row_id`.
-    KeepLast,
+    Upsert,
+    /// Keep the last version to arrive under `upsert_by_arrival`.
+    UpsertByArrival,
 }
 
 /// How a write resolves an incoming key that it has already seen; see the module
@@ -66,21 +64,24 @@ pub enum UpsertDedup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConflictPolicy {
     /// `drop`: the first copy of a key is kept, within and across batches.
-    KeepFirst,
+    Drop,
     /// `upsert`: identical rows collapse; different versions are ambiguous.
-    UpsertIdentical,
+    Upsert,
     /// `upsert_by_arrival`: the last copy wins, within and across batches.
-    UpsertKeepLast,
+    UpsertByArrival,
 }
 
 impl ConflictPolicy {
     /// The policy for a table's `on_conflict`, or `None` when it has none.
-    pub(crate) fn new(on_conflict: Option<&OnConflict>, dedup: UpsertDedup) -> Option<Self> {
+    pub(crate) fn new(
+        on_conflict: Option<&OnConflict>,
+        upsert_policy: UpsertPolicy,
+    ) -> Option<Self> {
         Some(match on_conflict? {
-            OnConflict::DoNothing(_) | OnConflict::DoNothingAll => Self::KeepFirst,
-            OnConflict::Upsert(_) => match dedup {
-                UpsertDedup::None | UpsertDedup::DropIdentical => Self::UpsertIdentical,
-                UpsertDedup::KeepLast => Self::UpsertKeepLast,
+            OnConflict::DoNothing(_) | OnConflict::DoNothingAll => Self::Drop,
+            OnConflict::Upsert(_) => match upsert_policy {
+                UpsertPolicy::Upsert => Self::Upsert,
+                UpsertPolicy::UpsertByArrival => Self::UpsertByArrival,
             },
         })
     }
@@ -88,24 +89,24 @@ impl ConflictPolicy {
     /// Whether a later batch's copy of a key replaces an earlier batch's copy
     /// (rather than being dropped).
     pub(crate) fn last_batch_wins(self) -> bool {
-        !matches!(self, Self::KeepFirst)
+        !matches!(self, Self::Drop)
     }
 }
 
 /// Which incoming version a write keeps, including strict equality validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Survivor {
-    Latest,
-    Earliest,
+    LastArrival,
+    FirstArrival,
     Identical,
 }
 
 impl Survivor {
     pub(crate) fn for_policy(policy: ConflictPolicy) -> Self {
         match policy {
-            ConflictPolicy::KeepFirst => Self::Earliest,
-            ConflictPolicy::UpsertIdentical => Self::Identical,
-            ConflictPolicy::UpsertKeepLast => Self::Latest,
+            ConflictPolicy::Drop => Self::FirstArrival,
+            ConflictPolicy::Upsert => Self::Identical,
+            ConflictPolicy::UpsertByArrival => Self::LastArrival,
         }
     }
 }
@@ -182,8 +183,8 @@ impl KeyResolver {
 
     /// Change streams apply each successive version rather than rejecting it.
     pub(crate) fn for_changes(mut self) -> Self {
-        if self.policy == ConflictPolicy::UpsertIdentical {
-            self.policy = ConflictPolicy::UpsertKeepLast;
+        if self.policy == ConflictPolicy::Upsert {
+            self.policy = ConflictPolicy::UpsertByArrival;
         }
         self
     }
@@ -274,7 +275,7 @@ impl KeyResolver {
                     Entry::Occupied(mut entry) => {
                         repeated = true;
                         let (previous_batch, previous_row) = *entry.get();
-                        if self.policy == ConflictPolicy::UpsertIdentical
+                        if self.policy == ConflictPolicy::Upsert
                             && encoded[previous_batch].1[previous_row] != contents[row]
                         {
                             conflicts.insert(digest);
@@ -663,25 +664,24 @@ mod tests {
     }
 
     #[test]
-    fn policy_follows_on_conflict_and_dedup() {
+    fn policy_follows_on_conflict_and_upsert_policy() {
         let upsert = OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]));
         let drop = OnConflict::DoNothing(ColumnReference::new(vec!["id".to_string()]));
-        assert_eq!(ConflictPolicy::new(None, UpsertDedup::KeepLast), None);
         assert_eq!(
-            ConflictPolicy::new(Some(&drop), UpsertDedup::None),
-            Some(ConflictPolicy::KeepFirst)
+            ConflictPolicy::new(None, UpsertPolicy::UpsertByArrival),
+            None
         );
         assert_eq!(
-            ConflictPolicy::new(Some(&upsert), UpsertDedup::None),
-            Some(ConflictPolicy::UpsertIdentical)
+            ConflictPolicy::new(Some(&drop), UpsertPolicy::Upsert),
+            Some(ConflictPolicy::Drop)
         );
         assert_eq!(
-            ConflictPolicy::new(Some(&upsert), UpsertDedup::DropIdentical),
-            Some(ConflictPolicy::UpsertIdentical)
+            ConflictPolicy::new(Some(&upsert), UpsertPolicy::Upsert),
+            Some(ConflictPolicy::Upsert)
         );
         assert_eq!(
-            ConflictPolicy::new(Some(&upsert), UpsertDedup::KeepLast),
-            Some(ConflictPolicy::UpsertKeepLast)
+            ConflictPolicy::new(Some(&upsert), UpsertPolicy::UpsertByArrival),
+            Some(ConflictPolicy::UpsertByArrival)
         );
     }
 
@@ -692,7 +692,7 @@ mod tests {
         let write = || vec![batch(&[(1, "a"), (2, "b"), (1, "a")]), batch(&[(1, "c")])];
         assert_eq!(
             rows(
-                &resolver(ConflictPolicy::KeepFirst)
+                &resolver(ConflictPolicy::Drop)
                     .collapse_write(write())
                     .expect("drop")
             ),
@@ -700,7 +700,7 @@ mod tests {
         );
         assert_eq!(
             rows(
-                &resolver(ConflictPolicy::UpsertKeepLast)
+                &resolver(ConflictPolicy::UpsertByArrival)
                     .collapse_write(write())
                     .expect("keep last")
             ),
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn keep_last_resolves_within_a_batch() {
-        let resolved = resolver(ConflictPolicy::UpsertKeepLast)
+        let resolved = resolver(ConflictPolicy::UpsertByArrival)
             .resolve_batch(&batch(&[(1, "a"), (2, "b"), (1, "c")]))
             .expect("resolved");
         assert_eq!(rows(&[resolved]), owned(&[(2, "b"), (1, "c")]));
@@ -726,7 +726,7 @@ mod tests {
             ],
         )
         .expect("batch");
-        for policy in [ConflictPolicy::KeepFirst, ConflictPolicy::UpsertKeepLast] {
+        for policy in [ConflictPolicy::Drop, ConflictPolicy::UpsertByArrival] {
             let error = resolver(policy)
                 .resolve_batch(&nulls)
                 .expect_err("null key");
@@ -1099,7 +1099,7 @@ mod tests {
             )
             .expect("batch")
         };
-        let resolver = KeyResolver::new("t", &schema, &[0], ConflictPolicy::UpsertIdentical)
+        let resolver = KeyResolver::new("t", &schema, &[0], ConflictPolicy::Upsert)
             .expect("a Map payload is supported");
         // NULL maps over different entries are one value.
         let kept = resolver
@@ -1120,7 +1120,7 @@ mod tests {
     #[test]
     fn a_write_without_repeats_is_returned_unchanged() {
         let write = vec![batch(&[(1, "a")]), batch(&[(2, "b")])];
-        let resolved = resolver(ConflictPolicy::UpsertKeepLast)
+        let resolved = resolver(ConflictPolicy::UpsertByArrival)
             .collapse_write(write.clone())
             .expect("resolved");
         assert_eq!(resolved, write);

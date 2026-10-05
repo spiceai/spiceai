@@ -27,7 +27,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use cayenne::metadata::{CreateTableOptions, PkConflictDetection, VortexConfig};
 
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, UpsertDedup};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, UpsertPolicy};
 
 use datafusion::prelude::SessionContext;
 
@@ -259,14 +259,14 @@ async fn make_id_name_table(
     name: &str,
     on_conflict: OnConflict,
 ) -> Result<(Arc<CayenneTableProvider>, SessionContext), Box<dyn std::error::Error>> {
-    make_id_name_table_resolving(fixture, name, on_conflict, UpsertDedup::None).await
+    make_id_name_table_resolving(fixture, name, on_conflict, UpsertPolicy::Upsert).await
 }
 
 async fn make_id_name_table_resolving(
     fixture: &common::TestFixture,
     name: &str,
     on_conflict: OnConflict,
-    dedup: UpsertDedup,
+    upsert_policy: UpsertPolicy,
 ) -> Result<(Arc<CayenneTableProvider>, SessionContext), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -285,7 +285,7 @@ async fn make_id_name_table_resolving(
     let ctx = SessionContext::new();
     let table = Arc::new(
         CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
-            .with_upsert_dedup(dedup)
+            .with_upsert_policy(upsert_policy)
             .create(table_options)
             .await?,
     );
@@ -347,7 +347,7 @@ async fn test_upsert_in_batch_duplicate_keeps_last_impl(
         &fixture,
         "upsert_in_batch_dup",
         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-        UpsertDedup::KeepLast,
+        UpsertPolicy::UpsertByArrival,
     )
     .await?;
 
@@ -377,7 +377,7 @@ async fn test_upsert_in_batch_duplicate_over_existing_keeps_last_impl(
         &fixture,
         "upsert_in_batch_dup_existing",
         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-        UpsertDedup::KeepLast,
+        UpsertPolicy::UpsertByArrival,
     )
     .await?;
 
@@ -458,7 +458,7 @@ async fn test_upsert_in_batch_duplicate_composite_pk_impl(
     let ctx = SessionContext::new();
     let table = Arc::new(
         CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
-            .with_upsert_dedup(UpsertDedup::KeepLast)
+            .with_upsert_policy(UpsertPolicy::UpsertByArrival)
             .create(table_options)
             .await?,
     );
@@ -505,7 +505,7 @@ async fn test_upsert_in_batch_duplicate_composite_pk_impl(
     assert_eq!(
         rows,
         vec![("EU".to_string(), 1, 300), ("US".to_string(), 1, 200),],
-        "composite-PK in-batch dedup collapses only the full-key duplicate, keep-last"
+        "composite-PK in-batch upsert_policy collapses only the full-key duplicate, keep-last"
     );
     Ok(())
 }

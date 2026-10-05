@@ -57,7 +57,7 @@ use std::time::Instant;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog, UpsertDedup};
+use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog, UpsertPolicy};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
@@ -337,15 +337,15 @@ async fn main() {
         SessionContext::new_with_config_rt(datafusion::prelude::SessionConfig::new(), runtime)
     };
     let key = ColumnReference::new(key_columns());
-    let (on_conflict, dedup) = match policy.as_str() {
-        "none" => (None, UpsertDedup::None),
-        "drop" => (Some(OnConflict::DoNothing(key)), UpsertDedup::None),
-        "upsert" => (Some(OnConflict::Upsert(key)), UpsertDedup::None),
-        "keep_last" => (Some(OnConflict::Upsert(key)), UpsertDedup::KeepLast),
+    let (on_conflict, upsert_policy) = match policy.as_str() {
+        "none" => (None, UpsertPolicy::Upsert),
+        "drop" => (Some(OnConflict::DoNothing(key)), UpsertPolicy::Upsert),
+        "upsert" => (Some(OnConflict::Upsert(key)), UpsertPolicy::Upsert),
+        "keep_last" => (Some(OnConflict::Upsert(key)), UpsertPolicy::UpsertByArrival),
         other => panic!("unknown policy {other}"),
     };
     let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-        .with_upsert_dedup(dedup)
+        .with_upsert_policy(upsert_policy)
         .create(CreateTableOptions {
             table_name: "t".to_string(),
             schema: schema(),

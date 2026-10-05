@@ -629,7 +629,7 @@ mod tests {
     use crate::MetadataCatalog;
     use crate::metadata::{CreateTableOptions, VortexConfig};
     use crate::provider::context::CayenneContext;
-    use crate::provider::key_conflicts::UpsertDedup;
+    use crate::provider::key_conflicts::UpsertPolicy;
     use crate::provider::table::{CayenneTableProvider, CayenneTableProviderBuilder};
 
     async fn visible_rows(ctx: &SessionContext, provider: &CayenneTableProvider) -> usize {
@@ -708,25 +708,20 @@ mod tests {
     async fn buffered_sink_writes_resolve_keys_before_validation() {
         for memory_mode in [true, false] {
             for overwrite in [true, false] {
-                for (policy, dedup, expected) in [
+                for (policy, upsert_policy, expected) in [
                     (
                         OnConflict::DoNothingAll,
-                        UpsertDedup::None,
+                        UpsertPolicy::Upsert,
                         Some(vec![(1, 10), (2, 20)]),
                     ),
                     (
                         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-                        UpsertDedup::None,
+                        UpsertPolicy::Upsert,
                         None,
                     ),
                     (
                         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-                        UpsertDedup::DropIdentical,
-                        None,
-                    ),
-                    (
-                        OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-                        UpsertDedup::KeepLast,
+                        UpsertPolicy::UpsertByArrival,
                         Some(vec![(1, 40), (2, 20)]),
                     ),
                 ] {
@@ -754,7 +749,7 @@ mod tests {
                     let provider =
                         CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
                             .with_context(Arc::clone(&context))
-                            .with_upsert_dedup(dedup)
+                            .with_upsert_policy(upsert_policy)
                             .create(CreateTableOptions {
                                 table_name: "buffered_keys".to_string(),
                                 schema: Arc::clone(&schema),
@@ -856,7 +851,7 @@ mod tests {
                             ctx.runtime_env(),
                         )
                         .with_context(Arc::clone(&context))
-                        .with_upsert_dedup(dedup)
+                        .with_upsert_policy(upsert_policy)
                         .open("buffered_keys")
                         .await
                         .expect("reopen durable table");

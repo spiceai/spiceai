@@ -24,11 +24,11 @@ const CONFLICT_CAUSE: &str = "its data holds different versions of 1 value of 'i
 async fn upsert_rejects_different_versions_without_changing_stored_rows() {
     let mut failures = Vec::new();
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for dedup in [UpsertDedup::None, UpsertDedup::DropIdentical] {
+        for upsert_policy in [UpsertPolicy::Upsert] {
             for op in [InsertOp::Overwrite, InsertOp::Append] {
                 for split in [false, true] {
-                    let label = format!("{mode:?}/{dedup:?}/{op:?}/split={split}");
-                    let (provider, catalog, runtime_env, _dir) = table(mode, dedup).await;
+                    let label = format!("{mode:?}/{upsert_policy:?}/{op:?}/split={split}");
+                    let (provider, catalog, runtime_env, _dir) = table(mode, upsert_policy).await;
                     write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
                         .await
                         .expect("seed");
@@ -47,7 +47,7 @@ async fn upsert_rejects_different_versions_without_changing_stored_rows() {
                     if actual != expected {
                         failures.push(format!("{label}: failed write changed rows: {actual:?}"));
                     }
-                    let reopened = reopen(&catalog, &runtime_env, dedup).await;
+                    let reopened = reopen(&catalog, &runtime_env, upsert_policy).await;
                     let actual = visible(&reopened).await;
                     if actual != expected {
                         failures.push(format!("{label}: persisted rows changed: {actual:?}"));
@@ -63,11 +63,11 @@ async fn upsert_rejects_different_versions_without_changing_stored_rows() {
 async fn identical_copies_collapse_for_refreshes_and_statements() {
     let mut failures = Vec::new();
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for dedup in [UpsertDedup::None, UpsertDedup::DropIdentical] {
+        for upsert_policy in [UpsertPolicy::Upsert] {
             for op in [InsertOp::Overwrite, InsertOp::Append] {
                 for split in [false, true] {
-                    let label = format!("{mode:?}/{dedup:?}/{op:?}/split={split}");
-                    let (provider, catalog, runtime_env, _dir) = table(mode, dedup).await;
+                    let label = format!("{mode:?}/{upsert_policy:?}/{op:?}/split={split}");
+                    let (provider, catalog, runtime_env, _dir) = table(mode, upsert_policy).await;
                     write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
                         .await
                         .expect("seed");
@@ -89,7 +89,7 @@ async fn identical_copies_collapse_for_refreshes_and_statements() {
                     if actual != expected {
                         failures.push(format!("{label}: wrong rows: {actual:?}"));
                     }
-                    let reopened = reopen(&catalog, &runtime_env, dedup).await;
+                    let reopened = reopen(&catalog, &runtime_env, upsert_policy).await;
                     let actual = visible(&reopened).await;
                     if actual != expected {
                         failures.push(format!("{label}: wrong persisted rows: {actual:?}"));
@@ -104,18 +104,18 @@ async fn identical_copies_collapse_for_refreshes_and_statements() {
 #[tokio::test(flavor = "multi_thread")]
 async fn staged_statements_apply_the_whole_input_policy() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for (policy, dedup, drop_existing) in [
-            (upsert_on_id(), UpsertDedup::None, false),
-            (upsert_on_id(), UpsertDedup::DropIdentical, false),
-            (upsert_on_id(), UpsertDedup::KeepLast, false),
-            (drop_on_id(), UpsertDedup::None, true),
+        for (policy, upsert_policy, drop_existing) in [
+            (upsert_on_id(), UpsertPolicy::Upsert, false),
+            (upsert_on_id(), UpsertPolicy::UpsertByArrival, false),
+            (drop_on_id(), UpsertPolicy::Upsert, true),
         ] {
             for different in [false, true] {
-                let label =
-                    format!("{mode:?}/{dedup:?}/drop={drop_existing}/different={different}");
+                let label = format!(
+                    "{mode:?}/{upsert_policy:?}/drop={drop_existing}/different={different}"
+                );
                 let (mut provider, catalog, runtime_env, _dir) =
                     upsert_table(mode, policy.clone()).await;
-                provider.upsert_dedup = dedup;
+                provider.upsert_policy = upsert_policy;
                 let prior = (owned(&[(1, "old"), (9, "old")]), 2);
                 write(
                     &provider,
@@ -140,7 +140,10 @@ async fn staged_statements_apply_the_whole_input_policy() {
                     prior,
                     "{label}: staging is private"
                 );
-                let expected = if different && !drop_existing && dedup != UpsertDedup::KeepLast {
+                let expected = if different
+                    && !drop_existing
+                    && upsert_policy != UpsertPolicy::UpsertByArrival
+                {
                     let error =
                         staged.expect_err("strict staged upsert rejects different versions");
                     assert!(
@@ -163,7 +166,7 @@ async fn staged_statements_apply_the_whole_input_policy() {
                     }
                 };
                 assert_eq!(visible(&provider).await, expected, "{label}: live rows");
-                let reopened = reopen(&catalog, &runtime_env, dedup).await;
+                let reopened = reopen(&catalog, &runtime_env, upsert_policy).await;
                 assert_eq!(visible(&reopened).await, expected, "{label}: durable rows");
             }
         }
@@ -196,7 +199,7 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
             upsert_on_id(),
         )
         .await;
-        provider.upsert_dedup = UpsertDedup::KeepLast;
+        provider.upsert_policy = UpsertPolicy::UpsertByArrival;
         write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
@@ -247,7 +250,7 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
                 "{label}: live data changed after failure: {actual:?}"
             ));
         }
-        let reopened = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+        let reopened = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
         let actual = visible(&reopened).await;
         if actual != expected {
             failures.push(format!(
@@ -259,7 +262,7 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
             .expect("publish the replacement without the fault");
         let expected = (owned(&[(9, "new"), (10, "new")]), 2);
         assert_eq!(visible(&provider).await, expected, "{label}: published");
-        let reopened = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+        let reopened = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
         assert_eq!(
             visible(&reopened).await,
             expected,
@@ -310,7 +313,7 @@ async fn late_append_error_does_not_publish_an_earlier_segment() {
             ),
         )
         .await;
-        provider.upsert_dedup = UpsertDedup::KeepLast;
+        provider.upsert_policy = UpsertPolicy::UpsertByArrival;
         write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
@@ -335,7 +338,7 @@ async fn late_append_error_does_not_publish_an_earlier_segment() {
             assert_eq!((rows, actual.1), (vec![(9, true)], 1), "{mode:?}");
         };
         assert_unchanged(visible(&provider).await);
-        let reopened = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+        let reopened = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
         assert_unchanged(visible(&reopened).await);
     }
 }
@@ -366,7 +369,7 @@ async fn seeded_streaming_table(
         upsert_on_id(),
     )
     .await;
-    provider.upsert_dedup = UpsertDedup::KeepLast;
+    provider.upsert_policy = UpsertPolicy::UpsertByArrival;
     write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
         .await
         .expect("seed");
@@ -457,7 +460,7 @@ async fn a_failed_commit_is_resolved_by_its_durable_outcome() {
                     new.clone()
                 }
             };
-            let reopened = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+            let reopened = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
             assert_eq!(visible(&reopened).await, durable, "{label}: reopened");
             write(&reopened, InsertOp::Append, vec![batch(&[(11, "x")])])
                 .await
@@ -527,7 +530,7 @@ async fn a_cancelled_append_publishes_before_releasing_the_write_lock() {
         let expected = (owned(&[(9, "new"), (10, "new")]), 2);
         assert_eq!(visible(&provider).await, expected, "{mode:?}: published");
         drop(next_writer);
-        let reopened = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+        let reopened = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
         assert_eq!(visible(&reopened).await, expected, "{mode:?}: reopened");
     }
 }
@@ -576,7 +579,7 @@ async fn conflicting_key_counts_cover_the_whole_statement() {
                         upsert_on_id(),
                     )
                     .await;
-                    provider.upsert_dedup = UpsertDedup::None;
+                    provider.upsert_policy = UpsertPolicy::Upsert;
                     write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
                         .await
                         .expect("seed");
@@ -615,10 +618,10 @@ async fn a_transaction_resolves_each_statement_and_commits_them_together() {
     use crate::provider::transaction::CayenneTransaction;
 
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for dedup in [UpsertDedup::KeepLast, UpsertDedup::None] {
-            let label = format!("{mode:?}/{dedup:?}");
+        for upsert_policy in [UpsertPolicy::UpsertByArrival, UpsertPolicy::Upsert] {
+            let label = format!("{mode:?}/{upsert_policy:?}");
             let (mut first, catalog, runtime_env, dir) = seeded_streaming_table(mode).await;
-            first.upsert_dedup = dedup;
+            first.upsert_policy = upsert_policy;
             let create = |name: &str| CreateTableOptions {
                 table_name: name.to_string(),
                 schema: schema(),
@@ -640,7 +643,7 @@ async fn a_transaction_resolves_each_statement_and_commits_them_together() {
                     Arc::clone(&catalog),
                     Arc::clone(&runtime_env),
                 )
-                .with_upsert_dedup(dedup)
+                .with_upsert_policy(upsert_policy)
                 .create(create(name))
                 .await
                 .expect("create table");
@@ -649,7 +652,7 @@ async fn a_transaction_resolves_each_statement_and_commits_them_together() {
                     .expect("seed");
                 tables.push(table);
             }
-            let latest = if dedup == UpsertDedup::KeepLast {
+            let latest = if upsert_policy == UpsertPolicy::UpsertByArrival {
                 "b"
             } else {
                 "a"
@@ -701,7 +704,7 @@ async fn a_transaction_resolves_each_statement_and_commits_them_together() {
                     Arc::clone(&catalog),
                     Arc::clone(&runtime_env),
                 )
-                .with_upsert_dedup(dedup)
+                .with_upsert_policy(upsert_policy)
                 .open(name)
                 .await
                 .expect("reopen");
@@ -742,7 +745,7 @@ async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
             let (first, catalog, runtime_env, dir) = seeded_streaming_table(mode).await;
             let second =
                 CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
-                    .with_upsert_dedup(UpsertDedup::KeepLast)
+                    .with_upsert_policy(UpsertPolicy::UpsertByArrival)
                     .create(CreateTableOptions {
                         table_name: "u".to_string(),
                         schema: schema(),
@@ -840,7 +843,7 @@ async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
                     Arc::clone(&catalog),
                     Arc::clone(&runtime_env),
                 )
-                .with_upsert_dedup(UpsertDedup::KeepLast)
+                .with_upsert_policy(UpsertPolicy::UpsertByArrival)
                 .open(name)
                 .await
                 .unwrap_or_else(|error| panic!("{label}: reopen {name}: {error}"));
@@ -888,7 +891,7 @@ async fn a_write_counts_the_rows_it_does_not_keep_by_reason() {
                     upsert_on_id(),
                 )
                 .await;
-                provider.upsert_dedup = UpsertDedup::KeepLast;
+                provider.upsert_policy = UpsertPolicy::UpsertByArrival;
                 let rows = Arc::new(SupersededRows::default());
                 let ctx = SessionContext::new();
                 let state = with_superseded_rows(&ctx.state(), Arc::clone(&rows));

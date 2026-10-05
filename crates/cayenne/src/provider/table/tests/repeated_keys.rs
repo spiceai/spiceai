@@ -19,7 +19,7 @@ limitations under the License.
 
 use super::*;
 use crate::metadata::DeletionMode;
-use crate::provider::key_conflicts::UpsertDedup;
+use crate::provider::key_conflicts::UpsertPolicy;
 use crate::provider::pk_index::{CachedPkIndex, CachedPkKeyset};
 use arrow::array::{AsArray, StringArray};
 
@@ -106,7 +106,7 @@ fn owned(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
 
 async fn table(
     mode: DeletionMode,
-    dedup: UpsertDedup,
+    upsert_policy: UpsertPolicy,
 ) -> (
     CayenneTableProvider,
     Arc<dyn MetadataCatalog>,
@@ -134,17 +134,17 @@ async fn table(
         ),
     )
     .await;
-    provider.upsert_dedup = dedup;
+    provider.upsert_policy = upsert_policy;
     (provider, catalog, runtime_env, dir)
 }
 
 async fn reopen(
     catalog: &Arc<dyn MetadataCatalog>,
     runtime_env: &Arc<RuntimeEnv>,
-    dedup: UpsertDedup,
+    upsert_policy: UpsertPolicy,
 ) -> CayenneTableProvider {
     CayenneTableProviderBuilder::new(Arc::clone(catalog), Arc::clone(runtime_env))
-        .with_upsert_dedup(dedup)
+        .with_upsert_policy(upsert_policy)
         .open("t")
         .await
         .expect("reopen")
@@ -153,13 +153,9 @@ async fn reopen(
 #[tokio::test(flavor = "multi_thread")]
 async fn streaming_append_resolves_copies_through_reopen_and_compaction() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for dedup in [
-            UpsertDedup::None,
-            UpsertDedup::DropIdentical,
-            UpsertDedup::KeepLast,
-        ] {
-            let label = format!("{mode:?}/{dedup:?}");
-            let (provider, catalog, runtime_env, _dir) = table(mode, dedup).await;
+        for upsert_policy in [UpsertPolicy::Upsert, UpsertPolicy::UpsertByArrival] {
+            let label = format!("{mode:?}/{upsert_policy:?}");
+            let (provider, catalog, runtime_env, _dir) = table(mode, upsert_policy).await;
             write(
                 &provider,
                 InsertOp::Append,
@@ -167,9 +163,13 @@ async fn streaming_append_resolves_copies_through_reopen_and_compaction() {
             )
             .await
             .expect("seed");
-            write(&provider, InsertOp::Append, copies_for_policy(dedup))
-                .await
-                .expect("streaming append");
+            write(
+                &provider,
+                InsertOp::Append,
+                copies_for_policy(upsert_policy),
+            )
+            .await
+            .expect("streaming append");
             let expected = (
                 owned(&[
                     (1, "c"),
@@ -187,7 +187,7 @@ async fn streaming_append_resolves_copies_through_reopen_and_compaction() {
                 assert_eq!(actual, expected, "{label} {stage}");
             };
             check("after append", visible(&provider).await);
-            let provider = reopen(&catalog, &runtime_env, dedup).await;
+            let provider = reopen(&catalog, &runtime_env, upsert_policy).await;
             check("after reopen", visible(&provider).await);
             provider
                 .compact_protected_snapshots_subset(8)
@@ -199,7 +199,7 @@ async fn streaming_append_resolves_copies_through_reopen_and_compaction() {
                 .await
                 .expect("rewrite");
             check("after full rewrite", visible(&provider).await);
-            let provider = reopen(&catalog, &runtime_env, dedup).await;
+            let provider = reopen(&catalog, &runtime_env, upsert_policy).await;
             check("after second reopen", visible(&provider).await);
         }
     }
@@ -208,7 +208,7 @@ async fn streaming_append_resolves_copies_through_reopen_and_compaction() {
 #[tokio::test(flavor = "multi_thread")]
 async fn streaming_append_failure_leaves_previous_rows() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::DropIdentical).await;
+        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertPolicy::Upsert).await;
         write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
@@ -225,7 +225,7 @@ async fn streaming_append_failure_leaves_previous_rows() {
         .expect_err("a null primary key fails the append");
         eprintln!("{mode:?} failed append: {error}");
         assert_eq!(visible(&provider).await, (owned(&[(9, "old")]), 1));
-        let provider = reopen(&catalog, &runtime_env, UpsertDedup::DropIdentical).await;
+        let provider = reopen(&catalog, &runtime_env, UpsertPolicy::Upsert).await;
         assert_eq!(visible(&provider).await, (owned(&[(9, "old")]), 1));
     }
 }
@@ -273,7 +273,7 @@ async fn streaming_append_drop_keeps_first_copy() {
             7,
         );
         assert_eq!(visible(&provider).await, expected);
-        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        let provider = reopen(&catalog, &runtime_env, UpsertPolicy::Upsert).await;
         assert_eq!(visible(&provider).await, expected);
         provider
             .compact_protected_snapshots_subset(8)
@@ -285,7 +285,7 @@ async fn streaming_append_drop_keeps_first_copy() {
             .await
             .expect("rewrite");
         assert_eq!(visible(&provider).await, expected);
-        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        let provider = reopen(&catalog, &runtime_env, UpsertPolicy::Upsert).await;
         assert_eq!(visible(&provider).await, expected);
     }
 }
@@ -302,8 +302,8 @@ fn repeated_across_batches() -> Vec<RecordBatch> {
     ]
 }
 
-fn copies_for_policy(dedup: UpsertDedup) -> Vec<RecordBatch> {
-    if matches!(dedup, UpsertDedup::KeepLast) {
+fn copies_for_policy(upsert_policy: UpsertPolicy) -> Vec<RecordBatch> {
+    if matches!(upsert_policy, UpsertPolicy::UpsertByArrival) {
         repeated_across_batches()
     } else {
         vec![
@@ -323,19 +323,19 @@ fn last_copies() -> Vec<(i64, String)> {
 async fn overwrite_resolves_copies_across_batches_through_its_lifecycle() {
     let mut failures = Vec::new();
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for dedup in [
-            UpsertDedup::None,
-            UpsertDedup::DropIdentical,
-            UpsertDedup::KeepLast,
-        ] {
-            let label = format!("{mode:?}/{dedup:?}");
-            let (provider, catalog, runtime_env, _dir) = table(mode, dedup).await;
+        for upsert_policy in [UpsertPolicy::Upsert, UpsertPolicy::UpsertByArrival] {
+            let label = format!("{mode:?}/{upsert_policy:?}");
+            let (provider, catalog, runtime_env, _dir) = table(mode, upsert_policy).await;
             write(&provider, InsertOp::Overwrite, vec![batch(&[(9, "old")])])
                 .await
                 .expect("seed");
-            write(&provider, InsertOp::Overwrite, copies_for_policy(dedup))
-                .await
-                .expect("overwrite repeating keys");
+            write(
+                &provider,
+                InsertOp::Overwrite,
+                copies_for_policy(upsert_policy),
+            )
+            .await
+            .expect("overwrite repeating keys");
             let expected = last_copies();
             let mut check =
                 |stage: &str, (rows, count): (Vec<(i64, String)>, i64), layers: usize| {
@@ -354,7 +354,7 @@ async fn overwrite_resolves_copies_across_batches_through_its_lifecycle() {
                 visible(&provider).await,
                 provider.protected_snapshot_ids().len(),
             );
-            let provider = reopen(&catalog, &runtime_env, dedup).await;
+            let provider = reopen(&catalog, &runtime_env, upsert_policy).await;
             check(
                 "after reopen",
                 visible(&provider).await,
@@ -378,7 +378,7 @@ async fn overwrite_resolves_copies_across_batches_through_its_lifecycle() {
                 visible(&provider).await,
                 provider.protected_snapshot_ids().len(),
             );
-            let provider = reopen(&catalog, &runtime_env, dedup).await;
+            let provider = reopen(&catalog, &runtime_env, upsert_policy).await;
             check(
                 "after second reopen",
                 visible(&provider).await,
@@ -417,7 +417,7 @@ fn assert_resolved_shape(provider: &CayenneTableProvider, mode: DeletionMode) {
 #[tokio::test(flavor = "multi_thread")]
 async fn position_capture_after_an_overwrite_repeating_keys_locates_the_live_copy() {
     let (provider, _catalog, _runtime_env, _dir) =
-        table(DeletionMode::Position, UpsertDedup::KeepLast).await;
+        table(DeletionMode::Position, UpsertPolicy::UpsertByArrival).await;
     write(&provider, InsertOp::Overwrite, repeated_across_batches())
         .await
         .expect("overwrite repeating keys");
@@ -487,7 +487,7 @@ async fn an_overwrite_repeating_a_string_key_resolves_it_in_both_modes() {
             ),
         )
         .await;
-        provider.upsert_dedup = UpsertDedup::KeepLast;
+        provider.upsert_policy = UpsertPolicy::UpsertByArrival;
         let ctx = SessionContext::new();
         let source = MemorySourceConfig::try_new_exec(
             &[vec![
@@ -538,7 +538,8 @@ async fn an_overwrite_repeating_a_string_key_resolves_it_in_both_modes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_overwrite_repeating_keys_is_superseded_by_a_later_upsert_and_overwrite() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
+        let (provider, catalog, runtime_env, _dir) =
+            table(mode, UpsertPolicy::UpsertByArrival).await;
         write(&provider, InsertOp::Overwrite, repeated_across_batches())
             .await
             .expect("overwrite repeating keys");
@@ -578,7 +579,7 @@ async fn an_overwrite_repeating_keys_is_superseded_by_a_later_upsert_and_overwri
             provider.protected_snapshot_ids().is_empty(),
             "{mode:?}: layers cleared"
         );
-        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        let provider = reopen(&catalog, &runtime_env, UpsertPolicy::Upsert).await;
         assert_eq!(
             visible(&provider).await,
             (owned(&[(1, "z")]), 1),
@@ -590,7 +591,7 @@ async fn an_overwrite_repeating_keys_is_superseded_by_a_later_upsert_and_overwri
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_overwrite_repeating_keys_leaves_the_previous_table() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::DropIdentical).await;
+        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertPolicy::Upsert).await;
         write(&provider, InsertOp::Overwrite, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
@@ -620,7 +621,7 @@ async fn a_failed_overwrite_repeating_keys_leaves_the_previous_table() {
             provider.protected_snapshot_ids().is_empty(),
             "{mode:?}: no layers"
         );
-        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        let provider = reopen(&catalog, &runtime_env, UpsertPolicy::Upsert).await;
         assert_eq!(
             visible(&provider).await,
             (owned(&[(9, "old")]), 1),
@@ -667,7 +668,8 @@ async fn drop_keeps_the_first_copy_across_batches() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_overwrite_repeating_keys_publishes_one_snapshot() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
+        let (provider, _catalog, _runtime_env, _dir) =
+            table(mode, UpsertPolicy::UpsertByArrival).await;
         write(&provider, InsertOp::Overwrite, repeated_across_batches())
             .await
             .expect("overwrite");
@@ -687,7 +689,8 @@ async fn an_overwrite_repeating_keys_publishes_one_snapshot() {
 async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies() {
     let mut failures = Vec::new();
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
+        let (provider, catalog, runtime_env, _dir) =
+            table(mode, UpsertPolicy::UpsertByArrival).await;
         write(
             &provider,
             InsertOp::Overwrite,
@@ -702,7 +705,7 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
             ("after overwrite", provider.clone_for_write()),
             (
                 "after reopen",
-                reopen(&catalog, &runtime_env, UpsertDedup::None).await,
+                reopen(&catalog, &runtime_env, UpsertPolicy::Upsert).await,
             ),
         ] {
             let ctx = SessionContext::new();
@@ -756,7 +759,8 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
 #[tokio::test(flavor = "multi_thread")]
 async fn an_arrival_statement_resolves_repeated_keys_across_batches() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
+        let (provider, catalog, runtime_env, _dir) =
+            table(mode, UpsertPolicy::UpsertByArrival).await;
         let repeated = || {
             MemorySourceConfig::try_new_exec(
                 &[vec![batch(&[(1, "a"), (2, "a")]), batch(&[(1, "b")])]],
@@ -786,7 +790,7 @@ async fn an_arrival_statement_resolves_repeated_keys_across_batches() {
             .await
             .expect("commit");
         assert_eq!(visible(&provider).await, (owned(&[(1, "b"), (2, "a")]), 2));
-        let provider = reopen(&catalog, &runtime_env, UpsertDedup::KeepLast).await;
+        let provider = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
         assert_eq!(visible(&provider).await, (owned(&[(1, "b"), (2, "a")]), 2));
     }
 }
@@ -822,7 +826,7 @@ async fn a_refresh_in_a_small_memory_pool_spills_and_keeps_the_last_copy() {
         )
         .await;
         let mut provider = provider;
-        provider.upsert_dedup = UpsertDedup::KeepLast;
+        provider.upsert_policy = UpsertPolicy::UpsertByArrival;
         let rows: Vec<(i64, &str)> = ["first", "last"]
             .iter()
             .flat_map(|value| (0..KEYS).map(move |id| (id, *value)))
@@ -895,7 +899,7 @@ async fn upsert_table(
         on_conflict,
     )
     .await;
-    provider.upsert_dedup = UpsertDedup::KeepLast;
+    provider.upsert_policy = UpsertPolicy::UpsertByArrival;
     (provider, catalog, runtime_env, dir)
 }
 
@@ -946,7 +950,7 @@ async fn streaming_append_supersedes_a_stored_copy_once_per_key() {
             ("after append", provider.clone_for_write()),
             (
                 "after reopen",
-                reopen(&catalog, &runtime_env, UpsertDedup::None).await,
+                reopen(&catalog, &runtime_env, UpsertPolicy::Upsert).await,
             ),
         ] {
             let observed = visible(&provider).await;
@@ -986,17 +990,16 @@ async fn streaming_append_drop_keeps_stored_then_first_copies() {
         let expected = (owned(&[(1, "old"), (2, "a"), (3, "b")]), 3);
         assert_eq!(visible(&provider).await, expected, "{mode:?}");
         assert_eq!(statistics_rows(&provider).await.unwrap_or(3), 3, "{mode:?}");
-        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        let provider = reopen(&catalog, &runtime_env, UpsertPolicy::Upsert).await;
         assert_eq!(visible(&provider).await, expected, "{mode:?}: reopened");
     }
 }
 
-/// `upsert_dedup` rejects different versions even when some copies are identical.
+/// `upsert` rejects different versions even when some copies are identical.
 #[tokio::test(flavor = "multi_thread")]
-async fn streaming_append_upsert_dedup_rejects_different_copies_across_batches() {
+async fn streaming_append_upsert_rejects_different_copies_across_batches() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, _catalog, _runtime_env, _dir) =
-            table(mode, UpsertDedup::DropIdentical).await;
+        let (provider, _catalog, _runtime_env, _dir) = table(mode, UpsertPolicy::Upsert).await;
         write(&provider, InsertOp::Append, vec![batch(&[(1, "old")])])
             .await
             .expect("seed");
@@ -1136,7 +1139,7 @@ async fn a_refresh_cut_into_many_key_ranges_keeps_the_last_copy_of_every_key() {
             )
             .await;
             let mut provider = provider;
-            provider.upsert_dedup = UpsertDedup::KeepLast;
+            provider.upsert_policy = UpsertPolicy::UpsertByArrival;
             let ctx = SessionContext::new();
             let source = MemorySourceConfig::try_new_exec(&[batches], Arc::clone(&schema), None)
                 .expect("source");
@@ -1174,7 +1177,7 @@ async fn a_refresh_cut_into_many_key_ranges_keeps_the_last_copy_of_every_key() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_staged_append_refuses_a_keyed_table() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        let (provider, _catalog, _runtime_env, _dir) = table(mode, UpsertPolicy::Upsert).await;
         assert!(provider.key_resolver().expect("resolver").is_some());
         let stream = Box::pin(RecordBatchStreamAdapter::new(
             schema(),
@@ -1223,9 +1226,9 @@ async fn user_columns_named_like_the_helper_columns_are_left_alone() {
             )
             .expect("batch")
         };
-        for (dedup, batches, expected) in [
+        for (upsert_policy, batches, expected) in [
             (
-                UpsertDedup::KeepLast,
+                UpsertPolicy::UpsertByArrival,
                 vec![
                     batch_of(&[(1, 30), (2, 30)]),
                     batch_of(&[(1, 20)]),
@@ -1234,17 +1237,17 @@ async fn user_columns_named_like_the_helper_columns_are_left_alone() {
                 Some(vec![(1, 20), (2, 10), (3, 10)]),
             ),
             (
-                UpsertDedup::None,
+                UpsertPolicy::Upsert,
                 vec![batch_of(&[(1, 30), (2, 30)]), batch_of(&[(1, 30)])],
                 Some(vec![(1, 30), (2, 30)]),
             ),
             (
-                UpsertDedup::None,
+                UpsertPolicy::Upsert,
                 vec![batch_of(&[(1, 30), (2, 30)]), batch_of(&[(1, 20)])],
                 None,
             ),
         ] {
-            let label = format!("{mode:?}/{dedup:?}");
+            let label = format!("{mode:?}/{upsert_policy:?}");
             let runtime_env = SessionContext::new().runtime_env();
             let (mut provider, _catalog, _dir) = create_cdc_table_with_schema(
                 "t",
@@ -1264,7 +1267,7 @@ async fn user_columns_named_like_the_helper_columns_are_left_alone() {
                 ),
             )
             .await;
-            provider.upsert_dedup = dedup;
+            provider.upsert_policy = upsert_policy;
             let ctx = SessionContext::new();
             let source = MemorySourceConfig::try_new_exec(&[batches], Arc::clone(&schema), None)
                 .expect("source");
@@ -1479,19 +1482,19 @@ async fn a_partition_append_resolves_its_whole_input() {
         )) as SendableRecordBatchStream
     };
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for (on_conflict, dedup, expected) in [
-            (upsert_on_id(), UpsertDedup::KeepLast, Ok(3)),
-            (drop_on_id(), UpsertDedup::None, Ok(3)),
+        for (on_conflict, upsert_policy, expected) in [
+            (upsert_on_id(), UpsertPolicy::UpsertByArrival, Ok(3)),
+            (drop_on_id(), UpsertPolicy::Upsert, Ok(3)),
             (
                 upsert_on_id(),
-                UpsertDedup::None,
+                UpsertPolicy::Upsert,
                 Err("different versions of 1 value of 'id'"),
             ),
         ] {
-            let label = format!("{mode:?}/{dedup:?}");
+            let label = format!("{mode:?}/{upsert_policy:?}");
             let (mut provider, _catalog, _runtime_env, _dir) =
                 upsert_table(mode, on_conflict).await;
-            provider.upsert_dedup = dedup;
+            provider.upsert_policy = upsert_policy;
             let prepared = provider.begin_deferred_snapshot_append(input(), 2).await;
             match (prepared, expected) {
                 (Ok(prepared), Ok(rows)) => {

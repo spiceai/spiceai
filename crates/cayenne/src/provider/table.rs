@@ -1864,7 +1864,7 @@ pub struct CayenneTableProvider {
     scan_view_reuse: ScanViewReuse,
     /// The `upsert` refinement of the dataset's `on_conflict`, which decides how a
     /// write resolves a key it repeats; see [`super::key_conflicts`].
-    upsert_dedup: super::key_conflicts::UpsertDedup,
+    upsert_policy: super::key_conflicts::UpsertPolicy,
     /// Counts the rows a write through this provider receives but does not keep;
     /// set on the clone a write runs on, from its session.
     superseded_rows: Option<Arc<util::session_state::SupersededRows>>,
@@ -2758,7 +2758,7 @@ pub struct CayenneTableProviderBuilder {
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
-    upsert_dedup: super::key_conflicts::UpsertDedup,
+    upsert_policy: super::key_conflicts::UpsertPolicy,
     secondary_indexes: Vec<Vec<String>>,
     index_word_bits: Option<u32>,
 }
@@ -2899,7 +2899,7 @@ struct CayenneTableProviderOpenOptions {
     maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
-    upsert_dedup: super::key_conflicts::UpsertDedup,
+    upsert_policy: super::key_conflicts::UpsertPolicy,
     secondary_indexes: Vec<Vec<String>>,
     index_word_bits: Option<u32>,
 }
@@ -2919,7 +2919,7 @@ impl CayenneTableProviderBuilder {
             maintained_aggregates: Vec::new(),
             durable_write_back: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
-            upsert_dedup: super::key_conflicts::UpsertDedup::None,
+            upsert_policy: super::key_conflicts::UpsertPolicy::Upsert,
             secondary_indexes: Vec::new(),
             index_word_bits: None,
         }
@@ -3003,12 +3003,12 @@ impl CayenneTableProviderBuilder {
         self
     }
 
-    /// Set the `upsert` refinement of the dataset's `on_conflict` (`upsert_dedup` or
-    /// `upsert_dedup_by_row_id`). Not persisted: it comes from the acceleration's
+    /// Set the dataset's canonical upsert policy (`upsert` or `upsert_by_arrival`).
+    /// Not persisted: it comes from the acceleration's
     /// settings on every load, as `on_conflict` does.
     #[must_use]
-    pub fn with_upsert_dedup(mut self, dedup: super::key_conflicts::UpsertDedup) -> Self {
-        self.upsert_dedup = dedup;
+    pub fn with_upsert_policy(mut self, upsert_policy: super::key_conflicts::UpsertPolicy) -> Self {
+        self.upsert_policy = upsert_policy;
         self
     }
 
@@ -3052,7 +3052,7 @@ impl CayenneTableProviderBuilder {
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
-            upsert_dedup: self.upsert_dedup,
+            upsert_policy: self.upsert_policy,
             secondary_indexes: self.secondary_indexes,
             index_word_bits: self.index_word_bits,
         };
@@ -3086,7 +3086,7 @@ impl CayenneTableProviderBuilder {
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
-            upsert_dedup: self.upsert_dedup,
+            upsert_policy: self.upsert_policy,
             secondary_indexes: self.secondary_indexes,
             index_word_bits: self.index_word_bits,
         };
@@ -9062,7 +9062,7 @@ impl CayenneTableProvider {
             maintained_aggregate_specs,
             durable_write_back,
             scan_view_reuse,
-            upsert_dedup,
+            upsert_policy,
             secondary_indexes,
             index_word_bits,
         } = options;
@@ -9360,7 +9360,7 @@ impl CayenneTableProvider {
             pk_column_indices,
             durable_write_back,
             scan_view_reuse,
-            upsert_dedup,
+            upsert_policy,
             superseded_rows: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -11481,7 +11481,7 @@ impl CayenneTableProvider {
             pk_column_indices: self.pk_column_indices.clone(),
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
-            upsert_dedup: self.upsert_dedup,
+            upsert_policy: self.upsert_policy,
             superseded_rows: self.superseded_rows.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
@@ -13358,7 +13358,7 @@ impl CayenneTableProvider {
     pub(crate) fn key_resolver(&self) -> Result<Option<super::key_conflicts::KeyResolver>> {
         let Some(policy) = super::key_conflicts::ConflictPolicy::new(
             self.table_metadata.on_conflict.as_ref(),
-            self.upsert_dedup,
+            self.upsert_policy,
         ) else {
             return Ok(None);
         };
@@ -48276,29 +48276,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn buffered_cdc_writes_resolve_repeated_keys_in_single_and_sharded_tiers() {
-        use crate::provider::key_conflicts::UpsertDedup;
+        use crate::provider::key_conflicts::UpsertPolicy;
         use datafusion_table_providers::util::column_reference::ColumnReference;
 
         for shards in [1, 4] {
-            for (on_conflict, dedup, expected) in [
+            for (on_conflict, upsert_policy, expected) in [
                 (
                     OnConflict::DoNothingAll,
-                    UpsertDedup::None,
+                    UpsertPolicy::Upsert,
                     Some(vec![(1, 10), (2, 20), (9, 90)]),
                 ),
                 (
                     OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-                    UpsertDedup::None,
+                    UpsertPolicy::Upsert,
                     Some(vec![(1, 40), (2, 20), (9, 90)]),
                 ),
                 (
                     OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-                    UpsertDedup::DropIdentical,
-                    Some(vec![(1, 40), (2, 20), (9, 90)]),
-                ),
-                (
-                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-                    UpsertDedup::KeepLast,
+                    UpsertPolicy::UpsertByArrival,
                     Some(vec![(1, 40), (2, 20), (9, 90)]),
                 ),
             ] {
@@ -48315,7 +48310,7 @@ mod tests {
                     on_conflict,
                 )
                 .await;
-                provider.upsert_dedup = dedup;
+                provider.upsert_policy = upsert_policy;
                 provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
                 assert!(provider.is_cdc_mem_tier_armed(), "CDC memory path is armed");
                 let schema = provider.table_schema();
@@ -48362,7 +48357,7 @@ mod tests {
                         vec![(9, 90)]
                     );
                 }
-                if dedup == UpsertDedup::DropIdentical {
+                if upsert_policy == UpsertPolicy::Upsert {
                     // A change stream's later change supersedes an earlier one even
                     // when they differ, within a batch and across batches.
                     let schema = provider.table_schema();
@@ -48397,7 +48392,7 @@ mod tests {
                     .await
                     .expect("checkpoint CDC tier");
                 let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-                    .with_upsert_dedup(dedup)
+                    .with_upsert_policy(upsert_policy)
                     .open("buffered_cdc_keys")
                     .await
                     .expect("reopen checkpointed CDC table");
@@ -64101,7 +64096,7 @@ mod tests {
             .expect("UntilInvalidated build 2 (reuse)");
         assert!(
             Arc::ptr_eq(&first, &reused),
-            "an unchanged state must serve the SAME cached bundle (dedup / reuse)"
+            "an unchanged state must serve the SAME cached bundle (upsert_policy / reuse)"
         );
 
         // A second append: UntilInvalidated must see it on the very next scan.

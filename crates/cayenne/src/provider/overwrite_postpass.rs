@@ -532,7 +532,7 @@ impl ArrivalStream {
         if !self.resolver.has_null_key(&batch) && !self.resolver.may_repeat_within(&batch)? {
             return Ok(vec![batch]);
         }
-        if self.resolver.policy() == ConflictPolicy::UpsertIdentical {
+        if self.resolver.policy() == ConflictPolicy::Upsert {
             return self.resolver.split_versions(&batch);
         }
         Ok(vec![self.resolver.resolve_batch(&batch)?])
@@ -1127,8 +1127,8 @@ impl DuplicateQuery<'_> {
                 .map(|i| format!("{BEST_KEY_PREFIX}{i}"))
                 .collect();
             let best = match survivor {
-                Survivor::Latest | Survivor::Identical => max(column(ARRIVAL_COLUMN)),
-                Survivor::Earliest => min(column(ARRIVAL_COLUMN)),
+                Survivor::LastArrival | Survivor::Identical => max(column(ARRIVAL_COLUMN)),
+                Survivor::FirstArrival => min(column(ARRIVAL_COLUMN)),
             };
             let mut aggregates = vec![best.alias(BEST_COLUMN), count(lit(1)).alias(COPIES_COLUMN)];
             let mut selected: Vec<Expr> = keys
@@ -1140,7 +1140,7 @@ impl DuplicateQuery<'_> {
             if survivor != Survivor::Identical {
                 // The kept copy's content, to tell identical copies from versions.
                 let kept_first =
-                    vec![column(ARRIVAL_COLUMN).sort(survivor == Survivor::Earliest, true)];
+                    vec![column(ARRIVAL_COLUMN).sort(survivor == Survivor::FirstArrival, true)];
                 aggregates.extend([
                     first_value(column(CONTENT_LO_COLUMN), kept_first.clone())
                         .alias(BEST_CONTENT_LO),
@@ -1201,10 +1201,10 @@ impl DuplicateQuery<'_> {
             }
             let repeated = ctx.read_batches(repeated_batches)?;
             let superseded_copy = match survivor {
-                Survivor::Latest | Survivor::Identical => {
+                Survivor::LastArrival | Survivor::Identical => {
                     column(ARRIVAL_COLUMN).lt(column(BEST_COLUMN))
                 }
-                Survivor::Earliest => column(ARRIVAL_COLUMN).gt(column(BEST_COLUMN)),
+                Survivor::FirstArrival => column(ARRIVAL_COLUMN).gt(column(BEST_COLUMN)),
             };
             let left: Vec<&str> = keys.iter().map(String::as_str).collect();
             let right: Vec<&str> = best_keys.iter().map(String::as_str).collect();
