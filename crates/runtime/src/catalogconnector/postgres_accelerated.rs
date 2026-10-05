@@ -662,7 +662,6 @@ impl AcceleratedCatalogProvider {
     /// separated from spawning so the whole catalog can be validated before any
     /// background bootstrap/CDC task starts (see `refresh`); a build failure
     /// aborts the refresh with nothing spawned.
-    #[expect(clippy::result_large_err)]
     fn build_accelerated_dataset(
         &self,
         schema_name: &str,

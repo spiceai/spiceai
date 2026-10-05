@@ -279,12 +279,6 @@ impl PreparedOverwrite {
 
     /// The steps of [`Self::finish`], run on their own task.
     async fn publish(self) -> Result<u64> {
-        // Finish the secondary index before the visibility flip, which publishes
-        // it together with the snapshot. Finishing it after the flip would leave
-        // a window in which every lookup falls back to a full scan.
-        self.table
-            .stage_lookup_index_for_snapshot(&self.new_snapshot_id)
-            .await;
         // Publish the new snapshot as a single atomic visibility flip under the listing
         // fence (snapshot id + deletion caches + inline cache + listing swap), so a
         // concurrent scan never observes a torn state. Full rationale on
@@ -408,9 +402,6 @@ impl PreparedOverwrite {
         // staged snapshot directory is mid-deletion.
         let _write_guard = self.write_guard;
         let _checkpoint_guard = self.checkpoint_guard;
-
-        // The snapshot these postings address is about to be deleted.
-        self.table.discard_lookup_index_build();
 
         // Best-effort cleanup of the new snapshot directory. Object stores
         // (S3) don't have a single "remove dir" call; we leave object-store
@@ -662,11 +653,6 @@ impl CayenneTableProvider {
         };
 
         let target_size_bytes = self.target_file_size_bytes();
-        // Build the point-lookup index from the rows this write is already
-        // touching. The sink reports each batch's file and file-local position,
-        // so the index is complete when the write is — no second pass over the
-        // finished files, and nothing to rebuild after the flip.
-        let lookup_index_observer = self.begin_lookup_index_build(&new_snapshot_id);
         // Overwrite replaces the entire table, and anything that reached here did
         // not fit the inline caps, so it is large by definition; shard across the
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
@@ -692,7 +678,6 @@ impl CayenneTableProvider {
                         RangePartitioning::hashed_run_sorted,
                         OverwriteRangePlan::partitioning,
                     )),
-                    lookup_index_observer,
                 )
                 .await?;
             if !is_s3 {
@@ -702,16 +687,7 @@ impl CayenneTableProvider {
             Ok(written)
         }
         .await;
-        // A write that fails before it is prepared never reaches `rollback`, so
-        // its partial index build is dropped here rather than held until the
-        // next refresh.
-        let (row_count, _files_written, write_stats_acc) = match written {
-            Ok(written) => written,
-            Err(error) => {
-                self.discard_lookup_index_build();
-                return Err(error);
-            }
-        };
+        let (row_count, _files_written, write_stats_acc) = written?;
 
         // Manifest snapshot model: reserve ONE sequence `S` for this overwrite
         // and AUTHOR the new snapshot's manifest with `[S, S]` — every file was
@@ -919,6 +895,53 @@ mod tests {
             policy.fan_out,
             crate::provider::table::EncodeFanOut::Serial,
             "the policy is what the writer honours, not the shard count"
+        );
+    }
+
+    /// A sorted replace arrives as one stream and is dealt over the session's
+    /// partitions to sort in parallel, then merged. Draining what it returns
+    /// must give every input row exactly once, in one ascending order, however
+    /// many batches the source sends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorted_overwrite_input_returns_every_row_in_one_order() {
+        use futures::TryStreamExt;
+        let (_dir, provider) = setup_sorted(vec!["id".to_string()]).await;
+        // 60 batches of scrambled ids: more batches than partitions, so every
+        // partition gets several and the merge sees them all.
+        let n = 60_000_i64;
+        let ids: Vec<i64> = (0..n).map(|i| (i * 7_919) % n).collect();
+        let batches: Vec<Result<RecordBatch, DataFusionError>> = ids
+            .chunks(1_000)
+            .map(|chunk| {
+                Ok(RecordBatch::try_new(
+                    test_schema(),
+                    vec![Arc::new(Int64Array::from(chunk.to_vec()))],
+                )
+                .expect("batch"))
+            })
+            .collect();
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            test_schema(),
+            futures::stream::iter(batches),
+        ));
+        let (stream, _shards, _policy) = provider
+            .sort_overwrite_input(input, 8)
+            .expect("sorted overwrite input");
+        let out: Vec<RecordBatch> = stream.try_collect().await.expect("drain");
+        let got: Vec<i64> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 ids")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(
+            got == (0..n).collect::<Vec<_>>(),
+            "a sorted replace must return every id once, ascending"
         );
     }
 

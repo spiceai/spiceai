@@ -25,8 +25,11 @@ limitations under the License.
 use std::{path::Path, sync::Arc, time::Duration};
 
 use app::AppBuilder;
+use arrow::util::pretty::pretty_format_batches;
 use cache::result::CacheStatus;
-use runtime::Runtime;
+use datafusion::common::TableReference;
+use futures::TryStreamExt;
+use runtime::{Runtime, datafusion::query::QueryBuilder};
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode, RefreshOnStartup, SnapshotBehavior},
     component::{
@@ -38,7 +41,6 @@ use spicepod::{
 };
 use tempfile::TempDir;
 
-use super::execute_query_and_check_cache_status;
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{register_test_connectors, runtime_ready_check, test_request_context, wait_until_true},
@@ -47,6 +49,7 @@ use crate::{
 const DATASET: &str = "snapshot_cached";
 const QUERY: &str = "SELECT id, name FROM snapshot_cached WHERE id = 2";
 const SOURCE_CSV: &str = "id,name\n1,alpha\n2,bravo\n3,charlie\n";
+const ROW: &str = "+----+-------+\n| id | name  |\n+----+-------+\n| 2  | bravo |\n+----+-------+";
 
 fn dataset(source: &Path, local_dir: &Path, refresh_mode: RefreshMode) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", source.display()), DATASET);
@@ -100,6 +103,21 @@ async fn start(app: app::App) -> Arc<Runtime> {
         .expect("runtime components should load");
     runtime_ready_check(&rt).await;
     rt
+}
+
+/// Runs `QUERY` on `rt`, returning its rows as a table and its cache status.
+async fn query(rt: &Runtime) -> (String, CacheStatus) {
+    let result = QueryBuilder::new(QUERY, rt.datafusion())
+        .build()
+        .run()
+        .await
+        .expect("query should run");
+    let cache_status = result.cache_status;
+    let batches: Vec<_> = result.data.try_collect().await.expect("query results");
+    let rows = pretty_format_batches(&batches)
+        .expect("format query results")
+        .to_string();
+    (rows, cache_status)
 }
 
 #[tokio::test]
@@ -156,21 +174,36 @@ async fn snapshot_refresh_without_newer_snapshot_keeps_cached_results() {
                     .build(),
             )
             .await;
+            // Readiness can be reported a moment before the table is registered;
+            // this test is about the cache, so it waits for the table itself.
+            let table = TableReference::bare(DATASET);
+            let df = reader.datafusion();
+            assert!(
+                wait_until_true(Duration::from_secs(30), || {
+                    let registered = df.table_exists(&table);
+                    async move { registered }
+                })
+                .await,
+                "the reader never registered '{DATASET}'"
+            );
 
-            execute_query_and_check_cache_status(&reader, QUERY, CacheStatus::CacheMiss)
-                .await
-                .expect("first query should run");
-            execute_query_and_check_cache_status(&reader, QUERY, CacheStatus::CacheHit)
-                .await
-                .expect("repeat query should run");
+            assert_eq!(
+                query(&reader).await,
+                (ROW.to_string(), CacheStatus::CacheMiss)
+            );
+            assert_eq!(
+                query(&reader).await,
+                (ROW.to_string(), CacheStatus::CacheHit)
+            );
 
-            // At least three snapshot checks, none of which finds a newer
-            // snapshot, since the writer has stopped.
+            // Several snapshot checks, none of which finds a newer snapshot. The
+            // check interval is what is under test, so this waits on the clock.
             tokio::time::sleep(Duration::from_millis(3500)).await;
-
-            execute_query_and_check_cache_status(&reader, QUERY, CacheStatus::CacheHit)
-                .await
-                .expect("query after unchanged snapshot checks should run");
+            assert_eq!(
+                query(&reader).await,
+                (ROW.to_string(), CacheStatus::CacheHit),
+                "a snapshot check that found no newer snapshot cleared the cached result"
+            );
 
             reader.shutdown().await;
         })

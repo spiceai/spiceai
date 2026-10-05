@@ -1,3 +1,7 @@
+# Validates query results over data loaded from Spice Cloud into DuckDB, a load
+# no other automated test makes. Weekly and bench only: the DuckDB accelerator
+# itself is benchmarked from file[parquet].
+schedule: weekly
 tests:
   bench:
     spicepod_path: accelerated/spicecloud-duckdb[file].yaml
@@ -6,16 +10,3 @@ tests:
     runner_type: spiceai-dev-runners
     ready_wait: 300
     validate_results: true
-  throughput:
-    spicepod_path: accelerated/spicecloud-duckdb[file].yaml
-    query_set: tpcds
-    query_overrides: duckdb
-    runner_type: spiceai-dev-large-runners
-    ready_wait: 300
-  load:
-    spicepod_path: accelerated/spicecloud-duckdb[file].yaml
-    query_set: tpcds
-    query_overrides: duckdb
-    runner_type: spiceai-dev-large-runners
-    ready_wait: 300
-    duration: 28800

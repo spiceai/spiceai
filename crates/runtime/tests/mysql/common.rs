@@ -49,21 +49,54 @@ const MYSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 const MYSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
-pub async fn start_mysql_docker_container(
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    start_mysql_docker_container_with_image(port, MYSQL_IMAGE).await
+pub async fn start_mysql_docker_container() -> Result<RunningContainer, anyhow::Error> {
+    start_mysql_docker_container_with_image(MYSQL_IMAGE).await
 }
 
-/// Start a `MySQL` container on `port` using a specific image tag. Used by the
+/// How many times [`start_mysql_docker_container_retrying_startup`] tries to
+/// bring the container up before reporting the last failure.
+#[cfg(not(target_os = "windows"))]
+const MYSQL_STARTUP_ATTEMPTS: u32 = 3;
+
+/// Start a `MySQL` container, retrying only the container startup.
+///
+/// For tests that nextest runs with `retries = 0` (see `.config/nextest.toml`).
+/// Nothing after the container is up is repeated, so a lost update cannot be
+/// retried into a pass. Each attempt uses a new container name and Docker-owned
+/// host port; a failed attempt drops its guard to remove only its container ID.
+#[cfg(not(target_os = "windows"))]
+pub async fn start_mysql_docker_container_retrying_startup()
+-> Result<RunningContainer, anyhow::Error> {
+    let mut attempt = 1;
+    loop {
+        match start_mysql_docker_container().await {
+            Ok(container) => return Ok(container),
+            Err(e) if attempt < MYSQL_STARTUP_ATTEMPTS => {
+                tracing::warn!(
+                    "MySQL container failed to start (attempt {attempt}/{MYSQL_STARTUP_ATTEMPTS}), retrying: {e:#}"
+                );
+                attempt += 1;
+            }
+            // The cause goes into the message rather than an anyhow context:
+            // callers format this with `{e}`, which prints only the outermost
+            // context and would hide why the last attempt failed.
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "MySQL container failed to start on all {MYSQL_STARTUP_ATTEMPTS} attempts, the last with: {e:#}"
+                ));
+            }
+        }
+    }
+}
+
+/// Start a `MySQL` container using a specific image tag. Used by the
 /// version matrix to exercise both the `SHOW BINARY LOG STATUS` path (8.2+) and
 /// the `SHOW MASTER STATUS` fallback (8.0).
 #[instrument]
 pub async fn start_mysql_docker_container_with_image(
-    port: u16,
     image: &str,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    start_mysql_container_inner(port, image, &[]).await
+) -> Result<RunningContainer, anyhow::Error> {
+    start_mysql_container_inner(image, &[]).await
 }
 
 /// Start a single-node `MySQL` container with GTIDs fully enabled
@@ -71,11 +104,8 @@ pub async fn start_mysql_docker_container_with_image(
 /// auto-positioning resume test — the source must issue GTIDs for the connector
 /// to persist a failover-safe checkpoint.
 #[instrument]
-pub async fn start_mysql_gtid_docker_container(
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
+pub async fn start_mysql_gtid_docker_container() -> Result<RunningContainer, anyhow::Error> {
     start_mysql_container_inner(
-        port,
         MYSQL_IMAGE,
         &["--gtid-mode=ON", "--enforce-gtid-consistency=ON"],
     )
@@ -86,15 +116,12 @@ pub async fn start_mysql_gtid_docker_container(
 /// (the `MySQL` entrypoint prepends `mysqld` when the first arg starts with
 /// `-`), so they configure the server itself (e.g. GTID mode).
 async fn start_mysql_container_inner(
-    port: u16,
     image: &str,
     mysqld_args: &[&str],
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    let container_name = format!("{MYSQL_DOCKER_CONTAINER}-{port}");
-    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let mut builder = ContainerRunnerBuilder::new(container_name)
+) -> Result<RunningContainer, anyhow::Error> {
+    let mut builder = ContainerRunnerBuilder::new(MYSQL_DOCKER_CONTAINER)
         .image(image.to_string())
-        .add_port_binding(3306, port)
+        .publish_port(3306)
         .add_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
         .add_env_var("MYSQL_DATABASE", "mysqldb")
         .healthcheck(HealthConfig {
@@ -118,7 +145,7 @@ async fn start_mysql_container_inner(
         .run(Some(MYSQL_CONTAINER_START_TIMEOUT))
         .await?;
 
-    wait_for_mysql_host_port(port).await?;
+    wait_for_mysql_host_port(running_container.host_port(3306)?).await?;
 
     Ok(running_container)
 }

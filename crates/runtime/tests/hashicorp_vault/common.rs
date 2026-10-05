@@ -38,15 +38,10 @@ const VAULT_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 const VAULT_SECRET_MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[instrument]
-pub async fn start_vault_docker_container(
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    let container_name = format!("{VAULT_DOCKER_CONTAINER}-{port}");
-    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-
-    let running_container = ContainerRunnerBuilder::new(container_name)
+pub async fn start_vault_docker_container() -> Result<RunningContainer, anyhow::Error> {
+    let running_container = ContainerRunnerBuilder::new(VAULT_DOCKER_CONTAINER)
         .image(VAULT_IMAGE.to_string())
-        .add_port_binding(8200, port)
+        .publish_port(8200)
         .add_env_var("VAULT_DEV_ROOT_TOKEN_ID", VAULT_ROOT_TOKEN)
         .add_env_var("VAULT_DEV_LISTEN_ADDRESS", "0.0.0.0:8200")
         .healthcheck(HealthConfig {
@@ -70,7 +65,7 @@ pub async fn start_vault_docker_container(
         .run(Some(VAULT_CONTAINER_START_TIMEOUT))
         .await?;
 
-    wait_for_secret_mount(port).await?;
+    wait_for_secret_mount(running_container.host_port(8200)?).await?;
     Ok(running_container)
 }
 
