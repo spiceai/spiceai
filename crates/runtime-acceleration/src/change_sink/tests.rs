@@ -243,7 +243,7 @@ async fn overlapping_scope_shapes_reject_equal_full_keys() {
     assert!(is_before_mutation(&error));
     assert_eq!(
         error.to_string(),
-        "Unique key conflicts between scoped appends for dataset 'scoped'"
+        "External error: Error during planning: Unique key conflicts between scoped appends for dataset 'scoped'"
     );
 }
 
@@ -262,7 +262,7 @@ async fn overlapping_scope_shapes_reject_equal_partial_keys() {
     assert!(is_before_mutation(&error));
     assert_eq!(
         error.to_string(),
-        "Unique key conflicts between scoped appends for dataset 'scoped'"
+        "External error: Error during planning: Unique key conflicts between scoped appends for dataset 'scoped'"
     );
 }
 
