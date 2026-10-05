@@ -773,14 +773,7 @@ mod tests {
                             &schema,
                             &[
                                 (1, 10),
-                                (
-                                    1,
-                                    if dedup == UpsertDedup::DropIdentical {
-                                        10
-                                    } else {
-                                        30
-                                    },
-                                ),
+                                (1, 30),
                                 (2, 20),
                             ],
                         ),
@@ -814,7 +807,6 @@ mod tests {
                         assert_eq!(keyed_count_sql(&ctx, &provider).await, 1);
                     }
                     if dedup == UpsertDedup::DropIdentical {
-                        let before_failure = keyed_rows(&ctx, &provider).await;
                         let sink = CayenneDataSink::new(
                             provider.clone_for_write(),
                             if overwrite {
@@ -836,10 +828,15 @@ mod tests {
                                 .map(Ok),
                             ),
                         ));
+                        // A refresh never fails on a key it repeats: `upsert_dedup`
+                        // keeps the last copy of differing ones too.
                         sink.write_all(stream, &ctx.task_ctx())
                             .await
-                            .expect_err("different rows under one key must fail");
-                        assert_eq!(keyed_rows(&ctx, &provider).await, before_failure);
+                            .expect("different rows under one key keep the last");
+                        assert_eq!(
+                            keyed_rows(&ctx, &provider).await.first(),
+                            Some(&(1, 70))
+                        );
                     }
                     if !memory_mode {
                         let before_reopen = keyed_rows(&ctx, &provider).await;

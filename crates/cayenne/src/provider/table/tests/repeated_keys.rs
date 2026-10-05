@@ -87,6 +87,18 @@ async fn visible(provider: &CayenneTableProvider) -> (Vec<(i64, String)>, i64) {
     (rows, count)
 }
 
+/// A batch whose second row has no primary key, which fails every write.
+fn null_key_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(5), None])),
+            Arc::new(StringArray::from_iter_values(["c", "d"])),
+        ],
+    )
+    .expect("batch")
+}
+
 fn owned(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
     rows.iter().map(|(id, v)| (*id, (*v).to_string())).collect()
 }
@@ -208,11 +220,11 @@ async fn streaming_append_failure_leaves_previous_rows() {
             vec![
                 batch(&[(1, "a"), (2, "a")]),
                 batch(&[(2, "b")]),
-                batch(&[(5, "c"), (5, "d")]),
+                null_key_batch(),
             ],
         )
         .await
-        .expect_err("a differing repeat within one batch fails upsert_dedup");
+        .expect_err("a null primary key fails the append");
         eprintln!("{mode:?} failed append: {error}");
         assert_eq!(visible(&provider).await, (owned(&[(9, "old")]), 1));
         let provider = reopen(&catalog, &runtime_env, UpsertDedup::DropIdentical).await;
@@ -571,23 +583,21 @@ async fn a_failed_overwrite_repeating_keys_leaves_the_previous_table() {
         write(&provider, InsertOp::Overwrite, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
-        // The third batch repeats key 5 with differing values, which `upsert_dedup`
-        // rejects, after the second batch has already opened a layer.
+        // The third batch carries a null primary key, which fails every policy,
+        // after the second batch has already been written.
         let error = write(
             &provider,
             InsertOp::Overwrite,
             vec![
                 batch(&[(1, "a"), (2, "a")]),
                 batch(&[(2, "b")]),
-                batch(&[(5, "c"), (5, "d")]),
+                null_key_batch(),
             ],
         )
         .await
-        .expect_err("a differing repeat within one batch fails upsert_dedup");
+        .expect_err("a null primary key fails the overwrite");
         assert!(
-            error
-                .to_string()
-                .contains("uniqueness constraint on column(s): 'id'"),
+            error.to_string().contains("'id' has null values"),
             "{mode:?}: {error}"
         );
         assert_eq!(

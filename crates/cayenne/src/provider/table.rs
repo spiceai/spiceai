@@ -13268,7 +13268,7 @@ impl CayenneTableProvider {
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>> {
         match self.key_resolver()? {
-            Some(resolver) => resolver.for_change_stream().collapse_write(batches),
+            Some(resolver) => resolver.collapse_write(batches),
             None => Ok(batches),
         }
     }
@@ -47810,13 +47810,8 @@ mod tests {
                     seed_write.in_memory_epoch().is_some(),
                     "seed used the memory tier"
                 );
-                let second_value = if dedup == UpsertDedup::DropIdentical {
-                    10
-                } else {
-                    30
-                };
                 let batches = vec![
-                    id_value_batch(Arc::clone(&schema), &[1, 1, 2], &[10, second_value, 20]),
+                    id_value_batch(Arc::clone(&schema), &[1, 1, 2], &[10, 30, 20]),
                     id_value_batch(Arc::clone(&schema), &[1], &[40]),
                 ];
                 let stream = Box::pin(RecordBatchStreamAdapter::new(

@@ -261,7 +261,7 @@ async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
                 (identical, OnConflictBehavior::Upsert, Some("a")),
                 (differing, OnConflictBehavior::Upsert, Some("c")),
                 (identical, OnConflictBehavior::UpsertDedup, Some("a")),
-                (differing, OnConflictBehavior::UpsertDedup, None),
+                (differing, OnConflictBehavior::UpsertDedup, Some("c")),
                 (identical, OnConflictBehavior::UpsertDedupByRowId, Some("a")),
                 (differing, OnConflictBehavior::UpsertDedupByRowId, Some("c")),
             ];

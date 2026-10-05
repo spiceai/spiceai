@@ -22,10 +22,11 @@ limitations under the License.
 //! |--------------------------|------------------------------|-----------------------|
 //! | `drop`                   | first copy kept              | first copy kept       |
 //! | `upsert`                 | last copy wins               | last copy wins        |
-//! | `upsert_dedup`           | identical rows collapse, else error | last copy wins |
+//! | `upsert_dedup`           | last copy wins               | last copy wins        |
 //! | `upsert_dedup_by_row_id` | last copy wins               | last copy wins        |
 //!
-//! A plain `upsert` keeps the last copy of a key a batch repeats, as conflict
+//! A refresh never fails on a key its data repeats, whatever the policy and
+//! wherever the copies fall: every upsert policy keeps the last copy, as conflict
 //! validation does for a statement's batch (`UpsertOptions::last_write_wins`).
 //!
 //! [`KeyResolver::resolve_batch`] applies the within-batch column, and
@@ -39,7 +40,6 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::Schema;
-use arrow::row::{RowConverter as TransientRowConverter, SortField as TransientSortField};
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use hash_index::PrehashedBuildHasher;
 
@@ -52,7 +52,8 @@ const REPEAT_CHECK_SEED: u64 = 0x6361_7965_6e6e_6502;
 use crate::row_converter::{RowConverter, SortField};
 
 /// The `upsert` refinement a dataset's `on_conflict` selects, which the table's
-/// stored `OnConflict` cannot express.
+/// stored `OnConflict` cannot express. A refresh resolves every key it repeats
+/// whichever is selected (see [`ConflictPolicy::new`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UpsertDedup {
     /// Plain `upsert` (or `drop`, which has no refinement).
@@ -70,11 +71,8 @@ pub enum UpsertDedup {
 pub(crate) enum ConflictPolicy {
     /// `drop`: the first copy of a key is kept, within and across batches.
     KeepFirst,
-    /// `upsert_dedup`: identical rows within a batch collapse, differing ones fail;
-    /// across batches the last copy wins.
-    UpsertDropIdentical,
-    /// `upsert` and `upsert_dedup_by_row_id`: the last copy wins, within and
-    /// across batches.
+    /// `upsert`, `upsert_dedup` and `upsert_dedup_by_row_id`: the last copy wins,
+    /// within and across batches.
     UpsertKeepLast,
 }
 
@@ -83,9 +81,12 @@ impl ConflictPolicy {
     pub(crate) fn new(on_conflict: Option<&OnConflict>, dedup: UpsertDedup) -> Option<Self> {
         Some(match on_conflict? {
             OnConflict::DoNothing(_) | OnConflict::DoNothingAll => Self::KeepFirst,
+            // A refresh resolves every repeat, so the refinements that only
+            // decide which within-batch repeats a statement tolerates do not apply.
             OnConflict::Upsert(_) => match dedup {
-                UpsertDedup::DropIdentical => Self::UpsertDropIdentical,
-                UpsertDedup::None | UpsertDedup::KeepLast => Self::UpsertKeepLast,
+                UpsertDedup::None | UpsertDedup::DropIdentical | UpsertDedup::KeepLast => {
+                    Self::UpsertKeepLast
+                }
             },
         })
     }
@@ -109,7 +110,7 @@ impl Survivor {
     pub(crate) fn for_policy(policy: ConflictPolicy) -> Self {
         match policy {
             ConflictPolicy::KeepFirst => Self::Earliest,
-            ConflictPolicy::UpsertDropIdentical | ConflictPolicy::UpsertKeepLast => Self::Latest,
+            ConflictPolicy::UpsertKeepLast => Self::Latest,
         }
     }
 }
@@ -128,8 +129,6 @@ pub(crate) struct KeyResolver {
     primary_key: Arc<[usize]>,
     policy: ConflictPolicy,
     keys: RowConverter,
-    /// Encodes whole rows, to tell identical copies from conflicting ones.
-    rows: Option<TransientRowConverter>,
 }
 
 impl std::fmt::Debug for KeyResolver {
@@ -158,41 +157,14 @@ impl KeyResolver {
                 .map(|&index| SortField::new(schema.field(index).data_type().clone()))
                 .collect(),
         )?;
-        let rows = matches!(policy, ConflictPolicy::UpsertDropIdentical)
-            .then(|| {
-                TransientRowConverter::new(
-                    schema
-                        .fields()
-                        .iter()
-                        .map(|field| TransientSortField::new(field.data_type().clone()))
-                        .collect(),
-                )
-            })
-            .transpose()?;
         Ok(Self {
             table_name: Arc::from(table_name),
             primary_key: primary_key.into(),
             policy,
             keys,
-            rows,
         })
     }
 
-    /// The resolver a change stream applies: each change of a key supersedes the
-    /// one before it (under `drop` the first is kept), so no repeat is an error.
-    pub(crate) fn for_change_stream(self) -> Self {
-        let policy = match self.policy {
-            ConflictPolicy::KeepFirst => ConflictPolicy::KeepFirst,
-            ConflictPolicy::UpsertDropIdentical | ConflictPolicy::UpsertKeepLast => {
-                ConflictPolicy::UpsertKeepLast
-            }
-        };
-        Self {
-            policy,
-            rows: None,
-            ..self
-        }
-    }
 
     pub(crate) fn policy(&self) -> ConflictPolicy {
         self.policy
@@ -260,11 +232,6 @@ impl KeyResolver {
                     repeated = true;
                     match self.policy {
                         ConflictPolicy::KeepFirst => {}
-                        ConflictPolicy::UpsertDropIdentical => {
-                            if !self.identical(batch, *entry.get(), row)? {
-                                return Err(self.uniqueness_violation(batch));
-                            }
-                        }
                         ConflictPolicy::UpsertKeepLast => {
                             entry.insert(row);
                         }
@@ -368,47 +335,6 @@ impl KeyResolver {
             .map(|key| pk_digest_bytes(key.as_ref()))
             .collect())
     }
-
-    fn identical(&self, batch: &RecordBatch, first: usize, second: usize) -> Result<bool> {
-        let Some(converter) = &self.rows else {
-            return Ok(false);
-        };
-        let pair: Vec<ArrayRef> = batch
-            .columns()
-            .iter()
-            .map(|column| {
-                arrow::compute::take(
-                    column.as_ref(),
-                    &arrow::array::UInt32Array::from(vec![
-                        u32::try_from(first).unwrap_or(u32::MAX),
-                        u32::try_from(second).unwrap_or(u32::MAX),
-                    ]),
-                    None,
-                )
-            })
-            .collect::<std::result::Result<_, _>>()?;
-        let rows = converter.convert_columns(&pair)?;
-        Ok(rows.row(0) == rows.row(1))
-    }
-
-    fn uniqueness_violation(&self, batch: &RecordBatch) -> Error {
-        let schema = batch.schema();
-        let columns: Vec<String> = self
-            .primary_key
-            .iter()
-            .map(|&index| format!("'{}'", schema.field(index).name()))
-            .collect();
-        Error::DataValidation {
-            table: self.table_name.to_string(),
-            message: format!(
-                "Incoming data violates uniqueness constraint on column(s): {}. Remove the \
-                 duplicate rows from the source, or set `on_conflict` to `upsert_dedup` or \
-                 `upsert_dedup_by_row_id`. For details, visit \
-                 https://spiceai.org/docs/features/data-acceleration/constraints",
-                columns.join(", ")
-            ),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -475,7 +401,7 @@ mod tests {
         );
         assert_eq!(
             ConflictPolicy::new(Some(&upsert), UpsertDedup::DropIdentical),
-            Some(ConflictPolicy::UpsertDropIdentical)
+            Some(ConflictPolicy::UpsertKeepLast)
         );
         assert_eq!(
             ConflictPolicy::new(Some(&upsert), UpsertDedup::KeepLast),
@@ -498,32 +424,11 @@ mod tests {
         );
         assert_eq!(
             rows(
-                &resolver(ConflictPolicy::UpsertDropIdentical)
-                    .collapse_write(write())
-                    .expect("identical rows collapse")
-            ),
-            owned(&[(2, "b"), (1, "c")])
-        );
-        assert_eq!(
-            rows(
                 &resolver(ConflictPolicy::UpsertKeepLast)
                     .collapse_write(write())
                     .expect("keep last")
             ),
             owned(&[(2, "b"), (1, "c")])
-        );
-    }
-
-    #[test]
-    fn drop_identical_rejects_a_differing_repeat_within_a_batch() {
-        let error = resolver(ConflictPolicy::UpsertDropIdentical)
-            .collapse_write(vec![batch(&[(1, "a"), (1, "b")])])
-            .expect_err("different values under one key within a batch");
-        assert!(
-            error
-                .to_string()
-                .contains("uniqueness constraint on column(s): 'id'"),
-            "{error}"
         );
     }
 
@@ -548,7 +453,6 @@ mod tests {
         .expect("batch");
         for policy in [
             ConflictPolicy::KeepFirst,
-            ConflictPolicy::UpsertDropIdentical,
             ConflictPolicy::UpsertKeepLast,
         ] {
             let error = resolver(policy)
