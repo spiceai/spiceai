@@ -376,6 +376,51 @@ mod tests {
         assert_eq!(rows, owned(&[(1, "a"), (2, "b"), (1, "c")]));
     }
 
+    #[test]
+    fn retained_digests_are_charged_to_the_window() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = MemoryConsumer::new("window").register(&pool);
+        let mut window = CollapseWindow::new(COLLAPSE_WINDOW_BYTES, Survivor::Latest, reservation);
+        let mut resolved = resolver(ConflictPolicy::UpsertKeepLast)
+            .resolve_batch(&batch(&[(1, "a")]))
+            .expect("resolve");
+        resolved.digests.reserve(1024);
+        let retained_digests = resolved.digests.capacity() * size_of::<u128>();
+        let arrays = resolved.batch.get_array_memory_size();
+        window.push(resolved);
+        assert!(
+            pool.reserved() >= arrays + retained_digests,
+            "the retained digest capacity must remain charged: {} reserved for at least {} bytes",
+            pool.reserved(),
+            arrays + retained_digests,
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_batches_keep_their_reservation_until_yielded() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = MemoryConsumer::new("window").register(&pool);
+        let second = batch(&[(2, "b")]);
+        let retained = second.get_array_memory_size() + size_of::<u128>();
+        let mut stream = CollapseStream::new(
+            input(vec![batch(&[(1, "a")]), second]),
+            resolver(ConflictPolicy::UpsertKeepLast),
+            COLLAPSE_WINDOW_BYTES,
+            reservation,
+        );
+        assert_eq!(
+            stream.next().await.expect("first batch").expect("collapse"),
+            batch(&[(1, "a")]),
+        );
+        assert!(
+            pool.reserved() >= retained,
+            "the queued second batch needs at least {retained} bytes, reserved {}",
+            pool.reserved(),
+        );
+        drop(stream);
+        assert_eq!(pool.reserved(), 0);
+    }
+
     /// The window's bound covers everything it holds — its rows and the map of
     /// their keys — and holds no more than one window's worth after a drain.
     #[test]
