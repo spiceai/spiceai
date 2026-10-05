@@ -2417,6 +2417,8 @@ struct SharedMetastoreFixture {
     context: SnapshotS3Context,
     names: Vec<String>,
     expected_rows: i64,
+    /// Holds the writer's source CSV, which exists only while the writer loads it.
+    source_dir: TempDir,
 }
 
 impl SharedMetastoreFixture {
@@ -2434,18 +2436,37 @@ impl SharedMetastoreFixture {
                 .map(|i| format!("taxi_trips_{i}"))
                 .collect(),
             expected_rows: 0,
+            source_dir: TempDir::new().context("Creating the writer's source directory")?,
         })
+    }
+
+    fn source_path(&self) -> PathBuf {
+        self.source_dir.path().join("taxi_sample.csv")
+    }
+
+    /// The source every dataset declares, the writer's and the readers' alike: a
+    /// `refresh_mode: snapshot` reader loads only snapshots of the source selection it
+    /// declares. Only the writer reads it, and `publish` removes it once the writer has
+    /// loaded, so a reader that does not bootstrap never loads.
+    fn source(&self) -> (String, Params) {
+        (
+            format!("file://{}", self.source_path().display()),
+            Params::from_string_map(HashMap::from([
+                ("file_format".to_string(), "csv".to_string()),
+                ("csv_has_header".to_string(), "true".to_string()),
+            ])),
+        )
     }
 
     /// Runs the writer until it has published a snapshot of every dataset.
     async fn publish(&mut self) -> Result<()> {
         let (context, names) = (&self.context, &self.names);
         let temp_dir = TempDir::new().context("Creating the writer's Cayenne directory")?;
-        let source_path = temp_dir.path().join("taxi_sample.csv");
+        let source_path = self.source_path();
         fs::write(&source_path, include_str!("../test_data/taxi_sample.csv"))
             .await
             .context("Writing sample CSV for the writer's datasets")?;
-        let from = format!("file://{}", source_path.display());
+        let (from, params) = self.source();
 
         let mut app = AppBuilder::new("snapshot_writer").with_snapshots(build_snapshots_config(
             context,
@@ -2461,16 +2482,18 @@ impl SharedMetastoreFixture {
             if let Some(acceleration) = dataset.acceleration.as_mut() {
                 acceleration.refresh_mode = Some(RefreshMode::Full);
             }
-            dataset.params = Some(Params::from_string_map(HashMap::from([
-                ("file_format".to_string(), "csv".to_string()),
-                ("csv_has_header".to_string(), "true".to_string()),
-            ])));
+            dataset.params = Some(params.clone());
             app = app.with_dataset(dataset);
         }
 
         configure_test_datafusion();
         let runtime = Arc::new(Runtime::builder().with_app(app.build()).build().await);
         load_runtime(Arc::clone(&runtime)).await?;
+        // Loaded and never refreshed, so the writer is done with its source: from here on
+        // no reader declaring it can find rows there.
+        fs::remove_file(&source_path)
+            .await
+            .context("Removing the writer's source once it has loaded")?;
         let expected_rows = count_table_rows(&runtime, &names[0]).await?;
         let wait = context
             .wait_for_current_snapshots(names, Duration::from_mins(2))
@@ -2485,8 +2508,9 @@ impl SharedMetastoreFixture {
         Ok(())
     }
 
-    /// A runtime serving only from snapshots: each dataset's source is a placeholder that
-    /// is never read, so a dataset that does not bootstrap never loads.
+    /// A runtime serving only from snapshots: each dataset declares the writer's source
+    /// (see [`Self::source`]), which is gone by the time a reader could read it, so a
+    /// dataset that does not bootstrap never loads.
     fn reader_app(
         &self,
         name: &str,
@@ -2494,13 +2518,14 @@ impl SharedMetastoreFixture {
         datasets: &[String],
         refresh_check_interval: &str,
     ) -> app::App {
+        let (from, params) = self.source();
         let mut app = AppBuilder::new(name).with_snapshots(build_snapshots_config(
             &self.context,
             BootstrapOnFailureBehavior::Warn,
         ));
         for dataset in datasets {
             let mut dataset = shared_metastore_dataset(
-                &format!("file:/nonexistent/{dataset}.csv"),
+                &from,
                 dataset,
                 root,
                 DatasetSnapshotBehavior::BootstrapOnly,
@@ -2509,10 +2534,7 @@ impl SharedMetastoreFixture {
                 acceleration.refresh_mode = Some(RefreshMode::Snapshot);
                 acceleration.refresh_check_interval = Some(refresh_check_interval.to_string());
             }
-            dataset.params = Some(Params::from_string_map(HashMap::from([(
-                "file_format".to_string(),
-                "csv".to_string(),
-            )])));
+            dataset.params = Some(params.clone());
             app = app.with_dataset(dataset);
         }
         app.build()
@@ -2547,7 +2569,7 @@ impl SharedMetastoreFixture {
                 .build()
                 .await,
         );
-        // A dataset that did not bootstrap retries its placeholder source for good, so the
+        // A dataset that did not bootstrap retries its missing source for good, so the
         // load is not awaited: the per-dataset queries in `wait_until_served` are the condition.
         let load = tokio::spawn(Arc::clone(&runtime).load_components());
         (runtime, load)
@@ -2713,7 +2735,7 @@ async fn snapshot_int_test_cayenne_shared_metastore_partial_restart() -> Result<
 }
 
 /// A reader started before any snapshot exists loads once the writer publishes one,
-/// instead of retrying its placeholder source forever.
+/// instead of retrying its missing source forever.
 #[tokio::test]
 async fn snapshot_int_test_cayenne_reader_started_before_first_snapshot() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
