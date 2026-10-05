@@ -783,9 +783,9 @@ async fn test_http_oauth_client_credentials_custom_header() -> Result<(), String
                 .ok_or_else(|| "expected an array of rows".to_string())?;
             assert!(!rows.is_empty(), "expected at least one row from /data");
             for row in rows {
-                // A 401 would still produce a row (with the error body); require
-                // 200 to prove the client-credentials token was accepted on the
-                // custom header.
+                // The default `on_error_response` fails the query on a 401 rather than
+                // recording its body, so the rows existing at all already says the token
+                // was accepted; asserting 200 pins which status they carry.
                 assert_eq!(
                     row.get("response_status").and_then(Value::as_u64),
                     Some(200),
