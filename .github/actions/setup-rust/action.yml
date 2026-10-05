@@ -103,94 +103,38 @@ runs:
         # tree before install so rustup does not rename components onto leftovers.
         rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
         mkdir -p "$rustup_home"
-        lockdir="$rustup_home/setup-rust.lock"
-        # Separate mkdir-atomic lock for stale reaping. Two waiters must not both
-        # decide the main lock is stale, then race: after A removes/recreates the
-        # main lock and writes its PID, B must not execute an already-decided
-        # `rm -rf` that deletes A's live lock. Only the reaper-lock holder may
-        # remove a stale main lock, and it re-checks under that lock.
-        reaperdir="$rustup_home/setup-rust.reaper.lock"
-
-        release_rustup_lock() {
-          if [ -f "$lockdir/pid" ] && [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$$" ]; then
-            rm -rf "$lockdir"
-          fi
-        }
-        trap release_rustup_lock EXIT
-
-        # Classify whether `$lockdir` looks stale (dead holder, or empty+old).
-        # Callers that will remove must re-check under `$reaperdir`.
-        rustup_lock_looks_stale() {
-          now=$(date +%s)
-          if [ "$(uname)" = "Darwin" ]; then
-            mtime=$(stat -f %m "$lockdir" 2>/dev/null || echo "$now")
-          else
-            mtime=$(stat -c %Y "$lockdir" 2>/dev/null || echo "$now")
-          fi
-          age=$((now - mtime))
-          holder=""
-          if [ -f "$lockdir/pid" ]; then
-            holder="$(cat "$lockdir/pid" 2>/dev/null || true)"
-          fi
-          if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-            return 1
-          fi
-          if [ -z "$holder" ] && [ "$age" -lt 15 ]; then
-            return 1
-          fi
-          return 0
-        }
-
-        # Stale-reap the main lock only while holding `$reaperdir` (mkdir-atomic).
-        # Clearing a stuck reaper never counts as acquiring it: after `rm` we
-        # return and retry, so two waiters cannot both believe they hold the
-        # reaper and race on removing a live main lock.
-        try_reap_stale_rustup_lock() {
-          if mkdir "$reaperdir" 2>/dev/null; then
-            echo $$ > "$reaperdir/pid"
-            # Re-check under the reaper lock before removing the main lock.
-            if [ -d "$lockdir" ] && rustup_lock_looks_stale; then
-              rm -rf "$lockdir"
-            fi
-            rm -rf "$reaperdir"
-            return 0
-          fi
-          now=$(date +%s)
-          if [ "$(uname)" = "Darwin" ]; then
-            rmtime=$(stat -f %m "$reaperdir" 2>/dev/null || echo "$now")
-          else
-            rmtime=$(stat -c %Y "$reaperdir" 2>/dev/null || echo "$now")
-          fi
-          rage=$((now - rmtime))
-          rholder=""
-          if [ -f "$reaperdir/pid" ]; then
-            rholder="$(cat "$reaperdir/pid" 2>/dev/null || true)"
-          fi
-          if [ -n "$rholder" ] && kill -0 "$rholder" 2>/dev/null; then
-            return 1
-          fi
-          if [ -z "$rholder" ] && [ "$rage" -lt 15 ]; then
-            return 1
-          fi
-          # Dead/stuck reaper: clear it, but do not acquire — retry via mkdir.
-          rm -rf "$reaperdir"
-          return 1
-        }
-
-        waited=0
-        while ! mkdir "$lockdir" 2>/dev/null; do
-          if rustup_lock_looks_stale; then
-            try_reap_stale_rustup_lock || true
-            continue
-          fi
-          sleep 2
-          waited=$((waited + 2))
-          if [ "$waited" -gt 900 ]; then
-            echo "Timed out waiting for $lockdir" >&2
+        # The lock is an OS advisory lock (flock(2)) on a file, not a directory or
+        # PID-file lock. The kernel drops it when the shell that holds it exits,
+        # however it exits (a cancelled job's SIGKILL included), so nothing ever
+        # has to decide a holder is dead and delete its lock. Every stale-reaping
+        # scheme has a check/delete race: a waiter that decided the old lock was
+        # stale can run its `rm` after another waiter has already recreated it,
+        # deleting a live lock and letting two installs in at once.
+        lockfile="$rustup_home/setup-rust.flock"
+        exec 9>>"$lockfile"
+        if command -v flock >/dev/null 2>&1; then
+          # util-linux flock(1) (Linux runners).
+          if ! flock -w 900 9; then
+            echo "Timed out waiting for $lockfile" >&2
             exit 1
           fi
-        done
-        echo $$ > "$lockdir/pid"
+        else
+          # macOS has no flock(1), but ships perl. flock(2) locks the open file
+          # description, which perl shares with this shell's fd 9, so the lock
+          # outlives the perl process and is held until this shell closes fd 9.
+          if ! perl -MFcntl=:flock -e '
+            open(my $fh, ">>&=", 9) or die "cannot open fd 9: $!\n";
+            my $deadline = time + 900;
+            until (flock($fh, LOCK_EX | LOCK_NB)) {
+              die "flock: $!\n" unless $!{EWOULDBLOCK} || $!{EAGAIN};
+              die "timed out\n" if time >= $deadline;
+              sleep 2;
+            }
+          '; then
+            echo "Could not lock $lockfile" >&2
+            exit 1
+          fi
+        fi
 
         if [ ! -x "$cargo_home/bin/rustup" ]; then
           curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
@@ -229,8 +173,8 @@ runs:
             --component clippy
         fi
 
-        release_rustup_lock
-        trap - EXIT
+        # Release the install lock; nothing below writes to RUSTUP_HOME.
+        exec 9>&-
 
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
