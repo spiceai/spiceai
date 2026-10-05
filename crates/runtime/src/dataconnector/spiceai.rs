@@ -70,9 +70,9 @@ pub enum Error {
     MissingRequiredParameter { parameter: String },
 
     #[snafu(display(
-        "Missing required parameter: spiceai_region. Set it to the region of the Spice Cloud app the dataset reads from, for example 'spiceai_region: us-east-1'. To list available regions, run: 'spice cloud regions'. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
+        "Missing required parameter: {parameter}. Set it to the region of the Spice Cloud app the dataset reads from, for example '{parameter}: us-east-1'. To list available regions, run: 'spice cloud regions'. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
     ))]
-    MissingRegion,
+    MissingRegion { parameter: String },
 
     #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}". {source} Ensure the endpoint is valid and reachable"#))]
     UnableToVerifyEndpointConnection {
@@ -302,13 +302,16 @@ fn ensure_supported_endpoint_scheme(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-fn get_region(params: &ConnectorParams) -> Option<&str> {
-    params.parameters.get("region").expose().ok()
-}
-
-fn require_valid_region(region: Option<&str>) -> Result<&str> {
-    let region = region.context(MissingRegionSnafu)?;
-    ensure!(!region.is_empty(), MissingRegionSnafu);
+fn require_valid_region(params: &ConnectorParams) -> Result<&str> {
+    let region = params
+        .parameters
+        .get("region")
+        .expose()
+        .ok()
+        .filter(|region| !region.is_empty())
+        .with_context(|| MissingRegionSnafu {
+            parameter: params.parameters.user_param("region").to_string(),
+        })?;
     ensure!(
         is_valid_region(region),
         InvalidRegionSnafu {
@@ -320,22 +323,20 @@ fn require_valid_region(region: Option<&str>) -> Result<&str> {
 }
 
 fn get_endpoint(params: &ConnectorParams) -> Result<Arc<str>> {
-    let region = get_region(params);
-
     let Some(endpoint) = get_explicit_endpoint(params).or_else(|| get_from_endpoint(params)) else {
-        let region = require_valid_region(region)?;
+        let region = require_valid_region(params)?;
         return Ok(spice_cloud_flight_endpoint(region).into());
     };
 
     ensure_supported_endpoint_scheme(endpoint)?;
 
     if is_legacy_spice_cloud_endpoint(endpoint) {
-        let region = require_valid_region(region)?;
+        let region = require_valid_region(params)?;
         return Ok(spice_cloud_flight_endpoint(region).into());
     }
 
     if let Some(endpoint_region) = spice_cloud_endpoint_region(endpoint) {
-        let region = require_valid_region(region)?;
+        let region = require_valid_region(params)?;
         ensure!(
             endpoint_region == region,
             CloudEndpointRegionMismatchSnafu {
@@ -367,7 +368,11 @@ fn get_credentials(params: &ConnectorParams, endpoint: &str) -> Result<Credentia
 
     if is_spice_cloud_endpoint(endpoint) {
         return MissingRequiredParameterSnafu {
-            parameter: "spiceai_api_key or spiceai_token".to_string(),
+            parameter: format!(
+                "{} or {}",
+                params.parameters.user_param("api_key"),
+                params.parameters.user_param("token")
+            ),
         }
         .fail();
     }
