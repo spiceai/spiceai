@@ -213,7 +213,10 @@ impl RefreshSource for ReportingRefreshSource {
 
 /// The error logged, and set as the dataset's status, when a dataset served from
 /// its existing acceleration cannot reach its source because of its configuration.
-fn source_configuration_error(dataset: &datafusion::sql::TableReference, cause: &str) -> String {
+pub(crate) fn source_configuration_error(
+    dataset: &datafusion::sql::TableReference,
+    cause: &str,
+) -> String {
     format!(
         "Dataset '{dataset}' cannot connect to its source because of its configuration, so it is served from its existing acceleration and will not refresh until the configuration is fixed. {cause}"
     )

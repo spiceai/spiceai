@@ -52,20 +52,42 @@ pub type ConnectorBuilder =
 /// answered.
 #[derive(Debug, Clone)]
 pub enum SourceUnavailable {
-    /// Reading the source failed with a retriable error.
-    Failed(String),
+    /// Reading the source failed, retaining whether its configuration must be fixed.
+    Failed {
+        cause: String,
+        configuration_error: bool,
+    },
     /// The source has not been contacted yet: the dataset is served from its
     /// acceleration and connects in the background.
     NotContacted,
 }
 
 impl SourceUnavailable {
-    /// Logs why `dataset` is served from its existing acceleration: a source that
-    /// could not be reached is a warning. A source not contacted yet logs nothing
-    /// here; a failure to reach it is reported when it happens.
+    /// Retains the classification used by background source failure reporting.
+    pub fn failed(error: &DataConnectorError) -> Self {
+        Self::Failed {
+            cause: error.to_string(),
+            configuration_error: !error.is_retriable(),
+        }
+    }
+
+    /// Logs why `dataset` is served from its existing acceleration: a transient
+    /// failure is a warning, and a configuration failure is an error. A source not
+    /// contacted yet logs nothing here; a failure is reported when it happens.
     pub fn log_serving_from_acceleration(&self, dataset: &TableReference) {
-        if let Self::Failed(cause) = self {
-            tracing::warn!("{}", unreachable_source_warning(dataset, cause));
+        if let Self::Failed {
+            cause,
+            configuration_error,
+        } = self
+        {
+            if *configuration_error {
+                tracing::error!(
+                    "{}",
+                    super::refresh_source::source_configuration_error(dataset, cause)
+                );
+            } else {
+                tracing::warn!("{}", unreachable_source_warning(dataset, cause));
+            }
         }
     }
 }
@@ -350,7 +372,43 @@ impl DataConnector for ReconnectingConnector {
 mod tests {
     use datafusion::sql::TableReference;
 
-    use super::unreachable_source_warning;
+    use super::{
+        ConnectorComponent, DataConnectorError, SourceUnavailable, unreachable_source_warning,
+    };
+
+    #[test]
+    fn initial_source_failure_retains_its_configuration_classification() {
+        let component = ConnectorComponent::Dataset(std::sync::Arc::new(super::DatasetSpec::new(
+            "http://127.0.0.1:28199/api",
+            TableReference::bare("orders"),
+        )));
+        let configuration_error = DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: component.clone(),
+            message: "Full refresh requires refresh_sql".to_string(),
+        };
+        assert!(matches!(
+            SourceUnavailable::failed(&configuration_error),
+            SourceUnavailable::Failed {
+                configuration_error: true,
+                ..
+            }
+        ));
+
+        let transient_error = DataConnectorError::UnableToConnectInvalidHostOrPort {
+            dataconnector: "https".to_string(),
+            connector_component: component,
+            host: "127.0.0.1".to_string(),
+            port: "28199".to_string(),
+        };
+        assert!(matches!(
+            SourceUnavailable::failed(&transient_error),
+            SourceUnavailable::Failed {
+                configuration_error: false,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn unreachable_source_warning_names_the_dataset_and_the_cause() {

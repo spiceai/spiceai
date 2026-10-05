@@ -1231,7 +1231,7 @@ impl Runtime {
                 ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
                 Arc::clone(&ds),
                 Arc::clone(&self.status),
-                matches!(reason, SourceUnavailable::Failed(_)),
+                matches!(reason, SourceUnavailable::Failed { .. }),
             ),
             checkpoint_schema,
             self.status.shutdown_token(),
@@ -1334,7 +1334,7 @@ impl Runtime {
                         data_connector,
                         resolved_refresh_mode,
                         checkpoint_schema,
-                        &SourceUnavailable::Failed(err.to_string()),
+                        &SourceUnavailable::failed(&err),
                     ));
                 }
                 self.status.update_dataset(
