@@ -44,6 +44,7 @@ use super::pk_index::pk_digest_bytes;
 use super::pk_validation::null_primary_key_message;
 use super::{Error, Result};
 use crate::row_converter::{RowConverter, SortField};
+use util::session_state::{SupersededReason, SupersededRows};
 
 /// Seeds the hash [`KeyResolver::may_repeat_within`] checks a batch's keys by.
 const REPEAT_CHECK_SEED: u64 = 0x6361_7965_6e6e_6502;
@@ -117,6 +118,7 @@ pub(crate) struct KeyResolver {
     policy: ConflictPolicy,
     keys: RowConverter,
     contents: ContentEncoder,
+    superseded: Option<Arc<SupersededRows>>,
 }
 
 impl std::fmt::Debug for KeyResolver {
@@ -157,7 +159,21 @@ impl KeyResolver {
             policy,
             keys,
             contents: ContentEncoder::new(schema)?,
+            superseded: None,
         })
+    }
+
+    /// Count the rows this resolver supersedes into `superseded`.
+    #[must_use]
+    pub(crate) fn counting(mut self, superseded: Option<Arc<SupersededRows>>) -> Self {
+        self.superseded = superseded;
+        self
+    }
+
+    fn count(&self, reason: SupersededReason, rows: u64) {
+        if let Some(superseded) = &self.superseded {
+            superseded.add(reason, rows);
+        }
     }
 
     pub(crate) fn policy(&self) -> ConflictPolicy {
@@ -276,6 +292,24 @@ impl KeyResolver {
         if !repeated {
             return Ok(batches);
         }
+        let (mut unchanged, mut arrival) = (0_u64, 0_u64);
+        for (index, (digests, contents)) in encoded.iter().enumerate() {
+            for (row, digest) in digests.iter().enumerate() {
+                let Some(&(kept_batch, kept_row)) = survivor.get(digest) else {
+                    continue;
+                };
+                if (kept_batch, kept_row) == (index, row) {
+                    continue;
+                }
+                if encoded[kept_batch].1[kept_row] == contents[row] {
+                    unchanged += 1;
+                } else {
+                    arrival += 1;
+                }
+            }
+        }
+        self.count(SupersededReason::Unchanged, unchanged);
+        self.count(SupersededReason::Arrival, arrival);
         batches
             .into_iter()
             .zip(&encoded)
@@ -325,6 +359,10 @@ impl KeyResolver {
                 }
             })
             .collect();
+        self.count(
+            SupersededReason::Unchanged,
+            levels.iter().filter(|level| level.is_none()).count() as u64,
+        );
         let deepest = levels.iter().flatten().copied().max().unwrap_or(0);
         if deepest == 0 && levels.iter().all(Option::is_some) {
             return Ok(vec![batch.clone()]);
@@ -383,7 +421,7 @@ pub(crate) fn conflicting_versions(table: &str, key_names: &str, count: usize) -
     Error::DataValidation {
         table: table.to_string(),
         message: format!(
-            "its data holds different versions of {formatted} {noun} of '{key_names}', and `on_conflict: upsert` does not choose between versions. Set `on_conflict` to `upsert_by_time` to keep the newest by `time_column`, or `upsert_by_arrival` to keep the version that arrived last. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+            "its data holds different versions of {formatted} {noun} of '{key_names}', and `on_conflict: upsert` does not choose between versions. Set `on_conflict` to `upsert_by_arrival` to keep the version that arrived last. See: https://spiceai.org/docs/features/data-acceleration/constraints"
         ),
     }
 }

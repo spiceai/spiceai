@@ -97,9 +97,9 @@ impl MultiSink {
                 })
             })?;
 
-        let _ = collect(insertion_plan, ctx_state.task_ctx())
+        collect(insertion_plan, ctx_state.task_ctx())
             .await
-            .map_err(retry_from_df_error);
+            .map_err(retry_from_df_error)?;
         Ok(())
     }
 
@@ -140,6 +140,7 @@ impl MultiSink {
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
+        superseded: Option<Arc<util::session_state::SupersededRows>>,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
         let schema = record_batch_stream.schema();
         let (tx, _) = broadcast::channel::<RecordBatch>(32);
@@ -166,9 +167,13 @@ impl MultiSink {
 
         // Spawn primary task
         let primary_provider = Arc::clone(&self.original_table_provider);
+        let parent_state = match superseded {
+            Some(rows) => util::session_state::with_superseded_rows(&ctx.state(), rows),
+            None => ctx.state(),
+        };
         join_set.spawn(Self::spawn_parent_task(
             primary_provider,
-            ctx.state(),
+            parent_state,
             tx.subscribe(),
             Arc::clone(&schema),
             parent_complete_tx,

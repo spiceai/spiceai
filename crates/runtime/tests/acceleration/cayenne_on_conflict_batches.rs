@@ -15,15 +15,14 @@ limitations under the License.
 */
 
 //! Cayenne resolves a primary key repeated in the incoming data of one refresh
-//! per `on_conflict`, each record batch being one upsert statement (regression
-//! tests for #14578):
+//! or statement per `on_conflict`, over all of its record batches (regression
+//! tests for #14578 and #14576):
 //!
-//! | `on_conflict`            | repeat within a batch          | repeat across batches |
-//! |--------------------------|--------------------------------|-----------------------|
-//! | `drop`                   | first copy kept                | first copy kept       |
-//! | `upsert`                 | last copy wins                 | last copy wins        |
-//! | `upsert_dedup`           | identical collapse, else error | last copy wins        |
-//! | `upsert_dedup_by_row_id` | last copy wins                 | last copy wins        |
+//! | `on_conflict`                                | identical copies | different versions   |
+//! |----------------------------------------------|------------------|----------------------|
+//! | `drop`                                       | one row          | first arrival kept   |
+//! | `upsert` (`upsert_dedup`)                    | one row          | the write fails      |
+//! | `upsert_by_arrival` (`upsert_dedup_by_row_id`) | one row        | last arrival kept    |
 #![expect(clippy::expect_used)]
 
 use std::collections::HashMap;
@@ -35,6 +34,7 @@ use app::AppBuilder;
 use arrow::array::{AsArray, RecordBatch};
 use futures::TryStreamExt;
 use runtime::Runtime;
+use runtime::status::ComponentStatus;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
 use spicepod::component::access::AccessMode;
 use spicepod::component::dataset::Dataset;
@@ -44,15 +44,52 @@ use spicepod::partitioning::PartitionedBy;
 use crate::configure_test_datafusion;
 use crate::utils::{runtime_ready_check_with_timeout_err, test_request_context};
 
-const POLICIES: [(&str, OnConflictBehavior); 4] = [
+const POLICIES: [(&str, OnConflictBehavior); 5] = [
     ("drop", OnConflictBehavior::Drop),
     ("upsert", OnConflictBehavior::Upsert),
     ("upsert_dedup", OnConflictBehavior::UpsertDedup),
+    ("upsert_by_arrival", OnConflictBehavior::UpsertByArrival),
     (
         "upsert_dedup_by_row_id",
         OnConflictBehavior::UpsertDedupByRowId,
     ),
 ];
+
+/// The version of a key each policy keeps among different versions, by which
+/// one arrived first (`first`) or last (`last`), or `None` when the write fails.
+fn kept<'a>(behavior: OnConflictBehavior, first: &'a str, last: &'a str) -> Option<&'a str> {
+    match behavior {
+        OnConflictBehavior::Drop => Some(first),
+        OnConflictBehavior::Upsert | OnConflictBehavior::UpsertDedup => None,
+        OnConflictBehavior::UpsertByArrival | OnConflictBehavior::UpsertDedupByRowId => {
+            Some(last)
+        }
+    }
+}
+
+/// The cause a strict `upsert` fails a write with, for one value of `key`.
+fn conflict_cause(key: &str) -> String {
+    format!(
+        "its data holds different versions of 1 value of '{key}', and `on_conflict: upsert` does not choose between versions."
+    )
+}
+
+/// The dataset's error, once it reports one.
+async fn dataset_error(rt: &Runtime) -> Option<String> {
+    let name = datafusion::sql::TableReference::from("t");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(ComponentStatus::Error(message)) =
+            rt.status().get_dataset_statuses().get(&name).cloned()
+        {
+            return Some(message.unwrap_or_default());
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 
 struct Case {
     mode: Mode,
@@ -61,6 +98,11 @@ struct Case {
 }
 
 impl Case {
+    /// The primary key the dataset declares, as a conflict names it.
+    fn key(&self) -> &'static str {
+        if self.partitioned { "id, region" } else { "id" }
+    }
+
     fn label(&self) -> String {
         format!(
             "{:?}/{:?}{}",
@@ -72,14 +114,13 @@ impl Case {
 }
 
 /// Load `csv` into a Cayenne dataset keyed by `id` (and `region` when
-/// partitioned), returning the runtime once it is ready, or `None` if the load
-/// failed.
+/// partitioned), returning the runtime and whether it became ready.
 async fn load(
     csv: &str,
     case: &Case,
     behavior: OnConflictBehavior,
     label: &str,
-) -> (Option<Runtime>, tempfile::TempDir) {
+) -> (Runtime, bool, tempfile::TempDir) {
     load_with_access(csv, case, behavior, label, AccessMode::Read).await
 }
 
@@ -89,7 +130,7 @@ async fn load_with_access(
     behavior: OnConflictBehavior,
     label: &str,
     access: AccessMode,
-) -> (Option<Runtime>, tempfile::TempDir) {
+) -> (Runtime, bool, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = dir.path().join("rows.csv");
     std::fs::write(&file, csv).expect("csv");
@@ -145,7 +186,7 @@ async fn load_with_access(
     let ready = runtime_ready_check_with_timeout_err(&rt, Duration::from_secs(15))
         .await
         .is_ok();
-    (ready.then_some(rt), dir)
+    (rt, ready, dir)
 }
 
 async fn rows(rt: &Runtime, sql: &str) -> Vec<RecordBatch> {
@@ -213,6 +254,50 @@ fn repeated_across_batches() -> String {
     csv
 }
 
+/// Check one load against the policy table: the kept value of key `id`, with
+/// `rows` rows in all, or the load failing with the conflict cause.
+#[expect(clippy::too_many_arguments)]
+async fn check_load(
+    rt: &Runtime,
+    ready: bool,
+    key: &str,
+    id: i64,
+    expected: Option<&str>,
+    rows: i64,
+    label: &str,
+    failures: &mut Vec<String>,
+) {
+    match (expected, ready) {
+        (Some(expected), true) => {
+            let (values, count) = (value_of(rt, id).await, count(rt).await);
+            let ok = values == [expected] && count == rows;
+            eprintln!(
+                "{label}: key {id} = {values:?}, COUNT(*) = {count}: {}",
+                if ok { "ok" } else { "WRONG" }
+            );
+            if !ok {
+                failures.push(format!("{label}: key {id} = {values:?}, COUNT(*) = {count}"));
+            }
+        }
+        (Some(_), false) => failures.push(format!(
+            "{label}: did not load: {:?}",
+            dataset_error(rt).await
+        )),
+        (None, true) => failures.push(format!(
+            "{label}: loaded different versions, key {id} = {:?}",
+            value_of(rt, id).await
+        )),
+        (None, false) => {
+            let error = dataset_error(rt).await.unwrap_or_default();
+            let ok = error.contains(&conflict_cause(key));
+            eprintln!("{label}: failed: {error}: {}", if ok { "ok" } else { "WRONG" });
+            if !ok {
+                failures.push(format!("{label}: wrong failure: {error}"));
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_repeated_across_batches_resolves_per_on_conflict() {
     test_request_context()
@@ -221,26 +306,19 @@ async fn a_key_repeated_across_batches_resolves_per_on_conflict() {
             for case in cases() {
                 for (name, behavior) in POLICIES {
                     let label = format!("{}/{name}", case.label());
-                    let (rt, _dir) =
+                    let (rt, ready, _dir) =
                         load(&repeated_across_batches(), &case, behavior, &label).await;
-                    let Some(rt) = rt else {
-                        failures.push(format!("{label}: did not load"));
-                        continue;
-                    };
-                    let expected = if behavior == OnConflictBehavior::Drop {
-                        "first"
-                    } else {
-                        "last"
-                    };
-                    let (values, count) = (value_of(&rt, 0).await, count(&rt).await);
-                    let ok = values == [expected] && count == 8_192;
-                    eprintln!(
-                        "{label}: key 0 = {values:?}, COUNT(*) = {count}: {}",
-                        if ok { "ok" } else { "WRONG" }
-                    );
-                    if !ok {
-                        failures.push(format!("{label}: key 0 = {values:?}, COUNT(*) = {count}"));
-                    }
+                    check_load(
+                        &rt,
+                        ready,
+                        case.key(),
+                        0,
+                        kept(behavior, "first", "last"),
+                        8_192,
+                        &label,
+                        &mut failures,
+                    )
+                    .await;
                 }
             }
             assert!(failures.is_empty(), "{failures:#?}");
@@ -254,44 +332,26 @@ async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
         .scope(async {
             let identical = "id,region,ts,v\n1,us,2026-01-01T00:00:00,a\n2,us,2026-01-01T00:00:00,b\n1,us,2026-01-01T00:00:00,a\n";
             let differing = "id,region,ts,v\n1,us,2026-01-01T00:00:00,a\n2,us,2026-01-01T00:00:00,b\n1,us,2026-01-01T00:00:00,c\n";
-            // (csv, policy, expected value of key 1, or None when the load must fail)
-            let expectations: [(&str, OnConflictBehavior, Option<&str>); 8] = [
-                (identical, OnConflictBehavior::Drop, Some("a")),
-                (differing, OnConflictBehavior::Drop, Some("a")),
-                (identical, OnConflictBehavior::Upsert, Some("a")),
-                (differing, OnConflictBehavior::Upsert, Some("c")),
-                (identical, OnConflictBehavior::UpsertDedup, Some("a")),
-                (differing, OnConflictBehavior::UpsertDedup, Some("c")),
-                (identical, OnConflictBehavior::UpsertDedupByRowId, Some("a")),
-                (differing, OnConflictBehavior::UpsertDedupByRowId, Some("c")),
-            ];
             let mut failures = Vec::new();
             for case in cases() {
-                for (index, (csv, behavior, expected)) in expectations.iter().enumerate() {
-                    let label = format!("{}/{behavior:?}/{index}", case.label());
-                    let (rt, _dir) = load(csv, &case, *behavior, &label).await;
-                    let observed = match &rt {
-                        None => None,
-                        Some(rt) => {
-                            let values = value_of(rt, 1).await;
-                            let count = count(rt).await;
-                            if count != 2 || values.len() != 1 {
-                                failures.push(format!(
-                                    "{label}: key 1 = {values:?}, COUNT(*) = {count}"
-                                ));
-                            }
-                            values.into_iter().next()
-                        }
-                    };
-                    let ok = observed.as_deref() == *expected;
-                    eprintln!(
-                        "{label}: expected {expected:?}, observed {observed:?}: {}",
-                        if ok { "ok" } else { "WRONG" }
-                    );
-                    if !ok {
-                        failures.push(format!(
-                            "{label}: expected {expected:?}, observed {observed:?}"
-                        ));
+                for (name, behavior) in POLICIES {
+                    for (csv, versions, expected) in [
+                        (identical, "identical", Some("a")),
+                        (differing, "differing", kept(behavior, "a", "c")),
+                    ] {
+                        let label = format!("{}/{name}/{versions}", case.label());
+                        let (rt, ready, _dir) = load(csv, &case, behavior, &label).await;
+                        check_load(
+                            &rt,
+                            ready,
+                            case.key(),
+                            1,
+                            expected,
+                            2,
+                            &label,
+                            &mut failures,
+                        )
+                        .await;
                     }
                 }
             }
@@ -300,136 +360,156 @@ async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
         .await;
 }
 
-/// A user's `UPDATE` keeps statement semantics: moving rows from several batches
-/// onto one key fails it, rather than resolving the repeat per `on_conflict` as
-/// a refresh does.
+/// A user's `UPDATE` is one statement over the rows it writes: moving rows
+/// onto one key collapses identical copies and fails on different versions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_update_repeating_a_key_across_batches_still_fails() {
+async fn an_update_repeating_a_key_follows_upsert() {
     test_request_context()
         .scope(async {
-            let distinct: String = std::iter::once("id,region,ts,v\n".to_string())
-                .chain((0..8_193).map(|id| format!("{id},us,2026-01-01T00:00:00,first\n")))
-                .collect();
-            for mode in [Mode::Memory, Mode::File] {
-                let case = Case {
-                    mode,
-                    refresh: RefreshMode::Full,
-                    partitioned: false,
-                };
-                let label = format!("{}/update", case.label());
-                let (rt, _dir) = load_with_access(
-                    &distinct,
-                    &case,
-                    OnConflictBehavior::Upsert,
-                    &label,
-                    AccessMode::ReadWrite,
-                )
-                .await;
-                let rt = rt.expect("the distinct keys load");
-                let result = rt
-                    .datafusion()
-                    .query_builder("UPDATE t SET id = 0")
-                    .build()
-                    .run()
+            for differ in [false, true] {
+                let rows: String = std::iter::once("id,region,ts,v\n".to_string())
+                    .chain((0..8_193).map(|id| {
+                        let v = if differ { id.to_string() } else { "same".to_string() };
+                        format!("{id},us,2026-01-01T00:00:00,{v}\n")
+                    }))
+                    .collect();
+                for mode in [Mode::Memory, Mode::File] {
+                    let case = Case {
+                        mode,
+                        refresh: RefreshMode::Full,
+                        partitioned: false,
+                    };
+                    let label = format!("{}/update/differ={differ}", case.label());
+                    let (rt, ready, _dir) = load_with_access(
+                        &rows,
+                        &case,
+                        OnConflictBehavior::Upsert,
+                        &label,
+                        AccessMode::ReadWrite,
+                    )
                     .await;
-                let outcome = match result {
-                    Err(error) => Err(error.to_string()),
-                    Ok(query) => query
-                        .data
-                        .try_collect::<Vec<_>>()
-                        .await
-                        .map_err(|error| error.to_string()),
-                };
-                let Err(error) = outcome else {
-                    panic!(
-                        "{label}: an UPDATE moving every row onto key 0 must fail; table now holds {} rows",
-                        count(&rt).await
-                    );
-                };
-                assert!(
-                    error.contains("duplicate primary key across batches"),
-                    "{label}: {error}"
-                );
+                    assert!(ready, "{label}: the distinct keys load");
+                    let result = rt
+                        .datafusion()
+                        .query_builder("UPDATE t SET id = 0")
+                        .build()
+                        .run()
+                        .await;
+                    let outcome = match result {
+                        Err(error) => Err(error.to_string()),
+                        Ok(query) => query
+                            .data
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .map_err(|error| error.to_string()),
+                    };
+                    if differ {
+                        let error = outcome.expect_err("different versions of key 0 fail");
+                        assert!(error.contains(&conflict_cause("id")), "{label}: {error}");
+                    } else {
+                        outcome.unwrap_or_else(|error| panic!("{label}: {error}"));
+                        assert_eq!(
+                            (value_of(&rt, 0).await, count(&rt).await),
+                            (vec!["same".to_string()], 1),
+                            "{label}: identical copies collapse"
+                        );
+                    }
+                }
             }
         })
         .await;
 }
 
 /// A parent with a `localpod` child refreshes through the child-syncing sink, and
-/// still resolves a key its data repeats across batches.
+/// still resolves a key its data repeats across batches: by arrival under
+/// `upsert_by_arrival`, and by failing the refresh, leaving the previous rows,
+/// under `upsert`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_localpod_parents_refresh_resolves_repeated_keys() {
     test_request_context()
         .scope(async {
-            let dir = tempfile::tempdir().expect("temp dir");
-            let file = dir.path().join("rows.csv");
-            let distinct: String = std::iter::once("id,region,v\n".to_string())
-                .chain((0..8_192).map(|id| format!("{id},us,first\n")))
-                .collect();
-            std::fs::write(&file, &distinct).expect("csv");
-            let params = HashMap::from([
-                (
-                    "cayenne_file_path".to_string(),
-                    dir.path().join("data").display().to_string(),
-                ),
-                (
-                    "cayenne_metadata_dir".to_string(),
-                    dir.path().join("meta").display().to_string(),
-                ),
-            ]);
-            let mut parent = Dataset::new(format!("file://{}", file.display()), "t");
-            parent.acceleration = Some(Acceleration {
-                enabled: true,
-                engine: Some("cayenne".to_string()),
-                mode: Mode::File,
-                refresh_mode: Some(RefreshMode::Full),
-                params: Some(Params::from_string_map(params)),
-                primary_key: Some("id".to_string()),
-                on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
-                ..Acceleration::default()
-            });
-            let mut child = Dataset::new("localpod:t", "t_child");
-            child.acceleration = Some(Acceleration {
-                enabled: true,
-                refresh_mode: Some(RefreshMode::Full),
-                ..Acceleration::default()
-            });
-            configure_test_datafusion();
-            let app = AppBuilder::new("cayenne_on_conflict_localpod")
-                .with_dataset(parent)
-                .with_dataset(child)
-                .build();
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_mins(2)) => panic!("load timed out"),
-                () = Arc::clone(&rt).load_components() => {}
-            }
-            runtime_ready_check_with_timeout_err(&rt, Duration::from_secs(30))
-                .await
-                .expect("ready");
-            assert_eq!(count(&rt).await, 8_192, "initial load");
-
-            std::fs::write(&file, format!("{distinct}0,us,last\n")).expect("csv");
-            crate::acceleration::trigger_refresh(&rt, "t")
-                .await
-                .expect("refresh");
-            let deadline = std::time::Instant::now() + Duration::from_mins(1);
-            loop {
-                let values = value_of(&rt, 0).await;
-                if values.contains(&"last".to_string()) {
-                    let count = count(&rt).await;
-                    assert_eq!(
-                        (values, count),
-                        (vec!["last".to_string()], 8_192),
-                        "the parent's refresh must keep one copy of key 0"
-                    );
-                    break;
+            for behavior in [OnConflictBehavior::UpsertByArrival, OnConflictBehavior::Upsert] {
+                let label = format!("localpod/{behavior:?}");
+                let dir = tempfile::tempdir().expect("temp dir");
+                let file = dir.path().join("rows.csv");
+                let distinct: String = std::iter::once("id,region,v\n".to_string())
+                    .chain((0..8_192).map(|id| format!("{id},us,first\n")))
+                    .collect();
+                std::fs::write(&file, &distinct).expect("csv");
+                let params = HashMap::from([
+                    (
+                        "cayenne_file_path".to_string(),
+                        dir.path().join("data").display().to_string(),
+                    ),
+                    (
+                        "cayenne_metadata_dir".to_string(),
+                        dir.path().join("meta").display().to_string(),
+                    ),
+                ]);
+                let mut parent = Dataset::new(format!("file://{}", file.display()), "t");
+                parent.acceleration = Some(Acceleration {
+                    enabled: true,
+                    engine: Some("cayenne".to_string()),
+                    mode: Mode::File,
+                    refresh_mode: Some(RefreshMode::Full),
+                    params: Some(Params::from_string_map(params)),
+                    primary_key: Some("id".to_string()),
+                    on_conflict: HashMap::from([("id".to_string(), behavior)]),
+                    ..Acceleration::default()
+                });
+                let mut child = Dataset::new("localpod:t", "t_child");
+                child.acceleration = Some(Acceleration {
+                    enabled: true,
+                    refresh_mode: Some(RefreshMode::Full),
+                    ..Acceleration::default()
+                });
+                configure_test_datafusion();
+                let app = AppBuilder::new("cayenne_on_conflict_localpod")
+                    .with_dataset(parent)
+                    .with_dataset(child)
+                    .build();
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_mins(2)) => panic!("{label}: load timed out"),
+                    () = Arc::clone(&rt).load_components() => {}
                 }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the refresh did not land; key 0 = {values:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                runtime_ready_check_with_timeout_err(&rt, Duration::from_secs(30))
+                    .await
+                    .expect("ready");
+                assert_eq!(count(&rt).await, 8_192, "{label}: initial load");
+
+                std::fs::write(&file, format!("{distinct}0,us,last\n")).expect("csv");
+                crate::acceleration::trigger_refresh(&rt, "t")
+                    .await
+                    .expect("refresh");
+                if behavior == OnConflictBehavior::Upsert {
+                    let error = dataset_error(&rt).await.unwrap_or_default();
+                    assert!(error.contains(&conflict_cause("id")), "{label}: {error}");
+                    assert_eq!(
+                        (value_of(&rt, 0).await, count(&rt).await),
+                        (vec!["first".to_string()], 8_192),
+                        "{label}: the previous rows are still served"
+                    );
+                    continue;
+                }
+                let deadline = std::time::Instant::now() + Duration::from_mins(1);
+                loop {
+                    let values = value_of(&rt, 0).await;
+                    if values.contains(&"last".to_string()) {
+                        let count = count(&rt).await;
+                        assert_eq!(
+                            (values, count),
+                            (vec!["last".to_string()], 8_192),
+                            "{label}: the parent's refresh must keep one copy of key 0"
+                        );
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{label}: the refresh did not land; key 0 = {values:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
             }
         })
         .await;
@@ -447,14 +527,18 @@ async fn the_refresh_after_a_first_append_load_finds_the_stored_keys() {
                 refresh: RefreshMode::Append,
                 partitioned: false,
             };
+            let first_load: String = std::iter::once("id,region,ts,v\n".to_string())
+                .chain((0..8_192).map(|id| format!("{id},us,2026-01-01T00:00:00,first\n")))
+                .collect();
             let mut failures = Vec::new();
             for (name, behavior, key_0) in [
                 ("upsert", OnConflictBehavior::Upsert, "newer"),
                 ("drop", OnConflictBehavior::Drop, "first"),
             ] {
                 let label = format!("{}/{name}/second_refresh", case.label());
-                let (rt, dir) = load(&repeated_across_batches(), &case, behavior, &label).await;
-                let rt = Arc::new(rt.unwrap_or_else(|| panic!("{label}: did not load")));
+                let (rt, ready, dir) = load(&first_load, &case, behavior, &label).await;
+                assert!(ready, "{label}: did not load");
+                let rt = Arc::new(rt);
                 std::fs::write(
                     dir.path().join("rows.csv"),
                     "id,region,ts,v\n0,us,2026-01-02T00:00:00,newer\n9000,us,2026-01-02T00:00:00,new\n",

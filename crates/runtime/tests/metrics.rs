@@ -462,6 +462,29 @@ const EVENT_GATED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     "cayenne_pk_bloom_split_rows_total",
 ];
 
+/// The value of counter `name` on the series carrying every label in `labels`,
+/// or `None` when no series does.
+fn counter_value(
+    registry: &prometheus::Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<f64> {
+    registry
+        .gather()
+        .into_iter()
+        .filter(|family| family.name() == name)
+        .flat_map(|family| family.get_metric().to_vec())
+        .find(|series| {
+            labels.iter().all(|(key, value)| {
+                series
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == *key && label.value() == *value)
+            })
+        })
+        .map(|series| series.get_counter().value())
+}
+
 async fn wait_until<F, Fut>(timeout: Duration, mut f: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -1342,4 +1365,94 @@ async fn a_cache_hit_is_recorded_when_the_stream_is_consumed() {
         recorded_ms >= SLOW_READER_DELAY.as_secs_f64() * 1000.0,
         "the hit recorded {recorded_ms}ms, missing the {SLOW_READER_DELAY:?} its caller took to read it"
     );
+}
+
+/// A Cayenne refresh reports the rows it received but did not keep, by reason:
+/// an identical copy as `unchanged` and a version settled by arrival as
+/// `arrival`, while `rows_written` counts every row received. A strict `upsert`
+/// dataset publishes `unchanged` at zero at load and no `arrival` series, which
+/// its refreshes cannot report.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
+    use spicepod::acceleration::OnConflictBehavior;
+
+    let registry = &*PROMETHEUS;
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let keyed = |name: &str, behavior: OnConflictBehavior, csv: &str| {
+        let path = dir.path().join(format!("{name}.csv"));
+        std::fs::write(&path, csv).expect("write the fixture CSV");
+        let mut dataset = Dataset::new(format!("file://{}", path.display()), name);
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            params: Some(Params::from_string_map(
+                [(
+                    "cayenne_file_path".to_string(),
+                    dir.path().join(format!("{name}-cayenne")).display().to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            primary_key: Some("id".to_string()),
+            on_conflict: HashMap::from([("id".to_string(), behavior)]),
+            ..Acceleration::default()
+        });
+        dataset
+    };
+    // 8,192 distinct keys fill the first record batch; the second repeats key 0
+    // unchanged and key 1 with a new value.
+    let repeated: String = std::iter::once("id,v\n".to_string())
+        .chain((0..8_192).map(|id| format!("{id},first\n")))
+        .chain(["0,first\n".to_string(), "1,second\n".to_string()])
+        .collect();
+    let app = AppBuilder::new("metrics_superseded_rows")
+        .with_dataset(keyed(
+            "superseded_arrival",
+            OnConflictBehavior::UpsertByArrival,
+            &repeated,
+        ))
+        .with_dataset(keyed(
+            "superseded_strict",
+            OnConflictBehavior::Upsert,
+            "id,v\n1,a\n2,b\n",
+        ))
+        .with_runtime(SpicepodRuntime {
+            task_history: TaskHistory {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+        .await
+        .expect("the datasets to load within a minute");
+    assert!(
+        wait_until(Duration::from_mins(1), || async { rt.status().is_ready() }).await,
+        "the runtime never reported ready, so the datasets never loaded"
+    );
+
+    let superseded = |dataset: &str, reason: &str| {
+        counter_value(
+            registry,
+            "dataset_acceleration_refresh_rows_superseded",
+            &[("dataset", dataset), ("reason", reason)],
+        )
+    };
+    assert_eq!(superseded("superseded_arrival", "unchanged"), Some(1.0));
+    assert_eq!(superseded("superseded_arrival", "arrival"), Some(1.0));
+    assert_eq!(
+        counter_value(
+            registry,
+            "dataset_acceleration_refresh_rows_written",
+            &[("dataset", "superseded_arrival")],
+        ),
+        Some(8_194.0)
+    );
+    assert_eq!(superseded("superseded_strict", "unchanged"), Some(0.0));
+    assert_eq!(superseded("superseded_strict", "arrival"), None);
 }

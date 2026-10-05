@@ -59,7 +59,7 @@ use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, UInt32Type,
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::common::{Column, JoinType, ScalarValue};
 use datafusion::execution::TaskContext;
-use datafusion::functions_aggregate::expr_fn::{count, max, min};
+use datafusion::functions_aggregate::expr_fn::{count, first_value, max, min};
 use datafusion::logical_expr::{Expr, lit};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
@@ -95,6 +95,8 @@ const MIN_CONTENT_LO: &str = "__cayenne_min_content_lo";
 const MAX_CONTENT_LO: &str = "__cayenne_max_content_lo";
 const MIN_CONTENT_HI: &str = "__cayenne_min_content_hi";
 const MAX_CONTENT_HI: &str = "__cayenne_max_content_hi";
+const BEST_CONTENT_LO: &str = "__cayenne_best_content_lo";
+const BEST_CONTENT_HI: &str = "__cayenne_best_content_hi";
 
 /// Seeds the hash that assigns each key to a chunk of the duplicate query.
 const CHUNK_HASH_SEED: u64 = 0x6361_7965_6e6e_6501;
@@ -1009,7 +1011,7 @@ impl CayenneTableProvider {
                 group_rows,
             };
             match query.run(&plan.specs).await {
-                Ok(superseded) => break superseded,
+                Ok(found) => break found,
                 Err(error)
                     if matches!(
                         error.find_root(),
@@ -1021,6 +1023,16 @@ impl CayenneTableProvider {
                 Err(error) => return Err(error.into()),
             }
         };
+        let SupersededCopies {
+            positions: superseded,
+            identical,
+        } = superseded;
+        let copies: u64 = superseded.iter().map(|positions| positions.len() as u64).sum();
+        self.count_superseded(util::session_state::SupersededReason::Unchanged, identical);
+        self.count_superseded(
+            util::session_state::SupersededReason::Arrival,
+            copies.saturating_sub(identical),
+        );
         // Sort each file's positions on the blocking pool, files in parallel.
         let sorts = superseded
             .into_iter()
@@ -1067,8 +1079,9 @@ struct DuplicateQuery<'a> {
 
 impl DuplicateQuery<'_> {
     /// The positions of every superseded copy, by file id, querying the key
-    /// space in `chunks` chunks.
-    async fn run(&self, specs: &[ChunkSpec]) -> datafusion_common::Result<Vec<Vec<u32>>> {
+    /// space in `chunks` chunks, and how many of them are identical to the copy
+    /// kept.
+    async fn run(&self, specs: &[ChunkSpec]) -> datafusion_common::Result<SupersededCopies> {
         let ctx = self.ctx;
         let survivor = self.survivor;
         let schema = self.schema;
@@ -1076,6 +1089,7 @@ impl DuplicateQuery<'_> {
         // Positions of superseded copies, by file id; each copy is emitted once,
         // since the join's build side holds each repeated key once.
         let mut superseded: Vec<Vec<u32>> = vec![Vec::new(); self.paths.len()];
+        let mut identical: u64 = 0;
         let mut group_read: Vec<u64> = vec![0; self.group_rows.len()];
         let mut conflicting_keys = 0;
         for spec in specs {
@@ -1120,6 +1134,15 @@ impl DuplicateQuery<'_> {
                 .map(|(key, best_key)| column(key).alias(best_key))
                 .collect();
             selected.push(column(BEST_COLUMN));
+            if survivor != Survivor::Identical {
+                // The kept copy's content, to tell identical copies from versions.
+                let kept_first = vec![column(ARRIVAL_COLUMN).sort(survivor == Survivor::Earliest, true)];
+                aggregates.extend([
+                    first_value(column(CONTENT_LO_COLUMN), kept_first.clone()).alias(BEST_CONTENT_LO),
+                    first_value(column(CONTENT_HI_COLUMN), kept_first).alias(BEST_CONTENT_HI),
+                ]);
+                selected.extend([BEST_CONTENT_LO, BEST_CONTENT_HI].map(column));
+            }
             if survivor == Survivor::Identical {
                 aggregates.extend([
                     min(column(CONTENT_LO_COLUMN)).alias(MIN_CONTENT_LO),
@@ -1180,6 +1203,18 @@ impl DuplicateQuery<'_> {
             };
             let left: Vec<&str> = keys.iter().map(String::as_str).collect();
             let right: Vec<&str> = best_keys.iter().map(String::as_str).collect();
+            let mut output = vec![column(FILE_COLUMN), column(POSITION_COLUMN)];
+            if survivor != Survivor::Identical {
+                output.extend(
+                    [
+                        CONTENT_LO_COLUMN,
+                        CONTENT_HI_COLUMN,
+                        BEST_CONTENT_LO,
+                        BEST_CONTENT_HI,
+                    ]
+                    .map(column),
+                );
+            }
             let joined = rows
                 .join(
                     repeated,
@@ -1188,12 +1223,25 @@ impl DuplicateQuery<'_> {
                     &right,
                     Some(superseded_copy),
                 )?
-                .select(vec![column(FILE_COLUMN), column(POSITION_COLUMN)])?;
+                .select(output)?;
             let mut stream = joined.execute_stream().await?;
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
                 let files = batch.column(0).as_primitive::<UInt32Type>();
                 let positions = batch.column(1).as_primitive::<UInt64Type>();
+                identical += if survivor == Survivor::Identical {
+                    batch.num_rows() as u64
+                } else {
+                    let content: Vec<_> = (2..6)
+                        .map(|index| batch.column(index).as_primitive::<UInt64Type>())
+                        .collect();
+                    (0..batch.num_rows())
+                        .filter(|&row| {
+                            content[0].value(row) == content[2].value(row)
+                                && content[1].value(row) == content[3].value(row)
+                        })
+                        .count() as u64
+                };
                 if arrow::compute::max(positions).is_some_and(|max| max > u64::from(u32::MAX)) {
                     return Err(datafusion_common::DataFusionError::Execution(
                         "a row position exceeds the position-delete range".to_string(),
@@ -1223,8 +1271,19 @@ impl DuplicateQuery<'_> {
             )
             .into());
         }
-        Ok(superseded)
+        Ok(SupersededCopies {
+            positions: superseded,
+            identical,
+        })
     }
+}
+
+/// What one run of the duplicate query found.
+struct SupersededCopies {
+    /// The positions of every superseded copy, by file id.
+    positions: Vec<Vec<u32>>,
+    /// How many of them are identical to the copy kept.
+    identical: u64,
 }
 
 /// Rows sampled from each file to cut a cluster into key ranges.

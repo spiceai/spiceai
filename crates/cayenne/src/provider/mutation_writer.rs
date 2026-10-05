@@ -292,9 +292,6 @@ fn restore_post_validation(
     *post_validation.lock() = Some(state);
 }
 
-/// A resolving streaming append once written: its rows after any fold, their
-/// statistics, and the incoming copies left for position deletes to hide.
-
 /// Which rules resolve a key a write repeats; see [`super::key_conflicts`].
 #[derive(Debug, Clone, Copy)]
 enum WriteKind {
@@ -1191,10 +1188,9 @@ impl<'a> AppendMutationWriter<'a> {
         } else {
             (data, true)
         };
-        // A streaming append resolves the keys it repeats after the write; a
-        // table with a partition column (a catalog table, written only by user
-        // statements, which resolve nothing) keeps the validation that rejects
-        // a key repeated across batches.
+        // A streaming append resolves the keys it repeats after the write. A
+        // table with a partition column (one created through Cayenne's own DDL)
+        // keeps the validation that rejects a key repeated across batches.
         if streaming
             && self.table.metadata().partition_column.is_none()
             && let Some(resolver) = self.table.key_resolver()?

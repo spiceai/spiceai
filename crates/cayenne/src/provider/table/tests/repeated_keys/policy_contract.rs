@@ -18,7 +18,7 @@ limitations under the License.
 
 use super::*;
 
-const CONFLICT_CAUSE: &str = "its data holds different versions of 1 value of 'id', and `on_conflict: upsert` does not choose between versions. Set `on_conflict` to `upsert_by_time` to keep the newest by `time_column`, or `upsert_by_arrival` to keep the version that arrived last. See: https://spiceai.org/docs/features/data-acceleration/constraints";
+const CONFLICT_CAUSE: &str = "its data holds different versions of 1 value of 'id', and `on_conflict: upsert` does not choose between versions. Set `on_conflict` to `upsert_by_arrival` to keep the version that arrived last. See: https://spiceai.org/docs/features/data-acceleration/constraints";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn upsert_rejects_different_versions_without_changing_stored_rows() {
@@ -819,5 +819,99 @@ async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
                 assert_eq!(visible(&reopened).await, durable, "{label}: {name} reopened");
             }
         }
+    }
+}
+
+/// A write counts the rows it receives but does not keep into the counter its
+/// session carries: an identical copy as `unchanged`, a version settled by
+/// arrival as `arrival`, whether the copies share a batch, span batches, or one
+/// meets a stored key `drop` keeps.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_counts_the_rows_it_does_not_keep_by_reason() {
+    use util::session_state::{SupersededReason, SupersededRows, with_superseded_rows};
+
+    let counted = |rows: &SupersededRows| {
+        (
+            rows.get(SupersededReason::Unchanged),
+            rows.get(SupersededReason::Arrival),
+        )
+    };
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        for inline_max_rows in [0, 1_000] {
+            for op in [InsertOp::Overwrite, InsertOp::Append] {
+                let label = format!("{mode:?}/inline={inline_max_rows}/{op:?}");
+                let runtime_env = SessionContext::new().runtime_env();
+                let (mut provider, _catalog, _dir) = create_cdc_table_with_schema(
+                    "t",
+                    Arc::clone(&runtime_env),
+                    schema(),
+                    vec!["id".to_string()],
+                    VortexConfig {
+                        deletion_mode: mode,
+                        inline_max_rows,
+                        stream_publish_interval_ms: 0,
+                        compaction_background_interval_ms: 3_600_000,
+                        ..VortexConfig::default()
+                    },
+                    upsert_on_id(),
+                )
+                .await;
+                provider.upsert_dedup = UpsertDedup::KeepLast;
+                let rows = Arc::new(SupersededRows::default());
+                let ctx = SessionContext::new();
+                let state = with_superseded_rows(&ctx.state(), Arc::clone(&rows));
+                // Key 1: an identical copy in its own batch and in a later one.
+                // Key 2: a different version in a later batch.
+                let source = MemorySourceConfig::try_new_exec(
+                    &[vec![
+                        batch(&[(1, "a"), (2, "a"), (1, "a")]),
+                        batch(&[(2, "b"), (3, "a")]),
+                        batch(&[(1, "a")]),
+                    ]],
+                    schema(),
+                    None,
+                )
+                .expect("source");
+                let plan = provider
+                    .insert_into(&state, source, op)
+                    .await
+                    .expect("plan");
+                collect(plan, ctx.task_ctx())
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: {error}"));
+                assert_eq!(
+                    visible(&provider).await,
+                    (owned(&[(1, "a"), (2, "b"), (3, "a")]), 3),
+                    "{label}: rows"
+                );
+                assert_eq!(counted(&rows), (2, 1), "{label}: counted");
+            }
+        }
+
+        // `drop` discards an incoming row whose key is stored.
+        let (provider, _catalog, _runtime_env, _dir) = upsert_table(mode, drop_on_id()).await;
+        write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
+            .await
+            .expect("seed");
+        let rows = Arc::new(SupersededRows::default());
+        let ctx = SessionContext::new();
+        let state = with_superseded_rows(&ctx.state(), Arc::clone(&rows));
+        let source = MemorySourceConfig::try_new_exec(
+            &[vec![batch(&[(9, "new"), (4, "a")])]],
+            schema(),
+            None,
+        )
+        .expect("source");
+        let plan = provider
+            .insert_into(&state, source, InsertOp::Append)
+            .await
+            .expect("plan");
+        collect(plan, ctx.task_ctx()).await.expect("append");
+        assert_eq!(
+            visible(&provider).await,
+            (owned(&[(4, "a"), (9, "old")]), 2),
+            "{mode:?}: drop keeps the stored row"
+        );
+        assert_eq!(counted(&rows), (0, 1), "{mode:?}: drop counted");
     }
 }

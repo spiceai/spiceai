@@ -1865,6 +1865,9 @@ pub struct CayenneTableProvider {
     /// The `upsert` refinement of the dataset's `on_conflict`, which decides how a
     /// write resolves a key it repeats; see [`super::key_conflicts`].
     upsert_dedup: super::key_conflicts::UpsertDedup,
+    /// Counts the rows a write through this provider receives but does not keep;
+    /// set on the clone a write runs on, from its session.
+    superseded_rows: Option<Arc<util::session_state::SupersededRows>>,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -9346,6 +9349,7 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             upsert_dedup,
+            superseded_rows: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -11462,6 +11466,7 @@ impl CayenneTableProvider {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             upsert_dedup: self.upsert_dedup,
+            superseded_rows: self.superseded_rows.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
@@ -13343,12 +13348,33 @@ impl CayenneTableProvider {
         let Some(pk_indices) = self.primary_key_indices()? else {
             return Ok(None);
         };
-        Ok(Some(super::key_conflicts::KeyResolver::new(
-            &self.table_metadata.table_name,
-            &self.table_schema(),
-            &pk_indices,
-            policy,
-        )?))
+        Ok(Some(
+            super::key_conflicts::KeyResolver::new(
+                &self.table_metadata.table_name,
+                &self.table_schema(),
+                &pk_indices,
+                policy,
+            )?
+            .counting(self.superseded_rows.clone()),
+        ))
+    }
+
+    /// This provider, counting into `rows` the rows its writes receive but do
+    /// not keep.
+    #[must_use]
+    pub fn with_superseded_rows(
+        mut self,
+        rows: Option<Arc<util::session_state::SupersededRows>>,
+    ) -> Self {
+        self.superseded_rows = rows;
+        self
+    }
+
+    /// Count `rows` received rows this write does not keep, for `reason`.
+    pub(crate) fn count_superseded(&self, reason: util::session_state::SupersededReason, rows: u64) {
+        if let Some(counter) = &self.superseded_rows {
+            counter.add(reason, rows);
+        }
     }
 
     /// Resolve the keys a buffered write (a refresh or an `INSERT`) repeats, per
@@ -37994,7 +38020,8 @@ impl TableProvider for CayenneTableProvider {
         // - Append: write lock, PK validation, on-conflict deletions, new snapshot
         //   when needed, retention filters, sort-and-rewrite, listing table refresh
         let sink = Arc::new(CayenneDataSink::new(
-            self.clone_for_write(),
+            self.clone_for_write()
+                .with_superseded_rows(util::session_state::superseded_rows(state.config())),
             overwrite,
             self.table_schema(),
             Arc::clone(&self.context),

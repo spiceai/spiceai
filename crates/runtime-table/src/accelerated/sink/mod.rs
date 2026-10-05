@@ -89,14 +89,23 @@ impl AccelerationSink {
         }
     }
 
+    /// Write `record_batch_stream` to the acceleration. `superseded` counts the
+    /// rows the dataset's own table receives but does not keep.
     pub async fn insert_into(
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
+        superseded: Option<Arc<util::session_state::SupersededRows>>,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
         match self {
-            AccelerationSink::Table(sink) => sink.insert_into(record_batch_stream, overwrite).await,
-            AccelerationSink::Multi(sink) => sink.insert_into(record_batch_stream, overwrite).await,
+            AccelerationSink::Table(sink) => {
+                sink.insert_into(record_batch_stream, overwrite, superseded)
+                    .await
+            }
+            AccelerationSink::Multi(sink) => {
+                sink.insert_into(record_batch_stream, overwrite, superseded)
+                    .await
+            }
         }
     }
 }

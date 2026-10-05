@@ -1404,6 +1404,7 @@ impl OnConflictValidationStream {
             repeats_resolved_after_write: self.repeats_resolved_after_write,
         };
 
+        let received = batch.num_rows();
         let validation_start = Instant::now();
         let validation_result = self.table.apply_on_conflict_to_batch(batch, &mut ctx);
         record_cayenne_write_phase(
@@ -1436,6 +1437,13 @@ impl OnConflictValidationStream {
 
         self.incoming_keys.extend(kept_keys.digests());
         self.kept_keys.absorb(kept_keys);
+
+        // A row validation drops is settled by arrival order: the stored row
+        // under `drop`, or another copy in the same batch.
+        self.table.count_superseded(
+            util::session_state::SupersededReason::Arrival,
+            received.saturating_sub(filtered_batch.as_ref().map_or(0, RecordBatch::num_rows)) as u64,
+        );
 
         Ok(filtered_batch)
     }

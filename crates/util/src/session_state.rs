@@ -46,6 +46,74 @@ pub fn session_context() -> SessionContext {
     SessionContext::new_with_config(session_config())
 }
 
+/// Why a write did not keep a row it received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersededReason {
+    /// An identical copy of a row the write kept.
+    Unchanged,
+    /// A different version of a key, settled by the order versions arrived in.
+    Arrival,
+}
+
+impl SupersededReason {
+    pub const ALL: [Self; 2] = [Self::Unchanged, Self::Arrival];
+
+    /// The `reason` label a metric reports this under.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::Arrival => "arrival",
+        }
+    }
+}
+
+/// The rows a write received but did not keep, by [`SupersededReason`]. A
+/// caller attaches one to the session that runs the write
+/// ([`with_superseded_rows`]); the accelerator counts into it.
+#[derive(Debug, Default)]
+pub struct SupersededRows {
+    unchanged: std::sync::atomic::AtomicU64,
+    arrival: std::sync::atomic::AtomicU64,
+}
+
+impl SupersededRows {
+    fn counter(&self, reason: SupersededReason) -> &std::sync::atomic::AtomicU64 {
+        match reason {
+            SupersededReason::Unchanged => &self.unchanged,
+            SupersededReason::Arrival => &self.arrival,
+        }
+    }
+
+    pub fn add(&self, reason: SupersededReason, rows: u64) {
+        if rows > 0 {
+            self.counter(reason)
+                .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, reason: SupersededReason) -> u64 {
+        self.counter(reason)
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// `state` with `rows` attached, for the accelerator to count the rows the
+/// write it runs does not keep; see [`SupersededRows`].
+#[must_use]
+pub fn with_superseded_rows(state: &SessionState, rows: Arc<SupersededRows>) -> SessionState {
+    let mut state = state.clone();
+    state.config_mut().set_extension(rows);
+    state
+}
+
+/// The [`SupersededRows`] attached to `config`, if any.
+#[must_use]
+pub fn superseded_rows(config: &SessionConfig) -> Option<Arc<SupersededRows>> {
+    config.get_extension::<SupersededRows>()
+}
+
 /// A [`TaskContext`] carrying [`session_config`], for executing a plan outside
 /// any session.
 #[must_use]

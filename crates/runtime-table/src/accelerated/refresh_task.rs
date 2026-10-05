@@ -1076,7 +1076,11 @@ impl RefreshTask {
         let sink = &*sink_lock;
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
-        if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
+        let superseded = Arc::new(util::session_state::SupersededRows::default());
+        if let Err(e) = sink
+            .insert_into(record_batch_stream, overwrite, Some(Arc::clone(&superseded)))
+            .await
+        {
             let error_message = format_datafusion_error(&e);
             self.set_refresh_status(
                 sql,
@@ -1099,6 +1103,18 @@ impl RefreshTask {
         } else {
             None
         };
+
+        // Rows the table did not keep, counted only once the write succeeded:
+        // a failed refresh changes nothing.
+        for reason in util::session_state::SupersededReason::ALL {
+            let rows = superseded.get(reason);
+            if rows > 0 {
+                metrics::REFRESH_ROWS_SUPERSEDED.add(
+                    rows,
+                    &self.dataset_metric_labels.tagged("reason", reason.label()),
+                );
+            }
+        }
 
         let refresh_stat = on_written_data_stat_available.try_recv().ok();
 

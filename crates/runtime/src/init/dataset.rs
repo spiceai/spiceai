@@ -49,7 +49,8 @@ use crate::{
         builder::DatasetBuilder,
     },
     component::{
-        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
+        AcceleratedComponent, deprecated_on_conflict_warning, deprecated_ready_state_warning,
+        disabled_acceleration_warning,
     },
     dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
@@ -166,6 +167,57 @@ pub(crate) fn warn_about_acceleration_block(
     let sets_deprecated_ready_state = acceleration.ready_state.is_some();
     if sets_deprecated_ready_state {
         tracing::warn!("{}", deprecated_ready_state_warning(component, name));
+    }
+
+    // Only Cayenne gives the aliases the behavior the warning names; other
+    // engines keep their own meaning for them.
+    if acceleration
+        .engine
+        .as_deref()
+        .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+    {
+        for alias in acceleration.on_conflict.values().copied() {
+            if let Some(replacement) = alias.replacement() {
+                tracing::warn!(
+                    "{}",
+                    deprecated_on_conflict_warning(component, name, alias, replacement)
+                );
+            }
+        }
+    }
+}
+
+/// Publish `dataset_acceleration_refresh_rows_superseded` at `0` for each reason a
+/// refresh of `ds` can report, so the series exist before the first one. A
+/// dataset whose refreshes report none gets no series.
+fn seed_superseded_rows(ds: &Dataset) {
+    use crate::component::dataset::acceleration::{Engine, OnConflictBehavior};
+    use util::session_state::SupersededReason;
+
+    let Some(acceleration) = ds.acceleration.as_ref().filter(|acceleration| {
+        acceleration.enabled
+            && acceleration.engine == Engine::Cayenne
+            && acceleration.refresh_mode != Some(RefreshMode::Changes)
+    }) else {
+        return;
+    };
+    let Some(behavior) = acceleration.on_conflict.values().next() else {
+        return;
+    };
+    let reasons: &[SupersededReason] = match behavior {
+        OnConflictBehavior::Upsert(options) if !options.last_write_wins => {
+            &[SupersededReason::Unchanged]
+        }
+        OnConflictBehavior::Drop | OnConflictBehavior::Upsert(_) => &SupersededReason::ALL,
+    };
+    for reason in reasons {
+        metrics::acceleration::REFRESH_ROWS_SUPERSEDED.add(
+            0,
+            &[
+                KeyValue::new("dataset", ds.name.to_string()),
+                KeyValue::new("reason", reason.label()),
+            ],
+        );
     }
 }
 
@@ -1408,6 +1460,7 @@ impl Runtime {
                 if !replaces_snapshot_reader {
                     metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
                 }
+                seed_superseded_rows(&ds);
 
                 if let Some(message) = schema_change_failure {
                     self.status.update_dataset(
