@@ -533,7 +533,7 @@ impl ArrivalStream {
         if self.resolver.policy() == ConflictPolicy::UpsertIdentical {
             return self.resolver.split_versions(&batch);
         }
-        Ok(vec![self.resolver.resolve_batch(&batch)?.batch])
+        Ok(vec![self.resolver.resolve_batch(&batch)?])
     }
 
     fn stamp(&mut self, resolved: &RecordBatch) -> datafusion_common::Result<RecordBatch> {

@@ -75,7 +75,6 @@ pub(crate) mod append_commit;
 pub(crate) mod append_stage;
 pub(crate) mod clustering;
 pub(crate) mod cold_partition;
-pub(crate) mod collapse_window;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod compaction_writer;

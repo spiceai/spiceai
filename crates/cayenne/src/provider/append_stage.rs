@@ -18,9 +18,10 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use arrow::datatypes::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use parking_lot::Mutex;
 
@@ -32,6 +33,66 @@ use super::overwrite::{FileStatsObserver, WriteShape};
 use super::overwrite_postpass::{self, ArrivalStream, DedupShare};
 use super::pk_index::PkDigestSet;
 use super::table::{CayenneTableProvider, record_cayenne_write_phase};
+
+/// A write that resolves the keys it repeats across record batches after it is
+/// written ([`super::overwrite_postpass`]): each batch resolves its own repeats
+/// and is stamped with its arrival, and once the files are written, a query
+/// over them finds every copy the policy does not keep.
+pub(super) struct ResolveAfterWrite {
+    survivor: Survivor,
+    key_columns: Vec<String>,
+    write_schema: SchemaRef,
+    stamped_batches: Arc<AtomicU64>,
+    _share: DedupShare,
+}
+
+impl ResolveAfterWrite {
+    /// `data` stamped for resolution under `resolver`, and the resolution to
+    /// run once it is written.
+    pub(super) fn start(
+        table: &CayenneTableProvider,
+        data: SendableRecordBatchStream,
+        resolver: KeyResolver,
+    ) -> Result<(Self, SendableRecordBatchStream)> {
+        let schema = table.table_schema();
+        let indices = table.primary_key_indices()?.unwrap_or_default();
+        let arrival_name = overwrite_postpass::arrival_column(&schema);
+        let survivor = Survivor::for_policy(resolver.policy());
+        let share = DedupShare::claim();
+        let arrival = ArrivalStream::new(data, resolver, &arrival_name);
+        let resolution = Self {
+            survivor,
+            key_columns: overwrite_postpass::key_column_names(&schema, &indices),
+            write_schema: overwrite_postpass::with_arrival(&schema, &arrival_name),
+            stamped_batches: arrival.stamped_batches(),
+            _share: share,
+        };
+        Ok((resolution, Box::pin(arrival)))
+    }
+
+    /// The schema the stamped stream is written with.
+    pub(super) fn write_schema(&self) -> SchemaRef {
+        Arc::clone(&self.write_schema)
+    }
+
+    /// The file and position of every copy, among the `rows` written to
+    /// `snapshot_id`, that the policy does not keep.
+    pub(super) async fn superseded(
+        &self,
+        table: &CayenneTableProvider,
+        snapshot_id: &str,
+        rows: u64,
+    ) -> Result<HashMap<String, Vec<u32>>> {
+        // A write of at most one batch repeats no key once that batch resolved
+        // its own repeats.
+        if rows == 0 || self.stamped_batches.load(Ordering::Relaxed) <= 1 {
+            return Ok(HashMap::new());
+        }
+        table
+            .find_superseded_by_arrival(snapshot_id, self.survivor, &self.key_columns, rows)
+            .await
+    }
+}
 
 pub(super) enum ValidationScope {
     /// Emptiness was checked under the caller's held write lock.
@@ -54,6 +115,48 @@ pub(super) struct StagedAppend {
 type ResolvedFiles = (u64, Arc<ColumnStatsAccumulator>, HashMap<String, Vec<u32>>);
 
 impl CayenneTableProvider {
+    /// Write `data` to the staging snapshot `staging_snapshot_id`, then fold the
+    /// copies of the keys it repeats that `resolution` does not keep out of the
+    /// staged files, returning the rows left.
+    pub(super) async fn stage_resolving_repeats(
+        &self,
+        data: SendableRecordBatchStream,
+        resolution: &ResolveAfterWrite,
+        staging_snapshot_id: &str,
+        target_partitions: usize,
+    ) -> Result<u64> {
+        let write = WriteShape {
+            target_size_bytes: self.target_file_size_bytes(),
+            target_partitions,
+            write_policy: super::delta_encoding::WritePolicy::DELTA,
+        };
+        let file_stats = Arc::new(FileStatsObserver::new(self.table_schema(), None));
+        self.staging_may_have_files().store(true, Ordering::Release);
+        let (rows, _, stats) = self
+            .write_to_snapshot_with_schema(
+                data,
+                write.target_size_bytes,
+                staging_snapshot_id,
+                write.target_partitions,
+                None,
+                write.write_policy,
+                None,
+                Some(Arc::clone(&file_stats) as _),
+                resolution.write_schema(),
+            )
+            .await?;
+        let superseded = resolution
+            .superseded(self, staging_snapshot_id, rows)
+            .await?;
+        if superseded.is_empty() {
+            return Ok(rows);
+        }
+        let dropped: u64 = superseded.values().map(|rows| rows.len() as u64).sum();
+        self.fold_superseded_copies(staging_snapshot_id, &superseded, write, &file_stats, &stats)
+            .await?;
+        Ok(rows.saturating_sub(dropped))
+    }
+
     pub(super) async fn stage_resolved_append(
         &self,
         data: SendableRecordBatchStream,
@@ -61,15 +164,8 @@ impl CayenneTableProvider {
         write: WriteShape,
         scope: ValidationScope,
     ) -> Result<StagedAppend> {
-        let survivor = Survivor::for_policy(resolver.policy());
         let schema = self.table_schema();
-        let indices = self.primary_key_indices()?.unwrap_or_default();
-        let key_columns = overwrite_postpass::key_column_names(&schema, &indices);
-        let arrival_name = overwrite_postpass::arrival_column(&schema);
-        let _dedup_share = DedupShare::claim();
-        let arrival = ArrivalStream::new(data, resolver, &arrival_name);
-        let stamped_batches = arrival.stamped_batches();
-        let data: SendableRecordBatchStream = Box::pin(arrival);
+        let (resolution, data) = ResolveAfterWrite::start(self, data, resolver)?;
         let (data, post_validation) = match scope {
             ValidationScope::Empty => (data, Arc::new(Mutex::new(None))),
             ValidationScope::Locked | ValidationScope::Optimistic => {
@@ -104,15 +200,12 @@ impl CayenneTableProvider {
                     file_stats
                         .as_ref()
                         .map(|observer| Arc::clone(observer) as _),
-                    overwrite_postpass::with_arrival(&schema, &arrival_name),
+                    resolution.write_schema(),
                 )
                 .await?;
             self.sync_local_snapshot_dir(&new_snapshot_id).await?;
-            if rows == 0 || stamped_batches.load(Ordering::Relaxed) <= 1 {
-                return Ok((rows, stats, HashMap::new()));
-            }
-            let superseded = self
-                .find_superseded_by_arrival(&new_snapshot_id, survivor, &key_columns, rows)
+            let superseded = resolution
+                .superseded(self, &new_snapshot_id, rows)
                 .await?;
             match file_stats.as_deref() {
                 Some(file_stats) if !superseded.is_empty() => {

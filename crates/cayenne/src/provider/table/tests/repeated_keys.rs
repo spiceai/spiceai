@@ -135,9 +135,6 @@ async fn table(
     )
     .await;
     provider.upsert_dedup = dedup;
-    // Flush the collapse window after every batch, so repeats across batches
-    // exercise the layers.
-    provider.collapse_window_bytes = 1;
     (provider, catalog, runtime_env, dir)
 }
 
@@ -491,7 +488,6 @@ async fn an_overwrite_repeating_a_string_key_resolves_it_in_both_modes() {
         )
         .await;
         provider.upsert_dedup = UpsertDedup::KeepLast;
-        provider.collapse_window_bytes = 1;
         let ctx = SessionContext::new();
         let source = MemorySourceConfig::try_new_exec(
             &[vec![
@@ -666,14 +662,12 @@ async fn drop_keeps_the_first_copy_across_batches() {
     assert!(provider.protected_snapshot_ids().is_empty());
 }
 
-/// Repeats the collapse window holds are resolved in memory: the refresh
-/// publishes one snapshot, with no layer and no tombstone.
+/// An overwrite resolves the keys it repeats across batches within its own
+/// snapshot: it publishes no layer and no key tombstone.
 #[tokio::test(flavor = "multi_thread")]
-async fn repeats_within_the_collapse_window_publish_one_snapshot() {
+async fn an_overwrite_repeating_keys_publishes_one_snapshot() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (mut provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
-        provider.collapse_window_bytes =
-            super::super::super::collapse_window::COLLAPSE_WINDOW_BYTES;
+        let (provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
         write(&provider, InsertOp::Overwrite, repeated_across_batches())
             .await
             .expect("overwrite");
@@ -901,7 +895,6 @@ async fn upsert_table(
         on_conflict,
     )
     .await;
-    provider.collapse_window_bytes = 1;
     provider.upsert_dedup = UpsertDedup::KeepLast;
     (provider, catalog, runtime_env, dir)
 }
@@ -1465,5 +1458,54 @@ async fn a_load_into_an_empty_table_drops_a_cached_index_it_did_not_fill() {
         let mut expected = last_copies();
         expected[0] = (1, "z".to_string());
         assert_eq!(visible(&provider).await, (expected, 6), "{mode:?}");
+    }
+}
+
+/// A partition's append resolves the keys it repeats over its whole input,
+/// however far apart its batches repeat them, before it is staged for
+/// publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partition_append_resolves_its_whole_input() {
+    let input = || {
+        let batches = vec![
+            batch(&[(1, "a"), (2, "a")]),
+            batch(&[(1, "b")]),
+            batch(&[(3, "a")]),
+            batch(&[(1, "c"), (2, "a")]),
+        ];
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema(),
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        )) as SendableRecordBatchStream
+    };
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        for (on_conflict, dedup, expected) in [
+            (upsert_on_id(), UpsertDedup::KeepLast, Ok(3)),
+            (drop_on_id(), UpsertDedup::None, Ok(3)),
+            (
+                upsert_on_id(),
+                UpsertDedup::None,
+                Err("different versions of 1 value of 'id'"),
+            ),
+        ] {
+            let label = format!("{mode:?}/{dedup:?}");
+            let (mut provider, _catalog, _runtime_env, _dir) =
+                upsert_table(mode, on_conflict).await;
+            provider.upsert_dedup = dedup;
+            let prepared = provider.begin_deferred_snapshot_append(input(), 2).await;
+            match (prepared, expected) {
+                (Ok(prepared), Ok(rows)) => {
+                    assert_eq!(prepared.row_count(), rows, "{label}: staged rows");
+                    prepared.rollback().await.expect("rollback");
+                }
+                (Err(error), Err(cause)) => {
+                    assert!(error.to_string().contains(cause), "{label}: {error}");
+                }
+                (Ok(prepared), Err(cause)) => {
+                    panic!("{label}: staged {} rows, expected {cause}", prepared.row_count())
+                }
+                (Err(error), Ok(_)) => panic!("{label}: {error}"),
+            }
+        }
     }
 }

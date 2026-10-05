@@ -22,7 +22,9 @@ limitations under the License.
 //! under `drop`. Change streams apply versions in arrival order.
 //!
 //! [`KeyResolver::resolve_batch`] resolves one batch, and
-//! [`KeyResolver::collapse_write`] resolves a buffered statement.
+//! [`KeyResolver::collapse_write`] resolves a buffered statement. A streamed
+//! statement resolves the keys it repeats across batches after it is written
+//! ([`super::overwrite_postpass`]).
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -105,16 +107,6 @@ impl Survivor {
             ConflictPolicy::UpsertKeepLast => Self::Latest,
         }
     }
-}
-
-/// A batch with its repeated keys resolved.
-#[derive(Debug)]
-pub(crate) struct ResolvedBatch {
-    pub(crate) batch: RecordBatch,
-    /// The key digest of each row of `batch`, in row order; all distinct.
-    pub(crate) digests: Vec<u128>,
-    /// Content identity in row order, with NULL equal to NULL.
-    pub(crate) contents: Vec<u128>,
 }
 
 /// Resolves repeated primary keys for one table under one [`ConflictPolicy`].
@@ -228,66 +220,11 @@ impl KeyResolver {
     /// # Errors
     ///
     /// Returns an error if a primary key is null, or the policy rejects a repeat.
-    pub(crate) fn resolve_batch(&self, batch: &RecordBatch) -> Result<ResolvedBatch> {
-        self.ensure_no_null_key(batch)?;
-        let digests = self.digests(batch)?;
-        let contents = self.content_digests(batch)?;
-        let mut conflicts = HashSet::with_hasher(PrehashedBuildHasher);
-        // The row each key keeps: its first copy under `drop`, else its last.
-        let mut survivor: HashMap<u128, usize, PrehashedBuildHasher> =
-            HashMap::with_capacity_and_hasher(digests.len(), PrehashedBuildHasher);
-        let mut repeated = false;
-        for (row, &digest) in digests.iter().enumerate() {
-            match survivor.entry(digest) {
-                Entry::Vacant(entry) => {
-                    entry.insert(row);
-                }
-                Entry::Occupied(mut entry) => {
-                    repeated = true;
-                    match self.policy {
-                        ConflictPolicy::KeepFirst => {}
-                        ConflictPolicy::UpsertIdentical => {
-                            if contents[*entry.get()] != contents[row] {
-                                conflicts.insert(digest);
-                            }
-                            entry.insert(row);
-                        }
-                        ConflictPolicy::UpsertKeepLast => {
-                            entry.insert(row);
-                        }
-                    }
-                }
-            }
-        }
-        if !conflicts.is_empty() {
-            return Err(self.conflicting_versions(conflicts.len()));
-        }
-        if !repeated {
-            return Ok(ResolvedBatch {
-                batch: batch.clone(),
-                digests,
-                contents,
-            });
-        }
-        let keep: BooleanArray = digests
-            .iter()
-            .enumerate()
-            .map(|(row, digest)| Some(survivor.get(digest) == Some(&row)))
-            .collect();
-        let digests = digests
-            .into_iter()
-            .zip(keep.values().iter())
-            .filter_map(|(digest, kept)| kept.then_some(digest))
-            .collect();
-        let contents = contents
-            .into_iter()
-            .zip(keep.values().iter())
-            .filter_map(|(content, kept)| kept.then_some(content))
-            .collect();
-        Ok(ResolvedBatch {
-            batch: filter_record_batch(batch, &keep)?,
-            digests,
-            contents,
+    pub(crate) fn resolve_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let mut resolved = self.collapse_write(vec![batch.clone()])?;
+        Ok(match resolved.pop() {
+            Some(resolved) => resolved,
+            None => batch.slice(0, 0),
         })
     }
 
@@ -737,8 +674,7 @@ mod tests {
         let resolved = resolver(ConflictPolicy::UpsertKeepLast)
             .resolve_batch(&batch(&[(1, "a"), (2, "b"), (1, "c")]))
             .expect("resolved");
-        assert_eq!(rows(&[resolved.batch]), owned(&[(2, "b"), (1, "c")]));
-        assert_eq!(resolved.digests.len(), 2);
+        assert_eq!(rows(&[resolved]), owned(&[(2, "b"), (1, "c")]));
     }
 
     #[test]
