@@ -64,6 +64,7 @@ pub enum SourceUnavailable {
 
 impl SourceUnavailable {
     /// Retains the classification used by background source failure reporting.
+    #[must_use]
     pub fn failed(error: &DataConnectorError) -> Self {
         Self::Failed {
             cause: error.to_string(),
