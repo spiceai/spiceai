@@ -1125,3 +1125,173 @@ async fn restore_held_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     );
     Ok(())
 }
+
+const CUSTOM_PATHS: &str = "spice_test_rustfs_snapshot_source_custom_paths";
+
+/// A Cayenne snapshot dataset that sets `cayenne_file_path` and `cayenne_metadata_dir`
+/// restores its copy there, not under `.spice/data`.
+#[tokio::test]
+async fn restores_cayenne_snapshots_to_the_paths_the_dataset_sets() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let (rustfs, container) = start_rustfs(CUSTOM_PATHS).await?;
+            let result = custom_paths_scenario(rustfs, &modules).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+async fn custom_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let modules_csv = dir.path().join("modules.csv");
+    std::fs::write(&modules_csv, INITIAL_CSV)?;
+    let writer = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_custom_paths_writer")
+                    .with_snapshots(writer_snapshots(rustfs, &prefix))
+                    .with_dataset(writer_dataset(modules, &modules_csv, "cayenne", dir.path()))
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&writer).await?;
+    wait_for_writer_snapshot(rustfs, &prefix, modules, 0).await?;
+    replicate_snapshots(rustfs, &prefix).await?;
+
+    let data_dir = dir.path().join("reader").join(modules);
+    let metadata_dir = dir.path().join("reader").join("metadata");
+    let mut dataset = reader_dataset(rustfs, modules, &prefix);
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        acceleration.params = Some(Params::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".to_string(),
+                data_dir.display().to_string(),
+            ),
+            (
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
+            ),
+        ])));
+    }
+    let reader = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_custom_paths_reader")
+                    .with_dataset(dataset)
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&reader).await?;
+
+    wait_for_rows(&reader, modules, 3).await?;
+    assert_eq!(rows(&reader, modules).await?, rows(&writer, modules).await?);
+    assert!(
+        std::fs::read_dir(&data_dir)?.next().is_some(),
+        "the copy is restored under `cayenne_file_path` ({})",
+        data_dir.display()
+    );
+    assert!(
+        metadata_dir.join("cayenne.db").is_file(),
+        "the metastore is restored under `cayenne_metadata_dir` ({})",
+        metadata_dir.display()
+    );
+    assert_eq!(
+        local_copies(modules),
+        Vec::<PathBuf>::new(),
+        "nothing is restored under `.spice/data`"
+    );
+
+    reader.shutdown().await;
+    writer.shutdown().await;
+    Ok(())
+}
+
+const OTHER_ENGINE_PATHS: &str = "spice_test_rustfs_snapshot_source_other_engine_paths";
+
+/// A snapshot dataset that sets a Cayenne path but reads another engine's snapshots is
+/// refused, by name, rather than silently keeping its copy under `.spice/data`.
+#[tokio::test]
+async fn refuses_cayenne_paths_for_another_engines_snapshots() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let (rustfs, container) = start_rustfs(OTHER_ENGINE_PATHS).await?;
+            let result = other_engine_paths_scenario(rustfs, &modules).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+async fn other_engine_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
+    writer.shutdown().await;
+
+    let mut dataset = reader_dataset(rustfs, modules, &prefix);
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        acceleration.params = Some(Params::from_string_map(HashMap::from([(
+            "cayenne_file_path".to_string(),
+            dir.path().join("reader").display().to_string(),
+        )])));
+    }
+    let reader = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_other_engine_paths_reader")
+                    .with_dataset(dataset)
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    let load = tokio::spawn(Arc::clone(&reader).load_components());
+
+    let table = datafusion::sql::TableReference::bare(modules);
+    let expected = format!(
+        "Dataset '{modules}' reads snapshots from 's3://{READER_BUCKET}/{prefix}/' that were created with the 'duckdb' engine, so `acceleration.params.cayenne_file_path`, which sets where a Cayenne copy is kept, does not apply"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut status = None;
+    while Instant::now() < deadline {
+        status = reader.status().get_dataset_status(&table);
+        if status
+            .as_ref()
+            .and_then(ComponentStatus::error_message)
+            .is_some_and(|message| message.contains(&expected))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let message = status
+        .as_ref()
+        .and_then(ComponentStatus::error_message)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        message.contains(&expected),
+        "the dataset is refused, naming the param, got {status:?}"
+    );
+    assert_eq!(
+        local_copies(modules),
+        Vec::<PathBuf>::new(),
+        "nothing is restored under `.spice/data`"
+    );
+
+    load.abort();
+    reader.shutdown().await;
+    Ok(())
+}
