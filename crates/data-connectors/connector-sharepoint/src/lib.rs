@@ -528,6 +528,15 @@ fn parse_object_store_components(
     ))
 }
 
+/// The user-facing name of `parameter`, noting the `flow` parameter that requires it.
+fn required_with(params: &Parameters, parameter: &str, flow: &str) -> String {
+    format!(
+        "`{}` (required with `{}`)",
+        params.user_param(parameter),
+        params.user_param(flow)
+    )
+}
+
 fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     let tenant = params.get("tenant_id").expose().ok().map(String::from);
     let client_id = params.get("client_id").expose().ok().map(String::from);
@@ -574,10 +583,10 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     }
     if let Some(assertion) = saml_assertion {
         let tenant = tenant.ok_or_else(|| Error::MissingParameter {
-            parameter: "tenant_id".into(),
+            parameter: format!("`{}`", params.user_param("tenant_id")),
         })?;
         let client_id = client_id.ok_or_else(|| Error::MissingParameter {
-            parameter: "client_id".into(),
+            parameter: format!("`{}`", params.user_param("client_id")),
         })?;
         return Ok(SharepointAuth::SamlBearer(SamlBearerConfig {
             tenant_id: tenant,
@@ -589,22 +598,22 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     }
 
     let tenant = tenant.ok_or_else(|| Error::MissingParameter {
-        parameter: "tenant_id".into(),
+        parameter: format!("`{}`", params.user_param("tenant_id")),
     })?;
     let client_id = client_id.ok_or_else(|| Error::MissingParameter {
-        parameter: "client_id".into(),
+        parameter: format!("`{}`", params.user_param("client_id")),
     })?;
 
     if let Some(code) = auth_code {
         let secret = client_secret.ok_or_else(|| Error::MissingParameter {
-            parameter: "client_secret (required with auth_code)".into(),
+            parameter: required_with(params, "client_secret", "auth_code"),
         })?;
         let redirect = params
             .get("redirect_uri")
             .expose()
             .ok()
             .ok_or_else(|| Error::MissingParameter {
-                parameter: "redirect_uri (required with auth_code)".into(),
+                parameter: required_with(params, "redirect_uri", "auth_code"),
             })?
             .to_string();
         return Ok(SharepointAuth::AuthCode {
@@ -618,7 +627,7 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     }
     if let Some(token) = refresh_token {
         let secret = client_secret.ok_or_else(|| Error::MissingParameter {
-            parameter: "client_secret (required with refresh_token)".into(),
+            parameter: required_with(params, "client_secret", "refresh_token"),
         })?;
         return Ok(SharepointAuth::RefreshToken {
             tenant_id: tenant,
