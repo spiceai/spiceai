@@ -1226,6 +1226,7 @@ impl<'a> AppendMutationWriter<'a> {
         let indices = self.table.primary_key_indices()?.unwrap_or_default();
         let key_columns = super::overwrite_postpass::key_column_names(&table_schema, &indices);
         let arrival_name = super::overwrite_postpass::arrival_column(&table_schema);
+        let dedup_share = super::overwrite_postpass::DedupShare::claim();
         let arrival = super::overwrite_postpass::ArrivalStream::new(data, resolver, &arrival_name);
         let stamped_batches = arrival.stamped_batches();
         let data: SendableRecordBatchStream = Box::pin(arrival);
@@ -1315,6 +1316,8 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(error);
             }
         };
+        // The copies are resolved: free this write's share of the duplicate query.
+        drop(dedup_share);
 
         let PostValidationState {
             mut on_conflict_deletions,

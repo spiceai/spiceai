@@ -676,10 +676,12 @@ impl CayenneTableProvider {
         // query finds every copy other than the one the policy keeps — the last
         // under the upsert policies, the first under `drop`.
         let mut postpass: Option<(Survivor, Vec<String>)> = None;
+        let mut dedup_share: Option<super::overwrite_postpass::DedupShare> = None;
         let data: SendableRecordBatchStream = match self.key_resolver()? {
             None => data,
             Some(resolver) => {
                 let indices = self.primary_key_indices()?.unwrap_or_default();
+                dedup_share = Some(super::overwrite_postpass::DedupShare::claim());
                 postpass = Some((
                     Survivor::for_policy(resolver.policy()),
                     super::overwrite_postpass::key_column_names(&self.table_schema(), &indices),
@@ -832,6 +834,8 @@ impl CayenneTableProvider {
                 }
             }
         };
+        // The copies are resolved: free this write's share of the duplicate query.
+        drop(dedup_share);
 
         // Manifest snapshot model: reserve ONE sequence `S` for this overwrite
         // and AUTHOR the new snapshot's manifest with `[S, S]` — every file was
