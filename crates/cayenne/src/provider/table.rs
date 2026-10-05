@@ -31323,7 +31323,7 @@ impl CayenneTableProvider {
         // `owned_capture_write_lock` is Some only for the public N>1 path. A caller
         // using `checkpoint_mem_tier_holding_locks` owns its write guard outside
         // this method, so it passes None and retains that lock for its operation.
-        let (shard_snapshots, flushed_counts, durable_epoch, reserved_snapshot_sequence) = {
+        let (shard_snapshots, flushed_counts, reserved_snapshot_sequence) = {
             // Acquire all shard publish locks in index order (deadlock-free).
             let mut guards = Vec::with_capacity(n);
             for lock in self.mem_tier_publish_locks.iter() {
@@ -31357,49 +31357,8 @@ impl CayenneTableProvider {
             } else {
                 Some(self.reserve_sequences_local(1).await?)
             };
-            // The cross-shard durable watermark on the SINGLE per-apply epoch axis
-            // (§3.4 Fix 1). The apply-epoch is a single GLOBAL monotone counter
-            // assigned once per apply UNDER `write_lock`, then stamped identically
-            // on every shard segment that apply produces. An apply only ever appends
-            // segments to the shards whose keys it touched, so a given apply-epoch is
-            // NOT present in every shard (e.g. a delete-absorb apply that routed all
-            // its tombstones to a single shard). This capture is all-shards-ATOMIC —
-            // it runs under `write_lock` (no apply in flight) and flushes each
-            // shard's COMPLETE current segment prefix (`flushed_counts[s]` == the
-            // shard's full segment count) — so EVERY apply that has run is now fully
-            // durable. The durable high-watermark is therefore the GLOBAL MAX
-            // apply-epoch captured across all shards: every epoch <= it is fully
-            // durable (a lower-epoch apply either landed in some shard's flushed
-            // prefix, or touched no shard at all — either way it is durable). MIN
-            // would be WRONG here: it pins the watermark at the least-recently-
-            // touched shard's last apply, so a cold shard starves the source slot
-            // and WAL never drains (the observed non-convergence) even though every
-            // applied epoch is durable. MIN is only required when shards checkpoint
-            // INDEPENDENTLY at different source positions; with atomic whole-tier
-            // capture there is no partial coverage, so MAX is both safe (never acks
-            // a not-yet-durable position — capture is under `write_lock`) and live.
-            // Shards with no captured `source_position` (empty, or the `None`-stamped
-            // N==1 single shard) are excluded. At N==1 there is no `source_position`
-            // at all, so this is `None` and the slot-ack falls back to the single
-            // shard's `MemTier::epoch` below (byte-identical).
-            // Cross-shard durable watermark = MAX (not MIN) over shards of the
-            // per-apply slot-ack epoch in each shard's flushed FULL prefix. Safe
-            // because the capture is all-shards-atomic over every shard's full
-            // prefix (§3.4 Fix 2/3): every epoch `<=` this max is durable in some
-            // shard's prefix, so acking it loses nothing on crash. MIN would
-            // UNDER-ack — an apply stamps its epoch only on the shards it touched,
-            // so a cold (recently-untouched) shard pins MIN low and the source slot
-            // never advances → WAL never drains. LOAD-BEARING on "no single-shard /
-            // partial-prefix checkpoint exists" (the whole-tier triggers + the sole
-            // all-shards capture body below enforce it); a partial checkpoint would
-            // make MAX a data-loss hole and require reverting to a MIN watermark.
-            let durable_epoch = shard_snapshots
-                .iter()
-                .zip(flushed_counts.iter())
-                .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
-                .max();
             drop(guards);
-            (shard_snapshots, flushed_counts, durable_epoch, seq)
+            (shard_snapshots, flushed_counts, seq)
         };
         // The all-shards-atomic capture window: the per-shard snapshot load +
         // sequence reservation under the publish locks (and `write_lock` at N>1).
@@ -31421,6 +31380,53 @@ impl CayenneTableProvider {
         // (spill/evolve/promotion): `owned_capture_write_lock` is None and the
         // caller's guard stays held for the rest of its operation.
         drop(owned_capture_write_lock.take());
+        // The cross-shard durable watermark on the SINGLE per-apply epoch axis
+        // (§3.4 Fix 1). The apply-epoch is a single GLOBAL monotone counter
+        // assigned once per apply UNDER `write_lock`, then stamped identically
+        // on every shard segment that apply produces. An apply only ever appends
+        // segments to the shards whose keys it touched, so a given apply-epoch is
+        // NOT present in every shard (e.g. a delete-absorb apply that routed all
+        // its tombstones to a single shard). This capture is all-shards-ATOMIC —
+        // it runs under `write_lock` (no apply in flight) and flushes each
+        // shard's COMPLETE current segment prefix (`flushed_counts[s]` == the
+        // shard's full segment count) — so EVERY apply that has run is now fully
+        // durable. The durable high-watermark is therefore the GLOBAL MAX
+        // apply-epoch captured across all shards: every epoch <= it is fully
+        // durable (a lower-epoch apply either landed in some shard's flushed
+        // prefix, or touched no shard at all — either way it is durable). MIN
+        // would be WRONG here: it pins the watermark at the least-recently-
+        // touched shard's last apply, so a cold shard starves the source slot
+        // and WAL never drains (the observed non-convergence) even though every
+        // applied epoch is durable. MIN is only required when shards checkpoint
+        // INDEPENDENTLY at different source positions; with atomic whole-tier
+        // capture there is no partial coverage, so MAX is both safe (never acks
+        // a not-yet-durable position — capture is under `write_lock`) and live.
+        // Shards with no captured `source_position` (empty, or the `None`-stamped
+        // N==1 single shard) are excluded. At N==1 there is no `source_position`
+        // at all, so this is `None` and the slot-ack falls back to the single
+        // shard's `MemTier::epoch` below (byte-identical).
+        // Cross-shard durable watermark = MAX (not MIN) over shards of the
+        // per-apply slot-ack epoch in each shard's flushed FULL prefix. Safe
+        // because the capture is all-shards-atomic over every shard's full
+        // prefix (§3.4 Fix 2/3): every epoch `<=` this max is durable in some
+        // shard's prefix, so acking it loses nothing on crash. MIN would
+        // UNDER-ack — an apply stamps its epoch only on the shards it touched,
+        // so a cold (recently-untouched) shard pins MIN low and the source slot
+        // never advances → WAL never drains. LOAD-BEARING on "no single-shard /
+        // partial-prefix checkpoint exists" (the whole-tier triggers + the sole
+        // all-shards capture body below enforce it); a partial checkpoint would
+        // make MAX a data-loss hole and require reverting to a MIN watermark.
+        //
+        // The fold walks every captured segment, so it grows with tier depth. It
+        // reads only the immutable captured shard snapshots and their captured
+        // `flushed_counts`, so computing it here, after the capture locks are
+        // released, yields exactly the value it would have under them while keeping
+        // the capture window to the snapshot loads and the sequence reservation.
+        let durable_epoch = shard_snapshots
+            .iter()
+            .zip(flushed_counts.iter())
+            .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
+            .max();
         // Emptiness must be judged on the REAL captured shard snapshots, not the
         // synthetic union view: `union_snapshot_view` carries the cross-shard
         // tombstone union + the summed byte/row counts but ALWAYS has empty
