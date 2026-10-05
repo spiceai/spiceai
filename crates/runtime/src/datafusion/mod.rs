@@ -2446,7 +2446,7 @@ impl DataFusion {
                 .await
                 .context(UnableToResolveTableProviderSnafu)?;
             permit
-                .drain_previous(Duration::from_secs(30))
+                .drain_previous()
                 .await
                 .context(UnableToDrainChangesSnafu {
                     dataset_name: table_reference.to_string(),
@@ -2557,10 +2557,7 @@ impl DataFusion {
                 DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
             })?;
 
-            let _permit = self
-                .change_generations
-                .lock(&table_ref, Duration::from_secs(30))
-                .await?;
+            let _permit = self.change_generations.lock(&table_ref).await?;
             // Atomically claim this placeholder before swapping: the resolver
             // that removes it from the pending registry owns the swap, and any
             // concurrent resolver that finds it already gone skips its own
@@ -3165,7 +3162,7 @@ impl DataFusion {
     async fn drained_generation(&self, name: &TableReference) -> Result<GenerationPermit> {
         let mut permit = self.generation_lock(name).await?;
         permit
-            .drain_previous(Duration::from_secs(30))
+            .drain_previous()
             .await
             .context(UnableToDrainChangesSnafu {
                 dataset_name: name.to_string(),
@@ -3218,7 +3215,7 @@ impl DataFusion {
         let name = dataset.name.to_string();
         let mut permit = self.generation_lock(&dataset.name).await?;
         permit
-            .drain_previous(Duration::from_secs(30))
+            .drain_previous()
             .await
             .context(UnableToDrainChangesSnafu {
                 dataset_name: name.clone(),
@@ -3275,7 +3272,7 @@ impl DataFusion {
             owner.revoke();
         }
         self.change_generations
-            .lock(name, Duration::from_secs(30))
+            .lock(name)
             .await
             .context(UnableToDrainChangesSnafu {
                 dataset_name: name.to_string(),
@@ -3363,7 +3360,7 @@ impl DataFusion {
             })?;
         if rebind.is_none() {
             permit
-                .drain_previous(Duration::from_secs(30))
+                .drain_previous()
                 .await
                 .context(UnableToDrainChangesSnafu {
                     dataset_name: dataset.name.to_string(),
@@ -4826,7 +4823,7 @@ impl DataFusion {
 
                 drop(guard);
                 permit
-                    .drain_previous(Duration::from_secs(30))
+                    .drain_previous()
                     .await
                     .context(UnableToDrainChangesSnafu {
                         dataset_name: dataset.name.to_string(),

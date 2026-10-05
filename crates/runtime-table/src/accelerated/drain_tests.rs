@@ -103,10 +103,14 @@ async fn change_sink_drain_joins_producer_and_retains_accepted_write() {
         });
         table.handlers.lock().push(producer);
         accepted.await.expect("producer admitted the write");
-        let mut cancelled_waiter = Box::pin(table.drain_changes(WAIT));
+        let mut cancelled_waiter = Box::pin(table.drain_changes());
         assert!(futures::poll!(cancelled_waiter.as_mut()).is_pending());
         drop(cancelled_waiter);
-        assert!(table.drain_changes(Duration::ZERO).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::ZERO, table.drain_changes())
+                .await
+                .is_err()
+        );
         assert!(
             cancelled.await.is_err(),
             "the producer future must be destroyed"
@@ -122,7 +126,7 @@ async fn change_sink_drain_joins_producer_and_retains_accepted_write() {
         first.wait().await.expect("first drain waiter");
         second.wait().await.expect("second drain waiter");
         table
-            .drain_changes(WAIT)
+            .drain_changes()
             .await
             .expect("retry observes completed drain");
         published

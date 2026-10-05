@@ -312,6 +312,11 @@ impl<'a> AppendMutationWriter<'a> {
         }
     }
 
+    fn can_buffer_rebuildable_write(&self) -> bool {
+        self.table.is_cdc_memory_mode()
+            && super::write_recovery::RebuildableWrite::permits(self.table, self.task_context)
+    }
+
     pub(super) async fn write_cdc_pipelined(
         &self,
         data: SendableRecordBatchStream,
@@ -349,7 +354,7 @@ impl<'a> AppendMutationWriter<'a> {
         // ALWAYS at N=1 — falls through to the byte-identical serial path below.
         let mem_tier_shards = self.table.mem_tier_shard_count();
         if mem_tier_shards > 1
-            && self.table.is_cdc_mem_tier_armed()
+            && (self.table.is_cdc_mem_tier_armed() || self.can_buffer_rebuildable_write())
             && self.table.metadata().partition_column.is_none()
         {
             if let Some(prepared) = self
@@ -487,18 +492,13 @@ impl<'a> AppendMutationWriter<'a> {
             ));
         }
 
-        // In-memory write path: append the validated batch to the RAM tier instead
-        // of persisting a per-batch durable BLOB. Taken when EITHER the table is a
-        // `mode: memory` accelerator (`is_memory_resident_mode` — the mem-tier is
-        // its permanent store) OR a key-based, non-partitioned CDC table
-        // (`is_cdc_memory_mode`) whose runtime has armed deferral for a replayable
-        // source (`has_slot_advancer`). The two differ in how the runtime acks the
-        // source slot: `mode: memory` never checkpoints, so the slot is committed
-        // immediately (nothing to defer behind); `cdc_durability: memory` defers the
-        // ack behind the covering durable checkpoint. Every other table/source keeps
-        // the durable path below, byte-identical.
+        // Buffer only permanent memory data, replayable CDC with a real source
+        // callback, or an explicitly rebuildable write to this storage owner.
+        // Rebuildable writes make no source acknowledgement promise. Replayable
+        // CDC still defers acknowledgement behind the covering checkpoint.
         let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
             || self.table.is_cdc_mem_tier_armed()
+            || self.can_buffer_rebuildable_write()
         {
             match self
                 .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)

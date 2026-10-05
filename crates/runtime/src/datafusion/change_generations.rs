@@ -29,7 +29,6 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 use datafusion::{
@@ -40,7 +39,6 @@ use runtime_acceleration::change_sink::Publication;
 use tokio::{
     runtime::Handle,
     sync::{Mutex, OwnedMutexGuard, oneshot},
-    time::{Instant, timeout_at},
 };
 
 use super::resolve_table_reference;
@@ -172,13 +170,8 @@ impl ChangeGenerations {
     /// Serializes lifecycle decisions without stopping the current owner.
     /// Schema-rebind callers can inspect the schema, release their schema lock,
     /// then drain under this permit only if a replacement is required.
-    pub(crate) async fn lock(
-        &self,
-        name: &TableReference,
-        timeout: Duration,
-    ) -> Result<GenerationPermit> {
+    pub(crate) async fn lock(&self, name: &TableReference) -> Result<GenerationPermit> {
         let name = resolve_table_reference(name.clone());
-        let deadline = Instant::now() + timeout;
         let slot = {
             let mut slots = self.slots.lock();
             if self.closing.load(Ordering::Acquire) {
@@ -196,9 +189,7 @@ impl ChangeGenerations {
             }
             Arc::clone(slots.entry(name.clone()).or_default())
         };
-        let state = timeout_at(deadline, slot.lock_owned())
-            .await
-            .map_err(|_| fenced(&name, "another lifecycle operation is still running"))?;
+        let state = slot.lock_owned().await;
         let permit = GenerationPermit {
             name,
             state,
@@ -206,21 +197,6 @@ impl ChangeGenerations {
             closing: Arc::clone(&self.closing),
         };
         permit.ensure_open()?;
-        Ok(permit)
-    }
-
-    /// Waits for the previous lifecycle operation and its actual drain result.
-    /// Cancellation and timeout leave a started drain in the registry. A failed
-    /// drain is permanent for this registry; a timeout can be retried.
-    #[cfg(test)]
-    pub(crate) async fn acquire(
-        &self,
-        name: &TableReference,
-        timeout: Duration,
-    ) -> Result<GenerationPermit> {
-        let deadline = Instant::now() + timeout;
-        let mut permit = self.lock(name, timeout).await?;
-        permit.drain_previous_until(deadline).await?;
         Ok(permit)
     }
 
@@ -250,7 +226,7 @@ impl ChangeGenerations {
                                     installed: true,
                                     closing,
                                 };
-                                permit.drain_previous_owned().await
+                                permit.drain_previous().await
                             }
                         }))
                         .await;
@@ -283,7 +259,10 @@ impl GenerationPermit {
         self.installed = false;
     }
 
-    async fn drain_previous_owned(&mut self) -> Result<()> {
+    /// Wait for completion before mutating storage. Do not hold a lock needed
+    /// by the draining owner's callbacks, producer tasks, or cache fanout.
+    /// Cancellation releases this waiter, not the registry's drain ownership.
+    pub(crate) async fn drain_previous(&mut self) -> Result<()> {
         self.state.begin_drain();
         let result = match &*self.state {
             State::Draining(publication) => publication.wait().await,
@@ -298,19 +277,6 @@ impl GenerationPermit {
         *self.state = State::Vacant;
         Ok(())
     }
-    /// No storage may be mutated until this succeeds. Do not hold a lock needed
-    /// by the draining owner's callbacks, producer tasks, or cache fanout.
-    pub(crate) async fn drain_previous(&mut self, timeout: Duration) -> Result<()> {
-        self.drain_previous_until(Instant::now() + timeout).await
-    }
-
-    async fn drain_previous_until(&mut self, deadline: Instant) -> Result<()> {
-        let name = self.name.clone();
-        timeout_at(deadline, self.drain_previous_owned())
-            .await
-            .map_err(|_| fenced(&name, "the previous generation is still draining"))?
-    }
-
     /// Owns construction independently of the caller. The future must contain
     /// every operation that can create producers or touch the new storage, and
     /// must not acquire this dataset's permit again. It must not spawn work
@@ -319,8 +285,8 @@ impl GenerationPermit {
     /// Cancellation before delivery drains the result instead of installing it.
     /// Failed/panicked construction stays fenced because no complete owner was
     /// returned to prove cleanup. Perform side-effect-free validation before
-    /// calling this method. A stuck constructor retains the permit; a later
-    /// waiter can time out but cannot replace its storage.
+    /// calling this method. A stuck constructor retains the permit; later
+    /// lifecycle operations wait rather than replacing its storage.
     pub(crate) async fn construct<T, F>(
         mut self,
         runtime: &Handle,
@@ -383,10 +349,34 @@ fn fenced(name: &ResolvedTableReference, reason: &str) -> DataFusionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
     use tokio::sync::watch;
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    impl ChangeGenerations {
+        async fn acquire(
+            &self,
+            name: &TableReference,
+            timeout: Duration,
+        ) -> Result<GenerationPermit> {
+            tokio::time::timeout(timeout, async {
+                let mut permit = self.lock(name).await?;
+                permit.drain_previous().await?;
+                Ok(permit)
+            })
+            .await
+            .map_err(|_| {
+                fenced(
+                    &resolve_table_reference(name.clone()),
+                    "test observer timed out",
+                )
+            })?
+        }
+    }
 
     fn name() -> TableReference {
         TableReference::bare("events")
@@ -409,6 +399,57 @@ mod tests {
             })
             .await
             .expect("constructed owner")
+    }
+
+    #[tokio::test]
+    async fn lifecycle_waits_for_completion_beyond_thirty_seconds() {
+        tokio::time::timeout(Duration::from_secs(40), async {
+            let constructing = ChangeGenerations::default();
+            let prepared = prepare(
+                &constructing,
+                Arc::new(AtomicBool::new(false)),
+                Publication::Ready,
+            )
+            .await;
+            let dataset = name();
+            let mut lock_waiter = Box::pin(constructing.lock(&dataset));
+            assert!(futures::poll!(lock_waiter.as_mut()).is_pending());
+
+            let draining = ChangeGenerations::default();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let (sender, receiver) = watch::channel(None);
+            prepare(
+                &draining,
+                Arc::clone(&stopped),
+                Publication::Pending(receiver),
+            )
+            .await
+            .installed();
+            let mut drain_waiter = Box::pin(async {
+                let mut permit = draining.lock(&dataset).await?;
+                permit.drain_previous().await
+            });
+            assert!(futures::poll!(drain_waiter.as_mut()).is_pending());
+            assert!(stopped.load(Ordering::SeqCst));
+
+            // Time itself is under test: neither lifecycle wait has a deadline.
+            tokio::time::sleep(Duration::from_secs(31)).await;
+            assert!(futures::poll!(lock_waiter.as_mut()).is_pending());
+            assert!(futures::poll!(drain_waiter.as_mut()).is_pending());
+            drop(prepared);
+            lock_waiter
+                .await
+                .expect("construction released its permit")
+                .drain_previous()
+                .await
+                .expect("unpublished owner drained");
+            sender.send_replace(Some(Ok(())));
+            drain_waiter
+                .await
+                .expect("storage completion releases the waiter");
+        })
+        .await
+        .expect("controlled lifecycle operations must complete");
     }
 
     #[tokio::test]
@@ -511,10 +552,10 @@ mod tests {
         prepare(&registry, Arc::clone(&stopped), Publication::Ready)
             .await
             .installed();
-        drop(registry.lock(&name(), WAIT).await.expect("inspection"));
+        drop(registry.lock(&name()).await.expect("inspection"));
         assert!(!stopped.load(Ordering::SeqCst));
-        let mut permit = registry.lock(&name(), WAIT).await.expect("replacement");
-        permit.drain_previous(WAIT).await.expect("drain");
+        let mut permit = registry.lock(&name()).await.expect("replacement");
+        permit.drain_previous().await.expect("drain");
         assert!(stopped.load(Ordering::SeqCst));
     }
 
@@ -525,7 +566,7 @@ mod tests {
         prepare(&registry, Arc::clone(&stopped), Publication::Ready)
             .await
             .installed();
-        let permit = registry.lock(&name(), WAIT).await.expect("inspection");
+        let permit = registry.lock(&name()).await.expect("inspection");
         let result = permit
             .construct::<(), _>(&Handle::current(), async {
                 panic!("the constructor must not be polled before drain")

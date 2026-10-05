@@ -661,7 +661,9 @@ impl CacheSinkWriter {
         let canonical = canonical_request_filters(&request.filters);
         if request.replaces_existing
             && batches.iter().all(|batch| batch.num_rows() == 0)
-            && (canonical.is_none()
+            && (canonical
+                .as_ref()
+                .is_none_or(|filters| filters.len() != REQUEST_KEY_COLUMNS.len())
                 || REQUEST_KEY_COLUMNS
                     .iter()
                     .any(|name| self.schema.column_with_name(name).is_none()))
@@ -817,9 +819,9 @@ pub(super) fn prepare_source_fetch(
     Ok((plan, None))
 }
 
-/// Cache-owned HTTP uses an empty path for the base URI and NULL query/body
-/// for absent overrides. Empty query/body strings are explicit overrides and
-/// remain distinct from NULL, including when the URI supplies query defaults.
+/// Accept only request-key predicates that describe one request. This does not
+/// infer omitted dimensions or normalize HTTP metadata; nonempty response rows
+/// supply the storage scope. Response predicates cannot authorize replacement.
 pub(super) fn canonical_request_filters(filters: &[Expr]) -> Option<Vec<Expr>> {
     let mut values: BTreeMap<usize, Option<&str>> = BTreeMap::new();
     let mut pending: Vec<_> = filters.iter().collect();
@@ -871,18 +873,11 @@ pub(super) fn canonical_request_filters(filters: &[Expr]) -> Option<Vec<Expr>> {
         }
     }
     Some(
-        REQUEST_KEY_COLUMNS
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                match values.get(&index).copied().unwrap_or(if index == 0 {
-                    Some("")
-                } else {
-                    None
-                }) {
-                    Some(value) => col(*name).eq(lit(value)),
-                    None => col(*name).is_null(),
-                }
+        values
+            .into_iter()
+            .map(|(index, value)| match value {
+                Some(value) => col(REQUEST_KEY_COLUMNS[index]).eq(lit(value)),
+                None => col(REQUEST_KEY_COLUMNS[index]).is_null(),
             })
             .collect(),
     )
@@ -892,7 +887,11 @@ fn tracked_http_plan(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Option<(Arc<dyn ExecutionPlan>, HttpFetchCompletion, bool)>> {
     if let Some(http) = plan.downcast_ref::<HttpExec>() {
-        let eligible = http.limit().is_none() && http.partitions().len() == 1;
+        // Page metadata can describe different storage keys. Exhausting those
+        // pages does not prove one replaceable set under the request filters.
+        let eligible = http.limit().is_none()
+            && http.partitions().len() == 1
+            && !http.provider().is_paginated();
         let (plan, completion) = http.for_cache_fetch();
         return Ok(Some((Arc::new(plan), completion, eligible)));
     }
@@ -1879,15 +1878,56 @@ mod tests {
     }
 
     #[test]
-    fn omitted_query_and_body_are_null_not_empty_overrides() {
+    fn paginated_fetch_does_not_authorize_single_scope_replacement() {
+        use data_components::http::provider::{HttpTableProvider, PaginationConfig};
+        for paginated in [false, true] {
+            let provider = HttpTableProvider::new(
+                "http://localhost/items".parse().expect("URL"),
+                Default::default(),
+                "json".into(),
+                true,
+            );
+            let provider = if paginated {
+                provider
+                    .with_pagination(PaginationConfig::default())
+                    .expect("pagination")
+            } else {
+                provider
+            };
+            let plan = HttpExec::new(
+                provider.schema(),
+                Arc::new(provider),
+                vec![(Some("/items".into()), None, None, None)],
+                None,
+            );
+            let (_, completion) = prepare_source_fetch(
+                Arc::new(plan),
+                &[col("request_path").eq(lit("/items"))],
+                None,
+            )
+            .expect("tracked plan");
+            assert_eq!(completion.is_some(), !paginated);
+        }
+    }
+
+    #[test]
+    fn cache_claim_keys_preserve_supplied_predicates() {
+        let path = col("request_path").eq(lit("/items"));
+        let omitted = super::super::compute_cache_key_from_filters(std::slice::from_ref(&path));
+        let explicit =
+            super::super::compute_cache_key_from_filters(&[path, col("request_body").eq(lit(""))]);
+        assert_ne!(
+            omitted, explicit,
+            "claim keys must not infer request dimensions"
+        );
+    }
+
+    #[test]
+    fn request_scope_does_not_infer_omitted_dimensions() {
         let path = col("request_path").eq(lit("/items"));
         assert_eq!(
             canonical_request_filters(std::slice::from_ref(&path)),
-            Some(vec![
-                path.clone(),
-                col("request_query").is_null(),
-                col("request_body").is_null(),
-            ])
+            Some(vec![path.clone()])
         );
         let explicit = vec![
             path,
@@ -1895,5 +1935,13 @@ mod tests {
             col("request_body").eq(lit("")),
         ];
         assert_eq!(canonical_request_filters(&explicit), Some(explicit));
+        assert_eq!(canonical_request_filters(&[]), Some(vec![]));
+        assert!(
+            canonical_request_filters(&[
+                col("request_path").eq(lit("/items")),
+                col("content").eq(lit("subset"))
+            ])
+            .is_none()
+        );
     }
 }

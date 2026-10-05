@@ -31,7 +31,7 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::logical_expr::{Expr, dml::InsertOp, not, utils::split_conjunction};
+use datafusion::logical_expr::{Expr, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -56,8 +56,6 @@ use runtime_request_context::CacheNamespace;
 use runtime_status::{ComponentStatus, RuntimeStatus};
 use util::expr::combine_exprs_balanced;
 
-#[cfg(test)]
-mod lookup_tests;
 mod writer;
 use writer::RetainedBufferCharge;
 pub use writer::{CacheSinkWriter, CacheWorkDrain, CacheWriteSender, SynchronizedCacheTarget};
@@ -514,41 +512,6 @@ pub fn stamp_namespace_column(
 #[must_use]
 pub fn namespace_filter_expr(namespace_id: &str) -> Expr {
     col(CACHE_NAMESPACE_COLUMN).eq(lit(namespace_id))
-}
-
-/// Bound a keyed cache lookup to the complete logical HTTP request identity,
-/// preserving response predicates. Scans without request predicates, or whose
-/// request predicates do not describe a single identity, retain their filters.
-/// Namespace filtering remains separate; lookup filters do not establish
-/// replacement completeness.
-#[must_use]
-pub fn cache_lookup_filters(schema: &arrow::datatypes::Schema, filters: &[Expr]) -> Vec<Expr> {
-    let (request_filters, other_filters): (Vec<_>, Vec<_>) = filters
-        .iter()
-        .flat_map(split_conjunction)
-        .partition(|filter| {
-            filter
-                .column_refs()
-                .iter()
-                .any(|column| REQUEST_KEY_COLUMNS.contains(&column.name.as_str()))
-        });
-    if request_filters.is_empty() {
-        return filters.to_vec();
-    }
-    let request_filters: Vec<_> = request_filters.into_iter().cloned().collect();
-    let Some(canonical) = writer::canonical_request_filters(&request_filters) else {
-        return filters.to_vec();
-    };
-    canonical
-        .into_iter()
-        .filter(|filter| {
-            filter
-                .column_refs()
-                .iter()
-                .all(|column| schema.column_with_name(&column.name).is_some())
-        })
-        .chain(other_filters.into_iter().cloned())
-        .collect()
 }
 
 /// Extends a federated/source schema with [`CACHE_NAMESPACE_COLUMN`] so the
@@ -1201,8 +1164,6 @@ fn check_cache_freshness(
 /// [`compute_cache_key_from_filters_and_namespace`] so two principals
 /// running the same SQL do not collide.
 fn compute_cache_key_from_filters(filters: &[Expr]) -> String {
-    let canonical = writer::canonical_request_filters(filters);
-    let filters = canonical.as_deref().unwrap_or(filters);
     let mut parts: Vec<String> = filters.iter().map(ToString::to_string).collect();
     parts.sort();
     parts.join("|")
@@ -1569,12 +1530,11 @@ impl CacheRefreshHelper {
                     row_filters.len()
                 );
 
-                let source_filters = Self::periodic_source_filters(federated.as_ref(), &row_filters);
                 let CacheFetch { batches, complete, charge } = Self::fetch_for_population(
                     &federated,
                     &session_state,
                     &dataset_name,
-                    &source_filters,
+                    &row_filters,
                     None,
                     cache_write_tx.task_context(&session_state),
                     cache_write_tx.memory_pool(),
@@ -1679,48 +1639,6 @@ impl CacheRefreshHelper {
         }
 
         Ok(total_refreshed)
-    }
-
-    /// An HTTP cache's stored empty path identifies the configured base URI,
-    /// not a public override. Claims and replacement predicates keep this path.
-    /// Unknown providers receive every original filter.
-    fn periodic_source_filters(source: &dyn TableProvider, row_filters: &[Expr]) -> Vec<Expr> {
-        if !Self::periodic_source_uses_http_paths(source) {
-            return row_filters.to_vec();
-        }
-        row_filters.iter().filter(|filter| {
-            !matches!(filter,
-                Expr::BinaryExpr(binary)
-                    if binary.op == datafusion::logical_expr::Operator::Eq
-                    && matches!(binary.left.as_ref(), Expr::Column(column)
-                        if column.relation.is_none() && column.name == "request_path")
-                    && matches!(binary.right.as_ref(), Expr::Literal(ScalarValue::Utf8(Some(path)), _)
-                        if path.is_empty())
-            )
-        }).cloned().collect()
-    }
-
-    fn periodic_source_uses_http_paths(mut source: &dyn TableProvider) -> bool {
-        for _ in 0..64 {
-            if source
-                .downcast_ref::<data_components::http::provider::HttpTableProvider>()
-                .is_some()
-            {
-                return true;
-            }
-            let Some(table) = source.downcast_ref::<spice_table::SpiceTable>() else {
-                return false;
-            };
-            // A schema-only metadata layer forwards the same scan and filters.
-            if table
-                .layer_as::<data_components::MetadataEnrichedTableProvider>()
-                .is_none()
-            {
-                return false;
-            }
-            source = table.below().as_ref();
-        }
-        false
     }
 
     /// Refreshes specific cache entry by fetching fresh data from the source.
@@ -4030,11 +3948,11 @@ mod pool_tests {
             };
             assert_eq!(
                 strings("request_query").iter().collect::<Vec<_>>(),
-                vec![None]
+                vec![Some("")]
             );
             assert_eq!(
                 strings("request_body").iter().collect::<Vec<_>>(),
-                vec![body]
+                vec![Some(body.unwrap_or(""))]
             );
             assert_eq!(strings("content").value(0), "fresh雪\0");
             assert_eq!(caller_pool.reserved(), 0);
@@ -4043,18 +3961,14 @@ mod pool_tests {
     }
 
     #[tokio::test]
-    async fn periodic_base_uri_and_explicit_path_replay_preserve_scope_and_wire_defaults() {
+    async fn periodic_explicit_request_replays_stored_scope() {
         use data_components::http::provider::HttpTableProvider;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for (explicit, enriched) in [(false, false), (true, false), (false, true), (true, true)] {
+        for enriched in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("listener");
-            let url = format!(
-                "http://{}{}?key=A",
-                listener.local_addr().expect("address"),
-                if explicit { "/" } else { "/items" },
-            );
+            let url = format!("http://{}/?key=A", listener.local_addr().expect("address"));
             let server = tokio::spawn(async move {
                 let mut requests = Vec::new();
                 for payload in ["v1", "v2"] {
@@ -4115,11 +4029,11 @@ mod pool_tests {
                     .is_err(),
                 "public empty path stays invalid"
             );
-            let mut filters = vec![col("request_body").eq(lit(""))];
-            if explicit {
-                filters.push(col("request_path").eq(lit("/items")));
-                filters.push(col("request_query").eq(lit("key=A")));
-            }
+            let filters = vec![
+                col("request_body").eq(lit("")),
+                col("request_path").eq(lit("/items")),
+                col("request_query").eq(lit("key=A")),
+            ];
             let initial = CacheRefreshHelper::fetch_for_population(
                 &source,
                 &state,
@@ -4208,10 +4122,10 @@ mod pool_tests {
                 requests
                     .iter()
                     .all(|wire| wire.starts_with("POST /items?key=A ")),
-                "explicit={explicit} enriched={enriched}: {requests:?}",
+                "enriched={enriched}: {requests:?}",
             );
             println!(
-                "periodic replay: explicit={explicit} enriched={enriched} original_scope={expected_scope:?} wire={:?} stored=v2",
+                "periodic replay: enriched={enriched} original_scope={expected_scope:?} wire={:?} stored=v2",
                 requests
                     .iter()
                     .map(|wire| wire.lines().next().expect("request line"))
@@ -4221,69 +4135,6 @@ mod pool_tests {
                 .await
                 .expect("close periodic sink");
             assert_eq!(pool.reserved(), 0);
-        }
-    }
-
-    #[test]
-    fn periodic_replay_does_not_rewrite_query_body_or_explicit_path_scope() {
-        let source = data_components::http::provider::HttpTableProvider::new(
-            "http://localhost/items?key=A".parse().expect("URL"),
-            Default::default(),
-            "text".into(),
-            true,
-        );
-        for query in [None, Some("")] {
-            for body in [None, Some("")] {
-                let mut filters = vec![col("request_path").eq(lit(""))];
-                for (name, value) in [("request_query", query), ("request_body", body)] {
-                    filters.push(match value {
-                        Some(value) => col(name).eq(lit(value)),
-                        None => col(name).is_null(),
-                    });
-                }
-                assert_eq!(
-                    CacheRefreshHelper::periodic_source_filters(&source, &filters),
-                    filters[1..]
-                );
-                filters[0] = col("request_path").eq(lit("/explicit"));
-                assert_eq!(
-                    CacheRefreshHelper::periodic_source_filters(&source, &filters),
-                    filters
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn non_http_and_opaque_sources_keep_empty_path_filters() {
-        use data_components::http::provider::HttpTableProvider;
-        let http: Arc<dyn TableProvider> = Arc::new(HttpTableProvider::new(
-            "http://localhost/items?key=A".parse().expect("URL"),
-            Default::default(),
-            "text".into(),
-            true,
-        ));
-        let non_http: Arc<dyn TableProvider> = Arc::new(
-            datafusion::datasource::MemTable::try_new(http.schema(), vec![vec![]])
-                .expect("same schema"),
-        );
-        let enriched = data_components::metadata_enriched_table_provider(
-            Arc::clone(&non_http),
-            std::collections::HashMap::from([("test_scope".to_string(), "periodic".to_string())]),
-            Default::default(),
-        );
-        let opaque: Arc<dyn TableProvider> =
-            Arc::new(runtime_datafusion::execution_plan::schema_cast::EnsureSchema::new(http));
-        let filters = vec![
-            col("request_path").eq(lit("")),
-            col("request_query").is_null(),
-            col("request_body").eq(lit("")),
-        ];
-        for source in [non_http, enriched, opaque] {
-            assert_eq!(
-                CacheRefreshHelper::periodic_source_filters(source.as_ref(), &filters),
-                filters
-            );
         }
     }
 

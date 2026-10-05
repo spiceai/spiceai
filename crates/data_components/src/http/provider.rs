@@ -2090,20 +2090,17 @@ pub struct HttpExec {
     /// ever sees it.
     metrics: ExecutionPlanMetricsSet,
     completion: Option<HttpFetchCompletion>,
-    logical_request_identity: bool,
 }
 
 impl HttpExec {
     /// Clone a cache-owned source execution with a fresh completion token.
-    /// Every page carries the original partition's request identity; outgoing
-    /// requests and response data are unchanged. Execute each partition once;
-    /// reuse invalidates this execution's token.
+    /// Execute each partition once; reuse invalidates this execution's token.
+    /// Request and response metadata are unchanged.
     #[must_use]
     pub fn for_cache_fetch(&self) -> (Self, HttpFetchCompletion) {
         let completion = HttpFetchCompletion::new(self.partitions.len());
         let mut plan = self.clone();
         plan.completion = Some(completion.clone());
-        plan.logical_request_identity = true;
         plan.metrics = ExecutionPlanMetricsSet::new();
         (plan, completion)
     }
@@ -2160,7 +2157,6 @@ impl HttpExec {
             deferred_partitions: false,
             metrics: ExecutionPlanMetricsSet::new(),
             completion: None,
-            logical_request_identity: false,
         }
     }
 
@@ -2247,7 +2243,6 @@ impl HttpExec {
             self.limit,
         );
         expanded.metrics = self.metrics.clone();
-        expanded.logical_request_identity = self.logical_request_identity;
         Ok(expanded)
     }
 
@@ -2390,7 +2385,8 @@ impl HttpExec {
 
         // Store the actual values from the partition for the primary key
         let path_for_batch = path.unwrap_or("");
-        let (query_for_batch, body_for_batch) = self.request_metadata(query, body);
+        let query_for_batch = query.unwrap_or("");
+        let body_for_batch = body.unwrap_or("");
         let headers_for_batch = request_headers.unwrap_or("");
 
         tracing::debug!(
@@ -2430,20 +2426,6 @@ impl HttpExec {
         Ok(batch)
     }
 
-    fn request_metadata<'a>(
-        &self,
-        query: Option<&'a str>,
-        body: Option<&'a str>,
-    ) -> (Option<&'a str>, Option<&'a str>) {
-        if self.logical_request_identity {
-            // NULL denotes no override: the URL retains its configured query,
-            // and no request body uses GET rather than an empty POST.
-            (query, body)
-        } else {
-            (Some(query.unwrap_or("")), Some(body.unwrap_or("")))
-        }
-    }
-
     /// Build a single Arrow array for one of the HTTP connector's
     /// built-in metadata columns. Used by both the default scan path
     /// and the JSON-decomposition path so that metadata columns behave
@@ -2452,8 +2434,8 @@ impl HttpExec {
     fn build_metadata_array(
         name: &str,
         path_for_batch: &str,
-        query_for_batch: Option<&str>,
-        body_for_batch: Option<&str>,
+        query_for_batch: &str,
+        body_for_batch: &str,
         headers_for_batch: &str,
         content_rows: &[String],
         fetch_result: &HttpFetchResult,
@@ -2584,7 +2566,8 @@ impl HttpExec {
         // cheap enough to always derive, and only used when at least
         // one metadata column is projected.
         let path_for_batch = path.unwrap_or("");
-        let (query_for_batch, body_for_batch) = self.request_metadata(query, body);
+        let query_for_batch = query.unwrap_or("");
+        let body_for_batch = body.unwrap_or("");
         let headers_for_batch = request_headers.unwrap_or("");
         let timestamp_nanos = Self::compute_fetched_at_nanos(fetch_result)?;
 
@@ -3121,17 +3104,9 @@ impl ExecutionPlan for HttpExec {
                         }
 
                         let num_rows = content_rows.len();
-                        let (response_path, response_query) = if exec.logical_request_identity {
-                            (state.path.as_deref(), state.query.as_deref())
-                        } else {
-                            (
-                                state.last_page_path.as_deref(),
-                                state.last_page_query.as_deref(),
-                            )
-                        };
                         let batch = exec.create_batch_from_rows(
-                            response_path,
-                            response_query,
+                            state.last_page_path.as_deref(),
+                            state.last_page_query.as_deref(),
                             state.body.as_deref(),
                             state.request_headers.as_deref(),
                             &content_rows,
@@ -9712,7 +9687,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_metadata_preserves_null_and_empty_without_changing_plain_http() {
+    fn cache_fetch_metadata_matches_plain_http() {
         let plain = make_exec(vec![(None, None, None, None)], None);
         let (cached, completion) = plain.for_cache_fetch();
         let rows = vec!["same".to_string(), "same".to_string()];
@@ -9723,11 +9698,11 @@ mod tests {
                     .expect("cache metadata batch");
                 assert_eq!(
                     string_col(&batch, "request_query"),
-                    vec![query.map(str::to_string); 2]
+                    vec![Some(query.unwrap_or("").to_string()); 2]
                 );
                 assert_eq!(
                     string_col(&batch, "request_body"),
-                    vec![body.map(str::to_string); 2]
+                    vec![Some(body.unwrap_or("").to_string()); 2]
                 );
                 assert_eq!(
                     string_col(&batch, "content"),
@@ -9754,7 +9729,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_identity_preserves_base_query_and_empty_override_behavior() {
+    fn cache_fetch_preserves_base_query_and_empty_override_behavior() {
         let mut provider = base_provider();
         provider.base_url.set_query(Some("base=one"));
         let exec = HttpExec::new(
@@ -9780,16 +9755,11 @@ mod tests {
                 .query(),
             Some("")
         );
-        assert_eq!(cached.request_metadata(None, None), (None, None));
-        assert_eq!(
-            cached.request_metadata(Some(""), Some("")),
-            (Some(""), Some(""))
-        );
         assert_eq!(cached.partitions, exec.partitions);
     }
 
     #[test]
-    fn cache_nested_metadata_preserves_absent_overrides() {
+    fn cache_fetch_nested_metadata_matches_plain_http() {
         let metadata = ["request_query".to_string(), "request_body".to_string()]
             .into_iter()
             .collect::<HashSet<_>>();
@@ -9824,8 +9794,14 @@ mod tests {
                 &empty_fetch_result(),
             )
             .expect("nested cache metadata");
-        assert_eq!(string_col(&batch, "request_query"), vec![None]);
-        assert_eq!(string_col(&batch, "request_body"), vec![None]);
+        assert_eq!(
+            string_col(&batch, "request_query"),
+            vec![Some(String::new())]
+        );
+        assert_eq!(
+            string_col(&batch, "request_body"),
+            vec![Some(String::new())]
+        );
     }
 
     #[test]

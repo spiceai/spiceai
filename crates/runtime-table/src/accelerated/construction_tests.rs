@@ -73,10 +73,7 @@ async fn cancelled_child_construction_does_not_retain_a_fanout_target() {
                     drop(build);
                     let child = result.expect("child construction");
                     assert_eq!(registry.read().await.len(), 1);
-                    child
-                        .drain_changes(Duration::from_secs(2))
-                        .await
-                        .expect("child drain");
+                    child.drain_changes().await.expect("child drain");
                     drop(child);
                     completed += 1;
                 }
@@ -98,10 +95,7 @@ async fn cancelled_child_construction_does_not_retain_a_fanout_target() {
         }
         assert!(completed > 0);
         assert!(cancelled > 0);
-        parent
-            .drain_changes(Duration::from_secs(2))
-            .await
-            .expect("parent drain");
+        parent.drain_changes().await.expect("parent drain");
     })
     .await
     .expect("bounded construction cancellation coverage");
@@ -132,10 +126,7 @@ async fn prepared_child_is_not_published_after_parent_closes() {
         assert!(prepared.publish().is_err());
         assert!(parent.synchronized_children().read().await.is_empty());
         drain.wait().await.expect("parent drain");
-        child
-            .drain_changes(Duration::from_secs(2))
-            .await
-            .expect("child drain");
+        child.drain_changes().await.expect("child drain");
     })
     .await
     .expect("closed parent must not retain child initialization");

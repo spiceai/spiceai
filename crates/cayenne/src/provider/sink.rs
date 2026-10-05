@@ -255,6 +255,22 @@ impl DataSink for CayenneDataSink {
             return Ok(rows);
         }
 
+        if self.overwrite == InsertOp::Append
+            && self.table.is_cdc_memory_mode()
+            && super::write_recovery::RebuildableWrite::permits(&self.table, context)
+        {
+            // Keep composed-provider effects while using the shared mutation,
+            // memory-budget, checkpoint and publication machinery.
+            return self
+                .table
+                .write_cdc_append_stream(normalized, context)
+                .await
+                .map_err(datafusion_common::DataFusionError::from)?
+                .finish()
+                .await
+                .map_err(Into::into);
+        }
+
         if self.overwrite == InsertOp::Overwrite {
             // Overwrite path: `CayenneTableProvider::begin_overwrite` acquires the
             // table write lock internally and the lock is held inside the

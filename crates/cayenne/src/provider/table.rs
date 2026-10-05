@@ -38232,11 +38232,8 @@ impl CayenneTableProvider {
         if self.background_mem_tier_checkpointer.get().is_some() {
             return false;
         }
-        // Gate on memory mode so file-mode and partitioned tables spawn nothing.
-        // The runtime arms the slot advancer lazily on the first replayable
-        // burst, so we do NOT gate on `has_slot_advancer()` here (it would be
-        // false at spawn time and the table would never get a checkpointer);
-        // `run_mem_tier_checkpoint_tick` re-checks the advancer each tick.
+        // Replayable and rebuildable writes share this checkpointer. Admission
+        // checks the recovery contract; the tick drains any eligible RAM work.
         if !self.is_cdc_memory_mode() {
             return false;
         }
@@ -38346,13 +38343,14 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
                 telemetry::KeyValue::new("outcome", outcome),
             ]);
         };
-        // Only memory-mode tables that the runtime has armed have a deferred
-        // slot ack to advance; everything else has nothing to flush here.
+        // File-backed RAM data must drain even without a source callback when
+        // an execution explicitly permits rebuilding it after loss.
         if !self.is_cdc_memory_mode() {
             emit_tick("not_memory_mode");
             return;
         }
-        if !self.has_slot_advancer() {
+        if !self.has_slot_advancer() && (self.is_memory_resident_mode() || self.mem_tier.is_empty())
+        {
             emit_tick("no_advancer");
             return;
         }
@@ -45183,11 +45181,7 @@ mod tests {
         );
     }
 
-    /// A1 guard — the periodic tick must NOT fire when the table is memory-mode
-    /// but UNARMED (no slot advancer). An unarmed provider takes the durable
-    /// write path, so it must never have a RAM tier to flush; a tick on it is a
-    /// pure no-op (defensive: the tick re-checks `has_slot_advancer()` so a
-    /// checkpointer spawned at table-open — before the runtime arms — is inert).
+    /// An empty tier without a source callback has no checkpoint work.
     #[tokio::test]
     async fn mem_tier_periodic_tick_is_noop_when_unarmed() {
         let runtime_env = SessionContext::new().runtime_env();
