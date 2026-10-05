@@ -24,12 +24,17 @@ use datafusion::logical_expr::Expr;
 
 use super::cdc::select_rows;
 
+#[must_use]
 pub fn missing_primary_keys(dataset_name: &str) -> DataFusionError {
     DataFusionError::Execution(format!(
         "Cannot delete rows from dataset '{dataset_name}' without primary keys"
     ))
 }
 
+/// Build a delete predicate for the selected rows' primary keys.
+///
+/// # Errors
+/// Returns an error if primary keys are missing or a key predicate cannot be built.
 pub fn build_batch_delete_expr_from_change_batch(
     change_batch: &ChangeBatch,
     row_indices: &[usize],
@@ -70,6 +75,9 @@ pub fn build_batch_delete_expr_from_change_batch(
 }
 
 /// Project only the keys required by `Index::delete_by_keys`.
+///
+/// # Errors
+/// Returns an error if a key column is missing or Arrow projection or row selection fails.
 pub fn build_pk_only_batch_from_change_batch(
     change_batch: &ChangeBatch,
     row_indices: &[usize],

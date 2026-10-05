@@ -79,7 +79,8 @@ impl InsertPlanCache {
         let streaming_plan = Arc::new(StreamingDataUpdateExecutionPlan::new_empty(Arc::clone(
             &target_schema,
         )));
-        let input: Arc<dyn ExecutionPlan> = streaming_plan.clone();
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::<StreamingDataUpdateExecutionPlan>::clone(&streaming_plan);
         let cast = Arc::new(SchemaCastScanExec::new(input, Arc::clone(&target_schema)));
         let insert_plan = table.insert_into(state, cast, InsertOp::Append).await?;
         Ok(Self {
@@ -145,6 +146,10 @@ impl ProviderChangeSinkBackend {
     /// Execute one finite append or ordered replacement through the composed
     /// provider. All batches are cast and the append is planned before deletion.
     /// The caller must establish that this provider supports ordered replacement.
+    ///
+    /// # Errors
+    /// Returns validation, planning, execution, or index-maintenance failures.
+    /// A failure after mutation starts does not roll back prior changes.
     pub async fn apply_rows(
         &self,
         schema: SchemaRef,
@@ -366,6 +371,9 @@ impl ProviderChangeSinkBackend {
 
     /// Execute a delete while the caller holds the shared write lock. Provider
     /// index wrappers handle accelerator-side index deletion.
+    ///
+    /// # Errors
+    /// Returns an error if the provider cannot plan or execute the delete.
     pub async fn delete_filter(&self, filter: Expr, ctx: &SessionContext) -> Result<()> {
         let plan = self
             .context
@@ -376,6 +384,10 @@ impl ProviderChangeSinkBackend {
         Ok(())
     }
 
+    /// Delete all rows and maintain indexes under the shared write lock.
+    ///
+    /// # Errors
+    /// Returns an error if deletion or index maintenance fails.
     pub async fn truncate(&self, ctx: &SessionContext) -> Result<()> {
         let _guard = self.context.write_lock.lock().await;
         // Some engines intentionally treat an empty filter list as a no-op.
@@ -467,6 +479,7 @@ impl ChangeSinkBackend for ProviderChangeSinkBackend {
     }
 }
 
+#[must_use]
 pub fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
     format!(
         "widening schema change detected on the CDC stream for '{dataset}' ({change}), \
@@ -495,6 +508,10 @@ pub fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
     )
 }
 
+/// Check operation codes before applying any group.
+///
+/// # Errors
+/// Returns a pre-mutation refusal if any group has an unknown operation.
 pub fn reject_unknown_operations(groups: &[(ChangeOperationType, Vec<usize>)]) -> Result<()> {
     if groups
         .iter()
@@ -509,6 +526,10 @@ pub fn reject_unknown_operations(groups: &[(ChangeOperationType, Vec<usize>)]) -
 
 /// Native deletes bypass accelerator index wrappers; provider deletes do not.
 /// Both must also maintain source-side external indexes.
+///
+/// # Errors
+/// Returns an error if primary-key projection fails. Individual index deletion
+/// failures are logged and do not stop maintenance of the remaining indexes.
 pub async fn delete_index_keys(
     context: &ChangeSinkContext,
     batch: &CdcBatch,
@@ -544,6 +565,11 @@ pub async fn delete_index_keys(
     Ok(())
 }
 
+/// Delete matching rows from writable Arrow tables, including partition children.
+/// Returns `None` when no supported Arrow table is exposed by the write layers.
+///
+/// # Errors
+/// Returns an error if a supported table cannot delete the supplied rows.
 pub async fn delete_matching_rows_from_arrow_provider(
     provider: &Arc<dyn TableProvider>,
     rows: &RecordBatch,
@@ -572,6 +598,10 @@ pub async fn delete_matching_rows_from_arrow_provider(
     Ok(None)
 }
 
+/// Maintain indexes on the provider and its partition children.
+///
+/// # Errors
+/// Returns an error if index maintenance fails for any visited provider.
 pub async fn perform_change_write_maintenance(provider: &Arc<dyn TableProvider>) -> Result<()> {
     if let Some(table) = provider.downcast_ref::<SpiceTable>() {
         return Box::pin(perform_change_write_maintenance(table.below())).await;

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::collections::VecDeque;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,9 @@ impl Publication {
     }
 
     /// Wait for publication without taking ownership of the write.
+    ///
+    /// # Errors
+    /// Returns the publication failure, or an error if the owner stops without a result.
     pub async fn wait(&self) -> Result<()> {
         let Self::Pending(receiver) = self else {
             return Ok(());
@@ -77,6 +81,10 @@ pub struct WriteReceipt {
 }
 
 impl WriteReceipt {
+    /// Observe query-visible completion of this write.
+    ///
+    /// # Errors
+    /// Returns the publication failure, or an error if the owner stops without a result.
     pub async fn published(&self) -> Result<()> {
         self.publication.wait().await
     }
@@ -91,14 +99,16 @@ pub struct Submission {
 impl Submission {
     /// Cancellation-safe: losing a select race retains the receipt. Repeated
     /// waits return the same milestones; dropping this observer cancels no work.
+    ///
+    /// # Errors
+    /// Returns the write failure, or an error if the owner stops without a receipt.
     pub async fn wait(&mut self) -> Result<WriteReceipt> {
         if self.outcome.is_none() {
             let result = (&mut self.result).await.unwrap_or_else(|_| Err(stopped()));
             self.outcome = Some(result.map_err(Arc::new));
         }
         self.outcome
-            .as_ref()
-            .cloned()
+            .clone()
             .ok_or_else(stopped)?
             .map_err(DataFusionError::Shared)
     }
@@ -178,6 +188,10 @@ pub struct ChangePermit {
 }
 
 impl ChangePermit {
+    /// Transfer the input into the reserved queue capacity.
+    ///
+    /// # Errors
+    /// Returns an error if admission closed after the capacity was reserved.
     pub fn submit(self, batch: ChangeBatch, options: WriteOptions) -> Result<Submission> {
         let (result, receiver) = oneshot::channel();
         self.send(
@@ -278,6 +292,9 @@ impl ChangeSink {
 
     /// Await capacity without taking ownership of input. A cancelled wait
     /// transfers no work. Close can still refuse the synchronous submit.
+    ///
+    /// # Errors
+    /// Returns an error if admission is closed or the owner stops.
     pub async fn reserve(&self) -> Result<ChangePermit> {
         if self.inner.closing.lock().is_some() {
             return Err(stopped());
@@ -309,12 +326,18 @@ impl ChangeSink {
 
     /// Transfer ownership and observe application. Dropping this future after
     /// admission does not cancel execution or finalization.
+    ///
+    /// # Errors
+    /// Returns an error if admission closes, the owner stops, or applying the input fails.
     pub async fn submit(&self, batch: ChangeBatch, options: WriteOptions) -> Result<WriteReceipt> {
         self.reserve().await?.submit(batch, options)?.wait().await
     }
 
     /// The owner invokes the callback after publication or failure, even if the
     /// submitting task ends. A pre-admission refusal drops the callback.
+    ///
+    /// # Errors
+    /// Returns an error if admission is closed or the owner stops before admission.
     pub async fn enqueue(
         &self,
         batch: ChangeBatch,
@@ -332,12 +355,19 @@ impl ChangeSink {
     }
 
     /// Establish durability only to the extent promised by the bound backend.
+    ///
+    /// # Errors
+    /// Returns an error if admission closes, the owner stops, or pending writes or flushing fail.
     pub async fn flush(&self) -> Result<()> {
         let (reply, result) = oneshot::channel();
         self.admit(Command::Flush(reply)).await?;
         result.await.map_err(|_| stopped())?
     }
 
+    /// Apply a schema evolution after preceding writes have settled.
+    ///
+    /// # Errors
+    /// Returns an error if admission closes, the owner stops, or pending writes or evolution fail.
     pub async fn evolve_schema(&self, plan: &WideningPlan) -> Result<()> {
         let (reply, result) = oneshot::channel();
         self.admit(Command::Evolve {
@@ -350,6 +380,7 @@ impl ChangeSink {
 
     /// Fence admission and start an owner-controlled drain. It continues even
     /// if every caller stops waiting. Repeated calls observe the same drain.
+    #[must_use]
     pub fn begin_close(&self) -> Publication {
         let mut closing = self.inner.closing.lock();
         if let Some(publication) = &*closing {
@@ -372,6 +403,9 @@ impl ChangeSink {
 
     /// A timeout does not abort accepted work or authorize another generation
     /// to publish to the same target. The caller must keep the target fenced.
+    ///
+    /// # Errors
+    /// Returns an error if the drain times out, the owner stops, or accepted writes or flushing fail.
     pub async fn close(&self, timeout: Duration) -> Result<()> {
         let publication = self.begin_close();
         tokio::time::timeout(timeout, publication.wait())
@@ -581,8 +615,8 @@ impl Owner {
                             > limits.max_bytes.max(1)
                     });
                     match burst.push(batch, options) {
-                        Ok(()) => replies.push_back(reply),
-                        Err(batch) => {
+                        ControlFlow::Continue(()) => replies.push_back(reply),
+                        ControlFlow::Break(batch) => {
                             self.carried = Some(Command::Apply(ApplyCommand {
                                 batch,
                                 options,
@@ -712,21 +746,20 @@ impl Owner {
                 SchemaDecision::Proceed => None,
             })
         {
-            let error = match self.settle().await {
-                Err(error) => error,
-                Ok(()) => {
-                    let error = self
-                        .backend
-                        .evolve_schema(plan)
-                        .await
-                        .err()
-                        .unwrap_or_else(|| {
-                            DataFusionError::Internal(
-                                "A non-live CDC backend accepted schema evolution".into(),
-                            )
-                        });
-                    self.fail(error)
-                }
+            let error = if let Err(error) = self.settle().await {
+                error
+            } else {
+                let error = self
+                    .backend
+                    .evolve_schema(plan)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| {
+                        DataFusionError::Internal(
+                            "A non-live CDC backend accepted schema evolution".into(),
+                        )
+                    });
+                self.fail(error)
             };
             for reply in replies {
                 reply.refuse(&error);

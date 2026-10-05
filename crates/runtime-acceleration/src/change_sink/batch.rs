@@ -22,7 +22,7 @@ use arrow::{
     datatypes::{DataType, SchemaRef},
 };
 use data_components::cdc;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::sync::Arc;
 
 use super::batching::{AppendIngress, CdcIngress};
@@ -105,6 +105,9 @@ impl CdcRows {
 
     /// Backends receive only materialized rows. Deferred decoding belongs to
     /// the owner and must complete for the entire burst before mutation.
+    ///
+    /// # Errors
+    /// Returns an error if the rows are unmaterialized or cannot form a CDC batch.
     pub fn into_built(self) -> Result<cdc::ChangeBatch> {
         if !self.rows.is_materialized() {
             return Err(DataFusionError::Internal(
@@ -139,6 +142,9 @@ impl ChangeBatch {
     }
 
     /// Append flat rows without imposing uniqueness on any grouping columns.
+    ///
+    /// # Errors
+    /// Returns an error if any batch differs from the supplied schema, including metadata.
     pub fn append(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result<Self> {
         for batch in &batches {
             validate_schema(&schema, &batch.schema())?;
@@ -157,6 +163,9 @@ impl ChangeBatch {
     /// Append a proven-fresh logical scope without deleting existing rows.
     /// Backends must reject conflicting physical keys outside each scope,
     /// including conflicts between scopes combined into the same append.
+    ///
+    /// # Errors
+    /// Returns an error if schemas differ or any row falls outside the scope.
     pub fn append_scoped(
         scope: SetKey,
         schema: SchemaRef,
@@ -188,6 +197,9 @@ impl ChangeBatch {
     /// source completeness, including pagination and limits; a finite vector does not
     /// prove completeness. Readers may observe the deletion gap, and an append failure
     /// after deletion may leave the previous rows lost.
+    ///
+    /// # Errors
+    /// Returns an error if schemas differ or any row falls outside the scope.
     pub fn replace_set(
         scope: SetKey,
         schema: SchemaRef,
@@ -210,6 +222,9 @@ impl ChangeBatch {
 
     /// Opt an append into this producer lane's bounded owner batching. Clones
     /// of one writer must retain the same ingress identity.
+    ///
+    /// # Errors
+    /// Returns an error for CDC input or a replacement rather than an append.
     pub fn with_append_ingress(mut self, ingress: Arc<AppendIngress>) -> Result<Self> {
         if self.replace_set.is_some() || !matches!(self.payload, ChangePayload::Rows { .. }) {
             return Err(DataFusionError::Plan(
@@ -252,9 +267,10 @@ impl ChangeBatch {
 
     /// Extend only compatible appends. Each validation range keeps its input
     /// identity; rows are neither concatenated nor deduplicated here.
-    pub(crate) fn merge_append(&mut self, other: Self) -> std::result::Result<(), Self> {
+    /// Returns `Break` with the unchanged input at a compatibility boundary.
+    pub(crate) fn merge_append(&mut self, other: Self) -> ControlFlow<Self> {
         if !self.can_merge_append(&other) {
-            return Err(other);
+            return ControlFlow::Break(other);
         }
         if let (
             ChangePayload::Rows {
@@ -281,7 +297,7 @@ impl ChangeBatch {
                 validation
             }));
         }
-        Ok(())
+        ControlFlow::Continue(())
     }
 
     #[must_use]
@@ -399,6 +415,10 @@ impl SetKey {
     /// have the column's type; string layout conversions are lossless and allowed.
     /// General predicates, NULL equality, conflicting values, and an unconstrained
     /// scope are rejected. Repeated equivalent constraints identify one component.
+    ///
+    /// # Errors
+    /// Returns an error for an empty or unsupported scope, unresolved columns,
+    /// incompatible literals, conflicting constraints, or unsupported comparisons.
     pub fn from_filters(schema: SchemaRef, filters: &[Expr]) -> Result<Self> {
         let mut values: Vec<(usize, ScalarValue)> = Vec::new();
         let mut pending: Vec<_> = filters.iter().collect();
@@ -496,6 +516,9 @@ impl SetKey {
 
     /// Validate every row with Arrow's null-aware, vectorized equality kernel.
     /// Duplicate rows remain valid; this scope does not imply uniqueness.
+    ///
+    /// # Errors
+    /// Returns an error if schemas differ, a comparison fails, or a row is outside the scope.
     pub fn validate_batch(&self, batch: &RecordBatch) -> Result<()> {
         validate_schema(&self.schema, &batch.schema())?;
         for (index, value) in &self.values {

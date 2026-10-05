@@ -27,6 +27,7 @@ pub struct BeforeMutation {
 
 /// Mark a refusal only when this submission has not changed storage or indexes.
 /// Planning a provider write is not proof: some wrappers mutate while planning.
+#[must_use]
 pub fn before_mutation(source: DataFusionError) -> DataFusionError {
     DataFusionError::External(Box::new(BeforeMutation { source }))
 }

@@ -37,6 +37,7 @@ pub struct CdcMetrics {
 }
 
 impl CdcMetrics {
+    #[must_use]
     pub fn new(dataset: &TableReference) -> Self {
         let name: Arc<str> = Arc::from(dataset.to_string());
         Self {
@@ -73,6 +74,11 @@ impl CdcMetrics {
     }
 }
 
+/// Select rows without changing their order or values.
+///
+/// # Errors
+/// Returns an error if a take index exceeds `UInt32`, Arrow selection fails,
+/// or the selected columns cannot form a record batch.
 pub fn select_rows(data_batch: &RecordBatch, row_indices: &[usize]) -> Result<RecordBatch> {
     if let Some((offset, length)) = contiguous_row_span(row_indices) {
         return Ok(data_batch.slice(offset, length));
@@ -99,6 +105,7 @@ pub fn select_rows(data_batch: &RecordBatch, row_indices: &[usize]) -> Result<Re
     Ok(RecordBatch::try_new(data_batch.schema(), selected_columns)?)
 }
 
+#[must_use]
 pub fn contiguous_row_span(row_indices: &[usize]) -> Option<(usize, usize)> {
     let first = *row_indices.first()?;
     if row_indices
@@ -325,6 +332,7 @@ pub fn group_into_sub_batches(
     out
 }
 
+#[must_use]
 pub fn encode_primary_key(
     data_batch: &RecordBatch,
     pk_col_indices: &[usize],
@@ -491,6 +499,7 @@ pub enum ChangeOperationType {
 }
 
 impl ChangeOperationType {
+    #[must_use]
     pub fn from_operation(op: &ChangeOperation) -> Self {
         match op {
             ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => {

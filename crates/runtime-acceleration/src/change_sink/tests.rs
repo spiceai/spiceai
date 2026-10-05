@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -36,7 +37,11 @@ use datafusion::sql::TableReference;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore, oneshot};
 
+use super::batching::{
+    AppendBurst, AppendIngress, CdcBurst, CdcIngress, CoalescingBurst, CoalescingLimits,
+};
 use super::provider::{ProviderChangeSinkBackend, refusal::is_before_mutation};
+use super::source_policy::{CdcPolicy, SchemaDecision};
 use super::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangeSink, ChangeSinkBackend,
     ChangeSinkContext, DurabilityObserver, ReplacementSupport, SchemaEvolutionSupport, SetKey,
@@ -78,9 +83,10 @@ async fn validate_scopes(columns: Vec<usize>, inputs: Vec<(Expr, RecordBatch)>) 
         let scope = SetKey::from_filters(Arc::clone(&schema), &[filter])?;
         let input = ChangeBatch::append_scoped(scope, Arc::clone(&schema), vec![batch])?;
         if let Some(merged) = &mut merged {
-            merged
-                .merge_append(input)
-                .expect("scoped appends must merge");
+            assert!(
+                merged.merge_append(input).is_continue(),
+                "scoped appends must merge"
+            );
         } else {
             merged = Some(input);
         }
@@ -93,6 +99,133 @@ async fn validate_scopes(columns: Vec<usize>, inputs: Vec<(Expr, RecordBatch)>) 
         )
         .await
         .map(|_| ())
+}
+
+#[test]
+fn append_merge_preserves_unconsumed_replacement() {
+    let schema = scope_schema();
+    let mut first = ChangeBatch::append(
+        Arc::clone(&schema),
+        vec![scope_row(&schema, "A", "west", 1)],
+    )
+    .expect("first append");
+    let row = scope_row(&schema, "B", "east", 2);
+    let scope = SetKey::from_filters(Arc::clone(&schema), &[col("tenant").eq(lit("B"))])
+        .expect("replacement scope");
+    let replacement =
+        ChangeBatch::replace_set(scope.clone(), schema, vec![row.clone()]).expect("replacement");
+    let ControlFlow::Break(returned) = first.merge_append(replacement) else {
+        panic!("replacement must remain separate from the append");
+    };
+    assert_eq!(first.num_rows(), 1);
+    assert_eq!(
+        returned
+            .replacement_scope()
+            .expect("scope retained")
+            .filters(),
+        scope.filters()
+    );
+    let super::ChangePayload::Rows { batches, .. } = returned.payload() else {
+        panic!("replacement rows retained");
+    };
+    assert_eq!(batches, &[row]);
+}
+
+fn two_input_limits() -> CoalescingLimits {
+    CoalescingLimits {
+        max_inputs: 2,
+        max_bytes: usize::MAX,
+        max_age: Duration::ZERO,
+    }
+}
+
+#[test]
+fn append_burst_returns_unconsumed_input_at_capacity() {
+    let schema = scope_schema();
+    let ingress = Arc::new(AppendIngress::new(
+        &TableReference::bare("append"),
+        two_input_limits(),
+    ));
+    let input = |id| {
+        ChangeBatch::append(
+            Arc::clone(&schema),
+            vec![scope_row(&schema, "A", "west", id)],
+        )
+        .expect("append")
+        .with_append_ingress(Arc::clone(&ingress))
+        .expect("append lane")
+    };
+    let mut burst = AppendBurst::new(input(1), WriteOptions::default()).expect("burst");
+    assert!(burst.push(input(2), WriteOptions::default()).is_continue());
+    let ControlFlow::Break(returned) = burst.push(input(3), WriteOptions::default()) else {
+        panic!("third input must remain outside the full burst");
+    };
+    assert_eq!(burst.len(), 2);
+    assert!(Arc::ptr_eq(
+        returned.append_ingress().expect("lane retained"),
+        &ingress
+    ));
+    let super::ChangePayload::Rows { batches, .. } = returned.payload() else {
+        panic!("append rows retained");
+    };
+    assert_eq!(batches, &[scope_row(&schema, "A", "west", 3)]);
+    let (accepted, _) = burst.finish();
+    assert_eq!(accepted.num_rows(), 2);
+}
+
+struct UnchangedSchema;
+
+impl CdcPolicy for UnchangedSchema {
+    fn classify(
+        &self,
+        _incoming: &SchemaRef,
+        _target: &SchemaRef,
+        _capabilities: ChangeCapabilities,
+    ) -> Result<SchemaDecision> {
+        Ok(SchemaDecision::Proceed)
+    }
+
+    fn applied(&self, _plan: &WideningPlan) {}
+
+    fn split_on_schema_change(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn cdc_burst_returns_unconsumed_input_at_capacity() {
+    let ingress = Arc::new(CdcIngress::new(
+        &TableReference::bare("cdc"),
+        Arc::new(UnchangedSchema),
+        two_input_limits(),
+    ));
+    let input = |values| {
+        let (_, rows) = zero_changes(Arc::new(Int64Array::from(values)));
+        ChangeBatch::cdc_rows(
+            data_components::cdc::LazyChangeBatch::ready(rows),
+            Arc::clone(&ingress),
+        )
+    };
+    let mut burst = CdcBurst::new(input(vec![1, 2]), WriteOptions::default()).expect("CDC burst");
+    assert!(
+        burst
+            .push(input(vec![3, 4]), WriteOptions::default())
+            .is_continue()
+    );
+    let next = input(vec![5, 6]);
+    let record = next.cdc_batch().expect("materialized CDC").record.clone();
+    let ControlFlow::Break(returned) = burst.push(next, WriteOptions::default()) else {
+        panic!("third input must remain outside the full burst");
+    };
+    assert_eq!(burst.len(), 2);
+    assert_eq!(returned.cdc_batch().expect("CDC retained").record, record);
+    let super::ChangePayload::Cdc(rows) = returned.payload() else {
+        panic!("CDC payload retained");
+    };
+    assert!(Arc::ptr_eq(
+        rows.ingress().expect("lane retained"),
+        &ingress
+    ));
 }
 
 #[tokio::test]
