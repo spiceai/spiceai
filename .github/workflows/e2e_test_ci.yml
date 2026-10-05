@@ -50,7 +50,7 @@ on:
 concurrency:
   # A newer run cancels the one in progress for the same pull request, merge group, non-trunk
   # branch or manually dispatched trunk commit. Trunk pushes share one group and never cancel
-  # the running build on `spiceai-macos`: a newer push replaces only the run still waiting.
+  # the running build on `spiceai-macos-large`: a newer push replaces only the run still waiting.
   # The trunk commit is the merge-group commit that already passed this workflow;
   # the jobs that run only on push cover the first and latest commit of a burst of merges.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ (github.ref_name == 'trunk' && github.event_name != 'push') && github.sha || 'any-sha' }}
@@ -103,7 +103,6 @@ jobs:
         id: setup-matrix
         with:
           script: |
-            const isTrunkPush = context.eventName === 'push' && context.ref === 'refs/heads/trunk';
             const matrix = [
               {
                 name: "Linux x64",
@@ -113,7 +112,11 @@ jobs:
                 target_arch: "x86_64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                builder: isTrunkPush ? "spiceai-macos" : "spiceai-macos-large",
+                // `spiceai-macos-large` on every event, trunk pushes included. A three-hour
+                // build on a `spiceai-macos` mini runs past its 180-minute step bound where
+                // the host is shared (#14557), and starves the short macOS test jobs below
+                // that sit on that pool to avoid exactly this neighbour (#13761).
+                builder: "spiceai-macos-large",
                 runner: "macos-15",
                 target_os: "darwin",
                 target_arch: "aarch64"

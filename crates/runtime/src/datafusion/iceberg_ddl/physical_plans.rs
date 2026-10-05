@@ -126,6 +126,12 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         Arc::new(tokio::sync::RwLock::new(crate::secrets::Secrets::new()))
     }
 
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        None
+    }
+
     fn acceleration(&self) -> Option<&RuntimeAcceleration> {
         Some(&self.acceleration)
     }

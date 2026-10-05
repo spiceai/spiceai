@@ -26,7 +26,6 @@ pub mod arrow;
 pub mod partitioned_arrow;
 
 pub mod spice_sys;
-pub use data_accelerator_api::snapshots::CayenneSnapshotValidationError;
 pub(crate) use data_accelerator_api::snapshots::validate_snapshot_paths;
 
 // The accelerator contract lives in `data-accelerator-api`; re-exported so

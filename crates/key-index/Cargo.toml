@@ -17,8 +17,8 @@ hash-index = { path = "../hash-index" }
 parking_lot.workspace = true
 snafu.workspace = true
 # The Verus specification of the key encoding (`escape_proof`); erased by a
-# normal build. Pinned to the Verus release CI runs.
-vstd = "=0.0.0-2026-09-20-0158"
+# normal build. The workspace pins it to the Verus release CI runs.
+vstd.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

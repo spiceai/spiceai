@@ -219,6 +219,12 @@ impl AccelerationSource for View {
         self.runtime.secrets()
     }
 
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        self.runtime.datafusion().snapshot_notifications()
+    }
+
     fn acceleration(&self) -> Option<&Acceleration> {
         self.acceleration.as_ref()
     }
