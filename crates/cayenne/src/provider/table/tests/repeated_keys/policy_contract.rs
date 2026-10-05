@@ -128,6 +128,75 @@ async fn identical_copies_collapse_for_refreshes_and_statements() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn staged_statements_apply_the_whole_input_policy() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        for (policy, dedup, drop_existing) in [
+            (upsert_on_id(), UpsertDedup::None, false),
+            (upsert_on_id(), UpsertDedup::DropIdentical, false),
+            (upsert_on_id(), UpsertDedup::KeepLast, false),
+            (drop_on_id(), UpsertDedup::None, true),
+        ] {
+            for different in [false, true] {
+                let label =
+                    format!("{mode:?}/{dedup:?}/drop={drop_existing}/different={different}");
+                let (mut provider, catalog, runtime_env, _dir) =
+                    upsert_table(mode, policy.clone()).await;
+                provider.upsert_dedup = dedup;
+                let prior = (owned(&[(1, "old"), (9, "old")]), 2);
+                write(
+                    &provider,
+                    InsertOp::Append,
+                    vec![batch(&[(1, "old"), (9, "old")])],
+                )
+                .await
+                .expect("seed");
+                let token = provider.transaction_write_token().await;
+                let latest = if different { "b" } else { "a" };
+                let batches = vec![
+                    batch(&[(1, "a"), (1, "a"), (2, "b"), (3, "a")]),
+                    batch(&[(1, latest), (3, latest)]),
+                ];
+                let stream = Box::pin(RecordBatchStreamAdapter::new(
+                    schema(),
+                    futures::stream::iter(batches.into_iter().map(Ok)),
+                ));
+                let staged = provider.begin_staged_upsert_occ(token, stream, 4).await;
+                assert_eq!(
+                    visible(&provider).await,
+                    prior,
+                    "{label}: staging is private"
+                );
+                let expected = if different && !drop_existing && dedup != UpsertDedup::KeepLast {
+                    let error =
+                        staged.expect_err("strict staged upsert rejects different versions");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("different versions of 2 values of 'id'"),
+                        "{label}: {error}"
+                    );
+                    prior
+                } else {
+                    staged
+                        .expect("stage")
+                        .commit(std::collections::HashSet::new(), true)
+                        .await
+                        .expect("commit");
+                    if drop_existing {
+                        (owned(&[(1, "old"), (2, "b"), (3, "a"), (9, "old")]), 4)
+                    } else {
+                        (owned(&[(1, latest), (2, "b"), (3, latest), (9, "old")]), 4)
+                    }
+                };
+                assert_eq!(visible(&provider).await, expected, "{label}: live rows");
+                let reopened = reopen(&catalog, &runtime_env, dedup).await;
+                assert_eq!(visible(&reopened).await, expected, "{label}: durable rows");
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
     let mut failures = Vec::new();
     for (mode, inline_max_rows) in [

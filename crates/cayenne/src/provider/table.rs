@@ -14529,6 +14529,15 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// Private-keyset validation for a staged statement whose repeated keys are
+    /// resolved against its complete, unpublished snapshot.
+    pub(crate) async fn prepare_stream_for_insert_offlock_resolving_repeats(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> Result<PreparedInsertStream> {
+        self.prepare_stream_for_insert_inner(stream, true, true).await
+    }
+
     async fn prepare_stream_for_insert_inner(
         &self,
         stream: SendableRecordBatchStream,

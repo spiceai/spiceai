@@ -65,6 +65,10 @@ impl PreparedResolvedAppend {
     }
 
     async fn commit_inner(&mut self) -> Result<u64> {
+        if self.rows == 0 {
+            super::staged_upsert::cleanup_orphan_snapshot_dir(&self.table, &self.snapshot_id).await;
+            return Ok(0);
+        }
         let catalog = self
             .table
             .catalog()

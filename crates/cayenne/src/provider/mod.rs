@@ -72,6 +72,7 @@ limitations under the License.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
 pub(crate) mod append_commit;
+pub(crate) mod append_stage;
 pub(crate) mod clustering;
 pub(crate) mod cold_partition;
 pub(crate) mod collapse_window;

@@ -63,7 +63,6 @@ limitations under the License.
 //! after every inline insert, and trigger a checkpoint to a Vortex file when
 //! exceeded.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -81,7 +80,6 @@ use tokio::sync::OwnedMutexGuard;
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
-use super::key_conflicts::Survivor;
 use super::mem_tier_budget;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
 use super::pk_index::PkDigestSet;
@@ -296,7 +294,6 @@ fn restore_post_validation(
 
 /// A resolving streaming append once written: its rows after any fold, their
 /// statistics, and the incoming copies left for position deletes to hide.
-type StagedResolvedAppend = (u64, Arc<ColumnStatsAccumulator>, HashMap<String, Vec<u32>>);
 
 /// Which rules resolve a key a write repeats; see [`super::key_conflicts`].
 #[derive(Debug, Clone, Copy)]
@@ -1237,122 +1234,27 @@ impl<'a> AppendMutationWriter<'a> {
         resolver: super::key_conflicts::KeyResolver,
         write_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
-        let survivor = Survivor::for_policy(resolver.policy());
-        let table_schema = self.table.table_schema();
-        let indices = self.table.primary_key_indices()?.unwrap_or_default();
-        let key_columns = super::overwrite_postpass::key_column_names(&table_schema, &indices);
-        let arrival_name = super::overwrite_postpass::arrival_column(&table_schema);
-        let dedup_share = super::overwrite_postpass::DedupShare::claim();
-        let arrival = super::overwrite_postpass::ArrivalStream::new(data, resolver, &arrival_name);
-        let stamped_batches = arrival.stamped_batches();
-        let data: SendableRecordBatchStream = Box::pin(arrival);
-        // Into an empty table there is no stored key to supersede or keep, so the
-        // conflict check, and the set of every incoming key it builds, is skipped;
-        // the keys the append repeats are resolved after the write as usual.
-        let (data, post_validation) = if self.into_empty_table {
-            (data, Arc::new(ParkingMutex::new(None)))
-        } else {
-            let prepared = self
-                .table
-                .prepare_stream_for_insert_resolving_repeats(data)
-                .await?;
-            let post_validation = prepared.post_validation();
-            (prepared.stream, post_validation)
-        };
-
-        let snapshot_id = uuid::Uuid::now_v7().to_string();
         let write = super::overwrite::WriteShape {
             target_size_bytes: self.context.target_file_size_bytes(),
             target_partitions: self.task_context.session_config().target_partitions(),
             write_policy: crate::provider::delta_encoding::WritePolicy::DELTA,
         };
-        // A key-deletion table folds the superseded copies out of the files that
-        // hold them; recording each file's statistics as it is written keeps the
-        // statistics exact over the files that survive.
-        let file_stats = (!self.table.should_capture_positions()).then(|| {
-            Arc::new(super::overwrite::FileStatsObserver::new(
-                Arc::clone(&table_schema),
-                None,
-            ))
-        });
-        let write_start = Instant::now();
-        let staged: Result<StagedResolvedAppend> = async {
-            let (rows, _, stats) = self
-                .table
-                .write_to_snapshot_with_schema(
-                    data,
-                    write.target_size_bytes,
-                    &snapshot_id,
-                    write.target_partitions,
-                    None,
-                    write.write_policy,
-                    None,
-                    file_stats
-                        .as_ref()
-                        .map(|observer| Arc::clone(observer) as _),
-                    super::overwrite_postpass::with_arrival(&table_schema, &arrival_name),
-                )
-                .await?;
-            self.table.sync_local_snapshot_dir(&snapshot_id).await?;
-            // One batch, its own repeats resolved, repeats no key.
-            if rows == 0 || stamped_batches.load(Ordering::Relaxed) <= 1 {
-                return Ok((rows, stats, HashMap::new()));
-            }
-            let superseded = self
-                .table
-                .find_superseded_by_arrival(&snapshot_id, survivor, &key_columns, rows)
-                .await?;
-            match file_stats.as_deref() {
-                Some(file_stats) if !superseded.is_empty() => {
-                    let dropped: u64 = superseded.values().map(|rows| rows.len() as u64).sum();
-                    let stats = self
-                        .table
-                        .fold_superseded_copies(
-                            &snapshot_id,
-                            &superseded,
-                            write,
-                            file_stats,
-                            &stats,
-                        )
-                        .await?;
-                    Ok((rows.saturating_sub(dropped), stats, HashMap::new()))
-                }
-                _ => Ok((rows, stats, superseded)),
-            }
-        }
-        .await;
-        record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
-        let (rows, stats, superseded) = match staged {
-            Ok(staged) => staged,
-            Err(error) => {
-                drop(take_post_validation(&post_validation));
-                self.table.clear_cached_pk_keyset();
-                self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
-                    .await;
-                return Err(error);
-            }
+        let scope = if self.into_empty_table {
+            super::append_stage::ValidationScope::Empty
+        } else {
+            super::append_stage::ValidationScope::Locked
         };
-        // The copies are resolved: free this write's share of the duplicate query.
-        drop(dedup_share);
-
-        let PostValidationState {
-            mut on_conflict_deletions,
+        let super::append_stage::StagedAppend {
+            new_snapshot_id: snapshot_id,
+            on_conflict_deletions,
             validated_keys,
-        } = take_post_validation(&post_validation);
-        // Stored copies this append supersedes, then the incoming copies it does
-        // not keep: counted apart, since `total_superseded` nets position deletes
-        // against the key deletes that twin them.
-        let hidden: usize = superseded.values().map(Vec::len).sum();
-        let superseded_rows = on_conflict_deletions
-            .total_superseded()
-            .saturating_add(hidden);
-        for (path, positions) in superseded {
-            on_conflict_deletions
-                .delete_specs
-                .entry(Arc::from(path.as_str()))
-                .or_default()
-                .extend(positions.into_iter().map(u64::from));
-        }
+            stats,
+            row_count: rows,
+            superseded: superseded_rows,
+        } = self
+            .table
+            .stage_resolved_append(data, resolver, write, scope)
+            .await?;
 
         if rows == 0 {
             self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
