@@ -65,7 +65,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use futures::{Stream, StreamExt, TryStreamExt};
-use object_store::ObjectStore;
+use object_store::{ObjectMeta, ObjectStore};
 use vortex::VortexSessionDefault;
 use vortex::array::VortexSessionExecute;
 use vortex::arrow::ArrowSessionExt;
@@ -751,7 +751,7 @@ impl CayenneTableProvider {
         &self,
         state: &dyn datafusion::catalog::Session,
         store: &Arc<dyn ObjectStore>,
-        files: &[super::lookup_index::IndexedFile],
+        files: &[ObjectMeta],
         key_columns: &[String],
     ) -> (
         Vec<Option<Vec<(ScalarValue, ScalarValue)>>>,
@@ -844,7 +844,7 @@ impl CayenneTableProvider {
         let ctx = self.create_session_context();
         let state = ctx.state();
         let Some((store, files)) = self
-            .lookup_index_snapshot_files(&state, snapshot_id, &self.read_schema())
+            .snapshot_file_metadata(&state, snapshot_id, &self.read_schema())
             .await
         else {
             return Err(super::Error::Internal {
@@ -906,7 +906,10 @@ impl CayenneTableProvider {
         let (bounds, file_rows) = self
             .written_key_bounds(&state, &store, &files, key_columns)
             .await;
-        let paths: Vec<String> = files.into_iter().map(|file| file.path).collect();
+        let paths: Vec<String> = files
+            .into_iter()
+            .map(|file| file.location.to_string())
+            .collect();
         let key_names: Arc<[String]> = key_columns.to_vec().into();
         // A chunk sized from the bytes and rows written can still outgrow a small
         // memory pool; then the key space is cut finer and the query run again.

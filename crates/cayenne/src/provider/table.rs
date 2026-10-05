@@ -36604,25 +36604,43 @@ impl CayenneTableProvider {
         Some((selection, explain))
     }
 
-    /// The WHOLE snapshot's data files, as the scan itself lists them. Filters
-    /// are deliberately not applied: a file pruned away for one query still
-    /// holds rows another query's key maps to, and an index built from a pruned
-    /// subset would answer a later lookup with a false empty.
+    /// The whole snapshot's data files for building or probing its lookup index.
     pub(crate) async fn lookup_index_snapshot_files(
         &self,
         state: &dyn Session,
         snapshot_id: &str,
         read_schema: &SchemaRef,
     ) -> Option<(Arc<dyn ObjectStore>, Vec<super::lookup_index::IndexedFile>)> {
+        let (store, files) = self
+            .snapshot_file_metadata(state, snapshot_id, read_schema)
+            .await?;
+        let files = files
+            .into_iter()
+            .map(|file| super::lookup_index::IndexedFile {
+                path: file.location.to_string(),
+            })
+            .collect();
+        Some((store, files))
+    }
+
+    /// The whole snapshot's data files, as the scan itself lists them. Filters
+    /// are deliberately not applied: a file pruned away for one query still
+    /// holds rows another query's key maps to, and an index built from a pruned
+    /// subset would answer a later lookup with a false empty.
+    pub(crate) async fn snapshot_file_metadata(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        read_schema: &SchemaRef,
+    ) -> Option<(Arc<dyn ObjectStore>, Vec<ObjectMeta>)> {
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
             snapshot_id,
         );
         let table_url = ListingTableUrl::parse(&snapshot_dir_url).ok()?;
-        // The index needs only each file's path, size and modification time.
-        // Collecting per-file statistics here doubled the CPU of every later scan
-        // of a freshly refreshed table, so this listing skips them.
+        // Footer statistics are read separately when needed. Listing requires
+        // only object metadata, not a scan of each file's footer.
         let options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
@@ -36645,13 +36663,11 @@ impl CayenneTableProvider {
             .await
             .ok()?;
         let store = state.runtime_env().object_store(&table_url).ok()?;
-        let files: Vec<super::lookup_index::IndexedFile> = listed
+        let files = listed
             .file_groups
             .iter()
             .flat_map(FileGroup::iter)
-            .map(|file| super::lookup_index::IndexedFile {
-                path: file.object_meta.location.to_string(),
-            })
+            .map(|file| file.object_meta.clone())
             .collect();
         // A snapshot with no files — a refresh small enough to be inlined into the
         // metastore — still gets an index: an empty one, which answers every
@@ -36667,19 +36683,11 @@ impl CayenneTableProvider {
         &self,
         state: &dyn Session,
         store: &Arc<dyn ObjectStore>,
-        file: &super::lookup_index::IndexedFile,
+        file: &ObjectMeta,
     ) -> datafusion_common::Result<Statistics> {
-        let object = ObjectMeta {
-            location: ObjectStorePath::from(file.path.as_str()),
-            last_modified: chrono::DateTime::from_timestamp_millis(file.last_modified_ms)
-                .unwrap_or_default(),
-            size: file.size,
-            e_tag: None,
-            version: None,
-        };
         self.context
             .file_format()
-            .infer_stats(state, store, self.table_schema(), &object)
+            .infer_stats(state, store, self.table_schema(), file)
             .await
     }
 
