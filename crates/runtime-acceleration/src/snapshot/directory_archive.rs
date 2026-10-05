@@ -1689,6 +1689,7 @@ mod tests {
             &archive_path,
             &[],
             &[],
+            &[],
         )
         .await?;
 
