@@ -237,6 +237,29 @@ pub struct SnapshotNotifications {
 }
 
 impl SnapshotNotifications {
+    /// Subscribe to the queue configured for a bootstrapping or refreshing
+    /// acceleration. Sources without notification configuration keep polling.
+    ///
+    /// # Errors
+    /// Returns an error when the configured queue or snapshot location is invalid.
+    pub async fn subscribe_for_behavior(
+        &self,
+        behavior: &super::SnapshotBehavior,
+        manager: &Arc<SnapshotManager>,
+    ) -> Result<Option<Subscription>> {
+        let (super::SnapshotBehavior::Enabled(snapshots, secrets, runtime, _)
+        | super::SnapshotBehavior::BootstrapOnly(snapshots, secrets, runtime)) = behavior
+        else {
+            return Ok(None);
+        };
+        let Some(secrets) = secrets.upgrade() else {
+            return Ok(None);
+        };
+        Ok(NotificationConfig::resolve(snapshots, secrets)
+            .await?
+            .map(|config| self.subscribe(&config, manager, runtime)))
+    }
+
     /// Subscribe `manager`'s dataset to the announcements of the snapshot
     /// location in `config`. The first subscription to a queue starts its
     /// consumer on `runtime`, which reads the location's metadata through
@@ -295,10 +318,19 @@ impl Drop for Consumer {
 /// One dataset's view of its snapshot location's announcements. Holding it
 /// keeps the location's consumer running.
 #[must_use = "dropping the subscription stops its announcements"]
+#[derive(Clone)]
 pub struct Subscription {
     announced: watch::Receiver<Announced>,
     dataset: String,
     _consumer: Arc<Consumer>,
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription")
+            .field("dataset", &self.dataset)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Subscription {
@@ -1034,6 +1066,54 @@ mod tests {
             .await
             .expect("the dataset's snapshot is announced");
         assert_eq!(id, Some(9));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_handoff_preserves_announcements_received_during_download() {
+        let (announcer, mut bootstrap) = TestAnnouncer::subscribe("orders");
+        announcer.announce("orders", 7);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), bootstrap.next_snapshot())
+                .await
+                .expect("initial announcement wakes bootstrap"),
+            Some(7)
+        );
+
+        // Dataset initialization clones its bootstrap result for load retries.
+        // The refresh task must see changes received after bootstrap woke up.
+        announcer.announce("orders", 8);
+        announcer.announce("orders", 9);
+        let mut refresh = bootstrap.clone();
+        drop(bootstrap);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), refresh.next_snapshot())
+                .await
+                .expect("pending announcement survives handoff"),
+            Some(9)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_dataset_subscriber_observes_the_current_announcement() {
+        let notifications = SnapshotNotifications::default();
+        let orders = build_manager_for_api_tests(Arc::new(InMemory::new()));
+        let mut sender = None;
+        let first = notifications.subscribe_with(&config(), &orders, |announce| {
+            sender = Some(announce);
+            tokio::spawn(futures::future::pending())
+        });
+        let announce = sender.expect("consumer started");
+        announce.send_replace(Announced::from([(orders.dataset_name().to_string(), 9)]));
+        let mut second = notifications.subscribe_with(&config(), &orders, |_| {
+            panic!("a late subscriber must reuse the queue consumer")
+        });
+        drop(first);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), second.next_snapshot())
+                .await
+                .expect("late subscription observes the current snapshot"),
+            Some(9)
+        );
     }
 
     #[test]

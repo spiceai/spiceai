@@ -19,11 +19,9 @@ snafu.workspace = true
 telemetry = { path = "../telemetry", optional = true }
 tracing.workspace = true
 twox-hash.workspace = true
-# Specification and proof vocabulary for `src/sbbf_layout.rs`. A normal
-# `cargo build` erases the specifications, so this carries no runtime cost;
-# `cargo verus focus` re-checks the proofs. Pinned to the Verus release whose
-# verifier is run in CI — the two are versioned together.
-vstd = "=0.0.0-2026-09-20-0158"
+# Specification and proof vocabulary for `src/sbbf_layout.rs`; `cargo verus focus`
+# re-checks the proofs. The workspace pins it to the Verus release CI runs.
+vstd.workspace = true
 
 [features]
 default = []

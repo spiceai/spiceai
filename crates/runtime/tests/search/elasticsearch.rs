@@ -25,18 +25,14 @@ const ES_IMAGE: &str = "docker.elastic.co/elasticsearch/elasticsearch:8.17.0";
 /// Starts a single-node Elasticsearch container with security disabled.
 ///
 /// Returns the [`RunningContainer`] handle — drop or call `.remove()` to clean up.
-pub(super) async fn start_elasticsearch_docker_container(
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    let container_name = format!("{ES_DOCKER_CONTAINER}-{port}");
-    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-
+pub(super) async fn start_elasticsearch_docker_container() -> Result<RunningContainer, anyhow::Error>
+{
     // ES images are only available from the official Elastic registry, not the
     // project-wide CONTAINER_REGISTRY mirror, so we always use the canonical image.
 
-    let running_container = ContainerRunnerBuilder::new(container_name)
+    let running_container = ContainerRunnerBuilder::new(ES_DOCKER_CONTAINER)
         .image(ES_IMAGE.to_string())
-        .add_port_binding(9200, port)
+        .publish_port(9200)
         .add_env_var("discovery.type", "single-node")
         .add_env_var("xpack.security.enabled", "false")
         .add_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")

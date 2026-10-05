@@ -54,7 +54,7 @@ use crate::{
     component::{
         AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
     },
-    dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
+    dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR, SCYLLADB_DATACONNECTOR,
         SCYLLADB_FEATURE,
@@ -253,8 +253,8 @@ impl Runtime {
         //
         // `LogErrors(true)` here, and `LogErrors(false)` in `load_views` below, because
         // the two validate the same views and only one of them may report: this pre-pass
-        // is the one that always runs. The snapshot validations between here and
-        // `load_views` return early on failure, so reporting from `load_views` instead
+        // is the one that always runs. The snapshot validation between here and
+        // `load_views` returns early on failure, so reporting from `load_views` instead
         // loses every view's load error, its status update, and its
         // discarded-acceleration warning on exactly the startups that already went wrong.
         let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
@@ -282,16 +282,6 @@ impl Runtime {
             }
         }
 
-        // Validate Cayenne snapshot consistency before initializing accelerators.
-        // All Cayenne datasets sharing the same metadata directory must have the same
-        // snapshot configuration (either all enabled or all disabled).
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
-            tracing::error!("{err}");
-            return;
-        }
-
         let init_results = self
             .initialize_datasets_accelerators(&startup_datasets)
             .await;
@@ -316,6 +306,10 @@ impl Runtime {
             ResolvedTableReference,
             (TableReference, PendingDatasetLoad),
         > = HashMap::new();
+        // Loads waiting on a snapshot's first publication, which component startup does not
+        // wait for. Their tasks stay registered for cancellation on reload or shutdown.
+        let mut background_roots = HashSet::new();
+        let mut background_chains: Vec<(TableReference, PendingDatasetLoad)> = Vec::new();
         // Keyed by parent so several `localpod` datasets reading from one dataset all chain
         // behind the same load, rather than the first one consuming it.
         let mut localpod_by_parent: HashMap<
@@ -347,19 +341,29 @@ impl Runtime {
                 continue;
             }
 
+            let pending = matches!(bootstrap_status, BootstrapStatus::Pending { .. });
             let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
             let load_semaphore = Arc::clone(&semaphore);
             let load = self.dataset_loads.begin(&ds.name);
-            let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+            let future: PendingDatasetLoad = Box::pin(async move {
                 cloned_self
                     .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
                     .await;
             });
-            dataset_futures.insert(
-                resolve_table_reference(ds.name.clone()),
-                (ds.name.clone(), future),
-            );
+            let resolved = resolve_table_reference(ds.name.clone());
+            let future = if pending {
+                background_roots.insert(resolved.clone());
+                self.track_snapshot_bootstrap(
+                    &ds.name,
+                    future,
+                    Some(self.initial_load.cancel.clone()),
+                )
+                .await
+            } else {
+                future
+            };
+            dataset_futures.insert(resolved, (ds.name.clone(), future));
         }
 
         // Each `localpod` dataset loads after the dataset it reads from, and a `localpod`
@@ -369,21 +373,46 @@ impl Runtime {
             .extract_if(|parent, _| dataset_futures.contains_key(parent))
             .collect();
         for (parent, children) in roots {
-            let chains: Vec<_> = children
-                .into_iter()
-                .map(|(ds, bootstrap_status)| {
-                    Arc::clone(&self).localpod_load_chain(
-                        ds,
-                        bootstrap_status,
-                        &mut localpod_by_parent,
-                        ReplacesRegistration::No,
-                    )
-                })
-                .collect();
+            let parent_background = background_roots.contains(&parent);
+            // Signalled once the parent's load ends, however it ends, so a chain running in
+            // the background starts only after its parent.
+            let parent_done = tokio_util::sync::CancellationToken::new();
+            let mut chains = Vec::new();
+            for (ds, bootstrap_status) in children {
+                let background = parent_background
+                    || localpod_chain_pending(&ds, &bootstrap_status, &localpod_by_parent);
+                let name = ds.name.clone();
+                let chain = Arc::clone(&self).localpod_load_chain(
+                    ds,
+                    bootstrap_status,
+                    &mut localpod_by_parent,
+                    ReplacesRegistration::No,
+                );
+                if background {
+                    let parent_done = parent_done.clone();
+                    let chain: PendingDatasetLoad = Box::pin(async move {
+                        parent_done.cancelled().await;
+                        chain.await;
+                    });
+                    let chain = self
+                        .track_snapshot_bootstrap(
+                            &name,
+                            chain,
+                            Some(self.initial_load.cancel.clone()),
+                        )
+                        .await;
+                    background_chains.push((name, chain));
+                } else {
+                    chains.push(chain);
+                }
+            }
             if let Some((_, parent_future)) = dataset_futures.get_mut(&parent) {
                 let parent_load = std::mem::replace(parent_future, Box::pin(async {}));
                 *parent_future = Box::pin(async move {
-                    parent_load.await;
+                    {
+                        let _parent_done = parent_done.drop_guard();
+                        parent_load.await;
+                    }
                     join_all(chains).await;
                 });
             }
@@ -409,13 +438,23 @@ impl Runtime {
         }
 
         let mut spawned_tasks = vec![];
+        let dispatched = dataset_futures.len() + background_chains.len();
 
-        for (ds, dataset_load_future) in dataset_futures.into_values() {
+        for (resolved, (ds, dataset_load_future)) in dataset_futures {
             let handle = tokio::spawn(async move {
                 tracing::info!("Dataset {ds} initializing...");
                 dataset_load_future.await;
             });
-            spawned_tasks.push(handle);
+            // A reader's first publication is independent of component startup.
+            if !background_roots.contains(&resolved) {
+                spawned_tasks.push(handle);
+            }
+        }
+        for (ds, chain) in background_chains {
+            tokio::spawn(async move {
+                tracing::info!("Dataset {ds} initializing...");
+                chain.await;
+            });
         }
 
         // Aggregate startup summary so users see "3/5 queued, 2 skipped at init" at a glance
@@ -425,7 +464,6 @@ impl Runtime {
         // parent dataset's task. Wording avoids the words "failed" / "error" so it
         // doesn't trip quickstart CI checks that grep spice.log for those tokens as a
         // sentinel for real failures.
-        let dispatched = spawned_tasks.len();
         let init_skipped = init_results.values().filter(|r| r.is_err()).count();
         let total = startup_datasets.len();
         if total > 0 {
@@ -678,7 +716,8 @@ impl Runtime {
         // placeholder and skip eager connector construction. The
         // resolver hook in `datafusion::create_logical_plan` will
         // trigger `ensure_ready` on first reference.
-        if self.is_deferral_eligible(&ds)
+        if matches!(bootstrap_status, BootstrapStatus::None)
+            && self.is_deferral_eligible(&ds)
             && let Some(deferred_schema) = self.try_static_schema_for_dataset(&ds).await
         {
             let runtime = ds.runtime();
@@ -723,7 +762,9 @@ impl Runtime {
         }
 
         let connector_start = Instant::now();
-        let connector = if Self::serves_existing_acceleration(&ds).await {
+        let connector = if !matches!(bootstrap_status, BootstrapStatus::Pending { .. })
+            && Self::serves_existing_acceleration(&ds).await
+        {
             // Served from its existing acceleration at once; the real connector is
             // built in the background, so the source's state never holds the dataset.
             Self::reconnecting_connector(&ds)
@@ -810,10 +851,13 @@ impl Runtime {
         load_semaphore: Arc<Semaphore>,
         load: DatasetLoad,
     ) {
+        let shutdown_token = self.status.shutdown_token();
         // A dataset that reads snapshots has no acceleration to load them into until
         // the engine that created them is known, which only their metadata says.
+        // Outside the supersede scope below: a supersede waits for a restore that has
+        // started rather than dropping it (see `dataset_loads`), and the resolution
+        // stops on its own while it is only waiting.
         let (ds, bootstrap_status) = if ds.is_pending_snapshot_source() {
-            let shutdown_token = self.status.shutdown_token();
             let resolved = tokio::select! {
                 resolved = self.resolve_snapshot_source(&ds, &load_semaphore, &load) => resolved,
                 () = shutdown_token.cancelled() => None,
@@ -825,16 +869,75 @@ impl Runtime {
         } else {
             (ds, bootstrap_status)
         };
+        let load_fut = async {
+            let pending = matches!(bootstrap_status, BootstrapStatus::Pending { .. });
+            let bootstrap_status = if pending
+                && ds.ready_state == crate::component::dataset::ReadyState::OnRegistration
+                && !self.df.table_exists(&ds.name)
+            {
+                // Source fallback must not open the acceleration file. Race it with
+                // the restore so an unavailable source cannot delay a publication.
+                let fallback = self.load_dataset_with_retry(
+                    Arc::clone(&ds),
+                    bootstrap_status.clone(),
+                    Arc::clone(&load_semaphore),
+                    &load,
+                );
+                let restore = bootstrap_status.complete();
+                tokio::pin!(restore);
+                tokio::select! {
+                    status = &mut restore => status,
+                    () = fallback => restore.await,
+                }
+            } else {
+                bootstrap_status.complete().await
+            };
+            // A restore completed at initialization already updated the cached
+            // timestamps there; only one completed here still needs it.
+            let restored = pending && bootstrap_status.is_bootstrapped();
+            if restored && ds.is_snapshot_source() && self.refuses_projected_publisher(&ds).await {
+                return;
+            }
+            if restored {
+                update_cached_dataset_timestamps(ds.as_ref()).await;
+            }
+            self.load_dataset_with_retry(Arc::clone(&ds), bootstrap_status, load_semaphore, &load)
+                .await;
+            if restored {
+                self.df.clear_cached_plans().await;
+                self.invalidate_cached_results_for(&ds.name).await;
+            }
+        };
 
+        // Use tokio::select! so that backoff sleeps inside `retry` are immediately
+        // interrupted when the runtime begins shutting down (e.g. on ctrl-c), or
+        // when a Spicepod change supersedes this load. Dropping `load_fut` there
+        // drops any attempt in progress, which releases the attempt lock that
+        // `DatasetLoads::supersede` waits for before the change applies.
+        tokio::select! {
+            () = load_fut => {},
+            () = shutdown_token.cancelled() => {},
+            () = load.superseded() => {},
+        }
+    }
+
+    async fn load_dataset_with_retry(
+        &self,
+        ds: Arc<Dataset>,
+        bootstrap_status: BootstrapStatus,
+        load_semaphore: Arc<Semaphore>,
+        load: &DatasetLoad,
+    ) {
         // Why a dataset with an acceleration on disk is not served from it, logged
         // once when its first attempt fails. Not before: a source that is reached only
         // when it is read (HTTP, S3) can fail after the dataset is already served
         // from its acceleration, and then it does not wait.
         let waits_for_source = parking_lot::Mutex::new(match Self::waits_for_source_reason(&ds) {
             Some(reason)
-                if crate::dataconnector::sink::recorded_checkpoint_schema(&ds)
-                    .await
-                    .is_some() =>
+                if !matches!(bootstrap_status, BootstrapStatus::Pending { .. })
+                    && crate::dataconnector::sink::recorded_checkpoint_schema(&ds)
+                        .await
+                        .is_some() =>
             {
                 Some(waits_for_source_message(&ds.name, &reason))
             }
@@ -842,12 +945,8 @@ impl Runtime {
         });
 
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
-
-        let runtime = Arc::clone(&self);
-        let shutdown_token = runtime.status.shutdown_token();
-        let retry_fut = retry(retry_strategy, || async {
-            // Exit immediately if the runtime is shutting down (e.g. after a backoff sleep completes).
-            if runtime.status.is_shutdown() {
+        let _ = retry(retry_strategy, || async {
+            if self.status.is_shutdown() {
                 return Err(RetryError::permanent(
                     crate::Error::UnableToInitializeDataConnector {
                         source: "Runtime is shutting down".into(),
@@ -865,7 +964,7 @@ impl Runtime {
                 ));
             };
 
-            match runtime
+            match self
                 .try_load_dataset_once(
                     Arc::clone(&ds),
                     bootstrap_status.clone(),
@@ -874,7 +973,7 @@ impl Runtime {
                 .await
             {
                 Ok(()) => Ok(()),
-                Err(err) if runtime.status.is_shutdown() => Err(RetryError::permanent(err)),
+                Err(err) if self.status.is_shutdown() => Err(RetryError::permanent(err)),
                 Err(err) => {
                     if let Some(message) = waits_for_source.lock().take() {
                         tracing::info!("{message}");
@@ -886,17 +985,64 @@ impl Runtime {
                     }
                 }
             }
-        });
+        })
+        .await;
+    }
 
-        // Use tokio::select! so that backoff sleeps inside `retry` are immediately
-        // interrupted when the runtime begins shutting down (e.g. on ctrl-c), or
-        // when a Spicepod change supersedes this load. Dropping `retry_fut` there
-        // drops any attempt in progress, which releases the attempt lock that
-        // `DatasetLoads::supersede` waits for before the change applies.
-        tokio::select! {
-            _ = retry_fut => {},
-            () = shutdown_token.cancelled() => {},
-            () = load.superseded() => {},
+    fn snapshot_bootstrap_task_name(name: &TableReference) -> String {
+        format!(
+            "snapshot_bootstrap:{}",
+            resolve_table_reference(name.clone())
+        )
+    }
+
+    /// Keeps background bootstrap in the runtime's task registry until it can
+    /// register the reader, or its configuration is replaced or removed.
+    async fn track_snapshot_bootstrap(
+        self: &Arc<Self>,
+        name: &TableReference,
+        load: Pin<Box<dyn Future<Output = ()> + Send>>,
+        initial_load_cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let cancel = self.status.shutdown_token().child_token();
+        let task_cancel = cancel.clone();
+        let completion = self
+            .start_runtime_task(
+                &Self::snapshot_bootstrap_task_name(name),
+                Some(cancel),
+                async move {
+                    let initial_load_cancel = async move {
+                        match initial_load_cancel {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        () = task_cancel.cancelled() => {},
+                        () = initial_load_cancel => {},
+                        () = load => {},
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+        let name = name.clone();
+        Box::pin(async move {
+            if let Err(err) = completion.await {
+                tracing::error!("Failed to initialize snapshot reader '{name}': {err}");
+            }
+        })
+    }
+
+    async fn cancel_snapshot_bootstrap(&self, name: &TableReference) {
+        let task = self
+            .tasks
+            .write()
+            .await
+            .remove(&Self::snapshot_bootstrap_task_name(name));
+        if let Some(task) = task {
+            task.cancel(Duration::from_secs(5)).await;
         }
     }
 
@@ -1124,14 +1270,16 @@ impl Runtime {
         data_connector: &Arc<dyn DataConnector>,
         resolved_refresh_mode: RefreshMode,
         allow_schema_mismatch: bool,
+        snapshot_fallback: bool,
     ) -> Result<(Arc<Dataset>, FederatedTable)> {
         // A dataset served from its existing acceleration registers before its real
         // connector is built (see `try_load_dataset_once`); the source is contacted in
         // the background.
-        if data_connector
-            .as_any()
-            .downcast_ref::<ReconnectingConnector>()
-            .is_some_and(|connector| !connector.is_connected())
+        if !snapshot_fallback
+            && data_connector
+                .as_any()
+                .downcast_ref::<ReconnectingConnector>()
+                .is_some_and(|connector| !connector.is_connected())
             && let Some(checkpoint_schema) = Self::existing_acceleration_schema(&ds).await
         {
             return Ok(self.defer_to_existing_acceleration(
@@ -1158,20 +1306,29 @@ impl Runtime {
                     &provider.schema(),
                     resolved_refresh_mode,
                 );
-                let federated_table = FederatedTable::new(
-                    Arc::new(ds.spec.clone()),
-                    provider,
-                    ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
-                    self.status.shutdown_token(),
-                    allow_schema_mismatch,
-                )
-                .await;
+                let federated_table = if snapshot_fallback {
+                    FederatedTable::new_unchecked(provider)
+                } else {
+                    FederatedTable::new(
+                        Arc::new(ds.spec.clone()),
+                        provider,
+                        ConnectorRefreshSource::new_arc(
+                            Arc::clone(data_connector),
+                            Arc::clone(&ds),
+                        ),
+                        self.status.shutdown_token(),
+                        allow_schema_mismatch,
+                    )
+                    .await
+                };
                 Ok((ds, federated_table))
             }
             Err(err) => {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
-                if let Some(checkpoint_schema) = Self::existing_acceleration_schema(&ds).await {
+                if !snapshot_fallback
+                    && let Some(checkpoint_schema) = Self::existing_acceleration_schema(&ds).await
+                {
                     return Ok(self.defer_to_existing_acceleration(
                         &ds,
                         data_connector,
@@ -1312,6 +1469,9 @@ impl Runtime {
         // Owned (not borrowed from `ds`) so the dataset can be rebuilt below by
         // schema inference without holding a borrow across the reassignment.
         let source = ds.source().to_string();
+        let snapshot_fallback = matches!(bootstrap_status, BootstrapStatus::Pending { .. });
+        let replaces_snapshot_reader =
+            bootstrap_status.is_bootstrapped() && self.df.table_exists(&ds.name);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         if let Some(acceleration) = &ds.acceleration
             && data_connector.resolve_refresh_mode(acceleration.refresh_mode)
@@ -1419,6 +1579,7 @@ impl Runtime {
                 &data_connector,
                 resolved_refresh_mode,
                 allow_schema_mismatch,
+                snapshot_fallback,
             )
             .await?;
         ds = resolved_ds;
@@ -1492,7 +1653,9 @@ impl Runtime {
                         }
                     },
                 );
-                metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
+                if !replaces_snapshot_reader {
+                    metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
+                }
 
                 if let Some(message) = schema_change_failure {
                     self.status.update_dataset(
@@ -2068,10 +2231,12 @@ impl Runtime {
 
         let replicate = ds.replication.as_ref().is_some_and(|r| r.enabled);
         // FEDERATED TABLE
-        if !ds.is_accelerated() {
+        if !ds.is_accelerated() || matches!(bootstrap_status, BootstrapStatus::Pending { .. }) {
             // `on_schema_change` only governs accelerated datasets in v1: federated
             // queries always reflect the live source schema, so the policy is inert.
-            if ds.on_schema_change != crate::component::dataset::OnSchemaChange::Block {
+            if !ds.is_accelerated()
+                && ds.on_schema_change != crate::component::dataset::OnSchemaChange::Block
+            {
                 tracing::warn!(
                     dataset = %ds.name,
                     "`on_schema_change: {policy}` has no effect on non-accelerated datasets; it applies to accelerated datasets only",
@@ -2252,14 +2417,6 @@ impl Runtime {
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
 
-        // Validate Cayenne snapshot consistency before initializing accelerators.
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
-            tracing::error!("{err}");
-            return;
-        }
-
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
         // Only the datasets this diff loads or updates are initialized: `mode: file_create`
@@ -2286,6 +2443,12 @@ impl Runtime {
         // or registers it. A dataset whose load was still retrying never
         // registered, so its new configuration is loaded below like an added
         // dataset's, retrying until its source answers, rather than updated once.
+        //
+        // A snapshot reader still waiting for its first publication is such a
+        // load: superseding it drops its bootstrap, so the source table it may
+        // have registered meanwhile is replaced below rather than kept serving
+        // the replaced configuration. Its runtime task has then ended, and only
+        // its registry entry is left to remove.
         let removed_datasets = current_app
             .datasets
             .iter()
@@ -2298,8 +2461,9 @@ impl Runtime {
             .chain(removed_datasets)
         {
             if self.dataset_loads.supersede(&name).await {
-                still_loading.insert(name);
+                still_loading.insert(name.clone());
             }
+            self.cancel_snapshot_bootstrap(&name).await;
         }
 
         let init_results = self
@@ -2414,24 +2578,45 @@ impl Runtime {
                     continue;
                 }
 
-                Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
-                continue;
+                if !matches!(bootstrap_status, BootstrapStatus::Pending { .. }) {
+                    Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
+                    continue;
+                }
+                // Keep the serving table until the replacement snapshot has been
+                // restored and its provider can be registered in place.
             }
 
-            // A superseded attempt can be dropped after it registered the table
-            // and before its load completed.
-            if still_loading.contains(&ds.name) && self.df.table_exists(&ds.name) {
-                Arc::clone(&self)
-                    .remove_dataset(
-                        ds.name.clone(),
-                        ds.acceleration.as_ref(),
-                        CacheInvalidation::Reload,
-                    )
-                    .await;
-            }
-
-            self.status
-                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+            // A snapshot reader keeps serving its table until the replacement snapshot
+            // has been restored, including when an earlier replacement was still
+            // waiting for its own: the superseded wait never registered anything, so
+            // the table is still the one that was serving before either change.
+            let pending = matches!(bootstrap_status, BootstrapStatus::Pending { .. });
+            let serving = if still_loading.contains(&ds.name) && !pending {
+                // A superseded attempt can be dropped after it registered the table
+                // and before its load completed.
+                if self.df.table_exists(&ds.name) {
+                    Arc::clone(&self)
+                        .remove_dataset(
+                            ds.name.clone(),
+                            ds.acceleration.as_ref(),
+                            CacheInvalidation::Reload,
+                        )
+                        .await;
+                }
+                false
+            } else {
+                // A snapshot reader keeps serving its table until the replacement
+                // snapshot has been restored (see above).
+                self.df.table_exists(&ds.name)
+            };
+            self.status.update_dataset(
+                &ds.name,
+                if serving {
+                    status::ComponentStatus::Refreshing
+                } else {
+                    status::ComponentStatus::Initializing
+                },
+            );
 
             if let Some(parent) = localpod_parent(ds) {
                 localpod_by_parent
@@ -2447,14 +2632,18 @@ impl Runtime {
             let ds_clone = Arc::clone(ds);
             let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
             let load = self.dataset_loads.begin(&ds.name);
-            added_futures.insert(
-                resolve_table_reference(ds.name.clone()),
-                Box::pin(async move {
-                    runtime
-                        .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
-                        .await;
-                }),
-            );
+            let load_future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+                runtime
+                    .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
+                    .await;
+            });
+            let load_future = if pending {
+                self.track_snapshot_bootstrap(&ds.name, load_future, None)
+                    .await
+            } else {
+                load_future
+            };
+            added_futures.insert(resolve_table_reference(ds.name.clone()), load_future);
         }
 
         // Every queued `localpod` dataset loads behind its parent: a load this diff spawns
@@ -3141,6 +3330,23 @@ type PendingDatasetLoad = Pin<Box<dyn Future<Output = ()> + Send>>;
 enum ReplacesRegistration {
     Yes,
     No,
+}
+
+/// Whether `ds`, or a `localpod` dataset queued anywhere below it, is still waiting for a
+/// snapshot's first publication, so its chain must not hold up component startup.
+fn localpod_chain_pending(
+    ds: &Dataset,
+    bootstrap_status: &BootstrapStatus,
+    localpod_by_parent: &HashMap<ResolvedTableReference, Vec<(Arc<Dataset>, BootstrapStatus)>>,
+) -> bool {
+    matches!(bootstrap_status, BootstrapStatus::Pending { .. })
+        || localpod_by_parent
+            .get(&resolve_table_reference(ds.name.clone()))
+            .is_some_and(|children| {
+                children.iter().any(|(child, child_status)| {
+                    localpod_chain_pending(child, child_status, localpod_by_parent)
+                })
+            })
 }
 
 /// The dataset a `localpod` dataset reads through, resolved as the query engine resolves it (so
@@ -5638,3 +5844,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         Arc::new(builder.build())
     }
 }
+
+#[cfg(all(test, feature = "snapshots", feature = "duckdb"))]
+#[path = "dataset_snapshot_bootstrap_tests.rs"]
+mod snapshot_bootstrap_tests;
