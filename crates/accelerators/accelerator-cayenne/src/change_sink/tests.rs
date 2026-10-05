@@ -103,18 +103,16 @@ async fn rebuildable_composed_rows_use_native_ram_without_source_callback() {
     for shards in [1, 4] {
         let ctx = SessionContext::new();
         let (table, _dir) = table(&ctx, shards).await;
-        let target = data_components::metadata_enriched_table_provider(
+        let target = spice_table::SpiceTable::over(
+            Arc::new(spice_table::IndexLayer::new()),
             Arc::clone(&table) as Arc<dyn TableProvider>,
-            std::collections::HashMap::from([("test_marker".into(), "wrapped".into())]),
-            Default::default(),
-        );
+        ) as Arc<dyn TableProvider>;
         assert!(!target.is::<CayenneTableProvider>());
-        assert_eq!(target.schema().metadata()["test_marker"], "wrapped");
         let backend = CayenneChangeSinkBackend::try_new(ChangeSinkContext::new(
             TableReference::bare("rebuildable"),
             target,
         ))
-        .expect("native binding through metadata");
+        .expect("native binding through a write-transparent layer");
         let sink = ChangeSink::new(backend, ctx.clone(), &Handle::current(), 2);
         assert_eq!(
             write(&sink, &table, vec![1, 2], Recovery::Rebuildable).await,
@@ -158,6 +156,45 @@ async fn rebuildable_composed_rows_use_native_ram_without_source_callback() {
         );
         sink.begin_close().wait().await.expect("drain");
     }
+}
+
+#[tokio::test]
+async fn write_opaque_metadata_preserves_provider_fallback() {
+    let ctx = SessionContext::new();
+    let (table, _dir) = table(&ctx, 1).await;
+    let target = data_components::metadata_enriched_table_provider(
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+        std::collections::HashMap::from([("test_marker".into(), "wrapped".into())]),
+        Default::default(),
+    );
+    assert!(!target.is::<CayenneTableProvider>());
+    assert_eq!(target.schema().metadata()["test_marker"], "wrapped");
+    let context = ChangeSinkContext::new(TableReference::bare("rebuildable"), target);
+    assert!(CayenneChangeSinkBackend::try_new(context.clone()).is_none());
+    let sink = ChangeSink::new(
+        Arc::new(ProviderChangeSinkBackend::new(context)),
+        ctx.clone(),
+        &Handle::current(),
+        2,
+    );
+    assert_eq!(
+        write(&sink, &table, vec![7], Recovery::Rebuildable).await,
+        StorageDurability::NotPromised
+    );
+    assert!(!table.has_slot_advancer());
+    assert_eq!(
+        table.checkpoint_mem_tier().await.expect("empty RAM tier"),
+        0
+    );
+    assert_eq!(
+        ctx.read_table(table as Arc<dyn TableProvider>)
+            .expect("scan")
+            .count()
+            .await
+            .expect("provider-backed row"),
+        1
+    );
+    sink.begin_close().wait().await.expect("drain fallback");
 }
 
 #[tokio::test]
