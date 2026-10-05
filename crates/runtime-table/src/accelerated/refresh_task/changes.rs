@@ -1698,11 +1698,11 @@ impl RefreshTask {
             } else {
                 "drained"
             };
-            applying.store(true, Ordering::Release);
-            let applied = self
-                .apply_burst(&mut apply_context, burst, close_reason)
-                .await;
-            applying.store(false, Ordering::Release);
+            let applied = {
+                let _applying = ApplyingGuard::enter(&applying);
+                self.apply_burst(&mut apply_context, burst, close_reason)
+                    .await
+            };
             if !applied {
                 rx.close();
                 reader_handle.abort();
@@ -3625,6 +3625,35 @@ impl Drop for PrefetchBytesGaugeReset {
     }
 }
 
+/// Marks the apply loop as in-flight for the reader, and clears that mark
+/// on every exit.
+///
+/// The reader builds deferred rows ahead only while this flag is set. A
+/// store after `apply_burst().await` would miss the paths that never come
+/// back from that await: the refresh task being cancelled, or a panic
+/// unwinding past the apply. Either would leave the reader grouping and
+/// prebuilding after the apply is already gone. `Drop` covers those the
+/// same way [`PrefetchBytesGaugeReset`] covers a torn-down gauge.
+struct ApplyingGuard {
+    applying: Arc<AtomicBool>,
+}
+
+impl ApplyingGuard {
+    #[must_use]
+    fn enter(applying: &Arc<AtomicBool>) -> Self {
+        applying.store(true, Ordering::Release);
+        Self {
+            applying: Arc::clone(applying),
+        }
+    }
+}
+
+impl Drop for ApplyingGuard {
+    fn drop(&mut self) {
+        self.applying.store(false, Ordering::Release);
+    }
+}
+
 /// Subtract from the CDC prefetch byte counter without wrapping.
 ///
 /// Charge and discharge are meant to be symmetric, but `u64::fetch_sub` past
@@ -4430,6 +4459,23 @@ mod tests {
     use spice_table::IndexLayer;
 
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn applying_guard_clears_the_flag_when_dropped() {
+        let applying = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = ApplyingGuard::enter(&applying);
+            assert!(
+                applying.load(Ordering::Acquire),
+                "enter must mark the apply as in flight"
+            );
+        }
+        assert!(
+            !applying.load(Ordering::Acquire),
+            "drop must clear the flag so a cancelled apply cannot leave the reader prebuilding"
+        );
+    }
 
     #[test]
     fn cdc_config_from_params_resolves_max_coalesce_age_ms() {
