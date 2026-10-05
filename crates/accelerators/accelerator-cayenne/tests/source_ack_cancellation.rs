@@ -44,14 +44,14 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 use futures::{StreamExt, stream};
-use runtime_acceleration::change_sink::{
-    ChangeBatch, ChangeSinkContext, Recovery, StorageDurability, WriteOptions,
+use runtime_acceleration::{
+    acceleration::RefreshMode,
+    change_sink::{ChangeBatch, ChangeSinkContext, Recovery, StorageDurability, WriteOptions},
 };
 use runtime_table::{
     accelerated::{refresh::Refresh, refresh_task::RefreshTaskBuilder},
     federated::FederatedTable,
 };
-use spicepod::acceleration::RefreshMode;
 use tokio::{
     io::AsyncWriteExt,
     runtime::Handle,
