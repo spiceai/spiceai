@@ -50,8 +50,9 @@ limitations under the License.
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, AsArray, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow::compute::filter_record_batch;
@@ -59,6 +60,10 @@ use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, UInt32Type,
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::common::{Column, JoinType, ScalarValue};
 use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::functions_aggregate::expr_fn::{count, first_value, max, min};
 use datafusion::logical_expr::{Expr, lit};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -895,7 +900,16 @@ impl CayenneTableProvider {
         key_columns: &[String],
         rows_written: u64,
     ) -> super::Result<HashMap<String, Vec<u32>>> {
-        let ctx = self.create_session_context();
+        let shared_env = self.runtime_env();
+        let query_pool = Arc::new(QueryPool::new(Arc::clone(&shared_env.memory_pool)));
+        let runtime_env = RuntimeEnvBuilder::from_runtime_env(&shared_env)
+            .with_memory_pool(Arc::clone(&query_pool) as Arc<dyn MemoryPool>)
+            .build_arc()
+            .map_err(|source| super::Error::DataFusion { source })?;
+        let ctx = datafusion::prelude::SessionContext::new_with_config_rt(
+            util::session_state::session_config(),
+            Arc::clone(&runtime_env),
+        );
         let state = ctx.state();
         let Some((store, files)) = self
             .snapshot_file_metadata(&state, snapshot_id, &self.read_schema())
@@ -972,8 +986,15 @@ impl CayenneTableProvider {
             .collect();
         let key_names: Arc<[String]> = key_columns.to_vec().into();
         // A chunk sized from the bytes and rows written can still outgrow a small
-        // memory pool; then the key space is cut finer and the query run again.
+        // memory pool; then the query runs again with the key space cut finer and
+        // fewer partitions, since each partition's join and aggregate hold a
+        // minimum whatever the chunk size.
+        let mut partitions = state.config().target_partitions().max(1);
         let superseded = loop {
+            let query_ctx = datafusion::prelude::SessionContext::new_with_config_rt(
+                util::session_state::session_config().with_target_partitions(partitions),
+                Arc::clone(&runtime_env),
+            );
             // Splitting a cluster into key ranges checks that the ranges read every
             // row of it, which needs every file's row count.
             let mut plan = plan_chunks(&sizes, &bounds, chunks, file_rows.is_some());
@@ -999,7 +1020,7 @@ impl CayenneTableProvider {
                 })
                 .collect();
             let query = DuplicateQuery {
-                ctx: &ctx,
+                ctx: &query_ctx,
                 store: &store,
                 paths: &paths,
                 key_names: &key_names,
@@ -1018,9 +1039,13 @@ impl CayenneTableProvider {
                     if matches!(
                         error.find_root(),
                         datafusion_common::DataFusionError::ResourcesExhausted(_)
-                    ) && chunks < MAX_CHUNKS =>
+                    ) && (chunks < MAX_CHUNKS || partitions > 1) =>
                 {
+                    // The failed attempt's tasks hold their memory until they
+                    // stop, and a retry started before then finds the pool full.
+                    query_pool.released(RELEASE_WAIT).await;
                     chunks = (chunks * 2).min(MAX_CHUNKS);
+                    partitions = (partitions / 2).max(1);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -1062,6 +1087,83 @@ impl CayenneTableProvider {
 
 /// The most chunks the duplicate query cuts the key space into.
 const MAX_CHUNKS: u64 = 4096;
+
+/// The longest a retry of the duplicate query waits for the attempt that ran
+/// out of memory to release it.
+const RELEASE_WAIT: Duration = Duration::from_secs(10);
+
+/// The shared memory pool, also counting the bytes one duplicate query holds,
+/// so a retry can wait until the attempt before it has released them.
+#[derive(Debug)]
+struct QueryPool {
+    shared: Arc<dyn MemoryPool>,
+    held: AtomicUsize,
+}
+
+impl QueryPool {
+    fn new(shared: Arc<dyn MemoryPool>) -> Self {
+        Self {
+            shared,
+            held: AtomicUsize::new(0),
+        }
+    }
+
+    /// Wait until this query holds no memory, or `limit` passes.
+    async fn released(&self, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        while self.held.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+impl std::fmt::Display for QueryPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.shared, f)
+    }
+}
+
+impl MemoryPool for QueryPool {
+    fn name(&self) -> &str {
+        self.shared.name()
+    }
+
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.shared.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.shared.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.shared.grow(reservation, additional);
+        self.held.fetch_add(additional, Ordering::AcqRel);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.shared.shrink(reservation, shrink);
+        self.held.fetch_sub(shrink, Ordering::AcqRel);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion_common::Result<()> {
+        self.shared.try_grow(reservation, additional)?;
+        self.held.fetch_add(additional, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.shared.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.shared.memory_limit()
+    }
+}
 
 /// One run of the duplicate query over a refresh's written files.
 struct DuplicateQuery<'a> {
@@ -1383,6 +1485,31 @@ pub(crate) fn key_column_names(schema: &Schema, indices: &[usize]) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retry after the query ran out of memory waits until the failed
+    /// attempt's tasks have released theirs, so it starts with the pool free.
+    #[tokio::test]
+    async fn a_retry_waits_for_the_failed_attempt_to_release_its_memory() {
+        let pool = Arc::new(QueryPool::new(Arc::new(
+            datafusion::execution::memory_pool::GreedyMemoryPool::new(1024),
+        )));
+        let shared = Arc::clone(&pool) as Arc<dyn MemoryPool>;
+        let attempt = MemoryConsumer::new("failed attempt").register(&shared);
+        attempt.try_grow(1024).expect("the attempt fits");
+        let retry = MemoryConsumer::new("retry").register(&shared);
+        assert!(
+            retry.try_grow(1).is_err(),
+            "the pool is full while it holds"
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(attempt);
+        });
+        pool.released(Duration::from_secs(10)).await;
+        retry
+            .try_grow(1024)
+            .expect("the retry gets the whole pool once the attempt released it");
+    }
 
     fn int_bound(value: Option<&ScalarValue>) -> Option<i64> {
         match value {
