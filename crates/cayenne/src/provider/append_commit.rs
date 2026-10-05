@@ -247,12 +247,12 @@ async fn resolve_failed_commit(
 }
 
 #[cfg(not(test))]
-async fn commit_transaction(txn: Box<dyn MetastoreTransaction>, _table_id: &str) -> CatalogResult<()> {
+pub(super) async fn commit_transaction(txn: Box<dyn MetastoreTransaction>, _table_id: &str) -> CatalogResult<()> {
     txn.commit().await
 }
 
 #[cfg(not(test))]
-async fn snapshot_sequence(
+pub(super) async fn snapshot_sequence(
     catalog: &CayenneCatalog,
     table_id: &str,
     snapshot_id: &str,
@@ -261,7 +261,7 @@ async fn snapshot_sequence(
 }
 
 #[cfg(test)]
-async fn commit_transaction(txn: Box<dyn MetastoreTransaction>, table_id: &str) -> CatalogResult<()> {
+pub(super) async fn commit_transaction(txn: Box<dyn MetastoreTransaction>, table_id: &str) -> CatalogResult<()> {
     use test_seams::CommitFault;
     let fault = test_seams::commit_fault(table_id);
     let committed = if fault == Some(CommitFault::FailWithoutCommit) {
@@ -278,7 +278,7 @@ async fn commit_transaction(txn: Box<dyn MetastoreTransaction>, table_id: &str) 
 }
 
 #[cfg(test)]
-async fn snapshot_sequence(
+pub(super) async fn snapshot_sequence(
     catalog: &CayenneCatalog,
     table_id: &str,
     snapshot_id: &str,

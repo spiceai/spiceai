@@ -132,6 +132,15 @@ impl CayenneStagedUpsert {
         &self.validated_keys
     }
 
+    /// Whether committing publishes nothing: no row was staged, so no stored
+    /// row is superseded either.
+    pub(crate) fn publishes_nothing(&self) -> bool {
+        self.row_count == 0
+            && self.on_conflict_deletions.delete_specs.is_empty()
+            && self.on_conflict_deletions.total_superseded() == 0
+            && self.on_conflict_deletions.reinserted_over_tombstone == 0
+    }
+
     /// Prepare this staged upsert's durable payload for an atomic multi-table
     /// commit: reserve sequences + write deletion-vector files (no metastore
     /// commit). The caller holds the table `write_lock`; it applies the payload
@@ -345,6 +354,25 @@ impl PreparedTxnCommit {
             }
         }
         Ok(())
+    }
+
+    /// The staged snapshot this commit publishes.
+    pub(crate) fn snapshot_id(&self) -> &str {
+        &self.new_snapshot_id
+    }
+
+    /// The sequence the staged snapshot commits under.
+    pub(crate) fn snapshot_sequence(&self) -> i64 {
+        self.publish.snapshot_sequence
+    }
+
+    /// Keep this table's staged files and refuse its writes until it is
+    /// reloaded, after a shared commit whose outcome could not be read back.
+    pub(crate) fn retain_after_unknown_outcome(&mut self) {
+        self.publish.retain_files_for_wal_recovery();
+        self.table
+            .publication_outcome_unknown()
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Disarm the publish's destructive abort cleanup after the shared

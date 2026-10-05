@@ -584,3 +584,240 @@ async fn conflicting_key_counts_cover_the_whole_statement() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// A transaction's write to each table is one statement over its own input,
+/// and the fused commit publishes every table's together. A table the
+/// transaction writes no rows to gains no snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_resolves_each_statement_and_commits_them_together() {
+    use crate::provider::transaction::CayenneTransaction;
+
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        for dedup in [UpsertDedup::KeepLast, UpsertDedup::None] {
+            let label = format!("{mode:?}/{dedup:?}");
+            let (mut first, catalog, runtime_env, dir) = seeded_streaming_table(mode).await;
+            first.upsert_dedup = dedup;
+            let create = |name: &str| CreateTableOptions {
+                table_name: name.to_string(),
+                schema: schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(upsert_on_id()),
+                base_path: dir.path().join("data").display().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    deletion_mode: mode,
+                    inline_max_rows: 0,
+                    stream_publish_interval_ms: 0,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            };
+            let mut tables = vec![first];
+            for name in ["u", "empty"] {
+                let table =
+                    CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                        .with_upsert_dedup(dedup)
+                        .create(create(name))
+                        .await
+                        .expect("create table");
+                write(&table, InsertOp::Append, vec![batch(&[(9, "old")])])
+                    .await
+                    .expect("seed");
+                tables.push(table);
+            }
+            let latest = if dedup == UpsertDedup::KeepLast {
+                "b"
+            } else {
+                "a"
+            };
+            let statement = |rows: bool| {
+                let batches = if rows {
+                    vec![
+                        batch(&[(1, "a"), (2, "a")]),
+                        batch(&[(1, latest), (9, "new")]),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema(),
+                    futures::stream::iter(batches.into_iter().map(Ok)),
+                )) as SendableRecordBatchStream
+            };
+            let empty_snapshots = catalog
+                .get_all_snapshot_sequences(tables[2].table_id())
+                .await
+                .expect("snapshots");
+            let txn = CayenneTransaction::new();
+            for (index, table) in tables.iter().enumerate() {
+                let token = table.transaction_write_token().await;
+                txn.register(
+                    table.table_id().to_string(),
+                    token,
+                    table.clone_for_write_operations(),
+                );
+                let staged = table
+                    .begin_staged_upsert_occ(token, statement(index < 2), 2)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: stage: {error}"));
+                txn.set_staged(table.table_id(), staged);
+            }
+            txn.commit()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: commit: {error}"));
+            let written = (owned(&[(1, latest), (2, "a"), (9, "new")]), 3);
+            let untouched = (owned(&[(9, "old")]), 1);
+            for (name, table, expected) in [
+                ("t", &tables[0], &written),
+                ("u", &tables[1], &written),
+                ("empty", &tables[2], &untouched),
+            ] {
+                assert_eq!(&visible(table).await, expected, "{label}: {name} live");
+                let reopened =
+                    CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                        .with_upsert_dedup(dedup)
+                        .open(name)
+                        .await
+                        .expect("reopen");
+                assert_eq!(
+                    &visible(&reopened).await,
+                    expected,
+                    "{label}: {name} reopened"
+                );
+            }
+            assert_eq!(
+                catalog
+                    .get_all_snapshot_sequences(tables[2].table_id())
+                    .await
+                    .expect("snapshots"),
+                empty_snapshots,
+                "{label}: a table written no rows gains no snapshot"
+            );
+        }
+    }
+}
+
+/// A transaction's commit that reports a failure is resolved like an append's:
+/// by reading back whether the shared transaction committed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
+    use crate::provider::append_commit::test_seams::{self, CommitFault};
+    use crate::provider::transaction::CayenneTransaction;
+
+    let old = (owned(&[(9, "old")]), 1);
+    let new = (owned(&[(9, "new"), (10, "new")]), 2);
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        for fault in [
+            CommitFault::FailAfterCommit,
+            CommitFault::FailWithoutCommit,
+            CommitFault::FailAfterCommitUnreadable,
+        ] {
+            let label = format!("{mode:?}/{fault:?}");
+            let (first, catalog, runtime_env, dir) = seeded_streaming_table(mode).await;
+            let second =
+                CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                    .with_upsert_dedup(UpsertDedup::KeepLast)
+                    .create(CreateTableOptions {
+                        table_name: "u".to_string(),
+                        schema: schema(),
+                        primary_key: vec!["id".to_string()],
+                        on_conflict: Some(upsert_on_id()),
+                        base_path: dir.path().join("data").display().to_string(),
+                        partition_column: None,
+                        vortex_config: VortexConfig {
+                            deletion_mode: mode,
+                            inline_max_rows: 0,
+                            stream_publish_interval_ms: 0,
+                            compaction_background_interval_ms: 3_600_000,
+                            ..VortexConfig::default()
+                        },
+                    })
+                    .await
+                    .expect("create table");
+            write(&second, InsertOp::Append, vec![batch(&[(9, "old")])])
+                .await
+                .expect("seed");
+            let tables = [first, second];
+            let commit = || async {
+                let txn = CayenneTransaction::new();
+                for table in &tables {
+                    let token = table.transaction_write_token().await;
+                    txn.register(
+                        table.table_id().to_string(),
+                        token,
+                        table.clone_for_write_operations(),
+                    );
+                    let stream = Box::pin(RecordBatchStreamAdapter::new(
+                        schema(),
+                        futures::stream::iter([Ok(batch(&[(9, "new"), (10, "new")]))]),
+                    ));
+                    let staged = table
+                        .begin_staged_upsert_occ(token, stream, 1)
+                        .await
+                        .expect("stage");
+                    txn.set_staged(table.table_id(), staged);
+                }
+                txn.commit().await
+            };
+            // The fused commit consults the first participant in table id order.
+            let first_id = tables
+                .iter()
+                .map(CayenneTableProvider::table_id)
+                .min()
+                .expect("tables")
+                .to_string();
+            test_seams::inject(&first_id, fault);
+            let result = commit().await;
+            let durable = match fault {
+                CommitFault::FailAfterCommit => {
+                    result.unwrap_or_else(|error| panic!("{label}: published: {error}"));
+                    new.clone()
+                }
+                CommitFault::FailWithoutCommit => {
+                    let error = result.expect_err("an uncommitted transaction fails");
+                    assert!(
+                        error.to_string().contains("injected commit failure"),
+                        "{label}: {error}"
+                    );
+                    for table in &tables {
+                        assert_eq!(visible(table).await, old, "{label}: live rows");
+                    }
+                    commit()
+                        .await
+                        .unwrap_or_else(|error| panic!("{label}: retry: {error}"));
+                    new.clone()
+                }
+                CommitFault::FailAfterCommitUnreadable => {
+                    let error = result.expect_err("an unknown outcome fails");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("reading back whether it committed failed too"),
+                        "{label}: {error}"
+                    );
+                    for table in &tables {
+                        let error = write(table, InsertOp::Append, vec![batch(&[(11, "x")])])
+                            .await
+                            .expect_err("writes are refused after an unknown outcome");
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("writes are refused until the table is reloaded"),
+                            "{label}: {error}"
+                        );
+                    }
+                    new.clone()
+                }
+            };
+            for name in ["t", "u"] {
+                let reopened =
+                    CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                        .with_upsert_dedup(UpsertDedup::KeepLast)
+                        .open(name)
+                        .await
+                        .unwrap_or_else(|error| panic!("{label}: reopen {name}: {error}"));
+                assert_eq!(visible(&reopened).await, durable, "{label}: {name} reopened");
+            }
+        }
+    }
+}
