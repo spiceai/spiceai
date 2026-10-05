@@ -266,6 +266,14 @@ async fn build_gcs_parameters(
     )
     .await
     .map_err(|source| Error::GcsParameterValidation { usage, source })?;
+    // Same contract as the GCS data connector: `build_gcs_object_store` uses only one
+    // method, so a second one would be silently ignored.
+    data_connector_api::parameters::gcs::validate_auth(&params).map_err(|source| {
+        Error::GcsParameterValidation {
+            usage,
+            source: Box::new(source),
+        }
+    })?;
     Ok(params
         .to_secret_map()
         .into_iter()
@@ -564,6 +572,34 @@ mod tests {
         assert_eq!(
             invalid.to_string(),
             "Failed to validate GCS parameters for test state: Invalid configuration for test state. 'gcs_skip_signature' parameter must be one of: true, false. Found not-a-bool."
+        );
+    }
+
+    /// A `gs://` location takes one authentication method, as the GCS data connector
+    /// does: with `gcs_skip_signature: true` the store would silently ignore a key.
+    #[tokio::test]
+    async fn build_object_store_rejects_gcs_location_with_two_auth_methods() {
+        let params = Params::from_string_map(HashMap::from([
+            ("gcs_skip_signature".to_string(), "true".to_string()),
+            (
+                "gcs_service_account_key".to_string(),
+                r#"{"client_email": "state@example.com", "private_key": "", "private_key_id": ""}"#
+                    .to_string(),
+            ),
+        ]));
+
+        let err = build_object_store(
+            secrets(),
+            Handle::current(),
+            "gs://state-bucket/runtime/rate-control/",
+            Some(&params),
+            "test state",
+        )
+        .await
+        .expect_err("two GCS authentication methods are reported, not resolved silently");
+        assert_eq!(
+            err.to_string(),
+            "Failed to validate GCS parameters for test state: Multiple authentication methods were provided. Specify only one of the following: gcs_service_account_path, gcs_service_account_key, gcs_application_default_credentials, or gcs_skip_signature. For details, visit: https://spiceai.org/docs/components/data-connectors/gcs#auth"
         );
     }
 

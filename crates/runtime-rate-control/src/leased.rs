@@ -984,6 +984,88 @@ mod tests {
         );
     }
 
+    /// Newer-version state is unavailable state: the lease granted before it appeared
+    /// is still honored, and once that lease expires `acquire` fails closed instead of
+    /// waiting on a lease that can never be renewed.
+    #[tokio::test]
+    async fn state_from_a_newer_version_fails_closed_once_the_current_lease_expires() {
+        use object_store::ObjectStoreExt;
+
+        let store = Arc::new(InMemory::new());
+        let mut config = config_for(10, "a", Duration::from_secs(1));
+        config.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let bucket = LeasedBucket::new(config);
+        bucket
+            .refresh_lease()
+            .await
+            .expect("lease from an empty state location");
+
+        // A newer instance rewrites the shared document after this one holds a lease.
+        let mut newer = fresh_state(1_000);
+        newer.schema_version = PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION + 1;
+        let path = object_store::path::Path::from("test/origin.json");
+        let bytes = serde_json::to_vec(&newer).expect("serialize");
+        store
+            .put(&path, bytes.clone().into())
+            .await
+            .expect("seed newer state");
+
+        let err = bucket
+            .refresh_lease()
+            .await
+            .expect_err("a newer state version must not be overwritten");
+        assert!(
+            matches!(
+                err,
+                Error::NewerStateVersion { found, supported, .. }
+                    if found == PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION + 1
+                        && supported == PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION
+            ),
+            "{err}"
+        );
+
+        // The lease covers the current and the next window, so this permit comes from
+        // it even if the window rolled since the first refresh.
+        bucket
+            .acquire()
+            .await
+            .expect("the lease granted before the newer state appeared is still honored");
+
+        // Lease expiry is wall-clock time, so wait for the instant it passes: the end of
+        // the next 1 s window, at most 2 s away.
+        let lease_expires_at_ms = bucket.inner.lock().await.lease_expires_at_ms;
+        let now_ms = unix_millis_now();
+        assert!(
+            lease_expires_at_ms > now_ms && lease_expires_at_ms <= now_ms + 2_000,
+            "the lease must end with the next window: expires at {lease_expires_at_ms} ms, now {now_ms} ms"
+        );
+        while unix_millis_now() <= lease_expires_at_ms {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(5), bucket.acquire())
+            .await
+            .expect("acquire must fail closed after the lease expires, not wait for a renewal");
+        assert!(
+            matches!(&result, Err(Error::FailClosed { origin }) if origin == "https://example.com"),
+            "{result:?}"
+        );
+        assert_eq!(bucket.metrics.fail_closed_total(), 1);
+
+        let stored = store
+            .get(&path)
+            .await
+            .expect("state still there")
+            .bytes()
+            .await
+            .expect("body");
+        assert_eq!(
+            stored.as_ref(),
+            bytes.as_slice(),
+            "the newer state is untouched"
+        );
+    }
+
     #[tokio::test]
     async fn single_replica_lease_grants_bootstrap_share() {
         let bucket = LeasedBucket::new(config_for(10, "a", Duration::from_secs(1)));
