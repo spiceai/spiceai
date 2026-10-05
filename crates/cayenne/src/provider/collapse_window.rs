@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Resolving the keys a write repeats within bounded windows of its input.
 //!
-//! A [`CollapseWindow`] holds up to [`COLLAPSE_WINDOW_BYTES`] of resolved batches
+//! A [`CollapseWindow`] targets [`COLLAPSE_WINDOW_BYTES`] of resolved batches
 //! and keeps, for each key it holds more than once, the copy the policy keeps —
 //! the last under the upsert policies, the first under `drop` — so a write that
 //! cannot take the post-write resolution of [`super::overwrite_postpass`] (a
@@ -37,8 +37,8 @@ use hash_index::PrehashedBuildHasher;
 
 use super::key_conflicts::{KeyResolver, ResolvedBatch, Survivor};
 
-/// Bytes of input a [`CollapseWindow`] holds before it resolves the keys they
-/// repeat; the memory an upsert refresh or append holds for it.
+/// Retained-byte target for a [`CollapseWindow`], checked after each batch.
+/// The memory pool can reject a batch before the window reaches this target.
 pub(crate) const COLLAPSE_WINDOW_BYTES: usize = 128 * 1024 * 1024;
 
 /// Collapses the batches of a bounded window of the input — keeping the last
@@ -56,9 +56,6 @@ pub(crate) struct CollapseWindow {
     /// row survives and the drain filters nothing.
     repeats: bool,
     keeps: Survivor,
-    /// Set when the memory pool refused the window's growth: the window drains
-    /// at once, smaller than its bound, rather than failing the write.
-    refused: bool,
     reservation: MemoryReservation,
 }
 
@@ -71,12 +68,11 @@ impl CollapseWindow {
             survivor: HashMap::with_hasher(PrehashedBuildHasher),
             repeats: false,
             keeps,
-            refused: false,
             reservation,
         }
     }
 
-    fn push(&mut self, resolved: ResolvedBatch) {
+    fn push(&mut self, resolved: ResolvedBatch) -> super::Result<()> {
         let index = self.batches.len();
         for (row, &digest) in resolved.digests.iter().enumerate() {
             if self.keeps == Survivor::Earliest {
@@ -90,41 +86,73 @@ impl CollapseWindow {
                 self.repeats |= self.survivor.insert(digest, (index, row)).is_some();
             }
         }
-        self.bytes += resolved.batch.get_array_memory_size();
+        self.bytes += resolved_bytes(&resolved);
         self.batches.push(resolved);
-        if self.reservation.try_resize(self.held_bytes()).is_err() {
-            self.refused = true;
+        if let Err(error) = self.reservation.try_resize(self.held_bytes()) {
+            self.reset();
+            return Err(error.into());
         }
+        Ok(())
     }
 
-    /// Everything the window holds: its rows and the map of their keys.
+    /// Retained Arrow buffers, digest vectors, batch slots and key-map buckets.
     fn held_bytes(&self) -> usize {
-        // hashbrown: one control byte per bucket beside each digest and position.
-        self.bytes
-            + self.survivor.capacity() * (size_of::<u128>() + size_of::<(usize, usize)>() + 1)
+        // HashMap capacity excludes the empty buckets required by its load
+        // factor. Round up to the bucket count and include the control group.
+        let map_bytes = if self.survivor.capacity() == 0 {
+            0
+        } else {
+            let buckets = (self.survivor.capacity() + 1).next_power_of_two();
+            buckets * (size_of::<(u128, (usize, usize))>() + 1) + 16
+        };
+        self.bytes + self.batches.capacity() * size_of::<ResolvedBatch>() + map_bytes
     }
 
     fn is_full(&self) -> bool {
-        self.refused || self.held_bytes() >= self.max_bytes
+        self.held_bytes() >= self.max_bytes
     }
 
-    /// Release the window's rows and its map, capacity included, so a window
-    /// holds at most its bound and nothing between windows.
+    /// Release all retained allocations and their reservation.
     fn reset(&mut self) {
+        self.batches = Vec::new();
         self.survivor = HashMap::with_hasher(PrehashedBuildHasher);
         self.bytes = 0;
-        self.refused = false;
+        self.repeats = false;
         self.reservation.free();
     }
 
-    fn drain(&mut self) -> super::Result<VecDeque<ResolvedBatch>> {
-        if !std::mem::take(&mut self.repeats) {
-            let out = std::mem::take(&mut self.batches).into();
-            self.reset();
-            return Ok(out);
-        }
-        let mut out = VecDeque::with_capacity(self.batches.len());
-        for (index, resolved) in std::mem::take(&mut self.batches).into_iter().enumerate() {
+    /// Transfer the charge to the batches waiting for the consumer.
+    fn drain(&mut self) -> super::Result<(VecDeque<ResolvedBatch>, MemoryReservation)> {
+        let reservation = self.reservation.take();
+        let batches = std::mem::take(&mut self.batches);
+        let result = (|| {
+            let out = if self.repeats {
+                self.filter_batches(batches, &reservation)?
+            } else {
+                batches.into()
+            };
+            let bytes = out.iter().map(resolved_bytes).sum::<usize>()
+                + out.capacity() * size_of::<ResolvedBatch>();
+            reservation.try_resize(bytes)?;
+            Ok((out, reservation))
+        })();
+        self.reset();
+        result
+    }
+
+    fn filter_batches(
+        &self,
+        batches: Vec<ResolvedBatch>,
+        reservation: &MemoryReservation,
+    ) -> super::Result<VecDeque<ResolvedBatch>> {
+        // The original buffers stay charged while filtering allocates their
+        // replacements. Include the output slots and temporary selection mask.
+        let filtered = reservation.new_empty();
+        filtered.try_grow(batches.len() * size_of::<ResolvedBatch>())?;
+        let mut out = VecDeque::with_capacity(batches.len());
+        for (index, resolved) in batches.into_iter().enumerate() {
+            let mask = reservation.new_empty();
+            mask.try_grow(resolved.digests.len().div_ceil(8) + 64 + size_of::<BooleanArray>())?;
             let keep: BooleanArray = resolved
                 .digests
                 .iter()
@@ -139,6 +167,7 @@ impl CollapseWindow {
                 out.push_back(resolved);
                 continue;
             }
+            filtered.try_grow(resolved_bytes(&resolved))?;
             let digests = resolved
                 .digests
                 .iter()
@@ -150,9 +179,12 @@ impl CollapseWindow {
                 digests,
             });
         }
-        self.reset();
         Ok(out)
     }
+}
+
+fn resolved_bytes(resolved: &ResolvedBatch) -> usize {
+    resolved.batch.get_array_memory_size() + resolved.digests.capacity() * size_of::<u128>()
 }
 
 /// Resolves each input batch's own repeats and, with a window, the repeats a
@@ -163,6 +195,7 @@ struct Collapser {
     window: Option<CollapseWindow>,
     /// Resolved batches waiting to be yielded.
     ready: VecDeque<ResolvedBatch>,
+    ready_reservation: Option<MemoryReservation>,
     exhausted: bool,
 }
 
@@ -177,8 +210,25 @@ impl Collapser {
             resolver,
             window,
             ready: VecDeque::new(),
+            ready_reservation: None,
             exhausted: false,
         }
+    }
+
+    fn drain_window(&mut self) -> super::Result<()> {
+        if let Some(window) = &mut self.window {
+            let (ready, reservation) = window.drain()?;
+            self.ready = ready;
+            self.ready_reservation = Some(reservation);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        self.exhausted = true;
+        self.ready = VecDeque::new();
+        self.ready_reservation = None;
+        self.window = None;
     }
 
     /// The next non-empty resolved batch. After an error the collapser yields
@@ -189,6 +239,12 @@ impl Collapser {
     ) -> Poll<Option<datafusion_common::Result<ResolvedBatch>>> {
         loop {
             if let Some(resolved) = self.ready.pop_front() {
+                if self.ready.is_empty() {
+                    self.ready = VecDeque::new();
+                    self.ready_reservation = None;
+                } else if let Some(reservation) = &self.ready_reservation {
+                    reservation.shrink(resolved_bytes(&resolved));
+                }
                 if resolved.batch.num_rows() == 0 {
                     continue;
                 }
@@ -206,9 +262,9 @@ impl Collapser {
                                 Ok(())
                             }
                             Some(window) => {
-                                window.push(resolved);
+                                window.push(resolved)?;
                                 if window.is_full() {
-                                    self.ready = window.drain()?;
+                                    self.drain_window()?;
                                 }
                                 Ok(())
                             }
@@ -216,21 +272,17 @@ impl Collapser {
                     })
                 }
                 Poll::Ready(Some(Err(error))) => {
-                    self.exhausted = true;
+                    self.finish();
                     return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(None) => {
                     self.exhausted = true;
-                    match self.window.as_mut() {
-                        Some(window) => window.drain().map(|ready| self.ready = ready),
-                        None => Ok(()),
-                    }
+                    self.drain_window()
                 }
                 Poll::Pending => return Poll::Pending,
             };
             if let Err(error) = step {
-                self.exhausted = true;
-                self.ready.clear();
+                self.finish();
                 return Poll::Ready(Some(Err(error.into())));
             }
         }
@@ -387,7 +439,7 @@ mod tests {
         resolved.digests.reserve(1024);
         let retained_digests = resolved.digests.capacity() * size_of::<u128>();
         let arrays = resolved.batch.get_array_memory_size();
-        window.push(resolved);
+        window.push(resolved).expect("reserve window");
         assert!(
             pool.reserved() >= arrays + retained_digests,
             "the retained digest capacity must remain charged: {} reserved for at least {} bytes",
@@ -421,8 +473,84 @@ mod tests {
         assert_eq!(pool.reserved(), 0);
     }
 
-    /// The window's bound covers everything it holds — its rows and the map of
-    /// their keys — and holds no more than one window's worth after a drain.
+    #[tokio::test]
+    async fn reservation_refusal_drops_buffered_data() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(
+            datafusion_execution::memory_pool::GreedyMemoryPool::new(128),
+        );
+        let mut stream = CollapseStream::new(
+            input(vec![batch(&[(1, "a")])]),
+            resolver(ConflictPolicy::UpsertKeepLast),
+            COLLAPSE_WINDOW_BYTES,
+            MemoryConsumer::new("window").register(&pool),
+        );
+        let error = stream
+            .next()
+            .await
+            .expect("reservation error")
+            .expect_err("the window exceeds the pool");
+        assert!(matches!(
+            error.find_root(),
+            datafusion_common::DataFusionError::ResourcesExhausted(_)
+        ));
+        assert_eq!(pool.reserved(), 0);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn input_error_releases_the_buffered_window() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let source = RecordBatchStreamAdapter::new(
+            schema(),
+            futures::stream::iter([
+                Ok(batch(&[(1, "a")])),
+                Err(datafusion_common::DataFusionError::Execution(
+                    "source failed".to_string(),
+                )),
+            ]),
+        );
+        let mut stream = CollapseStream::new(
+            Box::pin(source),
+            resolver(ConflictPolicy::UpsertKeepLast),
+            COLLAPSE_WINDOW_BYTES,
+            MemoryConsumer::new("window").register(&pool),
+        );
+        let error = stream
+            .next()
+            .await
+            .expect("source error")
+            .expect_err("the buffered window is not yielded after a source error");
+        assert_eq!(error.to_string(), "Execution error: source failed");
+        assert_eq!(pool.reserved(), 0);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn filtered_output_stays_charged_until_transferred() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let second = batch(&[(1, "c"), (3, "d")]);
+        let retained = second.get_array_memory_size() + 2 * size_of::<u128>();
+        let mut stream = CollapseStream::new(
+            input(vec![batch(&[(1, "a"), (2, "b")]), second.clone()]),
+            resolver(ConflictPolicy::UpsertKeepLast),
+            COLLAPSE_WINDOW_BYTES,
+            MemoryConsumer::new("window").register(&pool),
+        );
+        assert_eq!(
+            stream.next().await.expect("first").expect("collapse"),
+            batch(&[(2, "b")]),
+        );
+        assert!(pool.reserved() >= retained);
+        assert_eq!(
+            stream.next().await.expect("second").expect("collapse"),
+            second,
+        );
+        assert_eq!(pool.reserved(), 0);
+        assert!(stream.next().await.is_none());
+    }
+
+    /// The window's target covers its retained buffers and key-map allocation,
+    /// and no allocation from the prior window remains after a drain.
     #[test]
     fn a_window_stays_within_its_bound() {
         const BOUND: usize = 8 * 1024 * 1024;
@@ -438,7 +566,9 @@ mod tests {
                 .collect();
             next_id += rows;
             let rows: Vec<(i64, &str)> = ids.iter().map(|(id, v)| (*id, v.as_str())).collect();
-            window.push(resolver.resolve_batch(&batch(&rows)).expect("resolve"));
+            window
+                .push(resolver.resolve_batch(&batch(&rows)).expect("resolve"))
+                .expect("reserve window");
         };
         while !window.is_full() {
             push(&mut window, 8192);
