@@ -729,6 +729,8 @@ mod tests {
     use tokio::runtime::Handle;
     use tokio::sync::RwLock;
 
+    const MISSING_REGION_MESSAGE: &str = "Missing required parameter: spiceai_region. Set it to the region of the Spice Cloud app the dataset reads from, for example 'spiceai_region: us-east-1'. To list available regions, run: 'spice cloud regions'. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration";
+
     async fn make_params(params: Vec<(String, SecretString)>) -> ConnectorParams {
         make_params_for_from("spice.ai/test.table", params).await
     }
@@ -972,11 +974,10 @@ mod tests {
         let endpoint = spice_cloud_flight_endpoint("us-east-1");
         let error = get_credentials(&params, &endpoint)
             .expect_err("missing cloud credentials should return an error");
-        assert!(matches!(
-            error,
-            Error::MissingRequiredParameter { parameter }
-            if parameter == "api_key or token"
-        ));
+        assert_eq!(
+            error.to_string(),
+            "Missing required parameter: spiceai_api_key or spiceai_token. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
+        );
     }
 
     #[tokio::test]
@@ -1085,11 +1086,7 @@ mod tests {
         let params = make_params(vec![]).await;
 
         let error = get_endpoint(&params).expect_err("missing cloud region should error");
-        assert!(matches!(
-            error,
-            Error::MissingRequiredParameter { parameter }
-            if parameter == "region"
-        ));
+        assert_eq!(error.to_string(), MISSING_REGION_MESSAGE);
     }
 
     #[tokio::test]
@@ -1122,11 +1119,7 @@ mod tests {
         .await;
 
         let error = get_endpoint(&params).expect_err("cloud endpoint should require region");
-        assert!(matches!(
-            error,
-            Error::MissingRequiredParameter { parameter }
-            if parameter == "region"
-        ));
+        assert_eq!(error.to_string(), MISSING_REGION_MESSAGE);
     }
 
     #[tokio::test]
