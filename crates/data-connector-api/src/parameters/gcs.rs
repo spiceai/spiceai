@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use runtime_parameters::Parameters;
 use snafu::prelude::*;
 use tonic::async_trait;
 
@@ -27,6 +28,46 @@ pub enum Error {
     MultipleAuthMethods,
 }
 
+/// Ensures at most one GCS authentication method is set.
+///
+/// `gcs_skip_signature` and `gcs_application_default_credentials` count only
+/// when they are `true`. The GCS data connector and `gs://` state locations
+/// share this check so both accept the same parameter contract.
+///
+/// # Errors
+///
+/// Returns [`Error::MultipleAuthMethods`] when more than one method is set.
+pub fn validate_auth_methods(params: &Parameters) -> Result<(), Error> {
+    let has_service_account_path = params.get("service_account_path").expose().ok().is_some();
+    let has_service_account_key = params.get("service_account_key").expose().ok().is_some();
+
+    let has_skip_signature = params
+        .get("skip_signature")
+        .expose()
+        .ok()
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+    let has_application_default_credentials = params
+        .get("application_default_credentials")
+        .expose()
+        .ok()
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+    let auth_method_count = [
+        has_service_account_path,
+        has_service_account_key,
+        has_skip_signature,
+        has_application_default_credentials,
+    ]
+    .iter()
+    .filter(|&&b| b)
+    .count();
+
+    ensure!(auth_method_count <= 1, MultipleAuthMethods);
+
+    Ok(())
+}
+
 /// Validates GCS authentication configuration.
 /// Ensures only one authentication method is used.
 pub struct GcsAuthValidator;
@@ -36,52 +77,7 @@ impl Validator for GcsAuthValidator {
     type Error = Error;
 
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Error> {
-        // Check for each authentication method
-        let has_service_account_path = params
-            .parameters
-            .get("service_account_path")
-            .expose()
-            .ok()
-            .is_some();
-        let has_service_account_key = params
-            .parameters
-            .get("service_account_key")
-            .expose()
-            .ok()
-            .is_some();
-
-        // skip_signature must be explicitly "true" to count as an auth method
-        let has_skip_signature = params
-            .parameters
-            .get("skip_signature")
-            .expose()
-            .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
-        // application_default_credentials must be explicitly "true" to count as an auth method
-        let has_application_default_credentials = params
-            .parameters
-            .get("application_default_credentials")
-            .expose()
-            .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
-        // Count active authentication methods
-        let auth_method_count = [
-            has_service_account_path,
-            has_service_account_key,
-            has_skip_signature,
-            has_application_default_credentials,
-        ]
-        .iter()
-        .filter(|&&b| b)
-        .count();
-
-        if auth_method_count > 1 {
-            return Err(Error::MultipleAuthMethods);
-        }
-
-        Ok(())
+        validate_auth_methods(&params.parameters)
     }
 }
 
@@ -166,5 +162,51 @@ mod tests {
             .validate(&mut params)
             .await
             .expect("no auth method should be valid");
+    }
+
+    #[test]
+    fn skip_signature_true_conflicts_with_service_account_key() {
+        let params = Parameters::new(
+            to_secret_map(
+                [
+                    ("skip_signature".to_string(), "true".to_string()),
+                    (
+                        "service_account_key".to_string(),
+                        "{\"type\":\"service_account\"}".to_string(),
+                    ),
+                ]
+                .into(),
+            )
+            .into_iter()
+            .collect(),
+            "gcs",
+            TEST_PARAMETERS,
+        );
+        assert!(matches!(
+            validate_auth_methods(&params),
+            Err(Error::MultipleAuthMethods)
+        ));
+    }
+
+    #[test]
+    fn skip_signature_false_does_not_conflict_with_service_account_key() {
+        let params = Parameters::new(
+            to_secret_map(
+                [
+                    ("skip_signature".to_string(), "false".to_string()),
+                    (
+                        "service_account_key".to_string(),
+                        "{\"type\":\"service_account\"}".to_string(),
+                    ),
+                ]
+                .into(),
+            )
+            .into_iter()
+            .collect(),
+            "gcs",
+            TEST_PARAMETERS,
+        );
+        validate_auth_methods(&params)
+            .expect("skip_signature=false should not conflict with service_account_key");
     }
 }

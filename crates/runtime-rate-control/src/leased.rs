@@ -984,6 +984,85 @@ mod tests {
         );
     }
 
+    /// A newer-version document is left alone, and after that lease expires
+    /// `acquire` fails closed instead of over-admitting.
+    #[tokio::test]
+    async fn newer_state_version_fails_closed_after_lease_expires() {
+        use object_store::ObjectStoreExt;
+
+        let window = Duration::from_millis(100);
+        let store = Arc::new(InMemory::new());
+        let mut config = config_for(10, "a", window);
+        config.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
+
+        let bucket = LeasedBucket::new(config);
+        bucket
+            .refresh_lease()
+            .await
+            .expect("initial lease should succeed");
+        bucket
+            .acquire()
+            .await
+            .expect("the current lease must still admit");
+
+        let mut newer = fresh_state(duration_millis_u64(window));
+        newer.schema_version = PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION + 1;
+        let path = object_store::path::Path::from("test/origin.json");
+        let bytes = serde_json::to_vec(&newer).expect("serialize");
+        store
+            .put(&path, bytes.clone().into())
+            .await
+            .expect("seed newer state");
+
+        let err = bucket
+            .refresh_lease()
+            .await
+            .expect_err("a newer state version must not be overwritten");
+        assert!(matches!(err, Error::NewerStateVersion { .. }), "{err}");
+
+        let stored = store
+            .get(&path)
+            .await
+            .expect("state still there")
+            .bytes()
+            .await
+            .expect("body");
+        assert_eq!(
+            stored.as_ref(),
+            bytes.as_slice(),
+            "the newer state is untouched"
+        );
+
+        let expires_at_ms = {
+            let inner = bucket.inner.lock().await;
+            assert!(
+                inner.last_attempt_failed,
+                "refresh must mark the lease failing so acquire can fail closed"
+            );
+            inner.lease_expires_at_ms
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let now_ms = unix_millis_now();
+            if now_ms >= expires_at_ms {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lease expiry not reached; now_ms={now_ms} expires_at_ms={expires_at_ms}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let err = bucket
+            .acquire()
+            .await
+            .expect_err("acquire must fail closed after the lease expires");
+        assert!(matches!(err, Error::FailClosed { .. }), "{err}");
+        assert_eq!(bucket.metrics.fail_closed_total(), 1);
+    }
+
     #[tokio::test]
     async fn single_replica_lease_grants_bootstrap_share() {
         let bucket = LeasedBucket::new(config_for(10, "a", Duration::from_secs(1)));

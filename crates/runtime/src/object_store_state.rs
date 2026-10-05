@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
+use data_connector_api::parameters::gcs;
 use object_store::ObjectStore;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_object_store::{build_azure_object_store, build_gcs_object_store};
@@ -266,6 +267,10 @@ async fn build_gcs_parameters(
     )
     .await
     .map_err(|source| Error::GcsParameterValidation { usage, source })?;
+    gcs::validate_auth_methods(&params).map_err(|source| Error::GcsParameterValidation {
+        usage,
+        source: Box::new(source),
+    })?;
     Ok(params
         .to_secret_map()
         .into_iter()
@@ -564,6 +569,26 @@ mod tests {
         assert_eq!(
             invalid.to_string(),
             "Failed to validate GCS parameters for test state: Invalid configuration for test state. 'gcs_skip_signature' parameter must be one of: true, false. Found not-a-bool."
+        );
+
+        let conflicting = build_object_store(
+            secrets(),
+            Handle::current(),
+            "gs://state-bucket/",
+            Some(&Params::from_string_map(HashMap::from([
+                ("gcs_skip_signature".to_string(), "true".to_string()),
+                (
+                    "gcs_service_account_key".to_string(),
+                    "{\"type\":\"service_account\"}".to_string(),
+                ),
+            ]))),
+            "test state",
+        )
+        .await
+        .expect_err("two GCS auth methods are rejected, not silently ignored");
+        assert_eq!(
+            conflicting.to_string(),
+            "Failed to validate GCS parameters for test state: Multiple authentication methods were provided. Specify only one of the following: gcs_service_account_path, gcs_service_account_key, gcs_application_default_credentials, or gcs_skip_signature. For details, visit: https://spiceai.org/docs/components/data-connectors/gcs#auth"
         );
     }
 
