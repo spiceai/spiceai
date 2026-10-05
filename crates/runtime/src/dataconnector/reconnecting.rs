@@ -296,9 +296,15 @@ impl DataConnector for ReconnectingConnector {
         &self,
         dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        match self.built() {
-            Some(inner) => inner.metadata_provider(dataset).await,
-            None => None,
+        if !dataset.has_metadata_table {
+            return None;
+        }
+
+        // Registration asks for metadata once, so the connector must exist before
+        // it can decide whether a metadata table is supported.
+        match self.connector(dataset).await {
+            Ok(inner) => inner.metadata_provider(dataset).await,
+            Err(err) => Some(Err(err)),
         }
     }
 
@@ -423,3 +429,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "reconnecting/metadata_tests.rs"]
+mod metadata_tests;
