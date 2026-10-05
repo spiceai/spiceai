@@ -51,7 +51,7 @@ use std::sync::Arc;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: open. Specify a DuckDB file with the `open` parameter"
+        "Missing required parameter `duckdb_open`. Set it to the DuckDB database file to read, for example `duckdb_open: ./data.duckdb`. For details, visit: https://spiceai.org/docs/components/data-connectors/duckdb"
     ))]
     MissingDuckDBFile,
 }
