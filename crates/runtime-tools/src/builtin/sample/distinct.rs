@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow_schema::DataType;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use itertools::Itertools;
 use std::{
     fmt::{Display, Formatter},

@@ -49,7 +49,10 @@ use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
 use ::datafusion::error::DataFusionError;
-use ::datafusion::sql::{ResolvedTableReference, TableReference, sqlparser};
+use ::datafusion::{
+    common::{ResolvedTableReference, TableReference},
+    sql::sqlparser,
+};
 use app::App;
 
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
