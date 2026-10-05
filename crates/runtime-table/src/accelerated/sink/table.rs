@@ -238,7 +238,7 @@ impl TableSink {
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
-        refresh: &util::session_state::RefreshWrite,
+        write: &super::RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
         let start = std::time::Instant::now();
         tracing::debug!(
@@ -247,7 +247,7 @@ impl TableSink {
         );
 
         let ctx = util::session_state::session_context();
-        let state = util::session_state::mark_refresh_write(ctx.state(), refresh);
+        let state = write.state(&ctx.state());
         let target_schema = self.table_provider.schema();
         warn_on_narrowing_schema_cast(
             &self.dataset_name,
@@ -314,7 +314,7 @@ impl TableSink {
         .map_err(retry_from_df_error)?;
 
         let collect_start = std::time::Instant::now();
-        if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
+        if let Err(e) = collect(insertion_plan, state.task_ctx()).await {
             tracing::debug!(
                 "TableSink: collect() failed after {:.2}s: {e}",
                 collect_start.elapsed().as_secs_f64()

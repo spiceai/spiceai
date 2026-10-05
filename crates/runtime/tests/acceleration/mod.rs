@@ -84,7 +84,7 @@ mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
 mod snapshot_mutex;
 #[cfg(not(target_os = "windows"))]
-mod upsert_dedup_by_time_column;
+mod upsert_by_time;
 #[cfg(feature = "sqlite")]
 mod user_function_pushdown;
 

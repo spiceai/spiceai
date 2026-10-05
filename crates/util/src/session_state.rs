@@ -46,41 +46,94 @@ pub fn session_context() -> SessionContext {
     SessionContext::new_with_config(session_config())
 }
 
-/// Marks a session as a user's statement writing into an acceleration (an
-/// `INSERT`, or a write inside `BEGIN … COMMIT`), as opposed to the
-/// accelerator's own writes: refreshes and change streams.
-///
-/// An accelerator applies a dataset's `on_conflict` to the keys its own writes'
-/// incoming data repeats (each record batch one upsert); a user's statement
-/// keeps its own semantics. Every other write is the accelerator's own, so a
-/// write path that forgets the marker still resolves repeats rather than
-/// storing them. [`mark_user_statement`] sets it, and [`is_user_statement`]
-/// reads it.
-#[derive(Debug, Default)]
-pub struct UserStatementWrite;
+/// Why a write did not keep a row it received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersededReason {
+    /// An identical copy of a row the write kept.
+    Unchanged,
+    /// A different version of a key, settled by the order versions arrived in.
+    Arrival,
+    /// A version of a key with an earlier time than the version kept.
+    Older,
+    /// A version of a key with the kept version's time but different content.
+    EqualTime,
+}
 
-/// `state` marked as a user's statement; see [`UserStatementWrite`].
+impl SupersededReason {
+    pub const ALL: [Self; 4] = [Self::Unchanged, Self::Arrival, Self::Older, Self::EqualTime];
+
+    /// The `reason` label a metric reports this under.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::Arrival => "arrival",
+            Self::Older => "older",
+            Self::EqualTime => "equal_time",
+        }
+    }
+
+    /// Why a copy with version `loser` lost to `winner`, each a `(time, content
+    /// hash)` from [`RowVersions`].
+    #[must_use]
+    pub fn of_version(loser: (i64, u64), winner: (i64, u64)) -> Self {
+        if loser.0 < winner.0 {
+            Self::Older
+        } else if loser.1 == winner.1 {
+            Self::Unchanged
+        } else {
+            Self::EqualTime
+        }
+    }
+}
+
+/// The rows a write received but did not keep, by [`SupersededReason`]. A
+/// caller attaches one to the session that runs the write
+/// ([`with_superseded_rows`]); the accelerator counts into it.
+#[derive(Debug, Default)]
+pub struct SupersededRows {
+    counts: [std::sync::atomic::AtomicU64; SupersededReason::ALL.len()],
+}
+
+impl SupersededRows {
+    fn counter(&self, reason: SupersededReason) -> &std::sync::atomic::AtomicU64 {
+        &self.counts[reason as usize]
+    }
+
+    pub fn add(&self, reason: SupersededReason, rows: u64) {
+        if rows > 0 {
+            self.counter(reason)
+                .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, reason: SupersededReason) -> u64 {
+        self.counter(reason)
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// `state` with `rows` attached, for the accelerator to count the rows the
+/// write it runs does not keep; see [`SupersededRows`].
 #[must_use]
-pub fn mark_user_statement(state: &SessionState) -> SessionState {
+pub fn with_superseded_rows(state: &SessionState, rows: Arc<SupersededRows>) -> SessionState {
     let mut state = state.clone();
-    state
-        .config_mut()
-        .set_extension(Arc::new(UserStatementWrite));
+    state.config_mut().set_extension(rows);
     state
 }
 
-/// Whether `config` belongs to a user's statement; see [`UserStatementWrite`].
+/// The [`SupersededRows`] attached to `config`, if any.
 #[must_use]
-pub fn is_user_statement(config: &SessionConfig) -> bool {
-    config.get_extension::<UserStatementWrite>().is_some()
+pub fn superseded_rows(config: &SessionConfig) -> Option<Arc<SupersededRows>> {
+    config.get_extension::<SupersededRows>()
 }
 
 /// Orders the copies of a key a write repeats by the version each row carries,
 /// rather than by the order they arrive in: the row with the greatest
 /// `(time, content hash)` is kept. Implemented by the writer that knows how to read
-/// a row's version (for `on_conflict: upsert_dedup_by_time_column`, its
-/// `time_column`); read by an accelerator that resolves repeated keys after
-/// writing them.
+/// a row's version (for `on_conflict: upsert_by_time`, its `time_column`); read by
+/// an accelerator that resolves repeated keys after writing them.
 pub trait RowVersions: Send + Sync + std::fmt::Debug {
     /// Each row of `batch`'s time, as UTC nanoseconds, and content hash. The hash
     /// is 63 bits: its lowest bit is always clear. A row whose time cannot be read
@@ -95,66 +148,18 @@ pub trait RowVersions: Send + Sync + std::fmt::Debug {
     ) -> datafusion::error::Result<(arrow::array::Int64Array, arrow::array::UInt64Array)>;
 }
 
-/// The copies of a repeated key a write did not keep, by why.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct SupersededCounts {
-    /// Resolved by arrival order per `on_conflict` (a later copy wins under
-    /// `upsert`, the first under `drop`).
-    pub repeated: u64,
-    /// A copy with an earlier time than the version kept.
-    pub older: u64,
-    /// A copy with the kept version's time but different content.
-    pub equal_time: u64,
-    /// A copy identical in time and content to the version kept.
-    pub unchanged: u64,
-}
+/// The [`RowVersions`] a write orders a key's copies by; see [`with_row_versions`].
+#[derive(Debug)]
+struct WriteRowVersions(Arc<dyn RowVersions>);
 
-impl SupersededCounts {
-    /// Add `other` to these counts.
-    pub fn add(&mut self, other: &Self) {
-        self.repeated += other.repeated;
-        self.older += other.older;
-        self.equal_time += other.equal_time;
-        self.unchanged += other.unchanged;
-    }
-
-    /// Whether no copy was superseded.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-
-    /// Count a copy with version `loser` that lost to `winner`, each a
-    /// `(time, content hash)`.
-    pub fn count(&mut self, loser: (i64, u64), winner: (i64, u64)) {
-        if loser.0 < winner.0 {
-            self.older += 1;
-        } else if loser.1 == winner.1 {
-            self.unchanged += 1;
-        } else {
-            self.equal_time += 1;
-        }
-    }
-}
-
-/// Receives what an accelerator's write superseded, so the writer can record it.
-pub trait SupersededReport: Send + Sync + std::fmt::Debug {
-    fn superseded(&self, counts: &SupersededCounts);
-}
-
-/// What a refresh's write carries to the accelerator: how to order a key's copies,
-/// and where to report the ones it does not keep. See [`mark_refresh_write`].
-#[derive(Debug, Clone, Default)]
-pub struct RefreshWrite {
-    pub row_versions: Option<Arc<dyn RowVersions>>,
-    pub superseded: Option<Arc<dyn SupersededReport>>,
-}
-
-/// `state` carrying `refresh`, so the accelerator's write can read it.
+/// `state` carrying `versions`, so the accelerator's write orders a key's copies
+/// by them.
 #[must_use]
-pub fn mark_refresh_write(state: SessionState, refresh: &RefreshWrite) -> SessionState {
-    let mut state = state;
-    state.config_mut().set_extension(Arc::new(refresh.clone()));
+pub fn with_row_versions(state: &SessionState, versions: Arc<dyn RowVersions>) -> SessionState {
+    let mut state = state.clone();
+    state
+        .config_mut()
+        .set_extension(Arc::new(WriteRowVersions(versions)));
     state
 }
 
@@ -162,16 +167,8 @@ pub fn mark_refresh_write(state: SessionState, refresh: &RefreshWrite) -> Sessio
 #[must_use]
 pub fn row_versions(config: &SessionConfig) -> Option<Arc<dyn RowVersions>> {
     config
-        .get_extension::<RefreshWrite>()
-        .and_then(|refresh| refresh.row_versions.clone())
-}
-
-/// Where a write's `config` asks it to report superseded copies, if anywhere.
-#[must_use]
-pub fn superseded_report(config: &SessionConfig) -> Option<Arc<dyn SupersededReport>> {
-    config
-        .get_extension::<RefreshWrite>()
-        .and_then(|refresh| refresh.superseded.clone())
+        .get_extension::<WriteRowVersions>()
+        .map(|versions| Arc::clone(&versions.0))
 }
 
 /// A [`TaskContext`] carrying [`session_config`], for executing a plan outside

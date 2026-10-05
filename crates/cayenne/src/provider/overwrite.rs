@@ -291,12 +291,6 @@ impl PreparedOverwrite {
 
     /// The steps of [`Self::finish`], run on their own task.
     async fn publish(self) -> Result<u64> {
-        // Finish the secondary index before the visibility flip, which publishes
-        // it together with the snapshot. Finishing it after the flip would leave
-        // a window in which every lookup falls back to a full scan.
-        self.table
-            .stage_lookup_index_for_snapshot(&self.new_snapshot_id)
-            .await;
         // Publish the new snapshot as a single atomic visibility flip under the listing
         // fence (snapshot id + deletion caches + inline cache + listing swap), so a
         // concurrent scan never observes a torn state. Full rationale on
@@ -433,9 +427,6 @@ impl PreparedOverwrite {
         // staged snapshot directory is mid-deletion.
         let _write_guard = self.write_guard;
         let _checkpoint_guard = self.checkpoint_guard;
-
-        // The snapshot these postings address is about to be deleted.
-        self.table.discard_lookup_index_build();
 
         // Best-effort cleanup of the new snapshot directory. Object stores
         // (S3) don't have a single "remove dir" call; we leave object-store
@@ -676,10 +667,9 @@ impl CayenneTableProvider {
         // its rows with its arrival sequence, and once the files are written a
         // query finds every copy other than the one the policy keeps — the last
         // under the upsert policies, the first under `drop`.
-        // A writer that supplies row versions (`upsert_dedup_by_time_column`)
-        // orders the copies by version instead of arrival.
+        // A writer that supplies row versions (`upsert_by_time`) orders the copies
+        // by version instead of arrival.
         let mut postpass: Option<(CopyOrder, Vec<String>)> = None;
-        let mut batch_superseded = None;
         let mut dedup_share: Option<super::overwrite_postpass::DedupShare> = None;
         let data: SendableRecordBatchStream = match self.key_resolver()? {
             None => data,
@@ -694,14 +684,17 @@ impl CayenneTableProvider {
                     order,
                     super::overwrite_postpass::key_column_names(&self.table_schema(), &indices),
                 ));
-                let hidden = super::overwrite_postpass::hidden_columns(&self.table_schema());
-                let arrival =
-                    super::overwrite_postpass::ArrivalStream::new(data, resolver, &hidden.arrival);
-                batch_superseded = Some(arrival.superseded());
+                let table_schema = self.table_schema();
+                let arrival = super::overwrite_postpass::ArrivalStream::new(
+                    data,
+                    resolver,
+                    &super::overwrite_postpass::arrival_column(&table_schema),
+                );
                 match &self.row_versions {
-                    Some(versions) => {
-                        Box::pin(arrival.with_versions(Arc::clone(versions), &hidden))
-                    }
+                    Some(versions) => Box::pin(arrival.with_versions(
+                        Arc::clone(versions),
+                        &super::overwrite_postpass::version_columns(&table_schema),
+                    )),
                     None => Box::pin(arrival),
                 }
             }
@@ -724,27 +717,10 @@ impl CayenneTableProvider {
         };
 
         let target_size_bytes = self.target_file_size_bytes();
-        // Build the point-lookup index from the rows this write is already
-        // touching. The sink reports each batch's file and file-local position,
-        // so the index is complete when the write is — no second pass over the
-        // finished files, and nothing to rebuild after the flip.
-        let lookup_index_observer = self.begin_lookup_index_build(&new_snapshot_id);
-        // A table that deletes by key folds the superseded copies out of the
-        // snapshot before publishing it, which rewrites the files that hold them;
-        // recording each file's statistics as it is written is what keeps the
-        // table's statistics exact over the files that survive.
-        let file_stats = (postpass.is_some() && !self.should_capture_positions()).then(|| {
-            Arc::new(FileStatsObserver::new(
-                self.table_schema(),
-                lookup_index_observer.as_ref().map(Arc::clone),
-            ))
-        });
-        let write_observer = match &file_stats {
-            Some(stats) => {
-                Some(Arc::clone(stats) as Arc<dyn vortex_datafusion::VortexWriteObserver>)
-            }
-            None => lookup_index_observer,
-        };
+        // A key-deletion table rewrites files containing superseded copies.
+        // Per-file statistics preserve exact counts for the surviving files.
+        let file_stats = (postpass.is_some() && !self.should_capture_positions())
+            .then(|| Arc::new(FileStatsObserver::new(self.table_schema(), None)));
         // Overwrite replaces the entire table, and anything that reached here did
         // not fit the inline caps, so it is large by definition; shard across the
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
@@ -760,11 +736,15 @@ impl CayenneTableProvider {
         let write_schema = match &postpass {
             Some((order, _)) => {
                 let table_schema = self.table_schema();
-                let hidden = super::overwrite_postpass::hidden_columns(&table_schema);
+                let arrival = super::overwrite_postpass::arrival_column(&table_schema);
                 if matches!(order, CopyOrder::Version) {
-                    super::overwrite_postpass::with_versions(&table_schema, &hidden)
+                    super::overwrite_postpass::with_versions(
+                        &table_schema,
+                        &arrival,
+                        &super::overwrite_postpass::version_columns(&table_schema),
+                    )
                 } else {
-                    super::overwrite_postpass::with_arrival(&table_schema, &hidden.arrival)
+                    super::overwrite_postpass::with_arrival(&table_schema, &arrival)
                 }
             }
             None => self.table_schema(),
@@ -782,7 +762,7 @@ impl CayenneTableProvider {
                         RangePartitioning::hashed_run_sorted,
                         OverwriteRangePlan::partitioning,
                     )),
-                    write_observer.as_ref().map(Arc::clone),
+                    file_stats.as_ref().map(|stats| Arc::clone(stats) as _),
                     write_schema,
                 )
                 .await?;
@@ -792,16 +772,7 @@ impl CayenneTableProvider {
             Ok(written)
         }
         .await;
-        // A write that fails before it is prepared never reaches `rollback`, so
-        // its partial index build is dropped here rather than held until the
-        // next refresh.
-        let (row_count, _files_written, write_stats_acc) = match written {
-            Ok(written) => written,
-            Err(error) => {
-                self.discard_lookup_index_build();
-                return Err(error);
-            }
-        };
+        let (row_count, _files_written, write_stats_acc) = written?;
 
         // Hide the copies the refresh repeated before the manifest below, which
         // must list the final files: a table that deletes by position hides them
@@ -811,7 +782,7 @@ impl CayenneTableProvider {
             None => (HashMap::new(), write_stats_acc),
             Some((order, key_columns)) => {
                 let resolved: Result<_> = async {
-                    let (superseded, mut counts) = self
+                    let superseded = self
                         .find_superseded_by_arrival(
                             &new_snapshot_id,
                             order,
@@ -819,10 +790,6 @@ impl CayenneTableProvider {
                             row_count,
                         )
                         .await?;
-                    if let Some(within) = &batch_superseded {
-                        counts.add(&within.lock());
-                    }
-                    self.report_superseded(&counts);
                     match file_stats.as_deref() {
                         Some(file_stats) if !superseded.is_empty() => {
                             let stats = self
@@ -838,10 +805,6 @@ impl CayenneTableProvider {
                                     &write_stats_acc,
                                 )
                                 .await?;
-                            // The index build observed the files the fold removed, so
-                            // it cannot describe the snapshot; the published
-                            // snapshot's index is built from its files instead.
-                            self.discard_lookup_index_build();
                             Ok((HashMap::new(), stats))
                         }
                         _ => Ok((superseded, Arc::clone(&write_stats_acc))),
@@ -983,7 +946,6 @@ impl CayenneTableProvider {
     /// Drop an overwrite's unpublished snapshot after a failure before it is
     /// prepared, which never reaches `rollback`.
     async fn abandon_overwrite_snapshot(&self, snapshot_id: &str) {
-        self.discard_lookup_index_build();
         self.remove_unpublished_snapshot_dir(snapshot_id).await;
     }
 
@@ -1021,7 +983,6 @@ impl CayenneTableProvider {
                 None,
                 write.write_policy,
                 Some(RangePartitioning::hashed_run_sorted()),
-                None,
             )
             .await?;
         self.remove_snapshot_files(

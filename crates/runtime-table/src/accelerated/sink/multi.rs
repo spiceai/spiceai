@@ -140,13 +140,13 @@ impl MultiSink {
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
-        refresh: &util::session_state::RefreshWrite,
+        write: &super::RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
         // Row versions let one accelerator resolve repeated keys as it writes, but every
         // table here receives the rows and not every one reads them. The refresh resolves
         // them before writing to a table with synchronized children, so one attached since
         // then fails the write, and the next attempt resolves them first.
-        if refresh.row_versions.is_some() {
+        if write.row_versions.is_some() {
             return Err(RetryError::transient(
                 crate::accelerated::Error::FailedToWriteData {
                     source: DataFusionError::Execution(
@@ -182,7 +182,7 @@ impl MultiSink {
         let primary_provider = Arc::clone(&self.original_table_provider);
         join_set.spawn(Self::spawn_parent_task(
             primary_provider,
-            util::session_state::mark_refresh_write(ctx.state(), refresh),
+            write.state(&ctx.state()),
             tx.subscribe(),
             Arc::clone(&schema),
             parent_complete_tx,
@@ -195,7 +195,6 @@ impl MultiSink {
             .iter()
             .map(SynchronizedTable::child_accelerator)
         {
-            // A child reports nothing superseded: the parent's report already counts it.
             join_set.spawn(Self::spawn_child_task(
                 provider,
                 ctx.state(),

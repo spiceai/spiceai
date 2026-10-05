@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `on_conflict: upsert_dedup_by_time_column` keeps, per primary key, the row with the
+//! `on_conflict: upsert_by_time` keeps, per primary key, the row with the
 //! greatest `time_column`, whatever order the source returns a key's versions in.
 //!
-//! Each engine that supports the mode is run in memory and file mode:
+//! Cayenne is run in memory and file mode:
 //!
 //! - a full refresh, and an append's first load, over two files, each holding the newest version of one key and an
 //!   older version of the other, so whichever file is read first one key's older
@@ -55,27 +55,8 @@ const TABLE: &str = "events";
 /// and enough of them (well over Cayenne's 4 MiB write buffer) that a load streams.
 const FILLER_KEYS: i64 = 300_000;
 
-#[derive(Clone, Copy, Debug)]
-enum Engine {
-    Arrow,
-    Cayenne,
-    #[cfg(feature = "sqlite")]
-    Sqlite,
-}
-
-fn engines() -> Vec<(Engine, Mode)> {
-    let cases = vec![
-        (Engine::Arrow, Mode::Memory),
-        (Engine::Cayenne, Mode::Memory),
-        (Engine::Cayenne, Mode::File),
-    ];
-    #[cfg(feature = "sqlite")]
-    let cases = {
-        let mut cases = cases;
-        cases.extend([(Engine::Sqlite, Mode::Memory), (Engine::Sqlite, Mode::File)]);
-        cases
-    };
-    cases
+fn modes() -> [Mode; 2] {
+    [Mode::Memory, Mode::File]
 }
 
 fn csv(rows: &[(i64, &str, &str)]) -> String {
@@ -95,38 +76,21 @@ fn write(dir: &Path, name: &str, contents: &str) {
 async fn load(
     source: &Path,
     accel_dir: &Path,
-    engine: Engine,
     mode: &Mode,
     refresh: RefreshMode,
     label: &str,
 ) -> (Arc<Runtime>, bool) {
     let mut params = HashMap::new();
-    let engine_name = match engine {
-        Engine::Arrow => "arrow",
-        Engine::Cayenne => {
-            if *mode == Mode::File {
-                params.insert(
-                    "cayenne_file_path".to_string(),
-                    accel_dir.join("data").display().to_string(),
-                );
-                params.insert(
-                    "cayenne_metadata_dir".to_string(),
-                    accel_dir.join("meta").display().to_string(),
-                );
-            }
-            "cayenne"
-        }
-        #[cfg(feature = "sqlite")]
-        Engine::Sqlite => {
-            if *mode == Mode::File {
-                params.insert(
-                    "sqlite_file".to_string(),
-                    accel_dir.join("events.db").display().to_string(),
-                );
-            }
-            "sqlite"
-        }
-    };
+    if *mode == Mode::File {
+        params.insert(
+            "cayenne_file_path".to_string(),
+            accel_dir.join("data").display().to_string(),
+        );
+        params.insert(
+            "cayenne_metadata_dir".to_string(),
+            accel_dir.join("meta").display().to_string(),
+        );
+    }
 
     let mut dataset = Dataset::new(format!("file://{}/", source.display()), TABLE);
     dataset.time_column = Some("occurred_at".to_string());
@@ -135,21 +99,18 @@ async fn load(
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some(engine_name.to_string()),
+        engine: Some("cayenne".to_string()),
         mode: mode.clone(),
         refresh_mode: Some(refresh),
         refresh_append_overlap: Some("7d".to_string()),
         params: (!params.is_empty()).then(|| Params::from_string_map(params)),
         primary_key: Some("id".to_string()),
-        on_conflict: HashMap::from([(
-            "id".to_string(),
-            OnConflictBehavior::UpsertDedupByTimeColumn,
-        )]),
+        on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::UpsertByTime)]),
         ..Acceleration::default()
     });
 
     configure_test_datafusion();
-    let app = AppBuilder::new(format!("upsert_dedup_by_time_column_{label}"))
+    let app = AppBuilder::new(format!("upsert_by_time_{label}"))
         .with_dataset(dataset)
         .build();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -190,10 +151,10 @@ async fn full_refresh_keeps_the_newest_version_of_each_key() {
         .scope(async {
             // An append's first load reads the whole source too, so it must resolve the
             // same way.
-            for (engine, mode, refresh) in engines().into_iter().flat_map(|(engine, mode)| {
-                [RefreshMode::Full, RefreshMode::Append].map(move |r| (engine, mode.clone(), r))
+            for (mode, refresh) in modes().into_iter().flat_map(|mode| {
+                [RefreshMode::Full, RefreshMode::Append].map(move |r| (mode.clone(), r))
             }) {
-                let label = format!("first_load_{refresh:?}_{engine:?}_{mode:?}");
+                let label = format!("first_load_{refresh:?}_{mode:?}");
                 let source = tempfile::tempdir().expect("source dir");
                 let accel = tempfile::tempdir().expect("acceleration dir");
 
@@ -217,8 +178,7 @@ async fn full_refresh_keeps_the_newest_version_of_each_key() {
                     ]),
                 );
 
-                let (rt, ready) =
-                    load(source.path(), accel.path(), engine, &mode, refresh, &label).await;
+                let (rt, ready) = load(source.path(), accel.path(), &mode, refresh, &label).await;
                 assert!(ready, "{label}: the dataset should load");
 
                 assert_eq!(values_of(&rt, 1).await, ["id1-newest"], "{label}: key 1");
@@ -238,8 +198,8 @@ async fn full_refresh_keeps_the_newest_version_of_each_key() {
 async fn append_refresh_keeps_a_stored_newer_version_and_takes_a_newer_one() {
     test_request_context()
         .scope(async {
-            for (engine, mode) in engines() {
-                let label = format!("append_{engine:?}_{mode:?}");
+            for mode in modes() {
+                let label = format!("append_{mode:?}");
                 let source = tempfile::tempdir().expect("source dir");
                 let accel = tempfile::tempdir().expect("acceleration dir");
                 write(
@@ -254,7 +214,6 @@ async fn append_refresh_keeps_a_stored_newer_version_and_takes_a_newer_one() {
                 let (rt, ready) = load(
                     source.path(),
                     accel.path(),
-                    engine,
                     &mode,
                     RefreshMode::Append,
                     &label,
@@ -310,8 +269,8 @@ async fn append_refresh_keeps_a_stored_newer_version_and_takes_a_newer_one() {
 async fn a_null_time_column_fails_the_refresh() {
     test_request_context()
         .scope(async {
-            for (engine, mode) in engines() {
-                let label = format!("null_{engine:?}_{mode:?}");
+            for mode in modes() {
+                let label = format!("null_{mode:?}");
                 let source = tempfile::tempdir().expect("source dir");
                 let accel = tempfile::tempdir().expect("acceleration dir");
                 write(
@@ -323,7 +282,6 @@ async fn a_null_time_column_fails_the_refresh() {
                 let (_rt, ready) = load(
                     source.path(),
                     accel.path(),
-                    engine,
                     &mode,
                     RefreshMode::Full,
                     &label,
@@ -407,10 +365,7 @@ async fn a_synchronized_child_keeps_the_same_versions_as_its_parent() {
                     .into(),
                 )),
                 primary_key: Some("id".to_string()),
-                on_conflict: HashMap::from([(
-                    "id".to_string(),
-                    OnConflictBehavior::UpsertDedupByTimeColumn,
-                )]),
+                on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::UpsertByTime)]),
                 ..Acceleration::default()
             });
             let mut child = Dataset::new(format!("localpod:{TABLE}"), "events_child");
@@ -421,7 +376,7 @@ async fn a_synchronized_child_keeps_the_same_versions_as_its_parent() {
             });
 
             configure_test_datafusion();
-            let app = AppBuilder::new("upsert_dedup_by_time_column_synchronized_child")
+            let app = AppBuilder::new("upsert_by_time_synchronized_child")
                 .with_dataset(parent)
                 .with_dataset(child)
                 .build();

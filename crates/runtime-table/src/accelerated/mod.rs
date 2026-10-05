@@ -2189,8 +2189,6 @@ impl TableLayer for AcceleratedTable {
 
         self.stamp_unguarded_write();
 
-        let statement = user_statement(state);
-        let state: &dyn Session = statement.as_ref().map_or(state, |marked| marked);
         let plan = match &self.write_mode {
             WriteMode::AcceleratorOnly => {
                 // When on_conflict is configured, writes go only to the accelerator
@@ -2300,10 +2298,6 @@ impl TableLayer for AcceleratedTable {
 
         self.stamp_unguarded_write();
 
-        // `UPDATE` writes its new rows through the accelerator's own insert, which
-        // must keep statement semantics too.
-        let statement = user_statement(state);
-        let state: &dyn Session = statement.as_ref().map_or(state, |marked| marked);
         let plan = match &self.write_mode {
             WriteMode::AcceleratorOnly => {
                 self.accelerator.update(state, assignments, filters).await?
@@ -2750,15 +2744,6 @@ impl Retention {
     }
 }
 
-/// `state` marked as a user's statement, so the accelerator keeps statement
-/// semantics for the keys it repeats rather than resolving them per
-/// `on_conflict`, as it does for its own writes (refreshes and change streams).
-fn user_statement(state: &dyn Session) -> Option<datafusion::execution::SessionState> {
-    state
-        .as_any()
-        .downcast_ref::<datafusion::execution::SessionState>()
-        .map(util::session_state::mark_user_statement)
-}
 #[cfg(test)]
 mod tests {
     use super::*;

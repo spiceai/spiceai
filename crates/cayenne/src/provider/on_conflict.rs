@@ -631,6 +631,7 @@ impl DeletionSink for InlineAwareDeletionSink {
         _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let _write_guard = self.table.write_lock.lock().await;
+        self.table.ensure_publication_outcome_known()?;
         self.table.mark_maintained_aggregates_stale();
 
         // Make the in-memory CDC tier durable and capture the scan sources inside
@@ -1204,6 +1205,10 @@ pub(crate) struct ProtectedSnapshotScan<'a> {
     /// View-typed read schema so protected-snapshot scans match the main file
     /// scan in the union (see `viewify_read_schema`).
     pub(crate) read_schema: SchemaRef,
+    /// The main scan's secondary index selection and pinned view, applied to
+    /// each protected snapshot's files as to the current snapshot's.
+    pub(crate) lookup_selection: Option<super::lookup_index::LookupSelection>,
+    pub(crate) pinned_lookup_index: Option<Arc<super::lookup_index::LookupIndexView>>,
 }
 
 pub(crate) struct PreparedProtectedSnapshotUpdate {
@@ -1399,6 +1404,7 @@ impl OnConflictValidationStream {
             repeats_resolved_after_write: self.repeats_resolved_after_write,
         };
 
+        let received = batch.num_rows();
         let validation_start = Instant::now();
         let validation_result = self.table.apply_on_conflict_to_batch(batch, &mut ctx);
         record_cayenne_write_phase(
@@ -1431,6 +1437,14 @@ impl OnConflictValidationStream {
 
         self.incoming_keys.extend(kept_keys.digests());
         self.kept_keys.absorb(kept_keys);
+
+        // A row validation drops is settled by arrival order: the stored row
+        // under `drop`, or another copy in the same batch.
+        self.table.count_superseded(
+            util::session_state::SupersededReason::Arrival,
+            received.saturating_sub(filtered_batch.as_ref().map_or(0, RecordBatch::num_rows))
+                as u64,
+        );
 
         Ok(filtered_batch)
     }

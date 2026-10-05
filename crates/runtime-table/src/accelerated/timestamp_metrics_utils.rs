@@ -113,7 +113,7 @@ pub async fn with_find_max_timestamp_in_stream(
         data: out_stream,
         update_type: data_update.update_type,
         row_versions: data_update.row_versions,
-        engine_reports_superseded: data_update.engine_reports_superseded,
+        superseded: data_update.superseded,
     };
 
     (new_data_update, Some(max_ts))

@@ -109,37 +109,6 @@ pub mod changes;
 mod deletion;
 mod latest_by_time;
 
-/// Records the copies of repeated keys an accelerator's write did not keep in
-/// `dataset_acceleration_refresh_rows_superseded`, by reason.
-#[derive(Debug)]
-struct RecordSuperseded {
-    /// The dataset's label set.
-    labels: DatasetMetricLabels,
-}
-
-impl util::session_state::SupersededReport for RecordSuperseded {
-    fn superseded(&self, counts: &util::session_state::SupersededCounts) {
-        record_superseded(&self.labels, counts);
-    }
-}
-
-/// Adds `counts` to `dataset_acceleration_refresh_rows_superseded`, by reason.
-pub(crate) fn record_superseded(
-    labels: &DatasetMetricLabels,
-    counts: &util::session_state::SupersededCounts,
-) {
-    for (count, reason) in [
-        (counts.repeated, "repeated"),
-        (counts.older, "older"),
-        (counts.equal_time, "equal_time"),
-        (counts.unchanged, "unchanged"),
-    ] {
-        if count > 0 {
-            metrics::REFRESH_ROWS_SUPERSEDED.add(count, &labels.tagged("reason", reason));
-        }
-    }
-}
-
 /// The largest UTC offset a time may carry (+14:00), in nanoseconds.
 const MAX_UTC_OFFSET_NANOS: u128 = 14 * 3_600 * 1_000_000_000;
 
@@ -851,7 +820,7 @@ impl RefreshTask {
                     .get_full_or_incremental_append_update(refresh, None)
                     .await
                 {
-                    Ok(update) if refresh.upsert_dedup_by_time_column.is_some() => {
+                    Ok(update) if refresh.upsert_by_time.is_some() => {
                         self.select_latest_by_time(refresh, update, None).await
                     }
                     other => other,
@@ -1047,7 +1016,7 @@ impl RefreshTask {
 
         let schema = Arc::clone(&data_update.data.schema());
         let row_versions = data_update.row_versions.clone();
-        let engine_reports_superseded = data_update.engine_reports_superseded;
+        let counted_before_write = data_update.superseded.clone();
 
         let (notify_written_data_stat_available, mut on_written_data_stat_available) =
             oneshot::channel::<RefreshStat>();
@@ -1142,21 +1111,23 @@ impl RefreshTask {
         let sink = &*sink_lock;
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
-        // The write carries where to report the copies of repeated keys the
-        // accelerator does not keep, and, for `upsert_dedup_by_time_column`, how to
-        // order them.
-        let refresh_write = util::session_state::RefreshWrite {
-            row_versions,
-            superseded: engine_reports_superseded.then(|| {
-                Arc::new(RecordSuperseded {
-                    labels: self.dataset_metric_labels.clone(),
-                }) as Arc<dyn util::session_state::SupersededReport>
-            }),
+        // Under `upsert_by_time` the refresh may have counted the rows it did not
+        // keep before the write; then the table counts none of its own.
+        let (superseded, table_counts) = match counted_before_write {
+            Some(rows) => (rows, false),
+            None => (
+                Arc::new(util::session_state::SupersededRows::default()),
+                true,
+            ),
         };
-        let written = sink
-            .insert_into(record_batch_stream, overwrite, &refresh_write)
-            .await;
-        if let Err(e) = written {
+        let write = super::sink::RefreshWrite {
+            superseded: table_counts.then(|| Arc::clone(&superseded)),
+            row_versions,
+        };
+        if let Err(e) = sink
+            .insert_into(record_batch_stream, overwrite, &write)
+            .await
+        {
             let error_message = format_datafusion_error(&e);
             self.set_refresh_status(
                 sql,
@@ -1179,6 +1150,18 @@ impl RefreshTask {
         } else {
             None
         };
+
+        // Rows the table did not keep, counted only once the write succeeded:
+        // a failed refresh changes nothing.
+        for reason in util::session_state::SupersededReason::ALL {
+            let rows = superseded.get(reason);
+            if rows > 0 {
+                metrics::REFRESH_ROWS_SUPERSEDED.add(
+                    rows,
+                    &self.dataset_metric_labels.tagged("reason", reason.label()),
+                );
+            }
+        }
 
         let refresh_stat = on_written_data_stat_available.try_recv().ok();
 
@@ -1305,9 +1288,9 @@ impl RefreshTask {
                     .get_full_or_incremental_append_update(refresh, timestamp)
                     .await
                 {
-                    // `upsert_dedup_by_time_column` replaces the exact-row dedupe: it is
+                    // `upsert_by_time` replaces the exact-row dedupe: it is
                     // seeded with the stored keys and times from the same window start.
-                    Ok(data) if refresh.upsert_dedup_by_time_column.is_some() => {
+                    Ok(data) if refresh.upsert_by_time.is_some() => {
                         self.select_latest_by_time(refresh, data, timestamp).await
                     }
                     // Reuse `timestamp`: the dedupe must compare against the same mark the
@@ -1331,7 +1314,7 @@ impl RefreshTask {
         }
     }
 
-    /// `on_conflict: upsert_dedup_by_time_column`: pass on only rows newer than the version
+    /// `on_conflict: upsert_by_time`: pass on only rows newer than the version
     /// of their key already kept. When `window_start` is set (an append), the selector is
     /// first seeded with the keys and times the acceleration stores from that same window
     /// start the source fetch used: any stored row newer than an incoming row is at or after
@@ -1351,7 +1334,7 @@ impl RefreshTask {
         };
         let Some(time_column) = refresh.time_column.clone() else {
             return Err(not_applied(&latest_by_time::not_applied(
-                "'acceleration.on_conflict: upsert_dedup_by_time_column' requires a 'time_column'. Set 'time_column' to the column that records when each row occurred.",
+                "'acceleration.on_conflict: upsert_by_time' requires a 'time_column'. Set 'time_column' to the column that records when each row occurred.",
             )));
         };
         let accelerator_schema = self.accelerator.schema();
@@ -1366,12 +1349,12 @@ impl RefreshTask {
             });
         if key_columns.is_empty() {
             return Err(not_applied(&latest_by_time::not_applied(
-                "'acceleration.on_conflict: upsert_dedup_by_time_column' requires 'acceleration.primary_key'. Set it to the column(s) that identify a row.",
+                "'acceleration.on_conflict: upsert_by_time' requires 'acceleration.primary_key'. Set it to the column(s) that identify a row.",
             )));
         }
         // A synchronized child writes the same rows but cannot read their versions, so
         // a dataset with one resolves them here, before the rows reach either table.
-        let dedup = refresh.upsert_dedup_by_time_column.unwrap_or_default();
+        let dedup = refresh.upsert_by_time.unwrap_or_default();
         // The accelerator orders a key's copies by version only against the copies one
         // write holds: a write that replaces the table, or an append it loads into an
         // empty table (which it confirms itself, refusing the append otherwise). An
@@ -1400,7 +1383,6 @@ impl RefreshTask {
                 refresh.time_format,
             )
             .map_err(|e| not_applied(&e))?;
-            latest_by_time::publish_zero(&self.dataset_metric_labels);
             return Ok(update.with_row_versions(Some(row_versions)));
         }
         let mut selector = latest_by_time::LatestByTime::try_new(
@@ -1411,11 +1393,9 @@ impl RefreshTask {
             refresh.time_format,
         )
         .map_err(|e| not_applied(&e))?;
-        selector = selector.with_floats_as_stored(dedup.floats_as_stored);
         if let Some(runtime_env) = &self.query_runtime_env {
             selector = selector.with_runtime_env(Arc::clone(runtime_env));
         }
-        latest_by_time::publish_zero(&self.dataset_metric_labels);
 
         if let Some(value) = window_start
             && let Some(filter_converter) = self.get_accelerator_filter_converter(refresh)
@@ -3326,7 +3306,7 @@ fn dedup_predicates(
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
     // A refresh the dataset's configuration refused (e.g. a NULL `time_column` under
-    // `upsert_dedup_by_time_column`) carries its own complete cause.
+    // `upsert_by_time`) carries its own complete cause.
     if let Some(message) = latest_by_time::not_applied_message(&error) {
         return RetryError::permanent(super::Error::RefreshNotApplied { message });
     }

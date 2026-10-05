@@ -199,14 +199,57 @@ impl Display for IndexType {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OnConflictBehavior {
+    /// Keep the stored row and drop the incoming one. Of the versions of a key
+    /// one write holds, the first to arrive is kept.
     #[default]
     Drop,
+    /// Replace the stored row. On Cayenne, identical copies of a key in one
+    /// write collapse, and different versions fail the write.
     Upsert,
+    /// Deprecated: on Cayenne it behaves as `upsert`.
+    #[cfg_attr(feature = "schemars", schemars(extend("deprecated" = true)))]
     UpsertDedup,
+    /// Deprecated: on Cayenne it behaves as `upsert_by_arrival`.
+    #[cfg_attr(feature = "schemars", schemars(extend("deprecated" = true)))]
     UpsertDedupByRowId,
-    /// Keep, per primary key, the row with the greatest dataset `time_column`: the newest
-    /// version among the rows a refresh reads and, on append, the version already stored.
-    UpsertDedupByTimeColumn,
+    /// Replace the stored row. Of the versions of a key one write holds, the
+    /// last to arrive is kept. Cayenne only.
+    UpsertByArrival,
+    /// Keep, per primary key, the row with the greatest dataset `time_column`: the
+    /// newest version among the rows a refresh reads and, on append, the version
+    /// already stored. Cayenne only.
+    UpsertByTime,
+}
+
+impl OnConflictBehavior {
+    /// The name a Spicepod spells this behavior with.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Drop => "drop",
+            Self::Upsert => "upsert",
+            Self::UpsertDedup => "upsert_dedup",
+            Self::UpsertDedupByRowId => "upsert_dedup_by_row_id",
+            Self::UpsertByArrival => "upsert_by_arrival",
+            Self::UpsertByTime => "upsert_by_time",
+        }
+    }
+
+    /// The behavior a deprecated alias stands for, or `None` for a current name.
+    #[must_use]
+    pub fn replacement(self) -> Option<Self> {
+        match self {
+            Self::UpsertDedup => Some(Self::Upsert),
+            Self::UpsertDedupByRowId => Some(Self::UpsertByArrival),
+            Self::Drop | Self::Upsert | Self::UpsertByArrival | Self::UpsertByTime => None,
+        }
+    }
+
+    /// Whether only the Cayenne accelerator supports this behavior.
+    #[must_use]
+    pub fn requires_cayenne(self) -> bool {
+        matches!(self, Self::UpsertByArrival | Self::UpsertByTime)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -917,16 +960,30 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_acceleration_on_conflict_upsert_dedup_by_time_column() {
+    fn test_deserialize_acceleration_on_conflict_upsert_by_time() {
         let yaml = r"
                 on_conflict:
-                  foo: upsert_dedup_by_time_column
+                  foo: upsert_by_time
             ";
         let acceleration: Acceleration =
             yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
-            Some(&OnConflictBehavior::UpsertDedupByTimeColumn)
+            Some(&OnConflictBehavior::UpsertByTime)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_upsert_by_arrival() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert_by_arrival
+            ";
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::UpsertByArrival)
         );
     }
 

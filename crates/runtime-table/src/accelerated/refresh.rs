@@ -78,16 +78,12 @@ pub enum Error {
     },
 }
 
-/// How `on_conflict: upsert_dedup_by_time_column` resolves a refresh's versions for one
-/// accelerator.
+/// How `on_conflict: upsert_by_time` resolves a refresh's versions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct UpsertDedupByTimeColumn {
+pub struct UpsertByTime {
     /// The accelerator resolves a full refresh's repeated keys after writing them, by
     /// the row versions the refresh supplies (unpartitioned file-mode Cayenne).
     pub versions_resolved_after_write: bool,
-    /// The accelerator stores `-0.0` as `0.0` and `NaN` as NULL (SQLite), so content
-    /// hashes read floats that way.
-    pub floats_as_stored: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -105,10 +101,10 @@ pub struct Refresh {
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
     pub(crate) append_overlap: Option<Duration>,
-    /// `on_conflict: upsert_dedup_by_time_column`: keep only rows newer than the version
+    /// `on_conflict: upsert_by_time`: keep only rows newer than the version
     /// of their key already kept (see `refresh_task::latest_by_time`), resolved as the
     /// accelerator needs.
-    pub(crate) upsert_dedup_by_time_column: Option<UpsertDedupByTimeColumn>,
+    pub(crate) upsert_by_time: Option<UpsertByTime>,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
     /// TTL for cache entries. Data older than this is considered stale.
@@ -230,11 +226,8 @@ impl Refresh {
     }
 
     #[must_use]
-    pub fn upsert_dedup_by_time_column(
-        mut self,
-        upsert_dedup_by_time_column: Option<UpsertDedupByTimeColumn>,
-    ) -> Self {
-        self.upsert_dedup_by_time_column = upsert_dedup_by_time_column;
+    pub fn upsert_by_time(mut self, upsert_by_time: Option<UpsertByTime>) -> Self {
+        self.upsert_by_time = upsert_by_time;
         self
     }
 
@@ -539,7 +532,7 @@ impl Default for Refresh {
             mode: RefreshMode::Full,
             period: None,
             append_overlap: None,
-            upsert_dedup_by_time_column: None,
+            upsert_by_time: None,
             retry_enabled: false,
             retry_max_attempts: None,
             caching_ttl: None,

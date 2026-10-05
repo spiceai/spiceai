@@ -332,9 +332,9 @@ pub enum Error {
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display(
-        "Failed to register dataset '{dataset_name}' ({connector}): {reason} See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+        "Failed to register dataset '{dataset_name}' ({connector}): {reason} See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
     ))]
-    UpsertDedupByTimeColumnUnsupported {
+    UpsertByTimeUnsupported {
         dataset_name: String,
         connector: String,
         reason: String,

@@ -190,28 +190,25 @@ pub static REFRESH_ROWS_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("dataset_acceleration_refresh_rows_written")
         .with_description(
-            "Cumulative number of rows read from the federated source and written into the accelerated table.",
+            "Cumulative number of rows read from the federated source and written to the accelerated table, including rows the table does not keep (dataset_acceleration_refresh_rows_superseded).",
         )
         .with_unit("rows")
         .build()
 });
 
-/// Rows a refresh read from the source but did not write, because its `on_conflict` mode
-/// kept another version of the same key. Labelled by `reason`; under
-/// `on_conflict: upsert_dedup_by_time_column`:
+/// Rows a refresh received but the accelerated table did not keep, by `reason`:
 ///
-/// - `older`: a version of the key with a greater `time_column` was already kept;
-/// - `equal_time`: a row with the same time was read earlier in the same refresh, so
-///   `time_column` is not unique per key;
-/// - `unchanged`: the time equals the stored version's — on append, the overlap re-reading
-///   a row already loaded. A different row with the stored time is counted here too.
-///
-/// Rows read = `refresh_rows_written` + `refresh_rows_superseded`.
+/// - `unchanged`: an identical copy of a row the table kept;
+/// - `arrival`: a different version of the key, settled by the order versions arrived in;
+/// - `older`: under `on_conflict: upsert_by_time`, a version of the key with a greater
+///   `time_column` was kept;
+/// - `equal_time`: under `on_conflict: upsert_by_time`, a different row with the kept
+///   version's time, so `time_column` is not unique per key.
 pub static REFRESH_ROWS_SUPERSEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("dataset_acceleration_refresh_rows_superseded")
         .with_description(
-            "Cumulative number of rows read from the federated source and not written because the dataset's on_conflict mode kept another version of the same key.",
+            "Cumulative number of rows a refresh received but the accelerated table did not keep, because another version of the same primary key was kept, by reason.",
         )
         .with_unit("rows")
         .build()

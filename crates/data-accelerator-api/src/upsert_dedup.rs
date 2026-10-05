@@ -54,10 +54,6 @@ pub struct UpsertDedupTableProvider {
     /// Constraints for deduplication (e.g., primary key)
     /// Stored explicitly because the inner provider may not expose constraints
     constraints: Constraints,
-    /// Deduplicate only a user's statement
-    /// ([`util::session_state::UserStatementWrite`]); the inner provider resolves
-    /// the keys its own writes (refreshes, change streams) repeat.
-    statements_only: bool,
 }
 
 impl UpsertDedupTableProvider {
@@ -77,16 +73,7 @@ impl UpsertDedupTableProvider {
             inner,
             upsert_options,
             constraints,
-            statements_only: false,
         }
-    }
-
-    /// Deduplicate only a user's statement, for an inner provider that resolves
-    /// the keys its own writes repeat per `on_conflict`.
-    #[must_use]
-    pub fn for_statements_only(mut self) -> Self {
-        self.statements_only = true;
-        self
     }
 
     /// Returns true if deduplication is needed based on the upsert options.
@@ -156,10 +143,7 @@ impl TableProvider for UpsertDedupTableProvider {
         op: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // If no deduplication is needed, pass through to the underlying provider
-        if !self.needs_dedup()
-            || (self.statements_only
-                && !util::session_state::is_user_statement(state.config()))
-        {
+        if !self.needs_dedup() {
             return self.inner.insert_into(state, input, op).await;
         }
 
@@ -391,28 +375,6 @@ pub fn extract_upsert_options<S: std::hash::BuildHasher>(
     UpsertOptions {
         remove_duplicates,
         last_write_wins,
-    }
-}
-
-/// [`wrap_with_upsert_dedup_if_needed`] for a provider that resolves the keys its
-/// own writes repeat: only a user's statement is deduplicated by the wrapper.
-#[must_use]
-pub fn wrap_with_statement_upsert_dedup_if_needed<
-    T: TableProvider + 'static,
-    S: std::hash::BuildHasher,
->(
-    provider: Arc<T>,
-    options: &std::collections::HashMap<String, String, S>,
-    constraints: Constraints,
-) -> Arc<dyn TableProvider> {
-    let upsert_options = extract_upsert_options(options);
-    if upsert_options.remove_duplicates || upsert_options.last_write_wins {
-        Arc::new(
-            UpsertDedupTableProvider::new(provider, upsert_options, constraints)
-                .for_statements_only(),
-        )
-    } else {
-        provider
     }
 }
 

@@ -95,9 +95,6 @@ pub(super) struct CayennePartitionedAppendSink {
     schema: SchemaRef,
     physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
     table_root: PathBuf,
-    /// Whether the insert is a user's statement; see
-    /// [`util::session_state::UserStatementWrite`].
-    user_statement: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -235,6 +232,7 @@ impl DataSink for CayennePartitionedAppendSink {
         let _coordinator_guard = Arc::clone(&self.coordinator_lock).lock_owned().await;
 
         let target_partitions = context.session_config().target_partitions();
+        let superseded = util::session_state::superseded_rows(context.session_config());
 
         // Phase 1: fan input out to per-partition writer tasks that each call
         // begin_staged_append → prepare (writes the per-partition staging
@@ -261,7 +259,11 @@ impl DataSink for CayennePartitionedAppendSink {
                     s
                 } else {
                     let (handle, tx) = self
-                        .prepare_new_provider_for_partition(values, target_partitions)
+                        .prepare_new_provider_for_partition(
+                            values,
+                            target_partitions,
+                            superseded.clone(),
+                        )
                         .await?;
 
                     senders.insert(key.clone(), tx.clone());
@@ -686,15 +688,7 @@ impl CayennePartitionedAppendSink {
             schema,
             physical_exprs,
             table_root,
-            user_statement: false,
         }
-    }
-
-    /// Mark the append as a user's statement, which keeps statement semantics
-    /// for the keys it repeats instead of resolving them.
-    pub(super) fn with_user_statement(mut self, user_statement: bool) -> Self {
-        self.user_statement = user_statement;
-        self
     }
 
     async fn classify_append_snapshot_pointers(
@@ -829,6 +823,7 @@ impl CayennePartitionedAppendSink {
         &self,
         partition_values: Vec<ScalarValue>,
         target_partitions: usize,
+        superseded: Option<Arc<util::session_state::SupersededRows>>,
     ) -> Result<
         (
             JoinHandle<cayenne::provider::Result<PreparedStagedAppend>>,
@@ -853,7 +848,7 @@ impl CayennePartitionedAppendSink {
         }
         let cayenne_owned = cayenne
             .clone_for_write_operations()
-            .for_user_statement(self.user_statement);
+            .with_superseded_rows(superseded);
         let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
             PARTITION_WRITER_CHANNEL_DEPTH,
         );

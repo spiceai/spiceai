@@ -187,9 +187,9 @@ pub struct StreamingDataUpdate {
     /// [`util::session_state::RowVersions`]. A wrapper that rebuilds the update
     /// must carry it forward.
     pub row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
-    /// Whether the accelerator reports the copies of repeated keys it does not keep.
-    /// False when the refresh already counted them before the write.
-    pub engine_reports_superseded: bool,
+    /// The rows the refresh already counted as superseded before the write, when it
+    /// selects them itself; the accelerator then counts none of its own.
+    pub superseded: Option<Arc<util::session_state::SupersededRows>>,
 }
 
 impl StreamingDataUpdate {
@@ -199,15 +199,18 @@ impl StreamingDataUpdate {
             data,
             update_type,
             row_versions: None,
-            engine_reports_superseded: true,
+            superseded: None,
         }
     }
 
-    /// This update with the copies of repeated keys already counted by the refresh,
-    /// so the accelerator does not report them again.
+    /// This update with the rows the refresh counted as superseded before the write,
+    /// so the accelerator does not count them again.
     #[must_use]
-    pub fn superseded_counted_before_write(mut self) -> Self {
-        self.engine_reports_superseded = false;
+    pub fn superseded_counted_before_write(
+        mut self,
+        superseded: Arc<util::session_state::SupersededRows>,
+    ) -> Self {
+        self.superseded = Some(superseded);
         self
     }
 

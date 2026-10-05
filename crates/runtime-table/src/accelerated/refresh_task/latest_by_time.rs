@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `on_conflict: upsert_dedup_by_time_column`: keep, per primary key, only rows newer than
+//! `on_conflict: upsert_by_time`: keep, per primary key, only rows newer than
 //! the version of that key already kept.
 //!
 //! A refresh streams its rows through a [`LatestByTime`] selector that holds one entry per
@@ -57,8 +57,7 @@ use runtime_component::dataset::TimeFormat;
 use runtime_metrics::acceleration as metrics;
 use twox_hash::XxHash3_128;
 
-const DOCS: &str =
-    "https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column";
+const DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time";
 
 /// A refresh this mode refused to apply, worded as the cause the refresh log line shows
 /// after `Failed to refresh dataset <name> (<connector>):`. It crosses the write as a
@@ -109,10 +108,27 @@ fn time_format_name(time_format: Option<TimeFormat>) -> &'static str {
     }
 }
 
+/// Rows superseded under each version reason.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Counts {
+    older: u64,
+    equal_time: u64,
+    unchanged: u64,
+}
+
+impl Counts {
+    #[cfg(test)]
+    fn add(&mut self, other: &Self) {
+        self.older += other.older;
+        self.equal_time += other.equal_time;
+        self.unchanged += other.unchanged;
+    }
+}
+
 /// Rows a selection did not keep, by `reason`.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Superseded {
-    counts: util::session_state::SupersededCounts,
+    counts: Counts,
     /// How many of them were never passed on to the write (the rest were, and the
     /// engine replaces them).
     not_written: u64,
@@ -121,7 +137,12 @@ struct Superseded {
 impl Superseded {
     /// Count `version`, which lost to `winner`.
     fn count(&mut self, version: Kept, winner: Kept) {
-        self.counts.count(version.order(), winner.order());
+        use util::session_state::SupersededReason;
+        match SupersededReason::of_version(version.order(), winner.order()) {
+            SupersededReason::Older => self.counts.older += 1,
+            SupersededReason::EqualTime => self.counts.equal_time += 1,
+            SupersededReason::Unchanged | SupersededReason::Arrival => self.counts.unchanged += 1,
+        }
     }
 }
 
@@ -214,6 +235,8 @@ pub(crate) struct LatestByTime {
     /// written here and decided after the last one, against every run.
     deferred: Option<DeferredRows>,
     labels: super::DatasetMetricLabels,
+    /// The rows this refresh did not keep, recorded once its write succeeds.
+    superseded: Arc<util::session_state::SupersededRows>,
 }
 
 impl LatestByTime {
@@ -248,6 +271,7 @@ impl LatestByTime {
         };
         Ok(Self {
             labels: super::DatasetMetricLabels::from_name(dataset),
+            superseded: Arc::default(),
             dataset: dataset.to_string(),
             key_columns,
             key_types,
@@ -256,7 +280,6 @@ impl LatestByTime {
                 time_column,
                 time_format,
                 hashed: Arc::clone(schema),
-                floats_as_stored: false,
             }),
             encoding,
             latest: HashMap::new(),
@@ -271,18 +294,10 @@ impl LatestByTime {
 
     /// Charge the map to `runtime_env`'s memory pool, spilling to its disk manager when
     /// the pool refuses to grow it.
-    /// Hash floats as an accelerator that stores `-0.0` as `0.0` and `NaN` as NULL
-    /// (SQLite) reads them back, so a stored row hashes like the row it came from.
-    #[must_use]
-    pub(crate) fn with_floats_as_stored(mut self, floats_as_stored: bool) -> Self {
-        Arc::make_mut(&mut self.reader).floats_as_stored = floats_as_stored;
-        self
-    }
-
     #[must_use]
     pub(crate) fn with_runtime_env(mut self, runtime_env: Arc<RuntimeEnv>) -> Self {
         self.reservation = Some(
-            MemoryConsumer::new(format!("UpsertDedupByTimeColumnKeys[{}]", self.dataset))
+            MemoryConsumer::new(format!("UpsertByTimeKeys[{}]", self.dataset))
                 .register(&runtime_env.memory_pool),
         );
         self.disk = Some(Arc::clone(&runtime_env.disk_manager));
@@ -429,7 +444,7 @@ impl LatestByTime {
     }
 
     fn record(&self, superseded: &Superseded) {
-        record_selection(&self.labels, superseded);
+        record_selection(&self.labels, &self.superseded, superseded);
     }
 
     /// After the last row: decide every deferred row against every run, and return the
@@ -488,7 +503,10 @@ impl LatestByTime {
             superseded: Superseded::default(),
             _file: file,
         };
-        Ok(Some(resolver.into_stream(self.labels.clone())))
+        Ok(Some(resolver.into_stream(
+            self.labels.clone(),
+            Arc::clone(&self.superseded),
+        )))
     }
 
     /// [`Self::select`], returning the rows it did not pass on by reason instead of
@@ -647,7 +665,6 @@ pub(crate) fn row_versions(
         time_column,
         time_format,
         hashed: Arc::clone(schema),
-        floats_as_stored: false,
     }))
 }
 
@@ -662,16 +679,11 @@ pub(crate) struct VersionReader {
     /// The incoming rows' columns: a row's content hash is over these, cast to these
     /// types, so a stored copy of a row hashes like the incoming one.
     hashed: SchemaRef,
-    /// The accelerator stores `-0.0` as `0.0` and `NaN` as NULL (SQLite), so hashes read
-    /// floats the same way. Elsewhere rows that differ only there hash differently, so
-    /// an equal hash means the same row and either copy may be kept.
-    floats_as_stored: bool,
 }
 
 impl VersionReader {
-    /// Each row's content hash: every incoming column, cast to its incoming type, with
-    /// floats read as the accelerator stores them, so a stored copy of a row hashes like
-    /// the row it came from.
+    /// Each row's content hash: every incoming column, cast to its incoming type, so a
+    /// stored copy of a row hashes like the row it came from.
     fn content_hashes(&self, batch: &RecordBatch) -> Result<Vec<u64>, DataFusionError> {
         let columns = self
             .hashed
@@ -685,15 +697,10 @@ impl VersionReader {
                         self.dataset
                     ))
                 })?;
-                let column = if column.data_type() == field.data_type() {
+                Ok(if column.data_type() == field.data_type() {
                     Arc::clone(column)
                 } else {
                     cast_with_options(column, field.data_type(), &CastOptions::default())?
-                };
-                Ok(if self.floats_as_stored {
-                    normalize_floats(&column)
-                } else {
-                    column
                 })
             })
             .collect::<Result<Vec<ArrayRef>, DataFusionError>>()?;
@@ -750,21 +757,20 @@ impl util::session_state::RowVersions for VersionReader {
     }
 }
 
-/// Record the rows a selection did not keep: in `rows_superseded` by reason, and in
+/// Record the rows a selection did not keep: in `rows`, by reason, and in
 /// `rows_written`, which counts every row a refresh receives.
-fn record_selection(labels: &super::DatasetMetricLabels, superseded: &Superseded) {
-    super::record_superseded(labels, &superseded.counts);
+fn record_selection(
+    labels: &super::DatasetMetricLabels,
+    rows: &util::session_state::SupersededRows,
+    superseded: &Superseded,
+) {
+    use util::session_state::SupersededReason;
+    rows.add(SupersededReason::Older, superseded.counts.older);
+    rows.add(SupersededReason::EqualTime, superseded.counts.equal_time);
+    rows.add(SupersededReason::Unchanged, superseded.counts.unchanged);
     // Rows passed on are counted as the write receives them; the rest only here.
     if superseded.not_written > 0 {
         metrics::REFRESH_ROWS_WRITTEN.add(superseded.not_written, labels.dataset());
-    }
-}
-
-/// Publish this mode's `reason` series at `0`, so a dashboard sees them before the
-/// first superseded row and an alert can fire on their rise.
-pub(crate) fn publish_zero(labels: &super::DatasetMetricLabels) {
-    for reason in ["older", "equal_time", "unchanged"] {
-        metrics::REFRESH_ROWS_SUPERSEDED.add(0, &labels.tagged("reason", reason));
     }
 }
 
@@ -777,7 +783,7 @@ fn map_bytes(entries: usize) -> usize {
 
 fn spill_failed(cause: &dyn fmt::Display) -> DataFusionError {
     not_applied(&format!(
-        "'acceleration.on_conflict: upsert_dedup_by_time_column' could not spill its key versions to 'runtime.query.temp_directory', so this refresh was not applied and the previous data is still served. Free space there, or raise 'runtime.query.memory_limit'. Cause: {cause}."
+        "'acceleration.on_conflict: upsert_by_time' could not spill its key versions to 'runtime.query.temp_directory', so this refresh was not applied and the previous data is still served. Free space there, or raise 'runtime.query.memory_limit'. Cause: {cause}."
     ))
 }
 
@@ -797,7 +803,7 @@ fn write_run(
 ) -> Result<RefCountedTempFile, DataFusionError> {
     use std::io::Write as _;
     entries.sort_unstable_by_key(|(key, _)| *key);
-    let mut file = disk.create_tmp_file("upsert_dedup_by_time_column key spill")?;
+    let mut file = disk.create_tmp_file("upsert_by_time key spill")?;
     {
         let mut out = std::io::BufWriter::new(file.inner().as_file());
         for (key, kept) in &entries {
@@ -874,7 +880,7 @@ fn merge_runs(
             heap.push(Reverse((key, source, kept.time, kept.hash)));
         }
     }
-    let mut file = disk.create_tmp_file("upsert_dedup_by_time_column merged key spill")?;
+    let mut file = disk.create_tmp_file("upsert_by_time merged key spill")?;
     {
         let mut out = std::io::BufWriter::new(file.inner().as_file());
         let mut current: Option<(u128, Kept)> = None;
@@ -977,11 +983,11 @@ fn key_half(key: u128) -> u64 {
     u64::try_from(key & u128::from(u64::MAX)).unwrap_or_default()
 }
 
-const KEY_HI: &str = "__spice_upsert_dedup_key_hi";
-const KEY_LO: &str = "__spice_upsert_dedup_key_lo";
-const TIME: &str = "__spice_upsert_dedup_time";
-const SEQ: &str = "__spice_upsert_dedup_seq";
-const HASH: &str = "__spice_upsert_dedup_hash";
+const KEY_HI: &str = "__spice_upsert_by_time_key_hi";
+const KEY_LO: &str = "__spice_upsert_by_time_key_lo";
+const TIME: &str = "__spice_upsert_by_time_time";
+const SEQ: &str = "__spice_upsert_by_time_seq";
+const HASH: &str = "__spice_upsert_by_time_hash";
 /// The helper columns deferral appends after a row's own columns.
 const HELPERS: usize = 5;
 
@@ -1006,7 +1012,7 @@ impl DeferredRows {
         ]);
         let schema = Arc::new(Schema::new(fields));
         let file = disk
-            .create_tmp_file("upsert_dedup_by_time_column deferred rows")
+            .create_tmp_file("upsert_by_time deferred rows")
             .map_err(|e| spill_failed(&e))?;
         let writer = arrow::ipc::writer::FileWriter::try_new(
             file.inner().reopen().map_err(|e| spill_failed(&e))?,
@@ -1181,18 +1187,22 @@ impl DeferredResolver {
         )?)?))
     }
 
-    fn into_stream(self, labels: super::DatasetMetricLabels) -> SendableRecordBatchStream {
+    fn into_stream(
+        self,
+        labels: super::DatasetMetricLabels,
+        rows: Arc<util::session_state::SupersededRows>,
+    ) -> SendableRecordBatchStream {
         let schema = self.sorted.schema();
         let fields = &schema.fields()[..schema.fields().len() - HELPERS];
         let out_schema = Arc::new(Schema::new(fields.to_vec()));
-        let stream = futures::stream::try_unfold(Some((self, labels)), |state| async move {
-            let Some((mut resolver, labels)) = state else {
+        let stream = futures::stream::try_unfold(Some((self, labels, rows)), |state| async move {
+            let Some((mut resolver, labels, rows)) = state else {
                 return Ok(None);
             };
             if let Some(batch) = resolver.next_batch().await? {
-                Ok(Some((batch, Some((resolver, labels)))))
+                Ok(Some((batch, Some((resolver, labels, rows)))))
             } else {
-                record_selection(&labels, &resolver.superseded);
+                record_selection(&labels, &rows, &resolver.superseded);
                 Ok(None)
             }
         });
@@ -1214,48 +1224,6 @@ fn column_of<'a, T: arrow::datatypes::ArrowPrimitiveType>(
 fn strip_helpers(batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
     let keep: Vec<usize> = (0..batch.num_columns() - HELPERS).collect();
     Ok(batch.project(&keep)?)
-}
-
-/// `column` with `-0.0` read as `0.0` and `NaN` as NULL, as engines that do not keep them
-/// store them; other columns unchanged.
-fn normalize_floats(column: &ArrayRef) -> ArrayRef {
-    // Most float columns hold neither; they are hashed as they are.
-    let needs = |nan: bool, negative_zero: bool| nan || negative_zero;
-    let clean = match column.data_type() {
-        DataType::Float32 => !column
-            .as_primitive::<arrow::datatypes::Float32Type>()
-            .values()
-            .iter()
-            .any(|v| needs(v.is_nan(), *v == 0.0 && v.is_sign_negative())),
-        DataType::Float64 => !column
-            .as_primitive::<arrow::datatypes::Float64Type>()
-            .values()
-            .iter()
-            .any(|v| needs(v.is_nan(), *v == 0.0 && v.is_sign_negative())),
-        _ => true,
-    };
-    if clean {
-        return Arc::clone(column);
-    }
-    match column.data_type() {
-        DataType::Float32 => {
-            let normalized: arrow::array::Float32Array = column
-                .as_primitive::<arrow::datatypes::Float32Type>()
-                .iter()
-                .map(|v| v.filter(|v| !v.is_nan()).map(|v| v + 0.0))
-                .collect();
-            Arc::new(normalized)
-        }
-        DataType::Float64 => {
-            let normalized: arrow::array::Float64Array = column
-                .as_primitive::<arrow::datatypes::Float64Type>()
-                .iter()
-                .map(|v| v.filter(|v| !v.is_nan()).map(|v| v + 0.0))
-                .collect();
-            Arc::new(normalized)
-        }
-        _ => Arc::clone(column),
-    }
 }
 
 /// Shift each key left by `width + 1` bits and append `column`'s value and a NULL flag.
@@ -1357,6 +1325,7 @@ pub(crate) fn select_latest(
         Resolving(SendableRecordBatchStream),
     }
     let schema = update.data.schema();
+    let superseded = Arc::clone(&selector.superseded);
     let stream = futures::stream::try_unfold(
         State::Selecting(Box::new(selector), update.data),
         |state| async move {
@@ -1385,7 +1354,7 @@ pub(crate) fn select_latest(
         Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
         update.update_type,
     )
-    .superseded_counted_before_write()
+    .superseded_counted_before_write(superseded)
 }
 
 #[cfg(test)]
@@ -1510,7 +1479,7 @@ mod tests {
         let message = not_applied_message(&err).expect("a refresh-not-applied error");
         assert_eq!(
             message,
-            "'time_column' 'occurred_at' is NULL in 2 rows, so this refresh was not applied and the previous data is still served. Fill 'occurred_at' at the source, or exclude those rows with 'acceleration.refresh_sql'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+            "'time_column' 'occurred_at' is NULL in 2 rows, so this refresh was not applied and the previous data is still served. Fill 'occurred_at' at the source, or exclude those rows with 'acceleration.refresh_sql'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
         );
         assert!(
             !message.contains("id="),
@@ -1588,7 +1557,7 @@ mod tests {
         let message = not_applied_message(&err).expect("a refresh-not-applied error");
         assert_eq!(
             message,
-            "'time_column' 'occurred_at' has 2 values that cannot be read as 'ISO8601', so this refresh was not applied and the previous data is still served. Correct the source values or set 'time_format' to match them. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+            "'time_column' 'occurred_at' has 2 values that cannot be read as 'ISO8601', so this refresh was not applied and the previous data is still served. Correct the source values or set 'time_format' to match them. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
         );
         assert!(!message.contains("not-a-time"), "{message}");
     }
@@ -1607,7 +1576,7 @@ mod tests {
         assert_eq!(
             not_applied_message(&missing_time).as_deref(),
             Some(
-                "'time_column' 'updated_at' is not in the rows the refresh reads, so versions of a key cannot be ordered. Include it in 'acceleration.refresh_sql'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+                "'time_column' 'updated_at' is not in the rows the refresh reads, so versions of a key cannot be ordered. Include it in 'acceleration.refresh_sql'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
             )
         );
         let missing_key = LatestByTime::try_new(
@@ -1622,7 +1591,7 @@ mod tests {
         assert_eq!(
             not_applied_message(&missing_key).as_deref(),
             Some(
-                "primary key column 'tenant_id' is not in the rows the refresh reads, so versions of a key cannot be matched. Include it in 'acceleration.refresh_sql', or remove it from 'acceleration.primary_key'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_dedup_by_time_column"
+                "primary key column 'tenant_id' is not in the rows the refresh reads, so versions of a key cannot be matched. Include it in 'acceleration.refresh_sql', or remove it from 'acceleration.primary_key'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
             )
         );
     }
@@ -1644,7 +1613,7 @@ mod tests {
         assert_eq!(
             superseded,
             Superseded {
-                counts: util::session_state::SupersededCounts {
+                counts: Counts {
                     older: 1,
                     unchanged: 1,
                     ..Default::default()
@@ -1699,56 +1668,6 @@ mod tests {
         assert_eq!(sup_ab.counts.equal_time, 1);
         assert_eq!(sup_ba.counts.equal_time, 1);
         assert_eq!(sup_ab.counts.unchanged + sup_ba.counts.unchanged, 0);
-    }
-
-    #[test]
-    fn negative_zero_and_nan_hash_like_the_values_an_engine_stores_for_them() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("t", DataType::Int64, false),
-            Field::new("f", DataType::Float64, true),
-        ]));
-        let rows = |f: Vec<Option<f64>>| {
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(vec![1; f.len()])),
-                    Arc::new(Int64Array::from(vec![1; f.len()])),
-                    Arc::new(arrow::array::Float64Array::from(f)),
-                ],
-            )
-            .expect("batch")
-        };
-        let s = LatestByTime::try_new(
-            "events",
-            &schema,
-            vec!["id".to_string()],
-            "t".to_string(),
-            Some(TimeFormat::UnixSeconds),
-        )
-        .expect("selector");
-        let plain = s
-            .reader
-            .content_hashes(&rows(vec![Some(-0.0), Some(f64::NAN), Some(1.5)]))
-            .expect("hashes");
-        assert_ne!(
-            plain,
-            s.reader
-                .content_hashes(&rows(vec![Some(0.0), None, Some(1.5)]))
-                .expect("hashes"),
-            "an engine that keeps -0.0 and NaN tells them apart"
-        );
-        let s = s.with_floats_as_stored(true);
-        let incoming = s
-            .reader
-            .content_hashes(&rows(vec![Some(-0.0), Some(f64::NAN), Some(1.5)]))
-            .expect("hashes");
-        let stored = s
-            .reader
-            .content_hashes(&rows(vec![Some(0.0), None, Some(1.5)]))
-            .expect("hashes");
-        assert_eq!(incoming, stored);
-        assert_ne!(incoming[0], incoming[2]);
     }
 
     #[test]
@@ -1923,7 +1842,7 @@ mod tests {
             .expect_err("nothing fits");
         let message = not_applied_message(&err).expect("a refresh-not-applied error");
         assert!(
-            message.starts_with("'acceleration.on_conflict: upsert_dedup_by_time_column' could not spill its key versions to 'runtime.query.temp_directory', so this refresh was not applied and the previous data is still served. Free space there, or raise 'runtime.query.memory_limit'. Cause: "),
+            message.starts_with("'acceleration.on_conflict: upsert_by_time' could not spill its key versions to 'runtime.query.temp_directory', so this refresh was not applied and the previous data is still served. Free space there, or raise 'runtime.query.memory_limit'. Cause: "),
             "{message}"
         );
     }

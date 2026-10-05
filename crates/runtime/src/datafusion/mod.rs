@@ -28,7 +28,7 @@ use crate::accelerated::{
 };
 use crate::accelerated::{
     AcceleratedTable, Retention,
-    refresh::{Refresh, UpsertDedupByTimeColumn},
+    refresh::{Refresh, UpsertByTime},
 };
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
@@ -3234,22 +3234,17 @@ impl DataFusion {
         if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
             refresh = refresh.append_overlap(append_overlap);
         }
-        refresh = refresh.upsert_dedup_by_time_column(
-            acceleration_settings
-                .upsert_dedup_by_time_column
-                .is_some()
-                .then(|| UpsertDedupByTimeColumn {
+        refresh =
+            refresh.upsert_by_time(acceleration_settings.upsert_by_time.is_some().then(|| {
+                UpsertByTime {
                     // An unpartitioned file-mode Cayenne table resolves a full refresh's
                     // repeated keys after writing them, ordered by the row versions the
                     // refresh supplies.
                     versions_resolved_after_write: acceleration_settings.engine == Engine::Cayenne
                         && acceleration_settings.mode == Mode::File
                         && acceleration_settings.partition_by.is_empty(),
-                    // SQLite stores `-0.0` as `0.0` and `NaN` as NULL, so a stored row is
-                    // hashed with its floats read that way to match the row it came from.
-                    floats_as_stored: acceleration_settings.engine == Engine::Sqlite,
-                }),
-        );
+                }
+            }));
         if let Some(caching_ttl) = acceleration_settings.caching_ttl {
             refresh = refresh.caching_ttl(caching_ttl);
         }

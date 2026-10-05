@@ -27,7 +27,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use cayenne::metadata::{CreateTableOptions, PkConflictDetection, VortexConfig};
 
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, UpsertDedup};
 
 use datafusion::prelude::SessionContext;
 
@@ -216,12 +216,13 @@ async fn test_pk_conflict_detection_none_rejects_upsert_impl(
     Ok(())
 }
 
-// --- P1 regression: in-batch duplicate primary keys ---
+// --- In-batch duplicate primary keys ---
 // A single `INSERT ... VALUES (1,'a'),(1,'b')` is ONE RecordBatch with two rows
-// sharing a PK. Before the fix the Exact path kept both (silent double-insert);
-// dedup is now derived from the OnConflict variant (Upsert keep-last, DoNothing
-// keep-first) as an in-batch pre-pass.
+// sharing a PK. It keeps one row: the last under `upsert_by_arrival`, the first
+// under `drop`; plain `upsert` collapses identical copies and fails on different
+// versions.
 
+test_with_backends!(test_upsert_in_batch_versions_fail_impl);
 test_with_backends!(test_upsert_in_batch_duplicate_keeps_last_impl);
 test_with_backends!(test_upsert_in_batch_duplicate_over_existing_keeps_last_impl);
 test_with_backends!(test_do_nothing_in_batch_duplicate_keeps_first_impl);
@@ -258,6 +259,15 @@ async fn make_id_name_table(
     name: &str,
     on_conflict: OnConflict,
 ) -> Result<(Arc<CayenneTableProvider>, SessionContext), Box<dyn std::error::Error>> {
+    make_id_name_table_resolving(fixture, name, on_conflict, UpsertDedup::None).await
+}
+
+async fn make_id_name_table_resolving(
+    fixture: &common::TestFixture,
+    name: &str,
+    on_conflict: OnConflict,
+    dedup: UpsertDedup,
+) -> Result<(Arc<CayenneTableProvider>, SessionContext), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, false),
@@ -274,7 +284,10 @@ async fn make_id_name_table(
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?,
+        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
+            .with_upsert_dedup(dedup)
+            .create(table_options)
+            .await?,
     );
     ctx.register_table(
         name,
@@ -283,14 +296,58 @@ async fn make_id_name_table(
     Ok((table, ctx))
 }
 
-/// Upsert: a single batch with a duplicate PK keeps the LAST occurrence.
-async fn test_upsert_in_batch_duplicate_keeps_last_impl(
+/// `upsert`: different versions of a key in one statement fail it and change
+/// nothing; identical copies collapse.
+async fn test_upsert_in_batch_versions_fail_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_table, ctx) = make_id_name_table(
         &fixture,
+        "upsert_in_batch_versions",
+        OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
+    )
+    .await?;
+    ctx.sql("INSERT INTO upsert_in_batch_versions VALUES (1, 'orig')")
+        .await?
+        .collect()
+        .await?;
+
+    let error = match ctx
+        .sql("INSERT INTO upsert_in_batch_versions VALUES (1, 'a'), (1, 'b')")
+        .await
+    {
+        Ok(insert) => insert.collect().await.expect_err("different versions fail"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("its data holds different versions of 1 value of 'id'"),
+        "{error}"
+    );
+    ctx.sql("INSERT INTO upsert_in_batch_versions VALUES (2, 'x'), (2, 'x')")
+        .await?
+        .collect()
+        .await?;
+
+    let rows = collect_id_name(
+        &ctx,
+        "SELECT id, name FROM upsert_in_batch_versions ORDER BY id",
+    )
+    .await?;
+    assert_eq!(rows, vec![(1, "orig".to_string()), (2, "x".to_string())]);
+    Ok(())
+}
+
+/// `upsert_by_arrival`: a single batch with a duplicate PK keeps the LAST occurrence.
+async fn test_upsert_in_batch_duplicate_keeps_last_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_table, ctx) = make_id_name_table_resolving(
+        &fixture,
         "upsert_in_batch_dup",
         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
+        UpsertDedup::KeepLast,
     )
     .await?;
 
@@ -309,16 +366,18 @@ async fn test_upsert_in_batch_duplicate_keeps_last_impl(
     Ok(())
 }
 
-/// Upsert: an in-batch duplicate that ALSO conflicts with a pre-existing row must
-/// still yield one row (the last in-batch value) — exercises the delete path so a
-/// double-counted supersede would corrupt the live-row bookkeeping.
+/// `upsert_by_arrival`: an in-batch duplicate that ALSO conflicts with a
+/// pre-existing row must still yield one row (the last in-batch value) — exercises
+/// the delete path so a double-counted supersede would corrupt the live-row
+/// bookkeeping.
 async fn test_upsert_in_batch_duplicate_over_existing_keeps_last_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, ctx) = make_id_name_table(
+    let (_table, ctx) = make_id_name_table_resolving(
         &fixture,
         "upsert_in_batch_dup_existing",
         OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
+        UpsertDedup::KeepLast,
     )
     .await?;
 
@@ -398,7 +457,10 @@ async fn test_upsert_in_batch_duplicate_composite_pk_impl(
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?,
+        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
+            .with_upsert_dedup(UpsertDedup::KeepLast)
+            .create(table_options)
+            .await?,
     );
     ctx.register_table(
         "upsert_in_batch_dup_composite",
