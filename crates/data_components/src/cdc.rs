@@ -482,7 +482,12 @@ impl LazyChangeBatch {
                 let _ = self.built.set(batch);
                 None
             }
-            Err(e) => Some(e),
+            // Keep the form both `get` and `into_built` will return: `get`
+            // clones via [`reported_again`], and an `Arrow` error cannot be
+            // cloned, so store that already-reported equivalent now. A
+            // borrowed lookup and a consuming one then cannot disagree on the
+            // variant for the same failed prebuild.
+            Err(e) => Some(reported_again(&e)),
         };
         self.prebuilt = Some(Prebuilt { metadata, error });
     }
@@ -2187,6 +2192,7 @@ mod deferred_tests {
     //! empty batch) that converts to a `StreamError` for the dataset's stream.
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::error::ArrowError;
     use arrow_array::Int32Array;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2579,6 +2585,77 @@ mod deferred_tests {
             ),
         }
         assert_eq!(builds.load(Ordering::SeqCst), 1, "no second build");
+    }
+
+    /// A [`ChangeRows`] whose build fails as [`ChangeBatchError::Arrow`], the
+    /// variant [`reported_again`] cannot clone by value.
+    struct ArrowFailingRows;
+
+    impl ChangeRows for ArrowFailingRows {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+            Err(ChangeBatchError::Arrow {
+                source: ArrowError::ExternalError(Box::new(std::io::Error::other(
+                    "synthetic arrow failure",
+                ))),
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prebuild_arrow_failure_is_the_same_variant_on_borrow_and_consume() {
+        let group = vec![Ok(ChangeEnvelope::new_from_rows(
+            Box::new(NoOpCommitter),
+            Box::new(ArrowFailingRows),
+            false,
+        ))];
+        let mut group = prebuild_offloaded(group).await;
+        let envelope = group
+            .pop()
+            .expect("one item back")
+            .expect("still an envelope");
+        assert!(group.is_empty());
+
+        let borrowed = envelope
+            .change_batch()
+            .expect_err("a failed prebuild has no batch");
+        let ChangeBatchError::DeferredBuild {
+            message: borrowed_message,
+        } = &borrowed
+        else {
+            panic!("borrowed lookup must report DeferredBuild, got {borrowed:?}");
+        };
+        assert!(
+            borrowed_message.contains("synthetic arrow failure"),
+            "borrowed error must keep the build's cause, got {borrowed_message}"
+        );
+
+        match into_parts_offloaded_burst(vec![envelope]).await {
+            Ok(_) => panic!("a failed prebuild must fail the consumer"),
+            Err(err) => {
+                let ChangeBatchError::DeferredBuild { message } = &err else {
+                    panic!("consuming lookup must report the same DeferredBuild, got {err:?}");
+                };
+                assert_eq!(
+                    message, borrowed_message,
+                    "borrowed and consuming lookups must report the same error"
+                );
+            }
+        }
     }
 
     #[tokio::test]
