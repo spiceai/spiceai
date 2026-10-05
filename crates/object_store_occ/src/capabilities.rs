@@ -365,7 +365,10 @@ mod tests {
             create: Enforcement::Unsupported,
             update: Enforcement::Unknown("update not tried".into()),
         };
-        assert!(!unsupported_unknown.is_conclusive(), "{unsupported_unknown:?}");
+        assert!(
+            !unsupported_unknown.is_conclusive(),
+            "{unsupported_unknown:?}"
+        );
         assert_eq!(
             unsupported_unknown.refusal_reason(),
             Some("does not support conditional writes"),
