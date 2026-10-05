@@ -19,7 +19,7 @@ use data_connector_api::ConnectorComponent;
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use crate::identity::{identity_unnest, push_identity_fields};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use connector_graphql::graphql::{ErrorChecker, GraphQLContext};
+use connector_graphql::graphql::{ErrorChecker, GraphQLContext, RefusalKind};
 use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
@@ -60,8 +60,10 @@ impl GraphQLContext for ProjectsTableArgs {
 
                 // GitHub bug: When the app doesn't have access to Projects v2, GitHub sometimes
                 // returns "Something went wrong while executing your query" instead of a proper
-                // permission error. This appears to be a GitHub API bug where lack of permissions
-                // triggers an internal error rather than returning a proper authorization error.
+                // permission error. GitHub sends the same message when its backend times out, so
+                // the cause is not certain from the message. The error is reported as an inferred
+                // refusal (`RefusalKind::Inferred`) and is retried: a few retries on a real
+                // permission failure cost less than a permanent failure on a transient timeout.
                 if let Some(errors) = response.get("errors") {
                     tracing::debug!(
                         "GitHub projects query for {target} returned errors: {:?}",
@@ -73,11 +75,12 @@ impl GraphQLContext for ProjectsTableArgs {
                                 && message
                                     .contains("Something went wrong while executing your query")
                             {
-                                tracing::error!(
-                                    "GitHub returned a misleading projects error for {target}; treating it as a permissions failure"
+                                tracing::warn!(
+                                    "GitHub returned an internal query error for {target}; retrying"
                                 );
                                 return Err(connector_graphql::graphql::Error::InvalidCredentialsOrPermissions {
-                                message: format!("Failed to access {target_kind} for {target}: GitHub reported an internal query error, which usually means the GitHub App lacks project read permissions. Verify the app has the required project access."),
+                                message: format!("Failed to access {target_kind} for {target}: GitHub reported an internal query error. This is either a transient GitHub backend failure or a GitHub App that lacks project read permissions. If the error persists, verify the app has the required project access."),
+                                kind: RefusalKind::Inferred,
                             });
                             }
                         }

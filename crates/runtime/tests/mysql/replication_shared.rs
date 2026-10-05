@@ -53,12 +53,6 @@ use mysql_async::prelude::Queryable;
 use crate::init_tracing;
 use crate::mysql::common;
 
-// Distinct from the other MySQL suites (comments 13320, e2e 13321/13322/13323,
-// per-dataset replication 13324(+1,+2,+5), refresh_retry 13327, schema_inference
-// 13328, rehydration 13337) so parallel test binaries never fight over a
-// container.
-const MYSQL_SHARED_PORT: u16 = 13340;
-
 /// In-memory [`PositionStore`] standing in for one member's accelerator sidecar.
 #[derive(Default)]
 struct MemoryPositionStore {
@@ -352,8 +346,8 @@ async fn expect_single_change(
 async fn shared_group_multiplexes_and_routes_per_table() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_SHARED_PORT;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = common::get_mysql_conn(port)?;
     setup_table(&pool, "shared_a", &[(1, "a1"), (2, "a2")]).await?;
     setup_table(&pool, "shared_b", &[(1, "b1"), (2, "b2"), (3, "b3")]).await?;
@@ -416,8 +410,8 @@ async fn shared_group_multiplexes_and_routes_per_table() -> Result<(), anyhow::E
 async fn shared_group_late_join_snapshots_independently() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_SHARED_PORT + 1;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = common::get_mysql_conn(port)?;
     setup_table(&pool, "late_a", &[(1, "a1"), (2, "a2")]).await?;
     setup_table(&pool, "late_b", &[(1, "b1"), (2, "b2")]).await?;
@@ -471,8 +465,8 @@ async fn shared_group_late_join_snapshots_independently() -> Result<(), anyhow::
 async fn shared_group_restart_resumes_from_min_position() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_SHARED_PORT + 2;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = common::get_mysql_conn(port)?;
     setup_table(&pool, "resume_a", &[(1, "a1"), (2, "a2")]).await?;
     setup_table(&pool, "resume_b", &[(1, "b1"), (2, "b2")]).await?;
@@ -584,8 +578,8 @@ async fn wait_for_id(
 async fn shared_group_rejects_duplicate_source_table() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_SHARED_PORT + 3;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = common::get_mysql_conn(port)?;
     setup_table(&pool, "dup_a", &[(1, "a1")]).await?;
 
@@ -636,8 +630,8 @@ async fn shared_group_rejects_duplicate_source_table() -> Result<(), anyhow::Err
 async fn shared_group_gtid_restore_resumes_via_executed_set() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_SHARED_PORT + 4;
-    let _container = common::start_mysql_gtid_docker_container(port).await?;
+    let container = common::start_mysql_gtid_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = common::get_mysql_conn(port)?;
     // Confirm the source really issues GTIDs, else this would silently exercise
     // the file+offset path instead of GTID auto-positioning.
@@ -747,8 +741,8 @@ async fn shared_group_gtid_restore_resumes_via_executed_set() -> Result<(), anyh
 async fn shared_group_single_dataset_streams_snapshot_and_changes() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_SHARED_PORT + 5;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = common::get_mysql_conn(port)?;
     setup_table(&pool, "solo", &[(1, "s1"), (2, "s2")]).await?;
 
@@ -788,12 +782,12 @@ async fn shared_group_single_dataset_streams_snapshot_and_changes() -> Result<()
 /// mid-stream through the member's live channel.
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_group_purged_position_restart_rebuilds_file() -> Result<(), anyhow::Error> {
-    run_purged_position_restart(MYSQL_SHARED_PORT + 6, 210_601, false).await
+    run_purged_position_restart(210_601, false).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_group_purged_position_restart_rebuilds_gtid() -> Result<(), anyhow::Error> {
-    run_purged_position_restart(MYSQL_SHARED_PORT + 7, 210_701, true).await
+    run_purged_position_restart(210_701, true).await
 }
 
 /// Drive the purged-position restart recovery. `gtid` selects the positioning
@@ -806,18 +800,15 @@ async fn shared_group_purged_position_restart_rebuilds_gtid() -> Result<(), anyh
 /// than fatally erroring. A purge surfaces as `MySQL` error 1236 in both
 /// modes — file mode via the resolve-time file check, GTID mode via the running
 /// pump's `COM_BINLOG_DUMP_GTID` rejection (the path issue #11968 fixed).
-async fn run_purged_position_restart(
-    port: u16,
-    server_id: u32,
-    gtid: bool,
-) -> Result<(), anyhow::Error> {
+async fn run_purged_position_restart(server_id: u32, gtid: bool) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let _container = if gtid {
-        common::start_mysql_gtid_docker_container(port).await?
+    let container = if gtid {
+        common::start_mysql_gtid_docker_container().await?
     } else {
-        common::start_mysql_docker_container(port).await?
+        common::start_mysql_docker_container().await?
     };
+    let port = container.host_port(3306)?;
     let pool = common::get_mysql_conn(port)?;
     setup_table(&pool, "purge_a", &[(1, "a1"), (2, "a2")]).await?;
 

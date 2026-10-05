@@ -1136,7 +1136,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         return Ok(None);
     };
 
-    if let Some(config) = app.runtime.scheduler.clone() {
+    if let Some(config) = app.runtime.resolved_scheduler() {
         if rt.partition_store().is_some() {
             // Validate all accelerated datasets/views have partition keys
             // for distributed partition assignment.
@@ -2154,7 +2154,7 @@ async fn create_scheduler_server(
         tokio::pin!(shutdown);
         loop {
             if let Some(app) = rt.read_app().await {
-                break app.runtime.scheduler.clone();
+                break app.runtime.resolved_scheduler();
             }
             if last_warn.elapsed() >= std::time::Duration::from_secs(30) {
                 tracing::warn!(
@@ -2179,33 +2179,38 @@ async fn create_scheduler_server(
         }
     };
     let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
-        tracing::info!(
-            state_location = %scheduler_cfg.state_location,
-            "Scheduler using shared object-store job state"
-        );
-        let (store, base_prefix) = scheduler_registry::build_object_store(
-            rt.as_ref(),
-            &scheduler_cfg.state_location,
-            &scheduler_cfg,
-        )
-        .await
-        .map_err(|e| crate::Error::FailedToStartClusterScheduler {
-            source: Box::new(e),
-        })?;
-        let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
-            SpiceLogicalCodec::new_codec(),
-            SpicePhysicalCodec::new(Arc::clone(rt))
-                .boxed()
-                .context(FailedToStartClusterSchedulerSnafu)?,
-        );
-        Arc::new(shared_job_state::SharedJobState::new(
-            metrics_node_id,
-            store,
-            base_prefix,
-            codec,
-            session_builder,
-            config_producer,
-        ))
+        if let Some(state_location) = scheduler_cfg.state_location.as_deref() {
+            tracing::info!(
+                state_location = %state_location,
+                "Scheduler using shared object-store job state"
+            );
+            let (store, base_prefix) =
+                scheduler_registry::build_object_store(rt.as_ref(), state_location, &scheduler_cfg)
+                    .await
+                    .map_err(|e| crate::Error::FailedToStartClusterScheduler {
+                        source: Box::new(e),
+                    })?;
+            let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
+                SpiceLogicalCodec::new_codec(),
+                SpicePhysicalCodec::new(Arc::clone(rt))
+                    .boxed()
+                    .context(FailedToStartClusterSchedulerSnafu)?,
+            );
+            Arc::new(shared_job_state::SharedJobState::new(
+                metrics_node_id,
+                store,
+                base_prefix,
+                codec,
+                session_builder,
+                config_producer,
+            ))
+        } else {
+            Arc::new(InMemoryJobState::new(
+                metrics_node_id,
+                session_builder,
+                config_producer,
+            ))
+        }
     } else {
         Arc::new(InMemoryJobState::new(
             metrics_node_id,
