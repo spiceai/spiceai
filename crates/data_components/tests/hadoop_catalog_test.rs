@@ -48,9 +48,8 @@ fn get_file_hadoop_catalog(warehouse_root: &Path) -> HadoopCatalogBuilder {
 
     let mut fs_config = opendal::services::FsConfig::default();
     fs_config.root = Some(warehouse_root.to_string_lossy().into_owned());
-    let operator = opendal::Operator::new(fs_config.into_builder())
-        .expect("Should build FS operator")
-        .finish();
+    let operator =
+        opendal::Operator::new(fs_config.into_builder()).expect("Should build FS operator");
 
     HadoopCatalogBuilder::default()
         .with_warehouse_root(warehouse_url.to_string())
@@ -74,9 +73,8 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
     s3_config.access_key_id = Some(access_key.clone());
     s3_config.secret_access_key = Some(secret_key.clone());
 
-    let operator = opendal::Operator::new(s3_config.into_builder())
-        .expect("Should build S3 operator")
-        .finish();
+    let operator =
+        opendal::Operator::new(s3_config.into_builder()).expect("Should build S3 operator");
 
     HadoopCatalogBuilder::default()
         .with_warehouse_root("s3a://hadoop/")
@@ -112,9 +110,8 @@ fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
     s3_config.access_key_id = Some(access_key.clone());
     s3_config.secret_access_key = Some(secret_key.clone());
 
-    let operator = opendal::Operator::new(s3_config.into_builder())
-        .expect("Should build S3 operator")
-        .finish();
+    let operator =
+        opendal::Operator::new(s3_config.into_builder()).expect("Should build S3 operator");
 
     HadoopCatalogBuilder::default()
         .with_warehouse_root("s3://hadoop/")
