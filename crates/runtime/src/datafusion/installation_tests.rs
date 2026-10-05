@@ -254,3 +254,164 @@ async fn change_sink_installation_metadata_publication_failure_does_not_publish(
 async fn change_sink_installation_publishes_a_live_owner() {
     installation(Outcome::Complete).await;
 }
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn change_sink_initialization_refusal_keeps_installed_generation_live() {
+    use crate::component::dataset::acceleration::Mode;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let df = runtime.datafusion();
+        let app = Arc::new(app::AppBuilder::new("initialization-test").build());
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![]])
+                .expect("Arrow source"),
+        );
+        let source = Arc::new(MetadataGate {
+            provider: Arc::clone(&provider),
+            entered: Notify::new(),
+            release: Semaphore::new(1),
+            fail: false,
+        });
+        let build = |acceleration| {
+            let mut builder = DatasetBuilder::try_new("test:memory".into(), "initialization_test")
+                .expect("dataset")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&runtime));
+            builder.acceleration = Some(acceleration);
+            builder.time_column = Some("id".into());
+            builder.time_format = Some(TimeFormat::UnixSeconds);
+            builder.access = AccessMode::ReadWrite;
+            Arc::new(builder.build().expect("dataset configuration"))
+        };
+        let dataset = build(Acceleration {
+            refresh_mode: Some(RefreshMode::Append),
+            ..Acceleration::default()
+        });
+        let name = dataset.name.clone();
+        df.register_table(
+            dataset,
+            Table::Accelerated {
+                source: source as Arc<dyn DataConnector>,
+                federated_read_table: FederatedTable::new_unchecked(provider),
+                accelerated_table: None,
+                secrets: runtime.secrets(),
+                bootstrap_status: runtime_acceleration::BootstrapStatus::none().into(),
+                initial_partition_filters: None,
+            },
+        )
+        .await
+        .expect("install the current generation");
+        let installed = df.get_table(&name).await.expect("registered table");
+        let table = spice_table::find_layer::<crate::accelerated::AcceleratedTable>(
+            installed.as_ref(),
+            spice_table::LayerWalk::Read,
+        )
+        .expect("accelerated layer");
+        let sink = table.change_sink().expect("bound sink");
+        drop(
+            sink.reserve()
+                .await
+                .expect("live generation before refusal"),
+        );
+        let root = tempfile::tempdir().expect("fixture directory");
+        let storage = root.path().join("storage");
+        for InitializationCase {
+            engine,
+            accelerator,
+            params,
+            expected_error,
+        } in invalid_initializations(&storage)
+        {
+            let replacement = build(Acceleration {
+                engine,
+                mode: Mode::File,
+                params: params
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value))
+                    .collect(),
+                ..Acceleration::default()
+            });
+            let error = df
+                .initialize_accelerator(replacement, accelerator)
+                .await
+                .err()
+                .expect("invalid initialization must refuse");
+            assert!(error.to_string().contains(expected_error), "{error}");
+            assert!(!storage.exists(), "validation must not create storage");
+            let current = df
+                .get_table(&name)
+                .await
+                .expect("registered table survives");
+            assert!(Arc::ptr_eq(&installed, &current));
+            drop(
+                sink.reserve()
+                    .await
+                    .expect("refusal cannot close the installed sink"),
+            );
+        }
+        df.remove_table(&name)
+            .await
+            .expect("refusal cannot fence later removal");
+        df.ctx
+            .deregister_table(TableReference::partial("metadata", name.to_string()))
+            .expect("remove fixture metadata");
+    })
+    .await
+    .expect("initialization validation must finish");
+}
+
+#[cfg(not(windows))]
+struct InitializationCase {
+    engine: crate::component::dataset::acceleration::Engine,
+    accelerator: Arc<dyn data_accelerator_api::DataAccelerator>,
+    params: Vec<(&'static str, String)>,
+    expected_error: &'static str,
+}
+
+#[cfg(not(windows))]
+fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 4] {
+    use crate::component::dataset::acceleration::Engine;
+
+    let invalid_file = storage
+        .join("invalid.extension")
+        .to_string_lossy()
+        .into_owned();
+    [
+        InitializationCase {
+            engine: Engine::Cayenne,
+            accelerator: Arc::new(accelerator_cayenne::CayenneAccelerator::new()),
+            params: vec![
+                ("cayenne_file_path", storage.to_string_lossy().into_owned()),
+                (
+                    "cayenne_metadata_dir",
+                    storage
+                        .join("initialization_test/catalog")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ],
+            expected_error: "contains the Cayenne metastore directory",
+        },
+        InitializationCase {
+            engine: Engine::DuckDB,
+            accelerator: Arc::new(accelerator_duckdb::DuckDBAccelerator::new()),
+            params: vec![("duckdb_file", invalid_file.clone())],
+            expected_error: "extension",
+        },
+        InitializationCase {
+            engine: Engine::Sqlite,
+            accelerator: Arc::new(accelerator_sqlite::SqliteAccelerator::new()),
+            params: vec![("sqlite_file", invalid_file.clone())],
+            expected_error: "extension",
+        },
+        InitializationCase {
+            engine: Engine::Turso,
+            accelerator: Arc::new(accelerator_turso::TursoAccelerator::new()),
+            params: vec![("turso_file", invalid_file)],
+            expected_error: "extension",
+        },
+    ]
+}

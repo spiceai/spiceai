@@ -3213,6 +3213,13 @@ impl DataFusion {
         accelerator: Arc<dyn dataaccelerator::DataAccelerator>,
     ) -> Result<AcceleratorBootstrap> {
         let name = dataset.name.to_string();
+        accelerator
+            .validate_init(dataset.as_ref())
+            .await
+            .map_err(DataFusionError::External)
+            .context(UnableToDrainChangesSnafu {
+                dataset_name: name.clone(),
+            })?;
         let mut permit = self.generation_lock(&dataset.name).await?;
         permit
             .drain_previous()
