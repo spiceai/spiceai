@@ -18,8 +18,11 @@ use crate::federated::FederatedTable;
 use runtime_status as status;
 
 use super::{
-    metrics, refresh::RefreshOverrides, refresh_completion::RefreshRequestId,
-    refresh_task::RefreshTask, synchronized_table::SynchronizedTable,
+    metrics,
+    refresh::RefreshOverrides,
+    refresh_completion::RefreshRequestId,
+    refresh_task::{RefreshOutcome, RefreshTask},
+    synchronized_table::SynchronizedTable,
 };
 use futures::{FutureExt, future::BoxFuture};
 use tokio::{
@@ -37,7 +40,7 @@ use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use super::refresh::Refresh;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider};
 use opentelemetry::KeyValue;
 use spicepod::metric::Metrics;
 
@@ -251,7 +254,7 @@ pub struct RefreshTaskRunner {
 }
 
 type RefreshRunFuture =
-    BoxFuture<'static, std::result::Result<super::Result<()>, Box<dyn Any + Send>>>;
+    BoxFuture<'static, std::result::Result<super::Result<RefreshOutcome>, Box<dyn Any + Send>>>;
 
 /// One refresh request: the id it was issued under, and the overrides it
 /// carries.
@@ -263,7 +266,7 @@ type RefreshRunFuture =
 pub type RefreshRequest = (RefreshRequestId, Option<RefreshOverrides>);
 
 /// A finished refresh, reported under the id of the request that started it.
-pub type RefreshTaskCompletion = (RefreshRequestId, super::Result<()>);
+pub type RefreshTaskCompletion = (RefreshRequestId, super::Result<RefreshOutcome>);
 
 type RefreshTaskStartSender = Sender<RefreshRequest>;
 type RefreshTaskCompletionReceiver = Receiver<RefreshTaskCompletion>;
@@ -328,9 +331,9 @@ impl RefreshTaskRunner {
                     select! {
                         res = task => {
                             match res {
-                                Ok(Ok(())) => {
-                                    tracing::debug!("Dataset {dataset_name} refreshed successfully");
-                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(()))).await {
+                                Ok(Ok(outcome)) => {
+                                    tracing::debug!("Dataset {dataset_name} refreshed successfully ({outcome:?})");
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(outcome))).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },

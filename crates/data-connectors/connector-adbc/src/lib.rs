@@ -21,8 +21,8 @@ use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use data_connector_api::ConnectorContext;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
@@ -2466,6 +2466,7 @@ mod function_support_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatchIterator;
     use arrow::util::pretty::pretty_format_batches;
+    use datafusion::common::TableReference;
     use datafusion::common::tree_node::TreeNode;
     use datafusion::config::ConfigOptions;
     use datafusion::datasource::{MemTable, TableProvider, provider_as_source};
@@ -2478,7 +2479,6 @@ mod function_support_tests {
     use datafusion::optimizer::AnalyzerRule;
     use datafusion::physical_plan::{collect, displayable};
     use datafusion::prelude::{SessionContext, col, lit};
-    use datafusion::sql::TableReference;
     use datafusion_federation::sql::federation_analyzer_rule;
     use datafusion_federation::{
         FederatedPlanNode, FederatedPlanner, FederatedTableProviderAdaptor,
@@ -3063,6 +3063,66 @@ mod function_support_tests {
                 .analyzer(&scan_project(&provider, expr)),
             Some(FederationAnalyzerForLogicalPlan::With(_))
         )
+    }
+
+    /// Whether a plan carrying `expr` federates to a provider the catalog
+    /// connector builds for `driver_name` — its own factory path, so the
+    /// policy it installs is the one under test.
+    async fn federates_via_catalog(driver_name: &str, expr: Expr) -> bool {
+        let pool = Arc::new(
+            ADBCPool::new(StubDatabase::default(), None).expect("build the stub ADBC pool"),
+        );
+        let provider =
+            runtime::catalogconnector::adbc::build_table_factory(pool, true, driver_name)
+                .table_provider(TableReference::bare("t"), dialect_for_driver(driver_name))
+                .await
+                .expect("build the catalog-registered ADBC table provider");
+        let adaptor = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("a federation-enabled factory must produce a federated provider");
+        matches!(
+            adaptor
+                .source
+                .federation_provider()
+                .analyzer(&scan_project(&provider, expr)),
+            Some(FederationAnalyzerForLogicalPlan::With(_))
+        )
+    }
+
+    /// Regression test for #14482 on the ADBC routes: a `duckdb`, `postgresql`
+    /// or `mysql` driver reaches an engine that rounds a fractional-to-integer
+    /// cast `DataFusion` truncates, so the cast must stay local through the
+    /// dataset factory and the catalog factory alike; `sqlite` truncates like
+    /// `DataFusion` and keeps the pushdown.
+    #[tokio::test]
+    async fn a_fractional_to_integer_cast_stays_local_on_every_adbc_driver_that_rounds() {
+        use datafusion::prelude::cast;
+        let rounding = || cast(lit(1.5_f64), DataType::Int64);
+        for driver in [
+            "duckdb",
+            "postgresql",
+            "postgres",
+            "mysql",
+            "bigquery",
+            "snowflake",
+        ] {
+            assert!(
+                !federates(driver, rounding()).await,
+                "the {driver} driver rounds {}, so the dataset route must keep it local",
+                rounding()
+            );
+            assert!(
+                !federates_via_catalog(driver, rounding()).await,
+                "the {driver} driver rounds {}, so the catalog route must keep it local",
+                rounding()
+            );
+        }
+        assert!(
+            federates("sqlite", rounding()).await
+                && federates_via_catalog("sqlite", rounding()).await,
+            "SQLite truncates {} as DataFusion does, so the pushdown is kept",
+            rounding()
+        );
     }
 
     #[tokio::test]

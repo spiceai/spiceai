@@ -27,7 +27,7 @@ use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use sharded_cache::{EvictionPolicy, NUM_SHARDS};
 use snafu::ResultExt;
 use spicepod::component::caching::{CacheConfig, CacheEngine, CachingPolicy};
@@ -204,6 +204,35 @@ impl<
         self
     }
 
+    /// Refresh the item-count, size and hit-ratio metrics after a store, at
+    /// most once every 5 seconds across all callers.
+    async fn report_metrics_after_put(&self) {
+        let now_seconds = self.initial_instant.elapsed().as_secs();
+        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
+
+        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
+        // performance is comparable with relaxed load/store
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
+                .metrics_last_reported_time
+                .compare_exchange(
+                    last_emitted,
+                    now_seconds,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            V::record_item_count(self.item_count().await);
+            V::record_size(self.size_bytes().await);
+            V::record_max_size(self.max_size() as u64);
+
+            let hits = self.hits.load(Ordering::Relaxed);
+            let total = self.total_requests.load(Ordering::Relaxed);
+            V::update_hit_ratio(hits, total);
+        }
+    }
+
     /// `(hits, total_requests)` as fed to the hit-ratio gauge.
     #[cfg(test)]
     pub(crate) fn hit_ratio_counters(&self) -> (u64, u64) {
@@ -274,31 +303,12 @@ impl<
 
     async fn put_raw_key(&self, key: &u64, value: V) {
         self.backend.insert(*key, value).await;
+        self.report_metrics_after_put().await;
+    }
 
-        let now_seconds = self.initial_instant.elapsed().as_secs();
-        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
-
-        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
-        // performance is comparable with relaxed load/store
-        if now_seconds.saturating_sub(last_emitted) >= 5
-            && self
-                .metrics_last_reported_time
-                .compare_exchange(
-                    last_emitted,
-                    now_seconds,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            V::record_item_count(self.item_count().await);
-            V::record_size(self.size_bytes().await);
-            V::record_max_size(self.max_size() as u64);
-
-            let hits = self.hits.load(Ordering::Relaxed);
-            let total = self.total_requests.load(Ordering::Relaxed);
-            V::update_hit_ratio(hits, total);
-        }
+    async fn put_raw_key_with_weight(&self, key: &u64, value: V, weight: usize) {
+        self.backend.insert_with_weight(*key, value, weight).await;
+        self.report_metrics_after_put().await;
     }
 
     async fn replace_if(
@@ -376,13 +386,25 @@ impl<
         // invalidate gate, so a concurrent insert into an already-walked shard
         // cannot survive this return.
         let backend = Arc::clone(&self.backend);
-        let removed = tokio::task::spawn_blocking(move || {
+        let removed = match tokio::task::spawn_blocking(move || {
             backend.invalidate_matching(|value| {
                 crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
             })
         })
         .await
-        .context(InvalidationDidNotFinishSnafu { table_name })?;
+        {
+            Ok(removed) => removed,
+            // Tokio cancels a blocking task only when its runtime is shutting down,
+            // and this in-memory cache is dropped with it, so nothing stale can be
+            // served. A panicked scan is still an error.
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!(
+                    "Cache invalidation for dataset {table_name} was cancelled (likely shutdown)"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e).context(InvalidationDidNotFinishSnafu { table_name }),
+        };
 
         tracing::debug!("Invalidated {removed} cache entries by scanning the shards in place");
         Ok(())
@@ -636,6 +658,41 @@ mod tests {
             .is_none()
             .then_some(())
             .expect("cache should not contain key after invalidation");
+    }
+
+    /// A refresh that finishes while the runtime is shutting down still invalidates
+    /// the cache, and Tokio cancels a `spawn_blocking` task on a runtime that is
+    /// already shut down. The cache is dropped with the runtime, so there is nothing
+    /// stale left to serve — this must not surface as an invalidation failure.
+    #[test]
+    fn test_invalidation_cancelled_by_runtime_shutdown_is_not_an_error() {
+        let shut_down = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("build runtime");
+        let shut_down_handle = shut_down.handle().clone();
+        shut_down.shutdown_background();
+
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            TEST_MAX_SIZE,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build runtime");
+        let result = driver.block_on(async {
+            let _entered = shut_down_handle.enter();
+            cache
+                .invalidate_for_table(TableReference::bare("test_table"))
+                .await
+        });
+
+        if let Err(e) = result {
+            panic!("invalidation cancelled by runtime shutdown must not be an error: {e}");
+        }
     }
 
     /// Regression test for #11266: cache invalidation must resolve both the

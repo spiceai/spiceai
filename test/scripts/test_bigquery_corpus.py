@@ -85,6 +85,27 @@ class CorpusTests(unittest.TestCase):
         corpus.check_plan(241, explain(PARTIAL))
         corpus.check_plan(0, explain("DataSourceExec: values"))
 
+    def test_rounding_cast_partial_pins_its_remote_count_and_its_local_cast(self):
+        # Query 147 keeps its one scan and lifts the aggregate over it; the
+        # local `CAST(… AS Int32)` is what the connector policy refused to push
+        # down, so a plan without it is no longer this case.
+        aggregate = (
+            "AggregateExec: gby=[CAST(v0006@0 / 1000 AS Int32) * 10 as v0120]\n  "
+            + FULL
+        )
+        corpus.check_plan(147, explain(aggregate))
+        with self.assertRaises(HarnessError):
+            corpus.check_plan(147, explain(FULL))
+        # Query 033 splits into three scans, so neither one nor five will do.
+        scan = "  SchemaCastScanExec\n    " + REMOTE
+        three = "ProjectionExec: expr=[CAST(v0201@1 AS Int32) as v0316]\n" + "\n".join(
+            [scan] * 3
+        )
+        corpus.check_plan(33, explain(three))
+        for wrong in (5, 124):
+            with self.assertRaises(HarnessError):
+                corpus.check_plan(wrong, explain(three))
+
     def test_transport_cannot_change_field_type_name_or_nullability(self):
         for name in corpus.TRANSPORT:
             physical = name + "\n  " + REMOTE

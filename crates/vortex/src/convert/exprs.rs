@@ -20,9 +20,10 @@ use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
-use vortex::arrow::FromArrowType;
+use vortex::arrow::ArrowSession;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
+use vortex::dtype::half::f16;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
 use vortex::expr::cast;
@@ -59,7 +60,7 @@ pub(crate) fn make_vortex_predicate(
 ) -> DFResult<Option<Expression>> {
     let exprs: Vec<_> = predicate
         .iter()
-        .map(|e| expr_convertor.convert(e.as_ref()))
+        .map(|e| expr_convertor.convert_predicate(e.as_ref()))
         .collect::<DFResult<_>>()?;
 
     Ok(and_collect(exprs))
@@ -70,12 +71,26 @@ pub trait ExpressionConvertor: Send + Sync {
     /// Can an expression be pushed down given a specific schema
     fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool;
 
-    /// Try and convert a `DataFusion` [`PhysicalExpr`] into a Vortex [`Expression`].
+    /// Try and convert a `DataFusion` [`PhysicalExpr`] into a Vortex [`Expression`]
+    /// that evaluates to the same value, NULLs included, wherever it is used.
     ///
     /// # Errors
     ///
     /// Returns an error when the expression cannot be represented as a Vortex expression.
     fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<Expression>;
+
+    /// Convert a filter predicate: an expression whose result only decides whether
+    /// a row is kept, so a NULL result and a FALSE one mean the same thing. That
+    /// freedom lets a convertor emit a cheaper expression than [`Self::convert`]
+    /// where the two differ only in NULL versus FALSE. The default is
+    /// [`Self::convert`], which is exact everywhere and therefore always correct.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the expression cannot be represented as a Vortex expression.
+    fn convert_predicate(&self, expr: &dyn PhysicalExpr) -> DFResult<Expression> {
+        self.convert(expr)
+    }
 
     /// Split a projection into Vortex expressions that can be pushed down and leftover
     /// `DataFusion` projections that need to be evaluated after the scan.
@@ -146,7 +161,13 @@ impl DefaultExpressionConvertor {
         };
         // Match the DataFusion return field (UInt64, nullability from the list argument)
         // so a pushed `array_length` has the same type the plan already expects.
-        let return_dtype = DType::from_arrow((scalar_fn.return_type(), nullability));
+        let return_dtype = ArrowSession::default()
+            .from_arrow_datatype(scalar_fn.return_type(), nullability)
+            .map_err(|e| {
+                exec_datafusion_err!(
+                    "Failed to convert array_length return type to a Vortex dtype: {e}"
+                )
+            })?;
         Ok(cast(list_length(input), return_dtype))
     }
 
@@ -201,6 +222,9 @@ impl DefaultExpressionConvertor {
         };
 
         if let Some(base_expr) = case_expr.expr() {
+            // `DataFusion` matches a simple `CASE` operand against each `WHEN`
+            // value by bits, `-0.0` and `0.0` apart as in Vortex, unlike its
+            // `=` (see `compare_with_float_zero`).
             let base_expr = self.convert(base_expr.as_ref())?;
             for (when_expr, then_expr) in case_expr.when_then_expr().iter().rev() {
                 let when_expr = self.convert(when_expr.as_ref())?;
@@ -221,6 +245,189 @@ impl DefaultExpressionConvertor {
 
         Ok(else_expr)
     }
+
+    /// `left operator right` when one side is a floating-point zero literal,
+    /// rewritten so it holds for exactly the rows `DataFusion` keeps; `None`
+    /// for any other comparison, which converts as it is.
+    ///
+    /// `DataFusion` compares floats with `-0.0` and `0.0` equal (both operands
+    /// have their zeros normalized first), while Vortex compares them by IEEE
+    /// 754 total order, where `-0.0` sorts just below `0.0`. The two orders
+    /// agree on every comparison with a non-zero value, so only a comparison
+    /// with a zero needs both zeros spelled out. A comparison of two
+    /// non-literal floats has no such rewrite and is not pushed down (see
+    /// [`can_binary_be_pushed_down`]).
+    fn compare_with_float_zero(
+        &self,
+        operator: Operator,
+        left: &Arc<dyn PhysicalExpr>,
+        right: &Arc<dyn PhysicalExpr>,
+    ) -> DFResult<Option<Expression>> {
+        let (operand, operator) = if is_float_zero_literal(right) {
+            (left, operator)
+        } else if is_float_zero_literal(left) {
+            // `0 < x` is `x > 0`.
+            let swapped = match operator {
+                Operator::Lt => Operator::Gt,
+                Operator::Lte => Operator::Gte,
+                Operator::Gt => Operator::Lt,
+                Operator::Gte => Operator::Lte,
+                other => other,
+            };
+            (right, swapped)
+        } else {
+            return Ok(None);
+        };
+        let zero = if is_float_zero_literal(right) {
+            right
+        } else {
+            left
+        };
+        let Some((negative, positive)) = float_zeros(zero)? else {
+            return Ok(None);
+        };
+        let operand = self.convert(operand.as_ref())?;
+        let compare = |operator, zero: &Scalar| {
+            Binary.new_expr(operator, [operand.clone(), lit(zero.clone())])
+        };
+        Ok(Some(match operator {
+            Operator::Eq => Binary.new_expr(
+                Operator::Or,
+                [
+                    compare(Operator::Eq, &negative),
+                    compare(Operator::Eq, &positive),
+                ],
+            ),
+            Operator::NotEq => Binary.new_expr(
+                Operator::And,
+                [
+                    compare(Operator::NotEq, &negative),
+                    compare(Operator::NotEq, &positive),
+                ],
+            ),
+            Operator::Lt => compare(Operator::Lt, &negative),
+            Operator::Lte => compare(Operator::Lte, &positive),
+            Operator::Gt => compare(Operator::Gt, &positive),
+            Operator::Gte => compare(Operator::Gte, &negative),
+            // Arithmetic on a zero is not a comparison.
+            _ => return Ok(None),
+        }))
+    }
+
+    /// Converts an `IN` list, exactly or as a predicate (see [`InListUse`]).
+    ///
+    /// Vortex's `list_contains` answers FALSE where SQL answers NULL: when the
+    /// value is NULL, and when the value matches nothing in a list that holds a
+    /// NULL. As a predicate that is harmless for `IN`, since a filter drops the row
+    /// either way, and `list_contains` alone keeps the zone-map pruning it enables.
+    /// It is wrong everywhere else: negated, `x NOT IN (1, 2)` would keep a NULL
+    /// `x`, and as a value, `x IN (1, 2)` would read FALSE instead of NULL.
+    fn convert_in_list(
+        &self,
+        in_list: &df_expr::InListExpr,
+        usage: InListUse,
+    ) -> DFResult<Expression> {
+        let value = self.convert(in_list.expr().as_ref())?;
+        let list_elements: Vec<_> = in_list
+            .list()
+            .iter()
+            .map(|e| {
+                if let Some(lit) = e.downcast_ref::<df_expr::Literal>() {
+                    Scalar::from_df(lit.value()).map_err(|e| {
+                        exec_datafusion_err!(
+                            "Failed to convert IN list literal to a Vortex scalar: {e}"
+                        )
+                    })
+                } else {
+                    Err(exec_datafusion_err!("Failed to cast sub-expression"))
+                }
+            })
+            .try_collect()?;
+        // `DataFusion` holds `-0.0` and `0.0` equal and Vortex does not (see
+        // `compare_with_float_zero`), so a list holding one zero holds both.
+        let mut list_elements = list_elements;
+        for element in in_list.list() {
+            if let Some((negative, positive)) = float_zeros(element)? {
+                list_elements.extend([negative, positive]);
+            }
+        }
+
+        let Some(first_element) = list_elements.first() else {
+            return Ok(lit(Scalar::from(in_list.negated())));
+        };
+
+        // `Scalar::list` compares every element's dtype against the list's
+        // element dtype including nullability, and panics on a mismatch —
+        // inside the scan, so it surfaces as a panicked task rather than an
+        // error a caller can report. DataFusion types a NULL in an `IN` list
+        // as a nullable value of the list's type and the elements that carry
+        // a value as non-nullable, so the first element's dtype describes the
+        // whole list only when every element agrees with it: a list holding
+        // both a NULL and a value does not, whichever comes first. Take the
+        // dtype from an element that carries a value, widen it to hold the
+        // nulls when there are any, and bring every element to it.
+        let holds_a_null = list_elements.iter().any(Scalar::is_null);
+        let element_dtype = list_elements
+            .iter()
+            .find(|element| !element.is_null())
+            .unwrap_or(first_element)
+            .dtype()
+            .clone();
+        let element_dtype = if holds_a_null {
+            element_dtype.as_nullable()
+        } else {
+            element_dtype
+        };
+
+        let list_elements: Vec<Scalar> = list_elements
+            .into_iter()
+            .map(|element| {
+                if element.dtype() == &element_dtype {
+                    return Ok(element);
+                }
+                element.cast(&element_dtype).map_err(|e| {
+                    exec_datafusion_err!(
+                        "Failed to convert IN list literal to a Vortex scalar: {e}"
+                    )
+                })
+            })
+            .try_collect()?;
+
+        let list = Scalar::list(element_dtype, list_elements, Nullability::Nullable);
+        let contains = list_contains(lit(list), value.clone());
+
+        match (usage, in_list.negated()) {
+            (InListUse::Predicate, false) => Ok(contains),
+            // SQL's `x NOT IN (…, NULL)` is FALSE or NULL for every row, so no
+            // row passes; otherwise a NULL `x` is NULL and must not pass either.
+            (InListUse::Predicate, true) if holds_a_null => Ok(lit(false)),
+            (InListUse::Predicate, true) => {
+                Ok(Binary.new_expr(Operator::And, [is_not_null(value), not(contains)]))
+            }
+            (InListUse::Value, negated) => {
+                let null = lit(Scalar::null(DType::Bool(Nullability::Nullable)));
+                let exact = if holds_a_null {
+                    // TRUE on a match and NULL otherwise, a NULL value included.
+                    zip_expr(contains, lit(true), null)
+                } else {
+                    zip_expr(is_null(value), null, contains)
+                };
+                // `not` keeps NULL as NULL, as SQL's `NOT` does.
+                Ok(if negated { not(exact) } else { exact })
+            }
+        }
+    }
+}
+
+/// How an `IN` list's result is used, which decides how exactly it must follow
+/// SQL's NULL semantics.
+#[derive(Clone, Copy)]
+enum InListUse {
+    /// The result decides whether a row is kept, so NULL and FALSE mean the same.
+    Predicate,
+    /// The result is a value: a projection, or an operand of `NOT`, a comparison,
+    /// `IS NULL`, a cast or `CASE`. NULL must stay NULL.
+    Value,
 }
 
 impl ExpressionConvertor for DefaultExpressionConvertor {
@@ -232,9 +439,14 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         // TODO(joe): Don't return an error when we have an unsupported node, bubble up "TRUE" as in keep
         //  for that node, up to any `and` or `or` node.
         if let Some(binary_expr) = df.downcast_ref::<df_expr::BinaryExpr>() {
+            let operator = try_operator_from_df(*binary_expr.op())?;
+            if let Some(compared) =
+                self.compare_with_float_zero(operator, binary_expr.left(), binary_expr.right())?
+            {
+                return Ok(compared);
+            }
             let left = self.convert(binary_expr.left().as_ref())?;
             let right = self.convert(binary_expr.right().as_ref())?;
-            let operator = try_operator_from_df(*binary_expr.op())?;
 
             return Ok(Binary.new_expr(operator, [left, right]));
         }
@@ -263,7 +475,11 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         }
 
         if let Some(cast_expr) = df.downcast_ref::<df_expr::CastExpr>() {
-            let cast_dtype = DType::from_arrow((cast_expr.cast_type(), Nullability::Nullable));
+            let cast_dtype = ArrowSession::default()
+                .from_arrow_datatype(cast_expr.cast_type(), Nullability::Nullable)
+                .map_err(|e| {
+                    exec_datafusion_err!("Failed to convert cast type to a Vortex dtype: {e}")
+                })?;
             let child = self.convert(cast_expr.expr().as_ref())?;
             return Ok(cast(child, cast_dtype));
         }
@@ -294,68 +510,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         }
 
         if let Some(in_list) = df.downcast_ref::<df_expr::InListExpr>() {
-            let value = self.convert(in_list.expr().as_ref())?;
-            let list_elements: Vec<_> = in_list
-                .list()
-                .iter()
-                .map(|e| {
-                    if let Some(lit) = e.downcast_ref::<df_expr::Literal>() {
-                        Scalar::from_df(lit.value()).map_err(|e| {
-                            exec_datafusion_err!(
-                                "Failed to convert IN list literal to a Vortex scalar: {e}"
-                            )
-                        })
-                    } else {
-                        Err(exec_datafusion_err!("Failed to cast sub-expression"))
-                    }
-                })
-                .try_collect()?;
-
-            let Some(first_element) = list_elements.first() else {
-                return Ok(lit(Scalar::from(in_list.negated())));
-            };
-
-            // `Scalar::list` compares every element's dtype against the list's
-            // element dtype including nullability, and panics on a mismatch —
-            // inside the scan, so it surfaces as a panicked task rather than an
-            // error a caller can report. DataFusion types a NULL in an `IN` list
-            // as a nullable value of the list's type and the elements that carry
-            // a value as non-nullable, so the first element's dtype describes the
-            // whole list only when every element agrees with it: a list holding
-            // both a NULL and a value does not, whichever comes first. Take the
-            // dtype from an element that carries a value, widen it to hold the
-            // nulls when there are any, and bring every element to it.
-            let holds_a_null = list_elements.iter().any(Scalar::is_null);
-            let element_dtype = list_elements
-                .iter()
-                .find(|element| !element.is_null())
-                .unwrap_or(first_element)
-                .dtype()
-                .clone();
-            let element_dtype = if holds_a_null {
-                element_dtype.as_nullable()
-            } else {
-                element_dtype
-            };
-
-            let list_elements: Vec<Scalar> = list_elements
-                .into_iter()
-                .map(|element| {
-                    if element.dtype() == &element_dtype {
-                        return Ok(element);
-                    }
-                    element.cast(&element_dtype).map_err(|e| {
-                        exec_datafusion_err!(
-                            "Failed to convert IN list literal to a Vortex scalar: {e}"
-                        )
-                    })
-                })
-                .try_collect()?;
-
-            let list = Scalar::list(element_dtype, list_elements, Nullability::Nullable);
-            let expr = list_contains(lit(list), value);
-
-            return Ok(if in_list.negated() { not(expr) } else { expr });
+            return self.convert_in_list(in_list, InListUse::Value);
         }
 
         if let Some(dynamic_filter) = df.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>() {
@@ -374,6 +529,33 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         Err(exec_datafusion_err!(
             "Couldn't convert DataFusion physical {df} expression to a vortex expression"
         ))
+    }
+
+    fn convert_predicate(&self, df: &dyn PhysicalExpr) -> DFResult<Expression> {
+        // A predicate stays a predicate through `AND` and `OR`: with Kleene logic the
+        // combined result is TRUE for exactly the rows it would be TRUE for if every
+        // NULL operand were FALSE, so its operands may use the cheaper forms too.
+        // Anything else (`NOT`, a comparison, `IS NULL`, a cast) observes the
+        // difference, so below it the exact conversion applies.
+        if let Some(binary_expr) = df.downcast_ref::<df_expr::BinaryExpr>()
+            && matches!(binary_expr.op(), DFOperator::And | DFOperator::Or)
+        {
+            let left = self.convert_predicate(binary_expr.left().as_ref())?;
+            let right = self.convert_predicate(binary_expr.right().as_ref())?;
+            let operator = try_operator_from_df(*binary_expr.op())?;
+            return Ok(Binary.new_expr(operator, [left, right]));
+        }
+
+        if let Some(in_list) = df.downcast_ref::<df_expr::InListExpr>() {
+            return self.convert_in_list(in_list, InListUse::Predicate);
+        }
+
+        if let Some(dynamic_filter) = df.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>() {
+            let current = dynamic_filter.current()?;
+            return self.convert_predicate(current.as_ref());
+        }
+
+        self.convert(df)
     }
 
     fn split_projection(
@@ -524,8 +706,7 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
     } else if let Some(col) = expr.downcast_ref::<df_expr::Column>() {
         schema
             .field_with_name(col.name())
-            .ok()
-            .is_some_and(|field| supported_data_types(field.data_type()))
+            .is_ok_and(|field| supported_data_types(field.data_type()))
     } else if let Some(like) = expr.downcast_ref::<df_expr::LikeExpr>() {
         can_be_pushed_down_impl(like.expr(), schema)
             && can_be_pushed_down_impl(like.pattern(), schema)
@@ -682,8 +863,91 @@ fn is_convertible_case_expr(case_expr: &df_expr::CaseExpr) -> bool {
 fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
     let is_op_supported = try_operator_from_df(*binary.op()).is_ok();
     is_op_supported
+        && !compares_two_float_expressions(*binary.op(), binary.left(), binary.right(), schema)
         && can_be_pushed_down_impl(binary.left(), schema)
         && can_be_pushed_down_impl(binary.right(), schema)
+}
+
+/// Whether `left op right` compares two floating-point operands neither of
+/// which is a literal. Vortex orders `-0.0` below `0.0` and `DataFusion` holds
+/// them equal, and with no literal to spell both zeros out (see
+/// `compare_with_float_zero`), such a comparison is left to `DataFusion`.
+fn compares_two_float_expressions(
+    op: DFOperator,
+    left: &Arc<dyn PhysicalExpr>,
+    right: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> bool {
+    matches!(
+        op,
+        DFOperator::Eq
+            | DFOperator::NotEq
+            | DFOperator::Lt
+            | DFOperator::LtEq
+            | DFOperator::Gt
+            | DFOperator::GtEq
+    ) && left.downcast_ref::<df_expr::Literal>().is_none()
+        && right.downcast_ref::<df_expr::Literal>().is_none()
+        && [left, right].iter().any(|operand| {
+            operand
+                .data_type(schema)
+                .is_ok_and(|data_type| is_float(&data_type))
+        })
+}
+
+fn is_float(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, value) => is_float(value),
+        other => other.is_floating(),
+    }
+}
+
+/// Whether `expr` is a literal `0.0` or `-0.0` of a floating-point type.
+fn is_float_zero_literal(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.downcast_ref::<df_expr::Literal>()
+        .is_some_and(|literal| float_zeros_of(literal.value()).is_some())
+}
+
+/// Both zeros of `value`'s type, negative first, when `value` is a
+/// floating-point zero.
+fn float_zeros_of(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
+    match value {
+        ScalarValue::Float16(Some(v)) if *v == f16::ZERO => Some((
+            ScalarValue::Float16(Some(f16::NEG_ZERO)),
+            ScalarValue::Float16(Some(f16::ZERO)),
+        )),
+        ScalarValue::Float32(Some(v)) if *v == 0.0 => Some((
+            ScalarValue::Float32(Some(-0.0)),
+            ScalarValue::Float32(Some(0.0)),
+        )),
+        ScalarValue::Float64(Some(v)) if *v == 0.0 => Some((
+            ScalarValue::Float64(Some(-0.0)),
+            ScalarValue::Float64(Some(0.0)),
+        )),
+        ScalarValue::Dictionary(key, value) => float_zeros_of(value).map(|(negative, positive)| {
+            (
+                ScalarValue::Dictionary(key.clone(), Box::new(negative)),
+                ScalarValue::Dictionary(key.clone(), Box::new(positive)),
+            )
+        }),
+        _ => None,
+    }
+}
+
+/// Both zeros of a floating-point zero literal's type as Vortex scalars,
+/// negative first; `None` when `expr` is no such literal.
+fn float_zeros(expr: &Arc<dyn PhysicalExpr>) -> DFResult<Option<(Scalar, Scalar)>> {
+    let Some((negative, positive)) = expr
+        .downcast_ref::<df_expr::Literal>()
+        .and_then(|literal| float_zeros_of(literal.value()))
+    else {
+        return Ok(None);
+    };
+    let to_scalar = |value: &ScalarValue| {
+        Scalar::from_df(value)
+            .map_err(|e| exec_datafusion_err!("Failed to convert literal to a Vortex scalar: {e}"))
+    };
+    Ok(Some((to_scalar(&negative)?, to_scalar(&positive)?)))
 }
 
 fn contains_decimal_to_floating_cast(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
@@ -1061,8 +1325,10 @@ mod tests {
         let in_list = df_expr::InListExpr::try_new(column, values, false, &schema)
             .expect("IN-list expression should be valid");
 
+        // Filters convert as predicates, which keeps an IN list a bare
+        // `list_contains`; that is what min/max pruning recognizes.
         let result = DefaultExpressionConvertor::default()
-            .convert(&in_list)
+            .convert_predicate(&in_list)
             .expect("IN-list should convert to a Vortex expression");
         // The converted IN-list must be falsifiable from min/max statistics on `id`,
         // producing a pruning expression over the column's stats.
@@ -1075,7 +1341,9 @@ mod tests {
         );
         let session = VortexSession::default();
         let pruning_expr = result
-            .falsify(&scope, &session)
+            .bind(&scope)
+            .expect("converted IN-list should bind to the scope")
+            .falsify(&session)
             .expect("falsify should not error")
             .expect("converted IN-list should support min/max pruning");
 
@@ -1092,6 +1360,59 @@ mod tests {
             pruning_display.contains("stat($.id, vortex.max())"),
             "pruning expression should reference id's max statistic: {pruning_display}"
         );
+    }
+
+    fn nullable_in_list(values: Vec<Option<i32>>, negated: bool) -> df_expr::InListExpr {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let column = Arc::new(df_expr::Column::new("x", 0)) as Arc<dyn PhysicalExpr>;
+        let values = values
+            .into_iter()
+            .map(|value| {
+                Arc::new(df_expr::Literal::new(ScalarValue::Int32(value))) as Arc<dyn PhysicalExpr>
+            })
+            .collect();
+        df_expr::InListExpr::try_new(column, values, negated, &schema)
+            .expect("IN-list expression should be valid")
+    }
+
+    #[test]
+    fn test_in_list_value_conversion_keeps_null_for_a_null_value() {
+        // As a value, `x IN (…)` must be NULL for a NULL `x`, which a bare
+        // `list_contains` (FALSE) is not.
+        let result = DefaultExpressionConvertor::default()
+            .convert(&nullable_in_list(
+                vec![Some(1), Some(2), Some(3), Some(4)],
+                false,
+            ))
+            .expect("IN-list should convert to a Vortex expression");
+        let display = result.display_tree().to_string();
+        assert!(display.contains("vortex.list.contains"), "{display}");
+        assert!(display.contains("vortex.is_null"), "{display}");
+        assert!(display.contains("vortex.zip"), "{display}");
+    }
+
+    #[test]
+    fn test_not_in_predicate_conversion_excludes_null_values() {
+        // As a predicate, a NULL `x` must not pass `x NOT IN (…)`.
+        let result = DefaultExpressionConvertor::default()
+            .convert_predicate(&nullable_in_list(
+                vec![Some(1), Some(2), Some(3), Some(4)],
+                true,
+            ))
+            .expect("NOT IN list should convert to a Vortex expression");
+        let display = result.display_tree().to_string();
+        assert!(display.contains("vortex.is_not_null"), "{display}");
+        assert!(display.contains("vortex.not"), "{display}");
+        assert!(display.contains("vortex.list.contains"), "{display}");
+    }
+
+    #[test]
+    fn test_not_in_predicate_with_a_null_in_the_list_keeps_no_row() {
+        // `x NOT IN (1, NULL)` is FALSE or NULL for every row.
+        let result = DefaultExpressionConvertor::default()
+            .convert_predicate(&nullable_in_list(vec![Some(1), None], true))
+            .expect("NOT IN list should convert to a Vortex expression");
+        assert_eq!(result.to_string(), lit(false).to_string());
     }
 
     #[rstest]

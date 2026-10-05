@@ -584,6 +584,11 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
 /// RAM-resident row is in none of those. Under `mode: memory` the tier is the
 /// PERMANENT store, so what the sinks miss is the whole table.
 ///
+/// The background retention pass deliberately does NOT come through here: it calls
+/// `delete_mem_tier_rows_matching` directly, because the delete-all branch below releases
+/// the discarded bytes against the process-global mem-tier budget, which a
+/// memory-resident write never reserved. See `CayenneTableProvider::apply_retention_filters`.
+///
 /// Delete-all discards the tier wholesale (#11987, #12072). A filtered delete
 /// evaluates the predicate against the tier and rebuilds it without the matching
 /// rows (#12008), for memory-resident tables only — see
@@ -1199,6 +1204,10 @@ pub(crate) struct ProtectedSnapshotScan<'a> {
     /// View-typed read schema so protected-snapshot scans match the main file
     /// scan in the union (see `viewify_read_schema`).
     pub(crate) read_schema: SchemaRef,
+    /// The main scan's secondary index selection and pinned view, applied to
+    /// each protected snapshot's files as to the current snapshot's.
+    pub(crate) lookup_selection: Option<super::lookup_index::LookupSelection>,
+    pub(crate) pinned_lookup_index: Option<Arc<super::lookup_index::LookupIndexView>>,
 }
 
 pub(crate) struct PreparedProtectedSnapshotUpdate {
@@ -1210,6 +1219,25 @@ pub(crate) struct PreparedProtectedSnapshotUpdate {
 pub(crate) struct PostValidationState {
     pub(crate) on_conflict_deletions: OnConflictDeletions,
     pub(crate) validated_keys: PkDigestSet,
+}
+
+/// One apply's raw batches split by PK shard
+/// ([`CayenneTableProvider::split_apply_by_pk_shard`]), with the resident bytes
+/// each shard's sub-batches hold.
+pub(crate) struct ShardedApplyBatches {
+    /// Shard s's non-empty sub-batches, in apply order.
+    pub(crate) per_shard_batches: Vec<Vec<RecordBatch>>,
+    /// Shard s's resident bytes, each Arrow allocation counted once.
+    pub(crate) per_shard_bytes: Vec<u64>,
+}
+
+impl ShardedApplyBatches {
+    /// The whole apply's resident bytes: the figure to budget and reserve.
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.per_shard_bytes
+            .iter()
+            .fold(0, |total, bytes| total.saturating_add(*bytes))
+    }
 }
 
 /// Aggregate result of one sharded in-memory CDC apply

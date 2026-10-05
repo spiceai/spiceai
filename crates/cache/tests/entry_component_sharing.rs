@@ -47,9 +47,9 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cache::{QueryResultsCacheProvider, key::RawCacheKey, to_cached_record_batch_stream};
+use datafusion::common::TableReference;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
 use futures::StreamExt;
 use spicepod::component::caching::SQLResultsCacheConfig;
 
@@ -135,6 +135,7 @@ async fn store_entries(
             RawCacheKey::new(i as u64),
             input_tables,
             std::time::Instant::now(),
+            None,
         );
         // The store happens once the stream is drained, so drain it.
         while let Some(batch) = stream.next().await {
