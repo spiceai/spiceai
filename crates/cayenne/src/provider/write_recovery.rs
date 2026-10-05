@@ -32,6 +32,7 @@ pub struct RebuildableWrite {
 }
 
 impl RebuildableWrite {
+    /// Permit rebuildable writes to this table's storage owner and its clones.
     #[must_use]
     pub fn new(table: &CayenneTableProvider) -> Self {
         Self {
