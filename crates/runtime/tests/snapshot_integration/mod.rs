@@ -113,6 +113,19 @@ impl SnapshotS3Context {
         serde_json::from_slice(&data).context("Parsing snapshot metadata as JSON")
     }
 
+    /// The snapshot entries `metadata.json` records for `dataset`, oldest first. One
+    /// per publication, unlike the snapshot objects: those are named to the second,
+    /// so snapshots published within one second share an object.
+    async fn published_snapshots(&self, dataset: &str) -> Result<Vec<Value>> {
+        let metadata = self.metadata_json().await?;
+        metadata
+            .get(dataset)
+            .and_then(|entry| entry.get("snapshots"))
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| anyhow!("Snapshot metadata has no snapshots for dataset {dataset}"))
+    }
+
     async fn snapshot_objects(&self, dataset: &str) -> Result<Vec<ObjectMeta>> {
         let mut entries = Vec::new();
         let mut stream = self.store.list(Some(&self.base_path));
@@ -255,6 +268,53 @@ impl SnapshotFixture {
 
     fn schema(&self) -> &SchemaRef {
         &self.schema
+    }
+
+    /// A runtime that carries only this fixture's `snapshots` config, for a test that
+    /// drives its own `SnapshotManager`. Registering `taxi_trips` as well would start the
+    /// runtime's own snapshot writer on the same location and acceleration file, racing
+    /// the manager under test.
+    async fn snapshots_only_runtime(&self, app_name: &str) -> Result<Arc<Runtime>> {
+        let app = AppBuilder::new(app_name)
+            .with_snapshots(self.snapshots_config(BootstrapOnFailureBehavior::Warn))
+            .build();
+        configure_test_datafusion();
+        let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+        load_runtime(Arc::clone(&runtime)).await?;
+        Ok(runtime)
+    }
+
+    /// A `SnapshotManager` for `taxi_trips` that snapshots the `DuckDB` file at
+    /// `local_db_path` into this fixture's location.
+    async fn snapshot_manager(
+        &self,
+        runtime: &Runtime,
+        local_db_path: PathBuf,
+        compaction: SnapshotsCompaction,
+        policy: SnapshotsCreationPolicy,
+    ) -> Result<SnapshotManager> {
+        let runtime_snapshots = runtime
+            .app()
+            .read()
+            .await
+            .as_ref()
+            .and_then(|app| app.snapshots.clone())
+            .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
+        let snapshot_behavior = RuntimeSnapshotBehavior::enabled(
+            runtime_snapshots,
+            runtime.secrets_weak(),
+            runtime.tokio_io_runtime(),
+            compaction,
+        );
+        Ok(SnapshotManager::try_new(
+            TAXI_TRIPS_DATASET_NAME.to_string(),
+            snapshot_behavior,
+            runtime_acceleration::snapshot::AccelerationLayout::file(local_db_path),
+            AccelerationEngine::DuckDB,
+        )
+        .await
+        .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager"))?
+        .with_snapshots_creation_policy(policy))
     }
 
     async fn cleanup(self) -> Result<()> {
@@ -1008,66 +1068,50 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
         .scope(async {
             let fixture = prepare_duckdb_fixture("snapshot_int_test6").await?;
             let schema = Arc::clone(fixture.schema());
+            let runtime = fixture
+                .snapshots_only_runtime("snapshot_int_test6_concurrent")
+                .await?;
 
-            let dataset = fixture.dataset(
-                DatasetSnapshotBehavior::CreateOnly,
-                RefreshOnStartup::Auto,
-                &[],
-                &[],
-            );
-            let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
+            // Each writer stands for an instance: it snapshots its own copy of the
+            // acceleration file, so the writers race only on what instances share, the
+            // location's writer lease and `metadata.json`. Writers that shared one file
+            // would also race on its local staging copy, which no two instances share.
+            let initial = fixture
+                .context
+                .published_snapshots(TAXI_TRIPS_DATASET_NAME)
+                .await?
+                .len();
+            let writers_dir = TempDir::new().context("Creating directory for writer files")?;
+            let mut managers = Vec::with_capacity(10);
+            for writer in 0..10 {
+                let local_db_path = writers_dir.path().join(format!("taxi_trips_{writer}.duckdb"));
+                fs::copy(&fixture.local_db_path, &local_db_path)
+                    .await
+                    .context("Copying the acceleration file for a writer")?;
+                // Always: this test is about concurrent creation, not the on_change skip.
+                managers.push(
+                    fixture
+                        .snapshot_manager(
+                            &runtime,
+                            local_db_path,
+                            SnapshotsCompaction::Disabled,
+                            SnapshotsCreationPolicy::Always,
+                        )
+                        .await?,
+                );
+            }
 
-            let app = AppBuilder::new("snapshot_int_test6_concurrent")
-                .with_snapshots(snapshots)
-                .with_dataset(dataset)
-                .build();
-
-            configure_test_datafusion();
-
-            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
-            load_runtime(Arc::clone(&runtime)).await?;
-
-            let runtime_snapshots = runtime
-                .app()
-                .read()
-                .await
-                .as_ref()
-                .and_then(|app| app.snapshots.clone())
-                .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
-
-            let snapshot_behavior = RuntimeSnapshotBehavior::enabled(
-                runtime_snapshots,
-                runtime.secrets_weak(),
-                runtime.tokio_io_runtime(),
-                SnapshotsCompaction::Disabled,
-            );
-
-            let manager = SnapshotManager::try_new(
-                TAXI_TRIPS_DATASET_NAME.to_string(),
-                snapshot_behavior,
-                runtime_acceleration::snapshot::AccelerationLayout::file(
-                    fixture.local_db_path.clone(),
-                ),
-                AccelerationEngine::DuckDB,
-            )
-            .await
-            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for concurrent test"))?
-            // Use Always policy since this test is about concurrent snapshot creation,
-            // not about the on_change optimization
-            .with_snapshots_creation_policy(SnapshotsCreationPolicy::Always);
-
-            // The callers race for the dataset's snapshot writer lease. Every
+            // The writers race for the dataset's snapshot writer lease. Every
             // write of the lease that is refused was refused by one that
-            // landed, so at least one caller holds the lease and creates a
-            // snapshot; a caller whose writes all met a conflicting one
+            // landed, so at least one writer holds the lease and creates a
+            // snapshot; a writer whose writes all met a conflicting one
             // stands by and returns `None`.
-            let snapshot_results = try_join_all((0..10).map(|_| {
-                let manager_clone = manager.clone();
+            let snapshot_results = try_join_all(managers.into_iter().map(|manager| {
                 let schema = Arc::clone(&schema);
                 async move {
                     let mutex = Arc::new(Mutex::new(()));
                     let lock_guard = mutex.lock_owned().await;
-                    manager_clone
+                    manager
                         .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
                         .await
                 }
@@ -1086,18 +1130,16 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                 "Expected the writer lease holder to create a snapshot; results: {snapshot_results:?}"
             );
 
-            let expected_minimum = fixture.initial_snapshot_count + 1;
-            let snapshot_objects = fixture
-                .context
-                .wait_for_snapshot_objects(
-                    TAXI_TRIPS_DATASET_NAME,
-                    expected_minimum,
-                    Duration::from_mins(1),
-                )
-                .await?;
-            assert!(
-                snapshot_objects.len() >= expected_minimum,
-                "Expected accumulated snapshot uploads after concurrent writes"
+            // Every snapshot a writer reports as created is published: none is lost
+            // to a concurrent publication.
+            assert_eq!(
+                fixture
+                    .context
+                    .published_snapshots(TAXI_TRIPS_DATASET_NAME)
+                    .await?
+                    .len(),
+                initial + created,
+                "Expected one published snapshot per created snapshot; results: {snapshot_results:?}"
             );
 
             runtime.shutdown().await;
@@ -1116,43 +1158,17 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
         .scope(async {
             let fixture = prepare_duckdb_fixture("snapshot_int_test7").await?;
             let schema = Arc::clone(fixture.schema());
-
-            let dataset = fixture.dataset(
-                DatasetSnapshotBehavior::CreateOnly,
-                RefreshOnStartup::Auto,
-                &[],
-                &[],
-            );
-            let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
-
-            let app = AppBuilder::new("snapshot_int_test7_prepare")
-                .with_snapshots(snapshots)
-                .with_dataset(dataset)
-                .build();
-
-            configure_test_datafusion();
-
-            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
-            load_runtime(Arc::clone(&runtime)).await?;
-
-            let runtime_snapshots = runtime
-                .app()
-                .read()
-                .await
-                .as_ref()
-                .and_then(|app| app.snapshots.clone())
-                .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
-            let snapshot_behavior =
-                RuntimeSnapshotBehavior::enabled(runtime_snapshots, runtime.secrets_weak(), runtime.tokio_io_runtime(), SnapshotsCompaction::Disabled);
-            let manager = SnapshotManager::try_new(
-                TAXI_TRIPS_DATASET_NAME.to_string(),
-                snapshot_behavior,
-                runtime_acceleration::snapshot::AccelerationLayout::file(fixture.local_db_path.clone()),
-                AccelerationEngine::DuckDB,
-            )
-            .await
-            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for metadata test"))?
-            .with_snapshots_creation_policy(SnapshotsCreationPolicy::Always);
+            let runtime = fixture
+                .snapshots_only_runtime("snapshot_int_test7_prepare")
+                .await?;
+            let manager = fixture
+                .snapshot_manager(
+                    &runtime,
+                    fixture.local_db_path.clone(),
+                    SnapshotsCompaction::Disabled,
+                    SnapshotsCreationPolicy::Always,
+                )
+                .await?;
 
             let conn = Connection::open(&fixture.local_db_path)
                 .context("Opening DuckDB acceleration file for modification")?;
@@ -1181,6 +1197,12 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 .context("Cleaning up temporary snapshot modification table")?;
             drop(conn);
 
+            // Snapshot objects are named to the second. Publishing the modified
+            // snapshot within the second the original was published in would
+            // overwrite the original's object, leaving nothing to select.
+            let into_next_second = 1_000_u64.saturating_sub(u64::from(Utc::now().timestamp_subsec_millis()));
+            sleep(Duration::from_millis(into_next_second + 10)).await;
+
             let mutex = Arc::new(Mutex::new(()));
             let lock_guard = mutex.lock_owned().await;
 
@@ -1190,46 +1212,28 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 .context("Creating modified snapshot after deleting data")?
                 .context("Snapshot should be created")?;
 
-            let updated_objects = fixture
-                .context
-                .wait_for_snapshot_objects(
-                    TAXI_TRIPS_DATASET_NAME,
-                    fixture.initial_snapshot_count + 1,
-                    Duration::from_mins(1),
-                )
-                .await?;
-            let updated_metadata = build_metadata_document(
-                &fixture.context,
-                TAXI_TRIPS_DATASET_NAME,
-                &updated_objects,
-                &schema,
-            );
-            fixture
-                .context
-                .write_metadata(&updated_metadata)
-                .await
-                .context("Updating snapshot metadata after modification")?;
-
+            // The manager published the modified snapshot as current. Point the
+            // metadata back at the original one, which is the first entry: the
+            // manager appends each snapshot it publishes.
             let mut metadata = fixture.context.metadata_json().await?;
             let dataset_entry = metadata
                 .get_mut(TAXI_TRIPS_DATASET_NAME)
                 .and_then(Value::as_object_mut)
                 .ok_or_else(|| anyhow!("Snapshot metadata missing dataset entry"))?;
             let snapshots_array = dataset_entry
-                .get_mut("snapshots")
-                .and_then(Value::as_array_mut)
+                .get("snapshots")
+                .and_then(Value::as_array)
                 .ok_or_else(|| anyhow!("Snapshot metadata missing snapshots array"))?;
-            assert!(
-                snapshots_array.len() >= 2,
-                "Expected at least two snapshots to exist"
+            assert_eq!(
+                snapshots_array.len(),
+                fixture.initial_snapshot_count + 1,
+                "Expected the fixture's snapshots plus the modified one"
             );
-            let original_snapshot = snapshots_array
+            let original_snapshot_id = snapshots_array
                 .first()
-                .ok_or_else(|| anyhow!("Snapshots array unexpectedly empty"))?
-                .clone();
-            if let Some(snapshot_id) = original_snapshot.get("snapshot-id").cloned() {
-                dataset_entry.insert("current-snapshot-id".to_string(), snapshot_id);
-            }
+                .and_then(|snapshot| snapshot.get("snapshot-id").cloned())
+                .ok_or_else(|| anyhow!("Original snapshot has no snapshot-id"))?;
+            dataset_entry.insert("current-snapshot-id".to_string(), original_snapshot_id);
             fixture
                 .context
                 .write_metadata(&metadata)
@@ -1346,49 +1350,17 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             );
 
             // Step 2: Create snapshot WITH compaction enabled
-            let dataset = fixture.dataset(
-                DatasetSnapshotBehavior::CreateOnly,
-                RefreshOnStartup::Auto,
-                &[],
-                &[],
-            );
-            let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
-
-            let app = AppBuilder::new("snapshot_int_test8_compaction")
-                .with_snapshots(snapshots)
-                .with_dataset(dataset)
-                .build();
-
-            configure_test_datafusion();
-
-            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
-            load_runtime(Arc::clone(&runtime)).await?;
-
-            let runtime_snapshots = runtime
-                .app()
-                .read()
-                .await
-                .as_ref()
-                .and_then(|app| app.snapshots.clone())
-                .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
-
-            // Create snapshot behavior with compaction ENABLED (last param = true)
-            let snapshot_behavior_with_compaction = RuntimeSnapshotBehavior::enabled(
-                Arc::clone(&runtime_snapshots),
-                runtime.secrets_weak(),
-                runtime.tokio_io_runtime(),
-                SnapshotsCompaction::Enabled,
-            );
-
-            let manager_with_compaction = SnapshotManager::try_new(
-                TAXI_TRIPS_DATASET_NAME.to_string(),
-                snapshot_behavior_with_compaction,
-                runtime_acceleration::snapshot::AccelerationLayout::file(fixture.local_db_path.clone()),
-                AccelerationEngine::DuckDB,
-            )
-                .await
-                .ok_or_else(|| anyhow!("Failed to create SnapshotManager with compaction enabled"))?
-                .with_snapshots_creation_policy(SnapshotsCreationPolicy::Always);
+            let runtime = fixture
+                .snapshots_only_runtime("snapshot_int_test8_compaction")
+                .await?;
+            let manager_with_compaction = fixture
+                .snapshot_manager(
+                    &runtime,
+                    fixture.local_db_path.clone(),
+                    SnapshotsCompaction::Enabled,
+                    SnapshotsCreationPolicy::Always,
+                )
+                .await?;
 
             // Create compacted snapshot
             let mutex = Arc::new(Mutex::new(()));
@@ -1405,21 +1377,21 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
                 TAXI_TRIPS_DATASET_NAME
             );
 
-            // Wait for compacted snapshot to appear
-            let compacted_objects = fixture
+            // `create_snapshot` returns once the snapshot is published, so it is listed now.
+            let snapshot_objects = fixture
                 .context
-                .wait_for_snapshot_objects(
-                    TAXI_TRIPS_DATASET_NAME,
-                    fixture.initial_snapshot_count + 1,
-                    Duration::from_secs(90),
-                )
+                .snapshot_objects(TAXI_TRIPS_DATASET_NAME)
                 .await
-                .context("Waiting for compacted snapshot objects")?;
-
-            let compacted_snapshot = compacted_objects
+                .context("Listing snapshot objects")?;
+            let compacted_snapshot = snapshot_objects
                 .iter()
-                .max_by_key(|obj| obj.last_modified)
-                .ok_or_else(|| anyhow!("No compacted snapshot found in object storage"))?;
+                .find(|obj| obj.location == compacted_location)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Compacted snapshot {compacted_location} not listed; listed: {:?}",
+                        snapshot_objects.iter().map(|obj| obj.location.to_string()).collect::<Vec<_>>()
+                    )
+                })?;
 
             let compacted_size = compacted_snapshot.size;
             tracing::info!(
@@ -1450,19 +1422,8 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             // Step 4: Verify the compacted snapshot can be downloaded and used
             remove_existing_local_files(&fixture.local_db_path);
 
-            // Update metadata to reference the compacted snapshot
-            let updated_metadata = build_metadata_document(
-                &fixture.context,
-                TAXI_TRIPS_DATASET_NAME,
-                &compacted_objects,
-                &schema,
-            );
-            fixture
-                .context
-                .write_metadata(&updated_metadata)
-                .await
-                .context("Writing metadata for compacted snapshot")?;
-
+            // The manager published the compacted snapshot as current, so a restart
+            // bootstraps from it.
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
                 RefreshOnStartup::Auto,
@@ -1525,148 +1486,96 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
         .scope(async {
             let fixture = prepare_duckdb_fixture("snapshot_int_test9").await?;
             let schema = Arc::clone(fixture.schema());
-
-            let dataset = fixture.dataset(
-                DatasetSnapshotBehavior::CreateOnly,
-                RefreshOnStartup::Auto,
-                &[],
-                &[],
-            );
-            let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
-
-            let app = AppBuilder::new("snapshot_int_test9_onchange")
-                .with_snapshots(snapshots)
-                .with_dataset(dataset)
-                .build();
-
-            configure_test_datafusion();
-
-            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
-            load_runtime(Arc::clone(&runtime)).await?;
-
-            let runtime_snapshots = runtime
-                .app()
-                .read()
-                .await
-                .as_ref()
-                .and_then(|app| app.snapshots.clone())
-                .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
-
-            let snapshot_behavior = RuntimeSnapshotBehavior::enabled(
-                runtime_snapshots,
-                runtime.secrets_weak(),
-                runtime.tokio_io_runtime(),
-                SnapshotsCompaction::Disabled,
-            );
-
-            let manager = SnapshotManager::try_new(
-                TAXI_TRIPS_DATASET_NAME.to_string(),
-                snapshot_behavior,
-                runtime_acceleration::snapshot::AccelerationLayout::file(fixture.local_db_path.clone()),
-                AccelerationEngine::DuckDB,
-            )
-                .await
-                .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager"))?
-                .with_snapshots_creation_policy(SnapshotsCreationPolicy::OnChange);
-
-            // Create first snapshot with a specific last_updated_at timestamp
-            let last_updated_at = Some(12345i64);
+            let runtime = fixture
+                .snapshots_only_runtime("snapshot_int_test9_onchange")
+                .await?;
+            let manager = fixture
+                .snapshot_manager(
+                    &runtime,
+                    fixture.local_db_path.clone(),
+                    SnapshotsCompaction::Disabled,
+                    SnapshotsCreationPolicy::OnChange,
+                )
+                .await?;
             let mutex = Arc::new(Mutex::new(()));
-            let lock_guard = Arc::clone(&mutex).lock_owned().await;
 
-            let first_result = manager
-                .create_snapshot(&schema, lock_guard, last_updated_at, None, ForceCreate(false))
+            // The published snapshots' `last_updated_at`, oldest first.
+            let published = || async {
+                Ok::<_, anyhow::Error>(
+                    fixture
+                        .context
+                        .published_snapshots(TAXI_TRIPS_DATASET_NAME)
+                        .await?
+                        .iter()
+                        .map(|snapshot| {
+                            snapshot
+                                .get("snapshot-last-updated-at-ms")
+                                .and_then(Value::as_i64)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let initial = published().await?;
+
+            let first = manager
+                .create_snapshot(
+                    &schema,
+                    Arc::clone(&mutex).lock_owned().await,
+                    Some(12345),
+                    None,
+                    ForceCreate(false),
+                )
                 .await
                 .context("Creating first snapshot with OnChange policy")?;
-
             assert!(
-                first_result.is_some(),
-                "First snapshot should be created since no prior snapshot exists with this timestamp"
+                first.is_some(),
+                "First snapshot should be created since no prior snapshot has this last_updated_at"
+            );
+            let after_first = published().await?;
+            assert_eq!(
+                after_first,
+                [initial.as_slice(), &[Some(12345)]].concat(),
+                "The first snapshot should be published with its last_updated_at"
             );
 
-            // Wait for snapshot to appear in storage
-            let snapshots_after_first = fixture
-                .context
-                .wait_for_snapshot_objects(
-                    TAXI_TRIPS_DATASET_NAME,
-                    fixture.initial_snapshot_count + 1,
-                    Duration::from_mins(1),
+            let second = manager
+                .create_snapshot(
+                    &schema,
+                    Arc::clone(&mutex).lock_owned().await,
+                    Some(12345),
+                    None,
+                    ForceCreate(false),
                 )
-                .await?;
-
-            // Update metadata to include the new snapshot
-            let updated_metadata = build_metadata_document(
-                &fixture.context,
-                TAXI_TRIPS_DATASET_NAME,
-                &snapshots_after_first,
-                &schema,
-            );
-
-            // Manually set the snapshot_last_updated_at_ms in metadata
-            let mut metadata = updated_metadata;
-            if let Some(dataset_entry) = metadata.get_mut(TAXI_TRIPS_DATASET_NAME)
-                && let Some(snapshots_arr) =
-                    dataset_entry.get_mut("snapshots").and_then(Value::as_array_mut)
-                && let Some(last_snapshot) = snapshots_arr.last_mut()
-                && let Some(obj) = last_snapshot.as_object_mut()
-            {
-                obj.insert("snapshot-last-updated-at-ms".to_string(), json!(12345u64));
-            }
-            fixture.context.write_metadata(&metadata).await?;
-
-            let snapshot_count_after_first = snapshots_after_first.len();
-
-            // Try to create another snapshot with the SAME last_updated_at
-            let lock_guard = Arc::clone(&mutex).lock_owned().await;
-            let second_result = manager
-                .create_snapshot(&schema, lock_guard, last_updated_at, None, ForceCreate(false))
                 .await
                 .context("Attempting second snapshot with same last_updated_at")?;
-
             assert!(
-                second_result.is_none(),
+                second.is_none(),
                 "Second snapshot should be skipped since last_updated_at hasn't changed"
             );
-
-            // Verify no new snapshot was created
-            sleep(Duration::from_secs(2)).await;
-            let snapshots_after_second = fixture
-                .context
-                .snapshot_objects(TAXI_TRIPS_DATASET_NAME)
-                .await?;
-
             assert_eq!(
-                snapshots_after_second.len(),
-                snapshot_count_after_first,
-                "No new snapshot should be created when last_updated_at matches"
+                published().await?,
+                after_first,
+                "No snapshot should be published when last_updated_at matches"
             );
 
-            // Now create a snapshot with a DIFFERENT last_updated_at
-            let new_last_updated_at = Some(99999i64);
-            let lock_guard = Arc::clone(&mutex).lock_owned().await;
-            let third_result = manager
-                .create_snapshot(&schema, lock_guard, new_last_updated_at, None, ForceCreate(false))
+            let third = manager
+                .create_snapshot(
+                    &schema,
+                    Arc::clone(&mutex).lock_owned().await,
+                    Some(99999),
+                    None,
+                    ForceCreate(false),
+                )
                 .await
                 .context("Creating snapshot with new last_updated_at")?;
-
             assert!(
-                third_result.is_some(),
+                third.is_some(),
                 "Snapshot should be created when last_updated_at changes"
             );
-
-            // Wait and verify new snapshot was created
-            let snapshots_after_third = fixture
-                .context
-                .wait_for_snapshot_objects(
-                    TAXI_TRIPS_DATASET_NAME,
-                    snapshot_count_after_first + 1,
-                    Duration::from_mins(1),
-                )
-                .await?;
-
-            assert!(
-                snapshots_after_third.len() > snapshot_count_after_first,
-                "New snapshot should be created when last_updated_at changes"
+            assert_eq!(
+                published().await?,
+                [after_first.as_slice(), &[Some(99999)]].concat(),
+                "A snapshot should be published when last_updated_at changes"
             );
 
             runtime.shutdown().await;
@@ -1832,17 +1741,17 @@ async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            tokio::time::sleep(Duration::from_secs(20)).await;
-
-            // Wait for snapshot to appear
+            // The initial snapshot and two 5s interval ticks after it show the
+            // interval keeps creating snapshots. An exact count after a fixed sleep
+            // would also measure how long startup took on the machine.
             let snapshots_after = context
-                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 3, Duration::from_mins(1))
                 .await?;
 
-            assert_eq!(
-                snapshots_after.len(),
-                4,
-                "Exactly 4 snapshots should be created"
+            assert!(
+                snapshots_after.len() >= 3,
+                "The interval should keep creating snapshots; listed {}",
+                snapshots_after.len()
             );
 
             runtime.shutdown().await;
