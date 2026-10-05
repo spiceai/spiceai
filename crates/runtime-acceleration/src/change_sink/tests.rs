@@ -241,6 +241,10 @@ async fn overlapping_scope_shapes_reject_equal_full_keys() {
     .await;
     let error = result.expect_err("different overlapping scopes must not share a physical key");
     assert!(is_before_mutation(&error));
+    assert_eq!(
+        error.to_string(),
+        "Unique key conflicts between scoped appends for dataset 'scoped'"
+    );
 }
 
 #[tokio::test]
@@ -256,6 +260,10 @@ async fn overlapping_scope_shapes_reject_equal_partial_keys() {
     .await;
     let error = result.expect_err("membership in both scopes must not authorize a key collision");
     assert!(is_before_mutation(&error));
+    assert_eq!(
+        error.to_string(),
+        "Unique key conflicts between scoped appends for dataset 'scoped'"
+    );
 }
 
 #[tokio::test]
