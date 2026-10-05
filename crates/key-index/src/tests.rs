@@ -739,3 +739,29 @@ fn time_units_arrow_does_not_define_are_refused() {
         );
     }
 }
+
+#[test]
+fn a_dictionary_column_is_keyed_by_its_values() {
+    let dictionary =
+        |value: DataType| DataType::Dictionary(Box::new(DataType::Int8), Box::new(value));
+    let list = DataType::List(Arc::new(arrow_schema::Field::new_list_field(
+        DataType::Int32,
+        true,
+    )));
+    assert_eq!(
+        crate::key_type(&dictionary(DataType::Utf8)),
+        &DataType::Utf8
+    );
+    assert_eq!(crate::key_type(&DataType::Int64), &DataType::Int64);
+    assert!(crate::can_key(&dictionary(DataType::Utf8)));
+    assert!(crate::can_key(&DataType::Float64));
+    assert!(!crate::can_key(&list));
+    assert!(!crate::can_key(&dictionary(list.clone())));
+    for data_type in [DataType::Utf8, DataType::Float64, list] {
+        assert_eq!(
+            crate::can_key(&data_type),
+            KeyEncoder::new(vec![KeyField::new(data_type.clone(), true)]).is_ok(),
+            "{data_type:?}: `can_key` agrees with the encoder"
+        );
+    }
+}

@@ -230,6 +230,24 @@ fn kind(data_type: &DataType) -> Option<Kind> {
     })
 }
 
+/// The type a column of `column_type` is keyed by: its own, or a dictionary
+/// column's value type, since equal values must share a key whatever
+/// dictionary holds them.
+#[must_use]
+pub fn key_type(column_type: &DataType) -> &DataType {
+    match column_type {
+        DataType::Dictionary(_, value) => value,
+        other => other,
+    }
+}
+
+/// Whether a column of `column_type` can be part of a key, keyed by its
+/// [`key_type`].
+#[must_use]
+pub fn can_key(column_type: &DataType) -> bool {
+    kind(key_type(column_type)).is_some()
+}
+
 impl Kind {
     /// The encoded width of a value when it is fixed, for the kinds whose
     /// encoding is fixed-width and that may fold into an exact word. The
