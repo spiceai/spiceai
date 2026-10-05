@@ -9368,7 +9368,7 @@ mod tests {
 
         let before = catalog.metastore_query_count();
         let result = catalog
-            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None)
+            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None, &[])
             .await;
         violations.extend(statement_conflict_violation(
             "commit_overwrite",

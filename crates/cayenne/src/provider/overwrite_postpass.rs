@@ -107,14 +107,15 @@ const HASH_COLUMN: &str = "__cayenne_key_hash";
 /// Seeds the hash that assigns each key to a chunk of the duplicate query.
 const CHUNK_HASH_SEED: u64 = 0x6361_7965_6e6e_6501;
 
-/// Bytes of written data each chunk of the duplicate query covers. Written
-/// files hold far fewer bytes per row than the query does, so a chunk's hash
-/// tables hold more than this; see the module documentation.
+/// Bytes of written data a chunk of the duplicate query covers, shared between
+/// every write resolving its repeats at once ([`DedupShare`]). Written files hold
+/// far fewer bytes per row than the query does, so a chunk's hash tables hold
+/// more than this; see the module documentation.
 const CHUNK_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Rows each chunk of the duplicate query covers. With a single `Int64` key
-/// the query holds about 70 bytes per row of its chunk at its peak, so a chunk
-/// of this many rows holds a little over 1 GiB.
+/// Rows a chunk of the duplicate query covers, shared like [`CHUNK_BYTES`]. With
+/// a single `Int64` key the query holds about 70 bytes per row of its chunk at
+/// its peak, so a chunk of this many rows holds a little over 1 GiB.
 const CHUNK_ROWS: u64 = 16 * 1024 * 1024;
 
 /// A smaller [`CHUNK_ROWS`] for tests, so small tables still split into many
@@ -133,6 +134,38 @@ fn chunk_rows() -> u64 {
         }
     }
     CHUNK_ROWS
+}
+
+/// Writes in flight whose repeated keys are resolved after the write.
+static DEDUP_SHARES: AtomicU64 = AtomicU64::new(0);
+
+/// One write's share of the duplicate query's memory, held from the start of a
+/// write that resolves its repeated keys afterwards until that resolution ends.
+///
+/// [`CHUNK_BYTES`] and [`CHUNK_ROWS`] budget every duplicate query in the process
+/// together, so each sizes its chunks for its share: one refresh keeps the whole
+/// budget, while the partitions of a partitioned table, which resolve their
+/// repeats at the same time, split it rather than each holding a full chunk.
+/// Claiming at the start of the write, not of the query, counts every partition
+/// before the first of them plans its chunks.
+pub(crate) struct DedupShare(());
+
+impl DedupShare {
+    pub(crate) fn claim() -> Self {
+        DEDUP_SHARES.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Drop for DedupShare {
+    fn drop(&mut self) {
+        DEDUP_SHARES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How many writes the duplicate query's budget is currently shared between.
+fn dedup_shares() -> u64 {
+    DEDUP_SHARES.load(Ordering::Relaxed).max(1)
 }
 
 /// One step of the duplicate query: the files it reads, the hash slice
@@ -1117,9 +1150,10 @@ impl CayenneTableProvider {
         let stored = Arc::new(Field::new_struct("", stored_fields, false));
 
         let total_bytes: u64 = files.iter().map(|file| file.size).sum();
+        let shares = dedup_shares();
         let mut chunks = total_bytes
-            .div_ceil(CHUNK_BYTES)
-            .max(rows_written.div_ceil(chunk_rows()))
+            .div_ceil((CHUNK_BYTES / shares).max(1))
+            .max(rows_written.div_ceil((chunk_rows() / shares).max(1)))
             .max(1);
         let sizes: Vec<u64> = files.iter().map(|file| file.size).collect();
         // Each file's footer bounds on every key column, and its row count: every

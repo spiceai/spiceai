@@ -184,9 +184,14 @@ impl DataSink for CayenneDataSink {
             // OOM) before either appends. Reads use `ArcSwap` (lock-free), so this only
             // serializes writers.
             //
-            // Preparation snapshots the primary-key index after buffering, while
-            // this lock keeps that snapshot current for validation and commit.
-            let _write_guard = self.table.write_lock().lock().await;
+            // Taken before preparation, too: preparation snapshots the primary-key
+            // index the validation below decides conflicts against, and memory-mode
+            // writers are serialized on exactly this lock, so taking it first keeps
+            // that snapshot current through validation and commit. The write's own
+            // repeated keys are resolved before validation sees them (an APPEND's
+            // validation then supersedes the resident rows its keys meet, as the
+            // appended segment's own tombstones; an OVERWRITE replaces the tier).
+            let write_guard = self.table.write_lock().lock().await;
             let mut raw = normalized;
             while let Some(batch) = raw.next().await {
                 let batch = batch?;
@@ -247,6 +252,10 @@ impl DataSink for CayenneDataSink {
                 let record_seq = self.table.sequence_high_water().await;
                 self.table.record_mem_tier_pk_keys(&keys, record_seq);
             }
+            drop(write_guard);
+            // Memory mode arms retention here — see the method's own doc for why nowhere
+            // else can (#14045).
+            self.table.arm_retention_after_memory_resident_write();
             return Ok(rows);
         }
 
@@ -258,6 +267,35 @@ impl DataSink for CayenneDataSink {
             self.write_all_overwrite(normalized, context)
                 .await
                 .map_err(Into::into)
+        } else if let Some(write_guard) = self.lock_for_first_load().await {
+            // A refresh appending into a table that holds no rows has nothing to
+            // check its keys against, so it is written as one append without the
+            // conflict check or the segments: segments would each check their
+            // keys against the rows the previous ones published, and the check
+            // holds every incoming key in memory. The keys the load repeats are
+            // still resolved after the write, and it publishes as any append does.
+            tracing::debug!(
+                table = self.table.table_name(),
+                "Writing the first load into an empty table as one append"
+            );
+            let rows = AppendMutationWriter::new(&self.table, &self.context, context)
+                .into_empty_table()
+                .write(normalized)
+                .await?;
+            drop(write_guard);
+            // The load recorded no primary-key index; warm the one the next
+            // refresh validates against now, rather than on that refresh's path.
+            let table = self.table.clone_for_write();
+            tokio::spawn(async move {
+                if let Err(error) = table.warm_pk_index().await {
+                    tracing::debug!(
+                        table = table.table_name(),
+                        %error,
+                        "Failed to build the primary-key index after a first load; the next append builds it"
+                    );
+                }
+            });
+            Ok(rows)
         } else if let Some(interval) = self.context.stream_publish_interval() {
             // Append path with bounded publish latency: cut the input stream
             // into age/size-bounded segments and run a complete
@@ -463,6 +501,28 @@ impl CayenneDataSink {
             );
         }
         Ok(total_rows)
+    }
+
+    /// The write lock, held, when this append is a refresh's load into a table
+    /// that holds no rows, so it can skip the conflict check that finds nothing
+    /// to conflict with.
+    ///
+    /// Only a refresh qualifies: a user statement keeps statement semantics. The
+    /// table must resolve repeated keys after the write (a primary key, an
+    /// `on_conflict`, no partition column) and have no retention filter, the
+    /// conditions under which an append takes that path; a keyed table also never
+    /// takes a staged append, so no staged publish can land beneath the load.
+    /// Emptiness is observed under the lock this returns, which the load holds
+    /// until it publishes.
+    async fn lock_for_first_load(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if self.table.metadata().partition_column.is_some()
+            || self.table.has_retention_delete_filters()
+            || !matches!(self.table.key_resolver(), Ok(Some(_)))
+        {
+            return None;
+        }
+        let write_guard = self.table.write_lock_arc().lock_owned().await;
+        self.table.holds_no_rows().await.then_some(write_guard)
     }
 
     /// Append data from a record batch stream into the Cayenne table.
@@ -722,14 +782,7 @@ mod tests {
                             &schema,
                             &[
                                 (1, 10),
-                                (
-                                    1,
-                                    if dedup == UpsertDedup::DropIdentical {
-                                        10
-                                    } else {
-                                        30
-                                    },
-                                ),
+                                (1, 30),
                                 (2, 20),
                             ],
                         ),
@@ -763,7 +816,6 @@ mod tests {
                         assert_eq!(keyed_count_sql(&ctx, &provider).await, 1);
                     }
                     if dedup == UpsertDedup::DropIdentical {
-                        let before_failure = keyed_rows(&ctx, &provider).await;
                         let sink = CayenneDataSink::new(
                             provider.clone_for_write(),
                             if overwrite {
@@ -785,10 +837,15 @@ mod tests {
                                 .map(Ok),
                             ),
                         ));
+                        // A refresh never fails on a key it repeats: `upsert_dedup`
+                        // keeps the last copy of differing ones too.
                         sink.write_all(stream, &ctx.task_ctx())
                             .await
-                            .expect_err("different rows under one key must fail");
-                        assert_eq!(keyed_rows(&ctx, &provider).await, before_failure);
+                            .expect("different rows under one key keep the last");
+                        assert_eq!(
+                            keyed_rows(&ctx, &provider).await.first(),
+                            Some(&(1, 70))
+                        );
                     }
                     if !memory_mode {
                         let before_reopen = keyed_rows(&ctx, &provider).await;
@@ -851,6 +908,17 @@ mod tests {
             .create(options)
             .await
             .expect("table created");
+        // A stored row, so the stream appends in segments rather than loading an
+        // empty table as one replace.
+        append_rows(
+            &provider,
+            &sink_context,
+            &schema,
+            &ctx,
+            vec![int64_batch(&schema, vec![100])],
+        )
+        .await
+        .expect("seed");
 
         let release_second = Arc::new(Notify::new());
         let release_for_stream = Arc::clone(&release_second);
@@ -898,7 +966,7 @@ mod tests {
         // still open (the second batch is gated on `release_second`).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
-            if visible_rows(&ctx, &provider).await == 2 {
+            if visible_rows(&ctx, &provider).await == 3 {
                 break;
             }
             assert!(
@@ -913,7 +981,7 @@ mod tests {
         assert_eq!(written, 3, "all rows accounted across segments");
         assert_eq!(
             visible_rows(&ctx, &provider).await,
-            3,
+            4,
             "all rows visible after stream end"
         );
     }

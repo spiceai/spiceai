@@ -357,7 +357,9 @@ async fn main() {
                 deletion_mode,
                 inline_max_rows: 0,
                 compaction_background_interval_ms: 3_600_000,
-                stream_publish_interval_ms: if append_mode {
+                stream_publish_interval_ms: if append_mode
+                    && !std::env::args().any(|a| a == "--segmented")
+                {
                     0
                 } else {
                     VortexConfig::default().stream_publish_interval_ms
@@ -403,6 +405,17 @@ async fn main() {
         if refreshes > 1 {
             println!("  refresh {refresh} of {refreshes}: refresh_s={refresh_s:.2}");
         }
+    }
+    // A later, smaller append over the first keys: what the next refresh pays
+    // to check its keys against the rows the first load left.
+    let second_keys: usize = arg("--second-append-keys", "0").parse().expect("second keys");
+    if second_keys > 0 {
+        let start = Instant::now();
+        let rows = append(&provider, &ctx, source(second_keys, 1, 0)).await;
+        println!(
+            "second_append keys={second_keys} rows={rows} second_append_s={:.2}",
+            start.elapsed().as_secs_f64()
+        );
     }
     let layers = catalog
         .get_all_snapshot_sequences(provider.table_id())

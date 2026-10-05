@@ -680,6 +680,7 @@ impl CayenneTableProvider {
         // orders the copies by version instead of arrival.
         let mut postpass: Option<(CopyOrder, Vec<String>)> = None;
         let mut batch_superseded = None;
+        let mut dedup_share: Option<super::overwrite_postpass::DedupShare> = None;
         let data: SendableRecordBatchStream = match self.key_resolver()? {
             None => data,
             Some(resolver) => {
@@ -688,6 +689,7 @@ impl CayenneTableProvider {
                     Some(_) => CopyOrder::Version,
                     None => CopyOrder::Arrival(Survivor::for_policy(resolver.policy())),
                 };
+                dedup_share = Some(super::overwrite_postpass::DedupShare::claim());
                 postpass = Some((
                     order,
                     super::overwrite_postpass::key_column_names(&self.table_schema(), &indices),
@@ -855,6 +857,8 @@ impl CayenneTableProvider {
                 }
             }
         };
+        // The copies are resolved: free this write's share of the duplicate query.
+        drop(dedup_share);
 
         // Manifest snapshot model: reserve ONE sequence `S` for this overwrite
         // and AUTHOR the new snapshot's manifest with `[S, S]` — every file was

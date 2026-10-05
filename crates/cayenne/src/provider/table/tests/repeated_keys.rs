@@ -21,6 +21,7 @@ limitations under the License.
 use super::*;
 use crate::metadata::DeletionMode;
 use crate::provider::key_conflicts::UpsertDedup;
+use crate::provider::pk_index::{CachedPkIndex, CachedPkKeyset};
 use arrow::array::{AsArray, StringArray};
 
 fn schema() -> SchemaRef {
@@ -84,6 +85,18 @@ async fn visible(provider: &CayenneTableProvider) -> (Vec<(i64, String)>, i64) {
         .as_primitive::<arrow::datatypes::Int64Type>()
         .value(0);
     (rows, count)
+}
+
+/// A batch whose second row has no primary key, which fails every write.
+fn null_key_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(5), None])),
+            Arc::new(StringArray::from_iter_values(["c", "d"])),
+        ],
+    )
+    .expect("batch")
 }
 
 fn owned(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
@@ -207,11 +220,11 @@ async fn streaming_append_failure_leaves_previous_rows() {
             vec![
                 batch(&[(1, "a"), (2, "a")]),
                 batch(&[(2, "b")]),
-                batch(&[(5, "c"), (5, "d")]),
+                null_key_batch(),
             ],
         )
         .await
-        .expect_err("a differing repeat within one batch fails upsert_dedup");
+        .expect_err("a null primary key fails the append");
         eprintln!("{mode:?} failed append: {error}");
         assert_eq!(visible(&provider).await, (owned(&[(9, "old")]), 1));
         let provider = reopen(&catalog, &runtime_env, UpsertDedup::DropIdentical).await;
@@ -570,23 +583,21 @@ async fn a_failed_overwrite_repeating_keys_leaves_the_previous_table() {
         write(&provider, InsertOp::Overwrite, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
-        // The third batch repeats key 5 with differing values, which `upsert_dedup`
-        // rejects, after the second batch has already opened a layer.
+        // The third batch carries a null primary key, which fails every policy,
+        // after the second batch has already been written.
         let error = write(
             &provider,
             InsertOp::Overwrite,
             vec![
                 batch(&[(1, "a"), (2, "a")]),
                 batch(&[(2, "b")]),
-                batch(&[(5, "c"), (5, "d")]),
+                null_key_batch(),
             ],
         )
         .await
-        .expect_err("a differing repeat within one batch fails upsert_dedup");
+        .expect_err("a null primary key fails the overwrite");
         assert!(
-            error
-                .to_string()
-                .contains("uniqueness constraint on column(s): 'id'"),
+            error.to_string().contains("'id' has null values"),
             "{mode:?}: {error}"
         );
         assert_eq!(
@@ -1269,5 +1280,132 @@ async fn a_user_column_named_like_the_arrival_column_is_left_alone() {
             }
         }
         assert_eq!(rows, vec![(1, 20), (2, 10), (3, 10)], "{mode:?}");
+    }
+}
+
+/// A refresh's load into a table that holds no rows is written as one append
+/// without the conflict check: it publishes as any append does (one protected
+/// snapshot, the current snapshot unmoved) and resolves the keys it repeats. The
+/// next load, into a table that now holds rows, is checked and supersedes what it
+/// repeats.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_into_an_empty_table_appends_and_the_next_supersedes() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        for (on_conflict, kept) in [
+            (upsert_on_id(), last_copies()),
+            (
+                drop_on_id(),
+                owned(&[(1, "a"), (2, "a"), (3, "a"), (4, "b"), (5, "c"), (6, "d")]),
+            ),
+        ] {
+            let label = format!("{mode:?}/{on_conflict:?}");
+            let upsert = matches!(on_conflict, OnConflict::Upsert(_));
+            let (provider, _catalog, _runtime_env, _dir) = upsert_table(mode, on_conflict).await;
+            let empty = provider.current_snapshot_id();
+            write(&provider, InsertOp::Append, repeated_across_batches())
+                .await
+                .expect("first load");
+            let loaded = provider.current_snapshot_id();
+            assert_eq!(loaded, empty, "{label}: the first load appends");
+            assert_eq!(
+                provider.protected_snapshots.load().len(),
+                1,
+                "{label}: the first load publishes one snapshot"
+            );
+            assert_eq!(visible(&provider).await, (kept.clone(), 6), "{label}");
+            // The load records no primary-key index; one is warmed for the next
+            // load in the background.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while provider.pk_keyset_cache.lock().is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{label}: no primary-key index was warmed after the first load"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+
+            write(&provider, InsertOp::Append, vec![batch(&[(1, "z"), (7, "z")])])
+                .await
+                .expect("second load");
+            assert_eq!(
+                provider.current_snapshot_id(),
+                loaded,
+                "{label}: a load into a table holding rows appends"
+            );
+            let mut expected = kept;
+            if upsert {
+                expected[0] = (1, "z".to_string());
+            }
+            expected.push((7, "z".to_string()));
+            assert_eq!(visible(&provider).await, (expected, 7), "{label}");
+        }
+    }
+}
+
+/// A table holding rows only in the inline tier is not empty: a load into it
+/// appends and keeps every stored row, rather than replacing them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_into_a_table_holding_only_inline_rows_appends() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _dir) = create_cdc_table_with_schema(
+            "t",
+            Arc::clone(&runtime_env),
+            schema(),
+            vec!["id".to_string()],
+            VortexConfig {
+                deletion_mode: mode,
+                inline_max_rows: 1_000,
+                stream_publish_interval_ms: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+            upsert_on_id(),
+        )
+        .await;
+        write(&provider, InsertOp::Append, vec![batch(&[(1, "a"), (2, "a")])])
+            .await
+            .expect("first load");
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            2,
+            "{mode:?}: the first load sits in the inline tier"
+        );
+        let loaded = provider.current_snapshot_id();
+        write(&provider, InsertOp::Append, vec![batch(&[(2, "b"), (3, "b")])])
+            .await
+            .expect("second load");
+        assert_eq!(
+            provider.current_snapshot_id(),
+            loaded,
+            "{mode:?}: a load into a table holding inline rows appends"
+        );
+        assert_eq!(
+            visible(&provider).await,
+            (owned(&[(1, "a"), (2, "b"), (3, "b")]), 3),
+            "{mode:?}"
+        );
+    }
+}
+
+/// A load into an empty table records no keys, so it must drop a primary-key
+/// index cached before it (here an empty one): a later load validated against
+/// that index would miss every key the first load wrote and store them twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_into_an_empty_table_drops_a_cached_index_it_did_not_fill() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, _catalog, _runtime_env, _dir) = upsert_table(mode, upsert_on_id()).await;
+        *provider.pk_keyset_cache.lock() = Some(CachedPkIndex::Exact(
+            CachedPkKeyset::with_capacity(0),
+        ));
+        write(&provider, InsertOp::Append, repeated_across_batches())
+            .await
+            .expect("first load");
+        write(&provider, InsertOp::Append, vec![batch(&[(1, "z")])])
+            .await
+            .expect("second load");
+        let mut expected = last_copies();
+        expected[0] = (1, "z".to_string());
+        assert_eq!(visible(&provider).await, (expected, 6), "{mode:?}");
     }
 }

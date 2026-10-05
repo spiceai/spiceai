@@ -106,7 +106,11 @@ async fn test_accounting_tracks_keyset_and_deletions_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let ctx = SessionContext::new();
+    // A user's `INSERT`s: they record their keys as they write, which a
+    // refresh's load into an empty table defers to a background build.
+    let ctx = SessionContext::new_with_state(util::session_state::mark_user_statement(
+        &SessionContext::new().state(),
+    ));
     let table = Arc::new(
         CayenneTableProvider::create_table(
             catalog,
@@ -327,7 +331,11 @@ async fn test_accounting_tracks_inline_file_deletions_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let ctx = SessionContext::new();
+    // A user's `INSERT`s: they record their keys as they write, which a
+    // refresh's load into an empty table defers to a background build.
+    let ctx = SessionContext::new_with_state(util::session_state::mark_user_statement(
+        &SessionContext::new().state(),
+    ));
     let table = Arc::new(
         CayenneTableProvider::create_table(
             catalog,

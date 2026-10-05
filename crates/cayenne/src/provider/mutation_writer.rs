@@ -312,6 +312,10 @@ pub(super) struct AppendMutationWriter<'a> {
     table: &'a CayenneTableProvider,
     context: &'a Arc<CayenneContext>,
     task_context: &'a Arc<TaskContext>,
+    /// The caller holds the write lock over a table it observed to hold no rows
+    /// (`CayenneTableProvider::holds_no_rows`), so a streaming append has no
+    /// stored key to check its own against.
+    into_empty_table: bool,
 }
 
 impl<'a> AppendMutationWriter<'a> {
@@ -325,7 +329,16 @@ impl<'a> AppendMutationWriter<'a> {
             table,
             context,
             task_context,
+            into_empty_table: false,
         }
+    }
+
+    /// Write into a table the caller observed, under the write lock it still
+    /// holds, to hold no rows: a streaming append skips the conflict check.
+    #[must_use]
+    pub(super) fn into_empty_table(mut self) -> Self {
+        self.into_empty_table = true;
+        self
     }
 
     pub(super) async fn write_cdc_pipelined(
@@ -978,6 +991,10 @@ impl<'a> AppendMutationWriter<'a> {
             .record_mem_tier_pk_keys(&validated_keys, record_seq);
 
         drop(write_guard);
+        // Memory mode arms retention here — see the method's own doc. A no-op for the
+        // `cdc_durability: memory` tables that also reach this path, which arm from their
+        // own checkpoint.
+        self.table.arm_retention_after_memory_resident_write();
         record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);
         Ok(MemWriteOutcome::Done(Box::new(
             CayenneCdcWrite::in_memory_staged(
@@ -1133,6 +1150,11 @@ impl<'a> AppendMutationWriter<'a> {
                 + apply.on_conflict_deletions.deleted_row_keys.len(),
             "Sharded in-memory CDC apply completed"
         );
+        // Provably a no-op today: the sharded path requires `is_cdc_memory_mode()`, which
+        // a memory-resident table is not, and the accelerator pins memory mode to one
+        // shard. Called anyway so that pinning becoming a default a user can raise cannot
+        // silently reinstate #14045 — it is one branch on a field read.
+        self.table.arm_retention_after_memory_resident_write();
         record_cayenne_write_phase(
             self.table.table_name(),
             "cdc_path_inmemory_sharded",
@@ -1213,15 +1235,24 @@ impl<'a> AppendMutationWriter<'a> {
         let indices = self.table.primary_key_indices()?.unwrap_or_default();
         let key_columns = super::overwrite_postpass::key_column_names(&table_schema, &indices);
         let arrival_name = super::overwrite_postpass::arrival_column(&table_schema);
+        let dedup_share = super::overwrite_postpass::DedupShare::claim();
         let arrival = super::overwrite_postpass::ArrivalStream::new(data, resolver, &arrival_name);
         let stamped_batches = arrival.stamped_batches();
         let batch_superseded = arrival.superseded();
         let data: SendableRecordBatchStream = Box::pin(arrival);
-        let prepared = self
-            .table
-            .prepare_stream_for_insert_resolving_repeats(data)
-            .await?;
-        let post_validation = prepared.post_validation();
+        // Into an empty table there is no stored key to supersede or keep, so the
+        // conflict check, and the set of every incoming key it builds, is skipped;
+        // the keys the append repeats are resolved after the write as usual.
+        let (data, post_validation) = if self.into_empty_table {
+            (data, Arc::new(ParkingMutex::new(None)))
+        } else {
+            let prepared = self
+                .table
+                .prepare_stream_for_insert_resolving_repeats(data)
+                .await?;
+            let post_validation = prepared.post_validation();
+            (prepared.stream, post_validation)
+        };
 
         let snapshot_id = uuid::Uuid::now_v7().to_string();
         let write = super::overwrite::WriteShape {
@@ -1243,7 +1274,7 @@ impl<'a> AppendMutationWriter<'a> {
             let (rows, _, stats) = self
                 .table
                 .write_to_snapshot_with_schema(
-                    prepared.stream,
+                    data,
                     write.target_size_bytes,
                     &snapshot_id,
                     write.target_partitions,
@@ -1303,6 +1334,8 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(error);
             }
         };
+        // The copies are resolved: free this write's share of the duplicate query.
+        drop(dedup_share);
 
         let PostValidationState {
             mut on_conflict_deletions,
@@ -1347,7 +1380,9 @@ impl<'a> AppendMutationWriter<'a> {
             live_rows_delta,
             published_live_rows_delta,
         );
-        if retention_requested {
+        // An unchecked load recorded no keys, so a cached index (an empty one, say)
+        // would miss every key it wrote: drop it, and the next validation rebuilds.
+        if retention_requested || self.into_empty_table {
             self.table.clear_cached_pk_keyset();
         } else {
             let record_seq = self.table.sequence_high_water().await;
