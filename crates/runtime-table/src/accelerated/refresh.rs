@@ -1186,7 +1186,10 @@ impl Refresher {
                         let refresh_changed_accelerator = refresh_result_changed_accelerator(&res);
 
                         if refresh_succeeded {
-                            refresh_status.record_dataset_last_refresh(&dataset_name, SystemTime::now());
+                            let completed_at = SystemTime::now();
+                            for refreshed_dataset in refresh_task.get_dataset_names().await {
+                                refresh_status.record_dataset_last_refresh(&refreshed_dataset, completed_at);
+                            }
                         }
                         after_refresh_task_completed(
                             refresh_succeeded,
