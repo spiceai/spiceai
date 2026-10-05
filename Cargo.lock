@@ -19934,6 +19934,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "tokio",
+ "tpchgen",
  "yaml",
 ]
 
