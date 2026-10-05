@@ -950,7 +950,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: ToDFSchema::to_dfschema_ref(id_v_schema()).expect("df schema"),
             name: TableReference::bare(name),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,

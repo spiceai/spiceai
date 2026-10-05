@@ -1288,7 +1288,7 @@ async fn other_engine_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()
     );
     let load = tokio::spawn(Arc::clone(&reader).load_components());
 
-    let table = datafusion::sql::TableReference::bare(modules);
+    let table = datafusion::common::TableReference::bare(modules);
     let expected = format!(
         "Dataset '{modules}' reads snapshots from 's3://{READER_BUCKET}/{prefix}/' that were created with the 'duckdb' engine, so `acceleration.params.cayenne_file_path`, which sets where a Cayenne copy is kept, does not apply"
     );
