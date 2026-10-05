@@ -548,7 +548,7 @@ impl Shape {
         })
     }
 
-    /// Identifies this key's persisted runs: its label, the words its encoder
+    /// Identifies this key's persisted runs: its resolved columns, the words its encoder
     /// gives keys (its encoded types, their nullability and how keys become
     /// words) and the persisted format. A reopened table therefore reads back
     /// only runs written by the same key, encoding and format, and deletes the
@@ -556,13 +556,15 @@ impl Shape {
     /// The hash is the identity, so it is 128 bits (see
     /// [`hash_index::hash_key_128`]).
     fn persisted_key(&self) -> u128 {
-        let descriptor = format!(
-            "{}|{}|{:016x}",
-            self.label,
-            key_index::persist::VERSION,
-            self.encoder.word_identity()
-        );
-        hash_index::hash_key_128(descriptor.as_bytes())
+        let mut descriptor = Vec::new();
+        descriptor.extend_from_slice(&key_index::persist::VERSION.to_le_bytes());
+        descriptor.extend_from_slice(&self.encoder.word_identity().to_le_bytes());
+        descriptor.extend_from_slice(&(self.columns.len() as u64).to_le_bytes());
+        for column in &self.columns {
+            descriptor.extend_from_slice(&(column.name.len() as u64).to_le_bytes());
+            descriptor.extend_from_slice(column.name.as_bytes());
+        }
+        hash_index::hash_key_128(&descriptor)
     }
 
     /// The directory this key's persisted runs live in.
@@ -1584,7 +1586,7 @@ impl LookupIndexState {
             .iter()
             .map(|shape| shape.persisted_dir())
             .collect();
-        if !distinct_dirs(&keys) {
+        if !distinct_dirs(keys.iter().map(String::as_str)) {
             tracing::debug!(table = %self.table_name, "Secondary index runs are not persisted: two keys share a run directory");
             return;
         }
@@ -2549,8 +2551,9 @@ impl PersistedRuns {
     /// Persists `views`' runs in the background, coalescing with any sync
     /// already running.
     fn schedule(self: &Arc<Self>, views: Vec<(String, IndexView)>) {
-        let dirs: Vec<String> = views.iter().map(|(dir, _)| dir.clone()).collect();
-        if !self.loaded.load(Ordering::Acquire) || !distinct_dirs(&dirs) {
+        if !self.loaded.load(Ordering::Acquire)
+            || !distinct_dirs(views.iter().map(|(dir, _)| dir.as_str()))
+        {
             return;
         }
         *self.pending.lock() = Some(views);
@@ -2722,15 +2725,6 @@ impl PersistedRuns {
     }
 }
 
-/// The line a table logs when a schema change alters the encoding of the keys
-/// `labels` name, so their indexes are rebuilt.
-fn rebuilt_index_message(table_name: &str, labels: &[String]) -> String {
-    format!(
-        "Dataset '{table_name}' (cayenne): the schema change altered the key columns of its secondary index on {}, so the index is rebuilt from the table's files as lookups need it; until then those lookups read every file",
-        labels.join(", ")
-    )
-}
-
 /// The line a reopened table logs once it has loaded its persisted index.
 fn persisted_runs_loaded_message(
     table_name: &str,
@@ -2759,9 +2753,9 @@ fn persisted_runs_loaded_message(
 /// Whether every key has a run directory of its own. Keys sharing one would
 /// load each other's runs, and a lookup on one could then miss rows the
 /// other's runs hold, so a table whose keys collide persists nothing.
-fn distinct_dirs(dirs: &[String]) -> bool {
-    let unique: HashSet<&str> = dirs.iter().map(String::as_str).collect();
-    unique.len() == dirs.len()
+fn distinct_dirs<'a>(mut dirs: impl Iterator<Item = &'a str>) -> bool {
+    let mut unique = HashSet::new();
+    dirs.all(|dir| unique.insert(dir))
 }
 
 /// A persisted run's name: a digest of the run's files and size, so the same run
@@ -2789,6 +2783,15 @@ pub(crate) fn record_probe_outcome(
         telemetry::KeyValue::new("table", table_name.to_string()),
         telemetry::KeyValue::new("shape", shape.to_string()),
     ]);
+}
+
+/// The line a table logs when a schema change alters the encoding of the keys
+/// `labels` name, so their indexes are rebuilt.
+fn rebuilt_index_message(table_name: &str, labels: &[String]) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): the schema change altered the key columns of its secondary index on {}, so the index is rebuilt from the table's files as lookups need it; until then those lookups read every file",
+        labels.join(", ")
+    )
 }
 
 /// What the warning says when the memory pool refuses to fit an index.
@@ -4151,12 +4154,10 @@ mod tests {
                 .all(|dir| dir.len() == 32 && dir.chars().all(|c| c.is_ascii_hexdigit())),
             "{dirs:?}"
         );
-        assert!(distinct_dirs(&dirs), "{dirs:?}");
-        assert!(!distinct_dirs(&[
-            dirs[0].clone(),
-            dirs[1].clone(),
-            dirs[0].clone()
-        ]));
+        assert!(distinct_dirs(dirs.iter().map(String::as_str)), "{dirs:?}");
+        assert!(!distinct_dirs(
+            [dirs[0].as_str(), dirs[1].as_str(), dirs[0].as_str()].into_iter()
+        ));
     }
 
     #[tokio::test]

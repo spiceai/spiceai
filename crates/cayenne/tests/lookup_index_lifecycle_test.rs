@@ -809,6 +809,85 @@ async fn the_metastore_decides_which_persisted_runs_a_reopened_table_loads() {
     assert_eq!(dynamic_lookup(&reopened, name, &ids).await, ids);
 }
 
+/// Distinct composite keys with the same display label keep separate persisted
+/// identities, so reopening with a different key never loads the other key's
+/// postings as coverage for the new key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_keys_with_the_same_label_do_not_reuse_persisted_runs() {
+    const NAME: &str = "ambiguous_key_labels";
+    const ROWS: i64 = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("a, b", DataType::Int64, false),
+        Field::new("c", DataType::Int64, false),
+        Field::new("a", DataType::Int64, false),
+        Field::new("b, c", DataType::Int64, false),
+    ]));
+    let first = open_table(
+        &fixture,
+        Arc::clone(&env),
+        TableSpec::new(NAME, Arc::clone(&schema), &[&["a, b", "c"]])
+            .persistence(IndexPersistence::Enabled),
+    )
+    .await;
+    let columns = (0..5_i64)
+        .map(|column| {
+            Arc::new(Int64Array::from_iter_values(
+                (0..ROWS).map(|id| id + column * 100_000),
+            )) as arrow::array::ArrayRef
+        })
+        .collect();
+    overwrite(
+        &first,
+        vec![RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch")],
+    )
+    .await;
+    wait_for_persisted_runs(&fixture, NAME, 1).await;
+    let original = registered_runs(&fixture, NAME).await;
+    assert!(!original.is_empty(), "the original key must be persisted");
+    drop(first);
+
+    let reopened = open_table(
+        &fixture,
+        env,
+        TableSpec::new(NAME, schema, &[&["a", "b, c"]]).persistence(IndexPersistence::Enabled),
+    )
+    .await;
+    let verification = reopened
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify reopened index");
+    let sql = "SELECT id FROM ambiguous_key_labels WHERE a = 300007 AND \"b, c\" = 400007";
+    assert_eq!(
+        int64_column(&query(&reopened, NAME, sql).await),
+        vec![7],
+        "the first lookup must find the row through the uncovered-file fallback"
+    );
+    assert!(
+        verification.uncovered_files > 0,
+        "the new key must not load coverage from the other key: {verification:?}"
+    );
+    until_covered(&reopened, async || {
+        assert_eq!(int64_column(&query(&reopened, NAME, sql).await), vec![7]);
+    })
+    .await;
+    wait_for_persisted_runs(&fixture, NAME, 1).await;
+    let rebuilt = registered_runs(&fixture, NAME).await;
+    assert!(
+        rebuilt
+            .iter()
+            .all(|run| original.iter().all(|old| old.index_key != run.index_key)),
+        "the two keys must have distinct persisted identities: {original:?} -> {rebuilt:?}"
+    );
+    let before = counters(&reopened);
+    assert_eq!(int64_column(&query(&reopened, NAME, sql).await), vec![7]);
+    assert_eq!(counters(&reopened).full - before.full, 1);
+}
+
 /// With persisted runs, a reopened table loads its index runs instead of reading
 /// its files back: on reopen every file is covered before any build runs, and
 /// the loaded runs agree row for row with a read-back. Without them the same

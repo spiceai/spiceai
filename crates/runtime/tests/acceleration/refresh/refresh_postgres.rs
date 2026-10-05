@@ -18,7 +18,7 @@ use crate::acceleration::refresh::common::{
     initialize_postgres, refresh_table, start_test_runtime,
 };
 use crate::postgres::common;
-use crate::postgres::common::{PG_PASSWORD, get_random_port};
+use crate::postgres::common::PG_PASSWORD;
 use crate::{init_tracing, utils::test_request_context};
 use spicepod::param::Params;
 use std::collections::HashMap;
@@ -30,8 +30,8 @@ async fn test_acceleration_refresh_postgres_append() -> Result<(), anyhow::Error
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let db_conn = initialize_postgres(port).await?;
             let acceleration_params: HashMap<String, String> = [
@@ -88,8 +88,8 @@ async fn test_acceleration_refresh_postgres_full() -> Result<(), anyhow::Error> 
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let db_conn = initialize_postgres(port).await?;
             let acceleration_params: HashMap<String, String> = [
