@@ -79,7 +79,8 @@ fn orders_schema() -> Arc<Schema> {
 }
 
 /// Five distinct regions including NULL: `ap`, `eu`, `na`, `us`, and NULL.
-/// `qty = 20` includes a NULL region so `NOT IN` is unknown for every row.
+/// Only the NULL region has `qty = 20`, so a `NOT IN` subquery that dropped
+/// that NULL would become empty and count every outer row instead of 0.
 fn orders_batch(schema: &Arc<Schema>) -> TestResult<RecordBatch> {
     let mut ids = Vec::new();
     let mut regions: Vec<Option<&str>> = Vec::new();
@@ -87,7 +88,7 @@ fn orders_batch(schema: &Arc<Schema>) -> TestResult<RecordBatch> {
     let named = ["ap", "eu", "na", "us"];
     let mut id = 1_i64;
     for region in named {
-        for qty in [1_i64, 5, 20] {
+        for qty in [1_i64, 5] {
             ids.push(id);
             regions.push(Some(region));
             qtys.push(Some(qty));
