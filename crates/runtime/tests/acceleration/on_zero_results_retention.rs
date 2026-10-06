@@ -108,10 +108,11 @@ fn timed_events_dataset(dir: &Path, name: &str) -> Dataset {
         on_zero_results: ZeroResultsAction::UseSource,
         refresh_sql: Some(format!("SELECT * FROM {name} WHERE id != 3")),
         // Wider than the 2001 fixture timestamp so refresh loads id=2; the 1h
-        // retention period is what then evicts it.
-        refresh_data_window: Some("30y".to_string()),
+        // retention period is what then evicts it. `d` is a fundu unit; `y` is not.
+        refresh_data_window: Some("10000d".to_string()),
         retention_check_enabled: true,
-        retention_check_interval: Some("1s".to_string()),
+        // Longer than dataset load so the expired row is still visible after ready.
+        retention_check_interval: Some("15s".to_string()),
         retention_period: Some("1h".to_string()),
         ..Acceleration::default()
     });
@@ -227,18 +228,13 @@ async fn duckdb_time_retention_does_not_resurrect_via_fallback() -> anyhow::Resu
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime_datasets(&rt, Duration::from_mins(1)).await?;
 
-            let loaded = wait_until_true(Duration::from_secs(10), || {
-                let rt = Arc::clone(&rt);
-                async move { accelerator_ids(&rt, "timed").await.contains(&2) }
-            })
-            .await;
+            let loaded = accelerator_ids(&rt, "timed").await;
             assert!(
-                loaded,
-                "refresh_data_window must load id=2 before retention evicts it, leftover {:?}",
-                accelerator_ids(&rt, "timed").await
+                loaded.contains(&2),
+                "refresh_data_window must load id=2 before retention evicts it, leftover {loaded:?}"
             );
 
-            let evicted = wait_until_true(Duration::from_secs(10), || {
+            let evicted = wait_until_true(Duration::from_secs(30), || {
                 let rt = Arc::clone(&rt);
                 async move {
                     let ids = accelerator_ids(&rt, "timed").await;
