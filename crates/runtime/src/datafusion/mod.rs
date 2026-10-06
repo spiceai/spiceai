@@ -91,8 +91,8 @@ use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey}
 use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
+use datafusion::common::TableReference;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
-use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
