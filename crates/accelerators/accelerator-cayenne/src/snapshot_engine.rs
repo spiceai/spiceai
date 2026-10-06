@@ -292,16 +292,37 @@ fn persisted_run_files(
         .into_iter()
         .flatten()
         .filter_map(|row| {
-            let relative = PathBuf::from(slice_text(row, table_id)?)
+            let (table_id, index_key, run_name) = (
+                slice_text(row, table_id)?,
+                slice_text(row, index_key)?,
+                slice_text(row, run_name)?,
+            );
+            if ![table_id, index_key, run_name]
+                .into_iter()
+                .all(is_file_name)
+            {
+                return None;
+            }
+            let relative = PathBuf::from(table_id)
                 .join(cayenne::LOOKUP_INDEX_DIR_NAME)
-                .join(slice_text(row, index_key)?)
-                .join(slice_text(row, run_name)?);
+                .join(index_key)
+                .join(run_name);
             Some(DirectoryArchiveFile {
                 source: anchor.join(&relative),
                 archive_path: format!("{data_prefix}{}", relative.to_string_lossy()),
             })
         })
         .collect()
+}
+
+/// Metastore identifiers name one file or directory, never a path.
+fn is_file_name(value: &str) -> bool {
+    if value.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(std::path::Component::Normal(name)) if name == value)
+        && components.next().is_none()
 }
 
 /// Snapshot engine for Cayenne accelerators.
@@ -692,6 +713,114 @@ mod tests {
             exported_at_ms: 0,
             tables,
         }
+    }
+
+    #[test]
+    fn persisted_run_metadata_requires_single_file_names() {
+        let columns = EXPECTED_TABLES
+            .iter()
+            .find(|table| table.name == "cayenne_index_run")
+            .expect("index run schema")
+            .columns;
+        let valid: Vec<_> = columns
+            .iter()
+            .map(|column| match *column {
+                "table_id" => SliceValue::Text("table".to_string()),
+                "index_key" => SliceValue::Text("key".to_string()),
+                "run_name" => SliceValue::Text("kept.run".to_string()),
+                _ => SliceValue::Null,
+            })
+            .collect();
+        for field in ["table_id", "index_key", "run_name"] {
+            let slot = columns
+                .iter()
+                .position(|column| *column == field)
+                .expect("path field");
+            for malformed in [
+                "",
+                ".",
+                "..",
+                "/outside",
+                "../outside",
+                "nested/file",
+                "name/",
+                "name/.",
+                "name\\file",
+                "C:\\outside",
+                "bad\0name",
+            ] {
+                let mut invalid = valid.clone();
+                invalid[slot] = SliceValue::Text(malformed.to_string());
+                let mut slice = slice_with("table", "snapshot", &[], &[]);
+                slice.tables.insert(
+                    "cayenne_index_run".to_string(),
+                    vec![invalid, valid.clone()],
+                );
+                let files = persisted_run_files(Path::new("data"), "data/", &slice);
+                assert_eq!(files.len(), 1, "{field}={malformed:?}");
+                assert_eq!(
+                    files[0].source,
+                    Path::new("data/table/_lookup_index/key/kept.run")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_omits_absolute_persisted_run_paths() {
+        let tmp = tempfile::tempdir().expect("fixture");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical fixture root");
+        let anchor = root.join("data");
+        std::fs::create_dir(&anchor).expect("data directory");
+        std::fs::write(anchor.join("rows.vortex"), b"table data").expect("table file");
+        let outside = root.join("outside.txt");
+        std::fs::write(&outside, b"OUTSIDE_DATA_DIRECTORY").expect("outside file");
+        let mut slice = slice_with("table", "snapshot", &[], &[]);
+        let columns = EXPECTED_TABLES
+            .iter()
+            .find(|table| table.name == "cayenne_index_run")
+            .expect("index run schema")
+            .columns;
+        let row = columns
+            .iter()
+            .map(|column| match *column {
+                "table_id" => SliceValue::Text("table".to_string()),
+                "index_key" => SliceValue::Text("key".to_string()),
+                "run_name" => SliceValue::Text(outside.to_string_lossy().into_owned()),
+                _ => SliceValue::Null,
+            })
+            .collect();
+        slice
+            .tables
+            .insert("cayenne_index_run".to_string(), vec![row]);
+        let files: Vec<_> = persisted_run_files(&anchor, "data/", &slice)
+            .into_iter()
+            .map(|file| (file.source, file.archive_path))
+            .collect();
+        let destination = tmp.path().join("snapshot.tar");
+        runtime_acceleration::snapshot::directory_archive::archive_directories_to_file_with_plan(
+            &[(anchor, "data/".to_string())],
+            &destination,
+            &[],
+            &[],
+            &files,
+        )
+        .await
+        .expect("archive table");
+        let bytes = std::fs::read(destination).expect("archive bytes");
+        println!(
+            "archive_bytes={} outside_bytes_archived={}",
+            bytes.len(),
+            bytes
+                .windows(b"OUTSIDE_DATA_DIRECTORY".len())
+                .any(|bytes| bytes == b"OUTSIDE_DATA_DIRECTORY")
+        );
+        assert!(
+            !bytes
+                .windows(b"OUTSIDE_DATA_DIRECTORY".len())
+                .any(|bytes| bytes == b"OUTSIDE_DATA_DIRECTORY"),
+            "snapshot included outside bytes"
+        );
     }
 
     /// Retired snapshot directories, staging state and the `deletions/`

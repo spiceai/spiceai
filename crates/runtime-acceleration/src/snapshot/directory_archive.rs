@@ -251,7 +251,8 @@ where
 /// `bytes = extras[i].1`. The bytes count toward the returned total.
 /// `optional_files[i]`, a `(source, archive_path)` pair, is archived only if
 /// the file still exists when the archive reaches it (see
-/// `DirectorySnapshotPlan::optional_files`).
+/// `DirectorySnapshotPlan::optional_files`). Sources outside every configured
+/// archive directory are omitted.
 ///
 /// # Errors
 ///
@@ -1139,9 +1140,9 @@ fn open_no_follow(root: &Path, path: &Path) -> std::io::Result<Option<std::fs::F
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
         let name = match component {
-            Component::RootDir | Component::CurDir => continue,
+            Component::CurDir => continue,
             Component::Normal(name) => name,
-            Component::ParentDir | Component::Prefix(_) => return Ok(None),
+            Component::RootDir | Component::ParentDir | Component::Prefix(_) => return Ok(None),
         };
         let name = CString::new(name.as_bytes())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
@@ -1195,19 +1196,17 @@ fn append_optional_files<W: std::io::Write>(
         // Configured archive directories are trusted anchors; components below
         // them must never follow links. Ancestors of the anchor may contain
         // platform aliases such as macOS `/var`.
-        let root = dirs
+        let Some(root) = dirs
             .iter()
             .map(|(path, _)| path.as_path())
             .filter(|root| source.starts_with(root))
             .max_by_key(|root| root.components().count())
-            .unwrap_or_else(|| {
-                if source.is_absolute() {
-                    Path::new("/")
-                } else {
-                    Path::new(".")
-                }
-            });
-        let relative = source.strip_prefix(root).unwrap_or(source);
+        else {
+            continue;
+        };
+        let Ok(relative) = source.strip_prefix(root) else {
+            continue;
+        };
         let opened = match open_no_follow(root, relative) {
             Ok(opened) => opened,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1462,6 +1461,43 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn optional_files_outside_configured_roots_are_omitted() -> Result<()> {
+        let tmp = TempDir::new().expect("fixture");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical root");
+        let data = root.join("data");
+        let sibling = root.join("data-other");
+        std::fs::create_dir(&data).expect("data directory");
+        std::fs::create_dir(&sibling).expect("sibling directory");
+        let outside = sibling.join("secret.run");
+        std::fs::write(&outside, b"OUTSIDE_ROOT").expect("outside fixture");
+        let files = vec![
+            (outside, "data/outside.run".to_string()),
+            (
+                data.join("../data-other/secret.run"),
+                "data/parent.run".to_string(),
+            ),
+        ];
+        for dirs in [vec![], vec![(data, "data/".to_string())]] {
+            let mut archive = tar::Builder::new(Vec::new());
+            append_optional_files(&mut archive, &files, &dirs)?;
+            let bytes = archive.into_inner().expect("finish archive");
+            assert_eq!(
+                tar::Archive::new(bytes.as_slice())
+                    .entries()
+                    .expect("entries")
+                    .count(),
+                0
+            );
+            assert!(
+                !bytes
+                    .windows(b"OUTSIDE_ROOT".len())
+                    .any(|bytes| bytes == b"OUTSIDE_ROOT")
+            );
+        }
+        Ok(())
+    }
+
     /// An optional file is archived when it exists and left out when it does
     /// not. One that is a symbolic link is left out too, as the directory walk
     /// leaves out links: archiving its target would copy any file `spiced`
@@ -1489,7 +1525,18 @@ mod tests {
             ),
         ];
         let archive_path = test_dir.path().join("snapshot.tar");
-        archive_directories_to_file_with_plan(&[], &archive_path, &[], &[], &optional).await?;
+        archive_directories_to_file_with_plan(
+            &[(data_dir.clone(), "data/".to_string())],
+            &archive_path,
+            &[
+                PathBuf::from("kept.run"),
+                PathBuf::from("linked.run"),
+                PathBuf::from("linked_parent"),
+            ],
+            &[],
+            &optional,
+        )
+        .await?;
 
         // The configured root may have platform aliases above it, such as
         // `/var` on macOS. Links below that root must still be rejected.
