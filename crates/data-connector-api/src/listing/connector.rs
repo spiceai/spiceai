@@ -466,18 +466,17 @@ impl TableProvider for LocationPruningListingTable {
             Arc::clone(&self.object_store),
         );
 
-        // `_last_modified`/`_size` predicates are computable from each object's `ObjectMeta`,
-        // so evaluate them against the head()ed metadata and skip a file before opening it
-        // (e.g. `_location = X AND _last_modified > W` head()s X and never GETs it when its
-        // mtime fails the bound). `supports_filters_pushdown` reports these `Exact`, so the
-        // set applied here must match the set reported there. `_location` predicates are not
-        // re-evaluated — the head() selection already applied them.
+        // Metadata predicates (`_location`, `_last_modified`, `_size`) are computable from each
+        // object's `ObjectMeta`, so evaluate them against the head()ed metadata and skip a file
+        // before opening it (e.g. `_location = X AND _last_modified > W` head()s X and never
+        // GETs it when its mtime fails the bound). `supports_filters_pushdown` reports these
+        // `Exact`, so every one must be enforced here.
+        //
+        // `locations` is only a candidate set: it unions the values of every conjunct, which
+        // is a superset of the true matches (`_location = 'A' AND _location = 'B'` heads both
+        // and keeps neither). `_location` predicates that the extractor does not understand,
+        // such as `LIKE`, are likewise enforced by this check.
         let metadata_cols = &self.inner.options().metadata_cols;
-        let non_location_metadata: Vec<&str> = metadata_cols
-            .iter()
-            .map(|c| c.name())
-            .filter(|name| *name != "_location")
-            .collect();
         let metadata_filters: Vec<datafusion_expr::Expr> = filters
             .iter()
             .filter(|f| {
@@ -485,7 +484,7 @@ impl TableProvider for LocationPruningListingTable {
                 !refs.is_empty()
                     && refs
                         .iter()
-                        .all(|c| non_location_metadata.contains(&c.name.as_str()))
+                        .all(|c| metadata_cols.iter().any(|m| m.name() == c.name))
             })
             .cloned()
             .collect();
@@ -532,8 +531,8 @@ impl TableProvider for LocationPruningListingTable {
                 continue;
             }
 
-            // Prune by `_last_modified`/`_size` before opening the object; a file that
-            // fails the bound is never GETed.
+            // Prune by the metadata predicates before opening the object; a file that
+            // fails one is never GETed.
             let Some(meta) = datafusion::datasource::listing::helpers::filter_by_metadata(
                 meta,
                 &metadata_filters,
@@ -5693,6 +5692,64 @@ mod tests {
                 !plan.contains("FilterExec"),
                 "_last_modified is applied by the prune, not a residual filter"
             );
+        }
+
+        const NEW_LOC: &str = "s3://bucket/prefix/new.csv";
+
+        // Conjoined `_location` equalities select the union of both objects as candidates,
+        // but the SQL matches neither, so both must be pruned.
+        #[tokio::test]
+        async fn case2b_conflicting_location_equalities_match_nothing() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location = '{OLD_LOC}' AND _location = '{NEW_LOC}'"
+                ),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert!(
+                plan.contains("EmptyExec"),
+                "no object satisfies both equalities: {plan}"
+            );
+            assert!(!plan.contains("FilterExec"), "{plan}");
+        }
+
+        // An equality plus a `_location` predicate the extractor ignores (`LIKE`) must
+        // still enforce the `LIKE`.
+        #[tokio::test]
+        async fn case2c_location_equality_and_like_enforces_the_like() {
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location = '{OLD_LOC}' AND _location LIKE '%/new.csv'"
+                ),
+            )
+            .await;
+            assert!(
+                plan.contains("EmptyExec"),
+                "the LIKE excludes old.csv: {plan}"
+            );
+            assert!(!plan.contains("FilterExec"), "{plan}");
+        }
+
+        // Overlapping `IN` lists keep only the shared object.
+        #[tokio::test]
+        async fn case2d_overlapping_location_in_lists_keep_the_intersection() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location IN ('{OLD_LOC}', '{NEW_LOC}') \
+                     AND _location IN ('{NEW_LOC}')"
+                ),
+            )
+            .await;
+            assert!(!plan.contains("EmptyExec"), "new.csv matches: {plan}");
+            assert!(plan.contains("new.csv"), "{plan}");
+            assert!(!plan.contains("old.csv"), "old.csv is pruned: {plan}");
         }
 
         // Case 3: `_location = X AND other_col = 'foo'` — no LIST, scans, and the data
