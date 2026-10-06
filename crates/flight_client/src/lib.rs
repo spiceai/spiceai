@@ -469,7 +469,9 @@ impl FlightClient {
                 .into_parts();
 
             return Ok(FlightRecordBatchStream::new_from_flight_data(
-                response_stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+                response_stream
+                    .map_ok(conforming_map_entries)
+                    .map_err(|status| FlightError::Tonic(Box::new(status))),
             )
             .with_headers(md));
         }
@@ -505,7 +507,9 @@ impl FlightClient {
             .into_parts();
 
         Ok(FlightDataDecoder::new(
-            response_stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+            response_stream
+                .map_ok(conforming_map_entries)
+                .map_err(|status| FlightError::Tonic(Box::new(status))),
         ))
     }
 
@@ -684,4 +688,20 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
         }
         _ => false,
     }
+}
+
+/// Returns `message` with a schema message that declares a `Map` whose `entries` field is
+/// nullable replaced by the conforming declaration; any other message passes through untouched.
+///
+/// The Arrow IPC decoder validates the map layout, so a server that declares nullable `entries`
+/// would otherwise fail every batch it sends with an error that names no column. The decoder
+/// hands its batches straight to the caller, so they have to come out of the decode already
+/// conforming (see `arrow_tools::map_entries::conforming_schema_message`); entries that do hold
+/// nulls are still refused by the decode.
+fn conforming_map_entries(mut message: FlightData) -> FlightData {
+    if let Some(header) = arrow_tools::map_entries::conforming_schema_message(&message.data_header)
+    {
+        message.data_header = header.into();
+    }
+    message
 }

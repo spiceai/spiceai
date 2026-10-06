@@ -21,6 +21,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread"] }
+tpchgen.workspace = true
 yaml = { path = "../../crates/yaml" }
 
 [lints]

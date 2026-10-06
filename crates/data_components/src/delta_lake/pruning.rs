@@ -77,7 +77,13 @@ pub(crate) fn prune_partitions(
 
     // Applies `filter` to `batch`
     let do_filter = |filter| -> Result<ArrayRef, datafusion::error::DataFusionError> {
-        let expr = create_physical_expr(filter, &df_schema, &props)?;
+        let expr = create_physical_expr(
+            filter,
+            &df_schema,
+            &props,
+            &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(
+            ),
+        )?;
         expr.evaluate(&batch)?.into_array(partitioned_files.len())
     };
 

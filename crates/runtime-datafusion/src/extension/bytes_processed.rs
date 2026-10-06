@@ -37,7 +37,10 @@ use datafusion::physical_plan::filter_pushdown::{
 };
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::{Distribution, PhysicalExpr, PlanProperties};
+use datafusion::physical_plan::{
+    ChildStats, Distribution, InputDistributionRequirements, PhysicalExpr, PlanProperties,
+    ReplaceChildrenOptions, StatisticsArgs, StatisticsContext,
+};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     error::Result,
@@ -241,6 +244,18 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![Distribution::UnspecifiedDistribution; self.children().len()]
     }
 
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution;
+            self.children().len()
+        ])
+    }
+
+    /// Byte counting owns no dynamic filters.
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![None; self.children().len()]
     }
@@ -256,36 +271,47 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![self.input_exec.properties().output_ordering().is_none()]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input_exec]
+    }
+
+    /// `properties()` is read from the input, so there is nothing to keep or recompute.
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.with_input(children)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::External(
-                crate::Error::InvalidChildrenCount {
-                    children_count: children.len(),
-                }
-                .into(),
-            ));
-        }
+        self.with_input(children)
+    }
 
-        let Some(input) = children.into_iter().next() else {
-            unreachable!("should have one input");
-        };
-        Ok(Arc::new(Self {
-            input_exec: input,
-            emit_bytes_callback: Arc::clone(&self.emit_bytes_callback),
-            fallback_to_new_context: self.fallback_to_new_context,
-        }))
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.with_input(children)
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.with_input(children)
     }
 
     fn repartitioned(
@@ -328,7 +354,30 @@ impl ExecutionPlan for BytesProcessedExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input_exec.partition_statistics(partition)
+        StatisticsContext::new().compute(
+            self.input_exec.as_ref(),
+            &StatisticsArgs::new().with_partition(partition),
+        )
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    /// Counting bytes neither adds nor removes rows, so the input's statistics hold unchanged.
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        input_stats.first().map(Arc::clone).ok_or_else(|| {
+            DataFusionError::External(
+                crate::Error::InvalidChildrenCount {
+                    children_count: input_stats.len(),
+                }
+                .into(),
+            )
+        })
     }
 
     // Allow optimizer to push limits through to inputs
@@ -386,9 +435,40 @@ impl ExecutionPlan for BytesProcessedExec {
         let result = self.input_exec.try_pushdown_sort(order)?;
         Ok(result.map(|plan| self.wrap_input_exec(plan)))
     }
+
+    /// Not serializable. Forwarding to the input would ship a plan without the
+    /// byte accounting, so a remote executor's bytes would go uncounted.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
+    }
 }
 
 impl BytesProcessedExec {
+    fn with_input(
+        &self,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let [input]: [Arc<dyn ExecutionPlan>; 1] =
+            children
+                .try_into()
+                .map_err(|children: Vec<Arc<dyn ExecutionPlan>>| {
+                    DataFusionError::External(
+                        crate::Error::InvalidChildrenCount {
+                            children_count: children.len(),
+                        }
+                        .into(),
+                    )
+                })?;
+        Ok(Arc::new(Self {
+            input_exec: input,
+            emit_bytes_callback: Arc::clone(&self.emit_bytes_callback),
+            fallback_to_new_context: self.fallback_to_new_context,
+        }))
+    }
+
     fn wrap_input_exec(&self, input_exec: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let mut exec = BytesProcessedExec::new(input_exec, Arc::clone(&self.emit_bytes_callback));
         if self.fallback_to_new_context {

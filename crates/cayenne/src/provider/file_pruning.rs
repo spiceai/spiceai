@@ -68,6 +68,7 @@ pub(crate) fn build_listing_pruning_predicate(
         &predicate,
         &df_schema,
         &execution_props,
+        &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
     )?))
 }
 

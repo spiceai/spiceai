@@ -58,6 +58,30 @@ pub struct DispatchArgs {
     /// Dry run mode - print the workflow dispatch request without sending it
     #[arg(long, default_value = "false")]
     pub(crate) dry_run: bool,
+
+    /// Dispatch only the test files on this schedule (a file without a `schedule` key is
+    /// `daily`). Without it, every test file is dispatched.
+    #[arg(long, value_enum)]
+    pub(crate) schedule: Option<Schedule>,
+}
+
+/// Which scheduled run dispatches a test file.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Schedule {
+    #[default]
+    Daily,
+    /// For tests whose source is a hosted service.
+    Weekly,
+}
+
+impl std::fmt::Display for Schedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Schedule::Daily => write!(f, "daily"),
+            Schedule::Weekly => write!(f, "weekly"),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -96,7 +120,19 @@ impl From<Workflow> for TestType {
 /// Represents a single test file payload
 #[derive(Debug, Clone, Deserialize)]
 pub struct DispatchTestFile {
+    /// Which scheduled run dispatches the file's tests.
+    #[serde(default)]
+    pub schedule: Schedule,
     pub tests: DispatchTests,
+}
+
+impl DispatchTestFile {
+    /// Whether a dispatch restricted to `schedule` includes this file. An unrestricted
+    /// dispatch (`None`) includes every file.
+    #[must_use]
+    pub fn is_on_schedule(&self, schedule: Option<Schedule>) -> bool {
+        schedule.is_none_or(|schedule| schedule == self.schedule)
+    }
 }
 
 /// Represents the tests that can be defined in a test file
@@ -653,6 +689,53 @@ tests:
         // Verify other sections are empty
         assert_eq!(test_file.tests.bench.len(), 0);
         assert_eq!(test_file.tests.throughput.len(), 0);
+    }
+
+    #[test]
+    fn test_schedule_defaults_to_daily() {
+        let yaml = "
+tests:
+  bench:
+    spicepod_path: federated/file[parquet].yaml
+    query_set: tpch
+    runner_type: spiceai-dev-runners
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert_eq!(test_file.schedule, Schedule::Daily);
+        assert!(test_file.is_on_schedule(None));
+        assert!(test_file.is_on_schedule(Some(Schedule::Daily)));
+        assert!(!test_file.is_on_schedule(Some(Schedule::Weekly)));
+    }
+
+    #[test]
+    fn test_weekly_schedule_is_skipped_by_the_daily_dispatch() {
+        let yaml = "
+schedule: weekly
+tests:
+  bench:
+    spicepod_path: federated/oracle.yaml
+    query_set: tpch
+    runner_type: spiceai-dev-runners
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert_eq!(test_file.schedule, Schedule::Weekly);
+        assert!(test_file.is_on_schedule(None));
+        assert!(!test_file.is_on_schedule(Some(Schedule::Daily)));
+        assert!(test_file.is_on_schedule(Some(Schedule::Weekly)));
+    }
+
+    #[test]
+    fn test_unknown_schedule_is_rejected() {
+        let yaml = "
+schedule: weeky
+tests: {}
+";
+
+        yaml::from_str::<DispatchTestFile>(yaml).expect_err("an unknown schedule must not parse");
     }
 
     #[test]

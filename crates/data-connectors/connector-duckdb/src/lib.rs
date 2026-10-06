@@ -31,8 +31,8 @@ use data_connector_api::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
     DataConnectorFactory, DataConnectorResult,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
@@ -51,7 +51,7 @@ use std::sync::Arc;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: open. Specify a DuckDB file with the `open` parameter"
+        "Missing required parameter `duckdb_open`. Set it to the DuckDB database file to read, for example `duckdb_open: ./data.duckdb`. For details, visit: https://spiceai.org/docs/components/data-connectors/duckdb"
     ))]
     MissingDuckDBFile,
 }
@@ -277,3 +277,16 @@ data_connector_api::register_data_connector!(
     CONNECTOR_NAME,
     DuckDBFactory
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_error_names_the_spicepod_key() {
+        assert_eq!(
+            Error::MissingDuckDBFile.to_string(),
+            "Missing required parameter `duckdb_open`. Set it to the DuckDB database file to read, for example `duckdb_open: ./data.duckdb`. For details, visit: https://spiceai.org/docs/components/data-connectors/duckdb"
+        );
+    }
+}

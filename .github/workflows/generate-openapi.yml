@@ -40,9 +40,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust 1.98.1
+      - name: Set up Rust
         if: steps.check_pr.outputs.skip != 'true'
-        run: rustup toolchain install 1.98.1 --profile minimal
+        uses: ./.github/actions/setup-rust
 
       - name: Set up make
         if: runner.os != 'macOS' && steps.check_pr.outputs.skip != 'true'

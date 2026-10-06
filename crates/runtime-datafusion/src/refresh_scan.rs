@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
+use datafusion::common::TableReference;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DataFusionError};
 use datafusion::dataframe::DataFrame;
@@ -35,7 +36,6 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ident};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
-use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 use futures::TryStreamExt;
