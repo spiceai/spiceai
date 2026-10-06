@@ -994,10 +994,10 @@ mod tests {
     }
 
     /// Regression test for #14787: the orphaned-DV sweep unlinked deletion
-    /// vectors while a snapshot archived them. Under a snapshot pin the sweep
+    /// vectors while a snapshot archived them. Under a file-deletion hold the sweep
     /// waits, the archive keeps every file the slice lists, and it restores.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn orphan_dv_sweep_waits_for_the_snapshot_pin() {
+    async fn orphan_dv_sweep_waits_for_the_file_deletion_hold() {
         use runtime_acceleration::snapshot::directory_archive::archive_directories_to_file_with_plan;
 
         let tmp = tempfile::tempdir().expect("tmp");
@@ -1007,7 +1007,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir).expect("mkdir data");
         let (catalog, table, orphans) = table_with_orphan_dvs(&metadata_dir, &data_dir, 3).await;
 
-        let pin = table.pin_for_snapshot().await;
+        let hold = table.hold_file_deletions().await;
         let mut sweep = tokio::spawn({
             let table = Arc::clone(&table);
             async move { table.drain_orphan_dv_sweep(1).await }
@@ -1016,7 +1016,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(500), &mut sweep)
                 .await
                 .is_err(),
-            "the sweep must wait for the snapshot pin"
+            "the sweep must wait for the file-deletion hold"
         );
 
         let dirs = vec![
@@ -1040,10 +1040,10 @@ mod tests {
             .expect("archive");
         assert!(orphans.iter().all(|path| path.exists()));
 
-        drop(pin);
+        drop(hold);
         tokio::time::timeout(std::time::Duration::from_secs(30), sweep)
             .await
-            .expect("the sweep resumes once the pin drops")
+            .expect("the sweep resumes once the hold drops")
             .expect("sweep task");
         assert!(orphans.iter().all(|path| !path.exists()));
 
@@ -1051,9 +1051,10 @@ mod tests {
         assert_eq!(rows, 1, "the archive restores the table");
     }
 
-    /// The runtime's snapshot attempt pins the Cayenne table it snapshots.
+    /// The runtime's snapshot attempt holds file deletions on the Cayenne table it
+    /// snapshots.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn snapshot_attempt_pins_the_cayenne_table() {
+    async fn snapshot_attempt_holds_cayenne_file_deletions() {
         use async_trait::async_trait;
         use datafusion::common::TableReference;
         use datafusion::datasource::TableProvider;

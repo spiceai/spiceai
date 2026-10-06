@@ -127,9 +127,9 @@ pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WA
 pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
     CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction, EncodeBudgetSnapshot,
-    LastSmallFileCompactPath, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
-    PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit, QueryObservations, ScanViewReuse,
-    SlotAdvancer, SnapshotArchivePin, TimeRetentionFilterBuilder, TransactionCommit,
+    FileDeletionHold, LastSmallFileCompactPath, PARTITIONED_WAL_DIR, PartitionedWal,
+    PartitionedWalEntry, PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit,
+    QueryObservations, ScanViewReuse, SlotAdvancer, TimeRetentionFilterBuilder, TransactionCommit,
     TransactionWriteToken, TxnTable, begin_compaction_shutdown, cap_global_encode_concurrency,
     clear_global_mem_tier_pool_account, compaction_budget, compaction_budget_permits,
     deregister_query_observations, drain_compaction_tasks, encode_budget_snapshot,

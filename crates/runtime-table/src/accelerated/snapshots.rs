@@ -624,10 +624,10 @@ async fn create_checkpoint_and_snapshot_once(
 ) -> Result<(), SnapshotAttemptError> {
     // Keeps Cayenne maintenance from deleting files until the archive is written.
     // Taken before the write lock, so writers never wait on a sweep batch.
-    let cayenne_pin = match accelerator
+    let file_deletion_hold = match accelerator
         .and_then(|a| find_concrete::<CayenneTableProvider>(a.as_ref(), LayerWalk::Write))
     {
-        Some(table) => Some(table.pin_for_snapshot().await),
+        Some(table) => Some(table.hold_file_deletions().await),
         None => None,
     };
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
@@ -668,7 +668,7 @@ async fn create_checkpoint_and_snapshot_once(
     snapshot_manager
         .create_snapshot(
             checkpoint_schema,
-            SnapshotLockGuard::from(lock_guard).with(cayenne_pin),
+            SnapshotLockGuard::from(lock_guard).with(file_deletion_hold),
             updated_at,
             row_count,
             force_create,
