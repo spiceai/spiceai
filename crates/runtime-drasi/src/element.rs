@@ -42,10 +42,10 @@ pub enum ChangeOp {
 }
 
 impl ChangeOp {
-    /// Maps a Debezium operation code onto a Drasi operation.
+    /// Maps a CDC or internal runtime-table operation code onto a Drasi operation.
     ///
-    /// Debezium creates (`c`) and snapshot reads (`r`) become updates. Drasi's
-    /// update operation replaces the full node state and creates it when absent.
+    /// Debezium creates (`c`), snapshot reads (`r`), and updates (`u`) become
+    /// updates. The internal runtime-table insert marker (`i`) remains an insert.
     ///
     /// # Errors
     ///
@@ -55,6 +55,7 @@ impl ChangeOp {
     /// source no longer has.
     pub fn from_op_code(code: &str) -> std::result::Result<Self, &str> {
         match code {
+            "i" => Ok(ChangeOp::Insert),
             "c" | "r" | "u" => Ok(ChangeOp::Update),
             "d" => Ok(ChangeOp::Delete),
             other => Err(other),
@@ -285,6 +286,11 @@ mod tests {
         assert_eq!(ChangeOp::from_op_code("r"), Ok(ChangeOp::Update));
         assert_eq!(ChangeOp::from_op_code("u"), Ok(ChangeOp::Update));
         assert_eq!(ChangeOp::from_op_code("d"), Ok(ChangeOp::Delete));
+    }
+
+    #[test]
+    fn internal_runtime_table_insert_marker_stays_insert() {
+        assert_eq!(ChangeOp::from_op_code("i"), Ok(ChangeOp::Insert));
     }
 
     #[test]

@@ -30,13 +30,14 @@ use crate::transport::http::HttpTransport;
 use crate::transport::redis_stream::RedisStreamTransport;
 use crate::transport::{DrasiTransport, PreparedChange};
 
-/// One CDC batch to forward.
+/// One batch to forward from CDC or an internal runtime table.
 ///
 /// The change stream's own representation is columnar and carries the primary
 /// key as a per-row list of *column names*; this is the flattened view of it
 /// that the mapping needs.
 pub struct DrasiChangeRows<'a> {
-    /// Debezium operation code per row (`c`, `u`, `d`, `r`, …).
+    /// CDC operation code per row (`c`, `u`, `d`, `r`, …), or `i` for an
+    /// internal runtime-table append.
     pub op_codes: Vec<&'a str>,
     /// Primary-key column names per row.
     ///
@@ -365,6 +366,23 @@ mod tests {
         assert_eq!(prepared[0].node.id, "public.orders:1");
         assert_eq!(prepared[1].op, ChangeOp::Delete);
         assert_eq!(prepared[1].node.id, "public.orders:2");
+    }
+
+    #[test]
+    fn internal_runtime_table_insert_marker_prepares_as_insert() {
+        let sink = DrasiSink::with_transport(
+            config(OnDeliveryError::Block),
+            RecordingTransport::always_ok(),
+        );
+        let data = batch();
+        let prepared = sink
+            .prepare(&rows(&data, vec!["i", "i"]))
+            .expect("maps internal runtime-table append rows");
+
+        assert_eq!(
+            prepared.iter().map(|change| change.op).collect::<Vec<_>>(),
+            vec![ChangeOp::Insert, ChangeOp::Insert]
+        );
     }
 
     /// Truncate cannot be expressed as a set of deletes, and dropping it would
