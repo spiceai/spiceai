@@ -28,20 +28,20 @@ use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
+use crate::datafusion::AcceleratorBootstrap;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::init::dataset_loads::DatasetLoad;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, DataConnectorNotInBuildSnafu,
-    DrasiWithoutChangeStreamSnafu, DurableWriteBackCompositePrimaryKeySnafu,
-    DurableWriteBackPrerequisitesUnmetSnafu, DurableWriteBackRecreatingModeSnafu,
-    DurableWriteBackUndeclaredPrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu,
-    DurableWriteBackWithRetentionSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
-    HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
-    Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    DataConnectorNotInBuildSnafu, DrasiWithoutChangeStreamSnafu,
+    DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackPrerequisitesUnmetSnafu,
+    DurableWriteBackRecreatingModeSnafu, DurableWriteBackUndeclaredPrimaryKeySnafu,
+    DurableWriteBackUnsupportedBySourceSnafu, DurableWriteBackWithRetentionSnafu, Error,
+    FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshTimedOutSnafu, LogErrors,
+    OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
     UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
-    accelerated::AcceleratedTable,
     component::dataset::{
         Dataset,
         acceleration::{Acceleration, DurableWriteBackKey, Mode, RefreshMode},
@@ -581,9 +581,10 @@ impl Runtime {
     async fn try_load_dataset_once(
         &self,
         ds: Arc<Dataset>,
-        bootstrap_status: BootstrapStatus,
+        bootstrap_status: impl Into<AcceleratorBootstrap>,
         load_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<()> {
+        let bootstrap_status = bootstrap_status.into();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         preflight_dataset(&ds, &self.status, &spaced_tracer)?;
@@ -723,7 +724,7 @@ impl Runtime {
     async fn load_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
-        bootstrap_status: BootstrapStatus,
+        bootstrap_status: AcceleratorBootstrap,
         load_semaphore: Arc<Semaphore>,
         load: DatasetLoad,
     ) {
@@ -746,6 +747,7 @@ impl Runtime {
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let runtime = Arc::clone(&self);
+        let bootstrap_status = tokio::sync::Mutex::new(bootstrap_status);
         let shutdown_token = runtime.status.shutdown_token();
         let retry_fut = retry(retry_strategy, || async {
             // Exit immediately if the runtime is shutting down (e.g. after a backoff sleep completes).
@@ -767,10 +769,25 @@ impl Runtime {
                 ));
             };
 
+            let mut bootstrap = bootstrap_status.lock().await;
+            if bootstrap.needs_reinitialization() {
+                let Some(result) = runtime
+                    .initialize_datasets_accelerators(std::slice::from_ref(&ds))
+                    .await
+                    .remove(&ds.name)
+                else {
+                    return Err(RetryError::permanent(
+                        crate::Error::UnableToInitializeDataConnector {
+                            source: "Missing accelerator bootstrap result".into(),
+                        },
+                    ));
+                };
+                *bootstrap = result.map_err(RetryError::transient)?;
+            }
             match runtime
                 .try_load_dataset_once(
                     Arc::clone(&ds),
-                    bootstrap_status.clone(),
+                    bootstrap.clone(),
                     Some(Arc::clone(&load_semaphore)),
                 )
                 .await
@@ -945,8 +962,8 @@ impl Runtime {
         self: Arc<Self>,
         mut ds: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
-        accelerated_table: Option<Arc<AcceleratedTable>>,
-        bootstrap_status: BootstrapStatus,
+        accelerated_table: Option<crate::datafusion::PreparedAcceleratedTable>,
+        bootstrap_status: AcceleratorBootstrap,
         load_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<()> {
         // Owned (not borrowed from `ds`) so the dataset can be rebuilt below by
@@ -1214,18 +1231,33 @@ impl Runtime {
         self: Arc<Self>,
         ds_name: TableReference,
         ds_acceleration: Option<&Acceleration>,
-    ) {
-        if self.df.table_exists(&ds_name) {
+    ) -> bool {
+        self.remove_dataset_with_bootstrap(ds_name, ds_acceleration, &BootstrapStatus::None.into())
+            .await
+    }
+
+    async fn remove_dataset_with_bootstrap(
+        self: Arc<Self>,
+        ds_name: TableReference,
+        ds_acceleration: Option<&Acceleration>,
+        bootstrap: &AcceleratorBootstrap,
+    ) -> bool {
+        let was_registered = self.df.table_exists(&ds_name);
+        if was_registered {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                 datasets_health_monitor
                     .deregister_dataset(&ds_name.to_string())
                     .await;
             }
-
-            if let Err(e) = self.df.remove_table(&ds_name).await {
-                tracing::warn!("Unable to unload dataset {}: {}", &ds_name, e);
-                return;
-            }
+        }
+        // Pending construction also owns storage without a catalog entry.
+        if let Err(e) = self
+            .df
+            .remove_table_with_bootstrap(&ds_name, bootstrap)
+            .await
+        {
+            tracing::warn!("Unable to unload dataset {}: {}", &ds_name, e);
+            return false;
         }
 
         // Drop the dataset's CDC schema-evolution settings; a reload re-installs
@@ -1252,10 +1284,23 @@ impl Runtime {
             tracing::warn!("Unable to remove dataset schedule for {}: {e}", &ds_name);
         }
 
-        metrics::datasets::COUNT.add(-1, &[KeyValue::new("engine", engine)]);
+        if was_registered {
+            metrics::datasets::COUNT.add(-1, &[KeyValue::new("engine", engine)]);
+        }
+        true
     }
 
+    #[cfg(test)]
     async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
+        self.update_dataset_with_bootstrap(ds, BootstrapStatus::None.into())
+            .await;
+    }
+
+    async fn update_dataset_with_bootstrap(
+        self: Arc<Self>,
+        ds: Arc<Dataset>,
+        bootstrap: AcceleratorBootstrap,
+    ) {
         // Defense in depth. Today the only caller is `apply_dataset_diff`, which
         // preflights through `initialize_datasets_accelerators` and skips a
         // refused dataset before it gets here. But both branches below mutate
@@ -1293,7 +1338,11 @@ impl Runtime {
                 if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
                     tracing::info!("Accelerated Dataset {} updating...", &ds.name);
                     match Arc::clone(&self)
-                        .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
+                        .reload_accelerated_dataset(
+                            Arc::clone(&ds),
+                            Arc::clone(&connector),
+                            bootstrap.clone(),
+                        )
                         .await
                     {
                         Ok(()) => {
@@ -1318,15 +1367,42 @@ impl Runtime {
                     }
                 }
 
-                Arc::clone(&self)
-                    .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
-                    .await;
+                // A consumed bootstrap cannot describe storage after a failed replacement.
+                // Drain that generation and initialize a fresh one rather than reuse its status.
+                let bootstrap = if bootstrap.is_consumed() {
+                    if !Arc::clone(&self)
+                        .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                        .await
+                    {
+                        return;
+                    }
+                    let Some(Ok(bootstrap)) = self
+                        .initialize_datasets_accelerators(std::slice::from_ref(&ds))
+                        .await
+                        .remove(&ds.name)
+                    else {
+                        return;
+                    };
+                    bootstrap
+                } else {
+                    bootstrap
+                };
+                if !Arc::clone(&self)
+                    .remove_dataset_with_bootstrap(
+                        ds.name.clone(),
+                        ds.acceleration.as_ref(),
+                        &bootstrap,
+                    )
+                    .await
+                {
+                    return;
+                }
 
                 let initialized = DatasetInitialization::plan_eager(
                     Arc::clone(&ds),
                     Arc::clone(&self),
                     Arc::clone(&connector),
-                    BootstrapStatus::None,
+                    bootstrap,
                     None,
                     None,
                 )
@@ -1455,6 +1531,7 @@ impl Runtime {
         self: Arc<Self>,
         ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
+        bootstrap: AcceleratorBootstrap,
     ) -> Result<()> {
         let read_table = connector
             .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
@@ -1495,23 +1572,22 @@ impl Runtime {
         let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
 
         // create new accelerated table for updated data connector
-        let accelerated_table = Arc::new(
-            self.df
-                .create_accelerated_table(
-                    &ds,
-                    Arc::clone(&connector),
-                    federated_table,
-                    self.secrets(),
-                    BootstrapStatus::None,
-                    initial_partition_filters,
-                )
-                .await
-                .context(UnableToCreateAcceleratedTableSnafu {
-                    dataset: ds.name.clone(),
-                })?,
-        );
+        let accelerated_table = self
+            .df
+            .create_accelerated_table(
+                &ds,
+                Arc::clone(&connector),
+                federated_table,
+                self.secrets(),
+                bootstrap,
+                initial_partition_filters,
+            )
+            .await
+            .context(UnableToCreateAcceleratedTableSnafu {
+                dataset: ds.name.clone(),
+            })?;
 
-        let refresher = accelerated_table.refresher();
+        let refresher = accelerated_table.table().refresher();
 
         // wait for accelerated table to be ready
         if let Some(completion) = refresher.refresh_completion() {
@@ -1970,7 +2046,7 @@ impl Runtime {
         // consuming it and the rest racing it.
         let mut localpod_by_parent: HashMap<
             ResolvedTableReference,
-            Vec<(Arc<Dataset>, BootstrapStatus)>,
+            Vec<(Arc<Dataset>, AcceleratorBootstrap)>,
         > = HashMap::new();
 
         for ds in &datasets_to_apply {
@@ -2003,9 +2079,16 @@ impl Runtime {
                     // invalidates again on completion; a pass-through one has only this.
                     self.df.clear_cached_plans().await;
                     self.invalidate_cached_results_for(&ds.name).await;
-                    Arc::clone(&self)
-                        .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
-                        .await;
+                    if !Arc::clone(&self)
+                        .remove_dataset_with_bootstrap(
+                            ds.name.clone(),
+                            ds.acceleration.as_ref(),
+                            &bootstrap_status,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
                     self.status
                         .update_dataset(&ds.name, status::ComponentStatus::Initializing);
                     localpod_by_parent
@@ -2026,9 +2109,16 @@ impl Runtime {
                         .iter()
                         .find(|current| current.name == ds.name)
                         .and_then(|current| current.acceleration.clone());
-                    Arc::clone(&self)
-                        .remove_dataset(ds.name.clone(), current_acceleration.as_ref())
-                        .await;
+                    if !Arc::clone(&self)
+                        .remove_dataset_with_bootstrap(
+                            ds.name.clone(),
+                            current_acceleration.as_ref(),
+                            &bootstrap_status,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
                     self.status
                         .update_dataset(&ds.name, status::ComponentStatus::Initializing);
                     let runtime = Arc::clone(&self);
@@ -2046,16 +2136,24 @@ impl Runtime {
                     continue;
                 }
 
-                Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
+                Arc::clone(&self)
+                    .update_dataset_with_bootstrap(Arc::clone(ds), bootstrap_status)
+                    .await;
                 continue;
             }
 
             // A superseded attempt can be dropped after it registered the table
             // and before its load completed.
-            if still_loading.contains(&ds.name) && self.df.table_exists(&ds.name) {
-                Arc::clone(&self)
-                    .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
-                    .await;
+            if still_loading.contains(&ds.name)
+                && !Arc::clone(&self)
+                    .remove_dataset_with_bootstrap(
+                        ds.name.clone(),
+                        ds.acceleration.as_ref(),
+                        &bootstrap_status,
+                    )
+                    .await
+            {
+                continue;
             }
 
             self.status
@@ -2168,10 +2266,10 @@ impl Runtime {
     fn localpod_load_chain(
         self: Arc<Self>,
         ds: Arc<Dataset>,
-        bootstrap_status: BootstrapStatus,
+        bootstrap_status: AcceleratorBootstrap,
         localpod_by_parent: &mut HashMap<
             ResolvedTableReference,
-            Vec<(Arc<Dataset>, BootstrapStatus)>,
+            Vec<(Arc<Dataset>, AcceleratorBootstrap)>,
         >,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let children: Vec<_> = localpod_by_parent
@@ -2208,7 +2306,7 @@ impl Runtime {
     pub(super) async fn initialize_datasets_accelerators(
         &self,
         datasets: &[Arc<Dataset>],
-    ) -> HashMap<TableReference, Result<BootstrapStatus>> {
+    ) -> HashMap<TableReference, Result<AcceleratorBootstrap>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let init_futures = datasets.iter().map(|ds| {
@@ -2216,6 +2314,7 @@ impl Runtime {
             let spaced_tracer = Arc::clone(&spaced_tracer);
             let status = Arc::clone(&self.status);
             let accelerator_engine_registry = Arc::clone(&self.accelerator_engine_registry);
+            let df = Arc::clone(&self.df);
 
             async move {
                 // Before anything is initialized, dropped, or replaced: `init`
@@ -2228,7 +2327,7 @@ impl Runtime {
 
                 // Non-accelerated datasets or disabled acceleration are always successfully initialized
                 if ds.acceleration.as_ref().is_none_or(|acc| !acc.enabled) {
-                    return (ds.name.clone(), Ok(BootstrapStatus::None));
+                    return (ds.name.clone(), Ok(BootstrapStatus::None.into()));
                 }
 
                 let Some(acceleration_settings) = &ds.acceleration else {
@@ -2254,11 +2353,12 @@ impl Runtime {
                     }
                 };
 
-                match accelerator.init(ds.as_ref()).await.context(
-                    AcceleratorInitializationFailedSnafu {
-                        name: acceleration_settings.engine.to_string(),
-                    },
-                ) {
+                match df
+                    .initialize_accelerator(Arc::clone(&ds), accelerator)
+                    .await
+                    .context(UnableToCreateAcceleratedTableSnafu {
+                        dataset: ds.name.clone(),
+                    }) {
                     Ok(bootstrap_status) => {
                         if bootstrap_status.is_bootstrapped() {
                             update_cached_dataset_timestamps(ds.as_ref()).await;
@@ -2280,7 +2380,7 @@ impl Runtime {
         });
 
         let results = join_all(init_futures).await;
-        let init_results: HashMap<TableReference, Result<BootstrapStatus>> =
+        let init_results: HashMap<TableReference, Result<AcceleratorBootstrap>> =
             results.into_iter().collect();
 
         init_results
@@ -2317,8 +2417,8 @@ pub struct RegisterDatasetContext {
     data_connector: Arc<dyn DataConnector>,
     federated_read_table: FederatedTable,
     source: String,
-    accelerated_table: Option<Arc<AcceleratedTable>>,
-    bootstrap_status: BootstrapStatus,
+    accelerated_table: Option<crate::datafusion::PreparedAcceleratedTable>,
+    bootstrap_status: AcceleratorBootstrap,
 }
 
 /// Wait for the accelerated table a hot reload just recreated to complete its
@@ -2717,7 +2817,7 @@ fn localpod_parent(ds: &Dataset) -> Option<ResolvedTableReference> {
 /// registers nothing until its chain runs, so a `localpod` dataset reading through it must queue
 /// behind it too.
 fn is_queued_localpod(
-    localpod_by_parent: &HashMap<ResolvedTableReference, Vec<(Arc<Dataset>, BootstrapStatus)>>,
+    localpod_by_parent: &HashMap<ResolvedTableReference, Vec<(Arc<Dataset>, AcceleratorBootstrap)>>,
     name: &ResolvedTableReference,
 ) -> bool {
     localpod_by_parent

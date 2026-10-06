@@ -37,7 +37,7 @@ use crate::component::dataset::{
     },
 };
 use crate::dataaccelerator::{
-    AccelerationSource, BootstrapStatus, CayenneSnapshotValidationError, acceleration_file_path,
+    AccelerationSource, CayenneSnapshotValidationError, acceleration_file_path,
     validate_snapshot_consistency,
 };
 use crate::dataconnector::snapshot_source::{
@@ -69,7 +69,7 @@ impl Runtime {
         self: &Arc<Self>,
         pending: &Arc<Dataset>,
         load_semaphore: &Arc<Semaphore>,
-    ) -> Option<(Arc<Dataset>, BootstrapStatus)> {
+    ) -> Option<(Arc<Dataset>, crate::datafusion::AcceleratorBootstrap)> {
         let name = pending.name.clone();
         let resolution = self.snapshot_sources().begin_resolution(&name);
         let stopped = || self.status.is_shutdown() || resolution.is_superseded();

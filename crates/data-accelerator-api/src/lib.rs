@@ -638,6 +638,18 @@ pub trait DataAccelerator: Send + Sync {
         }
     }
 
+    /// Validate initialization without changing storage or starting background work.
+    ///
+    /// The runtime calls this while the installed generation can still write. Engines
+    /// must also validate inside [`Self::init`] because filesystem state can change
+    /// between validation and initialization. Decorators must forward this method.
+    async fn validate_init(
+        &self,
+        _source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
     /// Initialize the accelerator for a component
     /// Returns `WasBootstrapped::yes()` if the accelerator was initialized from existing data,
     /// `WasBootstrapped::no()` otherwise.

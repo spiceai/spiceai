@@ -52,6 +52,7 @@ pub struct RefreshTaskRunnerBuilder {
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
     change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    cache_write_sender: Option<super::caching::CacheWriteSender>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
     metrics: Option<Metrics>,
@@ -93,6 +94,7 @@ impl RefreshTaskRunnerBuilder {
             refresh,
             accelerator,
             change_sink: None,
+            cache_write_sender: None,
             disable_federation: false,
             semaphore: None,
             metrics: None,
@@ -115,6 +117,15 @@ impl RefreshTaskRunnerBuilder {
         sink: Option<runtime_acceleration::change_sink::ChangeSink>,
     ) -> Self {
         self.change_sink = sink;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache_write_sender(
+        mut self,
+        sender: Option<super::caching::CacheWriteSender>,
+    ) -> Self {
+        self.cache_write_sender = sender;
         self
     }
 
@@ -212,6 +223,7 @@ impl RefreshTaskRunnerBuilder {
         )
         .with_disable_federation(self.disable_federation)
         .with_change_sink(self.change_sink)
+        .with_cache_write_sender(self.cache_write_sender)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
         .with_metrics(self.metrics);
 

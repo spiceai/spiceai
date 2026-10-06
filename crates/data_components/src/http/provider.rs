@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod completeness;
+pub use completeness::HttpFetchCompletion;
+
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
 use crate::rate_limit::RateLimiter;
 use arrow::{
@@ -2086,9 +2089,22 @@ pub struct HttpExec {
     /// prunes `response_status` out of the batch before `cache::batches_cacheable`
     /// ever sees it.
     metrics: ExecutionPlanMetricsSet,
+    completion: Option<HttpFetchCompletion>,
 }
 
 impl HttpExec {
+    /// Clone a cache-owned source execution with a fresh completion token.
+    /// Execute each partition once; reuse invalidates this execution's token.
+    /// Request and response metadata are unchanged.
+    #[must_use]
+    pub fn for_cache_fetch(&self) -> (Self, HttpFetchCompletion) {
+        let completion = HttpFetchCompletion::new(self.partitions.len());
+        let mut plan = self.clone();
+        plan.completion = Some(completion.clone());
+        plan.metrics = ExecutionPlanMetricsSet::new();
+        (plan, completion)
+    }
+
     /// Returns the provider used by this exec.
     #[must_use]
     pub fn provider(&self) -> &Arc<HttpTableProvider> {
@@ -2140,6 +2156,7 @@ impl HttpExec {
             properties,
             deferred_partitions: false,
             metrics: ExecutionPlanMetricsSet::new(),
+            completion: None,
         }
     }
 
@@ -2438,9 +2455,14 @@ impl HttpExec {
             "request_headers" => {
                 Ok(Arc::new(StringArray::from(vec![headers_for_batch; num_rows])) as ArrayRef)
             }
-            "content" => Ok(Arc::new(StringArray::from_iter_values(
-                content_rows.iter().map(String::as_str),
-            )) as ArrayRef),
+            "content" => {
+                let bytes = Self::content_byte_capacity(content_rows.iter().map(String::len))?;
+                let mut builder = StringBuilder::with_capacity(content_rows.len(), bytes);
+                for row in content_rows {
+                    builder.append_value(row);
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
             "response_status" => Ok(Arc::new(UInt16Array::from(vec![
                 fetch_result.response_status;
                 num_rows
@@ -2477,6 +2499,18 @@ impl HttpExec {
                 "Unsupported field name: {other}"
             ))),
         }
+    }
+
+    fn content_byte_capacity(mut lengths: impl Iterator<Item = usize>) -> DataFusionResult<usize> {
+        let bytes = lengths.try_fold(0usize, |bytes, length| {
+            bytes.checked_add(length).ok_or_else(|| {
+                DataFusionError::Execution("HTTP content byte length overflow".into())
+            })
+        })?;
+        i32::try_from(bytes).map_err(|_| {
+            DataFusionError::Execution("HTTP content exceeds Utf8's 32-bit offset capacity".into())
+        })?;
+        Ok(bytes)
     }
 
     /// Compute the per-batch `_fetched_at` timestamp in nanoseconds since
@@ -2771,6 +2805,13 @@ impl ExecutionPlan for HttpExec {
         let exec = Arc::new(self.clone());
         let provider = Arc::clone(&self.provider);
         let schema = Arc::clone(&self.projected_schema);
+        let completion = self
+            .completion
+            .as_ref()
+            .map(|token| token.start(partition, self.limit.is_some()));
+        let progress = completion
+            .as_ref()
+            .map(completeness::CompletionGuard::progress);
 
         if provider.is_paginated() {
             let (path, query, body, request_headers) = self.partitions[partition].clone();
@@ -2794,6 +2835,7 @@ impl ExecutionPlan for HttpExec {
             let stream = futures::stream::try_unfold(initial_state, move |mut state| {
                 let exec = Arc::clone(&exec);
                 let provider = Arc::clone(&provider);
+                let progress = progress.clone();
 
                 async move {
                     loop {
@@ -2808,6 +2850,9 @@ impl ExecutionPlan for HttpExec {
                         if let Some(max_pages) = config.max_pages
                             && state.page >= max_pages
                         {
+                            if let Some(progress) = &progress {
+                                progress.truncated();
+                            }
                             tracing::warn!(
                                 "HTTP pagination reached the configured safety limit of {} pages. Increase `pagination_max_pages` to fetch additional pages.",
                                 max_pages
@@ -2859,6 +2904,9 @@ impl ExecutionPlan for HttpExec {
                                 .await
                                 .map_err(DataFusionError::from)?
                         } else {
+                            if let Some(progress) = &progress {
+                                progress.followed_page();
+                            }
                             let parsed_request_headers = state
                                 .request_headers
                                 .as_deref()
@@ -3069,6 +3117,9 @@ impl ExecutionPlan for HttpExec {
                         )?;
 
                         if HttpTableProvider::is_retryable_status(fetch_result.response_status) {
+                            if let Some(progress) = &progress {
+                                progress.failed();
+                            }
                             MetricBuilder::new(&exec.metrics)
                                 .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, partition)
                                 .add(1);
@@ -3089,12 +3140,22 @@ impl ExecutionPlan for HttpExec {
             });
 
             let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
-            Ok(Box::pin(stream_adapter))
+            Ok(completeness::track(Box::pin(stream_adapter), completion))
         } else {
             // Non-paginated: single fetch
             let stream = futures::stream::once(async move {
                 tracing::trace!("Fetching partition {}", partition);
                 let batch = exec.fetch_and_create_batch(&provider, partition).await?;
+                if batch
+                    .schema()
+                    .metadata()
+                    .get(crate::HTTP_RESPONSE_STATUS_METADATA_KEY)
+                    .and_then(|status| status.parse::<u16>().ok())
+                    .is_some_and(HttpTableProvider::is_retryable_status)
+                    && let Some(progress) = &progress
+                {
+                    progress.failed();
+                }
                 tracing::trace!(
                     "Yielding batch for partition {}: {} rows",
                     partition,
@@ -3104,7 +3165,7 @@ impl ExecutionPlan for HttpExec {
             });
 
             let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
-            Ok(Box::pin(stream_adapter))
+            Ok(completeness::track(Box::pin(stream_adapter), completion))
         }
     }
 }
@@ -9579,6 +9640,171 @@ mod tests {
             partitions,
             None,
         )
+    }
+
+    #[test]
+    fn content_builder_preserves_utf8_empty_nul_and_duplicate_values() {
+        let plain = make_exec(vec![(None, None, None, None)], None);
+        let (cached, _) = plain.for_cache_fetch();
+        let rows: Vec<String> = ["", "雪🌶", "before\0after", "same", "same"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let bytes = rows.iter().map(String::len).sum::<usize>();
+        assert_eq!(
+            HttpExec::content_byte_capacity(rows.iter().map(String::len)).expect("valid bytes"),
+            bytes
+        );
+        for exec in [plain, cached] {
+            let batch = exec
+                .create_batch_from_rows(None, None, None, None, &rows, &empty_fetch_result())
+                .expect("content batch");
+            assert_eq!(
+                string_col(&batch, "content"),
+                rows.iter().cloned().map(Some).collect::<Vec<_>>()
+            );
+            let content = batch.column_by_name("content").expect("content column");
+            assert_eq!(content.data_type(), &DataType::Utf8);
+            assert_eq!(content.null_count(), 0);
+            let content = content
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 content");
+            assert_eq!(content.value_data().len(), bytes);
+        }
+    }
+
+    #[test]
+    fn content_byte_capacity_checks_sum_and_utf8_offsets_without_allocating() {
+        let max = usize::try_from(i32::MAX).expect("Utf8 offset fits usize");
+        assert_eq!(
+            HttpExec::content_byte_capacity(std::iter::empty()).expect("empty"),
+            0
+        );
+        assert_eq!(
+            HttpExec::content_byte_capacity([max].into_iter()).expect("maximum offset"),
+            max
+        );
+        assert!(HttpExec::content_byte_capacity([max, 1].into_iter()).is_err());
+        assert!(HttpExec::content_byte_capacity([usize::MAX, 1].into_iter()).is_err());
+    }
+
+    #[test]
+    fn cache_fetch_metadata_matches_plain_http() {
+        let plain = make_exec(vec![(None, None, None, None)], None);
+        let (cached, completion) = plain.for_cache_fetch();
+        let rows = vec!["same".to_string(), "same".to_string()];
+        for query in [None, Some("")] {
+            for body in [None, Some("")] {
+                let batch = cached
+                    .create_batch_from_rows(None, query, body, None, &rows, &empty_fetch_result())
+                    .expect("cache metadata batch");
+                assert_eq!(
+                    string_col(&batch, "request_query"),
+                    vec![Some(query.unwrap_or("").to_string()); 2]
+                );
+                assert_eq!(
+                    string_col(&batch, "request_body"),
+                    vec![Some(body.unwrap_or("").to_string()); 2]
+                );
+                assert_eq!(
+                    string_col(&batch, "content"),
+                    vec![Some("same".to_string()); 2]
+                );
+                let ordinary = plain
+                    .create_batch_from_rows(None, query, body, None, &rows, &empty_fetch_result())
+                    .expect("ordinary metadata batch");
+                assert_eq!(
+                    string_col(&ordinary, "request_query"),
+                    vec![Some(String::new()); 2]
+                );
+                assert_eq!(
+                    string_col(&ordinary, "request_body"),
+                    vec![Some(String::new()); 2]
+                );
+                assert_eq!(batch.schema(), ordinary.schema());
+            }
+        }
+        assert!(
+            !completion.is_complete(),
+            "metadata construction is not exhaustion proof"
+        );
+    }
+
+    #[test]
+    fn cache_fetch_preserves_base_query_and_empty_override_behavior() {
+        let mut provider = base_provider();
+        provider.base_url.set_query(Some("base=one"));
+        let exec = HttpExec::new(
+            provider.schema(),
+            Arc::new(provider),
+            vec![(None, None, None, None)],
+            None,
+        );
+        let (cached, _) = exec.for_cache_fetch();
+        assert_eq!(
+            cached
+                .provider
+                .build_request_url("", None)
+                .expect("default URL")
+                .query(),
+            Some("base=one")
+        );
+        assert_eq!(
+            cached
+                .provider
+                .build_request_url("", Some(""))
+                .expect("override URL")
+                .query(),
+            Some("")
+        );
+        assert_eq!(cached.partitions, exec.partitions);
+    }
+
+    #[test]
+    fn cache_fetch_nested_metadata_matches_plain_http() {
+        let metadata = ["request_query".to_string(), "request_body".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let nesting = HttpJsonNesting::new(
+            vec![
+                "request_query".into(),
+                "request_body".into(),
+                "payload".into(),
+            ],
+            "payload".into(),
+            metadata.clone(),
+            metadata,
+        );
+        let provider = Arc::new(
+            base_provider()
+                .with_json_nesting(nesting.clone(), nesting_schema_with_metadata(&nesting)),
+        );
+        let (cached, _) = HttpExec::new(
+            provider.schema(),
+            provider,
+            vec![(None, None, None, None)],
+            None,
+        )
+        .for_cache_fetch();
+        let batch = cached
+            .create_batch_from_rows(
+                None,
+                None,
+                None,
+                None,
+                &["{\"value\":1}".into()],
+                &empty_fetch_result(),
+            )
+            .expect("nested cache metadata");
+        assert_eq!(
+            string_col(&batch, "request_query"),
+            vec![Some(String::new())]
+        );
+        assert_eq!(
+            string_col(&batch, "request_body"),
+            vec![Some(String::new())]
+        );
     }
 
     #[test]

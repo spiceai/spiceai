@@ -121,6 +121,9 @@ pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod wal_checksum;
 pub(crate) mod write_budget;
+pub(crate) mod write_recovery;
+
+pub use write_recovery::RebuildableWrite;
 
 // Re-export the main type at the module level for convenience
 pub use compaction::{
