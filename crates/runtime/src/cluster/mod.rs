@@ -27,9 +27,9 @@ use crate::{
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
     FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
+use ::datafusion::common::ResolvedTableReference;
 use ::datafusion::optimizer::AnalyzerRule;
 use ::datafusion::prelude::SessionConfig;
-use ::datafusion::sql::ResolvedTableReference;
 use app::App;
 use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
@@ -47,7 +47,7 @@ use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
 use ballista_scheduler::cluster::memory::{InMemoryClusterState, InMemoryJobState};
 use ballista_scheduler::cluster::{BallistaCluster, ClusterState, JobState};
-use ballista_scheduler::config::{OnCancelTasksFn, SchedulerConfig};
+use ballista_scheduler::config::{OnCancelTasksFn, SchedulerConfig, WorkAvailableReason};
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use ballista_scheduler::state::execution_graph::RunningTaskInfo;
@@ -439,6 +439,9 @@ fn spawn_scheduler_poll_loop(
                 Some(tx_ready),
                 poll_now_notify.clone(),
                 Some(Arc::clone(&available_task_slots)),
+                // Ballista's executor health feeds its own health endpoint, which Spice does
+                // not serve; the runtime reports executor health through its own checks.
+                ballista_executor::health::ExecutorHealth::new(),
             );
 
             tokio::select! {
@@ -1134,7 +1137,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         return Ok(None);
     };
 
-    if let Some(config) = app.runtime.scheduler.clone() {
+    if let Some(config) = app.runtime.resolved_scheduler() {
         if rt.partition_store().is_some() {
             // Validate all accelerated datasets/views have partition keys
             // for distributed partition assignment.
@@ -1489,10 +1492,11 @@ pub async fn initialize_cluster_executor(
         grpc_port: 0,
         specification: Some(ExecutorSpecification {
             resources: vec![ExecutorResource {
-                resource: Some(Resource::TaskSlots(concurrent_tasks)),
+                resource: Some(Resource::Vcores(concurrent_tasks)),
             }],
         }),
         os_info: None,
+        ballista_protocol_version: ballista_core::BALLISTA_PROTOCOL_VERSION,
     };
 
     // Use advertise address as node_id for metrics
@@ -1609,7 +1613,7 @@ pub async fn initialize_cluster_executor(
     > = Some(Arc::new(move |dataset_name, overrides_json| {
         let rt = Arc::clone(&refresh_dataset_handler_rt);
         Box::pin(async move {
-            let dataset_ref = ::datafusion::sql::TableReference::parse_str(&dataset_name);
+            let dataset_ref = ::datafusion::common::TableReference::parse_str(&dataset_name);
             let overrides = overrides_json.and_then(|json| {
                 serde_json::from_str(&json)
                     .map_err(|e| {
@@ -1954,8 +1958,16 @@ async fn create_scheduler_server(
 
     // Create callback that broadcasts PollNow to all connected executors when work is available.
     let registry_for_callback = executor_stream_registry.clone();
-    let on_work_available: Arc<dyn Fn(&str) + Send + Sync> =
-        Arc::new(move |reason: &str| registry_for_callback.broadcast_poll_now(reason));
+    let on_work_available: ballista_scheduler::config::OnWorkAvailableFn =
+        Arc::new(move |reason: WorkAvailableReason| {
+            let reason = match reason {
+                WorkAvailableReason::JobSubmitted { job_id } => format!("job_submitted:{job_id}"),
+                WorkAvailableReason::NewStagesRunnable { .. } => {
+                    "tasks_completed:new_stages_runnable".to_string()
+                }
+            };
+            registry_for_callback.broadcast_poll_now(&reason);
+        });
 
     let registry_for_cancel = executor_stream_registry.clone();
     let on_cancel_tasks: OnCancelTasksFn =
@@ -1981,20 +1993,10 @@ async fn create_scheduler_server(
                         return None;
                     };
 
-                    let Ok(partition_id) = u32::try_from(task.partition_id) else {
-                        tracing::warn!(
-                            executor_id,
-                            partition_id = task.partition_id,
-                            "Skipping cancel task with out-of-range partition_id"
-                        );
-                        return None;
-                    };
-
                     Some(TaskCancelInfo {
                         task_id,
                         job_id: task.job_id.to_string(),
                         stage_id,
-                        partition_id,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -2023,7 +2025,7 @@ async fn create_scheduler_server(
             let metadata = cluster_state_for_slots.registered_executor_metadata().await;
             let total: usize = metadata
                 .iter()
-                .map(|m| m.specification.task_slots as usize)
+                .map(|m| m.specification.vcores as usize)
                 .sum();
             let prev = slots_counter.swap(total, Ordering::Relaxed);
             if total != prev {
@@ -2152,7 +2154,7 @@ async fn create_scheduler_server(
         tokio::pin!(shutdown);
         loop {
             if let Some(app) = rt.read_app().await {
-                break app.runtime.scheduler.clone();
+                break app.runtime.resolved_scheduler();
             }
             if last_warn.elapsed() >= std::time::Duration::from_secs(30) {
                 tracing::warn!(
@@ -2177,33 +2179,38 @@ async fn create_scheduler_server(
         }
     };
     let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
-        tracing::info!(
-            state_location = %scheduler_cfg.state_location,
-            "Scheduler using shared object-store job state"
-        );
-        let (store, base_prefix) = scheduler_registry::build_object_store(
-            rt.as_ref(),
-            &scheduler_cfg.state_location,
-            &scheduler_cfg,
-        )
-        .await
-        .map_err(|e| crate::Error::FailedToStartClusterScheduler {
-            source: Box::new(e),
-        })?;
-        let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
-            SpiceLogicalCodec::new_codec(),
-            SpicePhysicalCodec::new(Arc::clone(rt))
-                .boxed()
-                .context(FailedToStartClusterSchedulerSnafu)?,
-        );
-        Arc::new(runtime_cluster::shared_job_state::SharedJobState::new(
-            metrics_node_id,
-            store,
-            base_prefix,
-            codec,
-            session_builder,
-            config_producer,
-        ))
+        if let Some(state_location) = scheduler_cfg.state_location.as_deref() {
+            tracing::info!(
+                state_location = %state_location,
+                "Scheduler using shared object-store job state"
+            );
+            let (store, base_prefix) =
+                scheduler_registry::build_object_store(rt.as_ref(), state_location, &scheduler_cfg)
+                    .await
+                    .map_err(|e| crate::Error::FailedToStartClusterScheduler {
+                        source: Box::new(e),
+                    })?;
+            let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
+                SpiceLogicalCodec::new_codec(),
+                SpicePhysicalCodec::new(Arc::clone(rt))
+                    .boxed()
+                    .context(FailedToStartClusterSchedulerSnafu)?,
+            );
+            Arc::new(runtime_cluster::shared_job_state::SharedJobState::new(
+                metrics_node_id,
+                store,
+                base_prefix,
+                codec,
+                session_builder,
+                config_producer,
+            ))
+        } else {
+            Arc::new(InMemoryJobState::new(
+                metrics_node_id,
+                session_builder,
+                config_producer,
+            ))
+        }
     } else {
         Arc::new(InMemoryJobState::new(
             metrics_node_id,
@@ -2408,7 +2415,7 @@ async fn executor_bind_app(
     // Fail closed if init fails and the table is still absent — otherwise the
     // executor can report Ready while scheduler federated queries break.
     if rt.df.task_history_enabled {
-        let task_history_ref = ::datafusion::sql::TableReference::partial(
+        let task_history_ref = ::datafusion::common::TableReference::partial(
             crate::datafusion::SPICE_RUNTIME_SCHEMA,
             crate::task_history::DEFAULT_TASK_HISTORY_TABLE,
         );

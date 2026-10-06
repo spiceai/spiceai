@@ -21,7 +21,7 @@ use std::{
 
 use super::SampleFrom;
 use arrow::{array::RecordBatch, compute::concat_batches};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;

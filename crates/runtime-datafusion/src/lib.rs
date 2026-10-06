@@ -67,7 +67,7 @@ pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
 /// Whether `dataset` names a table in one of Spice's reserved schemas. A
 /// reference with no catalog is resolved against [`SPICE_DEFAULT_CATALOG`].
 #[must_use]
-pub fn is_spice_internal_dataset(dataset: &datafusion::sql::TableReference) -> bool {
+pub fn is_spice_internal_dataset(dataset: &datafusion::common::TableReference) -> bool {
     match (dataset.catalog(), dataset.schema()) {
         (Some(catalog), Some(schema)) => is_spice_internal_schema(catalog, schema),
         (None, Some(schema)) => is_spice_internal_schema(SPICE_DEFAULT_CATALOG, schema),
@@ -80,8 +80,8 @@ pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 /// so it can be used for comparison.
 #[must_use]
 pub fn resolve_table_reference(
-    table: datafusion::sql::TableReference,
-) -> datafusion::sql::ResolvedTableReference {
+    table: datafusion::common::TableReference,
+) -> datafusion::common::ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 

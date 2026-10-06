@@ -15,7 +15,8 @@ limitations under the License.
 */
 //! Discovery of the tables that a SQL statement depends on.
 
-use datafusion::sql::{TableReference, parser, sqlparser::ast};
+use datafusion::common::TableReference;
+use datafusion::sql::{parser, sqlparser::ast};
 use std::collections::HashSet;
 
 /// Returns the tables a SQL statement reads from. CTE names are excluded, and the

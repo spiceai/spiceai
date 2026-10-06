@@ -34,10 +34,12 @@ use std::sync::Arc;
 
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::logical_expr::ScalarUDF;
-use datafusion::sql::{
-    TableReference,
-    parser::{self, DFParser},
-    sqlparser::{ast, dialect::PostgreSqlDialect},
+use datafusion::{
+    common::TableReference,
+    sql::{
+        parser::{self, DFParser},
+        sqlparser::{ast, dialect::PostgreSqlDialect},
+    },
 };
 use snafu::Snafu;
 use spicepod::component::function::{Function, FunctionKind};

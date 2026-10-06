@@ -44,6 +44,7 @@ use arrow_tools::schema::verify_schema;
 use cache::{CacheProbe, PlanOrCached};
 use datafusion::{
     common::ParamValues,
+    common::TableReference,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext, memory_pool::MemoryLimit},
     logical_expr::LogicalPlan,
@@ -52,7 +53,6 @@ use datafusion::{
         sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
-    sql::TableReference,
 };
 use datafusion_functions_json::{JsonUnionEncoder, JsonUnionValue};
 use error_code::ErrorCode;
@@ -66,6 +66,11 @@ pub(crate) use tracker::QueryTracker;
 pub mod builder;
 pub use builder::QueryBuilder;
 mod cache;
+mod cache_warming;
+mod warmup_plan;
+pub(crate) use cache_warming::{
+    ResultsCacheWarmer, build_results_cache_warmer, default_warmup_store_path,
+};
 pub mod transaction;
 pub use transaction::{
     TransactionError, TransactionOutcome, run_transaction, schema_statement, transaction_statements,
@@ -245,6 +250,19 @@ pub enum ResultsCacheMode {
     Bypass,
 }
 
+/// Which Tokio runtime a query executes on, and whether it takes a query
+/// admission permit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum QueryRuntimeBinding {
+    /// User queries: hop onto `cpu_runtime` when one is configured, and take
+    /// an admission permit so they share the query budget.
+    #[default]
+    QueryRuntime,
+    /// Background cache warming: stay on the current runtime (the refresh
+    /// runtime) and skip query admission so warming cannot stall user queries.
+    CurrentRuntimeUngated,
+}
+
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
@@ -266,6 +284,8 @@ pub struct Query {
     /// Controls results-cache lookup and storage. Set via
     /// [`QueryBuilder::results_cache_mode`].
     results_cache_mode: ResultsCacheMode,
+    /// Where this query executes and whether it is gated by query admission.
+    runtime_binding: QueryRuntimeBinding,
 }
 
 macro_rules! handle_error {
@@ -583,7 +603,10 @@ impl Query {
             return None;
         }
 
-        let statistics = match physical_plan.partition_statistics(None) {
+        let statistics = match datafusion::physical_plan::StatisticsContext::new().compute(
+            physical_plan.as_ref(),
+            &datafusion::physical_plan::StatisticsArgs::new(),
+        ) {
             Ok(statistics) => statistics,
             Err(error) => {
                 tracing::debug!(%error, "Unable to estimate Flight result size for adaptive batch size");
@@ -718,7 +741,8 @@ impl Query {
                 }
             }
         }
-        if let Some(runtime_handle) = self.df.cpu_runtime().cloned()
+        if matches!(self.runtime_binding, QueryRuntimeBinding::QueryRuntime)
+            && let Some(runtime_handle) = self.df.cpu_runtime().cloned()
             && !probe.is_servable_in_place()
         {
             return self
@@ -1119,6 +1143,7 @@ impl Query {
                 .map_err(|e| Error::JobSubmissionFailed {
                     message: e.to_string(),
                 })?
+                .to_string()
         };
 
         tracing::debug!(
@@ -1245,6 +1270,10 @@ impl Query {
             QueryMethod::Text { sql, .. } => Arc::clone(sql),
             QueryMethod::Plan(_) => Arc::from("<logical plan>"),
         };
+        let skip_query_admission = matches!(
+            self.runtime_binding,
+            QueryRuntimeBinding::CurrentRuntimeUngated
+        );
         let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
 
         // Cancellation can fire after the probe, while this query is waiting
@@ -1567,7 +1596,7 @@ impl Query {
                 };
                 let admission_permit: Option<tokio::sync::OwnedSemaphorePermit> =
                     match ctx.df.query_admission_semaphore() {
-                        Some(semaphore) if plan_executes_query => {
+                        Some(semaphore) if plan_executes_query && !skip_query_admission => {
                             Self::ensure_not_cancelled(
                                 &query_cancel_token,
                                 &query_id_str,
@@ -1801,6 +1830,12 @@ impl Query {
                     };
 
                 let final_stream = if cache_manager.should_cache_results() {
+                    if ctx.runtime_binding == QueryRuntimeBinding::QueryRuntime {
+                        ctx.df.observe_results_cache_warmup_plan(
+                            &plan,
+                            &request_context.cache_namespace(),
+                        );
+                    }
                     Self::wrap_stream_with_cache(
                         &ctx.df,
                         res_stream,
@@ -1898,6 +1933,7 @@ impl Query {
             cancellation_token: None,
             read_only: false,
             results_cache_mode: ResultsCacheMode::default(),
+            runtime_binding: QueryRuntimeBinding::QueryRuntime,
         }
     }
 
@@ -2793,7 +2829,12 @@ fn strip_root_order_preserving_repartition(
     let plan = if Arc::ptr_eq(children[0], &rewritten_child) {
         plan
     } else {
-        plan.with_new_children(vec![rewritten_child])?
+        plan.replace_children(
+            vec![rewritten_child],
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )?
     };
 
     if let Some(spm) = plan.downcast_ref::<SortPreservingMergeExec>() {
@@ -4818,6 +4859,17 @@ mod tests {
 
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         }
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::prelude::*;
 use spicepod::{component::view as spicepod_view, vector::VectorStore};
 use std::{collections::HashMap, fs, sync::Arc, time::Duration};
@@ -302,7 +302,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
 #[cfg(test)]
 mod tests {
     use super::{Error, ReadyState, ViewBuilder};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use spicepod::component::view as spicepod_view;
     use std::io::Write;
 

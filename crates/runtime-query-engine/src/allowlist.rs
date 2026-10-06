@@ -16,14 +16,12 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        ast::Ident,
-        dialect::GenericDialect,
-        parser::{Parser, ParserError},
-        tokenizer::Token,
-    },
+use datafusion::common::TableReference;
+use datafusion::sql::sqlparser::{
+    ast::Ident,
+    dialect::GenericDialect,
+    parser::{Parser, ParserError},
+    tokenizer::Token,
 };
 use globset::{Glob, GlobSet};
 
@@ -173,7 +171,7 @@ impl ResolvedTableAwareAllowlist {
 #[cfg(test)]
 mod tests {
 
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     use super::ResolvedTableAwareAllowlist;
 

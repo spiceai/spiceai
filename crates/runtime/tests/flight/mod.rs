@@ -27,7 +27,7 @@ use arrow_flight::{
     FlightClient, FlightDescriptor, PutResult, encode::FlightDataEncoderBuilder, error::FlightError,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::{Stream, TryStreamExt as _};
 use rand::RngExt as _;
 use runtime::{

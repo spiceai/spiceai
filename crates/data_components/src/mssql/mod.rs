@@ -28,12 +28,12 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
     catalog::Session,
+    common::TableReference,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
     logical_expr::{Operator, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
     prelude::Expr,
-    sql::TableReference,
 };
 use util::format_datafusion_error;
 
