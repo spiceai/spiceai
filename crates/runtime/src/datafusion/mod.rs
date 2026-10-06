@@ -3362,9 +3362,15 @@ impl DataFusion {
                 retention_delete_expr.clone(),
             ) {
                 Ok(keep) => {
-                    let keep = crate::accelerated::FallbackRetentionKeep::with_unscheduled_time(
+                    // Cayenne hides expired `time_column` values at scan time
+                    // whether or not the retention ticker runs. Other engines
+                    // only need the extra cutoff when no scheduled worker
+                    // inverts `retention_period`.
+                    let apply_time_column_keep =
+                        !declared_retention_runs || acceleration_settings.engine == Engine::Cayenne;
+                    let keep = crate::accelerated::FallbackRetentionKeep::with_time_column_keep(
                         keep,
-                        declared_retention_runs,
+                        apply_time_column_keep,
                         dataset.retention_period(),
                         dataset.time_column.clone(),
                         dataset.time_format,

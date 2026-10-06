@@ -136,23 +136,25 @@ impl FallbackRetentionKeep {
         }
     }
 
-    /// Merge `keep` with unscheduled time retention when the ticker is off.
+    /// Merge `keep` with a `time_column`-only cutoff.
     ///
-    /// The inverted cutoff uses `time_column` only. Cayenne's scan-time keep
+    /// Use `apply` when the accelerator hides expired rows at scan time
+    /// (Cayenne, ticker on or off) or when no scheduled worker runs. The
+    /// inverted cutoff uses `time_column` only. Cayenne's scan-time keep
     /// ignores `time_partition_column`, so a partition-AND delete would keep
     /// expired rows whose partition is recent or NULL and resurrect them
-    /// through fallback. Scheduled ticker filters still include the partition
-    /// column via [`Self::from_configured`].
+    /// through fallback. Other engines keep the ticker's partition-AND via
+    /// [`Self::from_configured`] when `apply` is false.
     #[must_use]
-    pub fn with_unscheduled_time(
+    pub fn with_time_column_keep(
         keep: Option<Self>,
-        scheduled_runs: bool,
+        apply: bool,
         period: Option<std::time::Duration>,
         time_column: Option<String>,
         time_format: Option<TimeFormat>,
     ) -> Option<Self> {
-        let time = match (scheduled_runs, period, time_column) {
-            (false, Some(period), Some(time_column)) => Some(Self::from_time(
+        let time = match (apply, period, time_column) {
+            (true, Some(period), Some(time_column)) => Some(Self::from_time(
                 period,
                 time_column,
                 time_format,
@@ -444,10 +446,10 @@ mod tests {
     }
 
     #[test]
-    fn with_unscheduled_time_covers_ticker_off() {
-        let keep = FallbackRetentionKeep::with_unscheduled_time(
+    fn with_time_column_keep_covers_ticker_off() {
+        let keep = FallbackRetentionKeep::with_time_column_keep(
             None,
-            false,
+            true,
             Some(Duration::from_secs(3600)),
             Some("ts".to_string()),
             Some(TimeFormat::UnixSeconds),
@@ -459,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn with_unscheduled_time_does_not_duplicate_scheduled() {
+    fn with_time_column_keep_does_not_duplicate_when_not_applied() {
         let scheduled = Retention {
             filters: vec![DataRetentionFilter::Time {
                 period: Duration::from_secs(3600),
@@ -474,9 +476,9 @@ mod tests {
         let keep = FallbackRetentionKeep::from_configured(Some(&scheduled), None)
             .expect("scheduled time is invertible")
             .expect("a keep spec");
-        let merged = FallbackRetentionKeep::with_unscheduled_time(
+        let merged = FallbackRetentionKeep::with_time_column_keep(
             Some(keep),
-            true,
+            false,
             Some(Duration::from_secs(3600)),
             Some("ts".to_string()),
             Some(TimeFormat::UnixSeconds),
@@ -485,7 +487,7 @@ mod tests {
         assert_eq!(
             merged.filters.len(),
             1,
-            "unscheduled time must not double the scheduled cutoff"
+            "DuckDB/Arrow scheduled keep must not grow a second time-column cutoff"
         );
     }
 
@@ -563,9 +565,9 @@ mod tests {
     #[tokio::test]
     async fn unscheduled_time_keep_matches_cayenne_without_partition() {
         let schema = partitioned_schema();
-        let keep = FallbackRetentionKeep::with_unscheduled_time(
+        let keep = FallbackRetentionKeep::with_time_column_keep(
             None,
-            false,
+            true,
             Some(Duration::from_secs(3600)),
             Some("ts".to_string()),
             Some(TimeFormat::UnixSeconds),
@@ -576,6 +578,32 @@ mod tests {
             ids,
             vec![1, 4],
             "Cayenne scan-time keep uses only ts: expired rows stay out even when partition_ts is NULL (id=2) or recent (id=3); NULL ts is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn cayenne_scheduled_merge_matches_scan_time_keep() {
+        let schema = partitioned_schema();
+        let scheduled = FallbackRetentionKeep::from_time(
+            Duration::from_secs(3600),
+            "ts".to_string(),
+            Some(TimeFormat::UnixSeconds),
+            Some("partition_ts".to_string()),
+            Some(TimeFormat::UnixSeconds),
+        );
+        let keep = FallbackRetentionKeep::with_time_column_keep(
+            Some(scheduled),
+            true,
+            Some(Duration::from_secs(3600)),
+            Some("ts".to_string()),
+            Some(TimeFormat::UnixSeconds),
+        )
+        .expect("Cayenne still applies the time-column keep when the ticker runs");
+        let ids = ids_matching(&keep, &schema).await;
+        assert_eq!(
+            ids,
+            vec![1, 4],
+            "merging Cayenne scan-time keep with the ticker AND must still drop expired ts"
         );
     }
 
