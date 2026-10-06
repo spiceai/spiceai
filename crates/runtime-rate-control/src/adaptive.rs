@@ -485,7 +485,7 @@ mod tests {
     fn default_matches_the_documented_defaults() {
         assert_eq!(
             AdaptiveRateControl::default(),
-            AdaptiveRateControl::new(DEFAULT_ADAPTIVE_FAILURE_THRESHOLD, DEFAULT_ADAPTIVE_WINDOW)
+            AdaptiveRateControl::with_default_window(DEFAULT_ADAPTIVE_FAILURE_THRESHOLD)
                 .expect("the defaults must be valid")
         );
     }

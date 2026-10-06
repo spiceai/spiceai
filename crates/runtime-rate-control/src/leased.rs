@@ -2824,20 +2824,21 @@ mod tests {
         }
         tokio::time::sleep(window + Duration::from_millis(20)).await;
         // Two passes: the first settles the tail counts in the file, the second
-        // has both replicas read that same settled state. Nothing pins the
-        // budget any more, so they agree by reading the same counts, not by
-        // adopting one another's value.
+        // has both replicas read that same settled state.
         for _ in 0..2 {
             for bucket in [&a, &b] {
                 bucket.refresh_lease().await.expect("lease");
             }
         }
 
+        // Each replica fixes a window's budget when it first leases it, usually
+        // as the pre-lease of the window before. The two read the shared counts
+        // at different moments, so they can differ by one token, not more.
         let burst_a = a.metrics.cluster_effective_burst();
         let burst_b = b.metrics.cluster_effective_burst();
-        assert_eq!(
-            burst_a, burst_b,
-            "replicas reading the same settled counts must derive the same budget"
+        assert!(
+            burst_a.abs_diff(burst_b) <= 1,
+            "replicas reading the same counts must derive budgets within one token, got {burst_a} and {burst_b}"
         );
         assert!(
             burst_a < 20,
