@@ -282,12 +282,12 @@ impl Refresh {
             });
         };
 
-        let time_format = self.time_format.unwrap_or(TimeFormat::Timestamp);
         validate_time_format_for_column(
             field.data_type(),
             dataset_name,
             time_column,
-            time_format,
+            self.time_format,
+            TIME_COLUMN_FORMAT_KEYS,
             log_ignored,
         )?;
 
@@ -302,12 +302,12 @@ impl Refresh {
             });
         };
 
-        let time_partition_format = self.time_partition_format.unwrap_or(TimeFormat::Timestamp);
         validate_time_format_for_column(
             field.data_type(),
             dataset_name,
             time_partition_column,
-            time_partition_format,
+            self.time_partition_format,
+            TIME_PARTITION_FORMAT_KEYS,
             log_ignored,
         )
     }
@@ -428,6 +428,23 @@ impl Refresh {
     }
 }
 
+/// Spicepod keys for the column and format being validated.
+#[derive(Clone, Copy)]
+struct TimeFormatConfigKeys {
+    column: &'static str,
+    format: &'static str,
+}
+
+const TIME_COLUMN_FORMAT_KEYS: TimeFormatConfigKeys = TimeFormatConfigKeys {
+    column: "time_column",
+    format: "time_format",
+};
+
+const TIME_PARTITION_FORMAT_KEYS: TimeFormatConfigKeys = TimeFormatConfigKeys {
+    column: "time_partition_column",
+    format: "time_partition_format",
+};
+
 const fn time_format_spicepod_name(time_format: TimeFormat) -> &'static str {
     match time_format {
         TimeFormat::Timestamp => "timestamp",
@@ -461,25 +478,51 @@ fn native_temporal_kind(data_type: &arrow::datatypes::DataType) -> Option<&'stat
     }
 }
 
+/// Advice after ignoring a string format on a native temporal column.
+///
+/// A timezone-naive timestamp matches the default `timestamp` format, so the
+/// setting can be removed. Date and timezone-aware timestamps do not: the
+/// default would reject them, so recommend `date` or `timestamptz`.
+fn ignored_string_time_format_advice(
+    data_type: &arrow::datatypes::DataType,
+    format_key: &str,
+) -> String {
+    match data_type {
+        arrow::datatypes::DataType::Timestamp(_, Some(_)) => {
+            format!("Set `{format_key}` to `timestamptz`.")
+        }
+        arrow::datatypes::DataType::Date32 | arrow::datatypes::DataType::Date64 => {
+            format!("Set `{format_key}` to `date`.")
+        }
+        _ => format!("Remove `{format_key}` from the dataset configuration."),
+    }
+}
+
 fn ignored_string_time_format_warning(
     dataset_name: &str,
-    time_column: &str,
+    column_name: &str,
     time_format: TimeFormat,
     data_type: &arrow::datatypes::DataType,
+    keys: TimeFormatConfigKeys,
 ) -> String {
     let kind = native_temporal_kind(data_type).unwrap_or("timestamp");
     format!(
-        "Dataset '{dataset_name}' ignores `time_format: {format}` on time_column '{time_column}' because the column is already a {kind} ({data_type}). Remove `time_format` from the dataset configuration. See: {TIME_FORMAT_DOCS}",
+        "Dataset '{dataset_name}' ignores `{format_key}: {format}` on `{column_key}` '{column_name}' because the column is already a {kind} ({data_type}). {advice} See: {TIME_FORMAT_DOCS}",
+        format_key = keys.format,
         format = time_format_spicepod_name(time_format),
+        column_key = keys.column,
+        advice = ignored_string_time_format_advice(data_type, keys.format),
     )
 }
 
-fn time_format_mismatch_fix(data_type: &arrow::datatypes::DataType) -> &'static str {
+fn time_format_mismatch_fix(data_type: &arrow::datatypes::DataType, format_key: &str) -> String {
     match data_type {
         arrow::datatypes::DataType::Utf8
         | arrow::datatypes::DataType::LargeUtf8
         | arrow::datatypes::DataType::Utf8View => {
-            "Set `time_format` to `iso8601` to parse string timestamps, or change the column to an integer or timestamp type that matches a different `time_format`."
+            format!(
+                "Set `{format_key}` to `iso8601` to parse string timestamps, or change the column to an integer or timestamp type that matches a different `{format_key}`."
+            )
         }
         arrow::datatypes::DataType::Int8
         | arrow::datatypes::DataType::Int16
@@ -492,33 +535,41 @@ fn time_format_mismatch_fix(data_type: &arrow::datatypes::DataType) -> &'static 
         | arrow::datatypes::DataType::Float16
         | arrow::datatypes::DataType::Float32
         | arrow::datatypes::DataType::Float64 => {
-            "Set `time_format` to `unix_seconds`, `unix_millis`, or `unix_nanos` to match the integer epoch column."
+            format!(
+                "Set `{format_key}` to `unix_seconds`, `unix_millis`, or `unix_nanos` to match the integer epoch column."
+            )
         }
         arrow::datatypes::DataType::Timestamp(_, None) => {
-            "Set `time_format` to `timestamp`, or remove `time_format` if the column is already a timestamp."
+            format!(
+                "Set `{format_key}` to `timestamp`, or remove `{format_key}` if the column is already a timestamp."
+            )
         }
         arrow::datatypes::DataType::Timestamp(_, Some(_)) => {
-            "Set `time_format` to `timestamptz`, or remove `time_format` if the column is already a timestamp."
+            format!("Set `{format_key}` to `timestamptz`.")
         }
         arrow::datatypes::DataType::Date32 | arrow::datatypes::DataType::Date64 => {
-            "Set `time_format` to `date`, or remove `time_format` if the column is already a date."
+            format!("Set `{format_key}` to `date`.")
         }
         _ => {
             "Use `iso8601` for string columns, `unix_seconds`/`unix_millis`/`unix_nanos` for integer columns, `timestamp`/`timestamptz` for timestamp columns, or `date` for date columns."
+                .to_string()
         }
     }
 }
 
 fn time_format_mismatch_message(
     table_name: &str,
-    time_column: &str,
+    column_name: &str,
     time_format: TimeFormat,
     data_type: &arrow::datatypes::DataType,
+    keys: TimeFormatConfigKeys,
 ) -> String {
     format!(
-        "time_column '{time_column}' in dataset '{table_name}' has data type '{data_type}', but `time_format` is configured as '{format}'. {fix} See: {TIME_FORMAT_DOCS}",
+        "`{column_key}` '{column_name}' in dataset '{table_name}' has data type '{data_type}', but `{format_key}` is configured as '{format}'. {fix} See: {TIME_FORMAT_DOCS}",
+        column_key = keys.column,
+        format_key = keys.format,
         format = time_format_spicepod_name(time_format),
-        fix = time_format_mismatch_fix(data_type),
+        fix = time_format_mismatch_fix(data_type, keys.format),
     )
 }
 
@@ -556,31 +607,43 @@ fn time_format_matches_data_type(
 fn validate_time_format_for_column(
     data_type: &arrow::datatypes::DataType,
     dataset_name: &str,
-    time_column: &str,
-    time_format: TimeFormat,
+    column_name: &str,
+    time_format: Option<TimeFormat>,
+    keys: TimeFormatConfigKeys,
     log_ignored: bool,
 ) -> Result<(), Error> {
-    if is_native_temporal_type(data_type) && is_string_time_format(time_format) {
+    if let Some(time_format) = time_format
+        && is_native_temporal_type(data_type)
+        && is_string_time_format(time_format)
+    {
         if log_ignored {
             tracing::warn!(
                 "{}",
                 ignored_string_time_format_warning(
                     dataset_name,
-                    time_column,
+                    column_name,
                     time_format,
-                    data_type
+                    data_type,
+                    keys
                 )
             );
         }
         return Ok(());
     }
 
+    let time_format = time_format.unwrap_or(TimeFormat::Timestamp);
     if time_format_matches_data_type(data_type, time_format) {
         return Ok(());
     }
 
     Err(Error::TimeFormatMismatch {
-        message: time_format_mismatch_message(dataset_name, time_column, time_format, data_type),
+        message: time_format_mismatch_message(
+            dataset_name,
+            column_name,
+            time_format,
+            data_type,
+            keys,
+        ),
     })
 }
 
@@ -3626,7 +3689,13 @@ mod tests {
         let message = err.to_string();
         assert_eq!(
             message,
-            time_format_mismatch_message("events", "ts", TimeFormat::UnixSeconds, &DataType::Utf8)
+            time_format_mismatch_message(
+                "events",
+                "ts",
+                TimeFormat::UnixSeconds,
+                &DataType::Utf8,
+                TIME_COLUMN_FORMAT_KEYS,
+            )
         );
         assert!(
             message.contains("Set `time_format` to `iso8601`"),
@@ -3652,7 +3721,13 @@ mod tests {
         let message = err.to_string();
         assert_eq!(
             message,
-            time_format_mismatch_message("events", "ts", TimeFormat::UnixSeconds, &data_type)
+            time_format_mismatch_message(
+                "events",
+                "ts",
+                TimeFormat::UnixSeconds,
+                &data_type,
+                TIME_COLUMN_FORMAT_KEYS,
+            )
         );
         assert!(
             message.contains("Set `time_format` to `timestamp`"),
@@ -3667,10 +3742,11 @@ mod tests {
             "ts",
             TimeFormat::ISO8601,
             &DataType::Timestamp(TimeUnit::Second, None),
+            TIME_COLUMN_FORMAT_KEYS,
         );
         assert_eq!(
             message,
-            "Dataset 'events' ignores `time_format: iso8601` on time_column 'ts' because the column is already a timestamp (Timestamp(s)). Remove `time_format` from the dataset configuration. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+            "Dataset 'events' ignores `time_format: iso8601` on `time_column` 'ts' because the column is already a timestamp (Timestamp(s)). Remove `time_format` from the dataset configuration. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
         );
     }
 
@@ -3681,10 +3757,118 @@ mod tests {
             "day",
             TimeFormat::ISO8601,
             &DataType::Date32,
+            TIME_COLUMN_FORMAT_KEYS,
         );
         assert_eq!(
             message,
-            "Dataset 'events' ignores `time_format: iso8601` on time_column 'day' because the column is already a date (Date32). Remove `time_format` from the dataset configuration. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+            "Dataset 'events' ignores `time_format: iso8601` on `time_column` 'day' because the column is already a date (Date32). Set `time_format` to `date`. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+        );
+    }
+
+    #[test]
+    fn test_ignored_string_time_format_warning_for_timestamptz() {
+        let data_type = DataType::Timestamp(TimeUnit::Second, Some("+00:00".into()));
+        let message = ignored_string_time_format_warning(
+            "events",
+            "ts",
+            TimeFormat::ISO8601,
+            &data_type,
+            TIME_COLUMN_FORMAT_KEYS,
+        );
+        assert_eq!(
+            message,
+            format!(
+                "Dataset 'events' ignores `time_format: iso8601` on `time_column` 'ts' because the column is already a timestamp ({data_type}). Set `time_format` to `timestamptz`. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+            )
+        );
+    }
+
+    #[test]
+    fn test_ignored_string_time_format_warning_for_partition() {
+        let message = ignored_string_time_format_warning(
+            "events",
+            "day",
+            TimeFormat::ISO8601,
+            &DataType::Date32,
+            TIME_PARTITION_FORMAT_KEYS,
+        );
+        assert_eq!(
+            message,
+            "Dataset 'events' ignores `time_partition_format: iso8601` on `time_partition_column` 'day' because the column is already a date (Date32). Set `time_partition_format` to `date`. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+        );
+    }
+
+    #[test]
+    fn test_validate_time_partition_iso8601_on_date_is_accepted() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::ISO8601)
+            .time_partition_column("day".to_string())
+            .time_partition_format(TimeFormat::ISO8601);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Utf8, false),
+            Field::new("day", DataType::Date32, false),
+        ]));
+        refresh
+            .validate_time_format("events", &schema)
+            .expect("iso8601 on a Date32 partition column must be accepted");
+    }
+
+    #[test]
+    fn test_validate_time_partition_format_mismatch_names_partition_keys() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::ISO8601)
+            .time_partition_column("day".to_string())
+            .time_partition_format(TimeFormat::UnixSeconds);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Utf8, false),
+            Field::new("day", DataType::Date32, false),
+        ]));
+        let err = refresh
+            .validate_time_format("events", &schema)
+            .expect_err("unix_seconds on a Date32 partition column is incompatible");
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            time_format_mismatch_message(
+                "events",
+                "day",
+                TimeFormat::UnixSeconds,
+                &DataType::Date32,
+                TIME_PARTITION_FORMAT_KEYS,
+            )
+        );
+        assert!(
+            message.contains("Set `time_partition_format` to `date`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Set `time_format` to `date`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`time_partition_column` 'day'"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_time_format_mismatch_fix_does_not_recommend_removal_for_date_or_timestamptz() {
+        assert_eq!(
+            time_format_mismatch_fix(&DataType::Date32, "time_format"),
+            "Set `time_format` to `date`."
+        );
+        assert_eq!(
+            time_format_mismatch_fix(
+                &DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+                "time_format"
+            ),
+            "Set `time_format` to `timestamptz`."
+        );
+        assert_eq!(
+            time_format_mismatch_fix(&DataType::Timestamp(TimeUnit::Second, None), "time_format"),
+            "Set `time_format` to `timestamp`, or remove `time_format` if the column is already a timestamp."
         );
     }
 
