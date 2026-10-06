@@ -80,22 +80,26 @@ impl AppendWorker {
         Self { config, source }
     }
 
-    /// Loads every step, then waits out the rest of the test duration.
+    /// Writes the initial data, which `spiced` loads on startup, so it must run
+    /// before `spiced` starts.
+    pub async fn setup(&self) -> Result<()> {
+        println!("AppendWorker - Running append data setup");
+        self.source.setup(&self.config).await
+    }
+
+    /// Loads every step, then waits out the rest of the test duration, both
+    /// counted from this call. Call it once the query workers are running, so
+    /// every load lands while queries are running.
     ///
     /// Loads are paced by `load_interval`, but never cut off by the test
     /// duration: generating the data is the harness's own work, so a slow runner
     /// lengthens the run instead of failing it. Only a run whose loads exceed
     /// twice the expected length fails, which catches a stuck load.
-    pub async fn start(self) -> Result<JoinHandle<Result<()>>> {
-        // Outside of the join handle, run some initial setup
-        // This ensures the appendable dataset is ready before the workers start
+    pub fn start_loads(self) -> JoinHandle<Result<()>> {
         let end_time = Instant::now() + self.config.end_duration;
-        println!("AppendWorker - Running append data setup");
-        self.source.setup(&self.config).await?;
-
         let load_steps = self.config.load_steps;
         let load_timeout = self.load_timeout();
-        Ok(tokio::spawn(async move {
+        tokio::spawn(async move {
             println!("AppendWorker - Starting append data generation");
             let mut loaded = 1;
             let loads = async {
@@ -122,7 +126,7 @@ impl AppendWorker {
                     "Append loads did not finish within {load_timeout:?}. Only loaded {loaded}/{load_steps}"
                 )),
             }
-        }))
+        })
     }
 
     /// Twice the longer of the test duration and the paced loads alone.

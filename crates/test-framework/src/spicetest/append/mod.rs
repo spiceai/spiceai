@@ -185,7 +185,7 @@ impl NotStarted {
 
 pub struct AppendStarted {
     queries: Vec<queries::Query>,
-    append_worker: JoinHandle<Result<()>>,
+    append_worker: AppendWorker,
     query_shutdown: CancellationToken,
     query_count: usize,
     parallel_count: usize,
@@ -236,9 +236,8 @@ impl SpiceTest<NotStarted> {
         }
         let append_source = FileAppendableSource::new(&append_config);
 
-        let append_worker = AppendWorker::new(append_config, Box::new(append_source))
-            .start()
-            .await?;
+        let append_worker = AppendWorker::new(append_config, Box::new(append_source));
+        append_worker.setup().await?;
 
         Ok(SpiceTest {
             name: self.name,
@@ -324,7 +323,7 @@ impl SpiceTest<AppendStarted> {
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
                 end_duration: self.state.end_duration,
-                append_worker: self.state.append_worker,
+                append_worker: self.state.append_worker.start_loads(),
                 query_shutdown: self.state.query_shutdown,
             },
         })
