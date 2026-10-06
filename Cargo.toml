@@ -1,6 +1,9 @@
 [workspace]
 default-members = ["bin/spiced"]
-exclude = ["crates/data-connectors/connector-nfs"]
+exclude = [
+    "crates/data-connectors/connector-nfs",
+    "tools/turso-072-fixture-gen",
+]
 members = [
     "bin/spice/",
     "bin/spiced/",
@@ -33,6 +36,7 @@ members = [
     "crates/repl",
     "crates/google-genai",
     "crates/hash-index",
+    "crates/key-index",
     "crates/llms",
     "crates/chat-api",
     "crates/embed-api",
@@ -306,6 +310,7 @@ globset = "0.4.16"
 governor = "0.10.4"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "25bc483efc3200df7a4f5426c176cddb18a84ad9" } # branch: spiceai (merged PR #8)
 graphql-parser = "0.4.0"
+hashbrown = "0.17.1"
 hex = "0.4.3"
 hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"
@@ -466,13 +471,19 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-turso = { version = "0.7.2", default-features = false }
+turso = { version = "0.8.1", default-features = false }
 turso-shared = { path = "crates/turso-shared" }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util", default-features = false }
 utoipa = { version = "5" }
 uuid = "1"
+# Specification and proof vocabulary for every crate that opts into
+# `[package.metadata.verus]`. A normal `cargo build` erases the specifications,
+# so it carries no runtime cost. Pinned to the Verus release CI runs: the
+# verifier and `vstd` ship together, so this moves with `VERUS_VSTD_VERSION` in
+# `.github/workflows/verus_verify.yml`.
+vstd = "=0.0.0-2026-09-20-0158"
 wasmtime = { version = "47.0.3", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.248.0"
 

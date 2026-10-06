@@ -21,10 +21,13 @@ limitations under the License.
 
 pub mod local_conditional_put;
 mod state;
+pub mod store;
+pub mod wal;
 
 use snafu::Snafu;
 
 pub use local_conditional_put::LocalConditionalPut;
+pub use object_store::UpdateVersion;
 pub use state::{InsertResult, ObjectState, UpdateResult, WriteResult};
 
 /// Errors that can occur during object state operations.

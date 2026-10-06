@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
-use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
+use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::accelerated::refresh_task::probe_acceleration_contents;
 use crate::accelerated::snapshots::{SnapshotRefreshState, reload_on_snapshot_notifications};
@@ -61,13 +61,12 @@ use crate::{status, view};
 use data_accelerator_api::swappable::SwappableTableProvider;
 use data_connector_api::accelerated::RegisteredAcceleratedTable;
 use data_connector_api::federated::FederatedTableProvider;
+use runtime_acceleration::acceleration::DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL;
 use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
-use runtime_acceleration::snapshot::notifications::{
-    NotificationConfig, SnapshotNotifications, Subscription,
-};
+use runtime_acceleration::snapshot::notifications::{SnapshotNotifications, Subscription};
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
@@ -738,12 +737,6 @@ fn remap_constraints_to_refresh_schema(
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
 const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 
-/// Default polling interval for `refresh_mode: snapshot` when the user does
-/// not specify `refresh_check_interval` explicitly. Picked to be slightly
-/// shorter than the default snapshot creation interval so a freshly created
-/// snapshot is picked up promptly without aggressive object-store load.
-pub(crate) const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
-
 pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
@@ -865,6 +858,10 @@ pub enum DeferredRefreshOutcome {
     /// Every recorder was dropped before a completion was recorded: no refresh
     /// ran, and none can.
     Abandoned,
+    /// The refresh failed and will not be retried. The table may still be
+    /// registered, but it did not load; do not broadcast readiness or create
+    /// a follow-on schedule.
+    Failed,
     /// A refresh landed, but the table has since been removed, or rebuilt as a
     /// new instance, so the action is no longer about the table registered under
     /// this name.
@@ -888,11 +885,15 @@ pub struct DataFusion {
     /// The SQS consumers that reload `refresh_mode: snapshot` datasets when
     /// their snapshot location reports a new snapshot. Shared, so datasets on
     /// one queue use one consumer.
-    snapshot_notifications: SnapshotNotifications,
+    snapshot_notifications: Arc<SnapshotNotifications>,
     /// Datasets whose table provider is installed somewhere other than the
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
+    /// First 10 distinct SQL results-cache plan shapes, replayed after the
+    /// first full/append refresh until the cache is full. No-op unless
+    /// `runtime.caching.sql_results.warmup` is `on_first_refresh`.
+    pub(crate) results_cache_warmer: query::ResultsCacheWarmer,
     /// Per-dataset locks that keep writes from overlapping a schema evolution's provider
     /// swap. Writes take the lock shared, evolution takes it exclusively. Without this, a
     /// write can complete through the provider being replaced, and its rows are then
@@ -1046,6 +1047,15 @@ impl DataFusion {
     #[must_use]
     pub fn caching(&self) -> Arc<Caching> {
         Arc::clone(&self.caching)
+    }
+
+    pub(crate) async fn accelerated_table_names(&self) -> Vec<TableReference> {
+        self.accelerated_tables
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect()
     }
 
     #[must_use]
@@ -1299,7 +1309,9 @@ impl DataFusion {
     /// caller cannot answer the first and forget the second. `Abandoned` alone is
     /// not enough: it reports only a drop that happens *before* any completion
     /// was recorded, while a completion recorded and *then* invalidated by a
-    /// removal or a rebuild still reads as answered.
+    /// removal or a rebuild still reads as answered. A terminal failure is
+    /// reported as [`DeferredRefreshOutcome::Failed`] so a one-shot load error
+    /// cannot be mistaken for a successful refresh.
     ///
     /// A `None` waiter is a caller with nothing to wait for; the table is still
     /// re-resolved, since it may have gone in the meantime.
@@ -1309,10 +1321,16 @@ impl DataFusion {
         instance: TableInstance,
         waiter: Option<RefreshCompletionWaiter>,
     ) -> DeferredRefreshOutcome {
-        if let Some(waiter) = waiter
-            && waiter.wait().await.is_abandoned()
-        {
-            return DeferredRefreshOutcome::Abandoned;
+        if let Some(waiter) = waiter {
+            match waiter.wait().await {
+                RefreshCompletionOutcome::Abandoned => {
+                    return DeferredRefreshOutcome::Abandoned;
+                }
+                RefreshCompletionOutcome::TerminalFailure => {
+                    return DeferredRefreshOutcome::Failed;
+                }
+                RefreshCompletionOutcome::Answered => {}
+            }
         }
 
         if self.table_instance_is_current(&instance).await {
@@ -2916,7 +2934,7 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
-        bootstrap_status: BootstrapStatus,
+        mut bootstrap_status: BootstrapStatus,
         initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
@@ -3116,14 +3134,20 @@ impl DataFusion {
         // Subscribed before the table is built, so a bad `s3_queue_url` fails the
         // dataset before its first refresh starts.
         let snapshot_subscription = match &snapshot_refresh_state {
-            Some(state) => self
-                .subscribe_to_snapshot_notifications(
-                    dataset,
-                    &acceleration_settings.snapshot_behavior,
-                    state,
-                )
-                .await?
-                .map(|subscription| (subscription, state.clone())),
+            Some(state) => {
+                let subscription = match bootstrap_status.take_snapshot_subscription() {
+                    Some(subscription) => Some(subscription),
+                    None => {
+                        self.subscribe_to_snapshot_notifications(
+                            dataset,
+                            &acceleration_settings.snapshot_behavior,
+                            state,
+                        )
+                        .await?
+                    }
+                };
+                subscription.map(|subscription| (subscription, state.clone()))
+            }
             None => None,
         };
 
@@ -3680,30 +3704,26 @@ impl DataFusion {
         snapshot_behavior: &SnapshotBehavior,
         state: &SnapshotRefreshState,
     ) -> Result<Option<Subscription>> {
-        let (SnapshotBehavior::Enabled(snapshots, secrets, io_runtime, _)
-        | SnapshotBehavior::BootstrapOnly(snapshots, secrets, io_runtime)) = snapshot_behavior
-        else {
+        let Some(notifications) = self.snapshot_notifications() else {
             return Ok(None);
         };
-        // The runtime's secrets are gone only while it shuts down.
-        let Some(secrets) = secrets.upgrade() else {
-            return Ok(None);
-        };
-        let config = NotificationConfig::resolve(snapshots, secrets)
+        notifications
+            .subscribe_for_behavior(snapshot_behavior, &state.manager)
             .await
             .context(SnapshotNotificationsConfigSnafu {
                 dataset_name: dataset.name.to_string(),
-            })?;
+            })
+    }
+
+    /// The queue consumers shared by local snapshot bootstrap and refresh.
+    pub(crate) fn snapshot_notifications(&self) -> Option<Arc<SnapshotNotifications>> {
         if matches!(
             self.cluster_config.effective_role(),
             Some(crate::config::ClusterRole::Scheduler)
         ) {
-            return Ok(None);
+            return None;
         }
-        Ok(config.map(|config| {
-            self.snapshot_notifications
-                .subscribe(&config, &state.manager, io_runtime)
-        }))
+        Some(Arc::clone(&self.snapshot_notifications))
     }
 
     // Compare the checkpoint schema (from the previous run) against the source/refresh
@@ -7367,6 +7387,24 @@ mod tests {
                 df.await_refresh_completion(instance, Some(waiter)).await,
                 DeferredRefreshOutcome::Apply,
                 "an untouched table must still apply, or every deferred action is dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_terminal_failure_does_not_apply() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            completion.record_terminal_failure(completion.issue());
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::Failed,
+                "a failed one-shot refresh must not broadcast PartitionsLoaded"
             );
         }
 
