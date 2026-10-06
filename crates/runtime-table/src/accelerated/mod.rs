@@ -70,6 +70,8 @@ pub mod caching;
 pub mod caching_eviction;
 #[cfg(test)]
 mod caching_scan_tests;
+pub mod fallback_retention;
+pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
 pub mod federation;
 pub mod refresh;
 pub mod refresh_completion;
@@ -325,6 +327,9 @@ pub struct AcceleratedTable {
     /// mode, where the storage schema is augmented with a hidden
     /// [`caching::CACHE_NAMESPACE_COLUMN`] for per-principal isolation.
     user_facing_schema: Option<SchemaRef>,
+    /// Inverse of configured retention predicates, applied to
+    /// `on_zero_results: use_source` fallback scans.
+    fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -1131,6 +1136,19 @@ impl Builder {
         // swept by the same ticker, write lock and index-aware delete every
         // other dataset uses. Attached before the retention task is spawned
         // below.
+        let fallback_retention_keep =
+            if matches!(self.zero_results_action, ZeroResultsAction::UseSource)
+                && refresh_mode != RefreshMode::Caching
+            {
+                self.retention.as_ref().and_then(|retention| {
+                    fallback_retention::FallbackRetentionKeep::from_retention(retention)
+                        .ok()
+                        .flatten()
+                })
+            } else {
+                None
+            };
+
         let retention = if refresh_mode == RefreshMode::Caching {
             Some(caching_eviction::retention(
                 caching_eviction::CacheLimits {
@@ -1330,6 +1348,7 @@ impl Builder {
             batch_write_tx,
             cluster_role: self.cluster_role,
             user_facing_schema: self.user_facing_schema,
+            fallback_retention_keep,
         })
     }
 }
@@ -1931,11 +1950,19 @@ impl AcceleratedTable {
                         accelerator_limit,
                     )
                     .await?;
+                let fallback_keep_filters = if let Some(ref keep) = self.fallback_retention_keep {
+                    let federated_provider = self.federated.table_provider().await;
+                    keep.keep_filters(&federated_provider.schema())
+                        .map_err(|e| DataFusionError::Plan(e.to_string()))?
+                } else {
+                    Vec::new()
+                };
                 Arc::new(FallbackOnZeroResultsScanExec::new(
                     self.dataset_name.clone(),
                     input,
                     fallback_fn,
                     TableScanParams::new(state, projection, filters, limit),
+                    fallback_keep_filters,
                 ))
             }
         };
@@ -2466,7 +2493,7 @@ pub trait RetentionPredicate: Send + Sync + std::fmt::Debug {
     ) -> datafusion::error::Result<Option<Expr>>;
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum DataRetentionFilter {
     Time {
         period: Duration,

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -87,6 +87,22 @@ impl TableScanParams {
             .await?;
         let input = wrap_with_filter(input, self.state.as_ref(), filters_to_reapply)?;
         optimize_single_partition_plan(input, &self.state)
+    }
+
+    /// Scan filters plus `extra`, preserving projection and limit.
+    #[must_use]
+    pub fn with_additional_filters(&self, extra: &[Expr]) -> Self {
+        let mut cloned = self.clone();
+        cloned.filters.extend(extra.iter().cloned());
+        cloned
+    }
+
+    /// Drop the caller's projection so residual filters can see every column.
+    #[must_use]
+    pub fn without_projection(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.projection = None;
+        cloned
     }
 }
 

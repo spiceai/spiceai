@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -53,6 +53,10 @@ pub struct FallbackOnZeroResultsScanExec {
     input: Arc<dyn ExecutionPlan>,
     fallback_table_provider: FallbackAsyncTableProvider,
     fallback_scan_params: TableScanParams,
+    /// Inverse of the dataset's retention delete predicates. Applied only to
+    /// the federated fallback scan so rows retention removed cannot come back
+    /// from the source.
+    fallback_keep_filters: Vec<datafusion::logical_expr::Expr>,
     properties: Arc<PlanProperties>,
 }
 
@@ -63,6 +67,7 @@ impl FallbackOnZeroResultsScanExec {
         mut input: Arc<dyn ExecutionPlan>,
         fallback_table_provider: FallbackAsyncTableProvider,
         fallback_scan_params: TableScanParams,
+        fallback_keep_filters: Vec<datafusion::logical_expr::Expr>,
     ) -> Self {
         let eq_properties = input.equivalence_properties().clone();
         let emission_type = input.pipeline_behavior();
@@ -77,6 +82,7 @@ impl FallbackOnZeroResultsScanExec {
             input,
             fallback_table_provider,
             fallback_scan_params,
+            fallback_keep_filters,
             properties: Arc::new(PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(1),
@@ -138,6 +144,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 Arc::clone(&children[0]),
                 Arc::clone(&self.fallback_table_provider),
                 self.fallback_scan_params.clone(),
+                self.fallback_keep_filters.clone(),
             )))
         } else {
             Err(DataFusionError::Execution(
@@ -170,6 +177,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         let schema = input_stream.schema();
         let scan_params = self.fallback_scan_params.clone();
         let table_name = self.table_name.clone();
+        let keep_filters = self.fallback_keep_filters.clone();
 
         let federated_provider_callback = Arc::clone(&self.fallback_table_provider);
         let potentially_fallback_stream = stream::once(async move {
@@ -208,9 +216,22 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 );
                 tracing::debug!("{fallback_msg}");
                 metrics::FEDERATED_FALLBACK.add(1, &[KeyValue::new("dataset_name", table_name.to_string())]);
+                tracing::info!(
+                    target: "task_history",
+                    fallback = true,
+                    on_zero_results = "use_source",
+                    "labels"
+                );
                 let federated_provider = federated_provider_callback().await;
                 let fallback_optimized_plan =
-                    match scan_params.scan_and_optimize(federated_provider.as_ref(), &[]).await {
+                    match scan_fallback_plan(
+                        federated_provider.as_ref(),
+                        scan_params,
+                        &keep_filters,
+                        Arc::clone(&schema),
+                    )
+                    .await
+                    {
                         Ok(plan) => plan,
                         Err(e) => {
                             let error_stream = RecordBatchStreamAdapter::new(
@@ -248,6 +269,34 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
 
         Ok(Box::pin(stream_adapter))
     }
+}
+
+/// Scan the federated source for a zero-results fallback.
+///
+/// When `keep_filters` is empty the source is scanned with the caller's
+/// projection and query filters only. When retention has an inverse, the
+/// source is scanned unprojected so the keep predicate can see columns the
+/// caller did not ask for, and every filter is re-applied as a residual so a
+/// source that cannot push the keep predicate down still cannot resurrect
+/// evicted rows.
+async fn scan_fallback_plan(
+    federated_provider: &dyn TableProvider,
+    scan_params: TableScanParams,
+    keep_filters: &[datafusion::logical_expr::Expr],
+    output_schema: SchemaRef,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if keep_filters.is_empty() {
+        return scan_params.scan_and_optimize(federated_provider, &[]).await;
+    }
+
+    let fallback_scan_params = scan_params
+        .without_projection()
+        .with_additional_filters(keep_filters);
+    let residual = fallback_scan_params.filters.clone();
+    let plan = fallback_scan_params
+        .scan_and_optimize(federated_provider, &residual)
+        .await?;
+    Ok(Arc::new(SchemaCastScanExec::new(plan, output_schema)) as Arc<dyn ExecutionPlan>)
 }
 
 mod metrics {
@@ -338,6 +387,7 @@ mod tests {
                     filters: vec![],
                     limit: None,
                 },
+                vec![],
             );
 
             let result_stream = exec
@@ -483,6 +533,7 @@ mod tests {
                 input_plan,
                 create_fallback_provider(memory_table_provider()),
                 fallback_scan_params,
+                vec![],
             );
 
             let result_stream = exec
@@ -494,6 +545,133 @@ mod tests {
 
             assert_eq!(collected_result.len(), 1);
             assert_eq!(batch_fallback().num_rows(), collected_result[0].num_rows());
+        }
+    }
+
+    mod retention_keep_filters {
+        use datafusion::{
+            catalog::{MemTable, TableProvider},
+            logical_expr::{col, lit},
+        };
+        use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
+
+        use super::*;
+        use crate::retention_keep::keep_expr_for_retention_delete;
+
+        fn events_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("deleted", DataType::Boolean, true),
+            ]))
+        }
+
+        fn source_batch() -> RecordBatch {
+            RecordBatch::try_new(
+                events_schema(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["keep", "gone", "also"])),
+                    Arc::new(arrow::array::BooleanArray::from(vec![
+                        Some(false),
+                        Some(true),
+                        Some(false),
+                    ])),
+                ],
+            )
+            .expect("source batch")
+        }
+
+        fn empty_memory_exec() -> Arc<dyn ExecutionPlan> {
+            Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![]], events_schema(), None).expect("empty exec"),
+            )))
+        }
+
+        fn source_table() -> Arc<dyn TableProvider> {
+            Arc::new(
+                MemTable::try_new(events_schema(), vec![vec![source_batch()]])
+                    .expect("source table"),
+            )
+        }
+
+        async fn collect_ids(
+            keep_filters: Vec<datafusion::logical_expr::Expr>,
+            query_filters: Vec<datafusion::logical_expr::Expr>,
+        ) -> Vec<i64> {
+            collect_projected_ids(keep_filters, query_filters, None).await
+        }
+
+        async fn collect_projected_ids(
+            keep_filters: Vec<datafusion::logical_expr::Expr>,
+            query_filters: Vec<datafusion::logical_expr::Expr>,
+            projection: Option<Vec<usize>>,
+        ) -> Vec<i64> {
+            let ctx = SessionContext::new();
+            let exec = FallbackOnZeroResultsScanExec::new(
+                TableReference::bare("events"),
+                empty_memory_exec(),
+                create_fallback_provider(source_table()),
+                TableScanParams {
+                    state: Arc::new(ctx.state()),
+                    projection,
+                    filters: query_filters,
+                    limit: None,
+                },
+                keep_filters,
+            );
+            let stream = exec.execute(0, ctx.task_ctx()).expect("stream");
+            let batches = datafusion::physical_plan::common::collect(stream)
+                .await
+                .expect("collect");
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id")
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn keep_filter_hides_retention_deleted_row() {
+            let keep = keep_expr_for_retention_delete(col("deleted").eq(lit(true)));
+            let ids = collect_ids(vec![keep], vec![col("id").eq(lit(2i64))]).await;
+            assert_eq!(
+                ids,
+                Vec::<i64>::new(),
+                "the evicted soft-deleted row must not come back from the source"
+            );
+        }
+
+        #[tokio::test]
+        async fn keep_filter_still_returns_rows_retention_would_keep() {
+            let keep = keep_expr_for_retention_delete(col("deleted").eq(lit(true)));
+            let ids = collect_ids(vec![keep], vec![col("id").eq(lit(3i64))]).await;
+            assert_eq!(
+                ids,
+                vec![3],
+                "a source row retention would keep still falls back"
+            );
+        }
+
+        #[tokio::test]
+        async fn keep_filter_hides_deleted_row_when_deleted_is_not_projected() {
+            let keep = keep_expr_for_retention_delete(col("deleted").eq(lit(true)));
+            let ids =
+                collect_projected_ids(vec![keep], vec![col("id").eq(lit(2i64))], Some(vec![0]))
+                    .await;
+            assert_eq!(
+                ids,
+                Vec::<i64>::new(),
+                "projecting away `deleted` must not resurrect the evicted row"
+            );
         }
     }
 }
