@@ -19659,7 +19659,7 @@ impl CayenneTableProvider {
     /// publication raised the surviving-sequence floor, or this provider just
     /// opened over a backlog an earlier process left behind.
     ///
-    /// Runs at most one lock-free [`Self::sweep_orphaned_deletion_vectors`] worker
+    /// Runs at most one [`Self::sweep_orphaned_deletion_vectors`] worker
     /// per table on the dedicated compaction runtime — mirroring
     /// [`Self::schedule_post_write_compaction`]. A signal raised while that worker
     /// runs is RECORDED rather than dropped
