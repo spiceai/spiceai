@@ -138,7 +138,10 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
                     Some("concat("),
                 ),
                 (
-                    "SELECT concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) AS c \
+                    // Keep `id` in the projection: a constant-only SELECT over
+                    // the accelerator is an empty federated scan, and the
+                    // SQLite row decoder panics on a zero-field schema.
+                    "SELECT id, concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) AS c \
                      FROM {table} WHERE id = 1",
                     Some("concat("),
                 ),
@@ -283,15 +286,15 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
             );
             assert_batches_eq!(
                 [
-                    "+------+",
-                    "| isn  |",
-                    "+------+",
-                    "| true |",
-                    "+------+",
+                    "+----+------+",
+                    "| id | isn  |",
+                    "+----+------+",
+                    "| 1  | true |",
+                    "+----+------+",
                 ],
                 &run_query(
                     &rt,
-                    "SELECT concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) IS NULL AS isn \
+                    "SELECT id, concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) IS NULL AS isn \
                      FROM accelerated WHERE id = 1"
                 )
                 .await?
