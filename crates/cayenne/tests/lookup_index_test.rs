@@ -930,15 +930,30 @@ async fn dynamic_filter_restricts_files_and_retains_uncovered_files() {
             .sum()
     }
 
-    fn restricted_opened_files(plan: &dyn ExecutionPlan) -> Vec<usize> {
-        if plan.name() == "RuntimeRestrictedScanExec" {
+    fn scan_opened_files(plan: &dyn ExecutionPlan) -> Vec<usize> {
+        if plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+            .is_some()
+        {
             return vec![
                 plan.metrics()
-                    .expect("restricted scan metrics")
+                    .expect("file scan metrics")
                     .sum_by_name("files_opened")
                     .expect("opened file metric")
                     .as_usize(),
             ];
+        }
+        plan.children()
+            .iter()
+            .flat_map(|child| scan_opened_files(child.as_ref()))
+            .collect()
+    }
+
+    fn restricted_opened_files(plan: &dyn ExecutionPlan) -> Vec<usize> {
+        if plan.name() == "RuntimeRestrictedScanExec" {
+            // Unary operators within the wrapper need not forward file metrics.
+            return scan_opened_files(plan);
         }
         plan.children()
             .iter()

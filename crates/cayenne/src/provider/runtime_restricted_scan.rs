@@ -38,9 +38,11 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    ChildStats, ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
+    PlanProperties, ReplaceChildrenOptions, SendableRecordBatchStream, StatisticsArgs,
+    StatisticsContext,
 };
-use datafusion_common::{Result, Statistics};
+use datafusion_common::{Result, Statistics, tree_node::TreeNodeRecursion};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::DataSourceExec;
@@ -74,6 +76,15 @@ impl RuntimeRestrictedScanExec {
             provider,
             restricted: Arc::default(),
         }
+    }
+
+    fn with_child(&self, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
+        let [input]: [Arc<dyn ExecutionPlan>; 1] = children.try_into().map_err(|_| {
+            datafusion_common::DataFusionError::Internal(
+                "RuntimeRestrictedScanExec needs one child".to_string(),
+            )
+        })?;
+        Ok(Arc::new(Self::new(input, Arc::clone(&self.provider))))
     }
 
     /// The scan to run: `input` narrowed to the files the selection may
@@ -155,7 +166,10 @@ fn narrowed(
         [child] => narrowed(child, selection)?,
         _ => return Ok(Arc::clone(plan)),
     };
-    Arc::clone(plan).with_new_children(vec![child])
+    Arc::clone(plan).replace_children(
+        vec![child],
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
 }
 
 impl fmt::Debug for RuntimeRestrictedScanExec {
@@ -192,16 +206,35 @@ impl ExecutionPlan for RuntimeRestrictedScanExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        // The predicate belongs to the child scan, which is visited separately.
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Properties are read directly from the child in both replacement modes.
+        self.with_child(children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_child(children)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let input = children.pop().ok_or_else(|| {
-            datafusion_common::DataFusionError::Internal(
-                "RuntimeRestrictedScanExec needs one child".to_string(),
-            )
-        })?;
-        Ok(Arc::new(Self::new(input, Arc::clone(&self.provider))))
+        self.with_child(children)
     }
 
     fn execute(
@@ -230,7 +263,24 @@ impl ExecutionPlan for RuntimeRestrictedScanExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        StatisticsContext::new().compute(self, &StatisticsArgs::new().with_partition(partition))
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let [child_stats] = input_stats else {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "RuntimeRestrictedScanExec needs one child's statistics".to_string(),
+            ));
+        };
+        Ok(Arc::clone(child_stats))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
