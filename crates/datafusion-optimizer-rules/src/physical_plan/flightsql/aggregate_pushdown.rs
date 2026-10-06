@@ -300,6 +300,7 @@ mod tests {
         Decimal128Array, Float64Array, RecordBatch, StringViewArray, UInt64Array,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::common::TableReference;
     use datafusion::config::ConfigOptions;
     use datafusion::execution::TaskContext;
     use datafusion::functions_aggregate::average::avg_udaf;
@@ -313,12 +314,12 @@ mod tests {
     use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::union::UnionExec;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion::physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream, collect,
     };
     use datafusion::scalar::ScalarValue;
-    use datafusion::sql::TableReference;
     use datafusion_datasource::memory::MemorySourceConfig;
     use flight_client::cookie::CookieStore;
     use std::fmt;
@@ -488,7 +489,10 @@ mod tests {
             .into_iter()
             .map(|c| replace_pushdown_with_memory(Arc::clone(c), data))
             .collect::<Result<_>>()?;
-        plan.with_new_children(new_children)
+        plan.replace_children(
+            new_children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn plan_display(plan: &Arc<dyn ExecutionPlan>) -> String {
@@ -989,6 +993,17 @@ mod tests {
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }

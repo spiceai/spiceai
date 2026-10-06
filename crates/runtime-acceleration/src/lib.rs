@@ -19,6 +19,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 pub mod acceleration;
 pub mod acceleration_source;
+pub mod change_sink;
 pub mod dataset_checkpoint;
 mod engine;
 pub mod layout;

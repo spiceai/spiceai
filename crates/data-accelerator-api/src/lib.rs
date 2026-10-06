@@ -566,6 +566,21 @@ impl AcceleratorEngineRegistry {
 pub trait DataAccelerator: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
+    /// Binds engine-specific change capabilities to the composed write target.
+    /// Wrappers must preserve every write transformation. The caller supplies
+    /// a default provider-backed sink when the engine provides no binding.
+    ///
+    /// # Errors
+    /// Returns an error if the engine cannot bind a writer to the supplied context.
+    async fn change_sink(
+        &self,
+        _context: runtime_acceleration::change_sink::ChangeSinkContext,
+        _runtime: &tokio::runtime::Handle,
+        _capacity: usize,
+    ) -> datafusion::error::Result<Option<runtime_acceleration::change_sink::ChangeSink>> {
+        Ok(None)
+    }
+
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
@@ -1061,7 +1076,7 @@ impl AcceleratorExternalTableBuilder {
                 .build()
             })?,
             name: self.table_name.clone(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,

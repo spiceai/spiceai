@@ -1,10 +1,11 @@
 use crate::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownNode;
 use crate::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownMarkerExec;
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::common::{Result, plan_err};
-use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode};
 use std::sync::Arc;
 
@@ -25,7 +26,8 @@ impl ExtensionPlanner for DuckDBLogicalExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        _session_state: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(logical_marker) = node.as_any().downcast_ref::<DuckDBAggregatePushdownNode>() {
             if physical_inputs.len() != 1 {
