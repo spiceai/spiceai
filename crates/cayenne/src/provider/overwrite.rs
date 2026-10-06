@@ -537,10 +537,15 @@ impl CayenneTableProvider {
         // stats do not depend on which path a refresh took. NDV is included:
         // unlike a CDC delta, this batch IS the whole table, so its distinct
         // counts are exact and there is no later checkpoint to fold them in.
-        let stats = Arc::new(ColumnStatsAccumulator::new_with_ndv(
-            buffer.schema().as_ref(),
-            true,
-        ));
+        let stats = Arc::new(
+            ColumnStatsAccumulator::new_with_ndv(buffer.schema().as_ref(), true).map_err(|e| {
+                super::Error::Vortex {
+                    operation: "derive the column statistics types from the table schema",
+                    table: self.table_name().to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+        );
         for batch in buffer.batches() {
             stats.update(batch);
         }
@@ -704,7 +709,10 @@ impl CayenneTableProvider {
         // A key-deletion table rewrites files containing superseded copies.
         // Per-file statistics preserve exact counts for the surviving files.
         let file_stats = (postpass.is_some() && !self.should_capture_positions())
-            .then(|| Arc::new(FileStatsObserver::new(self.table_schema(), None)));
+            .then(|| {
+                FileStatsObserver::new(self.table_name(), &self.table_schema(), None).map(Arc::new)
+            })
+            .transpose()?;
         // Overwrite replaces the entire table, and anything that reached here did
         // not fit the inline caps, so it is large by definition; shard across the
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
@@ -972,7 +980,7 @@ impl CayenneTableProvider {
             .await
             .map_err(|source| super::Error::Catalog { source })?;
 
-        let folded = ColumnStatsAccumulator::new_with_ndv(&self.table_schema(), false);
+        let folded = file_stats.empty.empty_like();
         let mut superseded_file_rows: u64 = 0;
         for (name, stats) in file_stats.take() {
             if rewritten_names.contains(&name) {
@@ -1019,21 +1027,33 @@ pub(crate) struct WriteShape {
 /// forwards every batch to `inner`.
 #[derive(Debug)]
 pub(crate) struct FileStatsObserver {
-    schema: arrow_schema::SchemaRef,
+    /// An empty accumulator for the table schema, copied for each new file.
+    empty: ColumnStatsAccumulator,
     inner: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
     files: parking_lot::Mutex<HashMap<String, Arc<ColumnStatsAccumulator>>>,
 }
 
 impl FileStatsObserver {
+    /// # Errors
+    ///
+    /// Returns an error for a column whose Arrow type Vortex cannot represent.
     pub(crate) fn new(
-        schema: arrow_schema::SchemaRef,
+        table: &str,
+        schema: &arrow_schema::Schema,
         inner: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
-    ) -> Self {
-        Self {
-            schema,
+    ) -> Result<Self> {
+        let empty = ColumnStatsAccumulator::new_with_ndv(schema, false).map_err(|e| {
+            super::Error::Vortex {
+                operation: "derive the column statistics types from the table schema",
+                table: table.to_string(),
+                source: Box::new(e),
+            }
+        })?;
+        Ok(Self {
+            empty,
             inner,
             files: parking_lot::Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     /// Each file's statistics, by file name.
@@ -1057,7 +1077,7 @@ impl vortex_datafusion::VortexWriteObserver for FileStatsObserver {
                 if let Some(stats) = files.get(name) {
                     Arc::clone(stats)
                 } else {
-                    let stats = Arc::new(ColumnStatsAccumulator::new_with_ndv(&self.schema, false));
+                    let stats = Arc::new(self.empty.empty_like());
                     files.insert(name.to_string(), Arc::clone(&stats));
                     stats
                 }

@@ -5835,14 +5835,40 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
     Ok(())
 }
 
+/// Compare schema identity without source statistics, which do not describe the stored layout.
+/// Field metadata and all other schema metadata remain part of the comparison.
+fn configuration_schemas_match(left: &arrow_schema::Schema, right: &arrow_schema::Schema) -> bool {
+    use arrow_tools::metadata_keys::{
+        INFERRED_COLUMN_STATS_METADATA_KEY, INFERRED_ROW_COUNT_METADATA_KEY,
+        INFERRED_TABLE_BYTES_METADATA_KEY,
+    };
+
+    let is_statistic = |key: &str| {
+        matches!(
+            key,
+            INFERRED_COLUMN_STATS_METADATA_KEY
+                | INFERRED_ROW_COUNT_METADATA_KEY
+                | INFERRED_TABLE_BYTES_METADATA_KEY
+        )
+    };
+    left.fields() == right.fields()
+        && left
+            .metadata()
+            .iter()
+            .all(|(key, value)| is_statistic(key) || right.metadata().get(key) == Some(value))
+        && right
+            .metadata()
+            .iter()
+            .all(|(key, value)| is_statistic(key) || left.metadata().get(key) == Some(value))
+}
+
 /// Checks if the existing stored configuration matches the new [`CreateTableOptions`].
 ///
 /// Returns `true` if the configuration matches (no recreation needed).
 /// Only compares data-affecting fields; runtime tuning parameters like cache sizes
 /// and write/upload concurrency are excluded since they don't affect data correctness.
 fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
-    // Compare Arrow schema
-    if stored.schema.as_ref() != options.schema.as_ref() {
+    if !configuration_schemas_match(&stored.schema, &options.schema) {
         return false;
     }
 
@@ -5994,7 +6020,7 @@ fn log_configuration_differences(
         ));
     }
 
-    if stored.schema.as_ref() != options.schema.as_ref() {
+    if !configuration_schemas_match(&stored.schema, &options.schema) {
         differences.push("schema: <changed>".to_string());
     }
 
@@ -10866,6 +10892,185 @@ mod tests {
             vortex_config,
             current_sequence_number: 0,
         }
+    }
+
+    #[test]
+    fn test_configuration_statistics_schema_ignores_only_statistics() {
+        use arrow_schema::{DataType, Field, Schema};
+        use arrow_tools::metadata_keys::{
+            INFERRED_COLUMN_STATS_METADATA_KEY, INFERRED_ROW_COUNT_METADATA_KEY,
+            INFERRED_TABLE_BYTES_METADATA_KEY,
+        };
+
+        let field = Field::new("id", DataType::Int64, false);
+        for key in [
+            INFERRED_ROW_COUNT_METADATA_KEY,
+            INFERRED_TABLE_BYTES_METADATA_KEY,
+            INFERRED_COLUMN_STATS_METADATA_KEY,
+        ] {
+            let schemas = [None, Some("1"), Some("2")].map(|value| {
+                let mut metadata = HashMap::from([("owner".to_string(), "test".to_string())]);
+                if let Some(value) = value {
+                    metadata.insert(key.to_string(), value.to_string());
+                }
+                Schema::new_with_metadata(vec![field.clone()], metadata)
+            });
+            for left in &schemas {
+                for right in &schemas {
+                    assert!(configuration_schemas_match(left, right), "{key}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_configuration_statistics_schema_preserves_other_metadata() {
+        use arrow_schema::{DataType, Field, Schema};
+        use arrow_tools::metadata_keys::{
+            INFERRED_INDEXES_METADATA_KEY, INFERRED_PRIMARY_KEY_METADATA_KEY,
+            INFERRED_ROW_COUNT_METADATA_KEY, INFERRED_SHARD_KEY_METADATA_KEY,
+            INFERRED_SORT_COLUMNS_METADATA_KEY,
+        };
+
+        let field = Field::new("id", DataType::Int64, false);
+        let empty = Schema::new(vec![field.clone()]);
+        for key in [
+            "owner",
+            INFERRED_PRIMARY_KEY_METADATA_KEY,
+            INFERRED_INDEXES_METADATA_KEY,
+            INFERRED_SORT_COLUMNS_METADATA_KEY,
+            INFERRED_SHARD_KEY_METADATA_KEY,
+        ] {
+            let schema = |value: &str| {
+                Schema::new_with_metadata(
+                    vec![field.clone()],
+                    HashMap::from([
+                        (key.to_string(), value.to_string()),
+                        (
+                            INFERRED_ROW_COUNT_METADATA_KEY.to_string(),
+                            "10".to_string(),
+                        ),
+                    ]),
+                )
+            };
+            assert!(!configuration_schemas_match(&empty, &schema("old")));
+            assert!(!configuration_schemas_match(&schema("old"), &empty));
+            assert!(!configuration_schemas_match(&schema("old"), &schema("new")));
+        }
+    }
+
+    #[test]
+    fn test_configuration_statistics_schema_preserves_fields() {
+        use arrow_schema::{DataType, Field, Schema};
+        use arrow_tools::metadata_keys::INFERRED_ROW_COUNT_METADATA_KEY;
+
+        let id = Field::new("id", DataType::Int64, false);
+        let payload = Field::new("payload", DataType::Utf8, false);
+        let stored = Schema::new(vec![id.clone(), payload.clone()]);
+        let alternatives = [
+            vec![
+                Field::new("renamed", DataType::Int64, false),
+                payload.clone(),
+            ],
+            vec![Field::new("id", DataType::Int32, false), payload.clone()],
+            vec![id.clone().with_nullable(true), payload.clone()],
+            vec![
+                id.clone().with_metadata(HashMap::from([(
+                    INFERRED_ROW_COUNT_METADATA_KEY.to_string(),
+                    "10".to_string(),
+                )])),
+                payload.clone(),
+            ],
+            vec![payload.clone(), id.clone()],
+            vec![id.clone()],
+            vec![id, payload, Field::new("extra", DataType::Int32, true)],
+        ];
+        for fields in alternatives {
+            let requested = Schema::new_with_metadata(
+                fields,
+                HashMap::from([(
+                    INFERRED_ROW_COUNT_METADATA_KEY.to_string(),
+                    "10".to_string(),
+                )]),
+            );
+            assert!(!configuration_schemas_match(&stored, &requested));
+            assert!(!configuration_schemas_match(&requested, &stored));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_configuration_statistics_schema_preserves_catalog_on_reopen() {
+        use arrow_schema::{DataType, Field, Schema};
+        use arrow_tools::metadata_keys::{
+            INFERRED_ROW_COUNT_METADATA_KEY, INFERRED_TABLE_BYTES_METADATA_KEY,
+        };
+
+        let (_root, base_path) = test_table_root();
+        let connection = format!("sqlite://{base_path}/catalog.db");
+        let catalog = CayenneCatalog::new(&connection).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("id", DataType::Int64, false)],
+            HashMap::from([(
+                INFERRED_TABLE_BYTES_METADATA_KEY.to_string(),
+                "16384".to_string(),
+            )]),
+        ));
+        let mut options = CreateTableOptions {
+            table_name: "statistics_schema".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path,
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(options.clone())
+            .await
+            .expect("create table");
+        let stored = catalog
+            .get_table(&options.table_name)
+            .await
+            .expect("read table");
+        drop(catalog);
+        let catalog = CayenneCatalog::new(&connection).expect("reopen catalog");
+        catalog.init().await.expect("initialize reopened catalog");
+        options.schema = Arc::new(Schema::new_with_metadata(
+            schema.fields().clone(),
+            HashMap::from([
+                (
+                    INFERRED_TABLE_BYTES_METADATA_KEY.to_string(),
+                    "393216".to_string(),
+                ),
+                (
+                    INFERRED_ROW_COUNT_METADATA_KEY.to_string(),
+                    "1959".to_string(),
+                ),
+            ]),
+        ));
+        let validated = catalog
+            .validate_existing_table_configuration(&options.table_name, &options)
+            .await
+            .expect("statistics do not change schema identity");
+        assert_eq!(validated.table_id, table_id);
+        assert_eq!(validated.current_snapshot_id, stored.current_snapshot_id);
+        assert_eq!(validated.schema, schema);
+        assert_eq!(
+            catalog
+                .create_table(options.clone())
+                .await
+                .expect("reuse table"),
+            table_id
+        );
+        assert_eq!(
+            catalog
+                .get_table(&options.table_name)
+                .await
+                .expect("read retained table")
+                .schema,
+            schema
+        );
     }
 
     #[test]

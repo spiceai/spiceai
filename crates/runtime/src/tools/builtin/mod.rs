@@ -41,7 +41,7 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
     use runtime_query_engine::query_engine::QueryEngine;
     use runtime_request_context::{Protocol, RequestContext};

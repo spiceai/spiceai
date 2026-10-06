@@ -750,22 +750,24 @@ impl PartitionStream for ReadBack {
                 let projection = projection.clone();
                 let range_filter = range_filter.clone();
                 async move {
+                    let external = |e| datafusion_common::DataFusionError::External(Box::new(e));
                     let session = VortexSession::default();
                     let vxf = session
                         .open_options()
-                        .open_object_store(&this.store, &path)
+                        .open_object_store(
+                            &this.store,
+                            object_store::path::Path::from(path.as_str()),
+                        )
                         .await
-                        .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
-                    let mut scan = vxf
-                        .scan()
-                        .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+                        .map_err(external)?;
+                    let mut scan = vxf.scan().map_err(external)?;
                     if let Some(Some(filter)) = range_filter {
-                        scan = scan.with_filter(filter);
+                        scan = scan.with_filter(filter.bind(vxf.dtype()).map_err(external)?);
                     }
                     let chunks = scan
-                        .with_projection(projection)
+                        .with_projection(projection.bind(vxf.dtype()).map_err(external)?)
                         .into_stream()
-                        .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+                        .map_err(external)?;
                     let batches = chunks.map(move |chunk| {
                         let chunk = chunk.map_err(|e| {
                             datafusion_common::DataFusionError::External(Box::new(e))
@@ -1315,17 +1317,25 @@ async fn sample_cut_points(
             continue;
         }
         let take = rows.min(SAMPLE_ROWS_PER_FILE);
-        let indices: vortex::buffer::Buffer<u64> = (0..take).map(|i| i * rows / take).collect();
+        // `take` is at most `rows`, so the evenly spaced indices strictly increase.
+        let indices = vortex::scan::strict_sorted_buffer::StrictSortedBuffer::try_new(
+            (0..take).map(|i| i * rows / take).collect(),
+        )
+        .ok()?;
         let vxf = session
             .open_options()
-            .open_object_store(store, &paths[file as usize])
+            .open_object_store(
+                store,
+                object_store::path::Path::from(paths[file as usize].as_str()),
+            )
             .await
             .ok()?;
+        let projection = get_item(column, root()).bind(vxf.dtype()).ok()?;
         let mut chunks = vxf
             .scan()
             .ok()?
             .with_row_indices(indices)
-            .with_projection(get_item(column, root()))
+            .with_projection(projection)
             .into_stream()
             .ok()?;
         while let Some(chunk) = chunks.next().await {

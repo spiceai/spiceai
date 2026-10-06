@@ -130,7 +130,11 @@ impl CayenneTableProvider {
             target_partitions,
             write_policy: super::delta_encoding::WritePolicy::DELTA,
         };
-        let file_stats = Arc::new(FileStatsObserver::new(self.table_schema(), None));
+        let file_stats = Arc::new(FileStatsObserver::new(
+            self.table_name(),
+            &self.table_schema(),
+            None,
+        )?);
         self.staging_may_have_files().store(true, Ordering::Release);
         let (rows, _, stats) = self
             .write_to_snapshot_with_schema(
@@ -185,7 +189,8 @@ impl CayenneTableProvider {
         };
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let file_stats = (!self.should_capture_positions())
-            .then(|| Arc::new(FileStatsObserver::new(Arc::clone(&schema), None)));
+            .then(|| FileStatsObserver::new(self.table_name(), &schema, None).map(Arc::new))
+            .transpose()?;
         let start = Instant::now();
         let written: Result<ResolvedFiles> = async {
             let (rows, _, stats) = self

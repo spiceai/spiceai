@@ -38,9 +38,10 @@ use arrow::json::reader::{ValueIter, infer_json_schema_from_iterator};
 use async_trait::async_trait;
 use bytes::Buf;
 use datafusion::common::parsers::CompressionTypeVariant;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering};
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::projection::ProjectionExprs;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
@@ -579,6 +580,12 @@ impl DataSource for NonRepartitionedFileScanConfig {
     }
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.inner.partition_statistics(partition)
+    }
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
     }
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
         self.inner.with_fetch(limit)

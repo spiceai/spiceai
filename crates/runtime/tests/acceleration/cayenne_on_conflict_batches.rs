@@ -74,7 +74,7 @@ fn conflict_cause(key: &str) -> String {
 
 /// The dataset's error, once it reports one.
 async fn dataset_error(rt: &Runtime) -> Option<String> {
-    let name = datafusion::sql::TableReference::from("t");
+    let name = datafusion::common::TableReference::from("t");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(ComponentStatus::Error(message)) =
