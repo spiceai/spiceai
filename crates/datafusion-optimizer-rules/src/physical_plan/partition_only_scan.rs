@@ -87,6 +87,7 @@ limitations under the License.
 //! static predicate, or a dynamic filter already narrowed to something else,
 //! still bails to the probe.
 
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, new_empty_array};
@@ -152,7 +153,10 @@ impl PhysicalOptimizerRule for PartitionOnlyScanRewrite {
 
             let input = Arc::clone(aggregate.input());
             match rewrite_partition_only_scan(&input)? {
-                Some(new_input) => Ok(Transformed::yes(node.with_new_children(vec![new_input])?)),
+                Some(new_input) => Ok(Transformed::yes(node.replace_children(
+                    vec![new_input],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )?)),
                 None => Ok(Transformed::no(node)),
             }
         })
@@ -194,7 +198,10 @@ fn rewrite_partition_only_scan(
     }
 
     match rewrite_partition_only_scan(children[0])? {
-        Some(new_child) => Ok(Some(Arc::clone(plan).with_new_children(vec![new_child])?)),
+        Some(new_child) => Ok(Some(Arc::clone(plan).replace_children(
+            vec![new_child],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?)),
         None => Ok(None),
     }
 }
@@ -307,12 +314,13 @@ fn partition_only_file_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&FileScanCo
         .as_ref()
         .downcast_ref::<FileScanConfig>()?;
 
-    // When the scan is organized by partition value it advertises hash
-    // partitioning on the partition columns, which a downstream aggregate may
-    // rely on for its input distribution (so no repartition was inserted). A
-    // replacement cannot always advertise that partitioning, so leave such a
-    // scan untouched rather than risk an unsatisfied distribution requirement.
-    if config.partitioned_by_file_group {
+    // When the scan declares an output partitioning (for example hash
+    // partitioning on the partition columns when it is organized by partition
+    // value), a downstream aggregate may rely on it for its input distribution
+    // (so no repartition was inserted). A replacement cannot always advertise
+    // that partitioning, so leave such a scan untouched rather than risk an
+    // unsatisfied distribution requirement.
+    if config.output_partitioning.is_some() {
         return None;
     }
 
