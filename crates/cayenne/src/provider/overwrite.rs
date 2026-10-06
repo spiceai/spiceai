@@ -514,10 +514,15 @@ impl CayenneTableProvider {
         // stats do not depend on which path a refresh took. NDV is included:
         // unlike a CDC delta, this batch IS the whole table, so its distinct
         // counts are exact and there is no later checkpoint to fold them in.
-        let stats = Arc::new(ColumnStatsAccumulator::new_with_ndv(
-            buffer.schema().as_ref(),
-            true,
-        ));
+        let stats = Arc::new(
+            ColumnStatsAccumulator::new_with_ndv(buffer.schema().as_ref(), true).map_err(|e| {
+                super::Error::Vortex {
+                    operation: "derive the column statistics types from the table schema",
+                    table: self.table_name().to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+        );
         for batch in buffer.batches() {
             stats.update(batch);
         }
