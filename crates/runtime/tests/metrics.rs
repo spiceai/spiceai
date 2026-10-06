@@ -1448,3 +1448,81 @@ async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
     assert_eq!(superseded("superseded_unique", "arrival"), Some(0.0));
     assert_eq!(superseded("superseded_keyless", "arrival"), None);
 }
+
+/// A user's statement reports the rows it received but did not keep: an `INSERT`
+/// repeating a key counts the copy that arrived first as `arrival`.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cayenne_statement_reports_the_rows_it_supersedes() {
+    use runtime_request_context::{Protocol, RequestContext};
+    use spicepod::acceleration::OnConflictBehavior;
+    use spicepod::component::access::AccessMode;
+
+    let registry = &*PROMETHEUS;
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let path = dir.path().join("statement.csv");
+    std::fs::write(&path, "id,v\n1,seed\n").expect("write the fixture CSV");
+    let mut dataset = Dataset::new(format!("file://{}", path.display()), "superseded_statement");
+    dataset.access = AccessMode::ReadWrite;
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Full),
+        params: Some(Params::from_string_map(
+            [(
+                "cayenne_file_path".to_string(),
+                dir.path().join("cayenne").display().to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        )),
+        primary_key: Some("id".to_string()),
+        // Keeps the statement's writes in the acceleration.
+        on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
+        ..Acceleration::default()
+    });
+    let app = AppBuilder::new("metrics_superseded_statement")
+        .with_dataset(dataset)
+        .with_runtime(SpicepodRuntime {
+            task_history: TaskHistory {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+        .await
+        .expect("the dataset to load within a minute");
+    assert!(
+        wait_until(Duration::from_mins(1), || async { rt.status().is_ready() }).await,
+        "the runtime never reported ready, so the dataset never loaded"
+    );
+
+    Arc::new(RequestContext::builder(Protocol::Http).build())
+        .scope(async {
+            let mut result = QueryBuilder::new(
+                "INSERT INTO superseded_statement VALUES (2, 'a'), (2, 'b'), (3, 'c')",
+                rt.datafusion(),
+            )
+            .build()
+            .run()
+            .await
+            .expect("the insert to run");
+            while let Some(batch) = result.data.next().await {
+                batch.expect("the insert to complete");
+            }
+        })
+        .await;
+
+    assert_eq!(
+        counter_value(
+            registry,
+            "dataset_acceleration_rows_superseded",
+            &[("dataset", "superseded_statement"), ("reason", "arrival")],
+        ),
+        Some(1.0)
+    );
+}

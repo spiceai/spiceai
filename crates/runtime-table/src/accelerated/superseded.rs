@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `dataset_acceleration_rows_superseded`: the rows a refresh received but the
-//! accelerated table did not keep (#14576).
+//! `dataset_acceleration_rows_superseded`: the rows a refresh or a user's
+//! statement received but the accelerated table did not keep (#14576).
 
 use runtime_metrics::acceleration as metrics;
 use util::session_state::{SupersededReason, SupersededRows};

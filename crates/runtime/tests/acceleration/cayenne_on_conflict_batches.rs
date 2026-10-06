@@ -364,6 +364,68 @@ async fn an_update_repeating_a_key_follows_upsert() {
         .await;
 }
 
+/// An `INSERT` reports the rows it inserted or replaced, as PostgreSQL does: a
+/// copy of a key that a later copy in the same statement replaced is not counted,
+/// and a row replacing a stored key is (#14576).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_insert_counts_the_rows_it_inserted_or_replaced() {
+    test_request_context()
+        .scope(async {
+            let rows = "id,region,ts,v\n1,us,2026-01-01T00:00:00,stored\n";
+            for mode in [Mode::Memory, Mode::File] {
+                let case = Case {
+                    mode,
+                    refresh: RefreshMode::Full,
+                    partitioned: false,
+                };
+                let label = format!("{}/insert", case.label());
+                let (rt, ready, _dir) = load_with_access(
+                    rows,
+                    &case,
+                    // `on_conflict` keeps a read-write dataset's writes in the
+                    // acceleration.
+                    Some(OnConflictBehavior::Upsert),
+                    &label,
+                    AccessMode::ReadWrite,
+                )
+                .await;
+                assert!(ready, "{label}: the stored row loads");
+                let batches = rt
+                    .datafusion()
+                    .query_builder(
+                        "INSERT INTO t VALUES \
+                         (1, 'us', TIMESTAMP '2026-01-02T00:00:00', 'replaced'), \
+                         (2, 'us', TIMESTAMP '2026-01-02T00:00:00', 'first'), \
+                         (2, 'us', TIMESTAMP '2026-01-02T00:00:00', 'second'), \
+                         (3, 'us', TIMESTAMP '2026-01-02T00:00:00', 'new')",
+                    )
+                    .build()
+                    .run()
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: the insert plans: {error}"))
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: the insert runs: {error}"));
+                let reported: Vec<u64> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_primitive::<arrow::datatypes::UInt64Type>()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                assert_eq!(reported, [3], "{label}: rows inserted or replaced");
+                assert_eq!(count(&rt).await, 3, "{label}: one row per key");
+                assert_eq!(value_of(&rt, 1).await, ["replaced"], "{label}: key 1");
+                assert_eq!(value_of(&rt, 2).await, ["second"], "{label}: key 2");
+            }
+        })
+        .await;
+}
+
 /// A parent with a `localpod` child refreshes through the child-syncing sink, and
 /// still keeps the last arrival of a key its data repeats across batches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2016,7 +2016,14 @@ impl AcceleratedTable {
     /// accelerator accepts the write, and which refuses a write outside a
     /// transaction at execute time. Stamping there too would move the marker
     /// for a write its own validation went on to refuse.
-    fn guard_accelerator_write(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    ///
+    /// `superseded` holds the rows the write does not keep, recorded with the
+    /// timestamp.
+    fn guard_accelerator_write(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        superseded: Option<Arc<util::session_state::SupersededRows>>,
+    ) -> Arc<dyn ExecutionPlan> {
         if !self.write_mode.reaches_accelerator() {
             return plan;
         }
@@ -2030,6 +2037,7 @@ impl AcceleratedTable {
             plan,
             Arc::clone(&self.accelerator_write_mutex),
             last_updated_at,
+            superseded,
             self.dataset_name.clone(),
         ))
     }
@@ -2190,13 +2198,28 @@ impl TableLayer for AcceleratedTable {
 
         self.stamp_unguarded_write();
 
+        let mut superseded = None;
         let plan = match &self.write_mode {
             WriteMode::AcceleratorOnly => {
                 // When on_conflict is configured, writes go only to the accelerator
                 // (the federated source may not support writes, e.g., file connector).
+                // The accelerator counts the rows the statement does not keep into
+                // the session it runs on; they are recorded once the write completes.
+                let counting = state
+                    .as_any()
+                    .downcast_ref::<datafusion::execution::SessionState>()
+                    .map(|state| {
+                        let rows = Arc::new(util::session_state::SupersededRows::default());
+                        superseded = Some(Arc::clone(&rows));
+                        util::session_state::with_superseded_rows(state, rows)
+                    });
+                let session: &dyn Session = match &counting {
+                    Some(counting) => counting,
+                    None => state,
+                };
                 let accelerated_insert_plan = self
                     .accelerator
-                    .insert_into(state, input, overwrite)
+                    .insert_into(session, input, overwrite)
                     .await?;
                 self.refresher().set_initial_load_completed(true);
                 accelerated_insert_plan
@@ -2233,7 +2256,7 @@ impl TableLayer for AcceleratedTable {
             )?,
         };
 
-        Ok(self.guard_accelerator_write(plan))
+        Ok(self.guard_accelerator_write(plan, superseded))
     }
 
     async fn delete_from(
@@ -2280,7 +2303,7 @@ impl TableLayer for AcceleratedTable {
             }
         };
 
-        Ok(self.guard_accelerator_write(plan))
+        Ok(self.guard_accelerator_write(plan, None))
     }
 
     async fn update(
@@ -2333,7 +2356,7 @@ impl TableLayer for AcceleratedTable {
             }
         };
 
-        Ok(self.guard_accelerator_write(plan))
+        Ok(self.guard_accelerator_write(plan, None))
     }
 
     async fn truncate(
@@ -2373,7 +2396,7 @@ impl TableLayer for AcceleratedTable {
             }
         };
 
-        Ok(self.guard_accelerator_write(plan))
+        Ok(self.guard_accelerator_write(plan, None))
     }
 
     async fn scan_with_args<'a>(
