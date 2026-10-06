@@ -26,8 +26,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{ArrowNativeType, DataType};
 use data_components::cdc::{ChangeBatch, ChangeOperation};
+use datafusion::common::TableReference;
 use datafusion::error::Result;
-use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use runtime_metrics::acceleration as metrics;
 

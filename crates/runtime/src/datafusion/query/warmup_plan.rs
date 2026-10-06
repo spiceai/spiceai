@@ -26,9 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::Field;
+use datafusion::common::TableReference;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, expr::Placeholder};
-use datafusion::sql::TableReference;
 use serde::{Deserialize, Serialize};
 
 /// A query shape that can be replayed with fresh key values from the dataset.
