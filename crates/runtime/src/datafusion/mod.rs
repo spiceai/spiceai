@@ -256,6 +256,13 @@ pub enum Error {
     #[snafu(display("Unable to delete table: {reason}"))]
     UnableToDeleteTable { reason: String },
 
+    /// The engine's own validation or initialization failed, as distinct from the
+    /// storage lifecycle around it. Callers name the engine.
+    #[snafu(display("{source}"))]
+    AcceleratorInitialization {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display(
         "Failed to drain changes for dataset '{dataset_name}', so its acceleration cannot be replaced: {source}"
     ))]
@@ -1018,6 +1025,32 @@ mod bootstrap_generation_tests {
                 .await
                 .expect("revoked owner drained"),
         );
+    }
+}
+
+/// An engine's `init` failure carried through generation construction.
+#[derive(Debug, Snafu)]
+#[snafu(display("{source}"))]
+struct EngineInitialization {
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// Report an engine's own failure as such, and anything else as a lifecycle failure.
+fn initialization_error(error: DataFusionError, dataset_name: String) -> Error {
+    match error {
+        DataFusionError::External(error) => match error.downcast::<EngineInitialization>() {
+            Ok(error) => Error::AcceleratorInitialization {
+                source: error.source,
+            },
+            Err(error) => Error::UnableToDrainChanges {
+                dataset_name,
+                source: DataFusionError::External(error),
+            },
+        },
+        error => Error::UnableToDrainChanges {
+            dataset_name,
+            source: error,
+        },
     }
 }
 
@@ -3332,10 +3365,7 @@ impl DataFusion {
         accelerator
             .validate_init(dataset.as_ref())
             .await
-            .map_err(DataFusionError::External)
-            .context(UnableToDrainChangesSnafu {
-                dataset_name: name.clone(),
-            })?;
+            .context(AcceleratorInitializationSnafu)?;
         let mut permit = self.generation_lock(&dataset.name).await?;
         permit
             .drain_previous()
@@ -3350,18 +3380,15 @@ impl DataFusion {
         );
         let initialized = permit
             .construct(&self.io_runtime, async move {
-                let status = accelerator
-                    .init(dataset.as_ref())
-                    .await
-                    .map_err(DataFusionError::External)?;
+                let status = accelerator.init(dataset.as_ref()).await.map_err(|source| {
+                    DataFusionError::External(Box::new(EngineInitialization { source }))
+                })?;
                 Ok(GenerationOwner::new(status, || {
                     runtime_acceleration::change_sink::Publication::Ready
                 }))
             })
             .await
-            .context(UnableToDrainChangesSnafu {
-                dataset_name: name.clone(),
-            })?;
+            .map_err(|error| initialization_error(error, name.clone()))?;
         initialized
             .ensure_open()
             .context(UnableToDrainChangesSnafu {

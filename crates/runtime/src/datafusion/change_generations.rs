@@ -346,7 +346,7 @@ impl Drop for GenerationPermit {
 
 fn fenced(name: &ResolvedTableReference, reason: &str) -> DataFusionError {
     DataFusionError::Execution(format!(
-        "Change generation for dataset '{name}' remains fenced: {reason}"
+        "Change generation for dataset '{name}' remains fenced: {reason}. Restart the runtime to load the dataset again"
     ))
 }
 

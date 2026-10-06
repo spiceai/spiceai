@@ -2681,8 +2681,17 @@ impl Runtime {
                 match df
                     .initialize_accelerator(Arc::clone(&ds), accelerator)
                     .await
-                    .context(UnableToCreateAcceleratedTableSnafu {
-                        dataset: ds.name.clone(),
+                    .map_err(|error| match error {
+                        crate::datafusion::Error::AcceleratorInitialization { source } => {
+                            Error::AcceleratorInitializationFailed {
+                                name: acceleration_settings.engine.to_string(),
+                                source,
+                            }
+                        }
+                        error => Error::UnableToCreateAcceleratedTable {
+                            dataset: ds.name.clone(),
+                            source: Box::new(error),
+                        },
                     }) {
                     Ok(bootstrap_status) => {
                         if bootstrap_status.is_bootstrapped() {
