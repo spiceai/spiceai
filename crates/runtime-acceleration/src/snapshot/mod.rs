@@ -40,7 +40,7 @@ use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Write,
     ops::Not,
     path::{Path, PathBuf},
@@ -1919,8 +1919,8 @@ impl SnapshotManager {
         }
 
         let start_time = Instant::now();
-        let now = Utc::now();
         let layout = SnapshotPathLayout::new(&self.dataset_name, &self.engine);
+        let now = self.unrecorded_instant(&layout, Utc::now()).await?;
         let destination_location = layout.build_location(&self.snapshots_location, now);
         let timestamp_ms = now.timestamp_millis();
 
@@ -1985,6 +1985,37 @@ impl SnapshotManager {
         );
 
         Ok(Some(destination_location))
+    }
+
+    /// The first second at or after `instant` whose snapshot location no recorded entry of
+    /// this dataset uses. Snapshot names have one-second resolution, so a second publish
+    /// within the same second would otherwise upload over the bytes an existing entry
+    /// describes, and that entry could no longer be restored.
+    async fn unrecorded_instant(
+        &self,
+        layout: &SnapshotPathLayout<'_>,
+        mut instant: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, SnapshotUploadError> {
+        let Some(handle) = self.load_metadata().await? else {
+            return Ok(instant);
+        };
+        let Some(dataset) = handle.metadata.datasets.get(&self.dataset_name) else {
+            return Ok(instant);
+        };
+        let recorded: HashSet<&str> = dataset
+            .snapshots
+            .iter()
+            .map(|entry| entry.snapshot.as_str())
+            .collect();
+        while recorded.contains(
+            self.snapshot_uri_for_location(
+                &layout.build_location(&self.snapshots_location, instant),
+            )
+            .as_str(),
+        ) {
+            instant += chrono::TimeDelta::seconds(1);
+        }
+        Ok(instant)
     }
 
     /// Refuses to publish to a location whose store does not enforce conditional writes.
@@ -5587,6 +5618,89 @@ mod tests {
         )
         .await;
         assert_eq!(entries.len(), 3, "every publish is recorded: {entries:?}");
+        // Each publish has its own object, holding the bytes its entry records, so every
+        // entry can be restored.
+        let uris: HashSet<&str> = entries
+            .iter()
+            .map(|entry| entry.snapshot.as_str())
+            .collect();
+        assert_eq!(
+            uris.len(),
+            3,
+            "each publish has its own snapshot object: {entries:?}"
+        );
+        for entry in &entries {
+            let object = manager
+                .snapshot_uri_to_object_path(&entry.snapshot, None)
+                .expect("snapshot object path");
+            let size = store.head(&object).await.expect("snapshot object").size;
+            assert_eq!(
+                size, entry.snapshot_size,
+                "the object behind {} holds the bytes its entry records",
+                entry.snapshot
+            );
+        }
+    }
+
+    /// A publish in the second of a recorded entry moves to the next free second, so it
+    /// cannot upload over the bytes that entry describes.
+    #[tokio::test]
+    async fn a_publish_in_a_recorded_second_moves_to_the_next_free_second() {
+        let dir = TempDir::new().expect("tempdir");
+        let location =
+            Url::from_directory_path(dir.path().join("snapshots")).expect("directory url");
+        let config = spicepod::component::snapshot::Snapshots {
+            enabled: true,
+            location: Some(location.to_string()),
+            bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Warn,
+            params: None,
+        };
+        let (store, snapshots_location) = build_snapshot_object_store(
+            &location,
+            &config,
+            Arc::new(RwLock::new(Secrets::new())),
+            Handle::current(),
+            DATASET_NAME,
+        )
+        .await
+        .expect("a file location builds a store");
+        let local_path = dir.path().join("accelerated.db");
+        std::fs::write(&local_path, b"first").expect("write accelerator file");
+        let schema = sample_schema();
+        let mut manager = build_manager_over(Arc::clone(&store), local_path, &schema);
+        manager.snapshots_location = snapshots_location.clone();
+        manager.snapshot_location_uri = location.to_string();
+        publish(&manager, &schema)
+            .await
+            .expect("publish to a file location")
+            .expect("snapshot created");
+        let entries =
+            dataset_entries(store.as_ref(), &snapshots_location.join(METADATA_FILE_NAME)).await;
+        let recorded =
+            DateTime::from_timestamp_millis(entries[0].timestamp_ms).expect("recorded instant");
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &manager.engine);
+
+        let next = manager
+            .unrecorded_instant(&layout, recorded)
+            .await
+            .expect("metadata read");
+        assert_eq!(next, recorded + chrono::TimeDelta::seconds(1));
+        assert_ne!(
+            manager.snapshot_uri_for_location(
+                &layout.build_location(&manager.snapshots_location, next)
+            ),
+            entries[0].snapshot
+        );
+
+        let unused = recorded + chrono::TimeDelta::seconds(5);
+        assert_eq!(
+            manager
+                .unrecorded_instant(&layout, unused)
+                .await
+                .expect("metadata read"),
+            unused,
+            "a second no entry uses is kept"
+        );
     }
 
     /// A store that accepts write conditions and ignores them is refused before anything
