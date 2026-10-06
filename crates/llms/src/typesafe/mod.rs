@@ -24,7 +24,6 @@ limitations under the License.
 //! <https://typesafe.ai/blog/introducing-system-one-models-and-jev>.
 
 mod list_models;
-mod rerank;
 
 use list_models::ModelsResponse;
 pub use list_models::TypeSafeModelLister;
@@ -43,7 +42,6 @@ use runtime_rate_control::RateController;
 use snafu::ResultExt;
 
 use crate::provider::create_http_client;
-use crate::rerank::LlmStrategy;
 
 /// Default `TypeSafe` API base URL (direct API, not the Vercel AI gateway).
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
@@ -60,8 +58,6 @@ pub struct TypeSafe {
     model_id: String,
     api_key: String,
     rate_controller: Arc<RateController>,
-    /// How [`rerank_api::Rerank`] asks for document scores.
-    rerank_strategy: LlmStrategy,
 }
 
 impl Debug for TypeSafe {
@@ -70,7 +66,6 @@ impl Debug for TypeSafe {
             .field("name", &self.name)
             .field("model_id", &self.model_id)
             .field("base_url", &self.base_url)
-            .field("rerank_strategy", &self.rerank_strategy)
             .finish_non_exhaustive()
     }
 }
@@ -100,9 +95,6 @@ impl TypeSafe {
             model_id: normalize_model_id(model_id),
             api_key: api_key.into(),
             rate_controller: RateController::builder().build(),
-            // Not `LlmStrategy::default()` (listwise): pointwise keeps each document's
-            // score independent of the other candidates in the request.
-            rerank_strategy: LlmStrategy::Pointwise,
         })
     }
 
@@ -115,12 +107,6 @@ impl TypeSafe {
     #[must_use]
     pub fn with_rate_controller(mut self, rate_controller: Arc<RateController>) -> Self {
         self.rate_controller = rate_controller;
-        self
-    }
-
-    #[must_use]
-    pub fn with_rerank_strategy(mut self, strategy: LlmStrategy) -> Self {
-        self.rerank_strategy = strategy;
         self
     }
 

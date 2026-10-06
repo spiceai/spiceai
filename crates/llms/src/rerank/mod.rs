@@ -27,10 +27,13 @@ limitations under the License.
 //! - **LLM-backed**: any model in the chat-completion store can be used as a
 //!   reranker via [`LlmRerank`], which prompts the model listwise or
 //!   pointwise and parses JSON scores from the response.
+//! - **Evaluation-backed**: any evaluation model (e.g. `TypeSafe` Jev) can be
+//!   used via [`EvaluateRerank`], which asks a `noul` relevance question per
+//!   document.
 //!
-//! The `rerank()` UDTF looks up a model name first in the reranker store and
-//! then falls back to wrapping a chat model in [`LlmRerank`] — so users can
-//! use any already-registered chat model as a reranker without extra config.
+//! The `rerank()` UDTF looks up a model name in the reranker store, then the
+//! chat store ([`LlmRerank`]), then the evaluation store ([`EvaluateRerank`])
+//! — so users can rerank with any already-registered model without extra config.
 
 use async_trait::async_trait;
 
@@ -46,6 +49,7 @@ use crate::chat as llms_chat_module;
 use llms_chat_module::Chat;
 
 pub mod cohere;
+pub mod evaluate;
 pub mod http;
 pub mod jina;
 pub mod voyage;
@@ -56,6 +60,7 @@ pub mod voyage;
 pub mod tei;
 
 pub use cohere::CohereReranker;
+pub use evaluate::EvaluateRerank;
 pub use http::HttpReranker;
 pub use jina::JinaReranker;
 #[cfg(feature = "local_embed")]

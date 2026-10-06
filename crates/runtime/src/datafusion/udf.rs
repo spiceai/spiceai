@@ -39,7 +39,7 @@ use runtime_datafusion_udfs::{ai::Ai, embed};
 use runtime_datafusion_udfs::{ai::AI_UDF_NAME, embed::EMBED_UDF_NAME};
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_search::full_text_udtf::TextSearchTableFunc;
-use runtime_search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
+use runtime_search::rerank::{RERANK_UDTF_NAME, RerankModelStores, RerankTableFunc};
 use runtime_search::rrf;
 use runtime_search::rrf::RRF_UDF_NAME;
 use runtime_search::search_engine::parse_explicit_primary_keys;
@@ -114,21 +114,17 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     // actual `FROM rerank(...)` implementation).
     let weak_df: std::sync::Weak<dyn runtime_query_engine::query_engine::QueryEngine> =
         Arc::downgrade(&runtime.df) as _;
+    let rerank_models = RerankModelStores {
+        rerankers: runtime.rerankers(),
+        chat_models: runtime.completion_llms(),
+        evaluate_models: runtime.evaluate_models(),
+    };
     ctx.register_udf(
-        RerankTableFunc::new(
-            std::sync::Weak::clone(&weak_df),
-            runtime.rerankers(),
-            runtime.completion_llms(),
-        )
-        .into(),
+        RerankTableFunc::new(std::sync::Weak::clone(&weak_df), rerank_models.clone()).into(),
     );
     ctx.register_udtf(
         RERANK_UDTF_NAME,
-        Arc::new(RerankTableFunc::new(
-            weak_df,
-            runtime.rerankers(),
-            runtime.completion_llms(),
-        )),
+        Arc::new(RerankTableFunc::new(weak_df, rerank_models)),
     );
 
     // `flatten_json_properties` / `flatten_json` / `json_tree` — JSON-Schema
