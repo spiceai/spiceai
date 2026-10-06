@@ -122,6 +122,34 @@ fn timed_events_dataset(dir: &Path, name: &str) -> Dataset {
     dataset
 }
 
+/// Both retention policies at once: `retention_sql` deletes soft-deleted rows
+/// and `retention_period` deletes rows older than an hour.
+#[cfg(feature = "duckdb")]
+fn combined_retention_dataset(dir: &Path, name: &str) -> Dataset {
+    let mut dataset = Dataset::new(
+        format!("file://{}", dir.join("retained.csv").display()),
+        name,
+    );
+    dataset.params = Some(Params::from_string_map(
+        [("file_format".to_string(), "csv".to_string())].into(),
+    ));
+    dataset.time_column = Some("ts".to_string());
+    dataset.time_format = Some(TimeFormat::UnixSeconds);
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        on_zero_results: ZeroResultsAction::UseSource,
+        refresh_sql: Some(format!("SELECT * FROM {name} WHERE id <= 4")),
+        refresh_data_window: Some("10000d".to_string()),
+        retention_sql: Some(format!("DELETE FROM {name} WHERE deleted = true")),
+        retention_check_enabled: true,
+        retention_check_interval: Some("200ms".to_string()),
+        retention_period: Some("1h".to_string()),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
 #[cfg(not(target_os = "windows"))]
 fn cayenne_time_dataset(source: &Path, name: &str, scheduled_ticker: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", source.display()), name);
@@ -296,6 +324,84 @@ async fn duckdb_time_retention_does_not_resurrect_via_fallback() -> anyhow::Resu
                 vec![3],
                 "a recent row never loaded must still fall back"
             );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// With `retention_sql` and `retention_period` both set, fallback returns only
+/// the rows neither policy deletes. A NULL `deleted` or `ts` matches neither
+/// delete, so the accelerator would keep that row, and so must fallback.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_combined_retention_does_not_resurrect_via_fallback() -> anyhow::Result<()> {
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            // 4_102_444_800 is 2100-01-01; 1_000_000_000 is 2001-09-09. Refresh
+            // loads ids 1-4: 1 is kept, 2 is soft-deleted, 3 has expired, and 4
+            // is both. Ids 5-9 are never loaded: 5 is kept, 6 has a NULL
+            // `deleted`, 7 has a NULL `ts`, 8 is soft-deleted, and 9 has expired.
+            std::fs::write(
+                dir.path().join("retained.csv"),
+                "id,ts,deleted\n\
+                 1,4102444800,false\n\
+                 2,4102444800,true\n\
+                 3,1000000000,false\n\
+                 4,1000000000,true\n\
+                 5,4102444800,false\n\
+                 6,4102444800,\n\
+                 7,,false\n\
+                 8,4102444800,true\n\
+                 9,1000000000,false\n",
+            )?;
+
+            let app = AppBuilder::new("combined_retention_fallback")
+                .with_dataset(combined_retention_dataset(dir.path(), "retained"))
+                .build();
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, Duration::from_mins(1)).await?;
+
+            let evicted = wait_until_true(Duration::from_secs(10), || {
+                let rt = Arc::clone(&rt);
+                async move { accelerator_ids(&rt, "retained").await == vec![1] }
+            })
+            .await;
+            assert!(
+                evicted,
+                "refresh must load ids 1-4 and retention must leave only id=1, leftover {:?}",
+                accelerator_ids(&rt, "retained").await
+            );
+
+            for (id, what) in [
+                (2, "a soft-deleted row"),
+                (3, "an expired row"),
+                (4, "a soft-deleted, expired row"),
+                (8, "a soft-deleted row never loaded"),
+                (9, "an expired row never loaded"),
+            ] {
+                let rows =
+                    run_query(&rt, &format!("SELECT id FROM retained WHERE id = {id}")).await?;
+                assert_eq!(
+                    ids(&rows),
+                    Vec::<i64>::new(),
+                    "{what} (id={id}) must not come back from the source"
+                );
+            }
+
+            let fallback = run_query(&rt, "SELECT id FROM retained WHERE id >= 5").await?;
+            assert_eq!(
+                ids(&fallback),
+                vec![5, 6, 7],
+                "the never-loaded rows retention keeps, including a NULL `deleted` and a NULL `ts`, must fall back"
+            );
+
+            let kept = run_query(&rt, "SELECT id FROM retained WHERE id = 1").await?;
+            assert_eq!(ids(&kept), vec![1]);
 
             rt.shutdown().await;
             Ok(())
