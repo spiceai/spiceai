@@ -19939,7 +19939,7 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Lock-free, throttled cleanup of orphaned key-based deletion vectors (issue
+    /// Throttled cleanup of orphaned key-based deletion vectors (issue
     /// #9388). Reclaims the `.arrow` files (and their catalog rows) that a raised
     /// surviving-sequence floor leaves behind: an orphaned key DV lives in the
     /// CURRENT snapshot's `deletions/` dir, which never rotates under sustained
@@ -19950,7 +19950,8 @@ impl CayenneTableProvider {
     /// Runs entirely OFF every write critical section: it holds NO `write_lock`
     /// and NO `compaction_lock`, and the `listing_fence` only in read mode across
     /// the metadata capture ([`Self::capture_orphan_dv_candidates`]) — never
-    /// across an unlink. This is sound because (a) orphaned DVs are query-time
+    /// across an unlink. Its unlinks wait only for an acceleration snapshot being
+    /// archived ([`Self::pin_for_snapshot`]). This is sound because (a) orphaned DVs are query-time
     /// no-ops, (b) scans never read DV `.arrow` files lazily (they are
     /// materialized into the in-memory index only at load/refresh), so a runtime
     /// unlink is invisible to scans, and (c) the floor is monotonic on the live

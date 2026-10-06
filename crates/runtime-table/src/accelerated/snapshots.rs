@@ -26,7 +26,8 @@ use runtime_acceleration::acceleration_source::AccelerationSource;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::notifications::Subscription;
 use runtime_acceleration::snapshot::{
-    ForceCreate, SnapshotManager, SnapshotUploadError, metrics as snapshot_metrics,
+    ForceCreate, SnapshotLockGuard, SnapshotManager, SnapshotUploadError,
+    metrics as snapshot_metrics,
 };
 use runtime_async::is_shutdown_cancellation;
 use runtime_status::{RuntimeStatus, WaitOutcome};
@@ -667,7 +668,7 @@ async fn create_checkpoint_and_snapshot_once(
     snapshot_manager
         .create_snapshot(
             checkpoint_schema,
-            (lock_guard, cayenne_pin),
+            SnapshotLockGuard::from(lock_guard).with(cayenne_pin),
             updated_at,
             row_count,
             force_create,
