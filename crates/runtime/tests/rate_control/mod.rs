@@ -303,7 +303,7 @@ mod cluster_adaptive {
         // Four of every five requests fail: an 80% error rate, far above the
         // 50% threshold.
         let mostly_failing = |taken: u64| {
-            Some(if taken % 5 == 0 {
+            Some(if taken.is_multiple_of(5) {
                 RequestOutcome::Success
             } else {
                 RequestOutcome::Failure
