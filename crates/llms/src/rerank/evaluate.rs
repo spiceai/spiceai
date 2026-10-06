@@ -144,7 +144,7 @@ impl EvaluateRerank {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
-        let ids: Vec<String> = (0..documents.len()).map(ToString::to_string).collect();
+        let ids: Vec<String> = (0..documents.len()).map(|i| i.to_string()).collect();
         let state = Map::from_iter([
             ("query".to_string(), Value::from(query)),
             (
