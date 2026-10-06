@@ -1150,6 +1150,16 @@ impl QueryResultsCacheProvider {
             }
             EntryValidity::Valid | EntryValidity::StaleWhileRevalidate => {
                 let weight = weight.unwrap_or_else(|| result.get_memory_size());
+                // The cache refuses a result heavier than `max_size` before it consults
+                // the resident, so that refusal is not storage: the key may stay empty.
+                let weight_bytes = u64::try_from(weight).unwrap_or(u64::MAX);
+                if weight_bytes > self.cache_max_size {
+                    tracing::debug!(
+                        "The query result ({weight_bytes} bytes) is larger than the SQL results cache max_size ({} bytes), skipping cache storage",
+                        self.cache_max_size
+                    );
+                    return Ok(false);
+                }
                 let stored = self
                     .put_raw_key_unless_older_read(raw_key, result, weight)
                     .await?;
@@ -3278,6 +3288,37 @@ mod tests {
                 "an untouched result must be served fresh"
             );
         }
+    }
+
+    /// A result heavier than `max_size` is refused before any resident is consulted,
+    /// so it is reported as not stored, and the key stays empty.
+    #[tokio::test]
+    async fn store_raw_key_reports_a_result_heavier_than_the_cache_as_not_stored() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(1);
+        let too_heavy = usize::try_from(provider.max_size()).expect("max_size fits usize") + 1;
+
+        assert!(
+            !provider
+                .store_raw_key(
+                    &key,
+                    cached_result_for("customer", Instant::now()).await,
+                    Some(too_heavy)
+                )
+                .await
+                .expect("cache access should succeed"),
+            "a result heavier than max_size is not stored"
+        );
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "the key stays empty"
+        );
     }
 
     /// Without a stale window, an overtaken result is not stored.
