@@ -319,8 +319,9 @@ pub enum RevalidationOutcome {
     /// A table the revalidation read was invalidated while it ran, and no stale
     /// window could serve the result, so it was discarded.
     InvalidatedMidFlight,
-    /// The result carried transient HTTP error responses (5xx/429), so the
-    /// previous entry was preserved rather than overwritten with them.
+    /// The origin answered with a transient HTTP error (5xx/429), either as
+    /// rows carrying the status or as the failure that ended the revalidation,
+    /// so the previous entry was preserved rather than overwritten.
     TransientErrors,
     /// The result held a column no copy can decouple from the memory its
     /// producer owns, so an entry over it could not be bounded by `max_size`.

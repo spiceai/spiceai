@@ -82,7 +82,7 @@ mod tests {
 
     use arrow::array::{ArrayRef, Int32Array, NullArray, RecordBatch};
     use arrow_ipc::writer::{
-        CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+        DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions,
     };
     use arrow_schema::{DataType, Field, Schema};
 
@@ -106,7 +106,7 @@ mod tests {
                 batch,
                 &mut tracker,
                 &options,
-                &mut CompressionContext::default(),
+                &mut IpcWriteContext::default(),
             )
             .expect("encoding a batch");
         assert!(

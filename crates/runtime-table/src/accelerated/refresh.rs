@@ -59,17 +59,12 @@ use tokio::time::sleep;
 // parser produces them, and it sits below `runtime` so connectors can call it.
 pub use runtime_datafusion::refresh_sql::{RefreshSQL, RefreshSQLColumns};
 
+const TIME_FORMAT_DOCS: &str = "https://spiceai.org/docs/reference/spicepod/datasets#time_format";
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(
-        "time_column '{time_column}' in dataset {table_name} has data type '{actual_time_format}', but time_format is configured as '{expected_time_format}'"
-    ))]
-    TimeFormatMismatch {
-        table_name: String,
-        time_column: String,
-        expected_time_format: String,
-        actual_time_format: String,
-    },
+    #[snafu(display("{message}"))]
+    TimeFormatMismatch { message: String },
 
     #[snafu(display("time_column '{time_column}' was not found in dataset {table_name}"))]
     NoTimeColumnFound {
@@ -249,50 +244,72 @@ impl Refresh {
     /// Checks that the dataset's `time_column` exists in `schema` and that its
     /// Arrow type is compatible with the configured `time_format`.
     ///
+    /// A string `time_format` such as `iso8601` on a column that is already a
+    /// native timestamp or date is accepted: the format is ignored and a single
+    /// warning is logged. Genuinely incompatible pairs remain errors.
+    ///
     /// # Errors
     ///
     /// Returns an error if the time column is absent from the schema, or if its
     /// type cannot represent the declared `time_format`.
     pub fn validate_time_format(
         &self,
-        dataset_name: String,
+        dataset_name: &str,
         schema: &Arc<Schema>,
     ) -> Result<(), Error> {
-        let Some(time_column) = self.time_column.clone() else {
+        self.validate_time_format_inner(dataset_name, schema, true)
+    }
+
+    /// Same checks as [`Self::validate_time_format`], without logging when a
+    /// string `time_format` is ignored on a native temporal column.
+    ///
+    /// Append refresh re-validates on every pass; the ignored-format warning
+    /// belongs at dataset setup so it is emitted once.
+    pub(crate) fn validate_time_format_inner(
+        &self,
+        dataset_name: &str,
+        schema: &Arc<Schema>,
+        log_ignored: bool,
+    ) -> Result<(), Error> {
+        let Some(time_column) = self.time_column.as_deref() else {
             return Ok(());
         };
 
-        let Some((_, field)) = schema.column_with_name(&time_column) else {
+        let Some((_, field)) = schema.column_with_name(time_column) else {
             return Err(Error::NoTimeColumnFound {
-                table_name: dataset_name,
-                time_column,
+                table_name: dataset_name.to_string(),
+                time_column: time_column.to_string(),
             });
         };
 
-        let time_format = self.time_format.unwrap_or(TimeFormat::Timestamp);
-        let data_type = field.data_type().clone();
+        validate_time_format_for_column(
+            field.data_type(),
+            dataset_name,
+            time_column,
+            self.time_format,
+            TIME_COLUMN_FORMAT_KEYS,
+            log_ignored,
+        )?;
 
-        validate_time_partition_format(&data_type, &dataset_name, &time_column, time_format)?;
+        let Some(time_partition_column) = self.time_partition_column.as_deref() else {
+            return Ok(());
+        };
 
-        if let Some(time_partition_column) = self.time_partition_column.clone() {
-            let Some((_, field)) = schema.column_with_name(&time_partition_column) else {
-                return Err(Error::NoTimeColumnFound {
-                    table_name: dataset_name,
-                    time_column: time_partition_column,
-                });
-            };
+        let Some((_, field)) = schema.column_with_name(time_partition_column) else {
+            return Err(Error::NoTimeColumnFound {
+                table_name: dataset_name.to_string(),
+                time_column: time_partition_column.to_string(),
+            });
+        };
 
-            let time_partition_format = self.time_partition_format.unwrap_or(TimeFormat::Timestamp);
-            let partition_data_type = field.data_type().clone();
-            validate_time_partition_format(
-                &partition_data_type,
-                &dataset_name,
-                &time_partition_column,
-                time_partition_format,
-            )?;
-        }
-
-        Ok(())
+        validate_time_format_for_column(
+            field.data_type(),
+            dataset_name,
+            time_partition_column,
+            self.time_partition_format,
+            TIME_PARTITION_FORMAT_KEYS,
+            log_ignored,
+        )
     }
 
     /// Determine the next refresh when Spice starts based on the refresh mode and the last checkpoint.
@@ -411,20 +428,101 @@ impl Refresh {
     }
 }
 
-fn validate_time_partition_format(
+/// Spicepod keys for the column and format being validated.
+#[derive(Clone, Copy)]
+struct TimeFormatConfigKeys {
+    column: &'static str,
+    format: &'static str,
+}
+
+const TIME_COLUMN_FORMAT_KEYS: TimeFormatConfigKeys = TimeFormatConfigKeys {
+    column: "time_column",
+    format: "time_format",
+};
+
+const TIME_PARTITION_FORMAT_KEYS: TimeFormatConfigKeys = TimeFormatConfigKeys {
+    column: "time_partition_column",
+    format: "time_partition_format",
+};
+
+const fn time_format_spicepod_name(time_format: TimeFormat) -> &'static str {
+    match time_format {
+        TimeFormat::Timestamp => "timestamp",
+        TimeFormat::Timestamptz => "timestamptz",
+        TimeFormat::UnixSeconds => "unix_seconds",
+        TimeFormat::UnixMillis => "unix_millis",
+        TimeFormat::UnixNanos => "unix_nanos",
+        TimeFormat::ISO8601 => "iso8601",
+        TimeFormat::Date => "date",
+    }
+}
+
+const fn is_string_time_format(time_format: TimeFormat) -> bool {
+    matches!(time_format, TimeFormat::ISO8601)
+}
+
+fn is_native_temporal_type(data_type: &arrow::datatypes::DataType) -> bool {
+    matches!(
+        data_type,
+        arrow::datatypes::DataType::Timestamp(_, _)
+            | arrow::datatypes::DataType::Date32
+            | arrow::datatypes::DataType::Date64
+    )
+}
+
+fn native_temporal_kind(data_type: &arrow::datatypes::DataType) -> Option<&'static str> {
+    match data_type {
+        arrow::datatypes::DataType::Timestamp(_, _) => Some("timestamp"),
+        arrow::datatypes::DataType::Date32 | arrow::datatypes::DataType::Date64 => Some("date"),
+        _ => None,
+    }
+}
+
+/// Advice after ignoring a string format on a native temporal column.
+///
+/// A timezone-naive timestamp matches the default `timestamp` format, so the
+/// setting can be removed. Date and timezone-aware timestamps do not: the
+/// default would reject them, so recommend `date` or `timestamptz`.
+fn ignored_string_time_format_advice(
     data_type: &arrow::datatypes::DataType,
+    format_key: &str,
+) -> String {
+    match data_type {
+        arrow::datatypes::DataType::Timestamp(_, Some(_)) => {
+            format!("Set `{format_key}` to `timestamptz`.")
+        }
+        arrow::datatypes::DataType::Date32 | arrow::datatypes::DataType::Date64 => {
+            format!("Set `{format_key}` to `date`.")
+        }
+        _ => format!("Remove `{format_key}` from the dataset configuration."),
+    }
+}
+
+fn ignored_string_time_format_warning(
     dataset_name: &str,
-    time_column: &str,
+    column_name: &str,
     time_format: TimeFormat,
-) -> Result<(), Error> {
-    let mut invalid = false;
+    data_type: &arrow::datatypes::DataType,
+    keys: TimeFormatConfigKeys,
+) -> String {
+    let kind = native_temporal_kind(data_type).unwrap_or("timestamp");
+    format!(
+        "Dataset '{dataset_name}' ignores `{format_key}: {format}` on `{column_key}` '{column_name}' because the column is already a {kind} ({data_type}). {advice} See: {TIME_FORMAT_DOCS}",
+        format_key = keys.format,
+        format = time_format_spicepod_name(time_format),
+        column_key = keys.column,
+        advice = ignored_string_time_format_advice(data_type, keys.format),
+    )
+}
+
+fn time_format_mismatch_fix(data_type: &arrow::datatypes::DataType, format_key: &str) -> String {
     match data_type {
         arrow::datatypes::DataType::Utf8
         | arrow::datatypes::DataType::LargeUtf8
         | arrow::datatypes::DataType::Utf8View => {
-            if time_format != TimeFormat::ISO8601 {
-                invalid = true;
-            }
+            format!(
+                "Set `{format_key}` to `iso8601` to parse string timestamps, or change the column to an integer or timestamp type that matches a different `{format_key}`."
+            )
         }
         arrow::datatypes::DataType::Int8
         | arrow::datatypes::DataType::Int16
@@ -437,67 +535,116 @@ fn validate_time_partition_format(
         | arrow::datatypes::DataType::Float16
         | arrow::datatypes::DataType::Float32
         | arrow::datatypes::DataType::Float64 => {
-            if time_format != TimeFormat::UnixSeconds
-                && time_format != TimeFormat::UnixMillis
-                && time_format != TimeFormat::UnixNanos
-            {
-                invalid = true;
-            }
+            format!(
+                "Set `{format_key}` to `unix_seconds`, `unix_millis`, or `unix_nanos` to match the integer epoch column."
+            )
         }
         arrow::datatypes::DataType::Timestamp(_, None) => {
-            if time_format != TimeFormat::Timestamp {
-                invalid = true;
-            }
+            format!(
+                "Set `{format_key}` to `timestamp`, or remove `{format_key}` if the column is already a timestamp."
+            )
         }
         arrow::datatypes::DataType::Timestamp(_, Some(_)) => {
-            if time_format != TimeFormat::Timestamptz {
-                invalid = true;
-            }
+            format!("Set `{format_key}` to `timestamptz`.")
         }
-        arrow::datatypes::DataType::Date32 => {
-            if time_format != TimeFormat::Date {
-                invalid = true;
-            }
+        arrow::datatypes::DataType::Date32 | arrow::datatypes::DataType::Date64 => {
+            format!("Set `{format_key}` to `date`.")
         }
-        arrow::datatypes::DataType::Null
-        | arrow::datatypes::DataType::Boolean
-        | arrow::datatypes::DataType::Date64
-        | arrow::datatypes::DataType::Time32(_)
-        | arrow::datatypes::DataType::Time64(_)
-        | arrow::datatypes::DataType::Duration(_)
-        | arrow::datatypes::DataType::Interval(_)
-        | arrow::datatypes::DataType::Binary
-        | arrow::datatypes::DataType::FixedSizeBinary(_)
-        | arrow::datatypes::DataType::LargeBinary
-        | arrow::datatypes::DataType::BinaryView
-        | arrow::datatypes::DataType::List(_)
-        | arrow::datatypes::DataType::ListView(_)
-        | arrow::datatypes::DataType::FixedSizeList(_, _)
-        | arrow::datatypes::DataType::LargeList(_)
-        | arrow::datatypes::DataType::LargeListView(_)
-        | arrow::datatypes::DataType::Struct(_)
-        | arrow::datatypes::DataType::Union(_, _)
-        | arrow::datatypes::DataType::Dictionary(_, _)
-        | arrow::datatypes::DataType::Decimal32(_, _)
-        | arrow::datatypes::DataType::Decimal64(_, _)
-        | arrow::datatypes::DataType::Decimal128(_, _)
-        | arrow::datatypes::DataType::Decimal256(_, _)
-        | arrow::datatypes::DataType::Map(_, _)
-        | arrow::datatypes::DataType::RunEndEncoded(_, _) => {
-            invalid = true;
+        _ => {
+            "Use `iso8601` for string columns, `unix_seconds`/`unix_millis`/`unix_nanos` for integer columns, `timestamp`/`timestamptz` for timestamp columns, or `date` for date columns."
+                .to_string()
         }
     }
+}
 
-    if invalid {
-        return Err(Error::TimeFormatMismatch {
-            table_name: dataset_name.to_string(),
-            time_column: time_column.to_string(),
-            expected_time_format: time_format.to_string(),
-            actual_time_format: data_type.to_string(),
-        });
+fn time_format_mismatch_message(
+    table_name: &str,
+    column_name: &str,
+    time_format: TimeFormat,
+    data_type: &arrow::datatypes::DataType,
+    keys: TimeFormatConfigKeys,
+) -> String {
+    format!(
+        "`{column_key}` '{column_name}' in dataset '{table_name}' has data type '{data_type}', but `{format_key}` is configured as '{format}'. {fix} See: {TIME_FORMAT_DOCS}",
+        column_key = keys.column,
+        format_key = keys.format,
+        format = time_format_spicepod_name(time_format),
+        fix = time_format_mismatch_fix(data_type, keys.format),
+    )
+}
+
+fn time_format_matches_data_type(
+    data_type: &arrow::datatypes::DataType,
+    time_format: TimeFormat,
+) -> bool {
+    match data_type {
+        arrow::datatypes::DataType::Utf8
+        | arrow::datatypes::DataType::LargeUtf8
+        | arrow::datatypes::DataType::Utf8View => time_format == TimeFormat::ISO8601,
+        arrow::datatypes::DataType::Int8
+        | arrow::datatypes::DataType::Int16
+        | arrow::datatypes::DataType::Int32
+        | arrow::datatypes::DataType::Int64
+        | arrow::datatypes::DataType::UInt8
+        | arrow::datatypes::DataType::UInt16
+        | arrow::datatypes::DataType::UInt32
+        | arrow::datatypes::DataType::UInt64
+        | arrow::datatypes::DataType::Float16
+        | arrow::datatypes::DataType::Float32
+        | arrow::datatypes::DataType::Float64 => matches!(
+            time_format,
+            TimeFormat::UnixSeconds | TimeFormat::UnixMillis | TimeFormat::UnixNanos
+        ),
+        arrow::datatypes::DataType::Timestamp(_, None) => time_format == TimeFormat::Timestamp,
+        arrow::datatypes::DataType::Timestamp(_, Some(_)) => time_format == TimeFormat::Timestamptz,
+        arrow::datatypes::DataType::Date32 | arrow::datatypes::DataType::Date64 => {
+            time_format == TimeFormat::Date
+        }
+        _ => false,
+    }
+}
+
+fn validate_time_format_for_column(
+    data_type: &arrow::datatypes::DataType,
+    dataset_name: &str,
+    column_name: &str,
+    time_format: Option<TimeFormat>,
+    keys: TimeFormatConfigKeys,
+    log_ignored: bool,
+) -> Result<(), Error> {
+    if let Some(time_format) = time_format
+        && is_native_temporal_type(data_type)
+        && is_string_time_format(time_format)
+    {
+        if log_ignored {
+            tracing::warn!(
+                "{}",
+                ignored_string_time_format_warning(
+                    dataset_name,
+                    column_name,
+                    time_format,
+                    data_type,
+                    keys
+                )
+            );
+        }
+        return Ok(());
     }
 
-    Ok(())
+    let time_format = time_format.unwrap_or(TimeFormat::Timestamp);
+    if time_format_matches_data_type(data_type, time_format) {
+        return Ok(());
+    }
+
+    Err(Error::TimeFormatMismatch {
+        message: time_format_mismatch_message(
+            dataset_name,
+            column_name,
+            time_format,
+            data_type,
+            keys,
+        ),
+    })
 }
 
 impl Default for Refresh {
@@ -1427,8 +1574,11 @@ async fn record_last_refresh_time_ms(
 #[cfg(test)]
 mod tests {
     use arrow::{
-        array::{ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, UInt64Array},
-        datatypes::{DataType, Field, Fields, Schema},
+        array::{
+            Array, ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, TimestampSecondArray,
+            UInt64Array,
+        },
+        datatypes::{DataType, Field, Fields, Schema, TimeUnit},
     };
     use data_components::arrow::write::MemTable;
     use datafusion::{
@@ -2743,6 +2893,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_refresh_append_batch_for_native_timestamp_with_iso8601_time_format() {
+        async fn test(
+            source_data: Vec<i64>,
+            existing_data: Vec<i64>,
+            expected_timestamps: Vec<i64>,
+            message: &str,
+        ) {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            )]));
+            let arr = TimestampSecondArray::from(source_data);
+
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+                .expect("data should be created");
+
+            let mem_table = Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("mem table should be created"),
+            );
+            let federated = Arc::new(FederatedTable::new_unchecked(mem_table));
+
+            let arr = TimestampSecondArray::from(existing_data);
+
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+                .expect("data should be created");
+
+            let accelerator = Arc::new(
+                MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+            ) as Arc<dyn TableProvider>;
+
+            let refresh = Refresh::new(RefreshMode::Append)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::ISO8601);
+
+            let refresh_completion = RefreshCompletion::new();
+            let mut refresher = Refresher::new(
+                status::RuntimeStatus::new(),
+                TableReference::bare("test"),
+                federated,
+                Some("mem_table".to_string()),
+                Arc::new(RwLock::new(refresh)),
+                Arc::clone(&accelerator),
+                None,
+                None,
+                Handle::current(),
+                Arc::new(Mutex::new(())),
+            );
+
+            refresher.with_refresh_completion(refresh_completion.clone());
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode)
+                .await
+                .expect("Should start refresh task");
+
+            trigger
+                .send(None)
+                .await
+                .expect("trigger sent correctly to refresh");
+
+            timeout(Duration::from_secs(2), refresh_completion.any().wait())
+                .await
+                .expect("finish before the timeout");
+
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+
+            let plan = accelerator
+                .scan(&state, None, &[], None)
+                .await
+                .expect("Scan plan can be constructed");
+
+            let result = collect(plan, ctx.task_ctx())
+                .await
+                .expect("Query successful");
+
+            let mut actual = Vec::new();
+            for batch in &result {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .expect("ts column is Timestamp(s)");
+                actual.extend(array.values().iter().copied());
+            }
+            let mut expected = expected_timestamps;
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "{message}");
+
+            drop(refresh_handle);
+        }
+
+        // 1970-01-01, 2012-12-01T11:11:11Z, 2012-12-01T11:11:12Z
+        test(
+            vec![0, 1_354_360_271, 1_354_360_272],
+            vec![],
+            vec![0, 1_354_360_271, 1_354_360_272],
+            "should insert all data into empty accelerator",
+        )
+        .await;
+        test(
+            vec![0, 1_354_360_271, 1_354_360_272],
+            vec![0, 1_354_360_271, 1_354_360_272, 1_354_360_275],
+            vec![0, 1_354_360_271, 1_354_360_272, 1_354_360_275],
+            "should not insert any stale data and keep original size",
+        )
+        .await;
+        test(
+            vec![1_354_360_276, 1_354_360_277],
+            vec![0, 1_354_360_271, 1_354_360_272, 1_354_360_275],
+            vec![
+                0,
+                1_354_360_271,
+                1_354_360_272,
+                1_354_360_275,
+                1_354_360_276,
+                1_354_360_277,
+            ],
+            "should apply new data onto existing data",
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_refresh_append_batch_for_timestamp() {
         async fn test(
             source_data: Vec<u64>,
@@ -3151,7 +3429,7 @@ mod tests {
         let refresh = Refresh::new(RefreshMode::Full);
         let schema = Arc::new(Schema::empty());
         refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
+            .validate_time_format("dataset_name", &schema)
             .expect("should validate successfully");
     }
 
@@ -3161,7 +3439,7 @@ mod tests {
 
         let schema = Arc::new(Schema::empty());
         assert!(matches!(
-            refresh.validate_time_format("test_dataset".to_string(), &schema),
+            refresh.validate_time_format("test_dataset", &schema),
             Err(Error::NoTimeColumnFound { .. })
         ));
     }
@@ -3181,7 +3459,7 @@ mod tests {
                 .time_format(format);
             let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
             assert!(matches!(
-                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                refresh.validate_time_format("test_dataset", &schema),
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
@@ -3205,7 +3483,7 @@ mod tests {
                 false,
             )]));
             assert!(matches!(
-                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                refresh.validate_time_format("test_dataset", &schema),
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
@@ -3218,7 +3496,6 @@ mod tests {
             TimeFormat::UnixSeconds,
             TimeFormat::UnixNanos,
             TimeFormat::Timestamptz,
-            TimeFormat::ISO8601,
             TimeFormat::Date,
         ] {
             let refresh = Refresh::new(RefreshMode::Full)
@@ -3227,11 +3504,11 @@ mod tests {
 
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+                DataType::Timestamp(TimeUnit::Second, None),
                 false,
             )]));
             assert!(matches!(
-                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                refresh.validate_time_format("test_dataset", &schema),
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
@@ -3244,7 +3521,6 @@ mod tests {
             TimeFormat::UnixSeconds,
             TimeFormat::UnixNanos,
             TimeFormat::Timestamp,
-            TimeFormat::ISO8601,
             TimeFormat::Date,
         ] {
             let refresh = Refresh::new(RefreshMode::Full)
@@ -3253,11 +3529,11 @@ mod tests {
 
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
+                DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
                 false,
             )]));
             assert!(matches!(
-                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                refresh.validate_time_format("test_dataset", &schema),
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
@@ -3271,7 +3547,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
         refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
+            .validate_time_format("dataset_name", &schema)
             .expect("should validate successfully");
     }
 
@@ -3292,7 +3568,7 @@ mod tests {
                 false,
             )]));
             refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
+                .validate_time_format("dataset_name", &schema)
                 .expect("should validate successfully");
         }
     }
@@ -3305,11 +3581,11 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Second, None),
             false,
         )]));
         refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
+            .validate_time_format("dataset_name", &schema)
             .expect("should validate successfully");
     }
 
@@ -3321,11 +3597,11 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
+            DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
             false,
         )]));
         refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
+            .validate_time_format("dataset_name", &schema)
             .expect("should validate successfully");
     }
 
@@ -3341,7 +3617,7 @@ mod tests {
             false,
         )]));
         refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
+            .validate_time_format("dataset_name", &schema)
             .expect("should validate successfully");
     }
 
@@ -3353,7 +3629,6 @@ mod tests {
             TimeFormat::UnixNanos,
             TimeFormat::Timestamp,
             TimeFormat::Timestamptz,
-            TimeFormat::ISO8601,
         ] {
             let refresh = Refresh::new(RefreshMode::Full)
                 .time_column("time".to_string())
@@ -3365,10 +3640,251 @@ mod tests {
                 false,
             )]));
             assert!(matches!(
-                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                refresh.validate_time_format("test_dataset", &schema),
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_iso8601_on_native_timestamp() {
+        for data_type in [
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("America/Los_Angeles".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ] {
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::ISO8601);
+            let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type, false)]));
+            refresh
+                .validate_time_format("events", &schema)
+                .expect("iso8601 on a native timestamp must be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_iso8601_on_date() {
+        for data_type in [DataType::Date32, DataType::Date64] {
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::ISO8601);
+            let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type, false)]));
+            refresh
+                .validate_time_format("events", &schema)
+                .expect("iso8601 on a date column must be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_date_on_date64() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::Date);
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Date64, false)]));
+        refresh
+            .validate_time_format("events", &schema)
+            .expect("date format matches a Date64 column");
+    }
+
+    #[test]
+    fn test_validate_time_column_unix_seconds_on_utf8_says_how_to_fix() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Utf8, false)]));
+        let err = refresh
+            .validate_time_format("events", &schema)
+            .expect_err("unix_seconds on a string column is incompatible");
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            time_format_mismatch_message(
+                "events",
+                "ts",
+                TimeFormat::UnixSeconds,
+                &DataType::Utf8,
+                TIME_COLUMN_FORMAT_KEYS,
+            )
+        );
+        assert!(
+            message.contains("Set `time_format` to `iso8601`"),
+            "{message}"
+        );
+        assert!(message.contains(TIME_FORMAT_DOCS), "{message}");
+    }
+
+    #[test]
+    fn test_validate_time_column_unix_seconds_on_timestamp_says_how_to_fix() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        let data_type = DataType::Timestamp(TimeUnit::Second, None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            data_type.clone(),
+            false,
+        )]));
+        let err = refresh
+            .validate_time_format("events", &schema)
+            .expect_err("unix_seconds on a timestamp column is incompatible");
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            time_format_mismatch_message(
+                "events",
+                "ts",
+                TimeFormat::UnixSeconds,
+                &data_type,
+                TIME_COLUMN_FORMAT_KEYS,
+            )
+        );
+        assert!(
+            message.contains("Set `time_format` to `timestamp`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_ignored_string_time_format_warning_names_the_dataset_and_fix() {
+        let message = ignored_string_time_format_warning(
+            "events",
+            "ts",
+            TimeFormat::ISO8601,
+            &DataType::Timestamp(TimeUnit::Second, None),
+            TIME_COLUMN_FORMAT_KEYS,
+        );
+        assert_eq!(
+            message,
+            "Dataset 'events' ignores `time_format: iso8601` on `time_column` 'ts' because the column is already a timestamp (Timestamp(s)). Remove `time_format` from the dataset configuration. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+        );
+    }
+
+    #[test]
+    fn test_ignored_string_time_format_warning_for_date() {
+        let message = ignored_string_time_format_warning(
+            "events",
+            "day",
+            TimeFormat::ISO8601,
+            &DataType::Date32,
+            TIME_COLUMN_FORMAT_KEYS,
+        );
+        assert_eq!(
+            message,
+            "Dataset 'events' ignores `time_format: iso8601` on `time_column` 'day' because the column is already a date (Date32). Set `time_format` to `date`. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+        );
+    }
+
+    #[test]
+    fn test_ignored_string_time_format_warning_for_timestamptz() {
+        let data_type = DataType::Timestamp(TimeUnit::Second, Some("+00:00".into()));
+        let message = ignored_string_time_format_warning(
+            "events",
+            "ts",
+            TimeFormat::ISO8601,
+            &data_type,
+            TIME_COLUMN_FORMAT_KEYS,
+        );
+        assert_eq!(
+            message,
+            format!(
+                "Dataset 'events' ignores `time_format: iso8601` on `time_column` 'ts' because the column is already a timestamp ({data_type}). Set `time_format` to `timestamptz`. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+            )
+        );
+    }
+
+    #[test]
+    fn test_ignored_string_time_format_warning_for_partition() {
+        let message = ignored_string_time_format_warning(
+            "events",
+            "day",
+            TimeFormat::ISO8601,
+            &DataType::Date32,
+            TIME_PARTITION_FORMAT_KEYS,
+        );
+        assert_eq!(
+            message,
+            "Dataset 'events' ignores `time_partition_format: iso8601` on `time_partition_column` 'day' because the column is already a date (Date32). Set `time_partition_format` to `date`. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+        );
+    }
+
+    #[test]
+    fn test_validate_time_partition_iso8601_on_date_is_accepted() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::ISO8601)
+            .time_partition_column("day".to_string())
+            .time_partition_format(TimeFormat::ISO8601);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Utf8, false),
+            Field::new("day", DataType::Date32, false),
+        ]));
+        refresh
+            .validate_time_format("events", &schema)
+            .expect("iso8601 on a Date32 partition column must be accepted");
+    }
+
+    #[test]
+    fn test_validate_time_partition_format_mismatch_names_partition_keys() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::ISO8601)
+            .time_partition_column("day".to_string())
+            .time_partition_format(TimeFormat::UnixSeconds);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Utf8, false),
+            Field::new("day", DataType::Date32, false),
+        ]));
+        let err = refresh
+            .validate_time_format("events", &schema)
+            .expect_err("unix_seconds on a Date32 partition column is incompatible");
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            time_format_mismatch_message(
+                "events",
+                "day",
+                TimeFormat::UnixSeconds,
+                &DataType::Date32,
+                TIME_PARTITION_FORMAT_KEYS,
+            )
+        );
+        assert!(
+            message.contains("Set `time_partition_format` to `date`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Set `time_format` to `date`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`time_partition_column` 'day'"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_time_format_mismatch_fix_does_not_recommend_removal_for_date_or_timestamptz() {
+        assert_eq!(
+            time_format_mismatch_fix(&DataType::Date32, "time_format"),
+            "Set `time_format` to `date`."
+        );
+        assert_eq!(
+            time_format_mismatch_fix(
+                &DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+                "time_format"
+            ),
+            "Set `time_format` to `timestamptz`."
+        );
+        assert_eq!(
+            time_format_mismatch_fix(&DataType::Timestamp(TimeUnit::Second, None), "time_format"),
+            "Set `time_format` to `timestamp`, or remove `time_format` if the column is already a timestamp."
+        );
     }
 
     #[tokio::test]

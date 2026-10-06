@@ -27,10 +27,10 @@ use cache::{
 };
 use datafusion::{
     common::ParamValues,
+    common::TableReference,
     execution::{SendableRecordBatchStream, SessionState},
     logical_expr::LogicalPlan,
     physical_plan::ExecutionPlan,
-    sql::TableReference,
 };
 use runtime_request_context::{
     CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
@@ -109,6 +109,24 @@ enum CacheResult {
 /// value type to dispatch on.
 fn record_revalidation_outcome(outcome: RevalidationOutcome) {
     cache::metrics::sql_results::SWR_REVALIDATIONS.add(1, &[outcome.key_value()]);
+}
+
+/// The outcome a revalidation that failed outright is counted under.
+///
+/// The HTTP connector refuses a 5xx/429 that outlives its retries instead of returning a
+/// row carrying the status, so a revalidation against a failing origin ends here rather
+/// than in [`cache::batches_cacheable`]. It kept the previous entry for the same reason a
+/// result carrying such a row does, so it is counted as `TransientErrors` too; any other
+/// failure keeps `otherwise`.
+fn failed_revalidation_outcome(
+    error: &(dyn std::error::Error + 'static),
+    otherwise: RevalidationOutcome,
+) -> RevalidationOutcome {
+    if data_components::http::provider::is_transient_origin_failure(error) {
+        RevalidationOutcome::TransientErrors
+    } else {
+        otherwise
+    }
 }
 
 impl CacheResponse {
@@ -1439,7 +1457,10 @@ impl Query {
                                         "Background revalidation failed during collection: {}",
                                         e
                                     );
-                                    record_revalidation_outcome(RevalidationOutcome::CollectFailed);
+                                    record_revalidation_outcome(failed_revalidation_outcome(
+                                        &e,
+                                        RevalidationOutcome::CollectFailed,
+                                    ));
                                 }
                             }
                         }
@@ -1449,7 +1470,10 @@ impl Query {
                                 "Background revalidation query failed: {}",
                                 e
                             );
-                            record_revalidation_outcome(RevalidationOutcome::QueryFailed);
+                            record_revalidation_outcome(failed_revalidation_outcome(
+                                &e,
+                                RevalidationOutcome::QueryFailed,
+                            ));
                         }
                     }
 
@@ -2727,6 +2751,48 @@ mod tests {
         );
     }
 
+    /// Both revalidations are still fresh — no table change — so this is the
+    /// admission that used an unconditional insert. The later resident must
+    /// stay.
+    #[tokio::test]
+    async fn test_swr_revalidation_keeps_a_newer_fresh_resident() {
+        let df = prepare_runtime(Some(sql_cache_config(Some("5m")))).await;
+        let cache_provider = df
+            .results_cache_provider()
+            .expect("results cache should be configured");
+        let (schema, batch) = one_row_batch();
+        let tables = Arc::new(HashSet::from([TableReference::bare("fresh_table")]));
+        let key = RawCacheKey::new(45);
+
+        let older = std::time::Instant::now();
+        tick().await;
+        let newer = std::time::Instant::now();
+
+        Query::cache_revalidation_result(
+            &df,
+            &key,
+            vec![batch.clone()],
+            Arc::clone(&schema),
+            Arc::clone(&tables),
+            newer,
+            None,
+        )
+        .await;
+        Query::cache_revalidation_result(&df, &key, vec![batch], schema, tables, older, None).await;
+        cache_provider.run_pending_tasks().await;
+
+        let (entry, validity) = cache_provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("the newer result must still be cached");
+        assert_eq!(
+            entry.read_started_at, newer,
+            "a fresh admission must not replace a resident that began reading later"
+        );
+        assert_eq!(validity, cache::EntryValidity::Valid);
+    }
+
     /// Reports a fixed [`MetricsSet`], standing in for an `HttpExec` whose
     /// `HTTP_TRANSIENT_FAILURE_METRIC_NAME` counter was incremented by a
     /// fetch a narrow projection then excluded `response_status` from.
@@ -2778,6 +2844,17 @@ mod tests {
             &self.properties
         }
 
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
@@ -2800,6 +2877,40 @@ mod tests {
         ) -> datafusion::common::Result<datafusion::execution::SendableRecordBatchStream> {
             unimplemented!("not used in tests")
         }
+    }
+
+    /// A revalidation the HTTP connector failed because the origin was down is
+    /// counted as `transient_errors`, as a result carrying the origin's 5xx
+    /// would be; any other failure keeps the outcome of the arm it failed in.
+    #[test]
+    fn a_revalidation_failed_by_a_transient_origin_status_counts_as_transient_errors() {
+        use datafusion::error::DataFusionError;
+
+        let refused = |status| -> DataFusionError {
+            data_components::http::provider::Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into()
+        };
+        let wrapped = DataFusionError::Context("revalidation".to_string(), Box::new(refused(503)));
+        assert_eq!(
+            failed_revalidation_outcome(&wrapped, RevalidationOutcome::CollectFailed),
+            RevalidationOutcome::TransientErrors
+        );
+        assert_eq!(
+            failed_revalidation_outcome(&refused(404), RevalidationOutcome::CollectFailed),
+            RevalidationOutcome::CollectFailed,
+            "a 404 is an answer about the resource, not an origin that is down"
+        );
+        assert_eq!(
+            failed_revalidation_outcome(
+                &DataFusionError::Execution("connection reset".to_string()),
+                RevalidationOutcome::QueryFailed
+            ),
+            RevalidationOutcome::QueryFailed
+        );
     }
 
     /// The narrow-projection counterpart to

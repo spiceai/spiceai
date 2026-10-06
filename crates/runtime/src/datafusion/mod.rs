@@ -92,6 +92,7 @@ use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
+use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -102,7 +103,6 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
@@ -3240,7 +3240,7 @@ impl DataFusion {
             refresh = refresh.period(refresh_data_window);
         }
         refresh
-            .validate_time_format(dataset.name.to_string(), &refresh_schema)
+            .validate_time_format(&dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         // Apply initial partition filters before the refresher starts to avoid a race

@@ -44,6 +44,7 @@ datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true, features = ["federation"] }
 db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }
+delta_kernel_default_engine = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
     "bundled",
@@ -101,9 +102,9 @@ serde_json.workspace = true
 snafu.workspace = true
 spice-table = { path = "../spice-table" }
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "18ae9bd3ac5c447612f292e41bf348a5c6ed9b50", features = [
     "tls",
-], optional = true } # branch: spiceai-58
+], optional = true } # branch: spiceai-59-2
 telemetry = { path = "../telemetry" }
 tempfile.workspace = true
 tiberius = { workspace = true, optional = true }
@@ -142,7 +143,7 @@ adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/
 databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
-delta_lake = ["dep:delta_kernel"]
+delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine"]
 elasticsearch = ["dep:elasticsearch"]
 duckdb = [
     "dep:duckdb",

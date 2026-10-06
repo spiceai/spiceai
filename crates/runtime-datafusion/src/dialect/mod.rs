@@ -85,7 +85,7 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
                 as ScalarFnToSqlHandler,
         ),
         (
-            // DuckDB dialect: coalesce(len(regexp_extract_all(string, pattern)), 0)
+            // DuckDB dialect: len(regexp_extract_all(string, pattern))
             // DataFusion dialect: regexp_count(str, regexp[, start, flags])
             REGEXP_COUNT_NAME,
             Box::new(duckdb::DuckDBRegexpFunction::Count.to_datafusion_function())
@@ -231,13 +231,16 @@ pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> 
 }
 
 /// Whether `DuckDB` evaluates this non-function expression node the way
-/// `DataFusion` does. Only casts are checked: `duckdb::cast_is_renderable` says
-/// which casts into text or binary are refused, and why, and
-/// [`integer_cast_is_renderable`] refuses one from a fractional value into an
-/// integer, which `DuckDB` rounds where `DataFusion` truncates.
+/// `DataFusion` does. `duckdb::cast_is_renderable` says which casts into text or
+/// binary are refused, and why; [`integer_cast_is_renderable`] refuses one from
+/// a fractional value into an integer, which `DuckDB` rounds where `DataFusion`
+/// truncates; and `duckdb::literal_is_renderable` refuses a binary literal,
+/// which the unparser spells in a form `DuckDB` reads as text.
 #[must_use]
 pub fn duckdb_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
-    duckdb::cast_is_renderable(expr, scope) && integer_cast_is_renderable(expr, scope)
+    duckdb::literal_is_renderable(expr)
+        && duckdb::cast_is_renderable(expr, scope)
+        && integer_cast_is_renderable(expr, scope)
 }
 
 /// Whether `PostgreSQL` evaluates this non-function expression node the way
@@ -854,10 +857,12 @@ mod tests {
     /// asserted separately because only one of them is this check's.
     /// `duckdb_can_translate` consults the type guard *before* the unparser,
     /// and a `ScalarValue::Binary` reports `Binary` with or without a scope, so
-    /// the guard is what answers `false` here. The `expr_to_sql` assertion
-    /// establishes the other path — the renderer would have refused it too,
-    /// with `NotImplemented("Unsupported scalar: Binary")` — so neither can be
-    /// removed on the assumption that the other still covers a binary literal.
+    /// the guard is what answers `false` here. The other path is the
+    /// expression check, which refuses the literal wherever it appears. The
+    /// renderer behind both refuses nothing: it spells the literal `X'ff'`,
+    /// which `DuckDB` reads as the text `'xff'`, so a rendering that reached
+    /// `DuckDB` would be a wrong answer rather than an error, and neither
+    /// refusal can be removed on the assumption that the renderer covers it.
     ///
     /// A binary *column* has neither: it renders cleanly as `"a" || 'z'`, and
     /// its type is readable only against a scope. That is why the scope is what
@@ -879,12 +884,68 @@ mod tests {
             !duckdb::concat_arguments_are_renderable(&call_of(binary_literal.clone()).args, None),
             "a binary literal reads as binary with no scope, so the type guard refuses it"
         );
+        assert!(
+            !duckdb_can_evaluate_expression(&lit(ScalarValue::Binary(Some(vec![0xff]))), None),
+            "the expression check refuses the binary literal itself, inside a call or not"
+        );
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
+        let rendered = unparser
+            .expr_to_sql(&binary_literal)
+            .expect("the renderer spells a binary literal")
+            .to_string();
         assert!(
-            unparser.expr_to_sql(&binary_literal).is_err(),
-            "and the renderer behind the guard refuses it as well"
+            rendered.contains("X'ff'"),
+            "the renderer spells the literal X'ff', which DuckDB reads as text, so both \
+             refusals above are what keep it local: {rendered}"
         );
+    }
+
+    /// A binary literal never reaches `DuckDB`: the unparser spells it `X'ff'`,
+    /// and `DuckDB` reads that as the text `'xff'`, so `b = X'ff'` over a `BLOB`
+    /// column matched the row holding the bytes `xff` rather than `0xFF`.
+    /// Every byte-array variant the unparser renders that way is refused,
+    /// including through a dictionary; a NULL renders as `NULL`, which `DuckDB`
+    /// reads correctly, and a string literal is unaffected.
+    #[test]
+    fn duckdb_declines_a_binary_literal() {
+        let byte = vec![0xff];
+        for value in [
+            ScalarValue::Binary(Some(byte.clone())),
+            ScalarValue::Binary(Some(Vec::new())),
+            ScalarValue::LargeBinary(Some(byte.clone())),
+            ScalarValue::BinaryView(Some(byte.clone())),
+            ScalarValue::FixedSizeBinary(1, Some(byte.clone())),
+            ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Binary(Some(byte))),
+            ),
+        ] {
+            let literal = lit(value.clone());
+            assert!(
+                !duckdb_can_evaluate_expression(&literal, None),
+                "{value:?} must stay local"
+            );
+            // The check is per node; the policy the DuckDB providers install
+            // walks the whole filter, so the comparison around it is refused.
+            assert!(
+                !crate::function_support::deny_spice_functions_for_duckdb_table_providers()
+                    .supports(&col("b").eq(literal), None),
+                "a comparison against {value:?} must stay local"
+            );
+        }
+        for value in [
+            ScalarValue::Binary(None),
+            ScalarValue::LargeBinary(None),
+            ScalarValue::BinaryView(None),
+            ScalarValue::FixedSizeBinary(1, None),
+            ScalarValue::Utf8(Some("ff".to_string())),
+        ] {
+            assert!(
+                duckdb_can_evaluate_expression(&lit(value.clone()), None),
+                "{value:?} renders as a value DuckDB reads correctly and must federate"
+            );
+        }
     }
 
     /// Regression test for #13900: the `U` flag has no `DuckDB` equivalent, so

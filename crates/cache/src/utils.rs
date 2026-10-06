@@ -22,11 +22,11 @@ use arrow_tools::metadata_keys::{
     HTTP_RESPONSE_STATUS_METADATA_KEY, HTTP_TRANSIENT_FAILURE_METRIC_NAME,
 };
 use datafusion::{
+    common::TableReference,
     common::tree_node::TreeNodeRecursion,
     execution::SendableRecordBatchStream,
     logical_expr::LogicalPlan,
     physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
-    sql::TableReference,
 };
 
 use crate::{CachedQueryResult, QueryResultsCacheProvider, RawCacheKey, Sizeable};
@@ -1009,6 +1009,34 @@ pub(crate) mod tests {
             .expect("cache access should succeed")
             .expect("the newer result must still be served fresh");
         assert_eq!(entry.read_started_at, newer_read);
+    }
+
+    /// Both reads are still fresh — no table change between them — so this is
+    /// the admission that used an unconditional insert. The later resident
+    /// must stay.
+    #[tokio::test]
+    async fn to_cached_record_batch_stream_does_not_replace_a_newer_fresh_result_with_an_older_fresh_one()
+     {
+        let provider = test_cache_provider_with_stale_window("5m");
+        let key = RawCacheKey::new(7);
+        let customer = HashSet::from([TableReference::bare("customer")]);
+
+        let older_read = std::time::Instant::now();
+        crate::tests::tick().await;
+        let newer_read = std::time::Instant::now();
+
+        drain_through_cache(&provider, key, customer.clone(), newer_read).await;
+        drain_through_cache(&provider, key, customer, older_read).await;
+
+        let entry = provider
+            .get_raw_key(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("the newer result must still be served fresh");
+        assert_eq!(
+            entry.read_started_at, newer_read,
+            "a fresh admission must not replace a resident that began reading later"
+        );
     }
 
     /// The qualification of the invalidated reference must not matter: `customer`
