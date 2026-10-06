@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::error::ArrowError;
 use client::GraphQLQuery;
@@ -28,6 +29,9 @@ pub mod builder;
 pub mod client;
 pub mod provider;
 pub mod rate_limit;
+pub mod response;
+
+pub use response::ResponseBodyFormat;
 
 /// Maximum number of retry attempts for a single page fetch during pagination.
 pub const PAGE_RETRY_MAX_ATTEMPTS: u32 = 5;
@@ -75,11 +79,22 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("The upstream server returned an error (HTTP {status}). {detail}"))]
+    #[snafu(display("{}", response::json_decode_error_message(*status, detail)))]
     JsonDecodeError {
         status: reqwest::StatusCode,
         detail: String,
         response_preview: String,
+    },
+
+    /// HTTP response was not GraphQL JSON. `message` names the status and the
+    /// detected body format; it never says the client failed to decode JSON.
+    #[snafu(display("{message}"))]
+    UnexpectedResponse {
+        status: reqwest::StatusCode,
+        format: ResponseBodyFormat,
+        preview: String,
+        retry_after: Option<Duration>,
+        message: String,
     },
 
     #[snafu(display(
@@ -120,9 +135,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// Retriable errors include:
 /// - All HTTP 5xx server errors (500, 502, 503, 504, etc.)
-/// - HTTP 408 Request Timeout
+/// - HTTP 408 Request Timeout and HTTP 429 Too Many Requests
 /// - Connection/timeout errors from reqwest
-/// - JSON decode errors (often due to truncated responses from timeouts)
+/// - Empty or incomplete HTTP 200 bodies (GitHub GraphQL does this intermittently)
+/// - JSON decode errors on a JSON-classified body (truncated payloads)
 ///
 /// `Error::RateLimited` is retriable: GitHub's secondary/CPU cap is reported on
 /// the response (`retry-after` + HTTP 403), after `check_rate_limit()` already
@@ -138,16 +154,21 @@ pub fn is_retriable_error(error: &Error) -> bool {
         Error::RateLimited { .. } => true,
         Error::InvalidCredentialsOrPermissions { kind, .. } => *kind == RefusalKind::Inferred,
         Error::InvalidReqwestStatus { status, .. } => {
-            status.is_server_error() || *status == StatusCode::REQUEST_TIMEOUT
+            status.is_server_error()
+                || *status == StatusCode::REQUEST_TIMEOUT
+                || *status == StatusCode::TOO_MANY_REQUESTS
         }
         Error::JsonDecodeError { status, .. } => {
-            // Truncated bodies show up as HTTP 200 with EOF mid-string; 5xx/403
-            // HTML is the same class of transient upstream failure. A 4xx JSON
-            // error (except 403) is a real client failure and is not retried.
+            // Truncated JSON on HTTP 200, or a JSON-classified 5xx/403/408/429.
+            // Other 4xx JSON errors are client failures and are not retried.
             status.is_success()
                 || status.is_server_error()
                 || *status == StatusCode::FORBIDDEN
                 || *status == StatusCode::REQUEST_TIMEOUT
+                || *status == StatusCode::TOO_MANY_REQUESTS
+        }
+        Error::UnexpectedResponse { status, format, .. } => {
+            response::is_retryable_unexpected_response(*status, *format)
         }
         Error::ReqwestInternal { source } => {
             // Check for transient network/connection errors:
@@ -161,9 +182,22 @@ pub fn is_retriable_error(error: &Error) -> bool {
                 || source.is_body()
                 || source.is_decode()
                 // Also check if the underlying status code is a retriable server error
-                || source.status().is_some_and(|s| s.is_server_error() || s == StatusCode::REQUEST_TIMEOUT)
+                || source.status().is_some_and(|s| {
+                    s.is_server_error()
+                        || s == StatusCode::REQUEST_TIMEOUT
+                        || s == StatusCode::TOO_MANY_REQUESTS
+                })
         }
         _ => false,
+    }
+}
+
+/// `Retry-After` carried on a classified unexpected response, if the server sent one.
+#[must_use]
+pub fn error_retry_after(error: &Error) -> Option<Duration> {
+    match error {
+        Error::UnexpectedResponse { retry_after, .. } => *retry_after,
+        _ => None,
     }
 }
 
@@ -172,9 +206,9 @@ pub fn is_retriable_error(error: &Error) -> bool {
 #[must_use]
 pub fn is_gateway_error(error: &Error) -> bool {
     let status = match error {
-        Error::InvalidReqwestStatus { status, .. } | Error::JsonDecodeError { status, .. } => {
-            Some(*status)
-        }
+        Error::InvalidReqwestStatus { status, .. }
+        | Error::JsonDecodeError { status, .. }
+        | Error::UnexpectedResponse { status, .. } => Some(*status),
         Error::ReqwestInternal { source } => source.status(),
         _ => None,
     };
@@ -603,7 +637,124 @@ mod tests {
                 is_gateway_error(&json_decode_err),
                 "JsonDecodeError with {status} should be a gateway error"
             );
+
+            let unexpected = Error::UnexpectedResponse {
+                status,
+                format: ResponseBodyFormat::Html,
+                preview: "Bad Gateway".to_string(),
+                retry_after: None,
+                message: format!("The upstream server returned HTML (HTTP {status})."),
+            };
+            assert!(
+                is_gateway_error(&unexpected),
+                "UnexpectedResponse with {status} should be a gateway error"
+            );
         }
+    }
+
+    #[test]
+    fn incomplete_200_is_retriable() {
+        let error = Error::UnexpectedResponse {
+            status: StatusCode::OK,
+            format: ResponseBodyFormat::Incomplete,
+            preview: String::new(),
+            retry_after: None,
+            message: response::unexpected_response_message(
+                StatusCode::OK,
+                ResponseBodyFormat::Incomplete,
+                "",
+            ),
+        };
+        assert!(
+            is_retriable_error(&error),
+            "a Content-Length mismatch on HTTP 200 must retry the same page"
+        );
+        let displayed = error.to_string();
+        assert!(displayed.contains("incomplete"));
+        assert!(!displayed.contains("upstream server returned an error"));
+    }
+
+    #[test]
+    fn empty_200_is_retriable_and_not_an_upstream_error() {
+        let error = Error::UnexpectedResponse {
+            status: StatusCode::OK,
+            format: ResponseBodyFormat::Empty,
+            preview: String::new(),
+            retry_after: None,
+            message: response::unexpected_response_message(
+                StatusCode::OK,
+                ResponseBodyFormat::Empty,
+                "",
+            ),
+        };
+        assert!(
+            is_retriable_error(&error),
+            "an empty HTTP 200 must retry the same page"
+        );
+        assert!(
+            !is_gateway_error(&error),
+            "an empty 200 is not a gateway status"
+        );
+        let displayed = error.to_string();
+        assert_eq!(
+            displayed,
+            "upstream returned an empty response body (HTTP 200)"
+        );
+        assert!(!displayed.contains("upstream server returned an error"));
+        assert!(!displayed.contains("Failed to decode response body as JSON"));
+    }
+
+    #[test]
+    fn html_200_is_not_retriable() {
+        let error = Error::UnexpectedResponse {
+            status: StatusCode::OK,
+            format: ResponseBodyFormat::Html,
+            preview: "Sign in".to_string(),
+            retry_after: None,
+            message: response::unexpected_response_message(
+                StatusCode::OK,
+                ResponseBodyFormat::Html,
+                "Sign in",
+            ),
+        };
+        assert!(
+            !is_retriable_error(&error),
+            "HTML on HTTP 200 is a wrong URL or redirect, not a blip"
+        );
+    }
+
+    #[test]
+    fn html_502_and_empty_503_and_429_are_retriable() {
+        for (status, format) in [
+            (StatusCode::BAD_GATEWAY, ResponseBodyFormat::Html),
+            (StatusCode::SERVICE_UNAVAILABLE, ResponseBodyFormat::Empty),
+            (StatusCode::GATEWAY_TIMEOUT, ResponseBodyFormat::Text),
+            (StatusCode::TOO_MANY_REQUESTS, ResponseBodyFormat::Text),
+        ] {
+            let error = Error::UnexpectedResponse {
+                status,
+                format,
+                preview: String::new(),
+                retry_after: None,
+                message: response::unexpected_response_message(status, format, ""),
+            };
+            assert!(
+                is_retriable_error(&error),
+                "{status} {format:?} should be retriable"
+            );
+        }
+    }
+
+    #[test]
+    fn json_decode_2xx_display_is_not_an_upstream_error() {
+        let error = Error::JsonDecodeError {
+            status: StatusCode::OK,
+            detail: "The response body could not be parsed as JSON.".to_string(),
+            response_preview: String::new(),
+        };
+        let displayed = error.to_string();
+        assert!(displayed.contains("invalid JSON"));
+        assert!(!displayed.contains("upstream server returned an error"));
     }
 
     #[test]

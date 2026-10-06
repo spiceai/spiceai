@@ -4785,6 +4785,7 @@ dependencies = [
  "tracing",
  "url",
  "util",
+ "wiremock",
  "zip 8.6.0",
 ]
 
