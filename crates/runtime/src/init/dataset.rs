@@ -1215,9 +1215,7 @@ impl Runtime {
             if let (Some(rule), Some(key)) = (rule, acceleration.primary_key.as_ref()) {
                 tracing::info!("{}", key_rule_line(&dataset_name, key, rule));
             }
-            // `on_conflict` also keeps a read-write dataset's writes in the
-            // acceleration, so it is not deprecated there until something replaces it.
-            if !acceleration.on_conflict.is_empty() && !ds.access().allows_write() {
+            if !acceleration.on_conflict.is_empty() {
                 let warning = if acceleration.engine == Engine::Cayenne {
                     cayenne_on_conflict_warning(&dataset_name, acceleration, rule)
                 } else {
@@ -2095,6 +2093,16 @@ impl Runtime {
             && !replicate
         {
             crate::AcceleratedWriteBackWithoutReplicationSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .fail()?;
+        }
+        // Writes kept only in the acceleration would be overwritten by the changes a
+        // change stream applies for the same keys.
+        if acceleration_settings.write_mode == spicepod::acceleration::WriteMode::Acceleration
+            && acceleration_settings.refresh_mode == Some(RefreshMode::Changes)
+        {
+            crate::AccelerationWriteModeWithChangesSnafu {
                 dataset_name: ds.name.to_string(),
             }
             .fail()?;

@@ -19,7 +19,7 @@ limitations under the License.
 //!
 //! Every test drives the transport-neutral orchestrator
 //! [`runtime::datafusion::query::run_transaction`] against an **accelerator-only**
-//! Cayenne table (`on_conflict` upsert + `refresh_mode: full`) whose source is a
+//! Cayenne table (`write_mode: acceleration` + `refresh_mode: full`) whose source is a
 //! local CSV file — fully self-contained, no external Postgres or S3. This is the
 //! configuration that routes gated writes through the staged commit path (see
 //! `transaction::resolve_cayenne_staged`).
@@ -57,7 +57,7 @@ use crate::utils::{runtime_ready_check, test_request_context};
 // Harness
 // ---------------------------------------------------------------------------
 
-/// Build an accelerator-only Cayenne dataset (`on_conflict: upsert` +
+/// Build an accelerator-only Cayenne dataset (`write_mode: acceleration` +
 /// `refresh_mode: full` + a primary key) seeded from a local CSV file. This is
 /// the exact shape `resolve_cayenne_staged` accepts as a transaction
 /// participant, and it is fully self-contained (no external source).
@@ -90,6 +90,7 @@ fn make_txn_dataset(
         params: Some(Params::from_string_map(params)),
         primary_key: Some("id".to_string()),
         on_conflict,
+        write_mode: spicepod::acceleration::WriteMode::Acceleration,
         ..Acceleration::default()
     });
     dataset

@@ -123,6 +123,12 @@ async fn load_with_access(
         "id"
     };
     let mut dataset = Dataset::new(format!("file://{}", file.display()), "t");
+    // A read-write dataset over a file source keeps its writes in the acceleration.
+    let write_mode = if access == AccessMode::ReadWrite {
+        spicepod::acceleration::WriteMode::Acceleration
+    } else {
+        spicepod::acceleration::WriteMode::default()
+    };
     dataset.access = access;
     // An append refresh of a partitioned table needs a time column to load.
     if case.partitioned && case.refresh == RefreshMode::Append {
@@ -138,6 +144,7 @@ async fn load_with_access(
         on_conflict: behavior
             .map(|behavior| HashMap::from([(key.to_string(), behavior)]))
             .unwrap_or_default(),
+        write_mode,
         partition_by: if case.partitioned {
             vec![PartitionedBy {
                 name: "region".to_string(),
@@ -336,9 +343,7 @@ async fn an_update_onto_a_kept_key_fails_and_changes_nothing() {
                 let (rt, ready, _dir) = load_with_access(
                     &rows,
                     &case,
-                    // `on_conflict` keeps a read-write dataset's writes in the
-                    // acceleration.
-                    Some(OnConflictBehavior::Upsert),
+                    None,
                     &label,
                     AccessMode::ReadWrite,
                 )
@@ -515,16 +520,8 @@ async fn an_insert_counts_the_rows_it_inserted_or_replaced() {
                     partitioned: false,
                 };
                 let label = format!("{}/insert", case.label());
-                let (rt, ready, _dir) = load_with_access(
-                    rows,
-                    &case,
-                    // `on_conflict` keeps a read-write dataset's writes in the
-                    // acceleration.
-                    Some(OnConflictBehavior::Upsert),
-                    &label,
-                    AccessMode::ReadWrite,
-                )
-                .await;
+                let (rt, ready, _dir) =
+                    load_with_access(rows, &case, None, &label, AccessMode::ReadWrite).await;
                 assert!(ready, "{label}: the stored row loads");
                 let batches = rt
                     .datafusion()

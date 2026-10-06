@@ -1480,6 +1480,7 @@ async fn a_cayenne_statement_reports_the_rows_it_supersedes() {
         primary_key: Some("id".to_string()),
         // Keeps the statement's writes in the acceleration.
         on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
+        write_mode: spicepod::acceleration::WriteMode::Acceleration,
         ..Acceleration::default()
     });
     let app = AppBuilder::new("metrics_superseded_statement")

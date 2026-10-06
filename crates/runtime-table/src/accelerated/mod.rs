@@ -600,7 +600,7 @@ impl Builder {
     }
 
     /// Set to only write to the accelerator (not replicate to federated source).
-    /// This is used when `on_conflict` is configured - writes go only to the accelerator.
+    /// This is used for a source that discards writes (`sink`).
     pub fn write_to_accelerator_only(&mut self) -> &mut Self {
         self.write_to_accelerator_only = true;
         self
@@ -1488,8 +1488,8 @@ impl AcceleratedTable {
         self.write_mode.is_dual_write()
     }
 
-    /// Whether writes are directed to the local accelerator only (the
-    /// `on_conflict` / read-only-source case). Conditional-commit transactions
+    /// Whether writes are directed to the local accelerator only (a source
+    /// that discards writes, `sink`). Conditional-commit transactions
     /// require this: their staging + atomic publish live in the accelerator
     /// write path, which the write-through/write-back/dual-write modes bypass.
     #[must_use]
@@ -2201,8 +2201,7 @@ impl TableLayer for AcceleratedTable {
         let mut superseded = None;
         let plan = match &self.write_mode {
             WriteMode::AcceleratorOnly => {
-                // When on_conflict is configured, writes go only to the accelerator
-                // (the federated source may not support writes, e.g., file connector).
+                // Writes go only to the accelerator: its source discards them (`sink`).
                 // The accelerator counts the rows the statement does not keep into
                 // the session it runs on; they are recorded once the write completes.
                 let counting = state

@@ -1099,6 +1099,7 @@ async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Er
                 params: Some(Params::from_string_map(params)),
                 primary_key: Some("event_id".to_string()),
                 on_conflict,
+                write_mode: spicepod::acceleration::WriteMode::Acceleration,
                 ..Acceleration::default()
             });
 

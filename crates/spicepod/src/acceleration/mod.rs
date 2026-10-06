@@ -60,6 +60,11 @@ pub enum RefreshMode {
 ///   single-column `primary_key` to key each delivery on, and
 ///   `replication.enabled: true` as an explicit opt-in to the source lagging the
 ///   accelerator.
+///
+/// - `acceleration`: Writes go only to the acceleration and never reach the
+///   federated source, which need not accept writes. Refreshes still load the
+///   source's data into the acceleration. Not valid with `refresh_mode: changes`,
+///   whose changes would overwrite the writes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +72,7 @@ pub enum WriteMode {
     #[default]
     WriteThrough,
     WriteBack,
+    Acceleration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -945,6 +951,19 @@ mod tests {
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::UpsertDedupByRowId)
         );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_write_mode() {
+        for (value, expected) in [
+            ("write_through", WriteMode::WriteThrough),
+            ("write_back", WriteMode::WriteBack),
+            ("acceleration", WriteMode::Acceleration),
+        ] {
+            let acceleration: Acceleration = yaml::from_str(&format!("write_mode: {value}"))
+                .expect("Failed to parse Acceleration");
+            assert_eq!(acceleration.write_mode, expected, "write_mode: {value}");
+        }
     }
 
     #[test]
