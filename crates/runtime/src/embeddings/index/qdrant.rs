@@ -17,9 +17,9 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema, SchemaRef};
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::Expr;
-use datafusion::sql::TableReference;
 use qdrant::QdrantStore as _;
 use search::generation::util::get_primary_keys;
 use search::index::chunking::ChunkedSearchIndex;
