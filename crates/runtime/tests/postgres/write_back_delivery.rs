@@ -69,7 +69,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 // ── source helpers ──────────────────────────────────────────────────────────
 
-/// A client on the source, from the port [`common::get_random_port`] handed the
+/// A client on the source, from the published port of the
 /// container.
 async fn connect(port: usize) -> Result<Client, anyhow::Error> {
     common::connect(u16::try_from(port)?).await
@@ -386,8 +386,8 @@ async fn a_write_outside_a_transaction_is_refused() -> Result<(), anyhow::Error>
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
             let source = connect(port).await?;
             // A plain table: the statement is refused before it reaches the
             // source, so there is nothing here for a trigger to observe. The seed
@@ -450,8 +450,8 @@ async fn a_plain_cdc_dataset_bootstraps_and_follows_the_source() -> Result<(), a
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
             let source = connect(port).await?;
             exec(
                 &source,
@@ -497,8 +497,8 @@ async fn write_back_bootstraps_without_an_explicit_slot() -> Result<(), anyhow::
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
             let source = connect(port).await?;
             exec(
                 &source,
@@ -586,8 +586,8 @@ async fn a_transactions_echo_is_dropped_while_a_foreign_write_lands() -> Result<
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
             let source = connect(port).await?;
             create_bumping_table(&source, "wb_echo").await?;
 
@@ -685,8 +685,8 @@ async fn a_pk_point_lookup_ordered_by_the_pk_plans_after_a_transactional_commit(
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
             let source = connect(port).await?;
             exec(
                 &source,

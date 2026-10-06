@@ -1,6 +1,7 @@
 tests:
   bench:
     spicepod_path: accelerated/on_zero_results/file[parquet]-duckdb[file]-on_zero_results.yaml
+    ready_wait: 300
     query_set: tpcds
     query_overrides: duckdb-zero-results
     runner_type: spiceai-dev-runners

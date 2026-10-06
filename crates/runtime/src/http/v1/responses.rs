@@ -206,7 +206,11 @@ pub(crate) async fn post(
         }
 
         let Some(model) = llms.read().await.get(&model_id).cloned() else {
-            return (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response();
+            let message = rt
+                .status()
+                .unavailable_model_reason(&model_id)
+                .unwrap_or_else(|| format!("model '{model_id}' not found"));
+            return (StatusCode::NOT_FOUND, message).into_response();
         };
 
         if stream {

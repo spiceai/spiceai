@@ -57,8 +57,12 @@ use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_execution::cache::DefaultListFilesCache;
+use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::cache::cache_manager::CacheManagerConfig;
+use datafusion_execution::cache::cache_manager::{
+    CachedFileList, DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT,
+};
+use datafusion_execution::cache::default_cache::DefaultCache;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{col, lit};
 use datafusion_physical_plan::collect;
@@ -212,8 +216,13 @@ async fn load_sf10_table() -> LoadedTable {
     let runtime_env = Arc::new(
         RuntimeEnvBuilder::new()
             .with_cache_manager(
-                CacheManagerConfig::default()
-                    .with_list_files_cache(Some(Arc::new(DefaultListFilesCache::default()))),
+                CacheManagerConfig::default().with_list_files_cache(Some(Arc::new(
+                    DefaultCache::<TableScopedPath, CachedFileList>::new_with_ttl(
+                        DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT,
+                        None,
+                    )
+                    .with_name("DefaultListFilesCache"),
+                ))),
             )
             .build()
             .expect("runtime env"),

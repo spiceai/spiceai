@@ -42,12 +42,13 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{
     Session, TableFunctionImpl, TableProvider, default_table_source::provider_as_source,
 };
+use datafusion::common::TableReference;
 use datafusion::common::{Column, DFSchema, DataFusionError, Result as DataFusionResult, Spans};
 use datafusion::datasource::{MemTable, TableType};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{
     ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Subquery,
-    TableScan, Volatility as DfVolatility,
+    Volatility as DfVolatility,
     simplify::{ExprSimplifyResult, SimplifyContext},
 };
 use datafusion::physical_plan::ExecutionPlan;
@@ -55,7 +56,6 @@ use datafusion::physical_plan::{PhysicalExpr, expressions::CastExpr};
 use datafusion::prelude::{DataFrame, Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::{
-    TableReference,
     parser::DFParser,
     sqlparser::{
         ast,
@@ -197,7 +197,7 @@ pub fn build_scalar_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
     let arrow_schema = Arc::new(Schema::new(fields));
     let df_schema = DFSchema::try_from(arrow_schema.as_ref().clone()).context(BuildSchemaSnafu)?;
 
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
 
     let logical_expr = ctx
         .parse_sql_expr(body, &df_schema)
@@ -331,13 +331,11 @@ impl ScalarUDFImpl for SqlScalarTableArgUdf {
         #[expect(deprecated)]
         let provider = self.table_func.call(&args)?;
         let table_source = provider_as_source(provider);
-        let table_scan = TableScan::try_new(
+        let table_scan = datafusion::logical_expr::TableScanBuilder::new(
             TableReference::bare(format!("{}_result", self.name)),
             table_source,
-            None,
-            vec![],
-            None,
-        )?;
+        )
+        .build()?;
         Ok(ExprSimplifyResult::Simplified(Expr::ScalarSubquery(
             Subquery {
                 subquery: Arc::new(LogicalPlan::TableScan(table_scan)),
@@ -843,7 +841,7 @@ fn context_with_args(
             })?;
         SessionContext::new_with_state(builder_from_existing(state).build())
     } else {
-        SessionContext::new()
+        util::session_state::session_context()
     };
     let batch = args_record_batch(Arc::clone(&schema), values)?;
     let table = MemTable::try_new(schema, vec![vec![batch]])?;

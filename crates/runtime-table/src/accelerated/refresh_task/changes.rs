@@ -40,6 +40,7 @@ use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
@@ -49,7 +50,6 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use runtime_acceleration::dataupdate::{
@@ -1278,7 +1278,7 @@ impl RefreshTask {
         let mut carried_received_ms: Option<i64> = None;
         let mut carried_received_at: Option<Instant> = None;
         let mut last_cycle_start = Instant::now();
-        let write_ctx = SessionContext::new();
+        let write_ctx = util::session_state::session_context();
         let write_session_state = write_ctx.state();
         let recv_wait_labels = metric_labels.dataset();
 
@@ -3465,14 +3465,27 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<
     let records: Vec<&RecordBatch> = batches.iter().map(|b| &b.record).collect();
     let combined = arrow::compute::concat_batches(&schema, records)
         .context(crate::accelerated::FailedToBuildRecordBatchSnafu)?;
-    ChangeBatch::try_new(combined).map_err(|e| {
-        // ChangeBatchError isn't part of the AcceleratedTable Error enum;
-        // wrap it in FailedToBuildRecordBatch so the caller's status path
-        // doesn't have to learn about a new variant.
-        crate::accelerated::Error::FailedToBuildRecordBatch {
-            source: arrow::error::ArrowError::ExternalError(Box::new(e)),
-        }
-    })
+    // The coalesced batch keeps the newest constituent commit timestamp: it rides
+    // the batch into the accelerator (`write_cdc_append_stream_with_source_commit_ts`),
+    // where it feeds the replication-lag and freshness signals the adaptive tuner's
+    // goals are stated against. Same rule as the burst frontier in `apply_burst`:
+    // the max is the most recent, and zero-row envelopes are excluded because their
+    // timestamp is not evidence that data up to that point was received.
+    let source_commit_ts_ms = batches
+        .iter()
+        .filter(|batch| !batch.is_heartbeat())
+        .filter_map(ChangeBatch::source_commit_ts_ms)
+        .max();
+    ChangeBatch::try_new(combined)
+        .map(|batch| batch.with_source_commit_ts_ms(source_commit_ts_ms))
+        .map_err(|e| {
+            // ChangeBatchError isn't part of the AcceleratedTable Error enum;
+            // wrap it in FailedToBuildRecordBatch so the caller's status path
+            // doesn't have to learn about a new variant.
+            crate::accelerated::Error::FailedToBuildRecordBatch {
+                source: arrow::error::ArrowError::ExternalError(Box::new(e)),
+            }
+        })
 }
 
 fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
@@ -4714,6 +4727,63 @@ mod tests {
         ChangeBatch::try_new(record).expect("Failed to create ChangeBatch")
     }
 
+    /// A coalesced burst keeps the newest source-commit timestamp of its
+    /// constituents. Without it every multi-envelope burst reached the
+    /// accelerator with `None`, so Cayenne's replication-lag goal read nothing
+    /// (`cayenne_ingest_replication_lag_seconds` had no series in eight 3-node
+    /// SF-1 lab arms on 2026-09-27, while the runtime's own
+    /// `dataset_acceleration_cdc_received_commit_unix_time_ms`, computed from
+    /// the envelopes before concatenation, was populated) and its freshness goal
+    /// fell back to a wall-clock age.
+    #[test]
+    fn concat_change_batches_keeps_the_newest_source_commit_ts() {
+        let older = create_test_change_batch(vec!["c"], &[vec!["1"]], vec![1], vec![Some("a")])
+            .with_source_commit_ts_ms(Some(1_700_000_000_000));
+        let newest = create_test_change_batch(vec!["u"], &[vec!["2"]], vec![2], vec![Some("b")])
+            .with_source_commit_ts_ms(Some(1_700_000_005_000));
+        let unstamped = create_test_change_batch(vec!["d"], &[vec!["3"]], vec![3], vec![None]);
+        // A zero-row envelope that survived the no-op-heartbeat retain (it rides a
+        // real committer) is not evidence of received data, so its newer stamp
+        // must not advance the coalesced batch's timestamp — the same exclusion
+        // the runtime's received/applied frontier applies.
+        let zero_row = create_test_change_batch(vec![], &[], vec![], vec![])
+            .with_source_commit_ts_ms(Some(1_700_000_099_000));
+        assert!(zero_row.is_heartbeat());
+        // Arrival order is not commit order: the last row-bearing constituent
+        // carries an OLDER stamp than an earlier one, so taking the last stamp
+        // (rather than the max) would be wrong.
+        let oldest_last =
+            create_test_change_batch(vec!["c"], &[vec!["4"]], vec![4], vec![Some("d")])
+                .with_source_commit_ts_ms(Some(1_699_999_000_000));
+
+        let combined = concat_change_batches(&[older, newest, unstamped, zero_row, oldest_last])
+            .expect("concat");
+        assert_eq!(combined.record.num_rows(), 4, "every row is carried");
+        let data = combined.data_batch();
+        let ids = data
+            .column_by_name("id")
+            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+            .expect("id column is Int32")
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![1, 2, 3, 4], "rows keep their arrival order");
+        assert_eq!(
+            combined.source_commit_ts_ms(),
+            Some(1_700_000_005_000),
+            "the coalesced batch carries the newest row-bearing constituent commit timestamp"
+        );
+
+        // A burst with no stamped constituent stays unstamped: no lag information.
+        let a = create_test_change_batch(vec!["c"], &[vec!["1"]], vec![1], vec![Some("a")]);
+        let b = create_test_change_batch(vec!["c"], &[vec!["2"]], vec![2], vec![Some("b")]);
+        assert_eq!(
+            concat_change_batches(&[a, b])
+                .expect("concat")
+                .source_commit_ts_ms(),
+            None
+        );
+    }
+
     #[test]
     fn test_empty_batch() {
         let change_batch = create_test_change_batch(vec![], &[], vec![], vec![]);
@@ -5199,7 +5269,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare(name.to_string()),
+            datafusion::common::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -5222,7 +5292,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(federated));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare(name.to_string()),
+            datafusion::common::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -5283,7 +5353,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare("test".to_string()),
+            datafusion::common::TableReference::bare("test".to_string()),
             federated,
             None,
             accelerator,
@@ -5335,7 +5405,7 @@ mod tests {
                 MemTable::try_new(Arc::clone(&stored), vec![vec![]])
                     .expect("mem table should be created"),
             );
-            let dataset = datafusion::sql::TableReference::bare(name.to_string());
+            let dataset = datafusion::common::TableReference::bare(name.to_string());
             install_cdc_schema_evolution(
                 &dataset,
                 CdcSchemaEvolution {
@@ -5418,7 +5488,7 @@ mod tests {
 
         let dataset = "cdc_map_entries_accepted";
         install_cdc_schema_evolution(
-            &datafusion::sql::TableReference::bare(dataset.to_string()),
+            &datafusion::common::TableReference::bare(dataset.to_string()),
             CdcSchemaEvolution {
                 policy: OnSchemaChange::Fail,
                 constraint_columns: vec![],
@@ -6705,6 +6775,17 @@ mod tests {
         fn properties(&self) -> &Arc<PlanProperties> {
             self.inner.properties()
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
         }

@@ -105,27 +105,33 @@ impl SqliteDatasetCheckpointer {
 
         conn.conn
             .call(move |conn| {
-                // Check if schema_json column exists
-                let columns: Vec<String> = conn
+                // Several datasets can share one database file, each migrating it over its
+                // own connection at the same time. `BEGIN IMMEDIATE` takes the write lock
+                // before the columns are read, so a second migrator waits (up to the busy
+                // timeout) and then sees the columns the first one added, instead of
+                // adding them again and failing with "duplicate column name".
+                let txn =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let columns: Vec<String> = txn
                     .prepare(&format!("PRAGMA table_info({CHECKPOINT_TABLE_NAME})"))?
                     .query_map([], |row| row.get::<_, String>(1))?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
 
                 if !columns.contains(&"schema_json".to_string()) {
-                    conn.execute(
+                    txn.execute(
                         &format!("ALTER TABLE {CHECKPOINT_TABLE_NAME} ADD COLUMN schema_json TEXT"),
                         [],
                     )?;
                 }
 
                 if !columns.contains(&"refresh_sql".to_string()) {
-                    conn.execute(
+                    txn.execute(
                         &format!("ALTER TABLE {CHECKPOINT_TABLE_NAME} ADD COLUMN refresh_sql TEXT"),
                         [],
                     )?;
                 }
 
-                Ok::<(), rusqlite::Error>(())
+                txn.commit()
             })
             .await
             .map_err(store_error)
@@ -826,5 +832,55 @@ mod tests {
             })
             .await
             .expect("backdate updated_at");
+    }
+
+    /// Datasets sharing one database file (Cayenne's metastore) each open the checkpoint
+    /// table over their own connection, and they do so concurrently when they bootstrap
+    /// from snapshots together. Every one of them must come up, not only the first to
+    /// add the migrated columns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_migrations_of_one_file_all_succeed() {
+        const CONNECTIONS: usize = 8;
+        const ROUNDS: usize = 20;
+
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path: Arc<str> = Arc::from(dir.path().join("cayenne.db").to_string_lossy());
+
+            let mut pools = Vec::with_capacity(CONNECTIONS);
+            for _ in 0..CONNECTIONS {
+                pools.push(Arc::new(
+                    SqliteConnectionPoolFactory::new(
+                        &path,
+                        Mode::File,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .build()
+                    .await
+                    .expect("to build file sqlite connection pool"),
+                ));
+            }
+
+            let mut migrations = tokio::task::JoinSet::new();
+            for (i, pool) in pools.into_iter().enumerate() {
+                migrations.spawn(async move {
+                    SqliteDatasetCheckpointer::try_new(pool, format!("dataset_{i}"))
+                        .await
+                        .map(|_| ())
+                });
+            }
+            let failures = migrations
+                .join_all()
+                .await
+                .into_iter()
+                .filter_map(Result::err)
+                .map(|err| err.to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                failures.is_empty(),
+                "round {round}: {} of {CONNECTIONS} concurrent checkpoint openings failed: {failures:?}",
+                failures.len()
+            );
+        }
     }
 }

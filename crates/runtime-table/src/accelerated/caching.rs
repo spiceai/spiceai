@@ -32,13 +32,13 @@ use datafusion::execution::context::SessionState;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{Expr, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
-use datafusion::physical_plan::execution_plan::EmissionType;
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
     stream::RecordBatchStreamAdapter,
 };
 use datafusion::physical_plan::{Distribution, Partitioning, PlanProperties};
-use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::expr::ExprListDisplay;
 use futures::{StreamExt, TryStreamExt};
@@ -49,6 +49,7 @@ use tokio::task::JoinHandle;
 
 use runtime_acceleration::acceleration::StaleIfError;
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
+use runtime_datafusion::execution_plan::TableScanParams;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_request_context::CacheNamespace;
 use runtime_status::{ComponentStatus, RuntimeStatus};
@@ -329,9 +330,11 @@ impl UncoalescedFetch<'_> {
             Ok(batches) if !batches.is_empty() => {
                 let batch_schema = batches[0].schema();
 
-                // A failing origin arrives as a successful fetch whose rows
-                // carry a 429 or 5xx status; serve the expired cached response
-                // instead when `caching_stale_if_error` allows it.
+                // The guard for a 429 or 5xx status reaching here on a
+                // *successful* fetch; serve the expired cached response instead
+                // when `caching_stale_if_error` allows it. The HTTP connector
+                // refuses such a status itself, so its own failures take the
+                // `Err` arm.
                 if !cache::batches_cacheable(&batches)
                     && let Some(stale) = match expired_batches {
                         Some(fallback) => fallback.read().await,
@@ -1181,13 +1184,13 @@ struct StaleCacheEntry {
 
 /// What a revalidation learned about the source.
 ///
-/// The distinction matters because a failing origin does not arrive as an
-/// error. Once the HTTP connector has exhausted its own `max_retries`, it
-/// surfaces the failure as a *successful* fetch whose rows carry a 429 or 5xx
-/// status — so a caller that only inspects `Result` sees "the source answered"
-/// and cannot tell that it answered with a failure. That is the dominant
-/// failure mode of the connectors caching mode accepts, and it is precisely
-/// when `caching_stale_if_error` is supposed to act.
+/// The distinction matters because a failing origin need not arrive as an
+/// error: a fetch can succeed and carry a 429 or 5xx in its rows, so a caller
+/// that only inspects `Result` sees "the source answered" and cannot tell that
+/// it answered with a failure. That is precisely when `caching_stale_if_error`
+/// is supposed to act. The HTTP connector refuses such a status itself — see
+/// its `on_error_response` — so this outcome is what covers a row that reaches
+/// the cache by any other route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevalidationOutcome {
     /// The source answered, and its rows were queued to replace the entry.
@@ -1211,13 +1214,11 @@ impl RevalidationOutcome {
     }
 }
 
-/// Helper functions for cache refresh operations
 /// An expired response is read only when a failing origin needs a fallback.
-/// The deferred form avoids executing the accelerator scan on a backend-first read.
 enum CacheFallback {
     Loaded(Vec<RecordBatch>),
     Deferred {
-        input: Arc<dyn ExecutionPlan>,
+        input: CachingScanInput,
         partition: usize,
         context: Arc<TaskContext>,
     },
@@ -1232,10 +1233,16 @@ impl CacheFallback {
                 partition,
                 context,
             } => input
+                .into_plan()
+                .await
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback planning failed"))
+                .ok()?
                 .execute(partition, context)
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback execution failed"))
                 .ok()?
                 .try_collect()
                 .await
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback collection failed"))
                 .ok()?,
         };
         let batches: Vec<RecordBatch> = batches
@@ -1293,7 +1300,7 @@ impl CacheRefreshHelper {
         let plan = accelerator
             .scan(session_state.as_ref(), None, &filters, None)
             .await?;
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = Arc::new(util::session_state::task_context());
 
         // Collect all stale rows from accelerator
         let stale_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
@@ -1372,12 +1379,13 @@ impl CacheRefreshHelper {
                     return Ok::<usize, datafusion::error::DataFusionError>(0);
                 }
 
-                // A failing origin arrives as a successful fetch whose rows
-                // carry a 429 or 5xx status, and this path overwrites the entry
-                // it refreshes. Writing that would replace the last good
-                // response with the origin's error body and serve it as a
-                // cache hit until it expires — so keep what is cached, which is
-                // also what `caching_stale_if_error` exists to do.
+                // This path overwrites the entry it refreshes, so a fetch
+                // that succeeded while carrying a 429 or 5xx would replace the
+                // last good response with the origin's error body and serve it
+                // as a cache hit until it expires — keep what is cached, which
+                // is also what `caching_stale_if_error` exists to do. The HTTP
+                // connector refuses such a status itself; this covers a row
+                // reaching here by any other route.
                 if !cache::batches_cacheable(&batches) {
                     tracing::debug!(
                         "Background refresh for dataset '{dataset_name}' found the origin failing (transient HTTP error response); keeping what is cached"
@@ -1629,7 +1637,7 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
         let schema = batches[0].schema();
         let total_rows: usize = batches
@@ -1683,7 +1691,7 @@ impl CacheRefreshHelper {
 
         // Execute the insertion
         tracing::debug!("overwrite_accelerator executing insert plan for dataset={dataset_name}",);
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let _ = datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
         tracing::debug!(
             "overwrite_accelerator COMPLETED - successfully inserted {total_rows} rows into accelerator for dataset={dataset_name}",
@@ -1799,7 +1807,7 @@ impl CacheRefreshHelper {
             return Ok(false);
         };
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
 
         let plan = match accelerator.delete_from(&state, vec![delete_expr]).await {
@@ -1813,7 +1821,7 @@ impl CacheRefreshHelper {
             Err(e) => return Err(e),
         };
 
-        let deleted = datafusion::physical_plan::collect(plan, Arc::new(TaskContext::default()))
+        let deleted = datafusion::physical_plan::collect(plan, ctx.task_ctx())
             .await?
             .first()
             .map_or(0, |batch| {
@@ -1865,7 +1873,7 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
         let schema = batches[0].schema();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1895,7 +1903,7 @@ impl CacheRefreshHelper {
 
         let insert_plan = accelerator.insert_into(&state, plan, insert_op).await?;
 
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let _ = datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
 
         tracing::debug!(
@@ -1927,7 +1935,7 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
 
         tracing::trace!(
@@ -1937,7 +1945,7 @@ impl CacheRefreshHelper {
 
         // Scan all data from the accelerator (no filters to get everything)
         let plan = accelerator.scan(&state, None, &[], None).await?;
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let existing_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
 
         let existing_rows: usize = existing_batches.iter().map(RecordBatch::num_rows).sum();
@@ -2111,7 +2119,7 @@ impl CacheRefreshHelper {
         child_accelerator: &Arc<dyn TableProvider>,
         dataset_name: &str,
     ) -> DataFusionResult<usize> {
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
 
         tracing::debug!(
@@ -2121,7 +2129,7 @@ impl CacheRefreshHelper {
 
         // Scan all existing data from the parent accelerator
         let plan = parent_accelerator.scan(&state, None, &[], None).await?;
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -2169,7 +2177,7 @@ impl CacheRefreshHelper {
             "Federated source SCAN successful for dataset={dataset_name}, plan has {} partitions",
             plan.properties().output_partitioning().partition_count()
         );
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = Arc::new(util::session_state::task_context());
 
         // Execute and collect all batches
         let all_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
@@ -2279,14 +2287,13 @@ impl CacheRefreshHelper {
                 // errors.
                 let batches_cacheable = cache::batches_cacheable(&batches);
 
-                // A failing origin does not arrive as an error. Once the HTTP
-                // connector has exhausted its own retries it reports the
-                // failure as a successful fetch whose rows carry a 429 or 5xx
-                // status, so serving stale data only from the `Err` arm below
-                // would miss the dominant failure mode — an operator who asked
-                // for `caching_stale_if_error` would get the origin's error
-                // body instead of the cached response they asked to fall back
-                // to.
+                // A failing origin usually takes the `Err` arm below: the HTTP
+                // connector refuses a 429 or 5xx that outlives its retries
+                // whatever `on_error_response` says. This arm is the guard for
+                // such a row reaching here by some other route, because an
+                // operator who asked for
+                // `caching_stale_if_error` would otherwise be served the
+                // origin's error body instead of the cached response.
                 if !batches_cacheable
                     && let Some(stale) = match expired_batches {
                         Some(fallback) => fallback.read().await,
@@ -2674,12 +2681,88 @@ pub type SynchronizedChildren = Arc<RwLock<Vec<Arc<dyn TableProvider>>>>;
 /// arbitrary caller `Expr`s, so full default features are kept rather than a stripped-down
 /// set, but the registry itself never varies by dataset or query, so it's built once for the
 /// process instead of once per exec.
-pub(crate) static SHARED_SESSION_STATE: LazyLock<Arc<SessionState>> =
-    LazyLock::new(|| Arc::new(SessionStateBuilder::new().with_default_features().build()));
+pub(crate) static SHARED_SESSION_STATE: LazyLock<Arc<SessionState>> = LazyLock::new(|| {
+    Arc::new(
+        SessionStateBuilder::new()
+            .with_config(util::session_state::session_config())
+            .with_default_features()
+            .build(),
+    )
+});
+
+/// Whether a filtered cache read must ask the origin before it may serve stored rows.
+pub(super) fn uses_source_first(
+    filters: &[Expr],
+    max_age: Option<Duration>,
+    stale_while_revalidate: Option<Duration>,
+    stale_if_error: StaleIfError,
+) -> bool {
+    !filters.is_empty()
+        && effective_max_age(max_age).is_zero()
+        && stale_while_revalidate.unwrap_or_default().is_zero()
+        && stale_if_error.serves_stale_on_error()
+}
+
+/// The accelerator read input. A deferred input owns query-specific scan arguments,
+/// not a storage snapshot; its read view is selected only if the origin fails.
+#[derive(Clone)]
+pub(super) enum CachingScanInput {
+    Planned(Arc<dyn ExecutionPlan>),
+    Deferred {
+        accelerator: Arc<dyn TableProvider>,
+        scan_params: TableScanParams,
+        filters_to_reapply: Vec<Expr>,
+        schema: SchemaRef,
+    },
+}
+
+impl From<Arc<dyn ExecutionPlan>> for CachingScanInput {
+    fn from(input: Arc<dyn ExecutionPlan>) -> Self {
+        Self::Planned(input)
+    }
+}
+
+impl CachingScanInput {
+    fn schema(&self) -> SchemaRef {
+        match self {
+            Self::Planned(input) => input.schema(),
+            Self::Deferred { schema, .. } => Arc::clone(schema),
+        }
+    }
+
+    async fn into_plan(self) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        match self {
+            Self::Planned(input) => Ok(input),
+            Self::Deferred {
+                accelerator,
+                scan_params,
+                filters_to_reapply,
+                schema,
+            } => {
+                let input = scan_params
+                    .scan_and_optimize(accelerator.as_ref(), &filters_to_reapply)
+                    .await?;
+                if input.schema().fields() != schema.fields() {
+                    tracing::debug!(expected = ?schema, actual = ?input.schema(), "Cache fallback schema mismatch");
+                    return Err(DataFusionError::Execution(
+                        "The cached response schema changed while fetching the origin".to_string(),
+                    ));
+                }
+                // Physical scans may omit schema-level table metadata. Keep the
+                // deferred node's output schema without accepting changed fields.
+                if input.schema() == schema {
+                    Ok(input)
+                } else {
+                    Ok(Arc::new(SchemaCastScanExec::new(input, schema)))
+                }
+            }
+        }
+    }
+}
 
 /// Caching acceleration execution plan that checks staleness and triggers background refresh
 pub struct CachingAccelerationScanExec {
-    input: Arc<dyn ExecutionPlan>,
+    input: CachingScanInput,
     plan_properties: Arc<PlanProperties>,
     /// Maximum time data is considered "fresh" - can be served without refresh
     max_age: Option<Duration>,
@@ -2709,8 +2792,8 @@ pub struct CachingAccelerationScanExec {
 
 impl CachingAccelerationScanExec {
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
-        input: Arc<dyn ExecutionPlan>,
+    pub(super) fn new(
+        input: impl Into<CachingScanInput>,
         max_age: Option<Duration>,
         stale_while_revalidate: Option<Duration>,
         stale_if_error: StaleIfError,
@@ -2727,15 +2810,22 @@ impl CachingAccelerationScanExec {
         batch_write_tx: CacheWriteSender,
     ) -> Self {
         let max_age = Some(effective_max_age(max_age));
+        let input = input.into();
 
-        let plan_properties = Arc::new(
-            input
+        let plan_properties = Arc::new(match &input {
+            CachingScanInput::Planned(input) => input
                 .properties()
                 .as_ref()
                 .clone()
                 .with_emission_type(EmissionType::Final)
                 .with_partitioning(Partitioning::UnknownPartitioning(1)),
-        );
+            CachingScanInput::Deferred { schema, .. } => PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(schema)),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ),
+        });
 
         let session_state = Arc::clone(&SHARED_SESSION_STATE);
 
@@ -2769,7 +2859,12 @@ impl std::fmt::Debug for CachingAccelerationScanExec {
 
 impl DisplayAs for CachingAccelerationScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "CachingAccelerationScanExec")
+        match &self.input {
+            CachingScanInput::Planned(_) => write!(f, "CachingAccelerationScanExec"),
+            CachingScanInput::Deferred { .. } => {
+                write!(f, "CachingAccelerationScanExec: cache_scan=deferred")
+            }
+        }
     }
 }
 
@@ -2787,19 +2882,43 @@ impl ExecutionPlan for CachingAccelerationScanExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition; 1]
+        vec![Distribution::SinglePartition; self.children().len()]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
+        match &self.input {
+            CachingScanInput::Planned(input) => vec![input],
+            CachingScanInput::Deferred { .. } => vec![],
+        }
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let input = match (&self.input, children.as_slice()) {
+            (CachingScanInput::Planned(_), [input]) => Arc::clone(input),
+            (CachingScanInput::Deferred { .. }, []) => return Ok(self),
+            _ => {
+                return Err(DataFusionError::Internal(
+                    "CachingAccelerationScanExec received an invalid number of children"
+                        .to_string(),
+                ));
+            }
+        };
         Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
+            input,
             self.max_age,
             self.stale_while_revalidate,
             self.stale_if_error,
@@ -2827,6 +2946,12 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             self.dataset_name
         );
 
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "CachingAccelerationScanExec only supports partition 0, got {partition}"
+            )));
+        }
+
         // The originating request context is attached to the session as
         // an extension by `Query::run_internal`. We read it from the
         // `TaskContext` here and NOT from `RequestContext::current()`,
@@ -2842,14 +2967,15 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         // With neither a fresh nor an SWR window, a stale-if-error entry can
         // only be served after a failing fetch. Do not execute its scan until
         // that failure; successful fetches replace any stored response for the key.
-        if !self.filters.is_empty()
-            && self.max_age == Some(Duration::ZERO)
-            && self.stale_while_revalidate.unwrap_or_default().is_zero()
-            && self.stale_if_error.serves_stale_on_error()
-        {
+        if uses_source_first(
+            &self.filters,
+            self.max_age,
+            self.stale_while_revalidate,
+            self.stale_if_error,
+        ) {
             let schema = self.input.schema();
             let stream_schema = Arc::clone(&schema);
-            let input = Arc::clone(&self.input);
+            let input = self.input.clone();
             let federated = Arc::clone(&self.federated);
             let session_state = Arc::clone(&self.session_state);
             let dataset_name = self.dataset_name.clone();
@@ -2892,8 +3018,12 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)));
         }
 
-        // Execute the accelerator scan
-        let accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
+        let CachingScanInput::Planned(input) = &self.input else {
+            return Err(DataFusionError::Internal(
+                "A cache-first read requires a planned accelerator input".to_string(),
+            ));
+        };
+        let accelerator_stream = input.execute(partition, Arc::clone(&context))?;
 
         // When no filters are provided (e.g., SELECT *), return cached data directly
         // without triggering HTTP requests to the federated source or staleness checks.
@@ -3212,6 +3342,8 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+    use datafusion::prelude::SessionContext;
     use parking_lot::RwLock;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
@@ -5006,6 +5138,7 @@ mod tests {
         let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
             MemorySourceConfig::try_new(&[vec![stale]], stale_schema, None).expect("cache input"),
         )));
+        let input = input.into();
         let in_flight: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
@@ -5175,6 +5308,7 @@ mod tests {
             MemorySourceConfig::try_new(&[vec![stale]], Arc::clone(&schema), None)
                 .expect("cache input"),
         )));
+        let input = input.into();
         let in_flight: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
@@ -6407,6 +6541,17 @@ mod tests {
             self.inner.properties()
         }
 
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
         }
@@ -6589,7 +6734,7 @@ mod tests {
                 stale_if_error: StaleIfError::Enabled,
                 max_age: Duration::ZERO,
                 expired_batches: Some(CacheFallback::Deferred {
-                    input,
+                    input: input.into(),
                     partition: 0,
                     context: Arc::new(TaskContext::default()),
                 }),
@@ -6650,7 +6795,7 @@ mod tests {
                 stale_if_error: StaleIfError::Enabled,
                 max_age: Duration::ZERO,
                 expired_batches: Some(CacheFallback::Deferred {
-                    input,
+                    input: input.into(),
                     partition: 0,
                     context: Arc::new(TaskContext::default()),
                 }),
@@ -6770,7 +6915,10 @@ mod tests {
             cached_input(vec![]),
             vec![col("request_path").eq(lit("/api/rewritten"))],
         )
-        .with_new_children(vec![cached_input(vec![])])
+        .replace_children(
+            vec![cached_input(vec![])],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .expect("with_new_children");
         let rows: Vec<RecordBatch> = rewritten
             .execute(0, Arc::new(TaskContext::default()))
@@ -7074,6 +7222,7 @@ mod write_path_tests {
     use datafusion::catalog::{Session, TableProvider};
     use datafusion::common::Constraints;
     use datafusion::datasource::TableType;
+    use datafusion::prelude::SessionContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Wraps a real accelerator and records which operations it was asked for.
