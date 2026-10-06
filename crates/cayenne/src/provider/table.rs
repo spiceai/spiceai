@@ -810,10 +810,22 @@ struct SnapshotSweepPins {
     grace: Duration,
 }
 
-/// Keeps maintenance from deleting the table's files until dropped.
+/// Keeps maintenance from deleting the table's files until dropped, then reruns
+/// the snapshot-directory sweeps it may have deferred.
 /// See [`CayenneTableProvider::pin_for_snapshot`].
 pub struct SnapshotArchivePin {
-    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    table: CayenneTableProvider,
+}
+
+impl Drop for SnapshotArchivePin {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.table.sweep_retired_snapshot_dirs();
+            self.table.schedule_old_snapshot_cleanup();
+        }
+    }
 }
 
 /// What one superseded-snapshot sweep must preserve.
@@ -6566,9 +6578,8 @@ impl CayenneTableProvider {
     /// never propagated — a failed sweep costs disk, not correctness, and the
     /// next commit retries it.
     async fn run_old_snapshot_cleanup(&self) {
-        // Retry later while a snapshot is being archived.
+        // Rerun by the snapshot pin when it drops.
         let Ok(_reclaim) = Arc::clone(&self.file_reclaim_fence).try_write_owned() else {
-            self.rearm_snapshot_cleanup();
             return;
         };
         let (protected_snapshot_ids, in_use_snapshot_ids) = self.snapshot_cleanup_pins();
@@ -7247,7 +7258,7 @@ impl CayenneTableProvider {
         // outcome recorded at this point would report a reclaim that never
         // happened. It is emitted once the task knows what it actually removed.
         // A snapshot being archived may reference a directory retired after its
-        // slice was exported; the ledger keeps them for the next sweep.
+        // slice was exported; its pin reruns this sweep when it drops.
         let Ok(reclaim) = Arc::clone(&self.file_reclaim_fence).try_write_owned() else {
             return;
         };
@@ -19648,7 +19659,8 @@ impl CayenneTableProvider {
     /// deletion to finish.
     pub async fn pin_for_snapshot(&self) -> SnapshotArchivePin {
         SnapshotArchivePin {
-            _guard: Arc::clone(&self.file_reclaim_fence).read_owned().await,
+            guard: Some(Arc::clone(&self.file_reclaim_fence).read_owned().await),
+            table: self.clone_for_write(),
         }
     }
 
@@ -39810,7 +39822,7 @@ mod tests {
     }
 
     /// The retired-snapshot sweep keeps a retired directory while a snapshot pin
-    /// is held, because the archive may reference it, and removes it afterwards.
+    /// is held, because the archive may reference it; dropping the pin reruns it.
     #[tokio::test]
     async fn snapshot_pin_defers_the_retired_snapshot_sweep() {
         let ctx = SessionContext::new();
@@ -39833,7 +39845,6 @@ mod tests {
         assert!(dir.exists(), "the sweep must keep the dir while pinned");
 
         drop(pin);
-        provider.sweep_retired_snapshot_dirs();
         let deadline = Instant::now() + Duration::from_secs(10);
         while dir.exists() {
             assert!(
