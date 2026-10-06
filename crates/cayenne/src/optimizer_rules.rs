@@ -5338,12 +5338,14 @@ mod tests {
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
-        let limit = optimized.downcast_ref::<LocalLimitExec>().unwrap_or_else(|| {
-            panic!(
-                "the rewrite must keep the join's fetch as a per-partition limit:\n{}",
-                displayable(optimized.as_ref()).indent(true)
-            )
-        });
+        let limit = optimized
+            .downcast_ref::<LocalLimitExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the rewrite must keep the join's fetch as a per-partition limit:\n{}",
+                    displayable(optimized.as_ref()).indent(true)
+                )
+            });
         assert_eq!(limit.fetch(), 7, "the limit must be the join's fetch");
         assert_coalesced_oracle_file_scan_sort_merge(limit.input(), 4);
     }

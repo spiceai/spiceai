@@ -203,10 +203,8 @@ async fn a_limit_survives_the_sort_merge_rewrite_impl(fixture: TestFixture) -> T
             "precondition: the rewriter must turn this join into a sort-merge join: {sql}\n{plan}"
         );
 
-        let all_rows: HashSet<String> = rows(&reference, unlimited_sql)
-            .await?
-            .into_iter()
-            .collect();
+        let all_rows: HashSet<String> =
+            rows(&reference, unlimited_sql).await?.into_iter().collect();
         assert!(
             all_rows.len() > expected,
             "precondition: {unlimited_sql} must return more rows than the limit, got {}",
