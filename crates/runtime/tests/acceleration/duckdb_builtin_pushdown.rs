@@ -1439,3 +1439,210 @@ async fn duckdb_regexp_replace_group_references_push_down_where_the_engines_agre
         })
         .await
 }
+
+/// Distinct customers in `eu` whose `string_agg(... ORDER BY customer)` order
+/// is the assertion: `alice|carol|dave`. A federated call that dropped the
+/// `ORDER BY` came back unordered, and a memory accelerator and a file
+/// accelerator could disagree with each other.
+fn write_string_agg_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        path,
+        "id,customer,region\n\
+         1,carol,eu\n\
+         2,alice,eu\n\
+         3,dave,eu\n\
+         4,alice,us\n\
+         5,bob,\n",
+    )?;
+    Ok(())
+}
+
+/// `string_agg(DISTINCT … ORDER BY …)` is not pushed into `DuckDB`: the
+/// unparser drops the `ORDER BY`, so a federated call answers unordered.
+/// The query must still succeed locally and match the unaccelerated engine.
+#[tokio::test]
+async fn duckdb_accelerated_ordered_string_agg_stays_local_and_agrees() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("string_agg.csv");
+            write_string_agg_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_string_agg")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            let query = "SELECT string_agg(DISTINCT customer, '|' ORDER BY customer) AS customers \
+                         FROM {table} WHERE region = 'eu'";
+            let plan = to_pretty_display(
+                &run_query(
+                    &rt,
+                    &format!("EXPLAIN {}", query.replace("{table}", "accelerated")),
+                )
+                .await?,
+            )?
+            .to_string();
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                !remote_sql.contains("string_agg"),
+                "an ordered string_agg must not be sent to DuckDB; plan was:\n{plan}"
+            );
+
+            let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &query.replace("{table}", "local")).await?;
+            let expected = [
+                "+-------------------+",
+                "| customers         |",
+                "+-------------------+",
+                "| alice|carol|dave  |",
+                "+-------------------+",
+            ];
+            assert_batches_eq!(expected, &accelerated);
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "DuckDB-accelerated ordered string_agg must agree with local evaluation"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// `encode(sha256(x), 'hex')` used to fail remotely: the sha256 rewrite yields
+/// a `BLOB` and `DuckDB`'s `encode` is a charset conversion, so
+/// `encode(unhex(sha256(..)), 'hex')` is `Binder Error: No function matches
+/// ... encode(BLOB, STRING_LITERAL)`. The dialect now renders the hex form as
+/// `lower(hex(..))`.
+#[tokio::test]
+async fn duckdb_accelerated_encode_sha256_hex_agrees_with_local() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("encode_digest.csv");
+            write_digest_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_encode_sha256")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            let plan = to_pretty_display(
+                &run_query(
+                    &rt,
+                    "EXPLAIN SELECT encode(sha256(name), 'hex') FROM accelerated",
+                )
+                .await?,
+            )?
+            .to_string();
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                remote_sql.contains("lower(hex(") && remote_sql.contains("unhex(sha256("),
+                "encode(sha256(..), 'hex') must be pushed down as lower(hex(unhex(sha256(..)))); \
+                 plan was:\n{plan}"
+            );
+            assert!(
+                !remote_sql.contains("encode("),
+                "DuckDB's encode is a charset conversion and must not appear; \
+                 the SQL sent was:\n{remote_sql}"
+            );
+
+            let query = "SELECT id, encode(sha256(name), 'hex') AS h FROM {table} ORDER BY id";
+            let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &query.replace("{table}", "local")).await?;
+            let expected = [
+                "+----+------------------------------------------------------------------+",
+                "| id | h                                                                |",
+                "+----+------------------------------------------------------------------+",
+                "| 1  | 8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8 |",
+                "| 2  | 5b771e77826caa5ec36e3fbf8f5b2c59b606253913fcfe10104a43410b7a380b |",
+                "| 3  | 39af95d07d82b5d68b6639fea9557192025b64fcc79d700c4cce10f94c16bfc8 |",
+                "| 4  |                                                                  |",
+                "+----+------------------------------------------------------------------+",
+            ];
+            assert_batches_eq!(expected, &accelerated);
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "DuckDB-accelerated encode(sha256(..), 'hex') must agree with local evaluation"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// `approx_distinct` is not a `DuckDB` function (`approx_count_distinct` is a
+/// different `HyperLogLog`). The query used to fail remotely; it now evaluates
+/// locally and matches the unaccelerated engine.
+#[tokio::test]
+async fn duckdb_accelerated_approx_distinct_stays_local_and_agrees() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("approx_distinct.csv");
+            write_string_agg_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_approx_distinct")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            let plan = to_pretty_display(
+                &run_query(
+                    &rt,
+                    "EXPLAIN SELECT approx_distinct(customer) FROM accelerated",
+                )
+                .await?,
+            )?
+            .to_string();
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                !remote_sql.contains("approx_distinct")
+                    && !remote_sql.contains("approx_count_distinct"),
+                "approx_distinct must not be sent to DuckDB; plan was:\n{plan}"
+            );
+
+            let query = "SELECT approx_distinct(customer) AS n FROM {table}";
+            let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &query.replace("{table}", "local")).await?;
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "DuckDB-accelerated approx_distinct must agree with local evaluation"
+            );
+            assert_batches_eq!(["+---+", "| n |", "+---+", "| 4 |", "+---+",], &accelerated);
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}

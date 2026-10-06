@@ -16,6 +16,18 @@ pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
 
 // https://duckdb.org/docs/stable/sql/functions/aggregates
 // https://datafusion.apache.org/user-guide/sql/aggregate_functions.html
+/// Whether this aggregate can be marked for `DuckDB` pushdown.
+///
+/// The unparser drops an aggregate `ORDER BY`, so a pushed
+/// `string_agg(DISTINCT x, '|' ORDER BY x)` comes back unordered. An unordered
+/// `string_agg` is still in [`SUPPORTED_AGG_FUNCTIONS`] and still marks.
+fn duckdb_aggregate_is_pushable(aggregate: &AggregateFunction) -> bool {
+    if !SUPPORTED_AGG_FUNCTIONS.contains(aggregate.func.name()) {
+        return false;
+    }
+    aggregate.func.name() != "string_agg" || aggregate.params.order_by.is_empty()
+}
+
 static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
     HashSet::from([
         // Basic aggregates
@@ -101,9 +113,7 @@ impl DuckDBAggregateLogicalPushdown {
 
         // Validate its agg expressions to make sure they are supported
         if !agg.aggr_expr.iter().all(|e| match e {
-            Expr::AggregateFunction(AggregateFunction { func, .. }) => {
-                SUPPORTED_AGG_FUNCTIONS.contains(func.name())
-            }
+            Expr::AggregateFunction(aggregate) => duckdb_aggregate_is_pushable(aggregate),
             _ => false,
         }) {
             return Ok(Transformed::no(plan));
@@ -478,6 +488,38 @@ mod tests {
             !rewritten.transformed,
             "Query with unsupported aggregate must NOT be rewritten"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_skips_string_agg_with_order_by() -> Result<()> {
+        let ctx = SessionContext::new();
+        let fake_duck_table = make_fake_duck_table().await?;
+        ctx.register_table("sut", Arc::new(fake_duck_table))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+
+        let ordered = ctx
+            .state()
+            .create_logical_plan("select string_agg(cast(id as varchar), '|' ORDER BY id) from sut")
+            .await?;
+        let rewritten = optimizer.rewrite(ordered, &ctx.state())?;
+        assert!(
+            !rewritten.transformed,
+            "string_agg with ORDER BY must not be marked: the unparser drops the ORDER BY"
+        );
+
+        let unordered = ctx
+            .state()
+            .create_logical_plan("select string_agg(cast(id as varchar), '|') from sut")
+            .await?;
+        let rewritten = optimizer.rewrite(unordered, &ctx.state())?;
+        assert!(
+            rewritten.transformed,
+            "an unordered string_agg is still a supported DuckDB aggregate"
+        );
+        assert_marker!(&rewritten.data);
 
         Ok(())
     }

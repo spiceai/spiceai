@@ -134,6 +134,8 @@ pub fn deny_spice_functions_for_duckdb_dialect_without_carve_out() -> FunctionSu
         .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
         .build()
         .with_expression_support(Arc::new(duckdb_can_evaluate_expression))
+        .with_aggregate_call_support(Arc::new(crate::dialect::duckdb_can_translate_aggregate))
+        .with_window_call_support(Arc::new(crate::dialect::duckdb_can_translate_window))
 }
 
 /// The one `DuckDB` policy both public accessors return, so the connector and
@@ -145,6 +147,8 @@ fn duckdb_function_support() -> FunctionSupport {
         .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
         .build()
         .with_expression_support(Arc::new(duckdb_can_evaluate_expression))
+        .with_aggregate_call_support(Arc::new(crate::dialect::duckdb_can_translate_aggregate))
+        .with_window_call_support(Arc::new(crate::dialect::duckdb_can_translate_window))
 }
 
 /// Whether `DuckDB` evaluates this non-function expression node the way
@@ -281,25 +285,91 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
     }
 }
 
+/// `DataFusion` built-ins `SQLite` must not be handed.
+///
+/// `SQLite` has no unparser-dialect seam (`SqliteTable` hardcodes
+/// `SqliteDialect`), so a name that is not faithful `SQLite` SQL cannot be
+/// rewritten and must stay local:
+///
+/// * `btrim` — `SQLite` has no function of that name; a federated `trim`
+///   fails with `no such function: btrim` (issue #13794).
+/// * `upper` / `lower` — `SQLite` folds only ASCII, so `upper('Ångström')`
+///   is `'ÅNGSTRöM'` federated and `'ÅNGSTRÖM'` locally.
+/// * `concat` — `SQLite`'s `concat` skips a NULL argument (`'bob-'`); the
+///   registered Spark `concat` returns NULL for the whole call. A `||`
+///   rewrite would match, but there is no dialect seam to install one
+///   (the same lever as `btrim`; option 1 of issue #13875).
+/// * `to_hex`, `md5`, `sha256`, `date_part`, `date_trunc`, `regexp_like`,
+///   `regexp_replace` — `SQLite` has none of these, so a federated call
+///   fails with `no such function` or, for `date_trunc`, a cast of the
+///   truncated `'2026-01'` text back into a timestamp.
+///
+/// Aggregates (`median`, `approx_distinct`, `string_agg`) and `ILIKE` are
+/// not names the scalar deny-list can see; they are refused by
+/// [`sqlite_can_translate_aggregate`] and [`sqlite_can_evaluate_expression`].
+pub const SQLITE_DENIED_BUILTINS: &[&str] = &[
+    crate::dialect::BTRIM_NAME,
+    "upper",
+    "lower",
+    "concat",
+    "to_hex",
+    "md5",
+    "sha256",
+    "date_part",
+    "date_trunc",
+    crate::dialect::REGEXP_LIKE_NAME,
+    crate::dialect::REGEXP_REPLACE_NAME,
+];
+
 /// `SQLite`-flavored deny-list as a value, for
 /// `SqliteTableProviderFactory::with_function_support`.
 ///
-/// Every Spice function, plus `btrim`. `SQLite` has no `btrim` — a pushed-down
-/// `trim` reaches it under `DataFusion`'s canonical name and fails the query
-/// with `no such function: btrim`, the same defect issue #13794 reports against
-/// `DuckDB`. `SQLite` does have a `trim` that matches, but its unparser dialect
-/// is constructed inside `datafusion-table-providers` with no seam to install a
-/// rewrite through, so the call is denied and evaluates locally above the
+/// Every Spice function, plus [`SQLITE_DENIED_BUILTINS`]. `SQLite`'s unparser
+/// dialect is constructed inside `datafusion-table-providers` with no seam to
+/// install a rewrite through, so each denied name evaluates locally above the
 /// federated scan instead. That costs the pushdown for those plans and returns
 /// the right rows, which is the trade the deny-list exists to make.
 ///
-/// Casts and decimal aggregates are gated by [`sqlite_can_evaluate_expression`].
+/// Casts, decimal aggregates and `ILIKE` are gated by
+/// [`sqlite_can_evaluate_expression`]. Aggregates `SQLite` cannot evaluate
+/// (`median`, `approx_distinct`, `string_agg`) are gated by
+/// [`sqlite_can_translate_aggregate`].
 #[must_use]
 pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
-        .deny_also([crate::dialect::BTRIM_NAME.to_string()])
+        .deny_also(SQLITE_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
         .build()
         .with_expression_support(Arc::new(sqlite_can_evaluate_expression))
+        .with_aggregate_call_support(Arc::new(sqlite_can_translate_aggregate))
+        .with_window_call_support(Arc::new(sqlite_can_translate_window))
+}
+
+/// Whether this aggregate call can be handed to `SQLite`.
+///
+/// `SQLite` has no `median`, no `approx_distinct` and no `string_agg`
+/// (`group_concat` is not a faithful stand-in: it has no `DISTINCT`/`ORDER BY`
+/// contract matching `DataFusion`). A federated call fails with
+/// `no such function`.
+#[must_use]
+pub fn sqlite_can_translate_aggregate(
+    call: &datafusion::logical_expr::expr::AggregateFunction,
+) -> bool {
+    !sqlite_untranslatable_aggregate(call.func.name())
+}
+
+/// Whether this window call can be handed to `SQLite`.
+///
+/// The same names [`sqlite_can_translate_aggregate`] refuses, written as a
+/// window: `SQLite` has no function of those names in either position.
+#[must_use]
+pub fn sqlite_can_translate_window(call: &datafusion::logical_expr::expr::WindowFunction) -> bool {
+    !sqlite_untranslatable_aggregate(call.fun.name())
+}
+
+fn sqlite_untranslatable_aggregate(name: &str) -> bool {
+    ["median", "approx_distinct", "string_agg"]
+        .iter()
+        .any(|denied| name.eq_ignore_ascii_case(denied))
 }
 
 /// Whether `SQLite` evaluates this non-function expression node the way
@@ -330,6 +400,10 @@ pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
 pub fn sqlite_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
     match expr {
         Expr::TryCast(_) => false,
+        // SQLite has no `ILIKE`. Its `LIKE` is ASCII case-insensitive and a
+        // federated `ILIKE` fails the query with a syntax error, so both the
+        // positive and negated forms stay local.
+        Expr::Like(like) if like.case_insensitive => false,
         // SQLite has no decimal type: it stores a decimal as a REAL or an
         // INTEGER and computes `avg` and `sum` over it in floating point or in
         // 64-bit integers. `avg` reads one unit high in the last place against
@@ -993,6 +1067,24 @@ mod tests {
             .expect("build plan")
     }
 
+    fn text_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
+        let schema = Schema::new(vec![
+            Field::new("g", DataType::Int32, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("i", DataType::Int64, true),
+        ]);
+        table_scan(Some("t"), &schema, None).expect("scan t")
+    }
+
+    /// `SELECT g, <aggregate> FROM t GROUP BY g` over a text column.
+    fn plan_text_aggregating(aggregate: Expr) -> LogicalPlan {
+        text_scan()
+            .aggregate(vec![col("g")], vec![aggregate])
+            .expect("aggregate")
+            .build()
+            .expect("build plan")
+    }
+
     /// `SELECT <aggregate>(<column>) OVER (PARTITION BY g) FROM t`.
     fn plan_windowing(
         aggregate: Arc<datafusion::logical_expr::AggregateUDF>,
@@ -1090,6 +1182,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn ordered_string_agg() -> Expr {
+        use datafusion::functions_aggregate::string_agg::string_agg;
+        use datafusion::logical_expr::ExprFunctionExt as _;
+        string_agg(col("s"), lit("|"))
+            .distinct()
+            .order_by(vec![col("s").sort(true, true)])
+            .build()
+            .expect("ordered distinct string_agg")
+    }
+
+    fn unordered_string_agg() -> Expr {
+        datafusion::functions_aggregate::string_agg::string_agg(col("s"), lit("|"))
+    }
+
+    /// `string_agg(... ORDER BY …)` is unparsed without the `ORDER BY`, so it
+    /// stays local on both `DuckDB` accessors. An unordered `string_agg` and
+    /// every other aggregate still federate. `approx_distinct` has no `DuckDB`
+    /// name and stays local.
+    #[test]
+    fn duckdb_keeps_ordered_string_agg_and_approx_distinct_local() {
+        use datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf;
+        use datafusion::functions_aggregate::expr_fn::approx_distinct;
+        for (route, support) in [
+            ("duckdb", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "ducklake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+        ] {
+            assert!(
+                !pushes(&plan_text_aggregating(ordered_string_agg()), &support),
+                "an ordered string_agg must stay local on {route}"
+            );
+            assert!(
+                !pushes(&plan_aggregating(approx_distinct(col("i"))), &support),
+                "approx_distinct must stay local on {route}"
+            );
+            assert!(
+                !pushes(&plan_windowing(approx_distinct_udaf(), "i"), &support),
+                "a windowed approx_distinct must stay local on {route}"
+            );
+            assert!(
+                pushes(&plan_text_aggregating(unordered_string_agg()), &support),
+                "an unordered string_agg must keep its {route} pushdown"
+            );
+        }
+    }
+
+    /// `encode(x, 'hex')` still federates (the dialect rewrites it);
+    /// `encode(x, 'base64')` stays local so `DuckDB` is never asked to
+    /// charset-encode a `BLOB`.
+    #[test]
+    fn duckdb_federates_hex_encode_and_keeps_other_encodings_local() {
+        use datafusion::functions::encoding::expr_fn::encode;
+        let hex = plan_projecting(encode(col("s"), lit("hex")));
+        let base64 = plan_projecting(encode(col("s"), lit("base64")));
+        assert_duckdb_federation(&[base64], &[hex]);
+    }
+
+    /// `SQLite` has no dialect seam, so every built-in it cannot evaluate
+    /// faithfully is denied by name or by call shape and stays local.
+    #[test]
+    fn sqlite_keeps_unfaithful_and_missing_functions_local() {
+        use datafusion::functions::crypto::expr_fn::{md5, sha256};
+        use datafusion::functions::datetime::expr_fn::{date_part, date_trunc};
+        use datafusion::functions::expr_fn::{concat, lower, to_hex, upper};
+        use datafusion::functions::regex::expr_fn::{regexp_like, regexp_replace};
+        use datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf;
+        use datafusion::functions_aggregate::expr_fn::{approx_distinct, median};
+        use datafusion::functions_aggregate::median::median_udaf;
+        let support = deny_spice_functions_for_sqlite_table_providers();
+        let month = Expr::Literal(ScalarValue::Utf8(Some("month".into())), None);
+
+        for refused in [
+            upper(col("s")),
+            lower(col("s")),
+            concat(vec![col("s"), lit("-")]),
+            to_hex(col("start")),
+            md5(col("s")),
+            sha256(col("s")),
+            date_part(month.clone(), col("s")),
+            date_trunc(month, col("s")),
+            regexp_like(col("s"), lit("a"), None),
+            regexp_replace(col("s"), lit("a"), lit("X"), None),
+            user_call("btrim"),
+        ] {
+            assert!(
+                !pushes(&plan_projecting(refused.clone()), &support),
+                "{refused} must stay local on SQLite"
+            );
+        }
+
+        for denied in [col("s").ilike(lit("%a%")), col("s").not_ilike(lit("%a%"))] {
+            assert!(
+                !pushes(&plan_projecting(denied), &support),
+                "SQLite has no ILIKE operator, including its negated form"
+            );
+        }
+        assert!(
+            pushes(&plan_projecting(col("s").like(lit("%a%"))), &support),
+            "ordinary LIKE must keep its SQLite pushdown"
+        );
+
+        for refused in [median(col("i")), approx_distinct(col("i"))] {
+            assert!(
+                !pushes(&plan_aggregating(refused.clone()), &support),
+                "{refused} must stay local on SQLite"
+            );
+        }
+        for refused in [ordered_string_agg(), unordered_string_agg()] {
+            assert!(
+                !pushes(&plan_text_aggregating(refused.clone()), &support),
+                "{refused} must stay local on SQLite"
+            );
+        }
+        for refused in [median_udaf(), approx_distinct_udaf()] {
+            assert!(
+                !pushes(&plan_windowing(Arc::clone(&refused), "i"), &support),
+                "a windowed {} must stay local on SQLite",
+                refused.name()
+            );
+        }
+        assert!(
+            pushes(&plan_projecting(col("s")), &support),
+            "a plain column must still federate on SQLite"
+        );
     }
 
     /// An aggregate whose operand type cannot be read is refused, not assumed

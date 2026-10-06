@@ -57,6 +57,8 @@ mod hash_index;
 mod localpod_sync;
 #[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
+#[cfg(feature = "sqlite")]
+mod sqlite_builtin_pushdown;
 
 #[cfg(not(target_os = "windows"))]
 mod on_conflict_cayenne;

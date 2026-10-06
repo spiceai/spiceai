@@ -78,6 +78,11 @@ const SHA256_NAME: &str = "sha256";
 /// federated digest comes back as the same bytes the kernel produces.
 const UNHEX_NAME: &str = "unhex";
 
+/// `DuckDB`'s blob-to-hex-text encoder. Used by [`encode_to_lowercase_hex`]
+/// because `DuckDB`'s own `encode` is a charset conversion, not a hex
+/// encoding.
+const HEX_NAME: &str = "hex";
+
 /// Renders `args` as a call to `duckdb_fn`, in the order given.
 ///
 /// The caller is responsible for having already put `args` into the shape
@@ -553,6 +558,47 @@ pub(crate) fn sha256_to_digest_bytes(
             "sha256 takes one argument, got {}; cannot render it as DuckDB SQL.",
             args.len()
         ))),
+    }
+}
+
+/// Renders `DataFusion`'s `encode(x, 'hex')` as `lower(hex(x))`.
+///
+/// `DuckDB`'s `encode` is a charset conversion (`encode(s, 'utf-8')` → `BLOB`),
+/// not a hex encoder. After [`sha256_to_digest_bytes`] the nested call
+/// `encode(sha256(x), 'hex')` is unparsed as `encode(unhex(sha256(x)), 'hex')`,
+/// which `DuckDB` rejects with `Binder Error: No function matches ...
+/// encode(BLOB, STRING_LITERAL)`.
+///
+/// `hex` is `DuckDB`'s blob-to-hex-text function and upper-cases the digits
+/// `DataFusion`'s `encode(..., 'hex')` renders in lower case, so the call is
+/// wrapped in [`LOWER_NAME`]. Every other encoding, arity, or a non-literal
+/// format is refused so the call evaluates locally rather than failing remotely.
+pub(crate) fn encode_to_lowercase_hex(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    match args {
+        [data, encoding] if is_literal_hex_encoding(encoding) => {
+            Ok(
+                renamed_fn_to_sql(unparser, std::slice::from_ref(data), HEX_NAME)?
+                    .map(|hex| wrap_in_call(hex, LOWER_NAME)),
+            )
+        }
+        _ => Err(DataFusionError::Plan(format!(
+            "encode is rendered as DuckDB SQL only for a literal 'hex' encoding, got {} argument(s).",
+            args.len()
+        ))),
+    }
+}
+
+/// Whether `encoding` is the string literal `hex`, in any ASCII case.
+fn is_literal_hex_encoding(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(value, _) => value
+            .try_as_str()
+            .flatten()
+            .is_some_and(|encoding| encoding.eq_ignore_ascii_case("hex")),
+        _ => false,
     }
 }
 
@@ -1463,6 +1509,81 @@ mod tests {
             .expr_to_sql(&call)
             .expect("sha256 unparses for DuckDB");
         assert_eq!(rendered.to_string(), "unhex(sha256('alpha'))");
+    }
+
+    /// `DuckDB`'s `encode` is a charset conversion, so `encode(unhex(sha256(x)),
+    /// 'hex')` fails remotely. The hex form must unparse as `lower(hex(..))`.
+    #[test]
+    fn encode_hex_unparses_to_a_lowercased_duckdb_hex() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered = encode_to_lowercase_hex(&unparser, &[column, lit("hex")])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), r#"lower(hex("t"."name"))"#);
+    }
+
+    /// A non-hex encoding, a column format, or the wrong arity must be an
+    /// error — not `Ok(None)`, which would hand `DuckDB`'s charset `encode`
+    /// the call and fail the query.
+    #[test]
+    fn encode_without_a_literal_hex_format_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        for args in [
+            vec![column.clone(), lit("base64")],
+            vec![column.clone(), col("fmt")],
+            vec![column.clone()],
+            vec![column, lit("hex"), lit("extra")],
+        ] {
+            let error = encode_to_lowercase_hex(&unparser, &args)
+                .expect_err("only encode(x, 'hex') renders");
+            assert!(
+                error
+                    .to_string()
+                    .contains("encode is rendered as DuckDB SQL only for a literal 'hex'"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    /// The whole `encode(sha256(x), 'hex')` call, so a handler that is written
+    /// but never installed fails here rather than as a federated Binder Error.
+    #[test]
+    fn duckdb_dialect_installs_the_encode_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::encoding::encode(),
+            vec![
+                Expr::ScalarFunction(ScalarFunction::new_udf(
+                    datafusion::functions::crypto::sha256(),
+                    vec![lit("alpha")],
+                )),
+                lit("hex"),
+            ],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("encode(sha256(..), 'hex') unparses for DuckDB");
+        assert_eq!(
+            rendered.to_string(),
+            "lower(hex(unhex(sha256('alpha'))))",
+            "the sha256 rewrite yields a BLOB; encode('hex') must wrap that in lower(hex(..))"
+        );
     }
 
     #[test]
