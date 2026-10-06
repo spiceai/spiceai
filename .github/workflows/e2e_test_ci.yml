@@ -988,7 +988,7 @@ jobs:
           full=$(curl -sf http://127.0.0.1:9095/metrics \
             | awk '/^cayenne_compaction_outcome_total\{/ && /kind="full"/ && /outcome="committed"/ && /table="audit_events"/ {sum += $NF} END {print sum + 0}')
           rows=$(curl -sf -X POST -H 'Content-Type: text/plain' --data 'SELECT COUNT(*) AS n FROM audit_events' \
-            http://127.0.0.1:8090/v1/sql | jq '.[0].n')
+            http://127.0.0.1:8090/v1/sql | tr -dc '0-9')
           echo "full compactions before ready: ${full}; rows: ${rows}"
           test "${full}" = 0
           test "${rows}" = 2940086

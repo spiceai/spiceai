@@ -107,16 +107,16 @@ jobs:
         run: |
           version="${{ github.event.inputs.baseline_version }}"
           if [ -z "$version" ]; then
-            version=$(gh release view --repo spiceai/spiceai --json tagName --jq .tagName)
+            latest=$(curl -sSLI -o /dev/null -w '%{url_effective}' https://github.com/spiceai/spiceai/releases/latest)
+            version="${latest##*/}"
           fi
           mkdir -p "${RUNNER_TEMP}/baseline"
-          gh release download "$version" --repo spiceai/spiceai \
-            --pattern spiced_linux_x86_64.tar.gz --dir "${RUNNER_TEMP}/baseline"
-          tar -xzf "${RUNNER_TEMP}/baseline/spiced_linux_x86_64.tar.gz" -C "${RUNNER_TEMP}/baseline"
+          curl -sSfL -o "${RUNNER_TEMP}/baseline/spiced.tar.gz" \
+            "https://github.com/spiceai/spiceai/releases/download/${version}/spiced_linux_x86_64.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/baseline/spiced.tar.gz" -C "${RUNNER_TEMP}/baseline"
+          chmod +x "${RUNNER_TEMP}/baseline/spiced"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "path=${RUNNER_TEMP}/baseline/spiced" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
