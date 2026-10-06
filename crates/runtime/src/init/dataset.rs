@@ -3433,7 +3433,7 @@ mod tests {
     fn the_waits_for_source_message_names_the_dataset_and_its_configuration() {
         assert_eq!(
             super::waits_for_source_message(
-                &datafusion::sql::TableReference::bare("orders"),
+                &datafusion::common::TableReference::bare("orders"),
                 "`refresh_mode: changes`"
             ),
             "Dataset 'orders' waits for its source before serving because it uses `refresh_mode: changes`. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"

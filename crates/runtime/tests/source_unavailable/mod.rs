@@ -1110,7 +1110,7 @@ mod served_from_acceleration {
         );
 
         rt.datafusion()
-            .refresh_table(&datafusion::sql::TableReference::bare("orders"), None)
+            .refresh_table(&datafusion::common::TableReference::bare("orders"), None)
             .await
             .map_err(|err| anyhow::anyhow!("the refresh request to be accepted: {err}"))?;
         // Sampled over time on purpose: the defect is a status that flips after the

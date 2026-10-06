@@ -26,8 +26,8 @@ use async_trait::async_trait;
 use data_connector_api::{ConnectorContext, DataConnector, DataConnectorResult};
 use datafusion::{
     arrow::datatypes::{DataType, Field, Schema},
+    common::TableReference,
     datasource::{MemTable, TableProvider},
-    sql::TableReference,
 };
 use runtime_table::federated::FederatedTable;
 

@@ -34,7 +34,7 @@ use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider, execution::runtime_env::RuntimeEnv, sql::TableReference,
+    common::TableReference, datasource::TableProvider, execution::runtime_env::RuntimeEnv,
 };
 use futures::future::BoxFuture;
 use tokio::sync::OnceCell;
@@ -377,7 +377,7 @@ impl DataConnector for ReconnectingConnector {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     use super::{
         ConnectorComponent, DataConnectorError, SourceUnavailable, unreachable_source_warning,
