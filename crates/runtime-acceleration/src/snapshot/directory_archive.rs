@@ -545,7 +545,7 @@ where
     use tokio::task::spawn_blocking;
 
     let normalized_mappings = normalize_prefix_mappings(options.prefix_mappings.as_ref())?;
-    let _lock_guards = acquire_extraction_locks(target_dir, &normalized_mappings).await?;
+    let lock_guards = acquire_extraction_locks(target_dir, &normalized_mappings).await?;
 
     tracing::debug!(
         "Acquired extraction locks for directory roots including: {}",
@@ -563,8 +563,10 @@ where
     let target_dir = target_dir.to_path_buf();
     let target_dir_for_error = target_dir.clone();
 
-    // Extract in a blocking task
+    // Extract in a blocking task. It owns the locks: dropping this future cannot stop
+    // the extraction, so the locks must outlive it rather than this future.
     spawn_blocking(move || {
+        let _lock_guards = lock_guards;
         let mut archive = Archive::new(&buffer[..]);
 
         // Ensure target directory exists
@@ -602,12 +604,15 @@ pub async fn extract_archive_file_with_options(
     options: ExtractOptions,
 ) -> Result<()> {
     let normalized_mappings = normalize_prefix_mappings(options.prefix_mappings.as_ref())?;
-    let _lock_guards = acquire_extraction_locks(target_dir, &normalized_mappings).await?;
+    let lock_guards = acquire_extraction_locks(target_dir, &normalized_mappings).await?;
     let archive_path = archive_path.to_path_buf();
     let target_dir = target_dir.to_path_buf();
     let target_dir_for_error = target_dir.clone();
 
+    // The blocking task owns the locks: dropping this future cannot stop the
+    // extraction, so the locks must outlive it rather than this future.
     tokio::task::spawn_blocking(move || {
+        let _lock_guards = lock_guards;
         let file = std::fs::File::open(&archive_path)
             .map_err(|source| ArchiveError::ReadArchive { source })?;
         let mut archive = tar::Archive::new(file);
@@ -1527,6 +1532,62 @@ mod tests {
         let (default_path, _) =
             remap_entry_path(Path::new("database/file.vortex"), &default_dir, &normalized)?;
         assert_eq!(default_path, default_dir.join("database/file.vortex"));
+        Ok(())
+    }
+
+    /// A restore is cancelled by dropping its future, but the blocking extraction it
+    /// started cannot be stopped. A replacement restore must not acquire the directory
+    /// lock while that extraction is still writing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_extraction_holds_locks_until_worker_finishes() -> Result<()> {
+        const FILES: usize = 400;
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let data_dir = test_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+        let contents = vec![7u8; 16 * 1024];
+        for i in 0..FILES {
+            std::fs::write(data_dir.join(format!("file{i}.vortex")), &contents)
+                .expect("write source file");
+        }
+        let archive_path = test_dir.path().join("snapshot.tar");
+        archive_directories_to_file_with_plan(
+            &[(data_dir, "data/".to_string())],
+            &archive_path,
+            &[],
+            &[],
+        )
+        .await?;
+
+        let extract_dir = TempDir::new().expect("Failed to create extract dir");
+        let target = extract_dir.path().to_path_buf();
+        let extracted_dir = target.join("data");
+        let count_extracted = || std::fs::read_dir(&extracted_dir).map_or(0, Iterator::count);
+
+        let restore = tokio::spawn({
+            let target = target.clone();
+            async move {
+                extract_archive_file_with_options(&archive_path, &target, ExtractOptions::default())
+                    .await
+            }
+        });
+        let started = tokio::time::Instant::now();
+        while count_extracted() == 0 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "extraction never started"
+            );
+            tokio::task::yield_now().await;
+        }
+        restore.abort();
+        let _ = restore.await;
+
+        let _replacement_guards = acquire_extraction_locks(&target, &[]).await?;
+        assert_eq!(
+            count_extracted(),
+            FILES,
+            "the replacement restore acquired the directory lock while the cancelled extraction was still writing"
+        );
         Ok(())
     }
 

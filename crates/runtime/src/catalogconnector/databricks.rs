@@ -212,13 +212,9 @@ async fn shared_databricks_catalog_rate_controller(
         }
     })?;
     let connector_component = ConnectorComponent::from(catalog);
-    // The Databricks clients do not yet record per-request outcomes, so only
-    // the static limits apply.
-    http_rate_control::log_static_rate_control_once(
-        "databricks",
-        Some(&catalog.app.runtime.params),
-    );
-    let mut rate_control = http_rate_control::resolve_static_config_for_component(
+    // The Databricks clients do not yet record per-request outcomes, so the
+    // configured limits apply unchanged.
+    let mut rate_control = http_rate_control::resolve_limits_for_component(
         params,
         Some(&catalog.app.runtime.params),
         &connector_component,
@@ -958,7 +954,7 @@ mod tests {
     }
 
     /// Regression test: this catalog resolves its rate control with
-    /// `resolve_static_config_for_component`, which reads every parameter of the
+    /// `resolve_limits_for_component`, which reads every parameter of the
     /// HTTP rate-control family. An undeclared name panics at load, so each one
     /// must appear in [`PARAMETERS`].
     #[test]
