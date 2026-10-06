@@ -366,14 +366,15 @@ async fn cayenne_unscheduled_time_retention_does_not_resurrect_via_fallback() ->
             let source = dir.path().join("timed.csv");
             // id=2 is expired on `ts` but recent on `partition_ts`. Cayenne's
             // scan-time keep uses only `ts`, so a partition-AND fallback would
-            // resurrect it. id=4 has a NULL timestamp, which both keeps.
+            // resurrect it. A NULL-timestamp row is not in this fixture:
+            // `refresh_data_window` is `ts >= cutoff` and never loads NULLs;
+            // that keep is covered by `unscheduled_time_keep_matches_cayenne_without_partition`.
             std::fs::write(
                 &source,
                 "id,ts,partition_ts\n\
                  1,2100-01-01T00:00:00Z,2100-01-01T00:00:00Z\n\
                  2,2001-09-09T01:46:40Z,2100-01-01T00:00:00Z\n\
-                 3,2100-01-01T00:00:00Z,2100-01-01T00:00:00Z\n\
-                 4,,\n",
+                 3,2100-01-01T00:00:00Z,2100-01-01T00:00:00Z\n",
             )?;
 
             configure_test_datafusion();
@@ -403,10 +404,6 @@ async fn cayenne_unscheduled_time_retention_does_not_resurrect_via_fallback() ->
                 !ids_in_accel.contains(&3),
                 "refresh_sql must leave id=3 out of the accelerator so fallback is the only path"
             );
-            assert!(
-                ids_in_accel.contains(&4),
-                "NULL-timestamp rows stay visible under Cayenne scan-time keep, leftover {ids_in_accel:?}"
-            );
 
             let evicted_row = run_query(&rt, &format!("SELECT id FROM {table} WHERE id = 2")).await?;
             assert_eq!(
@@ -420,13 +417,6 @@ async fn cayenne_unscheduled_time_retention_does_not_resurrect_via_fallback() ->
                 ids(&fallback),
                 vec![3],
                 "a recent row never loaded must still fall back"
-            );
-
-            let null_ts = run_query(&rt, &format!("SELECT id FROM {table} WHERE id = 4")).await?;
-            assert_eq!(
-                ids(&null_ts),
-                vec![4],
-                "a NULL-timestamp row must remain queryable"
             );
 
             rt.shutdown().await;
