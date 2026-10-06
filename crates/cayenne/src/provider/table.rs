@@ -810,13 +810,10 @@ struct SnapshotSweepPins {
     grace: Duration,
 }
 
-/// Keeps the files an acceleration snapshot archives on disk until dropped:
-/// pins the current and protected snapshot directories against the retired-snapshot
-/// sweep and holds off the orphaned-deletion-vector sweep.
+/// Keeps maintenance from deleting the table's files until dropped.
 /// See [`CayenneTableProvider::pin_for_snapshot`].
 pub struct SnapshotArchivePin {
-    _dirs: Arc<SnapshotScanRef>,
-    _reclaim: tokio::sync::OwnedRwLockReadGuard<()>,
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 /// What one superseded-snapshot sweep must preserve.
@@ -2585,9 +2582,10 @@ pub struct CayenneTableProvider {
     /// on the dedicated compaction runtime; a signal raised while it runs marks
     /// the state dirty so the worker takes another pass against the newer floor.
     orphan_dv_sweep_state: Arc<AtomicU8>,
-    /// Held shared by a [`SnapshotArchivePin`] and exclusively by the orphaned-DV
-    /// sweep while it unlinks, so the sweep never removes a file being archived.
-    orphan_dv_sweep_fence: Arc<tokio::sync::RwLock<()>>,
+    /// Held shared by a [`SnapshotArchivePin`] and exclusively while maintenance
+    /// deletes files: the orphaned-DV sweep waits for it, the snapshot-directory
+    /// sweeps skip the pass when it is held.
+    file_reclaim_fence: Arc<tokio::sync::RwLock<()>>,
     /// Admission gate for the footprint sample, throttling it to
     /// [`FOOTPRINT_SAMPLE_MIN_INTERVAL`].
     ///
@@ -6568,6 +6566,11 @@ impl CayenneTableProvider {
     /// never propagated — a failed sweep costs disk, not correctness, and the
     /// next commit retries it.
     async fn run_old_snapshot_cleanup(&self) {
+        // Retry later while a snapshot is being archived.
+        let Ok(_reclaim) = Arc::clone(&self.file_reclaim_fence).try_write_owned() else {
+            self.rearm_snapshot_cleanup();
+            return;
+        };
         let (protected_snapshot_ids, in_use_snapshot_ids) = self.snapshot_cleanup_pins();
         let pins = SnapshotSweepPins {
             current_snapshot_id: self.get_current_snapshot_id(),
@@ -7243,6 +7246,11 @@ impl CayenneTableProvider {
         // live snapshot references its files in place, or fail the unlink — so an
         // outcome recorded at this point would report a reclaim that never
         // happened. It is emitted once the task knows what it actually removed.
+        // A snapshot being archived may reference a directory retired after its
+        // slice was exported; the ledger keeps them for the next sweep.
+        let Ok(reclaim) = Arc::clone(&self.file_reclaim_fence).try_write_owned() else {
+            return;
+        };
         let sweep_table_name = self.table_metadata.table_name.clone();
         // The LIVE snapshot set whose manifests pin files alive: the current
         // snapshot plus every protected snapshot. Built here (under the same
@@ -7258,6 +7266,7 @@ impl CayenneTableProvider {
         let last_listed = Arc::clone(&self.snapshot_last_listed);
         let catalog = Arc::clone(&self.catalog);
         tokio::spawn(async move {
+            let _reclaim = reclaim;
             // Ref-count source: every manifest row for the table, so a file a
             // retired dir holds but a LIVE snapshot references in place (an
             // in-place compaction reference) is NOT unlinked. An empty manifest
@@ -9440,7 +9449,7 @@ impl CayenneTableProvider {
             protected_merge_claims: Arc::new(ParkingMutex::new(ProtectedMergeClaims::default())),
             post_write_compaction_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
             orphan_dv_sweep_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
-            orphan_dv_sweep_fence: Arc::new(tokio::sync::RwLock::new(())),
+            file_reclaim_fence: Arc::new(tokio::sync::RwLock::new(())),
             footprint_sample_gate: Arc::new(SampleGate::default()),
             data_dir_sample_gate: Arc::new(SampleGate::default()),
             in_memory_sample_gate: Arc::new(SampleGate::default()),
@@ -11517,7 +11526,7 @@ impl CayenneTableProvider {
             protected_merge_claims: Arc::clone(&self.protected_merge_claims),
             post_write_compaction_state: Arc::clone(&self.post_write_compaction_state),
             orphan_dv_sweep_state: Arc::clone(&self.orphan_dv_sweep_state),
-            orphan_dv_sweep_fence: Arc::clone(&self.orphan_dv_sweep_fence),
+            file_reclaim_fence: Arc::clone(&self.file_reclaim_fence),
             footprint_sample_gate: Arc::clone(&self.footprint_sample_gate),
             data_dir_sample_gate: Arc::clone(&self.data_dir_sample_gate),
             in_memory_sample_gate: Arc::clone(&self.in_memory_sample_gate),
@@ -19634,21 +19643,12 @@ impl CayenneTableProvider {
     }
 
     /// Pin the table for an acceleration snapshot. Take the pin before exporting
-    /// the metastore slice and hold it until the archive is written: the slice and
-    /// the archived files then agree.
+    /// the metastore slice and hold it until the archive is written, so no file the
+    /// slice references is deleted under the archive. Waits for an in-flight
+    /// deletion to finish.
     pub async fn pin_for_snapshot(&self) -> SnapshotArchivePin {
-        // Waits out an in-flight sweep batch, so the slice never lists a file the
-        // sweep already unlinked.
-        let reclaim = Arc::clone(&self.orphan_dv_sweep_fence).read_owned().await;
-        // Pin under the listing fence, as scans do, so no publication moves the
-        // current snapshot between reading it and pinning it.
-        let _fence = self.listing_fence.read().await;
-        let mut snapshot_ids: Vec<String> =
-            self.protected_snapshots.load().keys().cloned().collect();
-        snapshot_ids.push(self.get_current_snapshot_id());
         SnapshotArchivePin {
-            _dirs: SnapshotScanRef::new(Arc::clone(&self.snapshot_scan_refs), snapshot_ids),
-            _reclaim: reclaim,
+            _guard: Arc::clone(&self.file_reclaim_fence).read_owned().await,
         }
     }
 
@@ -19991,7 +19991,7 @@ impl CayenneTableProvider {
         // Wait for any acceleration snapshot archiving this table; held until the
         // catalog rows are removed, so a snapshot sees both the file and its row or
         // neither.
-        let _reclaim = self.orphan_dv_sweep_fence.write().await;
+        let _reclaim = self.file_reclaim_fence.write().await;
 
         // Unlink the `.arrow` file FIRST, then remove its catalog row. A crash in
         // the non-atomic window leaves a DISCOVERABLE dangling row (file gone, row
@@ -39809,43 +39809,39 @@ mod tests {
             .store(COALESCED_TASK_IDLE, Ordering::Release);
     }
 
-    /// A snapshot pin keeps the current and protected snapshot directories from
-    /// the retired-snapshot sweep, and holds off the orphaned-DV sweep on every
-    /// clone the background workers run on.
+    /// The retired-snapshot sweep keeps a retired directory while a snapshot pin
+    /// is held, because the archive may reference it, and removes it afterwards.
     #[tokio::test]
-    async fn snapshot_pin_covers_snapshot_dirs_and_the_orphan_dv_sweep() {
+    async fn snapshot_pin_defers_the_retired_snapshot_sweep() {
         let ctx = SessionContext::new();
         let (provider, _tmp, _ids) =
-            build_seq_prefix_fixture("snapshot_pin", ctx.runtime_env(), &[10, 20]).await;
-        let mut expected: HashSet<String> = provider
-            .protected_snapshots
-            .load()
-            .keys()
-            .cloned()
-            .collect();
-        assert!(!expected.is_empty(), "the fixture has protected snapshots");
-        expected.insert(provider.get_current_snapshot_id());
+            build_seq_prefix_fixture("snapshot_pin", ctx.runtime_env(), &[10]).await;
+        let retired = uuid::Uuid::now_v7().to_string();
+        let dir = provider.snapshot_dir_path_for(&retired);
+        std::fs::create_dir_all(&dir).expect("create retired dir");
+        std::fs::write(dir.join("part.vortex"), b"retired").expect("write retired file");
+        provider.retired_snapshot_dirs.lock().insert(
+            retired,
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("retired a minute ago"),
+        );
 
         let pin = provider.pin_for_snapshot().await;
-        assert_eq!(provider.in_flight_scan_snapshot_ids(), expected);
-        assert!(
-            provider
-                .clone_for_write()
-                .orphan_dv_sweep_fence
-                .try_write()
-                .is_err(),
-            "the sweep's clone must see the pin"
-        );
+        provider.clone_for_write().sweep_retired_snapshot_dirs();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(dir.exists(), "the sweep must keep the dir while pinned");
 
         drop(pin);
-        assert!(provider.in_flight_scan_snapshot_ids().is_empty());
-        assert!(
-            provider
-                .clone_for_write()
-                .orphan_dv_sweep_fence
-                .try_write()
-                .is_ok()
-        );
+        provider.sweep_retired_snapshot_dirs();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while dir.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the sweep removes the dir once unpinned"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Signalling a table whose worker is already running must record the signal
