@@ -1139,6 +1139,7 @@ impl GraphQLClient {
                 .await
                 .map_err(|e| Error::RateLimited {
                     message: format!("{e}"),
+                    retry_after: None,
                 })?;
         }
         let github_rate_limit_wait = github_rate_limit_started.elapsed();
@@ -1151,6 +1152,7 @@ impl GraphQLClient {
                     .await
                     .map_err(|e| Error::RateLimited {
                         message: format!("{e}"),
+                        retry_after: None,
                     })?,
             )
         } else {
@@ -1299,6 +1301,7 @@ impl GraphQLClient {
                     status,
                     detail,
                     response_preview: preview,
+                    retry_after,
                 }
             })?;
 
@@ -1310,7 +1313,7 @@ impl GraphQLClient {
         );
 
         // Check for errors before processing data
-        handle_http_error(status, &response)?;
+        handle_http_error(status, &response, retry_after)?;
         handle_graphql_query_error(&response, &query_string)?;
 
         // Custom error checker (e.g., for GitHub rate limits)
@@ -2040,7 +2043,11 @@ fn request_with_auth(request_builder: RequestBuilder, auth: Option<&Auth>) -> Re
     }
 }
 
-fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
+fn handle_http_error(
+    status: StatusCode,
+    response: &Value,
+    retry_after: Option<std::time::Duration>,
+) -> Result<()> {
     if status.is_client_error() | status.is_server_error() {
         let message = [
             &response["message"],
@@ -2061,6 +2068,7 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                 message: format!(
                     "The API rate limited the request (HTTP {status}). Retry later or reduce request concurrency. Details: {message}"
                 ),
+                retry_after,
             });
         }
 
@@ -2083,6 +2091,7 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                     message: format!(
                         "The API request timed out (HTTP {status}). This is often a transient issue. The data refresh will be retried automatically. If the problem persists, consider reducing query complexity or page size. Details: {message}"
                     ),
+                    retry_after,
                 })
             }
             StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => {
@@ -2091,6 +2100,7 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                     message: format!(
                         "The API service is temporarily unavailable (HTTP {status}). This is often a transient issue. The data refresh will be retried automatically. Details: {message}"
                     ),
+                    retry_after,
                 })
             }
             _ if status.is_server_error() => Err(Error::InvalidReqwestStatus {
@@ -2098,8 +2108,13 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                 message: format!(
                     "The API server returned an error (HTTP {status}). This may be a transient issue. The data refresh will be retried automatically. Details: {message}"
                 ),
+                retry_after,
             }),
-            _ => Err(Error::InvalidReqwestStatus { status, message }),
+            _ => Err(Error::InvalidReqwestStatus {
+                status,
+                message,
+                retry_after,
+            }),
         };
     }
     Ok(())
@@ -3254,7 +3269,7 @@ mod tests {
         let response = serde_json::from_str(&format!(r#"{{"message": "{message}"}}"#))
             .expect("Failed to consturuct json");
         let status = StatusCode::BAD_REQUEST;
-        let result = handle_http_error(status, &response);
+        let result = handle_http_error(status, &response, None);
         match result {
             Ok(()) => panic!("Expected error"),
             Err(e) => {
@@ -3266,7 +3281,7 @@ mod tests {
             serde_json::from_str(&format!(r#"{{ "error": {{"message": "{message}"}} }}"#))
                 .expect("Failed to consturuct json");
         let status = StatusCode::BAD_REQUEST;
-        let result = handle_http_error(status, &response);
+        let result = handle_http_error(status, &response, None);
         match result {
             Ok(()) => panic!("Expected error"),
             Err(e) => {
@@ -3278,7 +3293,7 @@ mod tests {
             serde_json::from_str(&format!(r#"{{ "errors": [{{"message": "{message}"}}] }}"#))
                 .expect("Failed to consturuct json");
         let status = StatusCode::BAD_REQUEST;
-        let result = handle_http_error(status, &response);
+        let result = handle_http_error(status, &response, None);
         match result {
             Ok(()) => panic!("Expected error"),
             Err(e) => {
@@ -3289,14 +3304,27 @@ mod tests {
         let rate_limited_response =
             serde_json::from_str(r#"{"message": "API rate limit exceeded for user"}"#)
                 .expect("Failed to construct json");
-        let rate_limited_result = handle_http_error(StatusCode::FORBIDDEN, &rate_limited_response);
+        let rate_limited_result =
+            handle_http_error(StatusCode::FORBIDDEN, &rate_limited_response, None);
         match rate_limited_result {
             Ok(()) => panic!("Expected rate-limited error"),
-            Err(super::Error::RateLimited { message }) => {
+            Err(super::Error::RateLimited { message, .. }) => {
                 assert!(message.contains("rate limited"));
                 assert!(message.contains("HTTP 403"));
             }
             Err(other) => panic!("Expected rate-limited error, got {other}"),
+        }
+
+        let retry_after_429 = handle_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &serde_json::from_str(r#"{"message":"slow down"}"#).expect("json"),
+            Some(std::time::Duration::from_secs(120)),
+        );
+        match retry_after_429 {
+            Err(super::Error::RateLimited { retry_after, .. }) => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(120)));
+            }
+            other => panic!("expected RateLimited with Retry-After, got {other:?}"),
         }
     }
 
@@ -4122,6 +4150,36 @@ mod tests {
                 .expect("recorded requests")
                 .len();
             assert_eq!(requests, 2, "one 503 then one successful JSON page");
+        }
+
+        /// JSON HTTP 429 keeps `Retry-After` and retries, then succeeds.
+        #[tokio::test]
+        async fn json_429_with_retry_after_then_succeeds() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(FailThenSucceed {
+                    remaining_failures: AtomicU32::new(1),
+                    failure: ResponseTemplate::new(429)
+                        .insert_header("Retry-After", "0")
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(json!({"message": "API rate limit exceeded"})),
+                    success: ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(users_payload()),
+                })
+                .mount(&server)
+                .await;
+
+            execute_with_retries(&client(&server))
+                .await
+                .expect("JSON 429 with Retry-After must retry and then succeed");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len();
+            assert_eq!(requests, 2, "one JSON 429 then one successful JSON page");
         }
 
         /// GraphQL JSON errors on HTTP 400 are parsed and surfaced, not retried.

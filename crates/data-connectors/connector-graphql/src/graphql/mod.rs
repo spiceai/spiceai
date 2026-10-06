@@ -45,6 +45,7 @@ pub enum Error {
     InvalidReqwestStatus {
         status: reqwest::StatusCode,
         message: String,
+        retry_after: Option<Duration>,
     },
 
     #[snafu(display(
@@ -72,7 +73,10 @@ pub enum Error {
     ResourceNotFound { message: String },
 
     #[snafu(display("{message}"))]
-    RateLimited { message: String },
+    RateLimited {
+        message: String,
+        retry_after: Option<Duration>,
+    },
 
     #[snafu(display("GraphQL query failed: failed to transform response data: {source}"))]
     ResultTransformError {
@@ -84,6 +88,7 @@ pub enum Error {
         status: reqwest::StatusCode,
         detail: String,
         response_preview: String,
+        retry_after: Option<Duration>,
     },
 
     /// HTTP response was not GraphQL JSON. `message` names the status and the
@@ -196,7 +201,10 @@ pub fn is_retriable_error(error: &Error) -> bool {
 #[must_use]
 pub fn error_retry_after(error: &Error) -> Option<Duration> {
     match error {
-        Error::UnexpectedResponse { retry_after, .. } => *retry_after,
+        Error::UnexpectedResponse { retry_after, .. }
+        | Error::RateLimited { retry_after, .. }
+        | Error::InvalidReqwestStatus { retry_after, .. }
+        | Error::JsonDecodeError { retry_after, .. } => *retry_after,
         _ => None,
     }
 }
@@ -321,6 +329,7 @@ mod tests {
                 status,
                 detail: "expected value at line 1 column 1".to_string(),
                 response_preview: "<html>Server Error</html>".to_string(),
+                retry_after: None,
             };
             assert!(
                 is_retriable_error(&error),
@@ -350,6 +359,7 @@ mod tests {
             let error = Error::InvalidReqwestStatus {
                 status,
                 message: format!("Server error: {status}"),
+                retry_after: None,
             };
             assert!(
                 is_retriable_error(&error),
@@ -361,6 +371,7 @@ mod tests {
         let timeout_error = Error::InvalidReqwestStatus {
             status: StatusCode::REQUEST_TIMEOUT,
             message: "Request Timeout".to_string(),
+            retry_after: None,
         };
         assert!(
             is_retriable_error(&timeout_error),
@@ -384,6 +395,7 @@ mod tests {
                 status,
                 detail: "expected value at line 1 column 1".to_string(),
                 response_preview: "invalid response".to_string(),
+                retry_after: None,
             };
             assert!(
                 !is_retriable_error(&error),
@@ -396,6 +408,7 @@ mod tests {
     fn rate_limited_is_retriable() {
         let error = Error::RateLimited {
             message: "GitHub API rate limit exceeded".to_string(),
+            retry_after: None,
         };
         assert!(
             is_retriable_error(&error),
@@ -404,11 +417,37 @@ mod tests {
     }
 
     #[test]
+    fn json_rate_limited_and_status_errors_preserve_retry_after() {
+        let cooldown = Duration::from_secs(120);
+        let rate_limited = Error::RateLimited {
+            message: "rate limited".to_string(),
+            retry_after: Some(cooldown),
+        };
+        assert_eq!(error_retry_after(&rate_limited), Some(cooldown));
+
+        let status = Error::InvalidReqwestStatus {
+            status: StatusCode::BAD_GATEWAY,
+            message: "Bad Gateway".to_string(),
+            retry_after: Some(cooldown),
+        };
+        assert_eq!(error_retry_after(&status), Some(cooldown));
+
+        let decode = Error::JsonDecodeError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "truncated".to_string(),
+            response_preview: String::new(),
+            retry_after: Some(cooldown),
+        };
+        assert_eq!(error_retry_after(&decode), Some(cooldown));
+    }
+
+    #[test]
     fn truncated_ok_json_is_retriable() {
         let error = Error::JsonDecodeError {
             status: StatusCode::OK,
             detail: "EOF while parsing a string at line 1 column 219264".to_string(),
             response_preview: "{\"data\":{\"repository\":".to_string(),
+            retry_after: None,
         };
         assert!(
             is_retriable_error(&error),
@@ -425,6 +464,7 @@ mod tests {
             status: StatusCode::FORBIDDEN,
             detail: "expected value at line 2 column 1".to_string(),
             response_preview: "Request forbidden by administrative rules.".to_string(),
+            retry_after: None,
         };
         assert!(
             is_retriable_error(&error),
@@ -469,12 +509,14 @@ mod tests {
         let gateway = Error::InvalidReqwestStatus {
             status: StatusCode::BAD_GATEWAY,
             message: "Bad Gateway".to_string(),
+            retry_after: None,
         };
         assert!(should_shrink_page_size(&gateway));
 
         let not_found = Error::InvalidReqwestStatus {
             status: StatusCode::NOT_FOUND,
             message: "Not Found".to_string(),
+            retry_after: None,
         };
         assert!(!should_shrink_page_size(&not_found));
     }
@@ -622,6 +664,7 @@ mod tests {
             let invalid_status_err = Error::InvalidReqwestStatus {
                 status,
                 message: format!("Gateway error: {status}"),
+                retry_after: None,
             };
             assert!(
                 is_gateway_error(&invalid_status_err),
@@ -632,6 +675,7 @@ mod tests {
                 status,
                 detail: "unexpected EOF".to_string(),
                 response_preview: "<html>Bad Gateway</html>".to_string(),
+                retry_after: None,
             };
             assert!(
                 is_gateway_error(&json_decode_err),
@@ -751,6 +795,7 @@ mod tests {
             status: StatusCode::OK,
             detail: "The response body could not be parsed as JSON.".to_string(),
             response_preview: String::new(),
+            retry_after: None,
         };
         let displayed = error.to_string();
         assert!(displayed.contains("invalid JSON"));
@@ -771,6 +816,7 @@ mod tests {
             let error = Error::InvalidReqwestStatus {
                 status,
                 message: format!("Server error: {status}"),
+                retry_after: None,
             };
             assert!(
                 !is_gateway_error(&error),
@@ -785,6 +831,7 @@ mod tests {
         let client_error = Error::InvalidReqwestStatus {
             status: StatusCode::NOT_FOUND,
             message: "Not Found".to_string(),
+            retry_after: None,
         };
         assert!(
             !is_gateway_error(&client_error),
