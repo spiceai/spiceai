@@ -28,7 +28,8 @@ use crate::init_tracing;
 
 use app::AppBuilder;
 use datafusion::{
-    datasource::TableProvider, physical_plan::collect, prelude::SessionContext, sql::TableReference,
+    common::TableReference, datasource::TableProvider, physical_plan::collect,
+    prelude::SessionContext,
 };
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,

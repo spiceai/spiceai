@@ -45,6 +45,8 @@ use object_store::ObjectStore;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+use object_store::path::Path as ObjectStorePath;
 use std::sync::{Arc, LazyLock};
 use vortex::VortexSessionDefault;
 use vortex::arrow::IntoArrowArray;
@@ -402,7 +404,7 @@ impl CayenneDeletionSink {
         // Open the Vortex file directly using the session
         let vxf = vortex_session
             .open_options()
-            .open_object_store(object_store, file_path)
+            .open_object_store(object_store, ObjectStorePath::from(file_path))
             .await
             .map_err(|e| Error::Vortex {
                 operation: "open vortex file for deletion scan",
@@ -418,7 +420,11 @@ impl CayenneDeletionSink {
                 table: table_name.clone(),
                 source: Box::new(e),
             })?
-            .with_projection(row_idx());
+            .with_projection(row_idx().bind(vxf.dtype()).map_err(|e| Error::Vortex {
+                operation: "bind vortex deletion scan projection",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?);
 
         if let Some(access_plan) = already_deleted {
             scan_builder = access_plan.apply_to_builder(scan_builder);
@@ -426,7 +432,12 @@ impl CayenneDeletionSink {
 
         // Apply filter if we have one
         if let Some(filter) = vortex_filter {
-            scan_builder = scan_builder.with_filter(filter.clone());
+            let filter = filter.bind(vxf.dtype()).map_err(|e| Error::Vortex {
+                operation: "bind vortex deletion scan filter",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+            scan_builder = scan_builder.with_filter(filter);
         }
 
         // Execute the scan and collect row indices
@@ -518,7 +529,7 @@ impl CayenneDeletionSink {
         // Open the Vortex file directly.
         let vxf = vortex_session
             .open_options()
-            .open_object_store(object_store, file_path)
+            .open_object_store(object_store, ObjectStorePath::from(file_path))
             .await
             .map_err(|e| Error::Vortex {
                 operation: "open vortex file for key-match scan",
@@ -540,7 +551,13 @@ impl CayenneDeletionSink {
             use vortex::expr::{root, select};
             // `select` accepts Vec<&str> / Vec<Arc<str>>
             let cols: Vec<&str> = key_columns.iter().map(String::as_str).collect();
-            let proj = select(cols, root());
+            let proj = select(cols, root())
+                .bind(vxf.dtype())
+                .map_err(|e| Error::Vortex {
+                    operation: "bind vortex key-match scan projection",
+                    table: table_name.clone(),
+                    source: Box::new(e),
+                })?;
             scan_builder = scan_builder.with_projection(proj);
         }
 
@@ -664,7 +681,7 @@ impl CayenneDeletionSink {
 
         let vxf = vortex_session
             .open_options()
-            .open_object_store(object_store, file_path)
+            .open_object_store(object_store, ObjectStorePath::from(file_path))
             .await
             .map_err(|e| Error::Vortex {
                 operation: "open vortex file for position read-back",
@@ -682,7 +699,14 @@ impl CayenneDeletionSink {
         {
             use vortex::expr::{root, select};
             let cols: Vec<&str> = pk_column_names.iter().map(String::as_str).collect();
-            scan_builder = scan_builder.with_projection(select(cols, root()));
+            let proj = select(cols, root())
+                .bind(vxf.dtype())
+                .map_err(|e| Error::Vortex {
+                    operation: "bind vortex position read-back projection",
+                    table: table_name.clone(),
+                    source: Box::new(e),
+                })?;
+            scan_builder = scan_builder.with_projection(proj);
         }
 
         let mut stream = scan_builder.into_stream().map_err(|e| Error::Vortex {
@@ -953,7 +977,7 @@ fn build_vortex_filter(
             // compatible types before conversion to physical expressions.
             let mut rewriter = TypeCoercionRewriter::new(df_schema);
             let coerced_filter = f.clone().rewrite(&mut rewriter)?.data;
-            create_physical_expr(&coerced_filter, df_schema, &execution_props)
+            create_physical_expr(&coerced_filter, df_schema, &execution_props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default())
         })
         .collect::<datafusion_common::Result<Vec<_>>>()?;
 

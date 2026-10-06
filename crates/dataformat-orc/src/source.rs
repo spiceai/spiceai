@@ -24,9 +24,11 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::{PhysicalExpr, apply_expression_roots};
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
@@ -113,6 +115,13 @@ impl FileSource for OrcSource {
 
     fn projection(&self) -> Option<&ProjectionExprs> {
         Some(&self.projection.source)
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        apply_expression_roots(self.projection.source.iter(), f)
     }
 
     fn table_schema(&self) -> &TableSchema {
@@ -381,7 +390,7 @@ mod tests {
         store.forget_reads();
         let store_handle = Arc::clone(&store);
 
-        let source = OrcSource::new(TableSchema::new(batch.schema(), vec![]));
+        let source = OrcSource::new(TableSchema::from(batch.schema()));
         let config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("memory://").expect("object store url"),
             Arc::new(source.clone()),

@@ -304,7 +304,7 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
-    use datafusion::{catalog::MemoryCatalogProvider, sql::TableReference};
+    use datafusion::{catalog::MemoryCatalogProvider, common::TableReference};
     use runtime_datafusion::schema_provider::SpiceSchemaProvider;
     use std::sync::Arc;
     use tokio::runtime::Handle;

@@ -33,17 +33,18 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock, Weak};
 
 use async_trait::async_trait;
-use datafusion::catalog::CatalogProviderList;
+use datafusion::catalog::{CatalogProviderList, Session};
 use datafusion::common::DFSchemaRef;
+use datafusion::common::TableReference;
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{DdlStatement, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion::logical_expr::{Expr, UserDefinedLogicalNode};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use datafusion::sql::TableReference;
 
 use crate::handler::{CatalogDdlHandler, CreateSchemaParams, CreateTableParams, DropTableParams};
 use crate::{
@@ -387,11 +388,23 @@ impl ExtensionPlanner for DdlExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         _physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
+        session: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         let Some(ddl_node) = node.as_any().downcast_ref::<DdlExtensionNode>() else {
             return Ok(None);
         };
+
+        // DataFusion's physical planner always plans with a `SessionState`; the DDL
+        // handlers register the new objects through its catalogs.
+        let session_state = session
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "DDL extension planning requires a DataFusion SessionState".to_string(),
+                )
+            })?;
 
         let catalog_list = Arc::<dyn CatalogProviderList>::clone(session_state.catalog_list());
 

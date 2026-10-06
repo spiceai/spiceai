@@ -20,8 +20,8 @@ use arrow_flight::{
     FlightDescriptor, IpcMessage, SchemaAsIpc, SchemaResult, flight_descriptor::DescriptorType,
 };
 use arrow_ipc::writer::IpcWriteOptions;
+use datafusion::common::TableReference;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
 use tonic::{Request, Response, Status};
 
 use crate::{FlightSqlService, handle_datafusion_error, to_tonic_err};

@@ -12,6 +12,9 @@ version.workspace = true
 arrow-schema.workspace = true
 data_components = { path = "../data_components" }
 datafusion.workspace = true
+# `ExecutionPlan::try_to_proto` exists only with datafusion-physical-plan's `proto`
+# feature, which datafusion-proto enables.
+datafusion-proto.workspace = true
 futures.workspace = true
 iceberg-datafusion.workspace = true
 runtime-datafusion = { path = "../runtime-datafusion" }

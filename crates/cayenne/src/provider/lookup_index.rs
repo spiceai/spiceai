@@ -82,7 +82,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
-use crate::row_converter::{RowConverter, SortField};
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::UInt64Type;
@@ -110,9 +109,8 @@ use vortex::dtype::Nullability;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::{
-    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider,
+    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider, include_by_index,
 };
-use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 
 /// Runtime index scans accept only small exact build-side key sets, and a
@@ -392,14 +390,6 @@ pub(crate) struct KeyColumn {
 }
 
 impl KeyColumn {
-    /// This column, encoded in `data_type` instead of its stored type.
-    pub(crate) fn encoded_as(&self, data_type: DataType) -> Self {
-        Self {
-            data_type,
-            ..self.clone()
-        }
-    }
-
     /// Resolves a configured key column: an exact name wins, then a unique
     /// case-insensitive match. Two case-insensitive candidates are an error
     /// rather than a guess, because building from one column and probing with
@@ -437,20 +427,6 @@ impl KeyColumn {
             self.nullable,
         ))
     }
-}
-
-/// The byte-comparable encoding of one key's columns.
-pub(crate) fn key_converter(columns: &[KeyColumn]) -> Result<RowConverter, String> {
-    RowConverter::new(
-        columns
-            .iter()
-            .map(|column| SortField::new(column.data_type.clone()))
-            .collect(),
-    )
-    .map_err(|e| {
-        let types: Vec<String> = columns.iter().map(|c| c.data_type.to_string()).collect();
-        format!("key ({}) cannot be row-encoded: {e}", types.join(", "))
-    })
 }
 
 /// Casts `array` to `data_type`, or returns it unchanged when it already matches.
@@ -850,7 +826,7 @@ impl RuntimeLookupSelection {
             .into_iter()
             .map(|(name, positions)| {
                 let plan = VortexAccessPlan::default()
-                    .with_selection(Selection::IncludeByIndex(Buffer::from(positions)));
+                    .with_selection(include_by_index(&Buffer::from(positions)));
                 (name, Arc::new(plan))
             })
             .collect();
@@ -858,8 +834,7 @@ impl RuntimeLookupSelection {
             index,
             plans,
             empty: Arc::new(
-                VortexAccessPlan::default()
-                    .with_selection(Selection::IncludeByIndex(Buffer::empty())),
+                VortexAccessPlan::default().with_selection(include_by_index(&Buffer::empty())),
             ),
         }
     }
@@ -1167,7 +1142,7 @@ impl VortexAccessPlanProvider for LookupAccessPlanProvider {
             .get(file_name(path))
             .map_or(&[][..], Vec::as_slice);
         let selected = VortexAccessPlan::default()
-            .with_selection(Selection::IncludeByIndex(Buffer::copy_from(candidates)));
+            .with_selection(include_by_index(&Buffer::copy_from(candidates)));
         self.state
             .counters
             .access_plans_attached
@@ -2604,13 +2579,16 @@ async fn read_back_files(
         }
         let vxf = session
             .open_options()
-            .open_object_store(store, &file.path)
+            .open_object_store(store, object_store::path::Path::from(file.path.as_str()))
             .await
             .map_err(|e| format!("open {}: {e}", file.path))?;
+        let file_projection = projection
+            .bind(vxf.dtype())
+            .map_err(|e| format!("bind projection {}: {e}", file.path))?;
         let mut stream = vxf
             .scan()
             .map_err(|e| format!("scan {}: {e}", file.path))?
-            .with_projection(projection.clone())
+            .with_projection(file_projection)
             .into_stream()
             .map_err(|e| format!("stream {}: {e}", file.path))?;
         while let Some(chunk) = stream.next().await {
@@ -3786,7 +3764,7 @@ mod tests {
             format!("{:?}", plan_a.selection()),
             format!(
                 "{:?}",
-                Some(&Selection::IncludeByIndex(Buffer::from(vec![0_u64, 2])))
+                Some(&include_by_index(&Buffer::from(vec![0_u64, 2])))
             ),
         );
         assert!(
@@ -4059,7 +4037,7 @@ mod tests {
             format!("{:?}", covered.selection()),
             format!(
                 "{:?}",
-                Some(&Selection::IncludeByIndex(Buffer::from(vec![0_u64, 2])))
+                Some(&include_by_index(&Buffer::from(vec![0_u64, 2])))
             ),
         );
         assert!(
