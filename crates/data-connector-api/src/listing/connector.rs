@@ -453,17 +453,19 @@ impl TableProvider for MetadataPruningListingTable {
                 filters.len()
             ]);
         }
-        // When `scan` will prune the listing by `_last_modified`, every
-        // predicate stays a residual `FilterExec` above the pruned scan:
-        // `Inexact` keeps the row-level filter (so precision and any
-        // partition/data-column predicate are always re-enforced) while the
-        // prune itself removes the files that cannot match. The `_location`
-        // fast-path takes precedence, so this only applies when it is absent.
-        // `scan` receives `&[Expr]`, so mirror the same predicate detection here
-        // over the borrowed slice this method is given.
+        // When `scan` takes the `_location` fast path or prunes the listing by
+        // `_last_modified`, every predicate stays a residual `FilterExec` above
+        // the pruned scan. Both paths only choose which objects to open: they
+        // apply no other predicate, and the inner listing reports a partition
+        // predicate `Exact`, which would drop it from the plan and return rows
+        // the query excluded. `Inexact` keeps the row-level filter so every
+        // predicate is re-enforced, while the prune still removes the files
+        // that cannot match. `scan` receives `&[Expr]`, so mirror the same
+        // predicate detection here over the borrowed slice this method is
+        // given.
         let owned_filters: Vec<datafusion_expr::Expr> = filters.iter().copied().cloned().collect();
-        if extract_location_predicates(&owned_filters).is_none()
-            && extract_last_modified_predicate(&owned_filters).is_some()
+        if extract_location_predicates(&owned_filters).is_some()
+            || extract_last_modified_predicate(&owned_filters).is_some()
         {
             return Ok(vec![
                 datafusion_expr::TableProviderFilterPushDown::Inexact;
@@ -4845,6 +4847,102 @@ mod tests {
             3,
             "the fifty-row file must be pruned from the listing:\n{}",
             datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    /// A `_location` predicate sends `scan` down its fast path, which opens the
+    /// named objects and applies no other predicate, while the inner listing
+    /// reports a metadata-column predicate `Exact` (spiceai/datafusion#240). A
+    /// `_size` predicate beside `_location` must still remove the rows of the
+    /// file it excludes, through the table `create_listing_table` builds.
+    #[tokio::test]
+    async fn location_fast_path_keeps_a_size_predicate_beside_it() {
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("valid batch");
+        let parquet_path = dir.path().join("data.parquet");
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&parquet_path).expect("create parquet"),
+            Arc::clone(&file_schema),
+            None,
+        )
+        .expect("parquet writer");
+        writer.write(&batch).expect("write parquet");
+        writer.close().expect("close parquet");
+        let file_size = std::fs::metadata(&parquet_path)
+            .expect("parquet file metadata")
+            .len();
+        assert!(
+            file_size > 50,
+            "precondition: the file must be larger than the `_size` bound, got {file_size} bytes"
+        );
+
+        let table_url = Url::from_directory_path(dir.path())
+            .expect("directory url")
+            .to_string();
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        let (connector, mut dataset) = setup_connector(table_url.clone(), params);
+        dataset.metadata = HashMap::from([
+            (
+                MetadataColumn::Location(None).name().to_string(),
+                "enabled".to_string(),
+            ),
+            (
+                MetadataColumn::Size.name().to_string(),
+                "enabled".to_string(),
+            ),
+        ]);
+
+        let url = Url::parse(&table_url).expect("table url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("parquet listing format")
+        else {
+            panic!("expected a parquet file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table production path");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", provider)
+            .expect("register listing table");
+
+        let location = Url::from_file_path(&parquet_path)
+            .expect("file url")
+            .to_string();
+        let rows = async |predicate: &str| -> usize {
+            let sql = format!("SELECT id FROM t WHERE _location = '{location}'{predicate}");
+            ctx.sql(&sql)
+                .await
+                .expect("plan query")
+                .collect()
+                .await
+                .expect("run query")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum()
+        };
+
+        assert_eq!(
+            rows("").await,
+            3,
+            "precondition: the `_location` predicate alone selects the file"
+        );
+        assert_eq!(rows(" AND _size > 50").await, 3);
+        assert_eq!(
+            rows(" AND _size < 50").await,
+            0,
+            "a `_size` predicate the file does not satisfy must remove its rows"
         );
     }
 
