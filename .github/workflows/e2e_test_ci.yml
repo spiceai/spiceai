@@ -985,6 +985,7 @@ jobs:
 
       - name: Check the load committed no full compaction and holds every row
         run: |
+          set -o pipefail
           full=$(curl -sf http://127.0.0.1:9095/metrics \
             | awk '/^cayenne_compaction_outcome_total\{/ && /kind="full"/ && /outcome="committed"/ && /table="audit_events"/ {sum += $NF} END {print sum + 0}')
           rows=$(curl -sf -X POST -H 'Content-Type: text/plain' --data 'SELECT COUNT(*) AS n FROM audit_events' \
@@ -2614,6 +2615,7 @@ jobs:
       - databricks_delta_catalog_connector_quickstart
       - graceful_shutdown_test_append
       - graceful_shutdown_test_full
+      - test_cold_start_unkeyed_append
     steps:
       - name: Verify all E2E jobs succeeded
         # Named rather than left to the runner default: this gate is the required
