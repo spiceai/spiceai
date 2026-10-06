@@ -105,6 +105,12 @@ pub fn sniff_body_format(body: &str) -> ResponseBodyFormat {
         return ResponseBodyFormat::Html;
     }
 
+    // The JSON parser is the final validator. A `{` / `[` prefix lets a missing
+    // or unknown Content-Type still reach decode instead of failing as "text".
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return ResponseBodyFormat::Json;
+    }
+
     ResponseBodyFormat::Text
 }
 
@@ -141,8 +147,8 @@ pub fn classify_response_body(
         }
         Some(ct) if is_html_media_type(ct) => ResponseBodyFormat::Html,
         Some(ct) if is_text_media_type(ct) => {
-            if sniffed == ResponseBodyFormat::Html {
-                ResponseBodyFormat::Html
+            if matches!(sniffed, ResponseBodyFormat::Html | ResponseBodyFormat::Json) {
+                sniffed
             } else {
                 ResponseBodyFormat::Text
             }
@@ -383,6 +389,8 @@ mod tests {
         );
         assert_eq!(sniff_body_format(""), ResponseBodyFormat::Empty);
         assert_eq!(sniff_body_format("   \n"), ResponseBodyFormat::Empty);
+        assert_eq!(sniff_body_format("{\"data\":{}}"), ResponseBodyFormat::Json);
+        assert_eq!(sniff_body_format("[{\"id\":1}]"), ResponseBodyFormat::Json);
         assert_eq!(sniff_body_format("not html"), ResponseBodyFormat::Text);
     }
 
@@ -424,6 +432,27 @@ mod tests {
         assert_eq!(
             classify_response_body(Some("application/json"), b"", Some(48), Some("gzip")),
             ResponseBodyFormat::Incomplete
+        );
+    }
+
+    #[test]
+    fn classify_json_when_content_type_is_missing() {
+        assert_eq!(
+            classify_response_body(None, b"{\"data\":{}}", None, None),
+            ResponseBodyFormat::Json
+        );
+        assert_eq!(
+            classify_response_body(Some("application/octet-stream"), b"[1,2]", None, None),
+            ResponseBodyFormat::Json
+        );
+        assert_eq!(
+            classify_response_body(
+                Some("text/plain; charset=utf-8"),
+                b"{\"data\":{}}",
+                None,
+                None
+            ),
+            ResponseBodyFormat::Json
         );
     }
 

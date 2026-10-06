@@ -4244,6 +4244,33 @@ mod tests {
             assert!(!crate::graphql::is_retriable_error(&err));
         }
 
+        /// A JSON GraphQL body with no Content-Type still decodes.
+        #[tokio::test]
+        async fn json_body_without_content_type_succeeds() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    // `set_body_bytes` omits Content-Type; `set_body_string` would
+                    // advertise `text/plain` and hide the missing-header path.
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(br#"{"data":{"users":[{"id":"1"}]}}"#),
+                )
+                .mount(&server)
+                .await;
+
+            let result = execute_once(&client(&server))
+                .await
+                .expect("JSON without Content-Type must still parse");
+            assert_eq!(
+                result
+                    .records
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                1
+            );
+        }
+
         /// `application/graphql-response+json` is a JSON GraphQL payload.
         #[tokio::test]
         async fn graphql_response_json_on_200_succeeds() {
