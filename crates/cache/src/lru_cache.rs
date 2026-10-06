@@ -27,7 +27,7 @@ use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use sharded_cache::{EvictionPolicy, NUM_SHARDS};
 use snafu::ResultExt;
 use spicepod::component::caching::{CacheConfig, CacheEngine, CachingPolicy};

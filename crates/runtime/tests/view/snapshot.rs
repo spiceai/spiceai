@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use app::AppBuilder;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::status::ComponentStatus;

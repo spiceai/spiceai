@@ -28,13 +28,17 @@ use arrow::array::{Array, RecordBatch};
 use arrow_flight::{FlightData, FlightDescriptor, PutResult, utils::flight_data_to_arrow_batch};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::{DataType, SchemaRef};
-use arrow_tools::{ipc, map_entries::MapEntriesNormalizer};
-use datafusion::{
-    common::DFSchema,
-    scalar::ScalarValue,
-    sql::{ResolvedTableReference, TableReference},
+use arrow_tools::{
+    ipc,
+    map_entries::{MapEntriesNormalizer, decodable_schema},
 };
-use datafusion_expr::{Expr, execution_props::ExecutionProps, lit};
+use datafusion::{
+    common::{DFSchema, ResolvedTableReference, TableReference},
+    scalar::ScalarValue,
+};
+use datafusion_expr::{
+    Expr, execution_props::ExecutionProps, lit, physical_planning_context::PhysicalPlanningContext,
+};
 use futures::{Stream, TryStreamExt as _, stream::BoxStream};
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -260,7 +264,7 @@ pub async fn forward_federated_partitioned_write(
     let batch_stream = decode_client_batches(
         &first_message,
         streaming_flight,
-        declared,
+        &declared,
         normalizer,
         path.to_string(),
     )?;
@@ -303,7 +307,7 @@ pub async fn forward_federated_partitioned_write(
 fn decode_client_batches<S>(
     first_message: &FlightData,
     mut messages: S,
-    declared: SchemaRef,
+    declared: &SchemaRef,
     normalizer: MapEntriesNormalizer,
     table_name: String,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send + 'static>
@@ -311,12 +315,8 @@ where
     S: Stream<Item = std::result::Result<FlightData, tonic::Status>> + Unpin + Send + 'static,
 {
     let dictionaries_by_id = HashMap::new();
-    let first_batch = maybe_read_first_batch(
-        first_message,
-        Arc::clone(&declared),
-        &dictionaries_by_id,
-        &table_name,
-    )?;
+    let first_batch =
+        maybe_read_first_batch(first_message, declared, &dictionaries_by_id, &table_name)?;
 
     Ok(async_stream::try_stream! {
         if let Some(batch) = first_batch {
@@ -341,7 +341,7 @@ where
 
             let batch = flight_data_to_arrow_batch(
                 &message,
-                Arc::clone(&declared),
+                Arc::clone(normalizer.decode_schema()),
                 &dictionaries_by_id,
             )
             .context(DecodeBatchSnafu)?;
@@ -381,7 +381,7 @@ fn declares_record_batch(data_header: &[u8], table: &str) -> Result<bool> {
 /// is reported as such.
 fn maybe_read_first_batch(
     first_message: &FlightData,
-    schema: SchemaRef,
+    schema: &SchemaRef,
     dictionaries_by_id: &HashMap<i64, Arc<dyn Array>>,
     table: &str,
 ) -> Result<Option<RecordBatch>> {
@@ -398,8 +398,14 @@ fn maybe_read_first_batch(
         return Ok(None);
     }
 
-    let batch = flight_data_to_arrow_batch(first_message, schema, dictionaries_by_id)
-        .context(DecodeBatchSnafu)?;
+    // `schema` is the client's own declaration, which a decoder cannot always be given: a map
+    // whose `entries` it declares nullable is refused inside the decode, over the one part of the
+    // column that holds no data. The batch is built against the form that decodes instead, and
+    // the caller's normalizer puts the map label back — or refuses, naming the column, the one
+    // shape that has no map to go back to.
+    let batch =
+        flight_data_to_arrow_batch(first_message, decodable_schema(schema), dictionaries_by_id)
+            .context(DecodeBatchSnafu)?;
     Ok(Some(batch))
 }
 
@@ -703,6 +709,7 @@ async fn route_batch_and_assign_unseen(
                     &combined,
                     &df_schema,
                     &ExecutionProps::new(),
+                    &PhysicalPlanningContext::default(),
                 )
                 .context(CreatePhysicalFilterSnafu {
                     executor_id: executor_id.clone(),
@@ -881,6 +888,7 @@ fn build_partition_physical_exprs(
                 e,
                 &df_schema,
                 &ExecutionProps::new(),
+                &PhysicalPlanningContext::default(),
             )
             .context(ParsePartitionExprSnafu)?;
             Ok((e.clone(), physical))
@@ -945,6 +953,7 @@ fn build_executor_filters(
             &combined,
             &df_schema,
             &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
         )
         .context(CreatePhysicalFilterSnafu {
             executor_id: executor_id.clone(),
@@ -1241,12 +1250,15 @@ mod tests {
         )
         .expect("entries struct");
 
-        let data = ArrayData::builder(map_type(entries_nullable))
+        let builder = ArrayData::builder(map_type(entries_nullable))
             .len(2)
             .add_buffer(Buffer::from_slice_ref([0i32, 1, 2]))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
 
         RecordBatch::try_new(
             map_schema(entries_nullable),
@@ -1278,13 +1290,9 @@ mod tests {
             "schema message should have empty body"
         );
 
-        let result = maybe_read_first_batch(
-            &flight_data[0],
-            Arc::clone(&schema),
-            &dictionaries_by_id,
-            "test.table",
-        )
-        .expect("should succeed");
+        let result =
+            maybe_read_first_batch(&flight_data[0], &schema, &dictionaries_by_id, "test.table")
+                .expect("should succeed");
         assert!(result.is_none(), "empty body should return None");
     }
 
@@ -1314,13 +1322,8 @@ mod tests {
             "data message should have non-empty body"
         );
 
-        let result = maybe_read_first_batch(
-            &data_fd,
-            Arc::clone(&schema),
-            &dictionaries_by_id,
-            "test.table",
-        )
-        .expect("should succeed");
+        let result = maybe_read_first_batch(&data_fd, &schema, &dictionaries_by_id, "test.table")
+            .expect("should succeed");
 
         let decoded = result.expect("non-empty body should return Some");
         assert_eq!(decoded.num_rows(), 3);
@@ -1351,13 +1354,8 @@ mod tests {
             .nth(1)
             .expect("should have data message");
 
-        let result = maybe_read_first_batch(
-            &data_fd,
-            Arc::clone(&schema),
-            &dictionaries_by_id,
-            "test.table",
-        )
-        .expect("should succeed");
+        let result = maybe_read_first_batch(&data_fd, &schema, &dictionaries_by_id, "test.table")
+            .expect("should succeed");
 
         let decoded = result.expect("should return Some for single row");
         assert_eq!(decoded.num_rows(), 1);
@@ -1378,14 +1376,10 @@ mod tests {
             .nth(1)
             .expect("should have a data message");
 
-        let decoded = maybe_read_first_batch(
-            &data_fd,
-            Arc::clone(&declared),
-            &dictionaries_by_id,
-            "test.table",
-        )
-        .expect("decode should succeed")
-        .expect("data message should carry a batch");
+        let decoded =
+            maybe_read_first_batch(&data_fd, &declared, &dictionaries_by_id, "test.table")
+                .expect("decode should succeed")
+                .expect("data message should carry a batch");
 
         let normalizer = MapEntriesNormalizer::for_schema(&declared);
 
@@ -1428,14 +1422,10 @@ mod tests {
             .nth(1)
             .expect("should have a data message");
 
-        let decoded = maybe_read_first_batch(
-            &data_fd,
-            Arc::clone(&declared),
-            &dictionaries_by_id,
-            "test.table",
-        )
-        .expect("decode should succeed")
-        .expect("data message should carry a batch");
+        let decoded =
+            maybe_read_first_batch(&data_fd, &declared, &dictionaries_by_id, "test.table")
+                .expect("decode should succeed")
+                .expect("data message should carry a batch");
 
         let err = MapEntriesNormalizer::for_schema(&declared)
             .normalize(decoded)
@@ -1492,7 +1482,7 @@ mod tests {
         let stream = decode_client_batches(
             &first,
             futures::stream::iter(messages.into_iter().map(Ok::<_, tonic::Status>)),
-            Arc::clone(schema),
+            schema,
             MapEntriesNormalizer::for_schema(schema),
             "test.s.events".to_string(),
         )?;
@@ -1588,7 +1578,7 @@ mod tests {
     #[tokio::test]
     async fn a_dictionary_message_wearing_the_keepalive_sentinel_is_refused_not_skipped() {
         use arrow::ipc::writer::{
-            CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+            DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions,
         };
 
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
@@ -1616,7 +1606,7 @@ mod tests {
                 &batch,
                 &mut tracker,
                 &options,
-                &mut CompressionContext::default(),
+                &mut IpcWriteContext::default(),
             )
             .expect("encoding a dictionary batch");
         let encoded_dictionary = dictionaries
@@ -1899,7 +1889,7 @@ mod tests {
         );
         assert!(!first.data_body.is_empty(), "the case needs a body");
 
-        let err = maybe_read_first_batch(&first, schema, &HashMap::new(), "test.s.events")
+        let err = maybe_read_first_batch(&first, &schema, &HashMap::new(), "test.s.events")
             .expect_err("a body no batch describes must not be silently dropped");
 
         assert!(

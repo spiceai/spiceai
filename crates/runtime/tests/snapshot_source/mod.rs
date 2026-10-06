@@ -528,7 +528,7 @@ async fn first_snapshot_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     // The load cannot finish until a snapshot exists, so it runs alongside the writer.
     let reader_load = tokio::spawn(Arc::clone(&reader).load_components());
 
-    let table = datafusion::sql::TableReference::bare(modules);
+    let table = datafusion::common::TableReference::bare(modules);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut status = None;
     while Instant::now() < deadline {
@@ -817,7 +817,7 @@ async fn projected_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     );
     let load = tokio::spawn(Arc::clone(&reader).load_components());
 
-    let table = datafusion::sql::TableReference::bare(modules);
+    let table = datafusion::common::TableReference::bare(modules);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut status = None;
     while Instant::now() < deadline {
@@ -914,7 +914,7 @@ async fn view_catalog_scenario(rustfs: Rustfs, modules: &str, view: &str) -> Res
     );
     let load = tokio::spawn(Arc::clone(&reader).load_components());
 
-    let table = datafusion::sql::TableReference::bare(modules);
+    let table = datafusion::common::TableReference::bare(modules);
     let served = async {
         wait_for_rows(&reader, modules, 3).await?;
         wait_for_rows(&reader, view, 1).await
@@ -956,7 +956,7 @@ async fn a_replaced_snapshot_dataset_stops_waiting_for_its_snapshot() -> Result<
 async fn replaced_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
-    let table = datafusion::sql::TableReference::bare(modules);
+    let table = datafusion::common::TableReference::bare(modules);
 
     let reader = Arc::new(
         Runtime::builder()
@@ -1029,7 +1029,7 @@ async fn replaced_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
 /// Waits for `table` to report an error whose message contains `expected`.
 async fn wait_for_error(
     rt: &Arc<Runtime>,
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
     expected: &str,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1051,7 +1051,10 @@ async fn wait_for_error(
 }
 
 /// Waits for `table` to report `Ready`.
-async fn wait_for_ready(rt: &Arc<Runtime>, table: &datafusion::sql::TableReference) -> Result<()> {
+async fn wait_for_ready(
+    rt: &Arc<Runtime>,
+    table: &datafusion::common::TableReference,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut status = None;
     while Instant::now() < deadline {
@@ -1070,7 +1073,7 @@ async fn wait_for_ready(rt: &Arc<Runtime>, table: &datafusion::sql::TableReferen
 /// every 100 ms, with when it was first seen.
 async fn other_statuses_than_ready(
     rt: &Arc<Runtime>,
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
     duration: Duration,
 ) -> Vec<String> {
     let started = Instant::now();
@@ -1113,7 +1116,7 @@ async fn a_replaced_snapshot_dataset_waits_for_its_in_progress_restore() -> Resu
 async fn restore_held_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
-    let table = datafusion::sql::TableReference::bare(modules);
+    let table = datafusion::common::TableReference::bare(modules);
     let hold = SnapshotRestoreHold::install(modules);
 
     let reader = Arc::new(
@@ -1344,7 +1347,7 @@ async fn other_engine_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()
     );
     let load = tokio::spawn(Arc::clone(&reader).load_components());
 
-    let table = datafusion::sql::TableReference::bare(modules);
+    let table = datafusion::common::TableReference::bare(modules);
     let expected = format!(
         "Dataset '{modules}' reads snapshots from 's3://{READER_BUCKET}/{prefix}/' that were created with the 'duckdb' engine, so `acceleration.params.cayenne_file_path`, which sets where a Cayenne copy is kept, does not apply"
     );

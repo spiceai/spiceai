@@ -1179,7 +1179,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_turso_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1277,7 +1277,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_pushdown_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1407,7 +1407,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_file_mode_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1552,7 +1552,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_default_path_table"),
-            location: file_path.clone(),
+            locations: vec![file_path.clone()],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1642,7 +1642,7 @@ mod tests {
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_ts_seconds"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -1708,7 +1708,7 @@ mod tests {
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_ts_millis"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -1774,7 +1774,7 @@ mod tests {
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_ts_micros"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -1840,7 +1840,7 @@ mod tests {
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_ts_nanos"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,

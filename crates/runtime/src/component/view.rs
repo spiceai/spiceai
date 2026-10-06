@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use snafu::prelude::*;
 use spicepod::{

@@ -4553,7 +4553,7 @@ mod tests {
     fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
         match engine {
             #[cfg(any(feature = "sqlite", feature = "turso"))]
-            AccelerationEngine::Sqlite | AccelerationEngine::Turso => {
+            engine if matches!(engine.snapshot_extension(), ".sqlite" | ".turso") => {
                 let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
                 conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
                     .expect("set wal");

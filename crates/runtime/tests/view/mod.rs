@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow::array::RecordBatch;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::{component::view::ViewBuilder, dataaccelerator::spice_sys::dataset_checkpointer};

@@ -40,7 +40,7 @@ use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use super::refresh::Refresh;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider};
 use opentelemetry::KeyValue;
 use runtime_component::dataset::acceleration::RefreshMode;
 use spicepod::metric::Metrics;
@@ -577,7 +577,7 @@ mod tests {
     use super::RefreshTaskRunner;
     use crate::accelerated::refresh::Refresh;
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use runtime_component::dataset::acceleration::RefreshMode;
     use runtime_datafusion::refresh_sql::{RefreshSQL, parse_refresh_sql};
     use std::sync::Arc;
