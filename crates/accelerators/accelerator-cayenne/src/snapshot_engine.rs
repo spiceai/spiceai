@@ -670,10 +670,7 @@ mod tests {
         use datafusion::logical_expr::dml::InsertOp;
         use datafusion::physical_plan::collect;
         use datafusion::prelude::SessionContext;
-        use runtime_acceleration::snapshot::directory_archive::{
-            ExtractOptions, archive_directories_to_file_with_plan,
-            extract_archive_file_with_options,
-        };
+        use runtime_acceleration::snapshot::directory_archive::archive_directories_to_file_with_plan;
 
         let tmp = tempfile::tempdir().expect("tmp");
         let metadata_dir = tmp.path().join("writer").join("metadata");
@@ -770,60 +767,12 @@ mod tests {
             .await
             .expect("archive");
 
-        let reader_root = tmp.path().join("reader");
-        let reader_metadata = reader_root.join("metadata");
-        let reader_data = reader_root.join("trips");
-        std::fs::create_dir_all(&reader_metadata).expect("mkdir");
-        std::fs::create_dir_all(&reader_data).expect("mkdir");
-        let reader_catalog = fresh_catalog(&reader_metadata).await;
-        extract_archive_file_with_options(
-            &tar,
-            &reader_root,
-            ExtractOptions {
-                prefix_mappings: Some(vec![
-                    ("metadata/".to_string(), reader_metadata.clone()),
-                    ("data/".to_string(), reader_data.clone()),
-                ]),
-                ..ExtractOptions::skip_existing()
-            },
-        )
-        .await
-        .expect("extract");
+        let (reader_data, rows) = restore(&tar, &tmp.path().join("reader")).await;
         assert!(
             !reader_data.join(&table_id).join(&first).exists(),
             "the retired snapshot must not be in the archive"
         );
         assert!(reader_data.join(&table_id).join(&second).is_dir());
-        CayenneSnapshotEngine::new(
-            Arc::clone(&reader_catalog) as Arc<dyn MetadataCatalog>,
-            "trips",
-            reader_data.clone(),
-        )
-        .finalize_directory_snapshot(
-            &[
-                (reader_metadata.clone(), "metadata/".to_string()),
-                (reader_data.clone(), "data/".to_string()),
-            ],
-            "trips",
-        )
-        .await
-        .expect("import");
-        let restored = CayenneTableProviderBuilder::new(
-            Arc::clone(&reader_catalog) as Arc<dyn MetadataCatalog>,
-            ctx.runtime_env(),
-        )
-        .open("trips")
-        .await
-        .expect("open");
-        let rows: usize = SessionContext::new()
-            .read_table(Arc::new(restored) as Arc<dyn TableProvider>)
-            .expect("read")
-            .collect()
-            .await
-            .expect("collect")
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
         assert_eq!(rows, 50, "the archive restores the refreshed table");
     }
 
@@ -873,5 +822,324 @@ mod tests {
             "msg={msg}"
         );
         assert!(msg.contains("older Spice"), "msg={msg}");
+    }
+
+    /// A key-upsert table holding one row, plus `orphans` orphan-eligible key
+    /// deletion vectors (sequence 0) in its current snapshot's `deletions/`.
+    async fn table_with_orphan_dvs(
+        metadata_dir: &std::path::Path,
+        data_dir: &std::path::Path,
+        orphans: usize,
+    ) -> (
+        Arc<CayenneCatalog>,
+        Arc<cayenne::CayenneTableProvider>,
+        Vec<PathBuf>,
+    ) {
+        use arrow::array::{BinaryArray, Int64Array, RecordBatch};
+        use cayenne::CayenneTableProviderBuilder;
+        use cayenne::metadata::{DeleteFile, DeletionMode, DeletionType};
+        use datafusion::datasource::TableProvider;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use datafusion_table_providers::util::{
+            column_reference::ColumnReference, on_conflict::OnConflict,
+        };
+
+        let catalog = fresh_catalog(metadata_dir).await;
+        let ctx = SessionContext::new();
+        let table = Arc::new(
+            CayenneTableProviderBuilder::new(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+            )
+            .create(CreateTableOptions {
+                table_name: "trips".to_string(),
+                schema: schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: data_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig {
+                    inline_max_rows: 0,
+                    deletion_mode: DeletionMode::Key,
+                    compaction_trigger_files: 1_000_000,
+                    compaction_trigger_protected_snapshots: 1_000_000,
+                    compaction_trigger_snapshot_age_ms: 0,
+                    compaction_background_interval_ms: 0,
+                    ..cayenne::metadata::VortexConfig::default()
+                },
+            })
+            .await
+            .expect("create table"),
+        );
+        let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vec![1_i64]))])
+            .expect("batch");
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema(), None).expect("exec");
+        let plan = table
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("plan");
+        collect(plan, ctx.task_ctx()).await.expect("write");
+        table.drain_in_flight_maintenance().await.expect("drain");
+
+        let deletions = data_dir.join(table.current_snapshot_id()).join("deletions");
+        std::fs::create_dir_all(&deletions).expect("mkdir deletions");
+        let dv_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "row_key",
+            arrow_schema::DataType::Binary,
+            false,
+        )]));
+        let mut paths = Vec::with_capacity(orphans);
+        for _ in 0..orphans {
+            let id = uuid::Uuid::now_v7().to_string();
+            let path = deletions.join(format!("delete_{id}.arrow"));
+            let empty = RecordBatch::try_new(
+                Arc::clone(&dv_schema),
+                vec![Arc::new(BinaryArray::from(Vec::<&[u8]>::new()))],
+            )
+            .expect("dv batch");
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(
+                std::fs::File::create(&path).expect("create dv"),
+                &dv_schema,
+            )
+            .expect("dv writer");
+            writer.write(&empty).expect("write dv");
+            writer.finish().expect("finish dv");
+            catalog
+                .add_delete_file(DeleteFile {
+                    delete_file_id: id,
+                    table_id: table.metadata().table_id.clone(),
+                    source_data_file_path: None,
+                    path: path.to_string_lossy().into_owned(),
+                    path_is_relative: false,
+                    format: "arrow_ipc".to_string(),
+                    delete_count: 0,
+                    file_size_bytes: 0,
+                    deletion_type: DeletionType::KeyBased,
+                    sequence_number: 0,
+                    reinsert_sequence: None,
+                })
+                .await
+                .expect("add delete file");
+            paths.push(path);
+        }
+        (catalog, table, paths)
+    }
+
+    /// Extracts `tar` under `root` into a fresh metastore and opens the table;
+    /// returns the reader's data directory and the restored row count.
+    async fn restore(tar: &std::path::Path, root: &std::path::Path) -> (PathBuf, usize) {
+        use arrow::array::RecordBatch;
+        use cayenne::CayenneTableProviderBuilder;
+        use datafusion::datasource::TableProvider;
+        use datafusion::prelude::SessionContext;
+        use runtime_acceleration::snapshot::directory_archive::{
+            ExtractOptions, extract_archive_file_with_options,
+        };
+
+        let metadata_dir = root.join("metadata");
+        let data_dir = root.join("trips");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let catalog = fresh_catalog(&metadata_dir).await;
+        extract_archive_file_with_options(
+            tar,
+            root,
+            ExtractOptions {
+                prefix_mappings: Some(vec![
+                    ("metadata/".to_string(), metadata_dir.clone()),
+                    ("data/".to_string(), data_dir.clone()),
+                ]),
+                ..ExtractOptions::skip_existing()
+            },
+        )
+        .await
+        .expect("extract");
+        CayenneSnapshotEngine::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            "trips",
+            data_dir.clone(),
+        )
+        .finalize_directory_snapshot(
+            &[
+                (metadata_dir, "metadata/".to_string()),
+                (data_dir.clone(), "data/".to_string()),
+            ],
+            "trips",
+        )
+        .await
+        .expect("import");
+        let ctx = SessionContext::new();
+        let restored = CayenneTableProviderBuilder::new(
+            catalog as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .open("trips")
+        .await
+        .expect("open");
+        let rows = ctx
+            .read_table(Arc::new(restored) as Arc<dyn TableProvider>)
+            .expect("read")
+            .collect()
+            .await
+            .expect("collect")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        (data_dir, rows)
+    }
+
+    /// Regression test for #14787: the orphaned-DV sweep unlinked deletion
+    /// vectors while a snapshot archived them. Under a snapshot pin the sweep
+    /// waits, the archive keeps every file the slice lists, and it restores.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn orphan_dv_sweep_waits_for_the_snapshot_pin() {
+        use runtime_acceleration::snapshot::directory_archive::archive_directories_to_file_with_plan;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let metadata_dir = tmp.path().join("writer").join("metadata");
+        let data_dir = tmp.path().join("writer").join("trips");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let (catalog, table, orphans) = table_with_orphan_dvs(&metadata_dir, &data_dir, 3).await;
+
+        let pin = table.pin_for_snapshot().await;
+        let mut sweep = tokio::spawn({
+            let table = Arc::clone(&table);
+            async move { table.drain_orphan_dv_sweep(1).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut sweep)
+                .await
+                .is_err(),
+            "the sweep must wait for the snapshot pin"
+        );
+
+        let dirs = vec![
+            (metadata_dir, "metadata/".to_string()),
+            (data_dir.clone(), "data/".to_string()),
+        ];
+        let plan =
+            CayenneSnapshotEngine::new(catalog as Arc<dyn MetadataCatalog>, "trips", data_dir)
+                .prepare_directory_snapshot(&dirs, "trips")
+                .await
+                .expect("prepare");
+        let skip: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
+        let extras: Vec<(String, Vec<u8>)> = plan
+            .extra_entries
+            .into_iter()
+            .map(|e| (e.archive_path, e.bytes))
+            .collect();
+        let tar = tmp.path().join("snapshot.tar");
+        archive_directories_to_file_with_plan(&dirs, &tar, &skip, &extras)
+            .await
+            .expect("archive");
+        assert!(orphans.iter().all(|path| path.exists()));
+
+        drop(pin);
+        tokio::time::timeout(std::time::Duration::from_secs(30), sweep)
+            .await
+            .expect("the sweep resumes once the pin drops")
+            .expect("sweep task");
+        assert!(orphans.iter().all(|path| !path.exists()));
+
+        let (_, rows) = restore(&tar, &tmp.path().join("reader")).await;
+        assert_eq!(rows, 1, "the archive restores the table");
+    }
+
+    /// The runtime's snapshot attempt pins the Cayenne table it snapshots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_attempt_pins_the_cayenne_table() {
+        use async_trait::async_trait;
+        use datafusion::common::TableReference;
+        use datafusion::datasource::TableProvider;
+        use runtime_acceleration::dataset_checkpoint::{DatasetCheckpointer, Result};
+        use runtime_acceleration::snapshot::ForceCreate;
+
+        /// Starts the orphaned-DV sweep from inside the attempt and records
+        /// whether it finished while the attempt ran.
+        struct ProbeCheckpointer {
+            table: Arc<cayenne::CayenneTableProvider>,
+            probe: std::sync::Mutex<Option<(bool, tokio::task::JoinHandle<()>)>>,
+        }
+
+        #[async_trait]
+        impl DatasetCheckpointer for ProbeCheckpointer {
+            async fn exists(&self) -> bool {
+                true
+            }
+            async fn checkpoint(&self, _: &arrow_schema::SchemaRef, _: Option<&str>) -> Result<()> {
+                let table = Arc::clone(&self.table);
+                let mut sweep = tokio::spawn(async move { table.drain_orphan_dv_sweep(1).await });
+                let finished =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), &mut sweep)
+                        .await
+                        .is_ok();
+                *self.probe.lock().expect("probe") = Some((finished, sweep));
+                Ok(())
+            }
+            async fn get_schema(&self) -> Result<Option<arrow_schema::SchemaRef>> {
+                Ok(None)
+            }
+            async fn last_checkpoint_time(&self) -> Result<Option<std::time::SystemTime>> {
+                Ok(None)
+            }
+            async fn get_refresh_sql(&self) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn set_schema(&self, _: &arrow_schema::SchemaRef) -> Result<()> {
+                Ok(())
+            }
+            async fn delete(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let metadata_dir = tmp.path().join("metadata");
+        let data_dir = tmp.path().join("trips");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let (_catalog, table, orphans) = table_with_orphan_dvs(&metadata_dir, &data_dir, 3).await;
+
+        let probe = Arc::new(ProbeCheckpointer {
+            table: Arc::clone(&table),
+            probe: std::sync::Mutex::new(None),
+        });
+        let checkpointer: Arc<dyn DatasetCheckpointer> = Arc::clone(&probe) as _;
+        let accelerator: Arc<dyn TableProvider> = table;
+        runtime_table::accelerated::snapshots::create_checkpoint_and_snapshot(
+            &checkpointer,
+            None,
+            &schema(),
+            &Arc::new(tokio::sync::Mutex::new(())),
+            &TableReference::bare("trips"),
+            &Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            ForceCreate(false),
+            Some(&accelerator),
+            None,
+            None,
+        )
+        .await;
+
+        let (finished, sweep) = probe
+            .probe
+            .lock()
+            .expect("probe")
+            .take()
+            .expect("the attempt ran");
+        assert!(
+            !finished,
+            "the sweep must wait while the snapshot attempt runs"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), sweep)
+            .await
+            .expect("the sweep resumes after the attempt")
+            .expect("sweep task");
+        assert!(orphans.iter().all(|path| !path.exists()));
     }
 }

@@ -15,6 +15,7 @@ use crate::accelerated::caching::is_reserved_caching_column;
 use crate::accelerated::refresh::Refresh;
 use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshCompletionOutcome};
 use arrow_schema::{FieldRef, Schema, SchemaRef};
+use cayenne::CayenneTableProvider;
 use data_accelerator_api::DataAccelerator;
 use data_accelerator_api::ReloadProviderFactory;
 use data_accelerator_api::swappable::SwappableTableProvider;
@@ -30,6 +31,7 @@ use runtime_acceleration::snapshot::{
 use runtime_async::is_shutdown_cancellation;
 use runtime_status::{RuntimeStatus, WaitOutcome};
 use snafu::{ResultExt, Snafu};
+use spice_table::{LayerWalk, find_concrete};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -619,6 +621,14 @@ async fn create_checkpoint_and_snapshot_once(
     federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
 ) -> Result<(), SnapshotAttemptError> {
+    // Keeps Cayenne maintenance from deleting files until the archive is written.
+    // Taken before the write lock, so writers never wait on a sweep batch.
+    let cayenne_pin = match accelerator
+        .and_then(|a| find_concrete::<CayenneTableProvider>(a.as_ref(), LayerWalk::Write))
+    {
+        Some(table) => Some(table.pin_for_snapshot().await),
+        None => None,
+    };
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
     // the accelerator and the federated (source) schema are available, so an
@@ -657,7 +667,7 @@ async fn create_checkpoint_and_snapshot_once(
     snapshot_manager
         .create_snapshot(
             checkpoint_schema,
-            lock_guard,
+            (lock_guard, cayenne_pin),
             updated_at,
             row_count,
             force_create,

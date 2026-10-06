@@ -46,7 +46,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::OwnedMutexGuard;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -1701,7 +1700,8 @@ impl SnapshotManager {
     ///
     /// # Arguments
     /// * `schema` - The schema of the dataset.
-    /// * `lock_guard` - Lock guard protecting accelerator writes during snapshot.
+    /// * `lock_guard` - Guards held until the acceleration is copied or archived, such as
+    ///   the accelerator write lock.
     /// * `last_updated_at` - Optional timestamp (ms since epoch) of the last `insert_into`.
     /// * `row_count` - Optional number of rows in the accelerated dataset at snapshot time.
     ///
@@ -1717,7 +1717,7 @@ impl SnapshotManager {
     pub async fn create_snapshot(
         &self,
         schema: &SchemaRef,
-        lock_guard: OwnedMutexGuard<()>,
+        lock_guard: impl Send,
         last_updated_at: Option<i64>,
         row_count: Option<u64>,
         force_create: ForceCreate,
@@ -1751,7 +1751,7 @@ impl SnapshotManager {
     async fn create_snapshot_as_writer(
         &self,
         schema: &SchemaRef,
-        lock_guard: OwnedMutexGuard<()>,
+        lock_guard: impl Send,
         last_updated_at: Option<i64>,
         row_count: Option<u64>,
         force_create: ForceCreate,
@@ -1872,7 +1872,7 @@ impl SnapshotManager {
         &self,
         source_local_path: &PathBuf,
         destination_location: &ObjectPath,
-        lock_guard: OwnedMutexGuard<()>,
+        lock_guard: impl Send,
     ) -> Result<(u64, String), SnapshotUploadError> {
         // Every engine hook below opens the accelerator file as a database, and each
         // driver's open CREATES one at a path that has none — so an absent file would be
@@ -1956,7 +1956,7 @@ impl SnapshotManager {
         &self,
         dirs: &[(PathBuf, String)],
         destination_location: &ObjectPath,
-        lock_guard: OwnedMutexGuard<()>,
+        lock_guard: impl Send,
     ) -> Result<(u64, String), SnapshotUploadError> {
         use crate::snapshot::directory_archive::archive_directories_to_file_with_plan;
 
