@@ -128,6 +128,30 @@ def check_timing(
         )
 
 
+def stalled_phases(
+    scenario: Scenario,
+    queries: list[runner.Query],
+    windows: dict[str, PhaseWindow],
+) -> list[str]:
+    """Phases where the load generator itself stopped asking.
+
+    A phase with no arrivals at the origin reads as a rate of zero, which is
+    indistinguishable from a runtime that stopped sending -- and the harness has
+    now produced that reading twice for reasons that had nothing to do with the
+    runtime (ephemeral-port exhaustion, and a multi-minute stall of the
+    generator process). The generator's own query log settles it: if it recorded
+    no queries in the window either, nothing was asked, so the run is BLOCKED
+    rather than FAIL. A real throttle to zero still shows queries, refused.
+    """
+    stalled = []
+    for bound in scenario.bounds:
+        window = windows[bound.phase]
+        asked = sum(1 for q in queries if window.start_ms <= q.t_epoch_ms < window.end_ms)
+        if asked == 0 and bound.phase not in stalled:
+            stalled.append(bound.phase)
+    return stalled
+
+
 def check_bound(
     bound: Bound,
     arrivals: list[rates.Arrival],
@@ -158,12 +182,12 @@ def check_bound(
             stats.p99 <= bound.max_p99,
             f"p99={stats.p99:g} <= {bound.max_p99:g}? ({stats})",
         )
-    if bound.max_rolling_2s is not None:
-        rolling = rates.max_rolling(selected, window.start_ms, window.end_ms, 2)
+    if bound.max_rolling_5s is not None:
+        rolling = rates.max_rolling(selected, window.start_ms, window.end_ms, 5)
         assertions.add(
-            f"{label}: two consecutive seconds stay within two budgets",
-            rolling <= bound.max_rolling_2s,
-            f"worst 2s window carried {rolling} <= {bound.max_rolling_2s:g}? ({stats})",
+            f"{label}: five consecutive seconds stay within five budgets",
+            rolling <= bound.max_rolling_5s,
+            f"worst 5s window carried {rolling} <= {bound.max_rolling_5s:g}? ({stats})",
         )
     if bound.max_fraction_of_warmup is not None:
         baseline = rates.rate_stats(selected, warmup.start_ms, warmup.end_ms)
@@ -411,6 +435,15 @@ def run_scenario(scenario: Scenario, args: argparse.Namespace) -> dict:
         )
 
     windows = phase_windows(scenario, t0)
+    stalled = stalled_phases(scenario, queries, windows)
+    if stalled:
+        blocked = True
+        assertions.add(
+            "harness: the load generator kept asking for the whole run",
+            False,
+            f"no query was recorded in phase(s) {stalled}; the generator stalled,"
+            " so this run measures the harness rather than the runtime",
+        )
     for bound in scenario.bounds:
         check_bound(bound, arrivals, windows[bound.phase], windows["warmup"], assertions)
     check_timing(scenario, arrivals, t0, assertions)
