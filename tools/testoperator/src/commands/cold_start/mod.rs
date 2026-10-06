@@ -409,7 +409,12 @@ fn counter(value: Option<f64>) -> u64 {
 
 fn median(mut values: Vec<u64>) -> u64 {
     values.sort_unstable();
-    values.get(values.len() / 2).copied().unwrap_or_default()
+    let mid = values.len() / 2;
+    match values.len() {
+        0 => 0,
+        len if len % 2 == 0 => values[mid - 1].midpoint(values[mid]),
+        _ => values[mid],
+    }
 }
 
 fn markdown_summary(results: &ColdStartResults) -> String {
@@ -595,6 +600,14 @@ cayenne_compaction_outcome_total{kind="subset_current",outcome="committed",table
             Some(&binary(&[2_000, 2_100, 1_900], 0, 10)),
         );
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn median_averages_the_middle_pair_of_an_even_count() {
+        assert_eq!(median(vec![3_000, 1_000]), 2_000);
+        assert_eq!(median(vec![1_000, 3_000, 2_000]), 2_000);
+        assert_eq!(median(vec![4, 1, 3, 2]), 2);
+        assert_eq!(median(Vec::new()), 0);
     }
 
     #[test]
