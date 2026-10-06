@@ -5580,7 +5580,7 @@ mod tests {
         fn provider(ctx: &SessionContext, store: &Arc<MatrixStore>) -> LocationPruningListingTable {
             let store_url = Url::parse("s3://bucket").expect("store url");
             ctx.runtime_env()
-                .register_object_store(&store_url, Arc::clone(&store) as Arc<dyn ObjectStore>);
+                .register_object_store(&store_url, Arc::clone(store) as Arc<dyn ObjectStore>);
 
             let table_path = ListingTableUrl::parse("s3://bucket/prefix/").expect("listing url");
             let file_schema = Arc::new(Schema::new(vec![Field::new(
@@ -5605,7 +5605,7 @@ mod tests {
             .expect("listing table");
             LocationPruningListingTable::new(
                 Arc::new(listing),
-                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                Arc::clone(store) as Arc<dyn ObjectStore>,
                 table_path,
                 file_schema,
                 ".csv",
