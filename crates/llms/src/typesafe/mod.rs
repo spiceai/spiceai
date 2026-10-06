@@ -24,6 +24,7 @@ limitations under the License.
 //! <https://typesafe.ai/blog/introducing-system-one-models-and-jev>.
 
 mod list_models;
+mod rerank;
 
 use list_models::ModelsResponse;
 pub use list_models::TypeSafeModelLister;
