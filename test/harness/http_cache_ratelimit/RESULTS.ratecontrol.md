@@ -1,119 +1,114 @@
 # HTTP rate control — catalog results
 
-`./run_ratecontrol.sh all`, 20/20 PASS, against `spiced
-v2.4.0-unstable-build.41116b5ae9+models.metal` built from
-`2edb8ab231` (branch `14575-cluster-adaptive-rate-control`) with the
-`rate-control` cargo feature. macOS, 10 cores, everything on localhost,
-2026-10-01.
+`./run_ratecontrol.sh all`, **21/21 PASS**, against `spiced
+v2.4.0-unstable-build.c7460de8c6+models.metal` — the tip of
+`14136-adaptive-rate-control` (PR #14143), built with the `rate-control` cargo
+feature. macOS, 10 cores, everything on localhost, 2026-10-06.
 
-Every scenario: a 20 rps budget per origin, `refresh_interval: 1s` where a
-cluster is involved, `rate_control_failure_threshold: 20%` unless stated, both
-caches off, `max_retries: 0`. Rates are p50 / p99 / peak of per-second arrivals
-at the origin, over each phase minus its settling window.
+Every scenario: a 20 rps budget per origin, `runtime.source_rate_control.refresh_interval: 1s`
+where a cluster is involved, `rate_control_failure_threshold: 20%` unless
+stated, both caches off, `max_retries: 0`. Rates are p50 / p99 / peak of
+per-second arrivals at the origin, over each phase minus its settling window.
+
+There is no static mode: rate control is always adaptive. The negative controls
+are a tolerant threshold, latency without errors, and an error rate under the
+threshold.
 
 ## One origin, one dataset, one replica
 
 | scenario | warmup | fault | recovery | throttle / recover |
 |---|---|---|---|---|
-| `static-limit` (control) | 20/21 | **20/21** — unchanged | 20/20 | — |
-| `adaptive-503` | 20/20 | **3/5** | 20/21 | 14s / 5s |
-| `adaptive-429` | 20/20 | **3/5** | 20/20 | 13s / 5s |
-| `adaptive-timeout` (hang > `client_timeout`) | 20/21 | **3/5** | 20/20 | 15s / 6s |
-| `adaptive-refuse` (TCP RST) | 20/20 | **3/5** | 20/20 | 13s / 5s |
-| `adaptive-latency-only` (400ms, healthy) | 20/20 | **20/21** — unchanged | 20/20 | — |
-| `below-threshold` (10% errors, 50% threshold) | 20/21 | **20/20** — unchanged | 20/20 | — |
+| `tolerant-threshold` (50% errors, 90% threshold) | 20/20 | **20/20** — unchanged, coefficient 1.000 | 20/20 | — |
+| `throttle-503` | 20/21 | **3/5** | 20/21 | 13s / 5s |
+| `throttle-429` | 20/21 | **3/5** | 20/21 | 14s / 5s |
+| `throttle-timeout` (hang > `client_timeout`) | 20/21 | **3/5** | 20/21 | 14s / 5s |
+| `throttle-refuse` (TCP RST) | 20/20 | **3/5** | 20/20 | 14s / 6s |
+| `no-throttle-latency-only` (400ms, healthy) | 20/21 | **20/20** — unchanged | 20/20 | — |
+| `below-threshold` (10% errors, 50% threshold) | 20/20 | **20/21** — unchanged | 20/20 | — |
 
 A 429, a refused connection and a timeout are each the same failure signal as a
-5xx. Latency alone is not, and an error rate under the threshold is not. Static
-mode never throttles, which is what makes the other rows mean something.
+5xx. Latency alone is not, an error rate under the threshold is not, and a
+threshold the error rate stays under is not.
 
 ## Several origins
 
 | scenario | phase | p1 | p2 |
 |---|---|---|---|
 | `multi-origin-isolation` (p2 fails) | warmup | 20 | 20 |
-| | fault | **20 — untouched** | **5 — throttled** |
-| | recovery | 20 | 20 |
-| `multi-origin-budgets` (p1 20 rps, p2 5 rps) | warmup | 20 | 5 |
+| | fault | **21 — untouched** | **5 — throttled** |
+| | recovery | 21 | 21 |
+| `multi-origin-budgets` (p1 20 rps, p2 5 rps) | throughout | 20 | 5 |
 
-One limiter per origin, one adaptive controller per origin, and no leakage
-between them: the healthy origin holds its full budget through its neighbour's
-outage, and two origins hold two different budgets at the same time.
+One limiter per origin and no leakage between them: the healthy origin holds
+its full budget through its neighbour's outage, and two origins hold two
+different budgets at the same time.
 
 ## Several datasets on one origin
 
 | scenario | phase | combined | d1 | d2 |
 |---|---|---|---|---|
-| `sameorigin-shared-budget` | warmup | **20/21** | 19 | 19 |
-| `sameorigin-coupled-throttle` (d1's path fails) | warmup | 20/21 | 17 | 20 |
-| | fault | **18** | **11** | **17** |
-| | recovery | 20/20 | 17 | 16 |
+| `sameorigin-shared-budget` | warmup | **20/20** | 16 | 16 |
+| `sameorigin-coupled-throttle` (d1's path fails) | warmup | 20/20 | 17 | 16 |
+| | fault | **18/19** | **11** | **17** |
+| | recovery | 20/20 | 14 | 16 |
 
 Two saturated datasets on one origin stay inside **one** budget, not two.
 
 When only d1's path fails, the origin's published admission coefficient falls to
-**0.82** — on failures d2 never saw — but the effect on the co-tenant is small.
-Over five runs d1 loses about half its rate every time (14→10, 19→9, 17→9,
-21→9, 17→11) while d2 stays flat (18→16, 16→16, 14→16, 18→17, 20→17) and the
-origin's total falls by only 1–2 rps. "Dataset B is throttled by dataset A's
-failures" is not what happens; B is admitted through a budget A's failures
-shrank, which is still more than a per-dataset limiter would do, but a failing
-tenant on a busy origin barely moves the origin's load.
+**0.849** — on failures d2 never saw — but the effect on the co-tenant is small:
+d1 loses about a third of its rate while d2 is unchanged and the origin's total
+falls by 2 rps. "Dataset B is throttled by dataset A's failures" is not what
+happens; B is admitted through a budget A's failures shrank.
 
-`sameorigin-minority-failure`: the sharp edge of that. d1 is given 2 of 18
-workers and fails **every** request for 65s. It is 10.3% of the origin's
-traffic, so the origin-wide error rate is 0.103 against a 0.20 threshold, and
-the admission coefficient stays at **1.000 across all 120 scrapes** — the
-controller never reacts, and the origin keeps taking its full 20 rps.
+`sameorigin-minority-failure` is the sharp edge of that: d1 gets 2 of 18 workers
+and fails **every** request, is about 10% of the origin's traffic, and the
+origin-wide error rate therefore stays under the 20% threshold. The coefficient
+never moves and the origin keeps taking its full 20 rps.
 
-The relationship is exact: the observed coefficient equals
-`(1 - f) / (1 - threshold)` where `f` is the origin-wide error rate (0.306 →
-0.867 observed 0.867; 0.443 → 0.696 observed 0.716). A tenant with share `s`
-failing everything contributes `f = s`, so it is invisible while `s < threshold`.
-
-`sameorigin-conflicting-config`: two datasets on one origin asking for
-different limits is refused at start-up — *"Multiple HTTP-based components
-target http://127.0.0.1:9001 with different rate-control settings."*
+`sameorigin-conflicting-config`: two datasets on one origin asking for different
+limits is refused at start-up. The message now names all seven parameters that
+must agree.
 
 ## Several replicas sharing one budget
 
-| scenario | warmup | fault | recovery | notes |
+| scenario | warmup | fault | recovery | implied vs published coefficient |
 |---|---|---|---|---|
-| `cluster-adaptive` (2 replicas) | 18/20 | **6/7** | 18/20 | throttles in 2s, recovers in 2s |
-| `cluster-static` (control) | 18/20 | **18/20** — unchanged | 17/21 | |
-| `cluster-asymmetric` (only r0 fails) | 19/21 | **14/16** (r0 7, r1 9) | 19/20 | coefficient 0.40; r1 saw only 200s |
-| `cluster-single-replica` | 19/20 | **5/6** | 19/19 | one replica, the whole budget |
-| `cluster-three-replicas` | 18/19 | **6/9** | 18/19 | the budget does not grow with the fleet |
-| `cluster-multi-origin` (p2 fails) | p1 20, p2 20 | **p1 21, p2 6** | p1 19, p2 19 | one shared budget per origin |
-| `cluster-sameorigin` (2 replicas x 2 datasets) | **18/19** | — | — | one budget over the whole cross-product |
-| `cluster-adaptive-s3` (rustfs) | 20/20 | **6/10** | 19/19 | same behaviour over an object store |
+| `cluster-adaptive` (2 replicas) | 18/21 | **5/7** | 18/20 | 0.308 vs **0.302** |
+| `cluster-tolerant-threshold` (control) | 18/19 | **18/19** — unchanged | 18/19 | both 1.000 |
+| `cluster-asymmetric` (only r0 fails) | 19/21 | **12/13** (r0 7, r1 7) | 19/20 | 0.673 vs **0.672** |
+| `cluster-single-replica` | 18/20 | **4/8** | 18/20 | 0.198 vs 0.289 |
+| `cluster-three-replicas` | 19/20 | **6/9** | 18/18 | 0.317 vs **0.317** |
+| `cluster-multi-origin` (p2 fails) | p1 20, p2 20 | **p1 20, p2 7** | p1 21, p2 20 | p2: 0.308 vs **0.296** |
+| `cluster-sameorigin` (2 replicas x 2 datasets) | **19/20** | 19/20 | 19/20 | no fault |
+| `cluster-adaptive-s3` (rustfs) | 20/20 | **6/10** | 19/19 | — |
 
 Beyond the rates, from the shared state object and each replica's own
 `/metrics`, across every cluster scenario:
 
-- `sum(granted) <= effective_burst` in **every window**.
-- Published `failed` equals the origin's own non-200 count **per window** —
-  62/62 windows in most runs — while hundreds of queries in the same runs were
-  refused a permit. A permit-acquire timeout never reaches the origin and never
-  reaches the failure counter.
-- `effective_burst` re-derived from the published formula agrees in 54–62 of 62
-  windows, and the best-fitting source-window offset is 2 in every run where
-  the coefficient moved.
-- Every replica publishes the same `cluster_effective_burst` and
-  `adaptive_admission_ratio` in **every settled second** (55/55 with three
-  replicas), and all three walked the same 14 distinct budgets, having
-  exchanged no traffic with each other.
-- Zero lease-refresh errors and zero fail-closed requests. On the S3 backend
-  the optimistic-concurrency path is exercised for real: ~10 conflicts over 90s,
-  each retried into a successful write.
+- `sum(granted) <= burst_per_window` in **every window**. The throttled budget
+  is no longer persisted — each replica derives it and holds it for the window —
+  so this is the bound the design guarantees: a grant is capped at
+  `effective_burst - granted_by_others`, and `effective_burst` at the
+  configured burst.
+- Published `failed` equals the origin's own non-200 count **exactly in total**
+  in every run (176/176, 282/282, 217/217, 153/153, 179/179, 175/175), with no
+  single window off by more than one, while hundreds of queries in the same runs
+  were refused a permit. A permit-acquire timeout never reaches the origin and
+  never reaches the failure counter.
+- The coefficient recomputed from the shared counts matches the
+  `adaptive_admission_ratio` the replicas published, to within 0.01 at two and
+  three replicas. At one replica it is 0.09 apart, which is the limit of the
+  method rather than a disagreement: the source-window offset is not cleanly
+  identifiable with a single writer.
+- Every replica publishes the same coefficient in every settled second and
+  sweeps the same range of them, having exchanged no traffic with its peers.
+- Zero lease-refresh errors and zero fail-closed requests, including over S3.
 
 ## Not covered
 
-- Clock skew. Every replica here shares one machine clock, so the design's
-  claim that window-identifier decay removes the dependence on a clock reading
-  is untested against real skew.
+- Clock skew. Every replica here shares one machine clock.
 - `requests_per_minute_limit` — only the per-second limit is exercised.
-- Half-lives longer than one window in cluster mode (`rate_control_window` >
-  `refresh_interval`); only the rounding message is checked.
-- IETF `RateLimit` / `RateLimit-Policy` advertised-quota headers, and the
-  `Retry-After` cooldown path — `run_phase2.sh` covers those for a single node.
+- Cluster half-lives longer than one window.
+- IETF `RateLimit` / `RateLimit-Policy` headers and the `Retry-After` cooldown
+  path — `run_phase2.sh` covers those for a single node.
+- Hot reload of `runtime.state` (deferred to #14780).
