@@ -273,25 +273,25 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
 
 /// Scan the federated source for a zero-results fallback.
 ///
-/// When `keep_filters` is empty the source is scanned with the caller's
-/// projection and query filters only. When retention has an inverse, the
-/// source is scanned unprojected so the keep predicate can see columns the
-/// caller did not ask for, and every filter is re-applied as a residual so a
-/// source that cannot push the keep predicate down still cannot resurrect
-/// evicted rows.
+/// Query filters are always re-applied as residuals so a source that cannot
+/// push them down still cannot return rows the query excluded. When retention
+/// has an inverse, the source is scanned unprojected so the keep predicate can
+/// see columns the caller did not ask for, and those keep filters are residuals
+/// too. The result is cast to the accelerated input schema so a projection that
+/// omitted a filter column still matches the caller's output.
 async fn scan_fallback_plan(
     federated_provider: &dyn TableProvider,
     scan_params: TableScanParams,
     keep_filters: &[datafusion::logical_expr::Expr],
     output_schema: SchemaRef,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    if keep_filters.is_empty() {
-        return scan_params.scan_and_optimize(federated_provider, &[]).await;
-    }
-
-    let fallback_scan_params = scan_params
-        .without_projection()
-        .with_additional_filters(keep_filters);
+    let fallback_scan_params = if keep_filters.is_empty() {
+        scan_params
+    } else {
+        scan_params
+            .without_projection()
+            .with_additional_filters(keep_filters)
+    };
     let residual = fallback_scan_params.filters.clone();
     let plan = fallback_scan_params
         .scan_and_optimize(federated_provider, &residual)
@@ -582,9 +582,10 @@ mod tests {
             .expect("source batch")
         }
 
-        fn empty_memory_exec() -> Arc<dyn ExecutionPlan> {
+        fn empty_memory_exec(projection: Option<Vec<usize>>) -> Arc<dyn ExecutionPlan> {
             Arc::new(DataSourceExec::new(Arc::new(
-                MemorySourceConfig::try_new(&[vec![]], events_schema(), None).expect("empty exec"),
+                MemorySourceConfig::try_new(&[vec![]], events_schema(), projection)
+                    .expect("empty exec"),
             )))
         }
 
@@ -595,35 +596,7 @@ mod tests {
             )
         }
 
-        async fn collect_ids(
-            keep_filters: Vec<datafusion::logical_expr::Expr>,
-            query_filters: Vec<datafusion::logical_expr::Expr>,
-        ) -> Vec<i64> {
-            collect_projected_ids(keep_filters, query_filters, None).await
-        }
-
-        async fn collect_projected_ids(
-            keep_filters: Vec<datafusion::logical_expr::Expr>,
-            query_filters: Vec<datafusion::logical_expr::Expr>,
-            projection: Option<Vec<usize>>,
-        ) -> Vec<i64> {
-            let ctx = SessionContext::new();
-            let exec = FallbackOnZeroResultsScanExec::new(
-                TableReference::bare("events"),
-                empty_memory_exec(),
-                create_fallback_provider(source_table()),
-                TableScanParams {
-                    state: Arc::new(ctx.state()),
-                    projection,
-                    filters: query_filters,
-                    limit: None,
-                },
-                keep_filters,
-            );
-            let stream = exec.execute(0, ctx.task_ctx()).expect("stream");
-            let batches = datafusion::physical_plan::common::collect(stream)
-                .await
-                .expect("collect");
+        fn batch_ids(batches: &[RecordBatch]) -> Vec<i64> {
             batches
                 .iter()
                 .flat_map(|batch| {
@@ -639,12 +612,63 @@ mod tests {
                 .collect()
         }
 
+        fn batch_names(batches: &[RecordBatch], column: usize) -> Vec<String> {
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(column)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("name")
+                        .iter()
+                        .map(|value| value.expect("name is non-null").to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+
+        async fn collect_fallback(
+            keep_filters: Vec<datafusion::logical_expr::Expr>,
+            query_filters: Vec<datafusion::logical_expr::Expr>,
+            projection: Option<Vec<usize>>,
+        ) -> (SchemaRef, Vec<RecordBatch>) {
+            let ctx = SessionContext::new();
+            let exec = FallbackOnZeroResultsScanExec::new(
+                TableReference::bare("events"),
+                empty_memory_exec(projection.clone()),
+                create_fallback_provider(source_table()),
+                TableScanParams {
+                    state: Arc::new(ctx.state()),
+                    projection,
+                    filters: query_filters,
+                    limit: None,
+                },
+                keep_filters,
+            );
+            let schema = exec.schema();
+            let stream = exec.execute(0, ctx.task_ctx()).expect("stream");
+            let batches = datafusion::physical_plan::common::collect(stream)
+                .await
+                .expect("collect");
+            (schema, batches)
+        }
+
+        async fn collect_ids(
+            keep_filters: Vec<datafusion::logical_expr::Expr>,
+            query_filters: Vec<datafusion::logical_expr::Expr>,
+        ) -> Vec<i64> {
+            let (_schema, batches) = collect_fallback(keep_filters, query_filters, None).await;
+            batch_ids(&batches)
+        }
+
         #[tokio::test]
         async fn empty_keep_returns_the_source_row() {
             let ids = collect_ids(vec![], vec![col("id").eq(lit(2i64))]).await;
-            assert!(
-                ids.contains(&2),
-                "without a retention inverse the source still serves the soft-deleted row, got {ids:?}"
+            assert_eq!(
+                ids,
+                vec![2],
+                "without a retention inverse the source still serves the soft-deleted row"
             );
         }
 
@@ -673,14 +697,35 @@ mod tests {
         #[tokio::test]
         async fn keep_filter_hides_deleted_row_when_deleted_is_not_projected() {
             let keep = keep_expr_for_retention_delete(col("deleted").eq(lit(true)));
-            let ids =
-                collect_projected_ids(vec![keep], vec![col("id").eq(lit(2i64))], Some(vec![0]))
-                    .await;
+            let (schema, batches) =
+                collect_fallback(vec![keep], vec![col("id").eq(lit(2i64))], Some(vec![0])).await;
+            assert_eq!(schema.fields().len(), 1);
+            assert_eq!(schema.field(0).name(), "id");
+            assert_eq!(schema.field(0).data_type(), &DataType::Int64);
             assert_eq!(
-                ids,
+                batch_ids(&batches),
                 Vec::<i64>::new(),
                 "projecting away `deleted` must not resurrect the evicted row"
             );
+        }
+
+        #[tokio::test]
+        async fn projected_fallback_keeps_schema_and_values_for_retained_row() {
+            let keep = keep_expr_for_retention_delete(col("deleted").eq(lit(true)));
+            let (schema, batches) =
+                collect_fallback(vec![keep], vec![col("id").eq(lit(3i64))], Some(vec![0, 1])).await;
+            assert_eq!(
+                schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>(),
+                vec!["id", "name"]
+            );
+            assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+            assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+            assert_eq!(batch_ids(&batches), vec![3]);
+            assert_eq!(batch_names(&batches, 1), vec!["also".to_string()]);
         }
     }
 }
