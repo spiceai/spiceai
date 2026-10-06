@@ -1620,10 +1620,8 @@ impl LookupIndexState {
         }
         if loaded > 0 {
             // A file counts as covered once every key's runs hold it.
-            let covered = self
-                .coverage()
-                .and_then(|keys| keys.iter().map(|&(_, covered, _)| covered).min())
-                .unwrap_or(0);
+            let view = self.published();
+            let covered = live.iter().filter(|file| view.covers(file)).count();
             tracing::info!(
                 table = %self.table_name,
                 "{}",

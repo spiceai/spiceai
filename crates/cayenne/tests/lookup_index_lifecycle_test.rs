@@ -46,6 +46,7 @@ use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
+use tracing::instrument::WithSubscriber;
 
 const KEY: [&str; 2] = ["TenantId", "ServiceId"];
 const MIB: usize = 1024 * 1024;
@@ -1020,6 +1021,94 @@ async fn failed_unregistration_keeps_a_removed_index_run_file() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_unregistration_keeps_an_unreadable_index_run_file() {
     failed_unregistration_retains_run_file(true).await;
+}
+
+/// The load message counts the intersection of coverage across index keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reopened_disjoint_index_runs_report_no_fully_covered_files() {
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "disjoint_persisted_runs";
+    let indexes: &[&[&str]] = &[&["AutoId"], &KEY];
+    let config = || VortexConfig {
+        target_vortex_file_size_mb: 1,
+        ..VortexConfig::default()
+    };
+    let table = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        indexes,
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    overwrite(&table, vec![rows(0, 20_000)]).await;
+    wait_for_persisted_runs(&fixture, name, 2).await;
+    let first = registered_runs(&fixture, name).await;
+    assert_eq!(first.len(), 2);
+    insert(&table, name, rows(20_000, 3_000)).await;
+    wait_for_persisted_runs(&fixture, name, 4).await;
+    let all = registered_runs(&fixture, name).await;
+    assert_eq!(all.len(), 4);
+    let remove_first = &first[0];
+    let remove_second = all
+        .iter()
+        .find(|run| {
+            run.index_key != remove_first.index_key
+                && !first
+                    .iter()
+                    .any(|old| old.index_key == run.index_key && old.run_name == run.run_name)
+        })
+        .expect("other key's second write run");
+    drop(table);
+    for run in [remove_first, remove_second] {
+        fixture
+            .catalog
+            .remove_index_run(&run.table_id, &run.index_key, &run.run_name)
+            .await
+            .expect("omit a persisted run");
+    }
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Capture(Arc::clone(&captured));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || writer.clone())
+        .finish();
+    let reopened = open_configured(
+        &fixture,
+        env,
+        name,
+        indexes,
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .with_subscriber(subscriber)
+    .await;
+    let output =
+        String::from_utf8(captured.lock().expect("captured log").clone()).expect("UTF-8 log");
+    println!("reopened coverage log: {output}");
+    assert!(output.contains("covering 0 of its 4 files"), "{output}");
+    lookup(&reopened, name, 7).await;
+    lookup(&reopened, name, 20_007).await;
 }
 
 /// With persisted runs, a reopened table loads its index runs instead of reading
