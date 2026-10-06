@@ -106,11 +106,9 @@ async fn change_sink_drain_joins_producer_and_retains_accepted_write() {
         let mut cancelled_waiter = Box::pin(table.drain_changes());
         assert!(futures::poll!(cancelled_waiter.as_mut()).is_pending());
         drop(cancelled_waiter);
-        assert!(
-            tokio::time::timeout(Duration::ZERO, table.drain_changes())
-                .await
-                .is_err()
-        );
+        tokio::time::timeout(Duration::ZERO, table.drain_changes())
+            .await
+            .expect_err("drain remains pending");
         assert!(
             cancelled.await.is_err(),
             "the producer future must be destroyed"

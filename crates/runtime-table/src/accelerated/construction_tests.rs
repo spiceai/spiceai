@@ -123,7 +123,9 @@ async fn prepared_child_is_not_published_after_parent_closes() {
             .await
             .expect("child snapshot");
         let drain = parent.begin_changes_drain();
-        assert!(prepared.publish().is_err());
+        prepared
+            .publish()
+            .expect_err("a draining parent refuses new children");
         assert!(parent.synchronized_children().read().await.is_empty());
         drain.wait().await.expect("parent drain");
         child.drain_changes().await.expect("child drain");

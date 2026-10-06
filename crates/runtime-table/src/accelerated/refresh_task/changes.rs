@@ -1155,127 +1155,6 @@ impl RefreshTask {
         .await
     }
 
-    /// Apply a single coalesced burst of CDC items drained from the prefetch
-    /// channel. Splits the burst into contiguous runs of `Ok` envelopes
-    /// (which can be coalesced into one accelerator write) and `Err` items
-    /// (handled one-by-one as today). Within an `Ok` run we concatenate the
-    /// underlying `RecordBatch`es into a single `ChangeBatch` and call
-    /// `write_change` once — turning N small writes into one larger write
-    /// and amortizing the per-envelope `SessionContext` + `insert_into`
-    /// planning cost. After a successful write we append the run's committers
-    /// to the ordered background commit chain so source acknowledgements stay
-    /// monotonic without blocking catch-up apply work.
-    #[cfg(test)]
-    async fn apply_burst(
-        &self,
-        context: &mut ApplyContext<'_>,
-        burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
-        close_reason: &'static str,
-    ) -> bool {
-        let burst_start = Instant::now();
-        let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
-        let burst_bytes = burst
-            .iter()
-            .map(cdc_item_budget_bytes)
-            .fold(0_usize, usize::saturating_add);
-        let labels = context.metric_labels.dataset();
-        metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, labels);
-        metrics::CDC_APPLY_BURST_BYTES
-            .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), labels);
-        // CDC_APPLY_BURST_ROWS_TOTAL is recorded from the built batches in
-        // `apply_envelope_run` (exact applied-row count) — `num_rows_hint()`
-        // over-counts a PK-changing UPDATE's delete+upsert as two rows.
-
-        // Freshest upstream commit timestamp in this burst, for the CDC
-        // replication-lag gauge. Computed here (before the burst is consumed by the
-        // apply loop below) but RECORDED only after the burst's Ok runs apply
-        // successfully — the gauge reflects APPLIED data, so a failed apply must not
-        // report artificially fresh lag. `source_commit_ts_ms` is stamped by the
-        // source connector (Postgres commit time, MongoDB change-stream cluster
-        // time, Debezium source ts); the max over the burst is the most recent.
-        // Sources that don't stamp a timestamp leave it `None`.
-        let max_commit_ts_ms = burst
-            .iter()
-            .filter_map(|item| item.as_ref().ok())
-            // Exclude heartbeats: a keepalive interleaved in a backlogged burst carries
-            // the server clock, which would inflate the applied frontier + lag gauge
-            // (applied appearing to outrun received). See ChangeBatch::is_heartbeat.
-            .filter(|env| !env.is_heartbeat())
-            .filter_map(cdc::ChangeEnvelope::source_commit_ts_ms)
-            .max();
-        if let Some(ts) = max_commit_ts_ms {
-            metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(ts, labels);
-        }
-
-        // Walk the burst preserving arrival order, processing contiguous
-        // runs of Ok envelopes together and Err items individually so error
-        // handling and ordering semantics match the pre-coalesce behavior.
-        let mut iter = burst.into_iter().peekable();
-        while let Some(item) = iter.next() {
-            match item {
-                Ok(first_env) => {
-                    let mut envelopes = Vec::with_capacity(8);
-                    envelopes.push(first_env);
-                    while let Some(Ok(_)) = iter.peek() {
-                        let Some(Ok(next)) = iter.next() else {
-                            unreachable!("peeked Ok above");
-                        };
-                        envelopes.push(next);
-                    }
-
-                    if !self.apply_envelope_run(context, envelopes).await {
-                        metrics::CDC_APPLY_BURST_DURATION_MS
-                            .record(elapsed_ms(burst_start), labels);
-                        return false;
-                    }
-                }
-                Err(e) => {
-                    // Transient errors (e.g., Kafka poll timeout) keep the
-                    // refresh status healthy; fatal errors flip status to
-                    // Error but we do not abort the loop, matching the
-                    // pre-coalesce contract.
-                    if handle_stream_error(&e, context.dataset_name) == StreamErrorType::Transient {
-                        continue;
-                    }
-
-                    let error_message = format_datafusion_error(&e);
-                    self.set_refresh_status(
-                        context.refresh_sql,
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
-                }
-            }
-        }
-        // Per-burst row count is not logged here: it's the exact
-        // `CDC_APPLY_BURST_ROWS_TOTAL` metric recorded in `apply_envelope_run`
-        // (from the built batches), not the pre-apply `num_rows_hint` upper bound.
-        tracing::debug!(
-            dataset = %context.dataset_name,
-            envelopes = burst_envelopes,
-            bytes = burst_bytes,
-            close_reason,
-            apply_ms = elapsed_ms(burst_start),
-            "Applied coalesced CDC change burst"
-        );
-        metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), labels);
-
-        // Record CDC progress only now that the burst's Ok runs have applied (the
-        // early `return false` above skips it, so a failed apply never reports fresh
-        // progress). The raw applied-commit watermark is emitted whenever the burst
-        // carried a source timestamp; the derived lag additionally needs a readable
-        // wall clock (skipped on pre-epoch / overflow rather than reporting a
-        // misleading 0ms).
-        if let Some(max_commit_ts_ms) = max_commit_ts_ms {
-            metrics::CDC_APPLIED_COMMIT_UNIX_TIME_MS.record(max_commit_ts_ms, labels);
-            if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
-                metrics::CDC_REPLICATION_LAG_MS
-                    .record(now_ms.saturating_sub(max_commit_ts_ms).max(0), labels);
-            }
-        }
-        true
-    }
-
     /// Signal the dataset Ready: flip `initial_load_completed`, wake readiness
     /// waiters, then publish the `Ready` component status — in that order, so a
     /// waiter woken by the completion observes the completed flag. The single
@@ -2122,9 +2001,9 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<
     // The coalesced batch keeps the newest constituent commit timestamp: it rides
     // the batch into the accelerator (`write_cdc_append_stream_with_source_commit_ts`),
     // where it feeds the replication-lag and freshness signals the adaptive tuner's
-    // goals are stated against. Same rule as the burst frontier in `apply_burst`:
-    // the max is the most recent, and zero-row envelopes are excluded because their
-    // timestamp is not evidence that data up to that point was received.
+    // goals are stated against. The max is the most recent, and zero-row envelopes
+    // are excluded because their timestamp is not evidence that data up to that
+    // point was received.
     let source_commit_ts_ms = batches
         .iter()
         .filter(|batch| !batch.is_heartbeat())
@@ -2140,45 +2019,6 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<
                 source: arrow::error::ArrowError::ExternalError(Box::new(e)),
             }
         })
-}
-
-#[cfg(test)]
-fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
-    // A coalescing byte-budget proxy, NOT a true in-memory Arrow size:
-    // `encoded_len` answers WITHOUT forcing a build — a deferred (e.g. Postgres)
-    // envelope from a schema-aware estimate of its buffered wire size, a built
-    // one from its actual Arrow size. Used only to bound how much a single burst
-    // accumulates before applying; the real Arrow build is deferred to apply
-    // time (`into_parts_offloaded_burst`), off the source's shared read path.
-    item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
-}
-
-/// Subtract from the CDC prefetch byte counter without wrapping.
-///
-/// Charge and discharge are meant to be symmetric, but `u64::fetch_sub` past
-/// zero wraps to ~1.8e19, which turns a small accounting slip into a reading no
-/// operator can interpret — and which looks nothing like "slightly wrong". A
-/// gauge that fails should fail toward zero, where the error stays proportional
-/// to the mistake, so saturate rather than wrap.
-#[cfg(test)]
-fn discharge_prefetch_bytes(counter: &AtomicU64, bytes: u64) {
-    let previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(bytes))
-    });
-    // Saturating in release is the right failure mode for a gauge, but it also
-    // HIDES the bug that motivated it: discharging one envelope twice used to
-    // wrap the counter to ~1.8e19, and saturation would instead quietly clamp to
-    // zero and look plausible. Every charge has exactly one discharge, so a
-    // discharge larger than the balance is a real accounting error - fail loudly
-    // where a test can see it, and stay soft where an operator would only see a
-    // gauge.
-    debug_assert!(
-        previous.is_ok_and(|balance| balance >= bytes),
-        "CDC prefetch byte counter underflowed: discharged {bytes} against a balance of \
-         {previous:?}. Each envelope must be discharged exactly once - a carried item \
-         is discharged at the try_recv that removed it, not again when the next \
-         iteration adopts it."
-    );
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
@@ -4576,12 +4416,12 @@ mod tests {
                 .await;
         });
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !observer
+            while observer
                 .queue
                 .lock()
                 .await
                 .back()
-                .is_some_and(|(fence, _)| *fence == 3)
+                .is_none_or(|(fence, _)| *fence != 3)
             {
                 tokio::task::yield_now().await;
             }
@@ -7266,21 +7106,9 @@ mod tests {
         assert_eq!(log.ids().await, vec![1, 2, 3, 4, 5, 6]);
     }
 
-    /// Regression test for the CDC prefetch byte counter.
-    ///
-    /// An envelope pulled from the channel but deferred past the burst byte cap
-    /// is stashed in `carried_item` and adopted by the NEXT iteration. It leaves
-    /// the channel exactly once, at the `try_recv` that removed it, so it must be
-    /// discharged exactly once. Discharging it again when the outer receive
-    /// adopted it drove the counter below zero, and the unsigned wrap made
-    /// `cdc_prefetch_buffer_bytes` report ~1.8e19 for every table with carry-over
-    /// activity - which is how it was found, on a lab run rather than here.
-    ///
-    /// `max_coalesced_bytes: 1` puts every envelope after the first over budget,
-    /// so this drives the carry path on every iteration. The accounting invariant
-    /// is enforced by the `debug_assert!` in `discharge_prefetch_bytes`, which is
-    /// live in test builds: a double discharge panics here rather than saturating
-    /// quietly to zero and looking plausible.
+    /// An envelope deferred past the burst byte cap is carried into the next
+    /// burst. `max_coalesced_bytes: 1` puts every envelope after the first over
+    /// budget, so this drives the carry path on every iteration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn carried_envelopes_are_discharged_from_the_prefetch_counter_exactly_once() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);

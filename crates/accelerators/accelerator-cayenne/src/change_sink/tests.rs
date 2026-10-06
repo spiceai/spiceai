@@ -165,7 +165,7 @@ async fn write_opaque_metadata_preserves_provider_fallback() {
     let target = data_components::metadata_enriched_table_provider(
         Arc::clone(&table) as Arc<dyn TableProvider>,
         std::collections::HashMap::from([("test_marker".into(), "wrapped".into())]),
-        Default::default(),
+        std::collections::HashMap::default(),
     );
     assert!(!target.is::<CayenneTableProvider>());
     assert_eq!(target.schema().metadata()["test_marker"], "wrapped");

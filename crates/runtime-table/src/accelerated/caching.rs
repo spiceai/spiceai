@@ -4058,6 +4058,10 @@ mod pool_tests {
                     .expect("response");
                 String::from_utf8(request).expect("request headers")
             });
+            #[expect(
+                clippy::default_trait_access,
+                reason = "this crate has no direct reqwest dependency"
+            )]
             let source: Arc<dyn TableProvider> = Arc::new(
                 HttpTableProvider::new(
                     url.parse().expect("URL"),
@@ -4156,6 +4160,10 @@ mod pool_tests {
                 }
                 requests
             });
+            #[expect(
+                clippy::default_trait_access,
+                reason = "this crate has no direct reqwest dependency"
+            )]
             let source: Arc<dyn TableProvider> = Arc::new(
                 HttpTableProvider::new(
                     url.parse().expect("URL"),
@@ -4176,7 +4184,7 @@ mod pool_tests {
                         "test_scope".to_string(),
                         "periodic".to_string(),
                     )]),
-                    Default::default(),
+                    std::collections::HashMap::default(),
                 )
             } else {
                 source

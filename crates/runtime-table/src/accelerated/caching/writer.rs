@@ -1639,7 +1639,7 @@ mod tests {
             .expect("many view buffers");
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bound - 1));
         let reservation = MemoryConsumer::new("descriptor admission").register(&pool);
-        assert!(own_snapshot_batch(batch, &reservation).is_err());
+        own_snapshot_batch(batch, &reservation).expect_err("descriptor budget refuses the batch");
         assert_eq!(pool.reserved(), 0);
         println!(
             "descriptor admission: buffers=129 bound={bound} limit={} retained=0",
@@ -1659,11 +1659,12 @@ mod tests {
         let (foreign, owners) = foreign_batch(&expected);
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
         let reservation = MemoryConsumer::new("snapshot test").register(&pool);
-        assert!(own_snapshot_batch(foreign, &reservation).is_err());
+        own_snapshot_batch(foreign, &reservation)
+            .expect_err("reservation refuses the foreign copy");
         assert!(owners.iter().all(|owner| owner.upgrade().is_none()));
         assert_eq!(pool.reserved(), 0);
-        assert!(checked_copy_sum(usize::MAX, 1).is_err());
-        assert!(checked_copy_product(usize::MAX, 2).is_err());
+        checked_copy_sum(usize::MAX, 1).expect_err("sum overflows");
+        checked_copy_product(usize::MAX, 2).expect_err("product overflows");
     }
 
     #[test]
@@ -1677,7 +1678,7 @@ mod tests {
         let exact: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
         let reservation = MemoryConsumer::new("no metadata room").register(&exact);
         reservation.try_grow(bytes).expect("buffers fit");
-        assert!(RetainedBufferCharge::new(&exact, reservation).is_err());
+        RetainedBufferCharge::new(&exact, reservation).expect_err("metadata does not fit the pool");
         assert_eq!(exact.reserved(), 0);
 
         let original_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes + metadata));
@@ -1686,7 +1687,9 @@ mod tests {
         reservation.try_grow(bytes).expect("buffer admission");
         let original =
             RetainedBufferCharge::new(&original_pool, reservation).expect("root metadata fits");
-        assert!(original.retain_for_pool(&second_pool).is_err());
+        original
+            .retain_for_pool(&second_pool)
+            .expect_err("a peer past the metadata budget is refused");
         assert_eq!(
             second_pool.reserved(),
             0,
@@ -1834,7 +1837,9 @@ mod tests {
             .expect("original admission");
         let same = original.retain_for_pool(&original_pool).expect("same pool");
         assert!(Arc::ptr_eq(&same, &original));
-        assert!(original.retain_for_pool(&small_pool).is_err());
+        original
+            .retain_for_pool(&small_pool)
+            .expect_err("small pool cannot hold the retained buffers");
         assert_eq!(small_pool.reserved(), 0);
         let second = original
             .retain_for_pool(&second_pool)
@@ -1925,6 +1930,10 @@ mod tests {
     fn pagination_configuration_requires_execution_proof() {
         use data_components::http::provider::{HttpTableProvider, PaginationConfig};
         for paginated in [false, true] {
+            #[expect(
+                clippy::default_trait_access,
+                reason = "this crate has no direct reqwest dependency"
+            )]
             let provider = HttpTableProvider::new(
                 "http://localhost/items".parse().expect("URL"),
                 Default::default(),
