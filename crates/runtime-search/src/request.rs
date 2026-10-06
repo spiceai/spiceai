@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use cache::key::SearchKey;
 use datafusion::common::Column;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion::sql::sqlparser::ast::{Expr, SelectItem, TableFactor, TableWithJoins};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;

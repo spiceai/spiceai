@@ -22,11 +22,11 @@ use arrow_tools::metadata_keys::{
     HTTP_RESPONSE_STATUS_METADATA_KEY, HTTP_TRANSIENT_FAILURE_METRIC_NAME,
 };
 use datafusion::{
+    common::TableReference,
     common::tree_node::TreeNodeRecursion,
     execution::SendableRecordBatchStream,
     logical_expr::LogicalPlan,
     physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
-    sql::TableReference,
 };
 
 use crate::{CachedQueryResult, QueryResultsCacheProvider, RawCacheKey, Sizeable};

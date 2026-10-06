@@ -17,6 +17,7 @@ limitations under the License.
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -25,7 +26,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties,
 };
-use datafusion::sql::TableReference;
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use std::fmt;
@@ -111,6 +111,17 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -366,7 +377,7 @@ mod tests {
                 })
                 .collect();
 
-            let table_schema = datafusion_datasource::TableSchema::new(schema(), Vec::new());
+            let table_schema = datafusion_datasource::TableSchema::from(schema());
             let parquet_source = ParquetSource::new(table_schema);
             let config = FileScanConfigBuilder::new(
                 ObjectStoreUrl::parse("file:///").expect("valid url"),

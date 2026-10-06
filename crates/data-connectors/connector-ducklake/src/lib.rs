@@ -30,8 +30,8 @@ use data_connector_api::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
     DataConnectorFactory,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;

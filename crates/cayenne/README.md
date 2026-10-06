@@ -885,10 +885,11 @@ Some Arrow data types cannot be stored in the Vortex format, and are rejected at
 - `Duration`
 - `FixedSizeBinary`
 - `Union`
-- `RunEndEncoded`
+- `RunEndEncoded` (Vortex can store it, but Cayenne does not accept it yet)
 
-`Map` is storable: Vortex has no map type but stores one as `List<Struct<keys, values>>` and
-restores it on read, so a map column round-trips.
+`Map` is storable and restored on read from the table's schema: Vortex stores a map under a type
+of its own that carries no Arrow field names (and an older file stores it as
+`List<Struct<keys, values>>`).
 
 One type is rewritten rather than rejected:
 

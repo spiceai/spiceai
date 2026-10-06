@@ -44,9 +44,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use app::App;
+use datafusion::common::TableReference;
 use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use runtime_request_context::{
     CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
@@ -1166,8 +1166,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use cache::result::CacheStatus;
     use cache::{Caching, QueryResultsCacheProvider, SimpleCache};
+    use datafusion::common::TableReference;
     use datafusion::datasource::{MemTable, TableProvider};
-    use datafusion::sql::TableReference;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use tokio::runtime::Handle;
 
