@@ -299,8 +299,9 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
 ///   registered Spark `concat` returns NULL for the whole call. A `||`
 ///   rewrite would match, but there is no dialect seam to install one
 ///   (the same lever as `btrim`; option 1 of issue #13875).
-/// * `to_hex`, `md5`, `sha256`, `date_part`, `date_trunc`, `regexp_like`,
-///   `regexp_replace` — `SQLite` has none of these, so a federated call
+/// * `to_hex`, `md5`, `sha256`, `encode`, `date_part`, `date_trunc`,
+///   `regexp_like`, `regexp_replace`, `regexp_match`, `regexp_instr`,
+///   `regexp_count` — `SQLite` has none of these, so a federated call
 ///   fails with `no such function` or, for `date_trunc`, a cast of the
 ///   truncated `'2026-01'` text back into a timestamp.
 ///
@@ -315,10 +316,14 @@ pub const SQLITE_DENIED_BUILTINS: &[&str] = &[
     "to_hex",
     "md5",
     "sha256",
+    "encode",
     "date_part",
     "date_trunc",
     crate::dialect::REGEXP_LIKE_NAME,
     crate::dialect::REGEXP_REPLACE_NAME,
+    crate::dialect::REGEXP_MATCH_NAME,
+    crate::dialect::REGEXP_INSTR_NAME,
+    crate::dialect::REGEXP_COUNT_NAME,
 ];
 
 /// `SQLite`-flavored deny-list as a value, for
@@ -1249,8 +1254,11 @@ mod tests {
     fn sqlite_keeps_unfaithful_and_missing_functions_local() {
         use datafusion::functions::crypto::expr_fn::{md5, sha256};
         use datafusion::functions::datetime::expr_fn::{date_part, date_trunc};
+        use datafusion::functions::encoding::expr_fn::encode;
         use datafusion::functions::expr_fn::{concat, lower, to_hex, upper};
-        use datafusion::functions::regex::expr_fn::{regexp_like, regexp_replace};
+        use datafusion::functions::regex::expr_fn::{
+            regexp_count, regexp_instr, regexp_like, regexp_match, regexp_replace,
+        };
         use datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf;
         use datafusion::functions_aggregate::expr_fn::{approx_distinct, median};
         use datafusion::functions_aggregate::median::median_udaf;
@@ -1264,10 +1272,14 @@ mod tests {
             to_hex(col("start")),
             md5(col("s")),
             sha256(col("s")),
+            encode(col("s"), lit("hex")),
             date_part(month.clone(), col("s")),
             date_trunc(month, col("s")),
             regexp_like(col("s"), lit("a"), None),
             regexp_replace(col("s"), lit("a"), lit("X"), None),
+            regexp_match(col("s"), lit("a"), None),
+            regexp_instr(col("s"), lit("a"), None, None, None, None, None),
+            regexp_count(col("s"), lit("a"), None, None),
             user_call("btrim"),
         ] {
             assert!(

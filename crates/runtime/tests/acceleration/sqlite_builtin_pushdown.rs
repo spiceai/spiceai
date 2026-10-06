@@ -166,6 +166,10 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
                     Some("sha256("),
                 ),
                 (
+                    "SELECT id, encode(sha256(customer), 'hex') AS h FROM {table} ORDER BY id",
+                    Some("encode("),
+                ),
+                (
                     "SELECT id, date_part('month', try_cast(ts AS timestamp)) AS m \
                      FROM {table} ORDER BY id",
                     Some("date_part("),
@@ -195,6 +199,18 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
                 (
                     "SELECT id, regexp_replace(customer, 'a', 'X') AS r FROM {table} ORDER BY id",
                     Some("regexp_replace("),
+                ),
+                (
+                    "SELECT id, regexp_match(customer, '(a)') AS m FROM {table} ORDER BY id",
+                    Some("regexp_match("),
+                ),
+                (
+                    "SELECT id, regexp_instr(customer, 'a') AS i FROM {table} ORDER BY id",
+                    Some("regexp_instr("),
+                ),
+                (
+                    "SELECT id, regexp_count(customer, 'a') AS c FROM {table} ORDER BY id",
+                    Some("regexp_count("),
                 ),
                 ("SELECT median(qty) AS m FROM {table}", Some("median(")),
                 (
