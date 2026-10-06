@@ -1575,7 +1575,7 @@ async fn record_last_refresh_time_ms(
 mod tests {
     use arrow::{
         array::{
-            ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, TimestampSecondArray,
+            Array, ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, TimestampSecondArray,
             UInt64Array,
         },
         datatypes::{DataType, Field, Fields, Schema, TimeUnit},
@@ -2897,7 +2897,7 @@ mod tests {
         async fn test(
             source_data: Vec<i64>,
             existing_data: Vec<i64>,
-            expected_size: usize,
+            expected_timestamps: Vec<i64>,
             message: &str,
         ) {
             let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2972,11 +2972,19 @@ mod tests {
                 .await
                 .expect("Query successful");
 
-            assert_eq!(
-                expected_size,
-                result.into_iter().map(|f| f.num_rows()).sum::<usize>(),
-                "{message}"
-            );
+            let mut actual = Vec::new();
+            for batch in &result {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .expect("ts column is Timestamp(s)");
+                actual.extend(array.values().iter().copied());
+            }
+            let mut expected = expected_timestamps;
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "{message}");
 
             drop(refresh_handle);
         }
@@ -2985,21 +2993,28 @@ mod tests {
         test(
             vec![0, 1_354_360_271, 1_354_360_272],
             vec![],
-            3,
+            vec![0, 1_354_360_271, 1_354_360_272],
             "should insert all data into empty accelerator",
         )
         .await;
         test(
             vec![0, 1_354_360_271, 1_354_360_272],
             vec![0, 1_354_360_271, 1_354_360_272, 1_354_360_275],
-            4,
+            vec![0, 1_354_360_271, 1_354_360_272, 1_354_360_275],
             "should not insert any stale data and keep original size",
         )
         .await;
         test(
             vec![1_354_360_276, 1_354_360_277],
             vec![0, 1_354_360_271, 1_354_360_272, 1_354_360_275],
-            6,
+            vec![
+                0,
+                1_354_360_271,
+                1_354_360_272,
+                1_354_360_275,
+                1_354_360_276,
+                1_354_360_277,
+            ],
             "should apply new data onto existing data",
         )
         .await;
