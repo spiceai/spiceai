@@ -1919,9 +1919,13 @@ impl SnapshotManager {
         }
 
         let start_time = Instant::now();
+        let now = Utc::now();
         let layout = SnapshotPathLayout::new(&self.dataset_name, &self.engine);
-        let now = self.unrecorded_instant(&layout, Utc::now()).await?;
-        let destination_location = layout.build_location(&self.snapshots_location, now);
+        // Only the object name moves to a free second; the snapshot records `now`.
+        let destination_location = layout.build_location(
+            &self.snapshots_location,
+            self.unrecorded_instant(&layout, now).await?,
+        );
         let timestamp_ms = now.timestamp_millis();
 
         tracing::debug!(
@@ -5611,6 +5615,7 @@ mod tests {
                 .expect("publish to a file location")
                 .expect("snapshot created");
         }
+        let published_by_ms = Utc::now().timestamp_millis();
 
         let entries = dataset_entries(
             store.as_ref(),
@@ -5618,6 +5623,14 @@ mod tests {
         )
         .await;
         assert_eq!(entries.len(), 3, "every publish is recorded: {entries:?}");
+        // An entry records when it was published, even when its object name had to move
+        // to a later second.
+        for entry in &entries {
+            assert!(
+                entry.timestamp_ms <= published_by_ms,
+                "entry recorded after the publishes ended ({published_by_ms} ms): {entry:?}"
+            );
+        }
         // Each publish has its own object, holding the bytes its entry records, so every
         // entry can be restored.
         let uris: HashSet<&str> = entries
