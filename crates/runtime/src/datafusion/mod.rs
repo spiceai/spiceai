@@ -3720,7 +3720,7 @@ impl DataFusion {
             validation_refresh = validation_refresh.time_partition_format(format);
         }
         validation_refresh
-            .validate_time_format(dataset.name.to_string(), &refresh_schema)
+            .validate_time_format(&dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
         if let Some(sql) = dataset.retention_sql() {
             retention_sql::parse_retention_sql(&dataset.name, &sql, source_table_provider.schema())
@@ -3969,7 +3969,7 @@ impl DataFusion {
             refresh = refresh.period(refresh_data_window);
         }
         refresh
-            .validate_time_format(dataset.name.to_string(), &refresh_schema)
+            .validate_time_format(&dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         // Apply initial partition filters before the refresher starts to avoid a race
