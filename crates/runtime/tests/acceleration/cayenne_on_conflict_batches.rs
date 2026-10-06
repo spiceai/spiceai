@@ -14,15 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Cayenne resolves a primary key repeated in the incoming data of one refresh
-//! or statement per `on_conflict`, over all of its record batches (regression
-//! tests for #14578 and #14576):
-//!
-//! | `on_conflict`                                | identical copies | different versions   |
-//! |----------------------------------------------|------------------|----------------------|
-//! | `drop`                                       | one row          | first arrival kept   |
-//! | `upsert` (`upsert_dedup`)                    | one row          | the write fails      |
-//! | `upsert_by_arrival` (`upsert_dedup_by_row_id`) | one row        | last arrival kept    |
+//! Cayenne keeps one row per primary key, the version that arrived last, for a
+//! key repeated in the incoming data of one refresh or statement over all of its
+//! record batches (regression tests for #14578 and #14576). `on_conflict` does
+//! not change that: every value, and none, gives the same rows.
 #![expect(clippy::expect_used)]
 
 use std::collections::HashMap;
@@ -44,36 +39,21 @@ use spicepod::partitioning::PartitionedBy;
 use crate::configure_test_datafusion;
 use crate::utils::{runtime_ready_check_with_timeout_err, test_request_context};
 
-const POLICIES: [(&str, OnConflictBehavior); 5] = [
-    ("drop", OnConflictBehavior::Drop),
-    ("upsert", OnConflictBehavior::Upsert),
-    ("upsert_dedup", OnConflictBehavior::UpsertDedup),
-    ("upsert_by_arrival", OnConflictBehavior::UpsertByArrival),
+/// Every `on_conflict` a dataset may set, and none.
+const POLICIES: [(&str, Option<OnConflictBehavior>); 6] = [
+    ("none", None),
+    ("drop", Some(OnConflictBehavior::Drop)),
+    ("upsert", Some(OnConflictBehavior::Upsert)),
+    ("upsert_dedup", Some(OnConflictBehavior::UpsertDedup)),
+    (
+        "upsert_by_arrival",
+        Some(OnConflictBehavior::UpsertByArrival),
+    ),
     (
         "upsert_dedup_by_row_id",
-        OnConflictBehavior::UpsertDedupByRowId,
+        Some(OnConflictBehavior::UpsertDedupByRowId),
     ),
 ];
-
-/// The version of a key each policy keeps among different versions, by which
-/// one arrived first (`first`) or last (`last`), or `None` when the write fails.
-fn kept<'a>(behavior: OnConflictBehavior, first: &'a str, last: &'a str) -> Option<&'a str> {
-    match behavior {
-        OnConflictBehavior::Drop => Some(first),
-        OnConflictBehavior::Upsert | OnConflictBehavior::UpsertDedup => None,
-        OnConflictBehavior::UpsertByArrival | OnConflictBehavior::UpsertDedupByRowId => Some(last),
-        OnConflictBehavior::UpsertByTime => {
-            unreachable!("`upsert_by_time` orders versions by time; see `upsert_by_time.rs`")
-        }
-    }
-}
-
-/// The cause a strict `upsert` fails a write with, for one value of `key`.
-fn conflict_cause(key: &str) -> String {
-    format!(
-        "its data holds different versions of 1 value of '{key}', and `on_conflict: upsert` does not choose between versions."
-    )
-}
 
 /// The dataset's error, once it reports one.
 async fn dataset_error(rt: &Runtime) -> Option<String> {
@@ -99,11 +79,6 @@ struct Case {
 }
 
 impl Case {
-    /// The primary key the dataset declares, as a conflict names it.
-    fn key(&self) -> &'static str {
-        if self.partitioned { "id, region" } else { "id" }
-    }
-
     fn label(&self) -> String {
         format!(
             "{:?}/{:?}{}",
@@ -119,7 +94,7 @@ impl Case {
 async fn load(
     csv: &str,
     case: &Case,
-    behavior: OnConflictBehavior,
+    behavior: Option<OnConflictBehavior>,
     label: &str,
 ) -> (Runtime, bool, tempfile::TempDir) {
     load_with_access(csv, case, behavior, label, AccessMode::Read).await
@@ -128,7 +103,7 @@ async fn load(
 async fn load_with_access(
     csv: &str,
     case: &Case,
-    behavior: OnConflictBehavior,
+    behavior: Option<OnConflictBehavior>,
     label: &str,
     access: AccessMode,
 ) -> (Runtime, bool, tempfile::TempDir) {
@@ -164,7 +139,9 @@ async fn load_with_access(
         refresh_mode: Some(case.refresh.clone()),
         params: Some(Params::from_string_map(params)),
         primary_key: Some(key.to_string()),
-        on_conflict: HashMap::from([(key.to_string(), behavior)]),
+        on_conflict: behavior
+            .map(|behavior| HashMap::from([(key.to_string(), behavior)]))
+            .unwrap_or_default(),
         partition_by: if case.partitioned {
             vec![PartitionedBy {
                 name: "region".to_string(),
@@ -255,57 +232,38 @@ fn repeated_across_batches() -> String {
     csv
 }
 
-/// Check one load against the policy table: the kept value of key `id`, with
-/// `rows` rows in all, or the load failing with the conflict cause.
-#[expect(clippy::too_many_arguments)]
+/// Check one load: key `id` holds `expected`, with `rows` rows in all.
 async fn check_load(
     rt: &Runtime,
     ready: bool,
-    key: &str,
     id: i64,
-    expected: Option<&str>,
+    expected: &str,
     rows: i64,
     label: &str,
     failures: &mut Vec<String>,
 ) {
-    match (expected, ready) {
-        (Some(expected), true) => {
-            let (values, count) = (value_of(rt, id).await, count(rt).await);
-            let ok = values == [expected] && count == rows;
-            eprintln!(
-                "{label}: key {id} = {values:?}, COUNT(*) = {count}: {}",
-                if ok { "ok" } else { "WRONG" }
-            );
-            if !ok {
-                failures.push(format!(
-                    "{label}: key {id} = {values:?}, COUNT(*) = {count}"
-                ));
-            }
-        }
-        (Some(_), false) => failures.push(format!(
+    if !ready {
+        failures.push(format!(
             "{label}: did not load: {:?}",
             dataset_error(rt).await
-        )),
-        (None, true) => failures.push(format!(
-            "{label}: loaded different versions, key {id} = {:?}",
-            value_of(rt, id).await
-        )),
-        (None, false) => {
-            let error = dataset_error(rt).await.unwrap_or_default();
-            let ok = error.contains(&conflict_cause(key));
-            eprintln!(
-                "{label}: failed: {error}: {}",
-                if ok { "ok" } else { "WRONG" }
-            );
-            if !ok {
-                failures.push(format!("{label}: wrong failure: {error}"));
-            }
-        }
+        ));
+        return;
+    }
+    let (values, count) = (value_of(rt, id).await, count(rt).await);
+    let ok = values == [expected] && count == rows;
+    eprintln!(
+        "{label}: key {id} = {values:?}, COUNT(*) = {count}: {}",
+        if ok { "ok" } else { "WRONG" }
+    );
+    if !ok {
+        failures.push(format!(
+            "{label}: key {id} = {values:?}, COUNT(*) = {count}"
+        ));
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_key_repeated_across_batches_resolves_per_on_conflict() {
+async fn a_key_repeated_across_batches_keeps_the_last_arrival() {
     test_request_context()
         .scope(async {
             let mut failures = Vec::new();
@@ -314,17 +272,7 @@ async fn a_key_repeated_across_batches_resolves_per_on_conflict() {
                     let label = format!("{}/{name}", case.label());
                     let (rt, ready, _dir) =
                         load(&repeated_across_batches(), &case, behavior, &label).await;
-                    check_load(
-                        &rt,
-                        ready,
-                        case.key(),
-                        0,
-                        kept(behavior, "first", "last"),
-                        8_192,
-                        &label,
-                        &mut failures,
-                    )
-                    .await;
+                    check_load(&rt, ready, 0, "last", 8_192, &label, &mut failures).await;
                 }
             }
             assert!(failures.is_empty(), "{failures:#?}");
@@ -333,7 +281,7 @@ async fn a_key_repeated_across_batches_resolves_per_on_conflict() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
+async fn a_key_repeated_within_a_batch_keeps_the_last_arrival() {
     test_request_context()
         .scope(async {
             let identical = "id,region,ts,v\n1,us,2026-01-01T00:00:00,a\n2,us,2026-01-01T00:00:00,b\n1,us,2026-01-01T00:00:00,a\n";
@@ -342,22 +290,12 @@ async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
             for case in cases() {
                 for (name, behavior) in POLICIES {
                     for (csv, versions, expected) in [
-                        (identical, "identical", Some("a")),
-                        (differing, "differing", kept(behavior, "a", "c")),
+                        (identical, "identical", "a"),
+                        (differing, "differing", "c"),
                     ] {
                         let label = format!("{}/{name}/{versions}", case.label());
                         let (rt, ready, _dir) = load(csv, &case, behavior, &label).await;
-                        check_load(
-                            &rt,
-                            ready,
-                            case.key(),
-                            1,
-                            expected,
-                            2,
-                            &label,
-                            &mut failures,
-                        )
-                        .await;
+                        check_load(&rt, ready, 1, expected, 2, &label, &mut failures).await;
                     }
                 }
             }
@@ -367,7 +305,7 @@ async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
 }
 
 /// A user's `UPDATE` is one statement over the rows it writes: moving rows
-/// onto one key collapses identical copies and fails on different versions.
+/// onto one key leaves one row for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_update_repeating_a_key_follows_upsert() {
     test_request_context()
@@ -393,7 +331,9 @@ async fn an_update_repeating_a_key_follows_upsert() {
                     let (rt, ready, _dir) = load_with_access(
                         &rows,
                         &case,
-                        OnConflictBehavior::Upsert,
+                        // `on_conflict` keeps a read-write dataset's writes in the
+                        // acceleration; Cayenne still upserts on the key.
+                        Some(OnConflictBehavior::Upsert),
                         &label,
                         AccessMode::ReadWrite,
                     )
@@ -413,14 +353,12 @@ async fn an_update_repeating_a_key_follows_upsert() {
                             .await
                             .map_err(|error| error.to_string()),
                     };
-                    if differ {
-                        let error = outcome.expect_err("different versions of key 0 fail");
-                        assert!(error.contains(&conflict_cause("id")), "{label}: {error}");
-                    } else {
-                        outcome.unwrap_or_else(|error| panic!("{label}: {error}"));
+                    outcome.unwrap_or_else(|error| panic!("{label}: {error}"));
+                    assert_eq!(count(&rt).await, 1, "{label}: one row for key 0");
+                    if !differ {
                         assert_eq!(
-                            (value_of(&rt, 0).await, count(&rt).await),
-                            (vec!["same".to_string()], 1),
+                            value_of(&rt, 0).await,
+                            vec!["same".to_string()],
                             "{label}: identical copies collapse"
                         );
                     }
@@ -431,14 +369,12 @@ async fn an_update_repeating_a_key_follows_upsert() {
 }
 
 /// A parent with a `localpod` child refreshes through the child-syncing sink, and
-/// still resolves a key its data repeats across batches: by arrival under
-/// `upsert_by_arrival`, and by failing the refresh, leaving the previous rows,
-/// under `upsert`.
+/// still keeps the last arrival of a key its data repeats across batches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_localpod_parents_refresh_resolves_repeated_keys() {
     test_request_context()
         .scope(async {
-            for behavior in [OnConflictBehavior::UpsertByArrival, OnConflictBehavior::Upsert] {
+            for behavior in [None, Some(OnConflictBehavior::Upsert)] {
                 let label = format!("localpod/{behavior:?}");
                 let dir = tempfile::tempdir().expect("temp dir");
                 let file = dir.path().join("rows.csv");
@@ -464,7 +400,9 @@ async fn a_localpod_parents_refresh_resolves_repeated_keys() {
                     refresh_mode: Some(RefreshMode::Full),
                     params: Some(Params::from_string_map(params)),
                     primary_key: Some("id".to_string()),
-                    on_conflict: HashMap::from([("id".to_string(), behavior)]),
+                    on_conflict: behavior
+                        .map(|behavior| HashMap::from([("id".to_string(), behavior)]))
+                        .unwrap_or_default(),
                     ..Acceleration::default()
                 });
                 let mut child = Dataset::new("localpod:t", "t_child");
@@ -492,16 +430,6 @@ async fn a_localpod_parents_refresh_resolves_repeated_keys() {
                 crate::acceleration::trigger_refresh(&rt, "t")
                     .await
                     .expect("refresh");
-                if behavior == OnConflictBehavior::Upsert {
-                    let error = dataset_error(&rt).await.unwrap_or_default();
-                    assert!(error.contains(&conflict_cause("id")), "{label}: {error}");
-                    assert_eq!(
-                        (value_of(&rt, 0).await, count(&rt).await),
-                        (vec!["first".to_string()], 8_192),
-                        "{label}: the previous rows are still served"
-                    );
-                    continue;
-                }
                 let deadline = std::time::Instant::now() + Duration::from_mins(1);
                 loop {
                     let values = value_of(&rt, 0).await;
@@ -527,7 +455,7 @@ async fn a_localpod_parents_refresh_resolves_repeated_keys() {
 
 /// An append refresh's first load into an empty table skips the conflict check,
 /// so the refresh after it must still find the stored rows: a key it repeats is
-/// superseded (`upsert`) or kept (`drop`), never stored twice.
+/// superseded, never stored twice, whatever `on_conflict` says.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_refresh_after_a_first_append_load_finds_the_stored_keys() {
     test_request_context()
@@ -541,10 +469,11 @@ async fn the_refresh_after_a_first_append_load_finds_the_stored_keys() {
                 .chain((0..8_192).map(|id| format!("{id},us,2026-01-01T00:00:00,first\n")))
                 .collect();
             let mut failures = Vec::new();
-            for (name, behavior, key_0) in [
-                ("upsert", OnConflictBehavior::Upsert, "newer"),
-                ("drop", OnConflictBehavior::Drop, "first"),
+            for (name, behavior) in [
+                ("none", None),
+                ("drop", Some(OnConflictBehavior::Drop)),
             ] {
+                let key_0 = "newer";
                 let label = format!("{}/{name}/second_refresh", case.label());
                 let (rt, ready, dir) = load(&first_load, &case, behavior, &label).await;
                 assert!(ready, "{label}: did not load");

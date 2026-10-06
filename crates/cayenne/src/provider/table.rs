@@ -1897,9 +1897,6 @@ pub struct CayenneTableProvider {
     /// How a scan reuses a cached [`ScanView`]. Set from `refresh_mode` at
     /// construction; see [`ScanViewReuse`] and [`Self::scan_view_at_current_input`].
     scan_view_reuse: ScanViewReuse,
-    /// The `upsert` refinement of the dataset's `on_conflict`, which decides how a
-    /// write resolves a key it repeats; see [`super::key_conflicts`].
-    upsert_policy: super::key_conflicts::UpsertPolicy,
     /// Counts the rows a write through this provider receives but does not keep;
     /// set on the clone a write runs on, from its session.
     superseded_rows: Option<Arc<util::session_state::SupersededRows>>,
@@ -2798,7 +2795,6 @@ pub struct CayenneTableProviderBuilder {
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
-    upsert_policy: super::key_conflicts::UpsertPolicy,
     secondary_indexes: Vec<Vec<String>>,
     index_word_bits: Option<u32>,
 }
@@ -2939,7 +2935,6 @@ struct CayenneTableProviderOpenOptions {
     maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
-    upsert_policy: super::key_conflicts::UpsertPolicy,
     secondary_indexes: Vec<Vec<String>>,
     index_word_bits: Option<u32>,
 }
@@ -2959,7 +2954,6 @@ impl CayenneTableProviderBuilder {
             maintained_aggregates: Vec::new(),
             durable_write_back: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
-            upsert_policy: super::key_conflicts::UpsertPolicy::Upsert,
             secondary_indexes: Vec::new(),
             index_word_bits: None,
         }
@@ -3043,15 +3037,6 @@ impl CayenneTableProviderBuilder {
         self
     }
 
-    /// Set the dataset's canonical upsert policy (`upsert` or `upsert_by_arrival`).
-    /// Not persisted: it comes from the acceleration's
-    /// settings on every load, as `on_conflict` does.
-    #[must_use]
-    pub fn with_upsert_policy(mut self, upsert_policy: super::key_conflicts::UpsertPolicy) -> Self {
-        self.upsert_policy = upsert_policy;
-        self
-    }
-
     /// Maintain a secondary index on each column set, one per `indexes` entry of
     /// the acceleration. A query whose filters pin every column of one of them
     /// to an equality literal reads only the rows holding that key.
@@ -3092,7 +3077,6 @@ impl CayenneTableProviderBuilder {
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
-            upsert_policy: self.upsert_policy,
             secondary_indexes: self.secondary_indexes,
             index_word_bits: self.index_word_bits,
         };
@@ -3126,13 +3110,31 @@ impl CayenneTableProviderBuilder {
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
-            upsert_policy: self.upsert_policy,
             secondary_indexes: self.secondary_indexes,
             index_word_bits: self.index_word_bits,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
             .await
+    }
+}
+
+/// The `on_conflict` a table with `primary_key` acts on: a table with a primary key
+/// keeps the last version of each key, so whatever its metastore records — a table
+/// created with `DoNothing` by an earlier release included — it upserts on that key.
+/// A table without one, or with no `on_conflict` (`pk_conflict_detection: none`),
+/// is left as recorded.
+fn upsert_on_primary_key(
+    primary_key: &[String],
+    on_conflict: Option<OnConflict>,
+) -> Option<OnConflict> {
+    match on_conflict {
+        Some(_) if !primary_key.is_empty() => Some(OnConflict::Upsert(
+            datafusion_table_providers::util::column_reference::ColumnReference::new(
+                primary_key.to_vec(),
+            ),
+        )),
+        on_conflict => on_conflict,
     }
 }
 
@@ -9117,12 +9119,13 @@ impl CayenneTableProvider {
             maintained_aggregate_specs,
             durable_write_back,
             scan_view_reuse,
-            upsert_policy,
             secondary_indexes,
             index_word_bits,
         } = options;
 
-        let table_metadata = catalog.get_table(table_name).await?;
+        let mut table_metadata = catalog.get_table(table_name).await?;
+        table_metadata.on_conflict =
+            upsert_on_primary_key(&table_metadata.primary_key, table_metadata.on_conflict);
 
         // Use the provided context (for partition cache sharing) or build a
         // fresh one from this table's VortexConfig and the shared RuntimeEnv.
@@ -9420,7 +9423,6 @@ impl CayenneTableProvider {
             pk_column_indices,
             durable_write_back,
             scan_view_reuse,
-            upsert_policy,
             superseded_rows: None,
             row_versions: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -11557,7 +11559,6 @@ impl CayenneTableProvider {
             pk_column_indices: self.pk_column_indices.clone(),
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
-            upsert_policy: self.upsert_policy,
             superseded_rows: self.superseded_rows.clone(),
             row_versions: self.row_versions.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
@@ -13440,20 +13441,19 @@ impl CayenneTableProvider {
         Ok(Some(indices))
     }
 
-    /// How this table's writes resolve a primary key they repeat, or `None` when
-    /// the table has no primary key or no `on_conflict`; see
-    /// [`super::key_conflicts`].
+    /// How this table's writes resolve a primary key they repeat — the last
+    /// arrival is kept — or `None` when the table has no primary key, or no
+    /// `on_conflict` target (`pk_conflict_detection: none`); see
+    /// [`super::key_conflicts`]. Which `on_conflict` the table stores does not
+    /// matter: a table created with `drop` keeps the last arrival too.
     ///
     /// # Errors
     ///
     /// Returns an error if a primary key column is missing or cannot be encoded.
     pub(crate) fn key_resolver(&self) -> Result<Option<super::key_conflicts::KeyResolver>> {
-        let Some(policy) = super::key_conflicts::ConflictPolicy::new(
-            self.table_metadata.on_conflict.as_ref(),
-            self.upsert_policy,
-        ) else {
+        if self.table_metadata.on_conflict.is_none() {
             return Ok(None);
-        };
+        }
         let Some(pk_indices) = self.primary_key_indices()? else {
             return Ok(None);
         };
@@ -13462,7 +13462,6 @@ impl CayenneTableProvider {
                 &self.table_metadata.table_name,
                 &self.table_schema(),
                 &pk_indices,
-                policy,
             )?
             .counting(self.superseded_rows.clone()),
         ))
@@ -13490,13 +13489,13 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Resolve the keys a buffered write (a refresh or an `INSERT`) repeats, per
-    /// the table's `on_conflict`, before conflict validation observes any of its
-    /// rows.
+    /// Resolve the keys a buffered write (a refresh or an `INSERT`) repeats,
+    /// keeping each key's last copy (or greatest version), before conflict
+    /// validation observes any of its rows.
     ///
     /// # Errors
     ///
-    /// Returns an error if a primary key is null or the policy rejects a repeat.
+    /// Returns an error if a primary key is null.
     pub(crate) fn collapse_buffered_write(
         &self,
         batches: Vec<RecordBatch>,
@@ -13542,8 +13541,7 @@ impl CayenneTableProvider {
     }
 
     /// Resolve the keys a buffered change-stream write repeats: a later change of
-    /// a key supersedes an earlier one (under `drop`, the first is kept), and no
-    /// repeat fails the write.
+    /// a key supersedes an earlier one, and no repeat fails the write.
     ///
     /// # Errors
     ///
@@ -13553,7 +13551,7 @@ impl CayenneTableProvider {
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>> {
         match self.key_resolver()? {
-            Some(resolver) => resolver.for_changes().collapse_write(batches),
+            Some(resolver) => resolver.collapse_write(batches),
             None => Ok(batches),
         }
     }
@@ -45200,39 +45198,6 @@ mod tests {
         );
     }
 
-    /// A non-upsert table must never be degraded to blooms: the bloom existence arm
-    /// keeps the incoming row and emits a key-based supersede for the prior one —
-    /// upsert semantics — which is why validation debug-asserts that a bloom index
-    /// implies `OnConflict::Upsert`. The resync leaves it exact and reports the true
-    /// resident bytes instead (see the step-6 comment for why it must not drop the
-    /// cache either).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sharded_apply_resync_leaves_an_over_budget_do_nothing_keyset_exact() {
-        let ctx = SessionContext::new();
-        let (provider, _catalog, _tmp) = write_past_the_sharded_keyset_budget(
-            &ctx,
-            "resync_keeps_over_budget_keyset_exact",
-            OnConflict::DoNothingAll,
-        )
-        .await;
-
-        let resident = match provider.sharded_pk_keyset_cache.lock().as_ref() {
-            Some(index @ ShardedPkIndex::Exact(_)) => index.approx_bytes(),
-            Some(ShardedPkIndex::Bloom(_)) => {
-                panic!("a DoNothing table must never degrade to blooms")
-            }
-            None => panic!("a DoNothing table must keep its exact cache, not drop it"),
-        };
-        assert!(
-            resident > provider.effective_sharded_keyset_budget(),
-            "the index the resync left alone must be the over-budget one"
-        );
-        assert!(
-            provider.table_memory.reserved_bytes() >= resident,
-            "an index left over budget must still be reported to the memory account"
-        );
-    }
-
     /// A table with no primary key has `pk_deletion_strategy: PositionBased`, so
     /// every delete leaves `delete_from` through the deletion-vector arm and never
     /// reaches `InlineAwareDeletionSink`. Position deletes address
@@ -48464,29 +48429,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn buffered_cdc_writes_resolve_repeated_keys_in_single_and_sharded_tiers() {
-        use crate::provider::key_conflicts::UpsertPolicy;
         use datafusion_table_providers::util::column_reference::ColumnReference;
 
         for shards in [1, 4] {
-            for (on_conflict, upsert_policy, expected) in [
-                (
-                    OnConflict::DoNothingAll,
-                    UpsertPolicy::Upsert,
-                    Some(vec![(1, 10), (2, 20), (9, 90)]),
-                ),
-                (
-                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-                    UpsertPolicy::Upsert,
-                    Some(vec![(1, 40), (2, 20), (9, 90)]),
-                ),
-                (
-                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-                    UpsertPolicy::UpsertByArrival,
-                    Some(vec![(1, 40), (2, 20), (9, 90)]),
-                ),
+            // Whatever `on_conflict` the table stores, a change stream's later
+            // change of a key supersedes an earlier one.
+            for on_conflict in [
+                OnConflict::DoNothingAll,
+                OnConflict::DoNothing(ColumnReference::new(vec!["id".to_string()])),
+                OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
             ] {
+                let label = format!("shards={shards}/{on_conflict:?}");
                 let ctx = SessionContext::new();
-                let (mut provider, catalog, _tmp) = create_cdc_table_with_on_conflict(
+                let (provider, catalog, _tmp) = create_cdc_table_with_on_conflict(
                     "buffered_cdc_keys",
                     ctx.runtime_env(),
                     VortexConfig {
@@ -48498,7 +48453,6 @@ mod tests {
                     on_conflict,
                 )
                 .await;
-                provider.upsert_policy = upsert_policy;
                 provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
                 assert!(provider.is_cdc_mem_tier_armed(), "CDC memory path is armed");
                 let schema = provider.table_schema();
@@ -48522,33 +48476,22 @@ mod tests {
                 let result = provider
                     .write_cdc_append_stream(stream, &ctx.task_ctx())
                     .await;
-                if let Some(rows) = expected {
-                    let write = result.expect("accepted CDC write");
-                    assert!(
-                        write.in_memory_epoch().is_some(),
-                        "write used the memory tier"
-                    );
-                    assert_eq!(
-                        collect_id_value_pairs(&ctx, &provider, "buffered_cdc_keys").await,
-                        rows
-                    );
-                    assert_eq!(
-                        query_count_star(&ctx, &provider, "buffered_cdc_keys").await,
-                        i64::try_from(rows.len()).expect("row count fits i64")
-                    );
-                } else {
-                    let Err(_) = result else {
-                        panic!("plain upsert must reject repeated key in one batch");
-                    };
-                    assert_eq!(
-                        collect_id_value_pairs(&ctx, &provider, "buffered_cdc_keys").await,
-                        vec![(9, 90)]
-                    );
-                }
-                if matches!(
-                    provider.table_metadata.on_conflict.as_ref(),
-                    Some(OnConflict::Upsert(_))
-                ) {
+                let write = result.expect("accepted CDC write");
+                assert!(
+                    write.in_memory_epoch().is_some(),
+                    "write used the memory tier"
+                );
+                let rows = vec![(1, 40), (2, 20), (9, 90)];
+                assert_eq!(
+                    collect_id_value_pairs(&ctx, &provider, "buffered_cdc_keys").await,
+                    rows,
+                    "{label}"
+                );
+                assert_eq!(
+                    query_count_star(&ctx, &provider, "buffered_cdc_keys").await,
+                    i64::try_from(rows.len()).expect("row count fits i64")
+                );
+                {
                     // A change stream's later change supersedes an earlier one even
                     // when they differ, within a batch and across batches.
                     let schema = provider.table_schema();
@@ -48583,7 +48526,6 @@ mod tests {
                     .await
                     .expect("checkpoint CDC tier");
                 let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-                    .with_upsert_policy(upsert_policy)
                     .open("buffered_cdc_keys")
                     .await
                     .expect("reopen checkpointed CDC table");
@@ -63412,16 +63354,14 @@ mod tests {
         );
     }
 
-    /// Two pipelined appends of the same new primary key resolve to ONE live row
-    /// under `on_conflict: do_nothing`, even when the second begins its Stage A
-    /// before the first has published.
+    /// Two pipelined appends of the same new primary key resolve to ONE live row,
+    /// the later one, in a table created with `DoNothingAll` (which upserts on its
+    /// key), even when the second begins its Stage A before the first has
+    /// published.
     ///
     /// That overlap is the pipeline's steady state rather than a race to provoke:
     /// the next Stage A is deliberately allowed to start before the previous
-    /// Stage B publishes. A `DoNothingAll` table whose keys are all new takes the
-    /// `!stage_on_conflict` arm, so this pins that arm's Stage-A key record — the
-    /// only thing that carries the first batch's key into the second batch's
-    /// validation while the staged rows are still undiscoverable.
+    /// Stage B publishes.
     ///
     /// Regression test for #13642.
     #[tokio::test]
@@ -63493,8 +63433,8 @@ mod tests {
 
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, table).await,
-            vec![(77, 1)],
-            "`on_conflict: do_nothing` must keep exactly the first row for key 77; two live rows \
+            vec![(77, 2)],
+            "a `DoNothingAll` table must keep exactly the last row for key 77; two live rows \
              mean the second batch could not see the first's staged key"
         );
     }

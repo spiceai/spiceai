@@ -74,7 +74,6 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
-use super::key_conflicts::Survivor;
 use super::mutation_writer::InlineBatchBuffer;
 use super::overwrite_postpass::CopyOrder;
 use super::table::{
@@ -670,8 +669,7 @@ impl CayenneTableProvider {
         // Resolve the keys the incoming data repeats after writing it
         // (`overwrite_postpass`): each batch resolves its own repeats and stamps
         // its rows with its arrival sequence, and once the files are written a
-        // query finds every copy other than the one the policy keeps — the last
-        // under the upsert policies, the first under `drop`.
+        // query finds every copy of a key but its last.
         // A writer that supplies row versions (`upsert_by_time`) orders the copies
         // by version instead of arrival.
         let mut postpass: Option<(CopyOrder, Vec<String>)> = None;
@@ -682,7 +680,7 @@ impl CayenneTableProvider {
                 let indices = self.primary_key_indices()?.unwrap_or_default();
                 let order = match &self.row_versions {
                     Some(_) => CopyOrder::Version,
-                    None => CopyOrder::Arrival(Survivor::for_policy(resolver.policy())),
+                    None => CopyOrder::Arrival,
                 };
                 dedup_share = Some(super::overwrite_postpass::DedupShare::claim());
                 postpass = Some((

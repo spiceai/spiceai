@@ -646,7 +646,6 @@ mod tests {
     use crate::MetadataCatalog;
     use crate::metadata::{CreateTableOptions, VortexConfig};
     use crate::provider::context::CayenneContext;
-    use crate::provider::key_conflicts::UpsertPolicy;
     use crate::provider::table::{CayenneTableProvider, CayenneTableProviderBuilder};
 
     async fn visible_rows(ctx: &SessionContext, provider: &CayenneTableProvider) -> usize {
@@ -725,22 +724,12 @@ mod tests {
     async fn buffered_sink_writes_resolve_keys_before_validation() {
         for memory_mode in [true, false] {
             for overwrite in [true, false] {
-                for (policy, upsert_policy, expected) in [
-                    (
-                        OnConflict::DoNothingAll,
-                        UpsertPolicy::Upsert,
-                        Some(vec![(1, 10), (2, 20)]),
-                    ),
-                    (
-                        OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-                        UpsertPolicy::Upsert,
-                        None,
-                    ),
-                    (
-                        OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
-                        UpsertPolicy::UpsertByArrival,
-                        Some(vec![(1, 40), (2, 20)]),
-                    ),
+                // Whatever `on_conflict` the table stores, its writes keep each
+                // key's last copy.
+                for policy in [
+                    OnConflict::DoNothingAll,
+                    OnConflict::DoNothing(ColumnReference::new(vec!["id".to_string()])),
+                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
                 ] {
                     let ctx = SessionContext::new();
                     let temp = tempfile::tempdir().expect("temp dir");
@@ -766,12 +755,11 @@ mod tests {
                     let provider =
                         CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
                             .with_context(Arc::clone(&context))
-                            .with_upsert_policy(upsert_policy)
                             .create(CreateTableOptions {
                                 table_name: "buffered_keys".to_string(),
                                 schema: Arc::clone(&schema),
                                 primary_key: vec!["id".to_string()],
-                                on_conflict: Some(policy),
+                                on_conflict: Some(policy.clone()),
                                 base_path: temp.path().join("data").display().to_string(),
                                 partition_column: None,
                                 vortex_config: config,
@@ -806,60 +794,24 @@ mod tests {
                         Arc::clone(&schema),
                         futures::stream::iter(batches.into_iter().map(Ok)),
                     ));
-                    let result = sink.write_all(stream, &ctx.task_ctx()).await;
-                    let strict = expected.is_none();
-                    if let Some(mut rows) = expected {
-                        result.expect("accepted write");
-                        if !overwrite {
-                            rows.push((9, 90));
-                        }
-                        assert_eq!(keyed_rows(&ctx, &provider).await, rows);
-                        assert_eq!(
-                            keyed_count_sql(&ctx, &provider).await,
-                            i64::try_from(rows.len()).expect("row count fits i64")
-                        );
-                        if !memory_mode {
-                            assert_eq!(
-                                provider.cached_inlined_row_count(),
-                                i64::try_from(rows.len()).expect("row count fits i64"),
-                                "the file-mode write used the inline tier"
-                            );
-                        }
-                    } else {
-                        result.expect_err("repeated differing rows must fail");
-                        assert_eq!(keyed_rows(&ctx, &provider).await, vec![(9, 90)]);
-                        assert_eq!(keyed_count_sql(&ctx, &provider).await, 1);
+                    sink.write_all(stream, &ctx.task_ctx())
+                        .await
+                        .expect("accepted write");
+                    let mut rows = vec![(1, 40), (2, 20)];
+                    if !overwrite {
+                        rows.push((9, 90));
                     }
-                    if strict {
-                        let sink = CayenneDataSink::new(
-                            provider.clone_for_write(),
-                            if overwrite {
-                                InsertOp::Overwrite
-                            } else {
-                                InsertOp::Append
-                            },
-                            Arc::clone(&schema),
-                            Arc::clone(&context),
+                    assert_eq!(keyed_rows(&ctx, &provider).await, rows, "{policy:?}");
+                    assert_eq!(
+                        keyed_count_sql(&ctx, &provider).await,
+                        i64::try_from(rows.len()).expect("row count fits i64")
+                    );
+                    if !memory_mode {
+                        assert_eq!(
+                            provider.cached_inlined_row_count(),
+                            i64::try_from(rows.len()).expect("row count fits i64"),
+                            "the file-mode write used the inline tier"
                         );
-                        let stream = Box::pin(RecordBatchStreamAdapter::new(
-                            Arc::clone(&schema),
-                            futures::stream::iter(
-                                vec![
-                                    keyed_batch(&schema, &[(1, 50), (1, 50)]),
-                                    keyed_batch(&schema, &[(1, 50), (2, 60)]),
-                                ]
-                                .into_iter()
-                                .map(Ok),
-                            ),
-                        ));
-                        sink.write_all(stream, &ctx.task_ctx())
-                            .await
-                            .expect("strict upsert collapses identical copies");
-                        let mut rows = vec![(1, 50), (2, 60)];
-                        if !overwrite {
-                            rows.push((9, 90));
-                        }
-                        assert_eq!(keyed_rows(&ctx, &provider).await, rows);
                     }
                     if !memory_mode {
                         let before_reopen = keyed_rows(&ctx, &provider).await;
@@ -868,7 +820,6 @@ mod tests {
                             ctx.runtime_env(),
                         )
                         .with_context(Arc::clone(&context))
-                        .with_upsert_policy(upsert_policy)
                         .open("buffered_keys")
                         .await
                         .expect("reopen durable table");

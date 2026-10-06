@@ -14,86 +14,43 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Per-statement conflict policies and failed-refresh visibility (#14576).
+//! Per-statement resolution of repeated keys and failed-refresh visibility (#14576).
 
 use super::*;
-
-const CONFLICT_CAUSE: &str = "its data holds different versions of 1 value of 'id', and `on_conflict: upsert` does not choose between versions. Set `on_conflict` to `upsert_by_arrival` to keep the version that arrived last. See: https://spiceai.org/docs/features/data-acceleration/constraints";
-
-#[tokio::test(flavor = "multi_thread")]
-async fn upsert_rejects_different_versions_without_changing_stored_rows() {
-    let mut failures = Vec::new();
-    for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for upsert_policy in [UpsertPolicy::Upsert] {
-            for op in [InsertOp::Overwrite, InsertOp::Append] {
-                for split in [false, true] {
-                    let label = format!("{mode:?}/{upsert_policy:?}/{op:?}/split={split}");
-                    let (provider, catalog, runtime_env, _dir) = table(mode, upsert_policy).await;
-                    write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
-                        .await
-                        .expect("seed");
-                    let batches = if split {
-                        vec![batch(&[(1, "a"), (2, "b")]), batch(&[(1, "c")])]
-                    } else {
-                        vec![batch(&[(1, "a"), (2, "b"), (1, "c")])]
-                    };
-                    match write(&provider, op, batches).await {
-                        Ok(()) => failures.push(format!("{label}: ambiguous write succeeded")),
-                        Err(error) if error.to_string().contains(CONFLICT_CAUSE) => {}
-                        Err(error) => failures.push(format!("{label}: wrong cause: {error}")),
-                    }
-                    let expected = (owned(&[(9, "old")]), 1);
-                    let actual = visible(&provider).await;
-                    if actual != expected {
-                        failures.push(format!("{label}: failed write changed rows: {actual:?}"));
-                    }
-                    let reopened = reopen(&catalog, &runtime_env, upsert_policy).await;
-                    let actual = visible(&reopened).await;
-                    if actual != expected {
-                        failures.push(format!("{label}: persisted rows changed: {actual:?}"));
-                    }
-                }
-            }
-        }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn identical_copies_collapse_for_refreshes_and_statements() {
     let mut failures = Vec::new();
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for upsert_policy in [UpsertPolicy::Upsert] {
-            for op in [InsertOp::Overwrite, InsertOp::Append] {
-                for split in [false, true] {
-                    let label = format!("{mode:?}/{upsert_policy:?}/{op:?}/split={split}");
-                    let (provider, catalog, runtime_env, _dir) = table(mode, upsert_policy).await;
-                    write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
-                        .await
-                        .expect("seed");
-                    let batches = if split {
-                        vec![batch(&[(1, "a"), (2, "b")]), batch(&[(1, "a")])]
-                    } else {
-                        vec![batch(&[(1, "a"), (2, "b"), (1, "a")])]
-                    };
-                    if let Err(error) = write(&provider, op, batches).await {
-                        failures.push(format!("{label}: identical copies rejected: {error}"));
-                        continue;
-                    }
-                    let expected = if op == InsertOp::Append {
-                        (owned(&[(1, "a"), (2, "b"), (9, "old")]), 3)
-                    } else {
-                        (owned(&[(1, "a"), (2, "b")]), 2)
-                    };
-                    let actual = visible(&provider).await;
-                    if actual != expected {
-                        failures.push(format!("{label}: wrong rows: {actual:?}"));
-                    }
-                    let reopened = reopen(&catalog, &runtime_env, upsert_policy).await;
-                    let actual = visible(&reopened).await;
-                    if actual != expected {
-                        failures.push(format!("{label}: wrong persisted rows: {actual:?}"));
-                    }
+        for op in [InsertOp::Overwrite, InsertOp::Append] {
+            for split in [false, true] {
+                let label = format!("{mode:?}/{op:?}/split={split}");
+                let (provider, catalog, runtime_env, _dir) = table(mode).await;
+                write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
+                    .await
+                    .expect("seed");
+                let batches = if split {
+                    vec![batch(&[(1, "a"), (2, "b")]), batch(&[(1, "a")])]
+                } else {
+                    vec![batch(&[(1, "a"), (2, "b"), (1, "a")])]
+                };
+                if let Err(error) = write(&provider, op, batches).await {
+                    failures.push(format!("{label}: identical copies rejected: {error}"));
+                    continue;
+                }
+                let expected = if op == InsertOp::Append {
+                    (owned(&[(1, "a"), (2, "b"), (9, "old")]), 3)
+                } else {
+                    (owned(&[(1, "a"), (2, "b")]), 2)
+                };
+                let actual = visible(&provider).await;
+                if actual != expected {
+                    failures.push(format!("{label}: wrong rows: {actual:?}"));
+                }
+                let reopened = reopen(&catalog, &runtime_env).await;
+                let actual = visible(&reopened).await;
+                if actual != expected {
+                    failures.push(format!("{label}: wrong persisted rows: {actual:?}"));
                 }
             }
         }
@@ -102,20 +59,13 @@ async fn identical_copies_collapse_for_refreshes_and_statements() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn staged_statements_apply_the_whole_input_policy() {
+async fn staged_statements_keep_each_keys_last_copy() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for (policy, upsert_policy, drop_existing) in [
-            (upsert_on_id(), UpsertPolicy::Upsert, false),
-            (upsert_on_id(), UpsertPolicy::UpsertByArrival, false),
-            (drop_on_id(), UpsertPolicy::Upsert, true),
-        ] {
+        for policy in [upsert_on_id(), drop_on_id()] {
             for different in [false, true] {
-                let label = format!(
-                    "{mode:?}/{upsert_policy:?}/drop={drop_existing}/different={different}"
-                );
-                let (mut provider, catalog, runtime_env, _dir) =
+                let label = format!("{mode:?}/{policy:?}/different={different}");
+                let (provider, catalog, runtime_env, _dir) =
                     upsert_table(mode, policy.clone()).await;
-                provider.upsert_policy = upsert_policy;
                 let prior = (owned(&[(1, "old"), (9, "old")]), 2);
                 write(
                     &provider,
@@ -140,33 +90,14 @@ async fn staged_statements_apply_the_whole_input_policy() {
                     prior,
                     "{label}: staging is private"
                 );
-                let expected = if different
-                    && !drop_existing
-                    && upsert_policy != UpsertPolicy::UpsertByArrival
-                {
-                    let error =
-                        staged.expect_err("strict staged upsert rejects different versions");
-                    assert!(
-                        error
-                            .to_string()
-                            .contains("different versions of 2 values of 'id'"),
-                        "{label}: {error}"
-                    );
-                    prior
-                } else {
-                    staged
-                        .expect("stage")
-                        .commit(std::collections::HashSet::new(), true)
-                        .await
-                        .expect("commit");
-                    if drop_existing {
-                        (owned(&[(1, "old"), (2, "b"), (3, "a"), (9, "old")]), 4)
-                    } else {
-                        (owned(&[(1, latest), (2, "b"), (3, latest), (9, "old")]), 4)
-                    }
-                };
+                staged
+                    .expect("stage")
+                    .commit(std::collections::HashSet::new(), true)
+                    .await
+                    .expect("commit");
+                let expected = (owned(&[(1, latest), (2, "b"), (3, latest), (9, "old")]), 4);
                 assert_eq!(visible(&provider).await, expected, "{label}: live rows");
-                let reopened = reopen(&catalog, &runtime_env, upsert_policy).await;
+                let reopened = reopen(&catalog, &runtime_env).await;
                 assert_eq!(visible(&reopened).await, expected, "{label}: durable rows");
             }
         }
@@ -184,7 +115,7 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
     ] {
         let label = format!("{mode:?}/inline={inline_max_rows}");
         let runtime_env = SessionContext::new().runtime_env();
-        let (mut provider, catalog, _dir) = create_cdc_table_with_schema(
+        let (provider, catalog, _dir) = create_cdc_table_with_schema(
             "t",
             Arc::clone(&runtime_env),
             schema(),
@@ -199,7 +130,6 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
             upsert_on_id(),
         )
         .await;
-        provider.upsert_policy = UpsertPolicy::UpsertByArrival;
         write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
@@ -250,7 +180,7 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
                 "{label}: live data changed after failure: {actual:?}"
             ));
         }
-        let reopened = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
+        let reopened = reopen(&catalog, &runtime_env).await;
         let actual = visible(&reopened).await;
         if actual != expected {
             failures.push(format!(
@@ -262,7 +192,7 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
             .expect("publish the replacement without the fault");
         let expected = (owned(&[(9, "new"), (10, "new")]), 2);
         assert_eq!(visible(&provider).await, expected, "{label}: published");
-        let reopened = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
+        let reopened = reopen(&catalog, &runtime_env).await;
         assert_eq!(
             visible(&reopened).await,
             expected,
@@ -293,7 +223,7 @@ async fn failed_snapshot_publication_keeps_prior_rows_after_reopen() {
 async fn late_append_error_does_not_publish_an_earlier_segment() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         let runtime_env = SessionContext::new().runtime_env();
-        let (mut provider, catalog, _dir) = create_cdc_table_with_schema(
+        let (provider, catalog, _dir) = create_cdc_table_with_schema(
             "t",
             Arc::clone(&runtime_env),
             schema(),
@@ -313,7 +243,6 @@ async fn late_append_error_does_not_publish_an_earlier_segment() {
             ),
         )
         .await;
-        provider.upsert_policy = UpsertPolicy::UpsertByArrival;
         write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
             .await
             .expect("seed");
@@ -338,7 +267,7 @@ async fn late_append_error_does_not_publish_an_earlier_segment() {
             assert_eq!((rows, actual.1), (vec![(9, true)], 1), "{mode:?}");
         };
         assert_unchanged(visible(&provider).await);
-        let reopened = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
+        let reopened = reopen(&catalog, &runtime_env).await;
         assert_unchanged(visible(&reopened).await);
     }
 }
@@ -354,7 +283,7 @@ async fn seeded_streaming_table(
     TempDir,
 ) {
     let runtime_env = SessionContext::new().runtime_env();
-    let (mut provider, catalog, dir) = create_cdc_table_with_schema(
+    let (provider, catalog, dir) = create_cdc_table_with_schema(
         "t",
         Arc::clone(&runtime_env),
         schema(),
@@ -369,7 +298,6 @@ async fn seeded_streaming_table(
         upsert_on_id(),
     )
     .await;
-    provider.upsert_policy = UpsertPolicy::UpsertByArrival;
     write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
         .await
         .expect("seed");
@@ -460,7 +388,7 @@ async fn a_failed_commit_is_resolved_by_its_durable_outcome() {
                     new.clone()
                 }
             };
-            let reopened = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
+            let reopened = reopen(&catalog, &runtime_env).await;
             assert_eq!(visible(&reopened).await, durable, "{label}: reopened");
             write(&reopened, InsertOp::Append, vec![batch(&[(11, "x")])])
                 .await
@@ -530,7 +458,7 @@ async fn a_cancelled_append_publishes_before_releasing_the_write_lock() {
         let expected = (owned(&[(9, "new"), (10, "new")]), 2);
         assert_eq!(visible(&provider).await, expected, "{mode:?}: published");
         drop(next_writer);
-        let reopened = reopen(&catalog, &runtime_env, UpsertPolicy::UpsertByArrival).await;
+        let reopened = reopen(&catalog, &runtime_env).await;
         assert_eq!(visible(&reopened).await, expected, "{mode:?}: reopened");
     }
 }
@@ -538,78 +466,6 @@ async fn a_cancelled_append_publishes_before_releasing_the_write_lock() {
 /// Strict `upsert` names how many keys hold different versions in the whole
 /// statement, whatever its batch boundaries and write path: versions within one
 /// batch, across batches, or both, each count once.
-#[tokio::test(flavor = "multi_thread")]
-async fn conflicting_key_counts_cover_the_whole_statement() {
-    // Keys 1-4 hold different versions (within a batch, across, and both);
-    // key 5 repeats one version; key 6 appears once.
-    let rows: [(i64, &str); 11] = [
-        (1, "a"),
-        (1, "b"),
-        (2, "a"),
-        (2, "b"),
-        (2, "c"),
-        (3, "a"),
-        (4, "a"),
-        (4, "b"),
-        (5, "a"),
-        (6, "a"),
-        (5, "a"),
-    ];
-    let splits: [&[usize]; 3] = [&[11], &[1; 11], &[6, 5]];
-    let late: [(i64, &str); 2] = [(3, "b"), (4, "c")];
-    let mut failures = Vec::new();
-    for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for inline_max_rows in [0, 1_000] {
-            for op in [InsertOp::Append, InsertOp::Overwrite] {
-                for split in splits {
-                    let label = format!("{mode:?}/inline={inline_max_rows}/{op:?}/{split:?}");
-                    let runtime_env = SessionContext::new().runtime_env();
-                    let (mut provider, catalog, _dir) = create_cdc_table_with_schema(
-                        "t",
-                        Arc::clone(&runtime_env),
-                        schema(),
-                        vec!["id".to_string()],
-                        VortexConfig {
-                            deletion_mode: mode,
-                            inline_max_rows,
-                            stream_publish_interval_ms: 0,
-                            compaction_background_interval_ms: 3_600_000,
-                            ..VortexConfig::default()
-                        },
-                        upsert_on_id(),
-                    )
-                    .await;
-                    provider.upsert_policy = UpsertPolicy::Upsert;
-                    write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
-                        .await
-                        .expect("seed");
-                    let mut batches = Vec::new();
-                    let mut start = 0;
-                    for &len in split {
-                        batches.push(batch(&rows[start..start + len]));
-                        start += len;
-                    }
-                    batches.push(batch(&late));
-                    match write(&provider, op, batches).await {
-                        Ok(()) => failures.push(format!("{label}: accepted")),
-                        Err(error)
-                            if error
-                                .to_string()
-                                .contains("different versions of 4 values of 'id'") => {}
-                        Err(error) => failures.push(format!("{label}: {error}")),
-                    }
-                    let actual = visible(&provider).await;
-                    if actual != (owned(&[(9, "old")]), 1) {
-                        failures.push(format!("{label}: rows changed: {actual:?}"));
-                    }
-                    drop(catalog);
-                }
-            }
-        }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
 /// A transaction's write to each table is one statement over its own input,
 /// and the fused commit publishes every table's together. A table the
 /// transaction writes no rows to gains no snapshot.
@@ -618,111 +474,98 @@ async fn a_transaction_resolves_each_statement_and_commits_them_together() {
     use crate::provider::transaction::CayenneTransaction;
 
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for upsert_policy in [UpsertPolicy::UpsertByArrival, UpsertPolicy::Upsert] {
-            let label = format!("{mode:?}/{upsert_policy:?}");
-            let (mut first, catalog, runtime_env, dir) = seeded_streaming_table(mode).await;
-            first.upsert_policy = upsert_policy;
-            let create = |name: &str| CreateTableOptions {
-                table_name: name.to_string(),
-                schema: schema(),
-                primary_key: vec!["id".to_string()],
-                on_conflict: Some(upsert_on_id()),
-                base_path: dir.path().join("data").display().to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    deletion_mode: mode,
-                    inline_max_rows: 0,
-                    stream_publish_interval_ms: 0,
-                    compaction_background_interval_ms: 3_600_000,
-                    ..VortexConfig::default()
-                },
-            };
-            let mut tables = vec![first];
-            for name in ["u", "empty"] {
-                let table = CayenneTableProviderBuilder::new(
-                    Arc::clone(&catalog),
-                    Arc::clone(&runtime_env),
-                )
-                .with_upsert_policy(upsert_policy)
-                .create(create(name))
-                .await
-                .expect("create table");
-                write(&table, InsertOp::Append, vec![batch(&[(9, "old")])])
+        let label = format!("{mode:?}");
+        let (first, catalog, runtime_env, dir) = seeded_streaming_table(mode).await;
+        let create = |name: &str| CreateTableOptions {
+            table_name: name.to_string(),
+            schema: schema(),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(upsert_on_id()),
+            base_path: dir.path().join("data").display().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                deletion_mode: mode,
+                inline_max_rows: 0,
+                stream_publish_interval_ms: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let mut tables = vec![first];
+        for name in ["u", "empty"] {
+            let table =
+                CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                    .create(create(name))
                     .await
-                    .expect("seed");
-                tables.push(table);
-            }
-            let latest = if upsert_policy == UpsertPolicy::UpsertByArrival {
-                "b"
+                    .expect("create table");
+            write(&table, InsertOp::Append, vec![batch(&[(9, "old")])])
+                .await
+                .expect("seed");
+            tables.push(table);
+        }
+        let latest = "b";
+        let statement = |rows: bool| {
+            let batches = if rows {
+                vec![
+                    batch(&[(1, "a"), (2, "a")]),
+                    batch(&[(1, latest), (9, "new")]),
+                ]
             } else {
-                "a"
+                Vec::new()
             };
-            let statement = |rows: bool| {
-                let batches = if rows {
-                    vec![
-                        batch(&[(1, "a"), (2, "a")]),
-                        batch(&[(1, latest), (9, "new")]),
-                    ]
-                } else {
-                    Vec::new()
-                };
-                Box::pin(RecordBatchStreamAdapter::new(
-                    schema(),
-                    futures::stream::iter(batches.into_iter().map(Ok)),
-                )) as SendableRecordBatchStream
-            };
-            let empty_snapshots = catalog
-                .get_all_snapshot_sequences(tables[2].table_id())
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema(),
+                futures::stream::iter(batches.into_iter().map(Ok)),
+            )) as SendableRecordBatchStream
+        };
+        let empty_snapshots = catalog
+            .get_all_snapshot_sequences(tables[2].table_id())
+            .await
+            .expect("snapshots");
+        let txn = CayenneTransaction::new();
+        for (index, table) in tables.iter().enumerate() {
+            let token = table.transaction_write_token().await;
+            txn.register(
+                table.table_id().to_string(),
+                token,
+                table.clone_for_write_operations(),
+            );
+            let staged = table
+                .begin_staged_upsert_occ(token, statement(index < 2), 2)
                 .await
-                .expect("snapshots");
-            let txn = CayenneTransaction::new();
-            for (index, table) in tables.iter().enumerate() {
-                let token = table.transaction_write_token().await;
-                txn.register(
-                    table.table_id().to_string(),
-                    token,
-                    table.clone_for_write_operations(),
-                );
-                let staged = table
-                    .begin_staged_upsert_occ(token, statement(index < 2), 2)
+                .unwrap_or_else(|error| panic!("{label}: stage: {error}"));
+            txn.set_staged(table.table_id(), staged);
+        }
+        txn.commit()
+            .await
+            .unwrap_or_else(|error| panic!("{label}: commit: {error}"));
+        let written = (owned(&[(1, latest), (2, "a"), (9, "new")]), 3);
+        let untouched = (owned(&[(9, "old")]), 1);
+        for (name, table, expected) in [
+            ("t", &tables[0], &written),
+            ("u", &tables[1], &written),
+            ("empty", &tables[2], &untouched),
+        ] {
+            assert_eq!(&visible(table).await, expected, "{label}: {name} live");
+            let reopened =
+                CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                    .open(name)
                     .await
-                    .unwrap_or_else(|error| panic!("{label}: stage: {error}"));
-                txn.set_staged(table.table_id(), staged);
-            }
-            txn.commit()
-                .await
-                .unwrap_or_else(|error| panic!("{label}: commit: {error}"));
-            let written = (owned(&[(1, latest), (2, "a"), (9, "new")]), 3);
-            let untouched = (owned(&[(9, "old")]), 1);
-            for (name, table, expected) in [
-                ("t", &tables[0], &written),
-                ("u", &tables[1], &written),
-                ("empty", &tables[2], &untouched),
-            ] {
-                assert_eq!(&visible(table).await, expected, "{label}: {name} live");
-                let reopened = CayenneTableProviderBuilder::new(
-                    Arc::clone(&catalog),
-                    Arc::clone(&runtime_env),
-                )
-                .with_upsert_policy(upsert_policy)
-                .open(name)
-                .await
-                .expect("reopen");
-                assert_eq!(
-                    &visible(&reopened).await,
-                    expected,
-                    "{label}: {name} reopened"
-                );
-            }
+                    .expect("reopen");
             assert_eq!(
-                catalog
-                    .get_all_snapshot_sequences(tables[2].table_id())
-                    .await
-                    .expect("snapshots"),
-                empty_snapshots,
-                "{label}: a table written no rows gains no snapshot"
+                &visible(&reopened).await,
+                expected,
+                "{label}: {name} reopened"
             );
         }
+        assert_eq!(
+            catalog
+                .get_all_snapshot_sequences(tables[2].table_id())
+                .await
+                .expect("snapshots"),
+            empty_snapshots,
+            "{label}: a table written no rows gains no snapshot"
+        );
     }
 }
 
@@ -745,7 +588,6 @@ async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
             let (first, catalog, runtime_env, dir) = seeded_streaming_table(mode).await;
             let second =
                 CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
-                    .with_upsert_policy(UpsertPolicy::UpsertByArrival)
                     .create(CreateTableOptions {
                         table_name: "u".to_string(),
                         schema: schema(),
@@ -843,7 +685,6 @@ async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
                     Arc::clone(&catalog),
                     Arc::clone(&runtime_env),
                 )
-                .with_upsert_policy(UpsertPolicy::UpsertByArrival)
                 .open(name)
                 .await
                 .unwrap_or_else(|error| panic!("{label}: reopen {name}: {error}"));
@@ -858,25 +699,20 @@ async fn a_failed_transaction_commit_is_resolved_by_its_durable_outcome() {
 }
 
 /// A write counts the rows it receives but does not keep into the counter its
-/// session carries: an identical copy as `unchanged`, a version settled by
-/// arrival as `arrival`, whether the copies share a batch, span batches, or one
-/// meets a stored key `drop` keeps.
+/// session carries, as `arrival`, whether the copies are identical or not and
+/// whether they share a batch or span batches. A stored row the write replaces
+/// was not received by it, so it is not counted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_counts_the_rows_it_does_not_keep_by_reason() {
     use util::session_state::{SupersededReason, SupersededRows, with_superseded_rows};
 
-    let counted = |rows: &SupersededRows| {
-        (
-            rows.get(SupersededReason::Unchanged),
-            rows.get(SupersededReason::Arrival),
-        )
-    };
+    let counted = |rows: &SupersededRows| rows.get(SupersededReason::Arrival);
     for mode in [DeletionMode::Key, DeletionMode::Position] {
         for inline_max_rows in [0, 1_000] {
             for op in [InsertOp::Overwrite, InsertOp::Append] {
                 let label = format!("{mode:?}/inline={inline_max_rows}/{op:?}");
                 let runtime_env = SessionContext::new().runtime_env();
-                let (mut provider, _catalog, _dir) = create_cdc_table_with_schema(
+                let (provider, _catalog, _dir) = create_cdc_table_with_schema(
                     "t",
                     Arc::clone(&runtime_env),
                     schema(),
@@ -891,7 +727,6 @@ async fn a_write_counts_the_rows_it_does_not_keep_by_reason() {
                     upsert_on_id(),
                 )
                 .await;
-                provider.upsert_policy = UpsertPolicy::UpsertByArrival;
                 let rows = Arc::new(SupersededRows::default());
                 let ctx = SessionContext::new();
                 let state = with_superseded_rows(&ctx.state(), Arc::clone(&rows));
@@ -919,11 +754,11 @@ async fn a_write_counts_the_rows_it_does_not_keep_by_reason() {
                     (owned(&[(1, "a"), (2, "b"), (3, "a")]), 3),
                     "{label}: rows"
                 );
-                assert_eq!(counted(&rows), (2, 1), "{label}: counted");
+                assert_eq!(counted(&rows), 3, "{label}: counted");
             }
         }
 
-        // `drop` discards an incoming row whose key is stored.
+        // A table created with `DoNothing` replaces the stored row too.
         let (provider, _catalog, _runtime_env, _dir) = upsert_table(mode, drop_on_id()).await;
         write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
             .await
@@ -944,9 +779,9 @@ async fn a_write_counts_the_rows_it_does_not_keep_by_reason() {
         collect(plan, ctx.task_ctx()).await.expect("append");
         assert_eq!(
             visible(&provider).await,
-            (owned(&[(4, "a"), (9, "old")]), 2),
-            "{mode:?}: drop keeps the stored row"
+            (owned(&[(4, "a"), (9, "new")]), 2),
+            "{mode:?}: the incoming row replaces the stored one"
         );
-        assert_eq!(counted(&rows), (0, 1), "{mode:?}: drop counted");
+        assert_eq!(counted(&rows), 0, "{mode:?}: nothing received was dropped");
     }
 }

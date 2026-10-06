@@ -59,7 +59,7 @@ use data_accelerator_api::snapshots::{
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
-    get_primary_keys_from_constraints, upsert_dedup,
+    get_primary_keys_from_constraints,
 };
 use runtime_acceleration::Engine;
 use runtime_acceleration::OnSchemaChange;
@@ -782,18 +782,6 @@ fn changes_scan_view_lag() -> Duration {
         Duration::from_millis(ms)
     });
     *CHANGES_SCAN_VIEW_LAG
-}
-
-/// Normalize the runtime's upsert options to Cayenne's canonical policy.
-fn upsert_policy_for<S: std::hash::BuildHasher>(
-    options: &HashMap<String, String, S>,
-) -> cayenne::UpsertPolicy {
-    let options = upsert_dedup::extract_upsert_options(options);
-    if options.last_write_wins {
-        cayenne::UpsertPolicy::UpsertByArrival
-    } else {
-        cayenne::UpsertPolicy::Upsert
-    }
 }
 
 /// `WithinLag` only for **read-only** `refresh_mode: changes` (analytical CDC
@@ -2617,7 +2605,6 @@ impl CayenneAccelerator {
         time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
         primary_keys: Vec<String>,
         on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
-        upsert_policy: cayenne::UpsertPolicy,
         runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Arc<cayenne::CayenneTableProvider>> {
         use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
@@ -2736,7 +2723,6 @@ impl CayenneAccelerator {
             .with_maintained_aggregates(maintained_aggregate_specs)
             .with_durable_write_back(durable_write_back)
             .with_scan_view_reuse(scan_view_reuse)
-            .with_upsert_policy(upsert_policy)
             .with_secondary_indexes(secondary_index_columns(source));
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
@@ -3943,8 +3929,6 @@ impl DataAccelerator for CayenneAccelerator {
                 detail: Arc::from(format!("on_conflict invalid: {e}")),
             })?;
 
-        let upsert_policy = upsert_policy_for(&cmd.options);
-
         // Always create the base Cayenne table provider
         let cayenne_table = self
             .create_cayenne_table_provider(
@@ -3956,7 +3940,6 @@ impl DataAccelerator for CayenneAccelerator {
                 time_retention_filter_builder.clone(),
                 primary_keys.clone(),
                 on_conflict.clone(),
-                upsert_policy,
                 Arc::clone(&runtime_env),
             )
             .await
@@ -4118,7 +4101,6 @@ impl DataAccelerator for CayenneAccelerator {
                 .with_background_compaction(Arc::clone(&self.compaction_semaphore))
                 .with_direct_partition_writes()
                 .with_scan_view_reuse(scan_view_reuse_for(source))
-                .with_upsert_policy(upsert_policy)
                 .with_secondary_indexes(secondary_index_columns(source)),
             );
 

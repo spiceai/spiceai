@@ -191,7 +191,7 @@ pub(crate) fn warn_about_acceleration_block(
 /// refresh of `ds` can report, so the series exist before the first one. A
 /// dataset whose refreshes report none gets no series.
 fn seed_superseded_rows(ds: &Dataset) {
-    use crate::component::dataset::acceleration::{Engine, OnConflictBehavior};
+    use crate::component::dataset::acceleration::Engine;
     use util::session_state::SupersededReason;
 
     let Some(acceleration) = ds.acceleration.as_ref().filter(|acceleration| {
@@ -201,21 +201,18 @@ fn seed_superseded_rows(ds: &Dataset) {
     }) else {
         return;
     };
-    let Some(behavior) = acceleration.on_conflict.values().next() else {
+    // A Cayenne table with a primary key keeps the last version of each key.
+    if acceleration.primary_key.is_none() {
         return;
-    };
-    let reasons: &[SupersededReason] = match behavior {
-        _ if acceleration.upsert_by_time.is_some() => &[
+    }
+    let reasons: &[SupersededReason] = if acceleration.upsert_by_time.is_some() {
+        &[
             SupersededReason::Unchanged,
             SupersededReason::Older,
             SupersededReason::EqualTime,
-        ],
-        OnConflictBehavior::Upsert(options) if !options.last_write_wins => {
-            &[SupersededReason::Unchanged]
-        }
-        OnConflictBehavior::Drop | OnConflictBehavior::Upsert(_) => {
-            &[SupersededReason::Unchanged, SupersededReason::Arrival]
-        }
+        ]
+    } else {
+        &[SupersededReason::Arrival]
     };
     for reason in reasons {
         metrics::acceleration::REFRESH_ROWS_SUPERSEDED.add(

@@ -24,7 +24,7 @@ limitations under the License.
 //!
 //! ```text
 //! cargo run --release -p cayenne --example layered_refresh_bench -- \
-//!     --policy <none|drop|upsert|keep_last> --keys 1000000 --passes 4 [--refreshes 2]
+//!     --policy <none|keep_last> --keys 1000000 --passes 4 [--refreshes 2]
 //! ```
 //!
 //! `--append` writes the generated data as an append refresh instead, through
@@ -57,7 +57,7 @@ use std::time::Instant;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog, UpsertPolicy};
+use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
@@ -302,7 +302,7 @@ async fn time_queries(ctx: &SessionContext, keys: usize, label: &str) {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let policy = arg("--policy", "upsert");
+    let policy = arg("--policy", "keep_last");
     let keys: usize = arg("--keys", "1000000").parse().expect("keys");
     let passes: usize = arg("--passes", "1").parse().expect("passes");
     let refreshes: usize = arg("--refreshes", "1").parse().expect("refreshes");
@@ -337,15 +337,12 @@ async fn main() {
         SessionContext::new_with_config_rt(datafusion::prelude::SessionConfig::new(), runtime)
     };
     let key = ColumnReference::new(key_columns());
-    let (on_conflict, upsert_policy) = match policy.as_str() {
-        "none" => (None, UpsertPolicy::Upsert),
-        "drop" => (Some(OnConflict::DoNothing(key)), UpsertPolicy::Upsert),
-        "upsert" => (Some(OnConflict::Upsert(key)), UpsertPolicy::Upsert),
-        "keep_last" => (Some(OnConflict::Upsert(key)), UpsertPolicy::UpsertByArrival),
+    let on_conflict = match policy.as_str() {
+        "none" => None,
+        "keep_last" => Some(OnConflict::Upsert(key)),
         other => panic!("unknown policy {other}"),
     };
     let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-        .with_upsert_policy(upsert_policy)
         .create(CreateTableOptions {
             table_name: "t".to_string(),
             schema: schema(),

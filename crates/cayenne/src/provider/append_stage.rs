@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
-use super::key_conflicts::{KeyResolver, Survivor};
+use super::key_conflicts::KeyResolver;
 use super::on_conflict::{OnConflictDeletions, PostValidationState};
 use super::overwrite::{FileStatsObserver, WriteShape};
 use super::overwrite_postpass::{self, ArrivalStream, CopyOrder, DedupShare};
@@ -57,7 +57,6 @@ impl ResolveAfterWrite {
         let schema = table.table_schema();
         let indices = table.primary_key_indices()?.unwrap_or_default();
         let arrival_name = overwrite_postpass::arrival_column(&schema);
-        let survivor = Survivor::for_policy(resolver.policy());
         let share = DedupShare::claim();
         let arrival = ArrivalStream::new(data, resolver, &arrival_name);
         let stamped_batches = arrival.stamped_batches();
@@ -74,7 +73,7 @@ impl ResolveAfterWrite {
                     )
                 }
                 None => (
-                    CopyOrder::Arrival(survivor),
+                    CopyOrder::Arrival,
                     overwrite_postpass::with_arrival(&schema, &arrival_name),
                     Box::pin(arrival),
                 ),

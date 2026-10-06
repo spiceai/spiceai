@@ -133,7 +133,6 @@ pub use compaction::{
     set_compaction_runtime_env, set_compaction_runtime_handle,
 };
 pub use context::CayenneContext;
-pub use key_conflicts::UpsertPolicy;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{
     clear_global_mem_tier_pool_account, global_mem_tier_pool_account_bytes, global_mem_tier_total,

@@ -1367,19 +1367,17 @@ async fn a_cache_hit_is_recorded_when_the_stream_is_consumed() {
     );
 }
 
-/// A Cayenne refresh reports the rows it received but did not keep, by reason:
-/// an identical copy as `unchanged` and a version settled by arrival as
-/// `arrival`, while `rows_written` counts every row received. A strict `upsert`
-/// dataset publishes `unchanged` at zero at load and no `arrival` series, which
-/// its refreshes cannot report.
+/// A Cayenne refresh reports the rows it received but did not keep — each copy
+/// of a key settled by arrival, identical or not — as `arrival`, while
+/// `rows_written` counts every row received. A dataset with a primary key
+/// publishes `arrival` at zero at load, before its first repeated key; one
+/// without a primary key publishes no series.
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
-    use spicepod::acceleration::OnConflictBehavior;
-
     let registry = &*PROMETHEUS;
     let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
-    let keyed = |name: &str, behavior: OnConflictBehavior, csv: &str| {
+    let keyed = |name: &str, primary_key: Option<&str>, csv: &str| {
         let path = dir.path().join(format!("{name}.csv"));
         std::fs::write(&path, csv).expect("write the fixture CSV");
         let mut dataset = Dataset::new(format!("file://{}", path.display()), name);
@@ -1399,8 +1397,7 @@ async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
                 .into_iter()
                 .collect(),
             )),
-            primary_key: Some("id".to_string()),
-            on_conflict: HashMap::from([("id".to_string(), behavior)]),
+            primary_key: primary_key.map(ToString::to_string),
             ..Acceleration::default()
         });
         dataset
@@ -1412,16 +1409,9 @@ async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
         .chain(["0,first\n".to_string(), "1,second\n".to_string()])
         .collect();
     let app = AppBuilder::new("metrics_superseded_rows")
-        .with_dataset(keyed(
-            "superseded_arrival",
-            OnConflictBehavior::UpsertByArrival,
-            &repeated,
-        ))
-        .with_dataset(keyed(
-            "superseded_strict",
-            OnConflictBehavior::Upsert,
-            "id,v\n1,a\n2,b\n",
-        ))
+        .with_dataset(keyed("superseded_arrival", Some("id"), &repeated))
+        .with_dataset(keyed("superseded_unique", Some("id"), "id,v\n1,a\n2,b\n"))
+        .with_dataset(keyed("superseded_keyless", None, "id,v\n1,a\n1,a\n"))
         .with_runtime(SpicepodRuntime {
             task_history: TaskHistory {
                 enabled: false,
@@ -1446,8 +1436,7 @@ async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
             &[("dataset", dataset), ("reason", reason)],
         )
     };
-    assert_eq!(superseded("superseded_arrival", "unchanged"), Some(1.0));
-    assert_eq!(superseded("superseded_arrival", "arrival"), Some(1.0));
+    assert_eq!(superseded("superseded_arrival", "arrival"), Some(2.0));
     assert_eq!(
         counter_value(
             registry,
@@ -1456,6 +1445,6 @@ async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
         ),
         Some(8_194.0)
     );
-    assert_eq!(superseded("superseded_strict", "unchanged"), Some(0.0));
-    assert_eq!(superseded("superseded_strict", "arrival"), None);
+    assert_eq!(superseded("superseded_unique", "arrival"), Some(0.0));
+    assert_eq!(superseded("superseded_keyless", "arrival"), None);
 }
