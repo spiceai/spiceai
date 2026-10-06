@@ -315,20 +315,20 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
             );
             // SQLite LIKE folds ASCII case, so a federated
             // `customer LIKE '%ALICE%'` would have kept the two `alice` rows.
-            // Distinct SQL from the loop case so the results cache cannot
-            // return a schema-less empty batch.
-            assert_batches_eq!(
-                [
-                    "+----+----------+",
-                    "| id | customer |",
-                    "+----+----------+",
-                    "+----+----------+",
-                ],
-                &run_query(
-                    &rt,
-                    "SELECT id, customer FROM accelerated WHERE customer LIKE '%ALICE%' ORDER BY id"
-                )
-                .await?
+            // Zero-row answers arrive as no batches, which pretty-print as
+            // `++` rather than an empty headered table.
+            let like_alice = run_query(
+                &rt,
+                "SELECT id, customer FROM accelerated WHERE customer LIKE '%ALICE%' ORDER BY id",
+            )
+            .await?;
+            assert_eq!(
+                like_alice
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                0,
+                "LIKE '%ALICE%' must match no row; SQLite would have kept the two alice rows"
             );
 
             rt.shutdown().await;
