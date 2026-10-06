@@ -48,7 +48,9 @@ use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use runtime_component::dataset::{ReadyState, TimeFormat};
 use runtime_datafusion::error::{SpiceExternalError, format_datafusion_error};
-use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
+use runtime_datafusion::execution_plan::fallback_on_zero_results::{
+    FallbackAsyncTableProvider, FallbackKeepFilters,
+};
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
     schema_cast::SchemaCastScanExec, wrap_with_filter,
@@ -1965,15 +1967,19 @@ impl AcceleratedTable {
                         accelerator_limit,
                     )
                     .await?;
-                let fallback_keep_filters = if let Some(ref keep) = self.fallback_retention_keep {
-                    // Schema only. Awaiting `table_provider()` would block every
-                    // accelerated scan on a deferred source, including ones that
-                    // never fall back. Source resolution stays in `fallback_fn`.
-                    keep.keep_filters(&self.federated.schema())
-                        .map_err(|e| DataFusionError::Plan(e.to_string()))?
-                } else {
-                    Vec::new()
-                };
+                // Schema only, and only invoked if the accelerator stream is
+                // empty. Planning here would coerce/simplify the keep predicate
+                // on every scan, including hits. Awaiting `table_provider()`
+                // would also block those hits on a deferred source.
+                let federated_schema = self.federated.schema();
+                let keep_spec = self.fallback_retention_keep.clone();
+                let fallback_keep_filters: FallbackKeepFilters =
+                    Arc::new(move || match &keep_spec {
+                        Some(keep) => keep
+                            .keep_filters(&federated_schema)
+                            .map_err(|e| DataFusionError::Plan(e.to_string())),
+                        None => Ok(Vec::new()),
+                    });
                 Arc::new(FallbackOnZeroResultsScanExec::new(
                     self.dataset_name.clone(),
                     input,

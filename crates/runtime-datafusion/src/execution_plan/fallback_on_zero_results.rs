@@ -44,6 +44,16 @@ pub type FallbackAsyncTableProvider = Arc<
         + Sync,
 >;
 
+/// Builds the retention keep filters only when a zero-results fallback runs.
+pub type FallbackKeepFilters = Arc<dyn Fn() -> Result<Vec<Expr>> + Send + Sync>;
+
+/// Already-planned keep filters. Tests use this; production builds the inverse
+/// lazily so an accelerator hit does not coerce or simplify a predicate.
+#[must_use]
+pub fn static_keep_filters(filters: Vec<Expr>) -> FallbackKeepFilters {
+    Arc::new(move || Ok(filters.clone()))
+}
+
 /// `FallbackOnZeroResultsScanExec` takes an input `ExecutionPlan` and a fallback `TableProvider`.
 /// If the input `ExecutionPlan` returns 0 rows, the fallback `TableProvider.scan()` is executed.
 ///
@@ -54,10 +64,9 @@ pub struct FallbackOnZeroResultsScanExec {
     input: Arc<dyn ExecutionPlan>,
     fallback_table_provider: FallbackAsyncTableProvider,
     fallback_scan_params: TableScanParams,
-    /// Inverse of the dataset's retention delete predicates. Applied only to
-    /// the federated fallback scan so rows retention removed cannot come back
-    /// from the source.
-    fallback_keep_filters: Vec<datafusion::logical_expr::Expr>,
+    /// Inverse of the dataset's retention delete predicates. Invoked only on
+    /// the federated fallback path so an accelerator hit does not plan them.
+    fallback_keep_filters: FallbackKeepFilters,
     properties: Arc<PlanProperties>,
 }
 
@@ -68,7 +77,7 @@ impl FallbackOnZeroResultsScanExec {
         mut input: Arc<dyn ExecutionPlan>,
         fallback_table_provider: FallbackAsyncTableProvider,
         fallback_scan_params: TableScanParams,
-        fallback_keep_filters: Vec<datafusion::logical_expr::Expr>,
+        fallback_keep_filters: FallbackKeepFilters,
     ) -> Self {
         let eq_properties = input.equivalence_properties().clone();
         let emission_type = input.pipeline_behavior();
@@ -145,7 +154,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 Arc::clone(&children[0]),
                 Arc::clone(&self.fallback_table_provider),
                 self.fallback_scan_params.clone(),
-                self.fallback_keep_filters.clone(),
+                Arc::clone(&self.fallback_keep_filters),
             )))
         } else {
             Err(DataFusionError::Execution(
@@ -178,7 +187,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         let schema = input_stream.schema();
         let scan_params = self.fallback_scan_params.clone();
         let table_name = self.table_name.clone();
-        let keep_filters = self.fallback_keep_filters.clone();
+        let keep_filters_fn = Arc::clone(&self.fallback_keep_filters);
 
         let federated_provider_callback = Arc::clone(&self.fallback_table_provider);
         let potentially_fallback_stream = stream::once(async move {
@@ -217,6 +226,16 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 );
                 tracing::debug!("{fallback_msg}");
                 metrics::FEDERATED_FALLBACK.add(1, &[KeyValue::new("dataset_name", table_name.to_string())]);
+                let keep_filters = match keep_filters_fn() {
+                    Ok(filters) => filters,
+                    Err(e) => {
+                        let error_stream = RecordBatchStreamAdapter::new(
+                            schema,
+                            stream::once(async move { Err(e) }),
+                        );
+                        return Box::pin(error_stream) as SendableRecordBatchStream;
+                    }
+                };
                 let federated_provider = federated_provider_callback().await;
                 let fallback_optimized_plan =
                     match scan_fallback_plan(
@@ -403,7 +422,7 @@ mod tests {
                     filters: vec![],
                     limit: None,
                 },
-                vec![],
+                static_keep_filters(vec![]),
             );
 
             let result_stream = exec
@@ -549,7 +568,7 @@ mod tests {
                 input_plan,
                 create_fallback_provider(memory_table_provider()),
                 fallback_scan_params,
-                vec![],
+                static_keep_filters(vec![]),
             );
 
             let result_stream = exec
@@ -675,7 +694,7 @@ mod tests {
                     filters: query_filters,
                     limit: None,
                 },
-                keep_filters,
+                static_keep_filters(keep_filters),
             );
             let schema = exec.schema();
             let stream = exec.execute(0, ctx.task_ctx()).expect("stream");
@@ -757,6 +776,59 @@ mod tests {
             assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
             assert_eq!(batch_ids(&batches), vec![3]);
             assert_eq!(batch_names(&batches, 1), vec!["also".to_string()]);
+        }
+
+        fn retained_memory_exec() -> Arc<dyn ExecutionPlan> {
+            Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![source_batch()]], events_schema(), None)
+                    .expect("retained exec"),
+            )))
+        }
+
+        #[tokio::test]
+        async fn keep_builder_runs_only_when_fallback_is_selected() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            async fn run(input: Arc<dyn ExecutionPlan>) -> usize {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let keep = keep_expr_for_retention_delete(col("deleted").eq(lit(true)));
+                let builder = {
+                    let calls = Arc::clone(&calls);
+                    Arc::new(move || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![keep.clone()])
+                    }) as FallbackKeepFilters
+                };
+                let ctx = SessionContext::new();
+                let exec = FallbackOnZeroResultsScanExec::new(
+                    TableReference::bare("events"),
+                    input,
+                    create_fallback_provider(source_table()),
+                    TableScanParams {
+                        state: Arc::new(ctx.state()),
+                        projection: None,
+                        filters: vec![],
+                        limit: None,
+                    },
+                    builder,
+                );
+                let stream = exec.execute(0, ctx.task_ctx()).expect("stream");
+                datafusion::physical_plan::common::collect(stream)
+                    .await
+                    .expect("collect");
+                calls.load(Ordering::SeqCst)
+            }
+
+            assert_eq!(
+                run(retained_memory_exec()).await,
+                0,
+                "an accelerator hit must not plan the retention inverse"
+            );
+            assert_eq!(
+                run(empty_memory_exec(None)).await,
+                1,
+                "fallback must plan the retention inverse once"
+            );
         }
     }
 }
