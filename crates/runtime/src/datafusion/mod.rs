@@ -3368,8 +3368,6 @@ impl DataFusion {
                         dataset.retention_period(),
                         dataset.time_column.clone(),
                         dataset.time_format,
-                        dataset.time_partition_column.clone(),
-                        dataset.time_partition_format,
                     );
                     if let Some(keep) = keep {
                         keep.validate(&source_table_provider.schema()).context(

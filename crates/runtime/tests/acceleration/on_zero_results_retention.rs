@@ -33,7 +33,10 @@ use spicepod::{
 use crate::{
     acceleration::load_runtime_datasets,
     configure_test_datafusion,
-    utils::{register_test_connectors, run_query, test_request_context, wait_until_true},
+    utils::{
+        register_test_connectors, run_query, runtime_ready_check, test_request_context,
+        wait_until_true,
+    },
 };
 
 fn ids(batches: &[RecordBatch]) -> Vec<i64> {
@@ -120,17 +123,22 @@ fn timed_events_dataset(dir: &Path, name: &str) -> Dataset {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn cayenne_unscheduled_time_dataset(dir: &Path, name: &str) -> Dataset {
-    let mut dataset = Dataset::new(format!("file://{}", dir.join("timed.csv").display()), name);
+fn cayenne_unscheduled_time_dataset(source: &Path, name: &str) -> Dataset {
+    let mut dataset = Dataset::new(format!("file://{}", source.display()), name);
     dataset.params = Some(Params::from_string_map(
         [("file_format".to_string(), "csv".to_string())].into(),
     ));
+    // Cayenne's scan-time keep builder rejects numeric columns without a
+    // unix scale (`data_type_to_timestamp_format(..., None)`), so the source
+    // timestamps are ISO-8601 strings — the DuckDB fixture can stay numeric.
     dataset.time_column = Some("ts".to_string());
-    dataset.time_format = Some(TimeFormat::UnixSeconds);
+    dataset.time_format = Some(TimeFormat::ISO8601);
+    dataset.time_partition_column = Some("partition_ts".to_string());
+    dataset.time_partition_format = Some(TimeFormat::ISO8601);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("cayenne".to_string()),
-        mode: spicepod::acceleration::Mode::File,
+        mode: spicepod::acceleration::Mode::Memory,
         refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
         on_zero_results: ZeroResultsAction::UseSource,
         refresh_sql: Some(format!("SELECT * FROM {name} WHERE id != 3")),
@@ -138,14 +146,6 @@ fn cayenne_unscheduled_time_dataset(dir: &Path, name: &str) -> Dataset {
         retention_check_enabled: false,
         retention_check_interval: None,
         retention_period: Some("1h".to_string()),
-        params: Some(Params::from_string_map(
-            [(
-                "cayenne_file_path".to_string(),
-                dir.join("accelerator").to_string_lossy().to_string(),
-            )]
-            .into_iter()
-            .collect(),
-        )),
         ..Acceleration::default()
     });
     dataset
@@ -360,50 +360,70 @@ async fn cayenne_unscheduled_time_retention_does_not_resurrect_via_fallback() ->
     test_request_context()
         .scope(async {
             let dir = tempfile::tempdir()?;
-            // 1_000_000_000 is 2001-09-09; 4_102_444_800 is 2100-01-01.
+            let source = dir.path().join("timed.csv");
+            // id=2 is expired on `ts` but recent on `partition_ts`. Cayenne's
+            // scan-time keep uses only `ts`, so a partition-AND fallback would
+            // resurrect it. id=4 has a NULL timestamp, which both keeps.
             std::fs::write(
-                dir.path().join("timed.csv"),
-                "id,ts\n1,4102444800\n2,1000000000\n3,4102444800\n",
+                &source,
+                "id,ts,partition_ts\n\
+                 1,2100-01-01T00:00:00Z,2100-01-01T00:00:00Z\n\
+                 2,2001-09-09T01:46:40Z,2100-01-01T00:00:00Z\n\
+                 3,2100-01-01T00:00:00Z,2100-01-01T00:00:00Z\n\
+                 4,,\n",
             )?;
 
             configure_test_datafusion();
+            let table = "cayenne_unscheduled_time_it";
             let app = AppBuilder::new("cayenne_unscheduled_time_fallback")
-                .with_dataset(cayenne_unscheduled_time_dataset(
-                    dir.path(),
-                    "cayenne_unscheduled_time",
-                ))
+                .with_dataset(cayenne_unscheduled_time_dataset(&source, table))
                 .build();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-            load_runtime_datasets(&rt, Duration::from_mins(2)).await?;
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timeout waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
 
-            let ids_in_accel = accelerator_ids(&rt, "cayenne_unscheduled_time").await;
+            let ids_in_accel = accelerator_ids(&rt, table).await;
             assert!(
                 ids_in_accel.contains(&1),
                 "refresh must load id=1, leftover {ids_in_accel:?}"
             );
             assert!(
                 !ids_in_accel.contains(&2),
-                "Cayenne scan-time retention must hide expired id=2 without a scheduled worker, leftover {ids_in_accel:?}"
+                "Cayenne scan-time retention must hide expired id=2 even when partition_ts is recent, leftover {ids_in_accel:?}"
             );
             assert!(
                 !ids_in_accel.contains(&3),
                 "refresh_sql must leave id=3 out of the accelerator so fallback is the only path"
             );
+            assert!(
+                ids_in_accel.contains(&4),
+                "NULL-timestamp rows stay visible under Cayenne scan-time keep, leftover {ids_in_accel:?}"
+            );
 
-            let evicted_row =
-                run_query(&rt, "SELECT id FROM cayenne_unscheduled_time WHERE id = 2").await?;
+            let evicted_row = run_query(&rt, &format!("SELECT id FROM {table} WHERE id = 2")).await?;
             assert_eq!(
                 ids(&evicted_row),
                 Vec::<i64>::new(),
                 "a row Cayenne hides at scan time must not come back from the source"
             );
 
-            let fallback =
-                run_query(&rt, "SELECT id FROM cayenne_unscheduled_time WHERE id = 3").await?;
+            let fallback = run_query(&rt, &format!("SELECT id FROM {table} WHERE id = 3")).await?;
             assert_eq!(
                 ids(&fallback),
                 vec![3],
                 "a recent row never loaded must still fall back"
+            );
+
+            let null_ts = run_query(&rt, &format!("SELECT id FROM {table} WHERE id = 4")).await?;
+            assert_eq!(
+                ids(&null_ts),
+                vec![4],
+                "a NULL-timestamp row must remain queryable"
             );
 
             rt.shutdown().await;

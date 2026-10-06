@@ -137,6 +137,12 @@ impl FallbackRetentionKeep {
     }
 
     /// Merge `keep` with unscheduled time retention when the ticker is off.
+    ///
+    /// The inverted cutoff uses `time_column` only. Cayenne's scan-time keep
+    /// ignores `time_partition_column`, so a partition-AND delete would keep
+    /// expired rows whose partition is recent or NULL and resurrect them
+    /// through fallback. Scheduled ticker filters still include the partition
+    /// column via [`Self::from_configured`].
     #[must_use]
     pub fn with_unscheduled_time(
         keep: Option<Self>,
@@ -144,16 +150,14 @@ impl FallbackRetentionKeep {
         period: Option<std::time::Duration>,
         time_column: Option<String>,
         time_format: Option<TimeFormat>,
-        time_partition_column: Option<String>,
-        time_partition_format: Option<TimeFormat>,
     ) -> Option<Self> {
         let time = match (scheduled_runs, period, time_column) {
             (false, Some(period), Some(time_column)) => Some(Self::from_time(
                 period,
                 time_column,
                 time_format,
-                time_partition_column,
-                time_partition_format,
+                None,
+                None,
             )),
             _ => None,
         };
@@ -261,6 +265,7 @@ fn time_retention_delete_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
     use runtime_component::dataset::TimeFormat;
@@ -446,8 +451,6 @@ mod tests {
             Some(Duration::from_secs(3600)),
             Some("ts".to_string()),
             Some(TimeFormat::UnixSeconds),
-            None,
-            None,
         )
         .expect("time period without a ticker is still invertible");
         keep.validate(&events_schema())
@@ -477,14 +480,120 @@ mod tests {
             Some(Duration::from_secs(3600)),
             Some("ts".to_string()),
             Some(TimeFormat::UnixSeconds),
-            None,
-            None,
         )
         .expect("scheduled keep is kept");
         assert_eq!(
             merged.filters.len(),
             1,
             "unscheduled time must not double the scheduled cutoff"
+        );
+    }
+
+    fn partitioned_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("partition_ts", DataType::Int64, true),
+        ]))
+    }
+
+    async fn ids_matching(keep: &FallbackRetentionKeep, schema: &SchemaRef) -> Vec<i64> {
+        use arrow::array::{Int64Array, RecordBatch};
+        use datafusion::catalog::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs(),
+        )
+        .expect("unix seconds fit i64");
+        let expired = now - 10_000;
+        let batch = RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int64Array::from(vec![
+                    Some(now),
+                    Some(expired),
+                    Some(expired),
+                    None,
+                ])),
+                Arc::new(Int64Array::from(vec![Some(now), None, Some(now), None])),
+            ],
+        )
+        .expect("batch");
+        let keep_expr = keep
+            .keep_filters(schema)
+            .expect("keep")
+            .into_iter()
+            .next()
+            .expect("one keep predicate");
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(Arc::clone(schema), vec![vec![batch]]).expect("mem")),
+        )
+        .expect("register");
+        let batches = ctx
+            .table("t")
+            .await
+            .expect("table")
+            .filter(keep_expr)
+            .expect("filter")
+            .collect()
+            .await
+            .expect("collect");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id")
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn unscheduled_time_keep_matches_cayenne_without_partition() {
+        let schema = partitioned_schema();
+        let keep = FallbackRetentionKeep::with_unscheduled_time(
+            None,
+            false,
+            Some(Duration::from_secs(3600)),
+            Some("ts".to_string()),
+            Some(TimeFormat::UnixSeconds),
+        )
+        .expect("unscheduled time is invertible");
+        let ids = ids_matching(&keep, &schema).await;
+        assert_eq!(
+            ids,
+            vec![1, 4],
+            "Cayenne scan-time keep uses only ts: expired rows stay out even when partition_ts is NULL (id=2) or recent (id=3); NULL ts is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_time_keep_uses_partition_and() {
+        let schema = partitioned_schema();
+        let keep = FallbackRetentionKeep::from_time(
+            Duration::from_secs(3600),
+            "ts".to_string(),
+            Some(TimeFormat::UnixSeconds),
+            Some("partition_ts".to_string()),
+            Some(TimeFormat::UnixSeconds),
+        );
+        let ids = ids_matching(&keep, &schema).await;
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4],
+            "scheduled ticker deletes only when ts AND partition_ts are both expired, so a recent or NULL partition keeps the row"
         );
     }
 
