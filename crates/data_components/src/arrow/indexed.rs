@@ -897,6 +897,20 @@ impl TableProvider for IndexedMemTable {
         self.mark_dirty();
         self.inner.truncate(state).await
     }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: datafusion::prelude::Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.mark_dirty();
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
+    }
 }
 
 #[async_trait]
@@ -1015,6 +1029,17 @@ impl ExecutionPlan for IndexedLookupExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -1099,6 +1124,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
     use datafusion::prelude::*;
 
     fn create_test_batch(ids: Vec<i64>, names: Vec<&str>) -> RecordBatch {
@@ -1810,7 +1836,9 @@ mod tests {
                 .scan(&session_state, None, std::slice::from_ref(&filter), None)
                 .await
                 .expect("scan");
-            let stats = plan.partition_statistics(None).expect("statistics");
+            let stats = StatisticsContext::new()
+                .compute(plan.as_ref(), &StatisticsArgs::new())
+                .expect("statistics");
             assert_eq!(
                 stats.num_rows,
                 datafusion::common::stats::Precision::Exact(expected),

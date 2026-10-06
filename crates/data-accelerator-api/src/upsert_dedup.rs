@@ -218,6 +218,21 @@ impl TableProvider for UpsertDedupTableProvider {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         self.inner.truncate(state).await
     }
+
+    /// Forwarded like UPDATE and DELETE: deduplication applies to `insert_into`'s
+    /// upsert input only, and the inner table resolves MERGE matches itself.
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
+    }
 }
 
 /// An execution plan that applies deduplication to batches before passing them downstream.
@@ -285,6 +300,17 @@ impl ExecutionPlan for UpsertDedupExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -406,6 +432,7 @@ mod tests {
         UpsertDedupExec, UpsertDedupTableProvider, extract_upsert_options,
         wrap_with_upsert_dedup_if_needed,
     };
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -863,7 +890,10 @@ mod tests {
         ));
 
         let rebuilt = Arc::clone(&dedup)
-            .with_new_children(vec![source(&[vec![batch(&[(1, "first"), (1, "second")])]])])
+            .replace_children(
+                vec![source(&[vec![batch(&[(1, "first"), (1, "second")])]])],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .expect("rebuild with one child");
 
         assert_eq!(rows_of(rebuilt).await, vec![(1, "second".to_string())]);
@@ -918,7 +948,10 @@ mod tests {
         ));
 
         let no_children = Arc::clone(&dedup)
-            .with_new_children(vec![])
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .expect_err("no children must be rejected");
         assert!(
             matches!(
@@ -929,10 +962,13 @@ mod tests {
         );
 
         let two_children = dedup
-            .with_new_children(vec![
-                source(&[vec![batch(&[(1, "a")])]]),
-                source(&[vec![batch(&[(2, "b")])]]),
-            ])
+            .replace_children(
+                vec![
+                    source(&[vec![batch(&[(1, "a")])]]),
+                    source(&[vec![batch(&[(2, "b")])]]),
+                ],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .expect_err("two children must be rejected");
         assert!(
             matches!(

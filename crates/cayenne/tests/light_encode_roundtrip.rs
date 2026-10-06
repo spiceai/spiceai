@@ -52,12 +52,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::util::display::array_value_to_string;
 use futures::StreamExt;
 use vortex::VortexSessionDefault;
+use vortex::array::VortexSessionExecute;
 use vortex::array::stream::ArrayStreamAdapter;
-use vortex::array::{ArrayRef, VortexSessionExecute};
-use vortex::arrow::FromArrowType;
-use vortex::arrow::{ArrowSessionExt, FromArrowArray};
+use vortex::arrow::ArrowSessionExt;
 use vortex::buffer::ByteBufferMut;
-use vortex::dtype::DType;
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex_btrblocks::schemes::{float, integer, string};
 use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme, SchemeExt};
@@ -344,9 +342,16 @@ async fn roundtrip(
         session = session.set(s);
     }
 
-    let dtype = DType::from_arrow(Arc::clone(schema));
-    let owned: Vec<RecordBatch> = batches.to_vec();
-    let stream = futures::stream::iter(owned.into_iter().map(|rb| ArrayRef::from_arrow(rb, false)));
+    let arrow = session.arrow();
+    let dtype = arrow
+        .from_arrow_schema(schema)
+        .expect("schema converts to a Vortex dtype");
+    let arrays: Vec<_> = batches
+        .iter()
+        .map(|rb| arrow.from_arrow_record_batch(rb.clone(), schema))
+        .collect();
+    drop(arrow);
+    let stream = futures::stream::iter(arrays);
     let adapter = ArrayStreamAdapter::new(dtype, stream);
 
     let mut buf = ByteBufferMut::empty();

@@ -37,8 +37,9 @@ use datafusion::{
     physical_expr::expressions::Column,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
-        SortOrderPushdownResult,
+        ChildStats, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+        InputDistributionRequirements, Partitioning, PlanProperties, ReplaceChildrenOptions,
+        SortOrderPushdownResult, StatisticsArgs,
         coalesce_partitions::CoalescePartitionsExec,
         execution_plan::{
             Boundedness, CardinalityEffect, EmissionType, InvariantLevel, check_default_invariants,
@@ -336,6 +337,24 @@ struct HttpWithDeferredParamsExec {
 }
 
 impl HttpWithDeferredParamsExec {
+    fn with_children(
+        &self,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let [http_side, build_side]: [Arc<dyn ExecutionPlan>; 2] =
+            children.try_into().map_err(|_| {
+                DataFusionError::Internal(
+                    "HttpWithDeferredParamsExec requires exactly 2 children".to_string(),
+                )
+            })?;
+        Ok(Arc::new(Self::new(
+            http_side,
+            build_side,
+            self.col_name.clone(),
+            self.build_col_index,
+        )))
+    }
+
     fn new(
         http_side: Arc<dyn ExecutionPlan>,
         build_side: Arc<dyn ExecutionPlan>,
@@ -423,6 +442,16 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
         vec![Distribution::UnspecifiedDistribution; 2]
     }
 
+    /// No specific distribution required for either child.
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![Distribution::UnspecifiedDistribution; 2])
+    }
+
+    /// Owns no dynamic filters.
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     /// No ordering required for either child.
     fn required_input_ordering(
         &self,
@@ -452,6 +481,19 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
+    ) -> Result<Arc<Statistics>, DataFusionError> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
+    }
+
+    /// The output depends on HTTP responses, so neither child's statistics say anything about it.
+    fn child_stats_requests(&self, _partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::Skip, ChildStats::Skip]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
     ) -> Result<Arc<Statistics>, DataFusionError> {
         Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
@@ -516,30 +558,56 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
         Ok(SortOrderPushdownResult::Unsupported)
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.http_side, &self.build_side]
+    }
+
+    /// Always rebuilds through `new`, which derives the properties from the HTTP side;
+    /// that is correct whether or not the children's properties changed.
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.with_children(children)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        if children.len() != 2 {
-            return Err(DataFusionError::Internal(
-                "HttpWithDeferredParamsExec requires exactly 2 children".to_string(),
-            ));
-        }
-        Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
-            Arc::clone(&children[1]),
-            self.col_name.clone(),
-            self.build_col_index,
-        )))
+        self.with_children(children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.with_children(children)
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.with_children(children)
+    }
+
+    /// Not serializable: execution fans out HTTP requests from this process.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>, DataFusionError> {
+        Ok(None)
     }
 
     fn execute(

@@ -442,11 +442,9 @@ mod tests {
     /// to; a full level writes with the session-default cascade.
     async fn encoded_file_size(level: u8, batch: &arrow::array::RecordBatch) -> usize {
         use vortex::VortexSessionDefault;
-        use vortex::array::ArrayRef as VortexArrayRef;
         use vortex::array::stream::ArrayStreamAdapter;
-        use vortex::arrow::{FromArrowArray, FromArrowType};
+        use vortex::arrow::ArrowSessionExt;
         use vortex::buffer::ByteBufferMut;
-        use vortex::dtype::DType;
         use vortex::file::WriteOptionsSessionExt;
         use vortex_session::VortexSession;
 
@@ -454,8 +452,13 @@ mod tests {
         if let Some(strategy) = strategy_builder_for_level(level) {
             session = session.set(strategy);
         }
-        let dtype = DType::from_arrow(batch.schema());
-        let chunk = VortexArrayRef::from_arrow(batch.clone(), false);
+        let schema = batch.schema();
+        let arrow = session.arrow();
+        let dtype = arrow
+            .from_arrow_schema(&schema)
+            .expect("schema converts to a Vortex dtype");
+        let chunk = arrow.from_arrow_record_batch(batch.clone(), &schema);
+        drop(arrow);
         let stream = ArrayStreamAdapter::new(dtype, futures::stream::iter([chunk]));
         let mut file = ByteBufferMut::empty();
         session

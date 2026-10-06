@@ -2978,7 +2978,7 @@ fn native_vector_indexes_for_schema(
                 .map(|(_, f)| f.as_ref().clone())
         })
         .collect();
-    let table_ref = datafusion::sql::TableReference::bare(table_name.to_string());
+    let table_ref = datafusion::common::TableReference::bare(table_name.to_string());
 
     schema
         .fields()

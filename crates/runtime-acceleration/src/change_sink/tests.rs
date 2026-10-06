@@ -28,12 +28,12 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::schema_evolution::WideningPlan;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeBatch as SourceBatch, changes_schema};
+use datafusion::common::TableReference;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, col, lit};
-use datafusion::sql::TableReference;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore, oneshot};
 

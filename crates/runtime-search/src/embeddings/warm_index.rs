@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_expr::ScalarUDF;
 use llms::embeddings::Embed;
 use runtime_acceleration::acceleration::ZeroResultsAction;

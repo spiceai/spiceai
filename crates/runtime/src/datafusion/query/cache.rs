@@ -27,10 +27,10 @@ use cache::{
 };
 use datafusion::{
     common::ParamValues,
+    common::TableReference,
     execution::{SendableRecordBatchStream, SessionState},
     logical_expr::LogicalPlan,
     physical_plan::ExecutionPlan,
-    sql::TableReference,
 };
 use runtime_request_context::{
     CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
@@ -2877,6 +2877,17 @@ mod tests {
 
         fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
             &self.properties
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         }
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

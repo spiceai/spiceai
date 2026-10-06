@@ -33,7 +33,7 @@ use datafusion_proto::bytes::Serializeable;
 use datafusion_proto::generated::datafusion_common;
 #[cfg(not(windows))]
 use datafusion_proto::physical_plan::AsExecutionPlan;
-use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use datafusion_proto::physical_plan::{PhysicalExtensionCodec, PhysicalProtoConverterExtension};
 #[cfg(not(windows))]
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use iceberg_datafusion::IcebergTableProvider;
@@ -86,8 +86,9 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if let Ok(plan) = self.inner.try_decode(buf, inputs, ctx) {
+        if let Ok(plan) = self.inner.try_decode(buf, inputs, ctx, proto_converter) {
             return Ok(plan);
         }
 
@@ -320,7 +321,12 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
         }
     }
 
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<()> {
         let wrapper = if let Some(concrete) = node.downcast_ref::<SchemaCastScanExec>() {
             let mut schema_buf = vec![];
             let serialized_schema = datafusion_common::Schema::try_from(concrete.schema())?;
@@ -457,11 +463,11 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     )),
                 }
             } else {
-                return self.inner.try_encode(node, buf);
+                return self.inner.try_encode(node, buf, proto_converter);
             }
             #[cfg(windows)]
             {
-                return self.inner.try_encode(node, buf);
+                return self.inner.try_encode(node, buf, proto_converter);
             }
         };
 
@@ -571,6 +577,13 @@ fn encode_partitioning(partitioning: &Partitioning) -> Result<IcebergPartitionin
                 }
             }
         }
+        // Range partitioning has no recipe here; keep only the count, the same
+        // fallback a hash over non-column expressions takes.
+        Partitioning::Range(range) => IcebergPartitioning {
+            kind: 0,
+            partition_count: to_u64(range.partition_count())?,
+            hash_columns: Vec::new(),
+        },
     })
 }
 
@@ -634,6 +647,7 @@ mod tests {
     use datafusion::physical_expr::expressions::col;
     use datafusion::physical_plan::displayable;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    use datafusion_proto::physical_plan::DefaultPhysicalProtoConverter;
     use reqwest::header::{HeaderMap, HeaderValue};
     use std::collections::HashMap;
 
@@ -832,13 +846,23 @@ mod tests {
             valid_schema.clone(),
         ));
         let err = codec
-            .try_decode(&missing, &[], task_ctx.as_ref())
+            .try_decode(
+                &missing,
+                &[],
+                task_ctx.as_ref(),
+                &DefaultPhysicalProtoConverter {},
+            )
             .expect_err("an unregistered HTTP table should fail");
         assert!(err.to_string().contains("is not registered"), "{err}");
 
         let wrong_provider = http_recipe(recipe(&wrong_table_ref, valid_schema.clone()));
         let err = codec
-            .try_decode(&wrong_provider, &[], task_ctx.as_ref())
+            .try_decode(
+                &wrong_provider,
+                &[],
+                task_ctx.as_ref(),
+                &DefaultPhysicalProtoConverter {},
+            )
             .expect_err("a non-HTTP provider should fail");
         assert!(
             err.to_string().contains("not an HttpTableProvider"),
@@ -850,13 +874,19 @@ mod tests {
                 &http_recipe(recipe(&http_table_ref, valid_schema)),
                 &[memory_exec("input")],
                 task_ctx.as_ref(),
+                &DefaultPhysicalProtoConverter {},
             )
             .expect_err("HttpExec with an input should fail");
         assert!(err.to_string().contains("must not have input"), "{err}");
 
         let malformed = http_recipe(recipe(&http_table_ref, vec![0xff]));
         codec
-            .try_decode(&malformed, &[], task_ctx.as_ref())
+            .try_decode(
+                &malformed,
+                &[],
+                task_ctx.as_ref(),
+                &DefaultPhysicalProtoConverter {},
+            )
             .expect_err("a malformed projected schema should fail");
 
         let incompatible = http_recipe(recipe(
@@ -868,7 +898,12 @@ mod tests {
             )])),
         ));
         let err = codec
-            .try_decode(&incompatible, &[], task_ctx.as_ref())
+            .try_decode(
+                &incompatible,
+                &[],
+                task_ctx.as_ref(),
+                &DefaultPhysicalProtoConverter {},
+            )
             .expect_err("an incompatible projected schema should fail");
         assert!(
             err.to_string().contains("registered provider uses"),
@@ -883,7 +918,11 @@ mod tests {
             None,
         );
         let err = codec
-            .try_encode(Arc::new(anonymous), &mut Vec::new())
+            .try_encode(
+                Arc::new(anonymous),
+                &mut Vec::new(),
+                &DefaultPhysicalProtoConverter {},
+            )
             .expect_err("an anonymous HTTP provider should not serialize");
         assert!(
             err.to_string().contains("no registered table reference"),
@@ -963,7 +1002,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         codec
-            .try_encode(Arc::new(scan), &mut buf)
+            .try_encode(Arc::new(scan), &mut buf, &DefaultPhysicalProtoConverter {})
             .expect("IcebergScanExec should serialize through the Spice codec");
 
         let wrapper =

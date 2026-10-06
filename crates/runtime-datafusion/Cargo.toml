@@ -23,6 +23,9 @@ datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json.workspace = true
+# `ExecutionPlan::try_to_proto` exists only with datafusion-physical-plan's `proto`
+# feature, which datafusion-proto enables.
+datafusion-proto.workspace = true
 datafusion-table-providers.workspace = true
 futures.workspace = true
 itertools.workspace = true
