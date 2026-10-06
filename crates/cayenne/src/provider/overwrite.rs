@@ -877,7 +877,7 @@ impl CayenneTableProvider {
             Vec::new()
         } else {
             match self
-                .write_position_deletion_vectors(&position_deletions)
+                .write_position_deletion_vectors(&new_snapshot_id, &position_deletions)
                 .await
             {
                 Ok(files) => files,
@@ -903,14 +903,18 @@ impl CayenneTableProvider {
     }
 
     /// Write position deletion vectors for `position_deletions`, at a fresh
-    /// sequence, for an overwrite to commit with its snapshot.
+    /// sequence, into `snapshot_id`, the snapshot the overwrite commits them with:
+    /// the snapshot it replaces is retired, and an overwrite that fails removes
+    /// only its own directory.
     async fn write_position_deletion_vectors(
         &self,
+        snapshot_id: &str,
         position_deletions: &HashMap<String, Vec<u32>>,
     ) -> Result<Vec<crate::metadata::DeleteFile>> {
         let sequence = self.reserve_sequences_local(1).await?;
         let mut metadata = self.metadata().clone();
         metadata.current_sequence_number = sequence;
+        metadata.current_snapshot_id = snapshot_id.to_string();
         let specs = position_deletions
             .iter()
             .map(|(file, rows)| {

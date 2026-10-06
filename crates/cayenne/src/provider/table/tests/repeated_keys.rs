@@ -382,6 +382,36 @@ fn assert_resolved_shape(provider: &CayenneTableProvider, mode: DeletionMode) {
     assert_eq!(position_deleted, expected, "{mode:?}: position deletes");
 }
 
+/// An overwrite's position deletes live in the snapshot it publishes, not in the
+/// snapshot it replaces: the replaced snapshot's directory is retired, and an
+/// overwrite that fails removes only its own directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overwrite_writes_its_position_deletes_into_its_own_snapshot() {
+    let (provider, catalog, _runtime_env, _dir) = table(DeletionMode::Position).await;
+    // A first overwrite, so the second replaces a snapshot of its own.
+    write(&provider, InsertOp::Overwrite, vec![batch(&[(9, "z")])])
+        .await
+        .expect("first overwrite");
+    let replaced = provider.get_current_snapshot_id();
+    write(&provider, InsertOp::Overwrite, repeated_across_batches())
+        .await
+        .expect("overwrite repeating keys");
+    let published = provider.get_current_snapshot_id();
+    assert_ne!(replaced, published, "the overwrite publishes a new snapshot");
+    let delete_files = catalog
+        .get_table_delete_files(provider.table_id())
+        .await
+        .expect("delete files");
+    assert!(!delete_files.is_empty(), "the overwrite hides its repeats by position");
+    for delete_file in &delete_files {
+        assert!(
+            delete_file.path.contains(&format!("/{published}/")),
+            "delete file {} is outside the published snapshot {published}",
+            delete_file.path
+        );
+    }
+}
+
 /// After an overwrite that repeats keys on a position-deletion table, position capture and
 /// a later upsert of the repeated keys still leave exactly one row per key.
 #[tokio::test(flavor = "multi_thread")]
