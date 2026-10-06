@@ -453,17 +453,19 @@ impl TableProvider for MetadataPruningListingTable {
                 filters.len()
             ]);
         }
-        // When `scan` will prune the listing by `_last_modified`, every
-        // predicate stays a residual `FilterExec` above the pruned scan:
-        // `Inexact` keeps the row-level filter (so precision and any
-        // partition/data-column predicate are always re-enforced) while the
-        // prune itself removes the files that cannot match. The `_location`
-        // fast-path takes precedence, so this only applies when it is absent.
-        // `scan` receives `&[Expr]`, so mirror the same predicate detection here
-        // over the borrowed slice this method is given.
+        // When `scan` takes the `_location` fast path or prunes the listing by
+        // `_last_modified`, every predicate stays a residual `FilterExec` above
+        // the pruned scan. Both paths only choose which objects to open: they
+        // apply no other predicate, and the inner listing reports a partition
+        // predicate `Exact`, which would drop it from the plan and return rows
+        // the query excluded. `Inexact` keeps the row-level filter so every
+        // predicate is re-enforced, while the prune still removes the files
+        // that cannot match. `scan` receives `&[Expr]`, so mirror the same
+        // predicate detection here over the borrowed slice this method is
+        // given.
         let owned_filters: Vec<datafusion_expr::Expr> = filters.iter().copied().cloned().collect();
-        if extract_location_predicates(&owned_filters).is_none()
-            && extract_last_modified_predicate(&owned_filters).is_some()
+        if extract_location_predicates(&owned_filters).is_some()
+            || extract_last_modified_predicate(&owned_filters).is_some()
         {
             return Ok(vec![
                 datafusion_expr::TableProviderFilterPushDown::Inexact;
@@ -4933,6 +4935,115 @@ mod tests {
             batches[0].schema().field(1).name(),
             "_location",
             "second column should be location"
+        );
+    }
+
+    /// The `_location` fast path in `scan` applies only `_location` and
+    /// `_last_modified`, so every other predicate in the same query must stay a
+    /// residual filter. The inner listing reports a partition predicate `Exact`,
+    /// which would otherwise drop it from the plan and return rows the query
+    /// excluded; `_size` and data-column predicates are covered here too so the
+    /// guard still holds if the inner listing starts reporting them `Exact`.
+    #[tokio::test]
+    async fn location_fast_path_keeps_other_predicates_as_residual_filters() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let partition_dir = temp_dir.path().join("day=2025-01-01");
+        std::fs::create_dir_all(&partition_dir).expect("create partition dir");
+
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("create batch");
+        let parquet_path = partition_dir.join("data.parquet");
+        let file = std::fs::File::create(&parquet_path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&file_schema), None).expect("create writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+        let file_size = std::fs::metadata(&parquet_path)
+            .expect("parquet file metadata")
+            .len();
+
+        let ctx = SessionContext::new();
+        // `Url::from_directory_path` spells the file URL the way the running
+        // platform needs (`file:///tmp/x/` on Unix, `file:///C:/...` on Windows);
+        // formatting the path by hand yields `file://C:/...`, whose `C:` parses
+        // as the URL host, so the listing matches nothing.
+        let store_url = Url::from_directory_path(temp_dir.path()).expect("directory url");
+        let table_url = store_url.to_string();
+        let table_path = ListingTableUrl::parse(&table_url).expect("parse listing url");
+        ctx.runtime_env().register_object_store(
+            &store_url,
+            Arc::new(object_store::local::LocalFileSystem::new()),
+        );
+
+        // The object path is absolute, so `_location` is the store root plus it.
+        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_file_extension(".parquet")
+            .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)])
+            .with_metadata_cols(vec![
+                datafusion_datasource::metadata::MetadataColumn::Location(Some("file:///".into())),
+                datafusion_datasource::metadata::MetadataColumn::Size,
+            ]);
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema)),
+        )
+        .expect("create listing table");
+        let provider = MetadataPruningListingTable::new(
+            Arc::new(listing),
+            ctx.runtime_env()
+                .object_store(&table_path)
+                .expect("object store"),
+            table_path,
+            file_schema,
+            ".parquet",
+        );
+        ctx.register_table("t", Arc::new(provider))
+            .expect("register table");
+
+        let location = Url::from_file_path(&parquet_path)
+            .expect("file url")
+            .to_string();
+        let count = async |predicate: String| -> usize {
+            let sql = format!("SELECT id FROM t WHERE _location = '{location}' AND {predicate}");
+            ctx.sql(&sql)
+                .await
+                .expect("plan query")
+                .collect()
+                .await
+                .expect("collect query")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum()
+        };
+
+        assert_eq!(count(format!("_size = {file_size}")).await, 3);
+        assert_eq!(
+            count(format!("_size = {}", file_size + 1)).await,
+            0,
+            "a `_size` predicate the file does not satisfy must remove its rows"
+        );
+        assert_eq!(count("day = '2025-01-01'".to_string()).await, 3);
+        assert_eq!(
+            count("day = '2099-12-31'".to_string()).await,
+            0,
+            "a partition predicate the file does not satisfy must remove its rows"
+        );
+        assert_eq!(
+            count("id > 1".to_string()).await,
+            2,
+            "a data-column predicate must still filter rows"
         );
     }
 
