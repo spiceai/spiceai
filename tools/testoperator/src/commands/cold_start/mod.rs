@@ -88,6 +88,10 @@ struct ColdStartResults {
 
 pub(crate) async fn run(args: &ColdStartArgs) -> anyhow::Result<()> {
     anyhow::ensure!(args.runs > 0, "--runs must be at least 1");
+    anyhow::ensure!(
+        args.max_ready_ratio.is_finite() && args.max_ready_ratio > 0.0,
+        "--max-ready-ratio must be a positive finite number"
+    );
     let app = super::load_app(&args.common).await?;
     let datasets: Vec<String> = app
         .datasets
