@@ -41,7 +41,7 @@ use data_components::unity_catalog::credential_vending::VendedDeltaTableFactory;
 use data_components::unity_catalog::provider::{
     ReadTableProviderFactory, UCTableProviderFactory, UnityCatalogProvider,
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_rate_control::RateController;
 use runtime_secrets::get_params_with_secrets;
 use secrecy::{ExposeSecret, SecretString};

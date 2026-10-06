@@ -610,8 +610,8 @@ async fn drop_replication_slot_when_inactive(
 async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1030,8 +1030,8 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
 async fn shared_slot_partitioned_source_table_streams_changes() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1125,8 +1125,8 @@ async fn shared_slot_partitioned_source_table_streams_changes() -> Result<(), an
 async fn shared_and_independent_slots_coexist() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1315,8 +1315,8 @@ async fn a_bootstrap_lost_before_it_was_durable_is_reloaded_not_resumed()
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1432,8 +1432,8 @@ async fn drop_slot_underneath_a_running_stream(
 async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1579,8 +1579,8 @@ async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<()
 async fn an_empty_acceleration_bootstraps_rather_than_rebuilding() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1650,8 +1650,8 @@ async fn an_empty_acceleration_is_still_loaded_when_no_snapshot_runs() -> Result
 {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1734,8 +1734,8 @@ async fn an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed()
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1840,8 +1840,8 @@ async fn an_unprovable_acceleration_with_a_surviving_position_is_loaded_not_resu
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1920,8 +1920,8 @@ async fn an_unprovable_acceleration_with_a_surviving_position_is_loaded_not_resu
 async fn an_unplaceable_acceleration_still_rebuilds() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -2025,8 +2025,8 @@ async fn a_slow_position_store_does_not_slow_the_commit_path() -> Result<(), any
 
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -2100,8 +2100,8 @@ async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -2264,8 +2264,8 @@ async fn a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -2402,8 +2402,8 @@ async fn an_unclaimed_table_in_a_for_all_tables_publication_does_not_pin_the_slo
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -2534,8 +2534,8 @@ async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner() -> Resul
 {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -2661,8 +2661,8 @@ async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner() -> Resul
 async fn drop_slot_after_shutdown_releases_an_inactive_slot() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 

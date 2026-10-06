@@ -49,8 +49,8 @@ async fn test_postgres_avg_rounds_to_declared_scale_instead_of_erroring()
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
             let db_conn = pool
