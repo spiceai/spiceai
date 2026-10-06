@@ -189,6 +189,22 @@ async fn value_of(rt: &Runtime, id: i64) -> Vec<String> {
         .collect()
 }
 
+/// The first column of `sql`'s rows, as strings.
+async fn rows_of(rt: &Runtime, sql: &str) -> Vec<String> {
+    rows(rt, sql)
+        .await
+        .iter()
+        .flat_map(|batch| {
+            let values = arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8)
+                .expect("a string column");
+            let values = values.as_string::<i32>();
+            (0..batch.num_rows())
+                .map(|row| values.value(row).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 async fn count(rt: &Runtime) -> i64 {
     rows(rt, "SELECT COUNT(*) FROM t").await[0]
         .column(0)
@@ -300,65 +316,185 @@ async fn a_key_repeated_within_a_batch_keeps_the_last_arrival() {
         .await;
 }
 
-/// A user's `UPDATE` is one statement over the rows it writes: moving rows
-/// onto one key leaves one row for it.
+/// An `UPDATE` that gives a row a key another row keeps fails and changes nothing,
+/// as in PostgreSQL (#14576); one that moves a row onto a free key succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_update_repeating_a_key_follows_upsert() {
+async fn an_update_onto_a_kept_key_fails_and_changes_nothing() {
     test_request_context()
         .scope(async {
-            for differ in [false, true] {
-                let rows: String = std::iter::once("id,region,ts,v\n".to_string())
-                    .chain((0..8_193).map(|id| {
-                        let v = if differ {
-                            id.to_string()
-                        } else {
-                            "same".to_string()
-                        };
-                        format!("{id},us,2026-01-01T00:00:00,{v}\n")
-                    }))
-                    .collect();
-                for mode in [Mode::Memory, Mode::File] {
-                    let case = Case {
-                        mode,
-                        refresh: RefreshMode::Full,
-                        partitioned: false,
-                    };
-                    let label = format!("{}/update/differ={differ}", case.label());
-                    let (rt, ready, _dir) = load_with_access(
-                        &rows,
-                        &case,
-                        // `on_conflict` keeps a read-write dataset's writes in the
-                        // acceleration; Cayenne still upserts on the key.
-                        Some(OnConflictBehavior::Upsert),
-                        &label,
-                        AccessMode::ReadWrite,
-                    )
-                    .await;
-                    assert!(ready, "{label}: the distinct keys load");
-                    let result = rt
-                        .datafusion()
-                        .query_builder("UPDATE t SET id = 0")
-                        .build()
-                        .run()
-                        .await;
-                    let outcome = match result {
-                        Err(error) => Err(error.to_string()),
-                        Ok(query) => query
-                            .data
-                            .try_collect::<Vec<_>>()
-                            .await
-                            .map_err(|error| error.to_string()),
-                    };
-                    outcome.unwrap_or_else(|error| panic!("{label}: {error}"));
-                    assert_eq!(count(&rt).await, 1, "{label}: one row for key 0");
-                    if !differ {
-                        assert_eq!(
-                            value_of(&rt, 0).await,
-                            vec!["same".to_string()],
-                            "{label}: identical copies collapse"
-                        );
+            // More than one record batch of distinct keys.
+            let rows: String = std::iter::once("id,region,ts,v\n".to_string())
+                .chain((0..8_193).map(|id| format!("{id},us,2026-01-01T00:00:00,v{id}\n")))
+                .collect();
+            for mode in [Mode::Memory, Mode::File] {
+                let case = Case {
+                    mode,
+                    refresh: RefreshMode::Full,
+                    partitioned: false,
+                };
+                let label = format!("{}/update", case.label());
+                let (rt, ready, _dir) = load_with_access(
+                    &rows,
+                    &case,
+                    // `on_conflict` keeps a read-write dataset's writes in the
+                    // acceleration.
+                    Some(OnConflictBehavior::Upsert),
+                    &label,
+                    AccessMode::ReadWrite,
+                )
+                .await;
+                assert!(ready, "{label}: the distinct keys load");
+                let update = |sql: &'static str| {
+                    let rt = &rt;
+                    async move {
+                        match rt.datafusion().query_builder(sql).build().run().await {
+                            Err(error) => Err(error.to_string()),
+                            Ok(query) => query
+                                .data
+                                .try_collect::<Vec<_>>()
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                        }
                     }
+                };
+                for (sql, message) in [
+                    // Every row is updated, so none keeps key 0: the rows collide
+                    // with one another.
+                    (
+                        "UPDATE t SET id = 0",
+                        "8193 rows would get the same new 'id'",
+                    ),
+                    (
+                        "UPDATE t SET id = 0 WHERE id > 0",
+                        "the new 'id' of 8192 rows match a key already stored",
+                    ),
+                    (
+                        "UPDATE t SET id = 1 WHERE id = 2",
+                        "the new 'id' of 1 row matches a key already stored",
+                    ),
+                    (
+                        "UPDATE t SET id = 100000 WHERE id IN (3, 4)",
+                        "2 rows would get the same new 'id'",
+                    ),
+                ] {
+                    let error = update(sql)
+                        .await
+                        .expect_err(&format!("{label}: `{sql}` fails"));
+                    assert!(
+                        error.contains(&format!(
+                            "Failed to update dataset 't': {message}, so nothing was changed."
+                        )),
+                        "{label}: `{sql}`: {error}"
+                    );
+                    assert_eq!(count(&rt).await, 8_193, "{label}: `{sql}` changes nothing");
+                    assert_eq!(
+                        value_of(&rt, 1).await,
+                        ["v1"],
+                        "{label}: `{sql}` keeps key 1"
+                    );
+                    assert_eq!(
+                        value_of(&rt, 2).await,
+                        ["v2"],
+                        "{label}: `{sql}` keeps key 2"
+                    );
                 }
+                // A NULL key is refused before the row it would replace is removed.
+                let error = update("UPDATE t SET id = NULL WHERE id = 2")
+                    .await
+                    .expect_err(&format!("{label}: a NULL key fails"));
+                assert_eq!(value_of(&rt, 2).await, ["v2"], "{label}: key 2 is kept");
+                assert_eq!(count(&rt).await, 8_193, "{label}: a NULL key changes nothing");
+                assert!(
+                    error.contains(
+                        "Failed to update dataset 't': the new 'id' of 1 row is NULL, and a primary key cannot be NULL, so nothing was changed."
+                    ),
+                    "{label}: {error}"
+                );
+                update("UPDATE t SET id = 100000 WHERE id = 3")
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: a move onto a free key: {error}"));
+                assert_eq!(count(&rt).await, 8_193, "{label}: the move keeps every row");
+                assert_eq!(
+                    value_of(&rt, 100_000).await,
+                    ["v3"],
+                    "{label}: the row moved"
+                );
+                assert!(value_of(&rt, 3).await.is_empty(), "{label}: key 3 is free");
+            }
+        })
+        .await;
+}
+
+/// A partitioned table checks every partition's updated rows before writing any:
+/// an `UPDATE` one partition refuses changes no partition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partitioned_update_one_partition_refuses_changes_none() {
+    test_request_context()
+        .scope(async {
+            // Five partitions can move key 1 to 2 and one already holds 2. The
+            // partitions are written in no fixed order, so two loads make it
+            // unlikely the refusing one is always reached first.
+            for attempt in 0..2 {
+                let moving = ["a", "b", "c", "d", "e"];
+                let mut rows = String::from("id,region,ts,v\n");
+                for region in moving {
+                    rows.push_str(&format!("1,{region},2026-01-01T00:00:00,{region}1\n"));
+                    rows.push_str(&format!("3,{region},2026-01-01T00:00:00,{region}3\n"));
+                }
+                rows.push_str("1,z,2026-01-01T00:00:00,z1\n2,z,2026-01-01T00:00:00,z2\n");
+                let case = Case {
+                    mode: Mode::File,
+                    refresh: RefreshMode::Full,
+                    partitioned: true,
+                };
+                let label = format!("{}/partitioned-update/{attempt}", case.label());
+                let (rt, ready, _dir) = load_with_access(
+                    &rows,
+                    &case,
+                    Some(OnConflictBehavior::Upsert),
+                    &label,
+                    AccessMode::ReadWrite,
+                )
+                .await;
+                assert!(ready, "{label}: the rows load");
+                let outcome = match rt
+                    .datafusion()
+                    .query_builder("UPDATE t SET id = 2 WHERE id = 1")
+                    .build()
+                    .run()
+                    .await
+                {
+                    Err(error) => Err(error.to_string()),
+                    Ok(query) => query
+                        .data
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                };
+                let mut expected: Vec<String> = moving
+                    .iter()
+                    .flat_map(|region| [format!("1:{region}1"), format!("3:{region}3")])
+                    .chain(["1:z1".to_string(), "2:z2".to_string()])
+                    .collect();
+                expected.sort();
+                assert_eq!(
+                    rows_of(
+                        &rt,
+                        "SELECT CAST(id AS VARCHAR) || ':' || v FROM t ORDER BY 1"
+                    )
+                    .await,
+                    expected,
+                    "{label}: no partition changed"
+                );
+                let error = outcome.expect_err(&format!("{label}: 'z' refuses"));
+                assert!(
+                    error.contains(
+                        "Failed to update dataset 't': the new '(id, region)' of 1 row matches a key already stored, so nothing was changed."
+                    ),
+                    "{label}: {error}"
+                );
             }
         })
         .await;

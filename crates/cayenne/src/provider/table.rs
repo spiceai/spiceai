@@ -1905,6 +1905,9 @@ pub struct CayenneTableProvider {
     /// greatest time survives, the last to arrive on a tie. Set on the clone
     /// a write runs on, from its session.
     pub(crate) row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
+    /// The dataset a user knows this table by, when it differs from the table's
+    /// own name: a partition's table is named for its parent and its key.
+    dataset_name: Option<Arc<str>>,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -2797,6 +2800,7 @@ pub struct CayenneTableProviderBuilder {
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
     index_word_bits: Option<u32>,
+    dataset_name: Option<Arc<str>>,
 }
 
 /// Resolves every configured lookup-index column before table creation/open,
@@ -2937,6 +2941,7 @@ struct CayenneTableProviderOpenOptions {
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
     index_word_bits: Option<u32>,
+    dataset_name: Option<Arc<str>>,
 }
 
 impl CayenneTableProviderBuilder {
@@ -2956,7 +2961,16 @@ impl CayenneTableProviderBuilder {
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
             secondary_indexes: Vec::new(),
             index_word_bits: None,
+            dataset_name: None,
         }
+    }
+
+    /// Name the dataset a user knows the table by in messages, when it differs from
+    /// the table's own name, as a partition's does.
+    #[must_use]
+    pub fn with_dataset_name(mut self, dataset_name: &str) -> Self {
+        self.dataset_name = Some(Arc::from(dataset_name));
+        self
     }
 
     /// Set retention filters that will be applied after writes.
@@ -3079,6 +3093,7 @@ impl CayenneTableProviderBuilder {
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
             index_word_bits: self.index_word_bits,
+            dataset_name: self.dataset_name,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -3112,6 +3127,7 @@ impl CayenneTableProviderBuilder {
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
             index_word_bits: self.index_word_bits,
+            dataset_name: self.dataset_name,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -5404,6 +5420,14 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn table_name(&self) -> &str {
         &self.table_metadata.table_name
+    }
+
+    /// The dataset a user knows this table by, for messages: the table's own name
+    /// unless it was opened as part of another (a partition).
+    fn dataset_name(&self) -> &str {
+        self.dataset_name
+            .as_deref()
+            .unwrap_or_else(|| self.table_name())
     }
 
     /// Returns the CURRENT logical Arrow schema for this table.
@@ -9121,6 +9145,7 @@ impl CayenneTableProvider {
             scan_view_reuse,
             secondary_indexes,
             index_word_bits,
+            dataset_name,
         } = options;
 
         let mut table_metadata = catalog.get_table(table_name).await?;
@@ -9425,6 +9450,7 @@ impl CayenneTableProvider {
             scan_view_reuse,
             superseded_rows: None,
             row_versions: None,
+            dataset_name,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -11561,6 +11587,7 @@ impl CayenneTableProvider {
             scan_view_reuse: self.scan_view_reuse,
             superseded_rows: self.superseded_rows.clone(),
             row_versions: self.row_versions.clone(),
+            dataset_name: self.dataset_name.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
@@ -38307,7 +38334,9 @@ impl TableProvider for CayenneTableProvider {
             datafusion_expr::LogicalPlanBuilder::scan("__update_source", table_source, None)?
                 .build()?;
 
-        if let Some(combined) = filters.clone().into_iter().reduce(Expr::and) {
+        let scan = plan.clone();
+        let combined_filter = filters.clone().into_iter().reduce(Expr::and);
+        if let Some(combined) = combined_filter.clone() {
             plan = datafusion_expr::LogicalPlanBuilder::from(plan)
                 .filter(combined)?
                 .build()?;
@@ -38384,12 +38413,25 @@ impl TableProvider for CayenneTableProvider {
             })?
             .clone();
 
-        Ok(Arc::new(data_components::update::UpdateExec::new(
+        let assigned: Vec<&str> = assignments.iter().map(|(name, _)| name.as_str()).collect();
+        let check = super::update_keys::UpdateKeyCheck::new(
+            self.dataset_name(),
+            scan,
+            &self.metadata().primary_key,
+            &assigned,
+            combined_filter,
+            session_state.clone(),
+        )?;
+        let update = data_components::update::UpdateExec::new(
             source_plan,
             Arc::new(self.clone_for_write()),
             session_state,
             filters,
-        )))
+        );
+        Ok(Arc::new(match check {
+            Some(check) => update.with_validator(Arc::new(check)),
+            None => update,
+        }))
     }
 }
 
