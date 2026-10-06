@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use parking_lot::Mutex;
 use runtime_acceleration::Engine;
 use runtime_acceleration::acceleration::DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL;
