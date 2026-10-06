@@ -712,8 +712,9 @@ pub fn parameter_specs() -> [ParameterSpec; 8] {
 /// Returns an invalid-configuration error when a `max_concurrent_requests`,
 /// `requests_per_second_limit` or `requests_per_minute_limit` value does not
 /// parse as a non-zero integer, a `rate_control_jitter_min` /
-/// `rate_control_jitter_max` value does not parse as a duration, or a
-/// `rate_control_failure_threshold` / `rate_control_window` value is invalid.
+/// `rate_control_jitter_max` / `rate_control_acquire_timeout` value does not
+/// parse as a duration, or a `rate_control_failure_threshold` /
+/// `rate_control_window` value is invalid.
 pub fn resolve_config_for_component<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
@@ -731,15 +732,17 @@ pub fn resolve_config_for_component<S: BuildHasher>(
     })
 }
 
-/// Resolve the limits (concurrency, request rate, jitter) of a component's
-/// rate-control configuration; the adaptive tuning takes its defaults.
+/// Resolve the limits (concurrency, request rate, jitter) and the acquire
+/// timeout of a component's rate-control configuration; the adaptive tuning
+/// takes its defaults.
 ///
 /// For connectors that do not yet report request outcomes and so declare only
-/// the limit and jitter parameters of [`parameter_specs`]. Their adaptive
-/// controller never sees a failure, so it applies the configured limits
-/// unchanged and its tuning has no effect. The `rate_control_failure_threshold`
-/// and `rate_control_window` parameters are not read: such a connector does not
-/// declare them, and looking up an undeclared parameter panics.
+/// the limit, jitter and acquire-timeout parameters of [`parameter_specs`].
+/// Their adaptive controller never sees a failure, so it applies the configured
+/// limits unchanged and its tuning has no effect. The
+/// `rate_control_failure_threshold` and `rate_control_window` parameters are
+/// not read: such a connector does not declare them, and looking up an
+/// undeclared parameter panics.
 ///
 /// # Errors
 /// Returns an invalid-configuration error when a `max_concurrent_requests`,

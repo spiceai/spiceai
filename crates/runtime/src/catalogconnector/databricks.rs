@@ -954,9 +954,9 @@ mod tests {
     }
 
     /// Regression test: this catalog resolves its rate control with
-    /// `resolve_limits_for_component`, which reads every parameter of the
-    /// HTTP rate-control family. An undeclared name panics at load, so each one
-    /// must appear in [`PARAMETERS`].
+    /// `resolve_limits_for_component`, which reads the limit, jitter and
+    /// acquire-timeout parameters of the HTTP rate-control family. An undeclared
+    /// name panics at load, so each one must appear in [`PARAMETERS`].
     #[test]
     fn test_http_rate_control_params_are_declared_in_parameters_spec() {
         for name in [
