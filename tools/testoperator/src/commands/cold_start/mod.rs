@@ -112,20 +112,19 @@ pub(crate) async fn run(args: &ColdStartArgs) -> anyhow::Result<()> {
         runs: Vec::new(),
     });
 
-    // Alternate the two binaries so drift in the host's load during the job
-    // affects both equally.
+    // Interleave the two binaries and swap which goes first in every other pair,
+    // so steady drift in the host's load during the job favours neither.
     for run in 1..=args.runs {
-        if let Some(baseline) = baseline.as_mut() {
-            println!("Cold start {run}/{} (baseline)", args.runs);
-            let (version, result) =
-                cold_start(args, &app, &baseline.spiced_path, &datasets).await?;
-            baseline.version = version;
-            baseline.runs.push(result);
+        let candidate_first = run % 2 == 0;
+        if candidate_first {
+            record_cold_start(args, &app, &mut candidate, &datasets, run, "candidate").await?;
         }
-        println!("Cold start {run}/{} (candidate)", args.runs);
-        let (version, result) = cold_start(args, &app, &candidate.spiced_path, &datasets).await?;
-        candidate.version = version;
-        candidate.runs.push(result);
+        if let Some(baseline) = baseline.as_mut() {
+            record_cold_start(args, &app, baseline, &datasets, run, "baseline").await?;
+        }
+        if !candidate_first {
+            record_cold_start(args, &app, &mut candidate, &datasets, run, "candidate").await?;
+        }
     }
 
     let failures = evaluate(args, &candidate, baseline.as_ref());
@@ -153,6 +152,21 @@ pub(crate) async fn run(args: &ColdStartArgs) -> anyhow::Result<()> {
         "Cold-start test failed: {}",
         results.failures.join("; ")
     );
+    Ok(())
+}
+
+async fn record_cold_start(
+    args: &ColdStartArgs,
+    app: &App,
+    binary: &mut BinaryResult,
+    datasets: &[String],
+    run: usize,
+    label: &str,
+) -> anyhow::Result<()> {
+    println!("Cold start {run}/{} ({label})", args.runs);
+    let (version, result) = cold_start(args, app, &binary.spiced_path, datasets).await?;
+    binary.version = version;
+    binary.runs.push(result);
     Ok(())
 }
 
