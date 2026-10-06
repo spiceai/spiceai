@@ -4243,6 +4243,37 @@ mod tests {
             assert!(!crate::graphql::is_retriable_error(&err));
         }
 
+        /// HTML HTTP 403 is a permission denial: not retried.
+        #[tokio::test]
+        async fn html_403_is_not_retried() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(403)
+                        .insert_header("content-type", "text/html")
+                        .set_body_string("<html><body>Request forbidden</body></html>"),
+                )
+                .mount(&server)
+                .await;
+
+            let err = execute_with_retries(&client(&server))
+                .await
+                .expect_err("HTML 403 must fail without retrying");
+
+            let displayed = err.to_string();
+            assert!(displayed.contains("HTML"), "displayed: {displayed}");
+            assert!(displayed.contains("403"), "displayed: {displayed}");
+            assert!(!displayed.contains("Failed to decode response body as JSON"));
+            assert!(!crate::graphql::is_retriable_error(&err));
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len();
+            assert_eq!(requests, 1, "a permission denial must not be retried");
+        }
+
         /// A JSON GraphQL body with no Content-Type still decodes.
         #[tokio::test]
         async fn json_body_without_content_type_succeeds() {

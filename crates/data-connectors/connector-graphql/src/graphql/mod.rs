@@ -164,11 +164,11 @@ pub fn is_retriable_error(error: &Error) -> bool {
                 || *status == StatusCode::TOO_MANY_REQUESTS
         }
         Error::JsonDecodeError { status, .. } => {
-            // Truncated JSON on HTTP 200, or a JSON-classified 5xx/403/408/429.
-            // Other 4xx JSON errors are client failures and are not retried.
+            // Truncated JSON on HTTP 200, or a JSON-classified 5xx/408/429.
+            // Other 4xx JSON errors (including 403) are client failures.
+            // A GitHub secondary rate-limit 403 is `RateLimited`, not this arm.
             status.is_success()
                 || status.is_server_error()
-                || *status == StatusCode::FORBIDDEN
                 || *status == StatusCode::REQUEST_TIMEOUT
                 || *status == StatusCode::TOO_MANY_REQUESTS
         }
@@ -381,11 +381,13 @@ mod tests {
 
     #[test]
     fn test_json_decode_client_error_not_retriable() {
-        // JSON decode errors with client status codes (4xx) should NOT be retriable
-        // (except 403, which is retriable — see test_json_decode_forbidden_retriable)
+        // JSON decode errors with client status codes (4xx) are not retried.
+        // 429 is the exception (`TOO_MANY_REQUESTS` below). 403 is permanent
+        // unless `handle_http_error` already classified it as `RateLimited`.
         let client_error_codes = [
             StatusCode::BAD_REQUEST,          // 400
             StatusCode::UNAUTHORIZED,         // 401
+            StatusCode::FORBIDDEN,            // 403
             StatusCode::NOT_FOUND,            // 404
             StatusCode::UNPROCESSABLE_ENTITY, // 422
         ];
@@ -456,10 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json_decode_forbidden_retriable() {
-        // A non-JSON 403 response indicates a transient upstream proxy or abuse-detection
-        // block (e.g. GitHub's "Request forbidden by administrative rules"), not a genuine
-        // credentials/permissions error (which returns valid JSON and is handled separately).
+    fn test_json_decode_forbidden_is_permanent() {
         let error = Error::JsonDecodeError {
             status: StatusCode::FORBIDDEN,
             detail: "expected value at line 2 column 1".to_string(),
@@ -467,8 +466,8 @@ mod tests {
             retry_after: None,
         };
         assert!(
-            is_retriable_error(&error),
-            "JsonDecodeError with 403 Forbidden should be retriable (transient abuse detection)"
+            !is_retriable_error(&error),
+            "an unclassified HTTP 403 is a permission denial, not a blip"
         );
     }
 
@@ -746,6 +745,25 @@ mod tests {
         );
         assert!(!displayed.contains("upstream server returned an error"));
         assert!(!displayed.contains("Failed to decode response body as JSON"));
+    }
+
+    #[test]
+    fn html_403_is_not_retriable() {
+        let error = Error::UnexpectedResponse {
+            status: StatusCode::FORBIDDEN,
+            format: ResponseBodyFormat::Html,
+            preview: "Request forbidden".to_string(),
+            retry_after: None,
+            message: response::unexpected_response_message(
+                StatusCode::FORBIDDEN,
+                ResponseBodyFormat::Html,
+                "Request forbidden",
+            ),
+        };
+        assert!(
+            !is_retriable_error(&error),
+            "HTML HTTP 403 is a permission denial; only RateLimited 403 is retried"
+        );
     }
 
     #[test]

@@ -312,12 +312,15 @@ pub fn json_decode_error_message(status: StatusCode, detail: &str) -> String {
 }
 
 /// Statuses the GraphQL client treats as transient (retry with backoff).
+///
+/// HTTP 403 is not included: a permission denial is permanent. A GitHub
+/// secondary rate-limit 403 is classified as [`Error::RateLimited`] from the
+/// JSON payload before this helper runs.
 #[must_use]
 pub fn is_transient_http_status(status: StatusCode) -> bool {
     status.is_server_error()
         || status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::FORBIDDEN
 }
 
 /// Whether an unexpected (non-JSON) body should be retried.
@@ -545,6 +548,14 @@ mod tests {
         ));
         assert!(!is_retryable_unexpected_response(
             StatusCode::UNAUTHORIZED,
+            ResponseBodyFormat::Text
+        ));
+        assert!(!is_retryable_unexpected_response(
+            StatusCode::FORBIDDEN,
+            ResponseBodyFormat::Html
+        ));
+        assert!(!is_retryable_unexpected_response(
+            StatusCode::FORBIDDEN,
             ResponseBodyFormat::Text
         ));
     }
