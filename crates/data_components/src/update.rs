@@ -207,7 +207,7 @@ impl ExecutionPlan for UpdateExec {
             self.session_state.clone(),
             self.filters.clone(),
         );
-        exec.validator = self.validator.clone();
+        exec.validator.clone_from(&self.validator);
         Ok(Arc::new(exec))
     }
 

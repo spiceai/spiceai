@@ -13529,7 +13529,7 @@ impl CayenneTableProvider {
     ) -> Result<Vec<RecordBatch>> {
         match (self.key_resolver()?, &self.row_versions) {
             (Some(resolver), Some(versions)) => {
-                self.collapse_buffered_write_by_version(&resolver, versions, batches)
+                Self::collapse_buffered_write_by_version(&resolver, versions, batches)
             }
             (Some(resolver), None) => resolver.collapse_write(batches),
             (None, _) => Ok(batches),
@@ -13540,7 +13540,6 @@ impl CayenneTableProvider {
     /// key keeps its greatest time (the later arrival on a tie), and the copies not
     /// kept are counted.
     fn collapse_buffered_write_by_version(
-        &self,
         resolver: &super::key_conflicts::KeyResolver,
         versions: &Arc<dyn util::session_state::RowVersions>,
         batches: Vec<RecordBatch>,
