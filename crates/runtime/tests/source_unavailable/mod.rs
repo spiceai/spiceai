@@ -1054,8 +1054,7 @@ mod served_from_acceleration {
         Ok(())
     }
 
-    /// A dataset refreshed on a cron schedule reports the first cron time after its
-    /// last refresh as its next refresh.
+    /// A dataset refreshed on a cron schedule reports the next future cron time.
     #[tokio::test]
     async fn a_cron_scheduled_dataset_reports_its_next_cron_time() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));
@@ -1084,6 +1083,49 @@ mod served_from_acceleration {
             (1, 1, 0),
             "next_refresh is the cron's next time, got {next_local}"
         );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// Missed cron occurrences are skipped unless a refresh has already been triggered.
+    #[tokio::test]
+    async fn cron_freshness_skips_missed_occurrences_and_retains_pending_refresh()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("freshness-missed-cron").await?;
+        let source = &fixture.source;
+        let spec = || with_refresh_cron(fixture.dataset(ReadyState::OnLoad), "0 0 1 1 *");
+        seed(source, spec()).await?;
+
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
+        assert!(served_from_acceleration(&rt, Duration::from_secs(10)).await);
+        let name = datafusion::common::TableReference::bare("orders");
+        let now = std::time::SystemTime::now();
+        let old_refresh = now - Duration::from_secs(400 * 24 * 60 * 60);
+        rt.status().record_dataset_last_refresh(&name, old_refresh);
+        rt.status().clear_dataset_next_refresh(&name);
+        let (Some(last_refresh), Some(next_refresh)) = freshness(&rt).await else {
+            anyhow::bail!("the cron schedule reports freshness");
+        };
+        let expected = scheduler::channel::cron::next_cron_time("0 0 1 1 *", now)?;
+        let expected: chrono::DateTime<chrono::Utc> = expected.into();
+        eprintln!(
+            "old_last_refresh={last_refresh} api_next={next_refresh} scheduler_next={expected}"
+        );
+        assert_eq!(
+            next_refresh, expected,
+            "missed cron occurrences are skipped"
+        );
+
+        let pending = now - Duration::from_secs(60);
+        rt.status().record_dataset_next_refresh(&name, pending);
+        let (_, Some(next_refresh)) = freshness(&rt).await else {
+            anyhow::bail!("the pending refresh retains its due time");
+        };
+        let pending: chrono::DateTime<chrono::Utc> = pending.into();
+        assert_eq!(next_refresh.timestamp(), pending.timestamp());
+        rt.status().clear_dataset_next_refresh(&name);
+        assert_eq!(freshness(&rt).await.1, Some(expected));
         stop(rt, loader).await;
         Ok(())
     }
