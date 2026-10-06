@@ -315,11 +315,18 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
             );
             // SQLite LIKE folds ASCII case, so a federated
             // `customer LIKE '%ALICE%'` would have kept the two `alice` rows.
+            // Distinct SQL from the loop case so the results cache cannot
+            // return a schema-less empty batch.
             assert_batches_eq!(
-                ["+----+", "| id |", "+----+", "+----+",],
+                [
+                    "+----+----------+",
+                    "| id | customer |",
+                    "+----+----------+",
+                    "+----+----------+",
+                ],
                 &run_query(
                     &rt,
-                    "SELECT id FROM accelerated WHERE customer LIKE '%ALICE%' ORDER BY id"
+                    "SELECT id, customer FROM accelerated WHERE customer LIKE '%ALICE%' ORDER BY id"
                 )
                 .await?
             );
