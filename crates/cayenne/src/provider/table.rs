@@ -35522,11 +35522,15 @@ impl CayenneTableProvider {
             .get_snapshot_file_statistics(&self.table_metadata.table_id, snapshot_id, &file_path)
             .await
             && persisted.file_size_bytes == file_size_bytes
-            && let Some(statistics) = crate::stats::statistics_from_persisted_blob(
+            && let Some(restored) = crate::stats::restore_persisted_statistics(
                 &persisted.statistics_blob,
                 &self.table_schema(),
                 persisted.num_rows,
             )
+            // A blob written before NaN was accounted for has its float bounds
+            // ignored; re-inferring from the footer restores them.
+            && restored.accounts_for_nan
+            && let statistics = restored.statistics
             // A blob written before per-column byte sizes were persisted carries none,
             // so serving it would report a different size for this file than the footer
             // does and leave `JoinSelection` picking a build side by which source
@@ -35535,9 +35539,6 @@ impl CayenneTableProvider {
             // no statistics at all re-infers on first touch in each process and is then
             // held by `scan_file_statistics`.
             && crate::stats::blob_carries_per_column_byte_sizes(&statistics)
-            // A blob written before NaN was accounted for has its float bounds
-            // ignored; re-inferring from the footer restores them.
-            && crate::stats::blob_accounts_for_nan(&persisted.statistics_blob, &table_schema)
         {
             self.scan_file_statistics.put(
                 &TableScopedPath {

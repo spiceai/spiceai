@@ -581,24 +581,6 @@ fn records_no_nan(stats: &StatsSet, dtype: &DType) -> bool {
             == Some(0)
 }
 
-/// Whether a persisted blob accounts for NaN in every float column it bounds.
-///
-/// A blob written before NaN was accounted for carries a float column's
-/// NaN-excluding bounds and no NaN count. Those bounds are never used (see
-/// `stats_set_to_column_stats`), so such a blob is stale: re-inferring the file's
-/// statistics from its footer, which records the NaN count, restores them.
-pub(crate) fn blob_accounts_for_nan(blob: &[u8], schema: &Schema) -> bool {
-    let Ok(file_stats) = deserialize_file_statistics(blob, schema) else {
-        return false;
-    };
-    file_stats.into_iter().all(|(stats, dtype)| {
-        let bounded = [Stat::Min, Stat::Max, Stat::Sum]
-            .into_iter()
-            .any(|stat| !stats.get(stat).is_absent());
-        !bounded || records_no_nan(stats, dtype)
-    })
-}
-
 /// Convert a Vortex [`FileStatistics`] to `DataFusion` [`Statistics`].
 ///
 /// Maps per-column Vortex stats to `DataFusion` column statistics and uses the
@@ -725,12 +707,39 @@ pub(crate) fn statistics_from_persisted_blob(
     schema: &Schema,
     num_rows: i64,
 ) -> Option<Arc<Statistics>> {
+    restore_persisted_statistics(blob, schema, num_rows).map(|restored| restored.statistics)
+}
+
+/// Scan statistics restored from a persisted blob, with whether the blob
+/// accounts for NaN in every float column it bounds.
+pub(crate) struct RestoredStatistics {
+    pub(crate) statistics: Arc<Statistics>,
+    /// `false` for a blob written before NaN was accounted for: it carries a float
+    /// column's NaN-excluding bounds and no NaN count. Those bounds are never used
+    /// (see `stats_set_to_column_stats`), so such a blob is stale, and
+    /// re-inferring the file's statistics from its footer, which records the NaN
+    /// count, restores them.
+    pub(crate) accounts_for_nan: bool,
+}
+
+/// Restore `DataFusion` scan statistics from a persisted Vortex blob, decoding it
+/// once for both the statistics and [`RestoredStatistics::accounts_for_nan`].
+pub(crate) fn restore_persisted_statistics(
+    blob: &[u8],
+    schema: &Schema,
+    num_rows: i64,
+) -> Option<RestoredStatistics> {
     let file_stats = deserialize_file_statistics(blob, schema).ok()?;
-    Some(Arc::new(file_statistics_to_df(
-        &file_stats,
-        schema,
-        num_rows,
-    )))
+    let accounts_for_nan = file_stats.into_iter().all(|(stats, dtype)| {
+        let bounded = [Stat::Min, Stat::Max, Stat::Sum]
+            .into_iter()
+            .any(|stat| !stats.get(stat).is_absent());
+        !bounded || records_no_nan(stats, dtype)
+    });
+    Some(RestoredStatistics {
+        statistics: Arc::new(file_statistics_to_df(&file_stats, schema, num_rows)),
+        accounts_for_nan,
+    })
 }
 
 /// Whether a restored blob was written by a build that persists per-column byte
@@ -1149,8 +1158,9 @@ mod tests {
         };
 
         let current = blob(column_stats_to_stats_set(&float_stats));
-        assert!(blob_accounts_for_nan(&current, &schema));
-        let restored = statistics_from_persisted_blob(&current, &schema, 3).expect("blob restores");
+        let restored = restore_persisted_statistics(&current, &schema, 3).expect("blob restores");
+        assert!(restored.accounts_for_nan);
+        let restored = restored.statistics;
         assert_eq!(
             restored.column_statistics[0].min_value,
             float_stats.min_value
@@ -1167,8 +1177,9 @@ mod tests {
         let mut legacy_set = column_stats_to_stats_set(&float_stats);
         legacy_set.clear(Stat::NaNCount);
         let legacy = blob(legacy_set);
-        assert!(!blob_accounts_for_nan(&legacy, &schema));
-        let restored = statistics_from_persisted_blob(&legacy, &schema, 3).expect("blob restores");
+        let restored = restore_persisted_statistics(&legacy, &schema, 3).expect("blob restores");
+        assert!(!restored.accounts_for_nan);
+        let restored = restored.statistics;
         let float_column = &restored.column_statistics[0];
         assert_eq!(float_column.min_value, DfPrecision::Absent);
         assert_eq!(float_column.max_value, DfPrecision::Absent);
