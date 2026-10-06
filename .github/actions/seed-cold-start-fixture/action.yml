@@ -2,7 +2,9 @@ name: 'Seed the cold-start fixture'
 description: |
   Generates the synthetic audit-events Delta Lake table that `test/spicepods/cold_start`
   loads and uploads it to MinIO, unless it is already there. Requires `setup-minio` first.
-  Run it from one job at a time: concurrent first seeds would interleave their Delta logs.
+  The `_SEEDED` object at the table root marks a completed upload; without it, any
+  partial upload is removed and the table is seeded again. Run it from one job at a
+  time: concurrent seeds would interleave their Delta logs.
 inputs:
   prefix:
     description: 'MinIO path of the table, under the `spice-minio` alias'
@@ -15,7 +17,7 @@ runs:
       id: fixture
       shell: bash
       run: |
-        if mc stat "spice-minio/${{ inputs.prefix }}/_delta_log/_last_checkpoint" >/dev/null 2>&1; then
+        if mc stat "spice-minio/${{ inputs.prefix }}/_SEEDED" >/dev/null 2>&1; then
           echo "present=true" >> "$GITHUB_OUTPUT"
         else
           echo "present=false" >> "$GITHUB_OUTPUT"
@@ -41,4 +43,7 @@ runs:
         python -m pip install 'pyspark==3.5.5' 'delta-spark==3.3.2'
         python test/scripts/cold_start_delta_fixture.py --out "${RUNNER_TEMP}/cold_start_fixture" \
           --rows 3000000 --commits 24 --post-optimize-commits 8
+        mc rm --recursive --force "spice-minio/${{ inputs.prefix }}/" || true
         mc cp --recursive "${RUNNER_TEMP}/cold_start_fixture/" "spice-minio/${{ inputs.prefix }}/"
+        echo "seeded by ${GITHUB_REPOSITORY}@${GITHUB_SHA} run ${GITHUB_RUN_ID}" \
+          | mc pipe "spice-minio/${{ inputs.prefix }}/_SEEDED"

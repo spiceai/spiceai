@@ -961,7 +961,7 @@ jobs:
 
       - name: Check for the fixture
         run: |
-          if ! mc stat spice-minio/benchmarks/cold_start/audit_events_3m/_delta_log/_last_checkpoint >/dev/null 2>&1; then
+          if ! mc stat spice-minio/benchmarks/cold_start/audit_events_3m/_SEEDED >/dev/null 2>&1; then
             echo "The cold-start fixture is missing from MinIO; run the 'testoperator run cold-start' workflow once to seed it."
             exit 1
           fi
