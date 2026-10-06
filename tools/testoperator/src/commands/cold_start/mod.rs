@@ -31,6 +31,7 @@ use std::{
 };
 
 use arrow::array::{Array, Int64Array};
+use datafusion::common::TableReference;
 use serde::Serialize;
 use test_framework::{
     anyhow,
@@ -226,12 +227,7 @@ async fn measure(
     let spice_client = Arc::new(instance.spice_client(None, true).await?);
     let mut results = Vec::with_capacity(datasets.len());
     for name in datasets {
-        let batches = query_to_batches(
-            Arc::clone(&spice_client),
-            &format!("SELECT COUNT(*) FROM \"{name}\""),
-            None,
-        )
-        .await?;
+        let batches = query_to_batches(Arc::clone(&spice_client), &count_sql(name), None).await?;
         let rows = batches
             .first()
             .and_then(|batch| batch.column(0).as_any().downcast_ref::<Int64Array>())
@@ -325,6 +321,19 @@ fn executable_path(path: &Path) -> anyhow::Result<PathBuf> {
     } else {
         Ok(path.to_path_buf())
     }
+}
+
+/// `COUNT(*)` over a dataset, naming it as the runtime registers it: parsed as
+/// a table reference, with each part quoted so that a schema-qualified name such
+/// as `sales.orders` or a reserved word such as `order` stays one identifier.
+fn count_sql(dataset: &str) -> String {
+    let table = TableReference::parse_str(dataset);
+    let quoted: Vec<String> = [table.catalog(), table.schema(), Some(table.table())]
+        .into_iter()
+        .flatten()
+        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+        .collect();
+    format!("SELECT COUNT(*) FROM {}", quoted.join("."))
 }
 
 /// Sum of every sample of `name` whose labels include all of `labels`.
@@ -489,6 +498,22 @@ cayenne_compaction_outcome_total{kind="subset_current",outcome="committed",table
         let mut args = ColdStartArgs::parse_from(["cold-start"]);
         args.max_full_compactions = max_full_compactions;
         args
+    }
+
+    #[test]
+    fn count_sql_quotes_each_part_of_a_dataset_name() {
+        assert_eq!(
+            count_sql("audit_events"),
+            r#"SELECT COUNT(*) FROM "audit_events""#
+        );
+        assert_eq!(
+            count_sql("sales.order"),
+            r#"SELECT COUNT(*) FROM "sales"."order""#
+        );
+        assert_eq!(
+            count_sql("Sales.Orders"),
+            r#"SELECT COUNT(*) FROM "sales"."orders""#
+        );
     }
 
     #[test]
