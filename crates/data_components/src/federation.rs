@@ -1112,6 +1112,326 @@ mod tests {
         );
     }
 
+    /// A scan of `name(id)` holding `ids`. Unlike `id_source`'s, `DataFusion` can
+    /// execute it, so a guard can set what the plan returns beside what its
+    /// unparsed SQL returns from a real engine.
+    fn id_table(name: &str, ids: &[&str]) -> LogicalPlan {
+        use datafusion::arrow::array::{RecordBatch, StringArray};
+        use datafusion::datasource::{MemTable, provider_as_source};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(ids.to_vec()))],
+        )
+        .expect("build the id batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("build the id table");
+        LogicalPlanBuilder::scan(name, provider_as_source(Arc::new(table)), Some(vec![0]))
+            .expect("scan")
+            .build()
+            .expect("build scan")
+    }
+
+    /// `id_table(name, ids)` keeping only the row whose `id` is `kept`.
+    fn id_table_where(name: &str, ids: &[&str], kept: &str) -> LogicalPlan {
+        LogicalPlanBuilder::from(id_table(name, ids))
+            .filter(col(format!("{name}.id")).eq(lit(kept)))
+            .expect("filter")
+            .build()
+            .expect("build filter")
+    }
+
+    /// Sorted rows as text, with `None` for NULL, so two engines' answers compare
+    /// as multisets.
+    #[cfg(feature = "sqlite")]
+    type Rows = Vec<Vec<Option<String>>>;
+
+    /// What `DataFusion` returns for `plan`: the oracle the unparsed SQL is held
+    /// to. Executing a plan shares no code with unparsing it.
+    #[cfg(feature = "sqlite")]
+    async fn datafusion_rows(plan: &LogicalPlan) -> Rows {
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::compute::cast;
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(plan.clone())
+            .await
+            .expect("plan the oracle")
+            .collect()
+            .await
+            .expect("execute the oracle");
+        let mut rows = Rows::new();
+        for batch in batches {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| cast(column, &DataType::Utf8).expect("render a column as text"))
+                .collect::<Vec<_>>();
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            let column = column.as_string::<i32>();
+                            (!column.is_null(row)).then(|| column.value(row).to_string())
+                        })
+                        .collect(),
+                );
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// What `SQLite` returns for `sql` over `tables`, each `name(id TEXT)`.
+    #[cfg(feature = "sqlite")]
+    fn sqlite_rows(tables: &[(&str, &[&str])], sql: &str) -> Rows {
+        let conn = rusqlite::Connection::open_in_memory().expect("open SQLite");
+        for (name, ids) in tables {
+            conn.execute(&format!("CREATE TABLE {name} (id TEXT NOT NULL)"), [])
+                .expect("create a table");
+            for id in *ids {
+                conn.execute(&format!("INSERT INTO {name} VALUES (?1)"), [id])
+                    .expect("insert a row");
+            }
+        }
+        let mut statement = conn
+            .prepare(sql)
+            .unwrap_or_else(|error| panic!("SQLite refused {sql}: {error}"));
+        let width = statement.column_count();
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..width)
+                    .map(|index| row.get::<_, Option<String>>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_else(|error| panic!("SQLite could not run {sql}: {error}"))
+            .collect::<Result<Rows, _>>()
+            .unwrap_or_else(|error| panic!("SQLite failed reading the rows of {sql}: {error}"));
+        rows.sort();
+        rows
+    }
+
+    /// Unparses `plan` for `SQLite`, runs it over `tables`, and demands the rows
+    /// `DataFusion` returns for the plan itself.
+    #[cfg(feature = "sqlite")]
+    async fn assert_sqlite_returns_the_plans_rows(
+        shape: &str,
+        plan: &LogicalPlan,
+        tables: &[(&str, &[&str])],
+    ) {
+        let expected = datafusion_rows(plan).await;
+        assert!(
+            expected.len() > 1,
+            "{shape}: the plan returns {} row(s), too few for a wrong scope to change",
+            expected.len()
+        );
+        let sql = unparse_with("sqlite", &SqliteDialect {}, plan);
+        assert_eq!(
+            sqlite_rows(tables, &sql),
+            expected,
+            "{shape}: SQLite returned other rows than the plan for: {sql}"
+        );
+    }
+
+    /// Regression test for #14373, fixed by fork PR #233: a join that is the
+    /// *right* input of another join was linearised into the enclosing `FROM`
+    /// with its right side first — `a ⋈ (b ⋈ c)` came out as
+    /// `FROM a INNER JOIN c ON b.id = c.id … JOIN b ON a.id = b.id`, naming `b`
+    /// before it is in scope. `PostgreSQL`, `DuckDB` and `SQLite` reject it, and an
+    /// engine that binds lazily runs a different join tree. The nested join stays
+    /// a parenthesised joined table on the right, and a LEFT JOIN folds a filter
+    /// from inside it into its own `ON`, since the shared `WHERE` would discard
+    /// the left rows the LEFT JOIN preserves.
+    #[tokio::test]
+    async fn a_join_that_is_another_joins_right_input_stays_on_its_right() {
+        let a: &[&str] = &["1", "2", "3"];
+        let b: &[&str] = &["1", "2"];
+        let c: &[&str] = &["1", "2", "4"];
+        let nested = |b_input: LogicalPlan, outer: JoinType| {
+            LogicalPlanBuilder::from(id_table("a", a))
+                .join(
+                    id_join(b_input, id_table("c", c), JoinType::Inner, ("b.id", "c.id")),
+                    outer,
+                    (vec!["a.id"], vec!["b.id"]),
+                    None,
+                )
+                .expect("outer join")
+                .project(vec![col("a.id"), col("b.id"), col("c.id")])
+                .expect("projection")
+                .build()
+                .expect("build")
+        };
+        let shapes = [
+            (
+                "a INNER JOIN (b JOIN c)",
+                nested(id_table("b", b), JoinType::Inner),
+            ),
+            (
+                "a FULL JOIN (b JOIN c)",
+                nested(id_table("b", b), JoinType::Full),
+            ),
+            (
+                "a LEFT JOIN (b[id = '1'] JOIN c)",
+                nested(id_table_where("b", b, "1"), JoinType::Left),
+            ),
+        ];
+        #[cfg(feature = "sqlite")]
+        {
+            let tables = [("a", a), ("b", b), ("c", c)];
+            for (shape, plan) in &shapes {
+                assert_sqlite_returns_the_plans_rows(shape, plan, &tables).await;
+            }
+        }
+
+        for (shape, plan) in &shapes {
+            let sql = federated_sql(plan);
+            // `b` has to be in scope where the outer join's `ON` names it, so the
+            // nested join is introduced, parenthesised, before that `ON`.
+            assert_precedes(&sql, "JOIN (b", "ON a.id = b.id");
+            assert!(
+                !sql.contains("WHERE"),
+                "{shape}: a filter from the nested input reached the enclosing WHERE: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for #14375, fixed by fork PR #234: a `Limit` that is a join
+    /// input got a scope of its own only when the enclosing `SELECT` already had a
+    /// `WHERE` or a projection. Without either, its `LIMIT` landed on the enclosing
+    /// query and bounded the join's output instead of one input — with
+    /// `b = {1, 2}` and `c = {1}`, `b FULL JOIN (c LIMIT 1)` returns two rows and
+    /// the SQL returned one. The limited input is derived under its scan's own
+    /// name, which the join's `ON` and the select list already use.
+    #[tokio::test]
+    async fn a_limit_on_a_join_input_bounds_that_input_rather_than_the_join() {
+        let b: &[&str] = &["1", "2"];
+        let c: &[&str] = &["1"];
+        let limited = |name: &str, ids: &[&str]| {
+            LogicalPlanBuilder::from(id_table(name, ids))
+                .limit(0, Some(1))
+                .expect("limit")
+                .build()
+                .expect("build limit")
+        };
+        let shapes = [
+            (
+                "b FULL JOIN (c LIMIT 1)",
+                id_join(
+                    id_table("b", b),
+                    limited("c", c),
+                    JoinType::Full,
+                    ("b.id", "c.id"),
+                ),
+            ),
+            (
+                "b LEFT JOIN (c LIMIT 1)",
+                id_join(
+                    id_table("b", b),
+                    limited("c", c),
+                    JoinType::Left,
+                    ("b.id", "c.id"),
+                ),
+            ),
+            (
+                "(c LIMIT 1) RIGHT JOIN b",
+                id_join(
+                    limited("c", c),
+                    id_table("b", b),
+                    JoinType::Right,
+                    ("c.id", "b.id"),
+                ),
+            ),
+        ];
+        #[cfg(feature = "sqlite")]
+        {
+            let tables = [("b", b), ("c", c)];
+            for (shape, plan) in &shapes {
+                assert_sqlite_returns_the_plans_rows(shape, plan, &tables).await;
+            }
+        }
+
+        for (shape, plan) in &shapes {
+            let sql = federated_sql(plan);
+            assert!(
+                paren_depth_at(&sql, first_offset_of(&sql, "LIMIT 1")) >= 1,
+                "{shape}: the input's LIMIT bounds the whole join instead of a derived table \
+                 of its own: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for fork PR #250, which completes fork PR #233 on the 55
+    /// line: a join's right input that is a qualified pass-through projection over
+    /// a join is unparsed as a nested joined table with a `SELECT` of its own. A
+    /// mark join inside replaces its mark with `EXISTS` only in that `SELECT`, so
+    /// when the projection passes the mark up to the query that reads it, the mark
+    /// join was dropped and `c.mark` left unbound — and on a LEFT JOIN's
+    /// null-extended input that also bypassed the refusal of a mark join there.
+    /// Such a projection is refused; one that leaves the mark behind still renders.
+    #[test]
+    fn a_mark_a_projection_over_a_join_passes_up_is_refused() {
+        let projected_mark = |columns: Vec<Expr>| {
+            LogicalPlanBuilder::from(plain_id_scan("b"))
+                .join(
+                    plain_id_scan("c"),
+                    JoinType::LeftMark,
+                    (vec!["b.id"], vec!["c.id"]),
+                    None,
+                )
+                .expect("mark join")
+                .project(columns)
+                .expect("projection")
+                .build()
+                .expect("build")
+        };
+        for outer in [JoinType::Left, JoinType::Inner, JoinType::Right] {
+            let plan = LogicalPlanBuilder::from(plain_id_scan("a"))
+                .join(
+                    projected_mark(vec![col("b.id"), col("c.mark")]),
+                    outer,
+                    (vec!["a.id"], vec!["b.id"]),
+                    None,
+                )
+                .expect("outer join")
+                .filter(!col("c.mark"))
+                .expect("filter on the mark")
+                .project(vec![col("a.id")])
+                .expect("projection")
+                .build()
+                .expect("build");
+            match federated_sql_result(&plan) {
+                Err(DataFusionError::NotImplemented(message)) => assert!(
+                    message.contains("mark join whose mark is read through a projection"),
+                    "{outer}: refused for another reason: {message}"
+                ),
+                other => panic!(
+                    "{outer}: the mark join under the projection is dropped from the SQL, which \
+                     still reads `c.mark`, so the plan has to be refused; got {other:?}"
+                ),
+            }
+        }
+
+        let plan = LogicalPlanBuilder::from(plain_id_scan("a"))
+            .join(
+                projected_mark(vec![col("b.id")]),
+                JoinType::Left,
+                (vec!["a.id"], vec!["b.id"]),
+                None,
+            )
+            .expect("outer join")
+            .project(vec![col("a.id"), col("b.id")])
+            .expect("projection")
+            .build()
+            .expect("build");
+        assert_eq!(
+            federated_sql(&plan),
+            "SELECT a.id, b.id FROM a LEFT OUTER JOIN (b) ON a.id = b.id",
+            "a mark join whose mark nothing reads keeps every row of its left input, so the \
+             nested join renders without it"
+        );
+    }
+
     fn federation_dialects() -> Vec<(&'static str, Arc<dyn Dialect>)> {
         vec![
             ("default", Arc::new(DefaultDialect {})),
