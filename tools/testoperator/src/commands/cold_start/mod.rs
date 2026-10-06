@@ -52,7 +52,7 @@ const METRICS_ADDR: &str = "127.0.0.1:9095";
 #[derive(Debug, Serialize)]
 struct DatasetResult {
     name: String,
-    initial_load_ms: Option<f64>,
+    initial_load_ms: f64,
     full_compactions: u64,
     rows: i64,
 }
@@ -243,17 +243,33 @@ async fn measure(
             .filter(|counts| counts.len() == 1)
             .map(|counts| counts.value(0))
             .ok_or_else(|| anyhow::anyhow!("COUNT(*) on dataset '{name}' returned no count"))?;
+        // Metric labels carry the name as the runtime registers it, e.g.
+        // `Sales.Orders` as `sales.orders`.
+        let label = TableReference::parse_str(name).to_string();
+        // Every accelerated dataset records its initial load, so a missing
+        // series means the labels did not match; without this check the
+        // compaction count below would read as zero instead of failing.
+        let initial_load_ms = metric_sum(
+            &metrics,
+            "dataset_acceleration_refresh_duration_ms_sum",
+            &[("dataset", &label)],
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "spiced reported no initial load for dataset '{name}' (label '{label}')"
+            )
+        })?;
         results.push(DatasetResult {
             name: name.clone(),
-            initial_load_ms: metric_sum(
-                &metrics,
-                "dataset_acceleration_refresh_duration_ms_sum",
-                &[("dataset", name)],
-            ),
+            initial_load_ms,
             full_compactions: counter(metric_sum(
                 &metrics,
                 "cayenne_compaction_outcome_total",
-                &[("table", name), ("kind", "full"), ("outcome", "committed")],
+                &[
+                    ("table", &label),
+                    ("kind", "full"),
+                    ("outcome", "committed"),
+                ],
             )),
             rows,
         });
@@ -422,9 +438,7 @@ fn markdown_summary(results: &ColdStartResults) -> String {
         let median_ms = binary.median_ready_ms();
         for (index, run) in binary.runs.iter().enumerate() {
             for dataset in &run.datasets {
-                let load = dataset
-                    .initial_load_ms
-                    .map_or_else(|| "-".to_string(), |ms| format!("{ms:.0}"));
+                let load = format!("{:.0}", dataset.initial_load_ms);
                 let _ = writeln!(
                     out,
                     "| {label} | {} | {median_ms} | {} | {} | {} | {load} | {} | {} |",
@@ -507,7 +521,7 @@ cayenne_compaction_outcome_total{kind="subset_current",outcome="committed",table
                     ready_ms,
                     datasets: vec![DatasetResult {
                         name: "audit_log".to_string(),
-                        initial_load_ms: None,
+                        initial_load_ms: 0.0,
                         full_compactions,
                         rows,
                     }],
