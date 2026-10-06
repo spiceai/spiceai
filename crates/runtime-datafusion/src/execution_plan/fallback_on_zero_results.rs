@@ -217,12 +217,6 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 );
                 tracing::debug!("{fallback_msg}");
                 metrics::FEDERATED_FALLBACK.add(1, &[KeyValue::new("dataset_name", table_name.to_string())]);
-                tracing::info!(
-                    target: "task_history",
-                    fallback = true,
-                    on_zero_results = "use_source",
-                    "labels"
-                );
                 let federated_provider = federated_provider_callback().await;
                 let fallback_optimized_plan =
                     match scan_fallback_plan(
