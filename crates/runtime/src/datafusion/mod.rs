@@ -3332,7 +3332,7 @@ impl DataFusion {
             .time_period(dataset.retention_period())
             .check_interval(dataset.retention_check_interval())
             .enabled(acceleration_settings.retention_check_enabled)
-            .delete_expr(retention_delete_expr);
+            .delete_expr(retention_delete_expr.clone());
 
         // Caching mode decides what bounds the accelerator in the block below, and
         // can install a policy derived from the caching parameters over this one — so
