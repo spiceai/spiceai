@@ -21,7 +21,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use byte_unit::Byte;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use moka::future::Cache;
 use parking_lot::RwLock;
 use snafu::ResultExt;
@@ -286,9 +286,9 @@ mod tests {
     use crate::CachedQueryResult;
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::TableReference;
     use datafusion::datasource::{MemTable, provider_as_source};
     use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
-    use datafusion::sql::TableReference;
     use rstest::rstest;
     use std::collections::HashSet;
     use std::hash::RandomState;

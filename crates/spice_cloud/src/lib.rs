@@ -20,7 +20,7 @@ use runtime::dataconnector::parameters::RuntimeConnectorContext;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use snafu::{ResultExt, prelude::*};

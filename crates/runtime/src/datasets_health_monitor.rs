@@ -23,7 +23,7 @@ use std::{
 
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::TimestampNanosecondType;
-use datafusion::{datasource::TableProvider, error::DataFusionError, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider, error::DataFusionError};
 use futures::{future::join_all, stream::TryStreamExt};
 use iceberg_datafusion::IcebergTableProvider;
 use opentelemetry::KeyValue;

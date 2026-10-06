@@ -97,7 +97,7 @@ pub fn validate_auth(parameters: &Parameters) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::ConnectorComponent;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion_table_providers::util::secrets::to_secret_map;
     use runtime_component::dataset::DatasetSpec;
     use runtime_parameters::{ParameterSpec, Parameters};
