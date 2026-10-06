@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use arrow::datatypes::SchemaRef;
 use data_components::cdc::{self, ChangeOperation};
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use runtime_metrics::acceleration as metrics;
 
