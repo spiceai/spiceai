@@ -215,6 +215,10 @@ jobs:
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          # The binaries only hand off to this run's test jobs, so they need not
+          # outlive it; at the repository's 30-day default each run kept its
+          # two builds (~600 MiB) stored for a month.
+          artifact_retention_days: '1'
 
       - name: Build spiced and spice CLI (macOS)
         if: matrix.target.target_os == 'darwin'
@@ -230,6 +234,7 @@ jobs:
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          artifact_retention_days: '1'
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Show sccache stats
@@ -245,8 +250,9 @@ jobs:
         if: always() && matrix.target.target_os == 'darwin' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
-        if: always() && matrix.target.target_os == 'darwin'
+        if: always() && matrix.target.target_os == 'darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-e2e-build-logs
@@ -372,16 +378,14 @@ jobs:
               },
               {
                 name: "macOS aarch64 (Apple Silicon)",
-                // The standard pool, not `spiceai-macos-large`: these two
-                // jobs are minutes long and every wait inside them is bounded
-                // (60s readiness, then 30s/30s/60s in the expect scripts), so
-                // what decides them is the size of whatever shares their Mac
-                // mini. A host carries several runner instances, and sharing
-                // one with a three-hour build starved this job badly enough
-                // that `spiced --version` took 186s against 0.1-0.3s on an
-                // uncontended host, blowing those bounds (#13761). The pool
-                // split bounds the neighbour rather than removing it.
-                runner: "spiceai-macos",
+                // `spiceai-macos-large`, like `test_hf_model`: both gate the
+                // merge queue through `E2E Test CI`, and on the `spiceai-macos`
+                // minis this 2.4-minute leg queued 83 min at p90 for a runner
+                // (merge_group, 2026-09-29..10-06). Every wait inside it is
+                // bounded (60s readiness, then 30s/30s/60s in the expect
+                // scripts), so a host starved by a neighbouring build fails it
+                // rather than slowing it (#13761).
+                runner: "spiceai-macos-large",
                 target_os: "darwin",
                 target_arch: "aarch64"
               }
@@ -454,7 +458,7 @@ jobs:
           sudo apt-get install -y expect
 
       - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        if: matrix.target.target_os == 'darwin' && !startsWith(matrix.target.runner, 'spiceai-macos')
         run: |
           if command -v expect >/dev/null 2>&1; then
             expect -v
@@ -490,8 +494,12 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          # A self-hosted Mac for Metal and for the Hugging Face cache in $HOME
+          # (see below); the large pool because this leg gates the merge queue,
+          # and on the `spiceai-macos` minis it queued 88 min at p90 for a runner
+          # (merge_group, 2026-09-29..10-06).
           - name: 'macOS aarch64 (Apple Silicon)'
-            runner: 'spiceai-macos'
+            runner: 'spiceai-macos-large'
             target_os: 'darwin'
             target_arch: 'aarch64'
     steps:
@@ -655,7 +663,7 @@ jobs:
           sudo apt-get install -y expect
 
       - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        if: matrix.target.target_os == 'darwin' && !startsWith(matrix.target.runner, 'spiceai-macos')
         run: |
           if command -v expect >/dev/null 2>&1; then
             expect -v
@@ -1899,8 +1907,9 @@ jobs:
           python3 test/github/check_live.py --endpoint "${SPICE_HTTP_ENDPOINT}" \
             --artifacts github-live-results
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload GitHub test evidence
-        if: always()
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: github-connector-results-${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}
