@@ -244,6 +244,45 @@ Without it `state_location` is ignored, the runtime warns once, and every
 cluster scenario silently measures a process-local limiter instead.
 `cluster-adaptive-s3` additionally needs `rustfs` and the `aws` CLI.
 
+### The configuration it drives (changed 2026-10-06, PR #14143)
+
+```yaml
+runtime:
+  state:
+    location: file:///var/lib/spice/state/   # or s3://, abfs://, abfss://
+    params:                                  # object-store params, optional
+      s3_region: us-east-1
+  source_rate_control:
+    refresh_interval: "1s"                   # the lease window
+
+datasets:
+  - from: https://api.example.com/v1
+    name: d1
+    params:
+      requests_per_second_limit: "20"
+      rate_control_failure_threshold: "20%"  # default 10%
+      rate_control_window: "3s"              # default 10s; cluster: refresh_interval
+      rate_control_acquire_timeout: "2s"     # default: the connector client_timeout
+```
+
+Three things moved and the harness moved with them:
+
+- **There is no `rate_control_mode`.** Rate control is always adaptive. The
+  nearest expressible "do not throttle" control is a threshold the origin's
+  error rate stays under — `tolerant-threshold` fails half the requests against
+  a 90% threshold, where `K = 10` puts the coefficient at exactly 1.
+- **`runtime.state.location` replaces `runtime.source_rate_control.state_location`**
+  (and `.params`). It is the runtime's one shared object store, also used for
+  results-cache warmup and distributed query state, so setting it for either of
+  those turns cluster rate control on too. `source_rate_control` now rejects
+  unknown fields, so the old spelling fails to load rather than being ignored.
+  `refresh_interval` stays where it was.
+- **The throttled budget is no longer written back.** Each replica derives
+  `effective_burst` from the shared counts and holds it for the window, so the
+  state object is schema **3** again with no `effective_burst` field, and
+  `cluster_effective_burst`, `lease_acquire_duration_ms` and
+  `lease_acquire_conflicts_total` are no longer exported as metrics.
+
 ### What a scenario is
 
 `loadgen/ratecontrol/scenarios.py` is the catalog, and it is meant to be read:
@@ -317,16 +356,19 @@ The shared state object is read back as evidence
 
 | check | why the arrival log cannot settle it |
 |---|---|
-| `sum(granted) <= effective_burst` per window | the lease split is invisible from outside |
-| arrivals within the leased budget over adjacent windows | distinguishes a real oversell from a boundary-crossing request |
+| `sum(granted) <= burst_per_window` per window | the lease split is invisible from outside. This is the bound the design guarantees now that the budget is not persisted: a grant is capped at `effective_burst - granted_by_others`, and `effective_burst` at `burst_per_window` |
+| arrivals within the configured budget over adjacent windows | distinguishes a real oversell from a boundary-crossing request |
 | published `ok`/`failed` == the origin's own 200/non-200 per window | proves a permit-acquire timeout, which never reaches the origin, is never counted as an upstream failure |
-| `effective_burst` matches the published formula | re-derives it from `ok`/`failed` with `K = 1/(1 - failure_threshold)` |
-| static mode publishes no outcome counts | the state object stays byte-compatible with pre-cluster-adaptive runtimes |
+| the coefficient the counts imply == the one the replicas published | recomputes it from `ok`/`failed` with `K = 1/(1 - failure_threshold)` and compares against `adaptive_admission_ratio`. A cross-source check: the shared file and the runtime's own telemetry have to say the same thing |
 
 And from each replica's own `/metrics`: every replica must publish the same
-`cluster_effective_burst` and `adaptive_admission_ratio`, having exchanged no
-traffic with its peers — plus zero lease-refresh errors and zero fail-closed
-requests.
+`adaptive_admission_ratio` in every settled second and sweep the same range of
+them over the run, having exchanged no traffic with its peers — plus zero
+lease-refresh errors and zero fail-closed requests.
+
+Two notes on that metric in cluster mode, both by design: it is absent until
+the first lease, and `adaptive_throttled_total` stays `0`, because the cluster
+lowers its budget rather than charging a heavier weight.
 
 ### Five findings from building the catalog
 

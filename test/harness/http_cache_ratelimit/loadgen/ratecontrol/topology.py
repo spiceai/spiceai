@@ -40,20 +40,27 @@ REPLICA_HEADER = "X-Spice-Replica"
 
 @dataclass(frozen=True)
 class RateControl:
-    """The rate-control parameters every dataset on one origin must agree on."""
+    """The rate-control parameters every dataset on one origin must agree on.
+
+    There is no mode. HTTP rate control is always adaptive: the limits scale
+    down while the origin fails and back up as it recovers, and the only way to
+    make it tolerant is a high `failure_threshold`. A dataset with no limit at
+    all has nothing to scale, which is not an error.
+    """
 
     requests_per_second: int | None = None
     requests_per_minute: int | None = None
     max_concurrent_requests: int | None = None
-    mode: str = "static"  # "static" | "adaptive"
+    #: The error rate above which throttling starts. Default 10%.
     failure_threshold: str | None = None  # e.g. "20%"
-    window: str | None = None  # `rate_control_window`, the decay half-life
+    #: The decay half-life. Default 10s locally, `refresh_interval` in cluster
+    #: mode -- one window is the shortest half-life the shared state expresses.
+    window: str | None = None
     acquire_timeout: str = "2s"
 
     def as_params(self) -> dict[str, str]:
         """The dataset parameters these settings become."""
         params: dict[str, str] = {
-            "rate_control_mode": self.mode,
             "rate_control_acquire_timeout": self.acquire_timeout,
         }
         if self.requests_per_second is not None:
@@ -109,9 +116,20 @@ class DatasetSpec:
 
 @dataclass(frozen=True)
 class ClusterState:
-    """Where replicas lease a shared budget from, if they do."""
+    """Where replicas lease a shared budget from, if they do.
+
+    The location is `runtime.state.location`, which is the runtime's one shared
+    object store -- also used for results-cache warmup and distributed query
+    state. Setting it turns cluster rate control on for every origin that has a
+    request-rate limit; there is no rate-control-specific location any more.
+    `runtime.source_rate_control.state_location` and `.params` were removed, and
+    `source_rate_control` rejects unknown fields, so the old spelling fails to
+    load rather than being ignored.
+    """
 
     backend: str = "file"  # "file" | "s3"
+    #: `runtime.source_rate_control.refresh_interval`: the lease window, and in
+    #: cluster mode the default adaptive half-life.
     refresh_interval: str = "1s"
     bucket: str = "rate-control-state"
     prefix: str = "state/"
@@ -178,12 +196,15 @@ def render_spicepod(
     if state_location is not None:
         assert topology.cluster is not None
         lines += [
-            "  source_rate_control:",
-            f"    state_location: {state_location}",
-            f'    refresh_interval: "{topology.cluster.refresh_interval}"',
+            "  state:",
+            f"    location: {state_location}",
         ]
         if state_params:
             lines += state_params.rstrip("\n").split("\n")
+        lines += [
+            "  source_rate_control:",
+            f'    refresh_interval: "{topology.cluster.refresh_interval}"',
+        ]
     lines += ["", "datasets:"]
 
     for dataset in topology.datasets:

@@ -271,6 +271,7 @@ def state_location(scenario: Scenario, paths: RunPaths) -> tuple[str | None, str
         directory = os.path.join(paths.root, "state")
         os.makedirs(directory, exist_ok=True)
         return f"file://{directory}/", ""
+    # `runtime.state.params`, the object-store params for the shared location.
     params = "\n".join(
         [
             "    params:",

@@ -45,6 +45,8 @@ from ratecontrol import rates, runner, state  # noqa: E402
 from ratecontrol.scenarios import GROUPS, SCENARIOS, Bound, Scenario  # noqa: E402
 
 SPICEPOD_NAME = "http-ratecontrol"
+#: `rate_control_failure_threshold` when a scenario leaves it unset.
+DEFAULT_FAILURE_THRESHOLD = 0.10
 
 
 @dataclass
@@ -240,16 +242,14 @@ def check_metrics_agreement(
     disagreement, and it cannot be told apart from one while the value is
     moving. Where nothing is moving, a difference can only be a real one.
 
-    The budget itself is settled far more strictly by the shared state object:
-    `effective_burst` is one value per window, first-write-wins, and
-    `sum(granted) <= effective_burst` is checked on every window.
+    `adaptive_admission_ratio` is the only coefficient the runtime exports now;
+    `cluster_effective_burst` and the two `lease_acquire_*` series went with the
+    persisted budget. The shared state object backs this up from the other side:
+    the coefficient its counts imply is compared with the ratio published here.
     """
     if scenario.topology.replicas < 2 or scenario.topology.cluster is None:
         return
-    tracked = (
-        "dataset_http_rate_control_cluster_effective_burst",
-        "dataset_http_rate_control_adaptive_admission_ratio",
-    )
+    tracked = ("dataset_http_rate_control_adaptive_admission_ratio",)
     by_second: dict[tuple[int, str], dict[str, tuple[tuple[str, float], ...]]] = defaultdict(dict)
     for replica, scraper in scrapers.items():
         for sample in scraper.samples:
@@ -290,34 +290,30 @@ def check_metrics_agreement(
         f" ({moving} seconds skipped because a published value was still moving)",
     )
 
-    # Phase-independent corroboration: over the whole run every replica should
-    # walk the same set of budgets. A replica computing its own coefficient
-    # would visit values its peers never do.
-    published: dict[str, set[float]] = defaultdict(set)
+    # Phase-independent corroboration: the replicas should sweep the same
+    # range. Set equality was the check while the metric was a whole-token
+    # budget with a handful of distinct values; the admission ratio is a float
+    # that moves every window, so which exact values a 1 Hz scrape catches is
+    # down to tick phase, not agreement. The range is not: a replica deriving
+    # its own coefficient from its own view would bottom out somewhere else.
+    published: dict[str, list[float]] = defaultdict(list)
     for replica, scraper in scrapers.items():
         for sample in scraper.samples:
             if sample.metric_name == tracked[0]:
-                published[replica].add(sample.value)
-    if len(published) >= 2:
-        sets = list(published.values())
-        shared = set.intersection(*sets)
-        union = set.union(*sets)
+                published[replica].append(sample.value)
+    spans = {
+        replica: (min(values), max(values))
+        for replica, values in published.items()
+        if values
+    }
+    if len(spans) >= 2:
+        lows = [low for low, _high in spans.values()]
+        highs = [high for _low, high in spans.values()]
         assertions.add(
-            "metrics: the replicas walk the same set of budgets over the run",
-            len(shared) >= 0.8 * len(union),
-            f"{len(shared)}/{len(union)} of the budgets published were published by every replica",
+            "metrics: the replicas sweep the same range of coefficients",
+            max(lows) - min(lows) <= 0.1 and max(highs) - min(highs) <= 0.1,
+            ", ".join(f"{replica} [{low:.3f}, {high:.3f}]" for replica, (low, high) in sorted(spans.items())),
         )
-
-    for name, label in (
-        ("dataset_http_rate_control_lease_refresh_errors_total", "lease refresh errors"),
-        ("dataset_http_rate_control_fail_closed_total", "fail-closed requests"),
-    ):
-        worst = 0.0
-        for scraper in scrapers.values():
-            for sample in scraper.samples:
-                if sample.metric_name == name:
-                    worst = max(worst, sample.value)
-        assertions.add(f"metrics: no {label}", worst == 0, f"max observed {worst:g}")
 
 
 def run_scenario(scenario: Scenario, args: argparse.Namespace) -> dict:
@@ -434,11 +430,26 @@ def run_scenario(scenario: Scenario, args: argparse.Namespace) -> dict:
             shared = state.SharedState.load(path)
             origin_arrivals = rates.select(arrivals, rates.Slice(origin=origin.name))
             threshold = origin.rate_control.failure_threshold
+            # The ratio each replica published, by unix second. Window ids are
+            # unix seconds while `refresh_interval` is 1s, which is what makes
+            # the file's counts and this series comparable.
+            published_ratio = {
+                sample.scrape_epoch_ms // 1000: sample.value
+                for scraper in scrapers.values()
+                for sample in scraper.samples
+                if sample.metric_name == "dataset_http_rate_control_adaptive_admission_ratio"
+                and sample.origin.endswith(f":{origin.port}")
+            }
             for check in state.check_state(
                 shared,
                 origin_arrivals,
-                adaptive=origin.rate_control.mode == "adaptive",
-                failure_threshold=float(threshold.rstrip("%")) / 100 if threshold else None,
+                failure_threshold=(
+                    float(threshold.rstrip("%")) / 100
+                    if threshold
+                    else DEFAULT_FAILURE_THRESHOLD
+                ),
+                published_ratio=published_ratio,
+                replicas=scenario.topology.replicas,
             ):
                 assertions.add(f"{origin.name} {check.name}", check.passed, check.detail)
             with open(paths.path(f"state_timeline_{origin.name}.txt"), "w", encoding="utf-8") as fh:

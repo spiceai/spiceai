@@ -56,6 +56,11 @@ THROTTLED = 0.5 * BUDGET  # 10
 #: Two whole seconds may carry two budgets, plus the one request that was
 #: granted in the second before them and landed inside them.
 ROLLING_2S = 2 * BUDGET + 1
+#: The cluster budget is no longer written back: each replica derives
+#: `effective_burst` from the shared counts and holds it for the window. What
+#: the shared file still bounds is the configured burst, because a grant is
+#: capped at `effective_burst - granted_by_others` and `effective_burst` is
+#: itself capped at `burst_per_window`.
 
 P1_PORT = 9001
 P2_PORT = 9002
@@ -185,13 +190,24 @@ STEADY_SHAPE = dict(
 
 
 def _adaptive(rps: int = BUDGET, threshold: str = "20%", window: str | None = None) -> RateControl:
-    return RateControl(
-        requests_per_second=rps, mode="adaptive", failure_threshold=threshold, window=window
-    )
+    return RateControl(requests_per_second=rps, failure_threshold=threshold, window=window)
 
 
-def _static(rps: int = BUDGET) -> RateControl:
-    return RateControl(requests_per_second=rps, mode="static")
+#: There is no static mode to compare against any more -- rate control is always
+#: adaptive. The nearest expressible control is a threshold so tolerant that a
+#: half-failing origin stays under it: at a 90% threshold `K = 10`, so a 50%
+#: success rate gives `min(1, (10*0.5r + 1)/(r + 1)) = 1` and nothing throttles.
+#: That is a real claim about the knob, not a stand-in for a mode.
+TOLERANT_THRESHOLD = "90%"
+
+
+def _tolerant(rps: int = BUDGET) -> RateControl:
+    return RateControl(requests_per_second=rps, failure_threshold=TOLERANT_THRESHOLD)
+
+
+def _limit(rps: int = BUDGET) -> RateControl:
+    """A plain request-rate limit on its default threshold and window."""
+    return RateControl(requests_per_second=rps)
 
 
 def _one_origin(rate_control: RateControl, datasets: int = 1) -> Topology:
@@ -251,20 +267,24 @@ def _unchanged(phase: str, claim: str, where: Slice = Slice()) -> Bound:
 
 A_SCENARIOS = (
     Scenario(
-        name="static-limit",
-        claim="static mode keeps sending the configured rate at a failing origin",
-        topology=_one_origin(_static()),
-        faults=(Fault("p1", FAIL_503),),
+        name="tolerant-threshold",
+        claim="a threshold the origin's error rate stays under does not throttle",
+        topology=_one_origin(_tolerant()),
+        # Half the requests fail, against a 90% threshold. This is the negative
+        # control for every throttling scenario below: if it throttled too, the
+        # others would be evidence of something other than the error signal.
+        faults=(Fault("p1", dict(FAIL_503, error_rate=0.5, seed=7)),),
+        fault_admission_ratio_above=0.999,
         bounds=(
             _saturated("warmup"),
-            _unchanged("fault", "a failing origin does not change a static limit"),
+            _unchanged("fault", "an error rate under the threshold changes nothing"),
             _saturated("recovery"),
         ),
         **STEADY_SHAPE,
     ),
     Scenario(
-        name="adaptive-503",
-        claim="adaptive mode throttles on 5xx and recovers when the origin does",
+        name="throttle-503",
+        claim="rate control throttles on 5xx and recovers when the origin does",
         topology=_one_origin(_adaptive()),
         faults=(Fault("p1", FAIL_503),),
         bounds=(_saturated("warmup"), _throttled("fault"), _saturated("recovery")),
@@ -272,7 +292,7 @@ A_SCENARIOS = (
         **SINGLE_ADAPTIVE_SHAPE,
     ),
     Scenario(
-        name="adaptive-429",
+        name="throttle-429",
         claim="a 429 is a failure signal, the same as a 5xx",
         topology=_one_origin(_adaptive()),
         faults=(Fault("p1", FAIL_429),),
@@ -281,7 +301,7 @@ A_SCENARIOS = (
         **SINGLE_ADAPTIVE_SHAPE,
     ),
     Scenario(
-        name="adaptive-timeout",
+        name="throttle-timeout",
         claim="a request that hangs past client_timeout throttles like an error does",
         # The hang is the slow path: each worker is parked for a whole
         # client_timeout, so demand needs many more of them to stay above the
@@ -299,7 +319,7 @@ A_SCENARIOS = (
         **SINGLE_ADAPTIVE_SHAPE,
     ),
     Scenario(
-        name="adaptive-refuse",
+        name="throttle-refuse",
         claim="a refused connection throttles like an error does",
         topology=_one_origin(_adaptive()),
         faults=(Fault("p1", REFUSE),),
@@ -308,7 +328,7 @@ A_SCENARIOS = (
         **SINGLE_ADAPTIVE_SHAPE,
     ),
     Scenario(
-        name="adaptive-latency-only",
+        name="no-throttle-latency-only",
         claim="a slow but healthy origin is not throttled",
         topology=_one_origin(_adaptive()),
         faults=(Fault("p1", LATENCY_ONLY),),
@@ -370,8 +390,8 @@ B_SCENARIOS = (
         claim="each origin holds its own budget at the same time",
         topology=Topology(
             origins=(
-                OriginSpec("p1", P1_PORT, _static(BUDGET)),
-                OriginSpec("p2", P2_PORT, _static(5)),
+                OriginSpec("p1", P1_PORT, _limit(BUDGET)),
+                OriginSpec("p2", P2_PORT, _limit(5)),
             ),
             datasets=(DatasetSpec("d1", "p1"), DatasetSpec("d2", "p2")),
         ),
@@ -404,7 +424,7 @@ C_SCENARIOS = (
     Scenario(
         name="sameorigin-shared-budget",
         claim="datasets that share an origin share one budget, they do not each get one",
-        topology=_one_origin(_static(), datasets=2),
+        topology=_one_origin(_limit(), datasets=2),
         bounds=(
             Bound(
                 claim="two saturated datasets on one origin stay within ONE budget",
@@ -518,7 +538,7 @@ C_SCENARIOS = (
         name="sameorigin-conflicting-config",
         claim="two datasets on one origin may not ask for different limits",
         topology=Topology(
-            origins=(OriginSpec("p1", P1_PORT, _static()),),
+            origins=(OriginSpec("p1", P1_PORT, _limit()),),
             datasets=(
                 DatasetSpec("d1", "p1", "/data"),
                 DatasetSpec("d2", "p1", "/data.json", override={"requests_per_second_limit": "5"}),
@@ -572,13 +592,13 @@ D_SCENARIOS = (
         **CLUSTER_SHAPE,
     ),
     Scenario(
-        name="cluster-static",
-        claim="static mode does not throttle a cluster either",
-        topology=_cluster(_static()),
-        faults=(Fault("p1", FAIL_503),),
+        name="cluster-tolerant-threshold",
+        claim="a tolerant threshold does not throttle a cluster either",
+        topology=_cluster(_tolerant()),
+        faults=(Fault("p1", dict(FAIL_503, error_rate=0.5, seed=7)),),
         bounds=(
             _saturated("warmup"),
-            _unchanged("fault", "a failing origin does not change a static cluster limit"),
+            _unchanged("fault", "an error rate under the threshold changes nothing"),
         ),
         **STEADY_SHAPE,
     ),
@@ -659,7 +679,7 @@ D_SCENARIOS = (
     Scenario(
         name="cluster-sameorigin",
         claim="one budget covers every replica and every dataset on one origin",
-        topology=_cluster(_static(), replicas=2, datasets_per_origin=2),
+        topology=_cluster(_limit(), replicas=2, datasets_per_origin=2),
         bounds=(
             Bound(
                 claim="2 replicas x 2 datasets stay within ONE 20 rps budget",
