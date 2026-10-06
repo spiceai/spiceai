@@ -128,13 +128,16 @@ fn cayenne_unscheduled_time_dataset(source: &Path, name: &str) -> Dataset {
     dataset.params = Some(Params::from_string_map(
         [("file_format".to_string(), "csv".to_string())].into(),
     ));
-    // Cayenne's scan-time keep builder rejects numeric columns without a
-    // unix scale (`data_type_to_timestamp_format(..., None)`), so the source
-    // timestamps are ISO-8601 strings — the DuckDB fixture can stay numeric.
+    // ISO-8601 CSV values so the file connector yields Timestamp rather
+    // than Int64. Cayenne's scan-time keep builder rejects numeric columns
+    // without a unix scale (`data_type_to_timestamp_format(..., None)`).
+    // `time_format` is Timestamp because that is the inferred Arrow type;
+    // ISO8601 is only valid while the column stays Utf8. The DuckDB fixture
+    // can stay numeric.
     dataset.time_column = Some("ts".to_string());
-    dataset.time_format = Some(TimeFormat::ISO8601);
+    dataset.time_format = Some(TimeFormat::Timestamp);
     dataset.time_partition_column = Some("partition_ts".to_string());
-    dataset.time_partition_format = Some(TimeFormat::ISO8601);
+    dataset.time_partition_format = Some(TimeFormat::Timestamp);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("cayenne".to_string()),
