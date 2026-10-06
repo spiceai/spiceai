@@ -1058,7 +1058,17 @@ pub enum Table {
     Federated {
         data_connector: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
+        generation: FederatedGeneration,
     },
+}
+
+/// What a federated registration does with the dataset's storage generation.
+pub enum FederatedGeneration {
+    /// Drain any accelerated generation the federated table replaces.
+    Drain,
+    /// Serve the source while a pending snapshot reader's restore owns the
+    /// generation. The federated table holds no storage, so it leaves it in place.
+    SnapshotRestore,
 }
 
 struct PendingSinkRegistration {
@@ -1851,8 +1861,14 @@ impl DataFusion {
             Table::Federated {
                 data_connector,
                 federated_read_table,
+                generation,
             } => {
-                let _permit = self.drained_generation(&dataset_table_ref).await?;
+                let _permit = match generation {
+                    FederatedGeneration::Drain => {
+                        Some(self.drained_generation(&dataset_table_ref).await?)
+                    }
+                    FederatedGeneration::SnapshotRestore => None,
+                };
                 if let Some(deferred_connector) =
                     data_connector.as_any().downcast_ref::<DeferredConnector>()
                 {

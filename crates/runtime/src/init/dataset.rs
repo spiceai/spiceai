@@ -2085,6 +2085,11 @@ impl Runtime {
                     crate::datafusion::Table::Federated {
                         data_connector,
                         federated_read_table,
+                        generation: if bootstrap_status.is_pending() {
+                            crate::datafusion::FederatedGeneration::SnapshotRestore
+                        } else {
+                            crate::datafusion::FederatedGeneration::Drain
+                        },
                     },
                 )
                 .await
