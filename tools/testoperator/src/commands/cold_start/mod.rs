@@ -19,9 +19,10 @@ limitations under the License.
 //!
 //! Two checks guard the result. A work bound (`--max-full-compactions`) catches
 //! a load that rewrites its own rows, independent of how fast the runner is. A
-//! relative bound (`--max-ready-ratio`) compares the candidate's median time to
-//! ready against a baseline binary run on the same host in the same job, which
-//! tolerates noisy shared runners where an absolute threshold would not.
+//! relative bound (`--max-ready-ratio`) compares the candidate's median and
+//! slowest time to ready against a baseline binary run on the same host in the
+//! same job, which tolerates noisy shared runners where an absolute threshold
+//! would not.
 
 use std::{
     fmt::Write as _,
@@ -72,6 +73,14 @@ struct BinaryResult {
 impl BinaryResult {
     fn median_ready_ms(&self) -> u64 {
         median(self.runs.iter().map(|run| run.ready_ms).collect())
+    }
+
+    fn slowest_ready_ms(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|run| run.ready_ms)
+            .max()
+            .unwrap_or_default()
     }
 }
 
@@ -294,19 +303,33 @@ fn evaluate(
         }
     }
 
+    // The median tolerates one noisy start; the slowest start catches a
+    // regression that only some cold starts hit.
     if let Some(baseline) = baseline {
-        let candidate_ms = candidate.median_ready_ms();
-        let baseline_ms = baseline.median_ready_ms().max(1);
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "millisecond durations are far below 2^52"
-        )]
-        let ratio = candidate_ms as f64 / baseline_ms as f64;
-        if ratio > args.max_ready_ratio {
-            failures.push(format!(
-                "median time to ready {candidate_ms} ms is {ratio:.2}x the baseline's {baseline_ms} ms (max {:.2}x)",
-                args.max_ready_ratio
-            ));
+        for (statistic, candidate_ms, baseline_ms) in [
+            (
+                "median",
+                candidate.median_ready_ms(),
+                baseline.median_ready_ms(),
+            ),
+            (
+                "slowest",
+                candidate.slowest_ready_ms(),
+                baseline.slowest_ready_ms(),
+            ),
+        ] {
+            let baseline_ms = baseline_ms.max(1);
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "millisecond durations are far below 2^52"
+            )]
+            let ratio = candidate_ms as f64 / baseline_ms as f64;
+            if ratio > args.max_ready_ratio {
+                failures.push(format!(
+                    "{statistic} time to ready {candidate_ms} ms is {ratio:.2}x the baseline's {baseline_ms} ms (max {:.2}x)",
+                    args.max_ready_ratio
+                ));
+            }
         }
     }
 
@@ -542,8 +565,15 @@ cayenne_compaction_outcome_total{kind="subset_current",outcome="committed",table
             &binary(&[43_000, 44_000, 42_000], 0, 10),
             Some(&binary(&[2_000, 2_100, 1_900], 0, 10)),
         );
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(failures[0].contains("baseline"), "{failures:?}");
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[0].starts_with("median time to ready"),
+            "{failures:?}"
+        );
+        assert!(
+            failures[1].starts_with("slowest time to ready"),
+            "{failures:?}"
+        );
 
         let failures = evaluate(
             &args(None),
@@ -551,6 +581,20 @@ cayenne_compaction_outcome_total{kind="subset_current",outcome="committed",table
             Some(&binary(&[2_000, 2_100, 1_900], 0, 10)),
         );
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn evaluate_flags_a_regression_only_some_cold_starts_hit() {
+        let failures = evaluate(
+            &args(None),
+            &binary(&[2_000, 2_000, 43_000], 0, 10),
+            Some(&binary(&[2_000, 2_000, 2_000], 0, 10)),
+        );
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with("slowest time to ready"),
+            "{failures:?}"
+        );
     }
 
     #[test]

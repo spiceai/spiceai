@@ -346,7 +346,7 @@ Append tests are not built by default, as the File connector source generation r
 
 ### Running Cold-Start Tests
 
-`testoperator run cold-start` starts `spiced` with an empty data directory and measures how long its accelerations take to load and report ready. With `--baseline-spiced-path` it alternates runs of the candidate and a baseline binary, such as the previous release, on the same host and fails when the candidate's median time to ready exceeds `--max-ready-ratio` times the baseline's. `--max-full-compactions` fails a run that commits more full Cayenne compactions than that before it is ready, a bound that does not depend on the host's speed. Every run must load the same row count. Both binaries receive `--cpu-cores` (default 2).
+`testoperator run cold-start` starts `spiced` with an empty data directory and measures how long its accelerations take to load and report ready. With `--baseline-spiced-path` it alternates runs of the candidate and a baseline binary, such as the previous release, on the same host and fails when the candidate's median or slowest time to ready exceeds `--max-ready-ratio` times the baseline's median or slowest. `--max-full-compactions` fails a run that commits more full Cayenne compactions than that before it is ready, a bound that does not depend on the host's speed. Every run must load the same row count. Both binaries receive `--cpu-cores` (default 2).
 
 ```bash
 testoperator run cold-start \

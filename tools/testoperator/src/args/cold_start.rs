@@ -40,8 +40,8 @@ pub struct ColdStartArgs {
     #[arg(long, default_value = "2")]
     pub(crate) cpu_cores: String,
 
-    /// Fail when the candidate's median time to ready exceeds this multiple of
-    /// the baseline's median.
+    /// Fail when the candidate's median or slowest time to ready exceeds this
+    /// multiple of the baseline's median or slowest.
     #[arg(long, default_value = "2.0")]
     pub(crate) max_ready_ratio: f64,
 
