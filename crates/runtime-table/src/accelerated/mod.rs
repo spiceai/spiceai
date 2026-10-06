@@ -469,6 +469,7 @@ pub struct Builder {
     /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
     /// Layered over the process-global CDC config.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
 }
 
 impl Builder {
@@ -524,6 +525,7 @@ impl Builder {
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
+            fallback_retention_keep: None,
         }
     }
 
@@ -550,6 +552,14 @@ impl Builder {
 
     pub fn retention(&mut self, retention: Option<Retention>) -> &mut Self {
         self.retention = retention;
+        self
+    }
+
+    pub fn fallback_retention_keep(
+        &mut self,
+        keep: Option<fallback_retention::FallbackRetentionKeep>,
+    ) -> &mut Self {
+        self.fallback_retention_keep = keep;
         self
     }
 
@@ -973,6 +983,7 @@ impl Builder {
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
+        let write_retention_sql_delete_expr = self.refresh.write_retention_sql_delete_expr.clone();
         let refresh_params = Arc::new(RwLock::new(self.refresh));
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
@@ -1140,11 +1151,15 @@ impl Builder {
             if matches!(self.zero_results_action, ZeroResultsAction::UseSource)
                 && refresh_mode != RefreshMode::Caching
             {
-                self.retention.as_ref().and_then(|retention| {
-                    fallback_retention::FallbackRetentionKeep::from_retention(retention)
-                        .ok()
-                        .flatten()
-                })
+                match self.fallback_retention_keep.clone() {
+                    Some(keep) => Some(keep),
+                    None => fallback_retention::FallbackRetentionKeep::from_configured(
+                        self.retention.as_ref(),
+                        write_retention_sql_delete_expr,
+                    )
+                    .ok()
+                    .flatten(),
+                }
             } else {
                 None
             };

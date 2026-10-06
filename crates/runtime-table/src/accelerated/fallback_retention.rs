@@ -75,6 +75,49 @@ impl FallbackRetentionKeep {
         }))
     }
 
+    /// Keep spec for a `retention_sql` delete predicate, including write-time
+    /// application when the scheduled retention worker is not running.
+    #[must_use]
+    pub fn from_delete_expr(delete_expr: Expr) -> Self {
+        Self {
+            filters: vec![DataRetentionFilter::Expression {
+                delete_expr: Box::new(delete_expr),
+            }],
+        }
+    }
+
+    /// Combine scheduled filters with a write-time `retention_sql` predicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ComputedOnly`] when the only configured policy is a
+    /// computed predicate and there is no `retention_sql` to invert.
+    pub fn from_configured(
+        retention: Option<&Retention>,
+        retention_sql_delete_expr: Option<Expr>,
+    ) -> Result<Option<Self>> {
+        let scheduled = match retention {
+            Some(retention) => match Self::from_retention(retention) {
+                Ok(keep) => keep,
+                Err(Error::ComputedOnly) if retention_sql_delete_expr.is_some() => None,
+                Err(err) => return Err(err),
+            },
+            None => None,
+        };
+        Ok(match (scheduled, retention_sql_delete_expr) {
+            (Some(keep), Some(expr)) => Some(keep.merge(Self::from_delete_expr(expr))),
+            (Some(keep), None) => Some(keep),
+            (None, Some(expr)) => Some(Self::from_delete_expr(expr)),
+            (None, None) => None,
+        })
+    }
+
+    #[must_use]
+    pub fn merge(mut self, other: Self) -> Self {
+        self.filters.extend(other.filters);
+        self
+    }
+
     /// Keep predicates matching the rows retention would leave in the accelerator.
     ///
     /// Time cutoffs are evaluated at the call, so a fallback uses "now" rather
@@ -303,6 +346,43 @@ mod tests {
         let err = FallbackRetentionKeep::from_retention(&retention)
             .expect_err("computed-only has no inverse");
         assert!(matches!(err, Error::ComputedOnly));
+    }
+
+    #[test]
+    fn from_configured_computed_only_without_sql_is_error() {
+        let retention = Retention {
+            filters: Vec::new(),
+            check_interval: Duration::from_secs(1),
+            computed: Some(Arc::new(RefuseComputed)),
+        };
+        let err = FallbackRetentionKeep::from_configured(Some(&retention), None)
+            .expect_err("computed-only has no inverse");
+        assert!(matches!(err, Error::ComputedOnly));
+    }
+
+    #[test]
+    fn from_configured_uses_write_time_sql_when_unscheduled() {
+        let keep = FallbackRetentionKeep::from_configured(None, Some(col("deleted").eq(lit(true))))
+            .expect("write-time sql is invertible")
+            .expect("a keep spec");
+        keep.validate(&events_schema())
+            .expect("deleted = true is a source filter");
+    }
+
+    #[test]
+    fn from_configured_sql_covers_computed_only_scheduled() {
+        let retention = Retention {
+            filters: Vec::new(),
+            check_interval: Duration::from_secs(1),
+            computed: Some(Arc::new(RefuseComputed)),
+        };
+        let keep = FallbackRetentionKeep::from_configured(
+            Some(&retention),
+            Some(col("deleted").eq(lit(true))),
+        )
+        .expect("sql still inverts when the scheduled policy is computed-only")
+        .expect("a keep spec");
+        assert_eq!(keep.filters.len(), 1);
     }
 
     #[derive(Debug)]

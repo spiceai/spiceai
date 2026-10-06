@@ -640,6 +640,15 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn empty_keep_returns_the_source_row() {
+            let ids = collect_ids(vec![], vec![col("id").eq(lit(2i64))]).await;
+            assert!(
+                ids.contains(&2),
+                "without a retention inverse the source still serves the soft-deleted row, got {ids:?}"
+            );
+        }
+
+        #[tokio::test]
         async fn keep_filter_hides_retention_deleted_row() {
             let keep = keep_expr_for_retention_delete(col("deleted").eq(lit(true)));
             let ids = collect_ids(vec![keep], vec![col("id").eq(lit(2i64))]).await;

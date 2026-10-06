@@ -3356,15 +3356,20 @@ impl DataFusion {
             acceleration_settings.on_zero_results,
             ZeroResultsAction::UseSource
         ) && !matches!(refresh_mode, RefreshMode::Caching)
-            && let Some(ref retention_cfg) = retention
         {
-            match crate::accelerated::FallbackRetentionKeep::from_retention(retention_cfg) {
-                Ok(Some(keep)) => keep.validate(&source_table_provider.schema()).context(
-                    RetentionUseSourceUntranslatableSnafu {
-                        dataset_name: dataset.name.to_string(),
-                        connector: dataset.source().to_string(),
-                    },
-                )?,
+            match crate::accelerated::FallbackRetentionKeep::from_configured(
+                retention.as_ref(),
+                retention_delete_expr.clone(),
+            ) {
+                Ok(Some(keep)) => {
+                    keep.validate(&source_table_provider.schema()).context(
+                        RetentionUseSourceUntranslatableSnafu {
+                            dataset_name: dataset.name.to_string(),
+                            connector: dataset.source().to_string(),
+                        },
+                    )?;
+                    accelerated_table_builder.fallback_retention_keep(Some(keep));
+                }
                 Ok(None) => {}
                 Err(source) => {
                     return Err(Error::RetentionUseSourceUntranslatable {
