@@ -31725,16 +31725,8 @@ impl CayenneTableProvider {
         // all-shards capture body below enforce it); a partial checkpoint would
         // make MAX a data-loss hole and require reverting to a MIN watermark.
         //
-        // The fold walks every captured segment, so it grows with tier depth. It
-        // reads only the immutable captured shard snapshots and their captured
-        // `flushed_counts`, so computing it here, after the capture locks are
-        // released, yields exactly the value it would have under them while keeping
-        // the capture window to the snapshot loads and the sequence reservation.
-        let durable_epoch = shard_snapshots
-            .iter()
-            .zip(flushed_counts.iter())
-            .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
-            .max();
+        // The fold walks every captured segment, so it grows with tier depth. It runs
+        // below, after the empty-tier check, in the same blocking task as the union.
         // Emptiness must be judged on the REAL captured shard snapshots, not the
         // synthetic union view: `union_snapshot_view` carries the cross-shard
         // tombstone union + the summed byte/row counts but ALWAYS has empty
@@ -31771,21 +31763,36 @@ impl CayenneTableProvider {
         // locks are released: merging the shards' tombstone maps grows with the
         // tier, and under the locks it held every append and the apply's
         // `write_lock` for the whole merge.
-        let snapshot = if n == 1 {
-            Arc::clone(&shard_snapshots[0])
-        } else {
-            let shards = shard_snapshots.clone();
-            let epoch = durable_epoch.unwrap_or(0);
-            let union = tokio::task::spawn_blocking(move || {
-                crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(&shards, epoch)
-            })
-            .await
-            .map_err(|source| Error::TaskPanicked {
-                table: self.table_metadata.table_name.clone(),
-                source,
-            })?;
-            Arc::new(union)
-        };
+        //
+        // The watermark fold reads the same captured snapshots and their captured
+        // `flushed_counts`, so after the capture locks are released it yields exactly
+        // the value it would have under them. The fold and the union run together in
+        // one blocking task, so neither occupies an async worker.
+        let shards = shard_snapshots.clone();
+        let counts = flushed_counts.clone();
+        let (durable_epoch, snapshot) = tokio::task::spawn_blocking(move || {
+            let durable_epoch = shards
+                .iter()
+                .zip(counts.iter())
+                .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
+                .max();
+            let snapshot = if n == 1 {
+                Arc::clone(&shards[0])
+            } else {
+                Arc::new(
+                    crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(
+                        &shards,
+                        durable_epoch.unwrap_or(0),
+                    ),
+                )
+            };
+            (durable_epoch, snapshot)
+        })
+        .await
+        .map_err(|source| Error::TaskPanicked {
+            table: self.table_metadata.table_name.clone(),
+            source,
+        })?;
         // At N==1 the slot-ack currency stays the single shard's `MemTier::epoch`
         // (no `source_position` stamped), byte-identical to the pre-shard path. At
         // N>1 it is the shared per-apply `durable_epoch` MAX computed above.
