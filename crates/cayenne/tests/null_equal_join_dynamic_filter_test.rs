@@ -22,7 +22,7 @@ limitations under the License.
 //! `IS NOT DISTINCT FROM` dropped the NULL group and `NOT IN` crashed or
 //! dropped NULLs. Memory mode has no Vortex file scan and is the control.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "tests use expect for assertion context")]
 
 mod common;
 
@@ -267,13 +267,10 @@ async fn file_mode_keeps_null_keys_under_dynamic_filters_impl(
             && (plan.contains("NullsEqual") || plan.contains("NullEquals")),
         "precondition: the query must plan as a null-equal hash join:\n{plan}"
     );
-    let pushed_dynamic = plan.contains("DynamicFilter") || plan.contains("dynamic_filter");
-    if pushed_dynamic {
-        assert!(
-            plan.contains("IS NULL") || plan.contains("IsNull"),
-            "a pushed min/max dynamic filter must keep NULL keys (`pred OR col IS NULL`):\n{plan}"
-        );
-    }
+    assert!(
+        plan.contains("DynamicFilter") && (plan.contains("IS NULL") || plan.contains("IsNull")),
+        "the pushed min/max dynamic filter must keep NULL keys (`pred OR col IS NULL`):\n{plan}"
+    );
 
     Ok(())
 }
