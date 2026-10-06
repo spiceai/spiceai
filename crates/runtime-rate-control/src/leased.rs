@@ -126,7 +126,7 @@ use crate::phase_change_log::{Damping, PhaseChangeLog};
 /// The format stays at 3. The cluster outcome counters (`ok`, `failed`) are
 /// optional and additive, and no persisted struct denies unknown fields, so one
 /// file serves a mixed-version fleet: an older instance ignores the counters and
-/// keeps static rate control working, and a newer instance reads an older file
+/// keeps applying the configured limits, and a newer instance reads an older file
 /// with the counters absent.
 ///
 /// Bump this only for a change an older reader would misread.
@@ -594,8 +594,9 @@ impl WindowCounts {
     ///
     /// Published as a pair because the cluster estimate reads a lease only when
     /// both fields are present. A window with no recorded outcome is evidence of
-    /// nothing — in static mode that is every window, and its leases stay
-    /// exactly as they were before cluster adaptive throttling existed.
+    /// nothing — for a bucket without adaptive settings that is every window,
+    /// and its leases stay exactly as they were before cluster adaptive
+    /// throttling existed.
     fn reported_outcomes(self) -> Option<(u64, u64)> {
         (self.ok > 0 || self.failed > 0).then_some((self.ok, self.failed))
     }
@@ -673,7 +674,8 @@ struct PendingPublish {
 
 /// Cluster adaptive parameters for one leased bucket.
 ///
-/// Absent in static mode, where the coefficient is always
+/// Absent for a bucket built without adaptive settings, where the coefficient
+/// is always
 /// [`FULL_ADMISSION_COEFFICIENT`] and the effective budget is the configured
 /// one.
 #[derive(Debug, Clone, Copy)]
@@ -710,7 +712,8 @@ pub(crate) struct LeasedBucketConfig {
     pub limiter_key: String,
     /// Cluster-wide burst budget per window.
     pub burst_per_window: u64,
-    /// Cluster adaptive throttling parameters, or `None` in static mode.
+    /// Cluster adaptive throttling parameters, or `None` to apply the
+    /// configured budget unchanged.
     pub adaptive: Option<LeasedAdaptiveConfig>,
 }
 
@@ -746,8 +749,8 @@ pub struct LeasedBucketMetrics {
     /// Total times a lease refresh failed to talk to the store.
     pub lease_refresh_errors_total: AtomicU64,
     /// The cluster admission coefficient of the current window, as
-    /// [`f64::to_bits`]. `None` in static mode, encoded as
-    /// [`NO_COEFFICIENT_BITS`] so a mode that cannot throttle reports no series
+    /// [`f64::to_bits`]. `None` without adaptive settings, encoded as
+    /// [`NO_COEFFICIENT_BITS`] so a bucket that cannot throttle reports no series
     /// rather than a constant `1` that reads like a live measurement.
     adaptive_admission_ratio_bits: AtomicU64,
     /// The whole part of the cluster budget of the current window, after the
@@ -756,7 +759,7 @@ pub struct LeasedBucketMetrics {
 }
 
 /// The encoding [`LeasedBucketMetrics::adaptive_admission_ratio_bits`] uses for
-/// "static mode, no coefficient". A NaN payload, which no real coefficient can
+/// "no adaptive settings, no coefficient". A NaN payload, which no real coefficient can
 /// take: the coefficient is clamped to `[0, 1]`.
 const NO_COEFFICIENT_BITS: u64 = u64::MAX;
 
@@ -809,7 +812,7 @@ impl LeasedBucketMetrics {
     }
 
     /// The cluster admission coefficient of the most recently leased window, in
-    /// `[0, 1]`. `None` in static mode.
+    /// `[0, 1]`. `None` without adaptive settings, or before the first lease.
     #[must_use]
     pub fn adaptive_admission_ratio(&self) -> Option<f64> {
         match self.adaptive_admission_ratio_bits.load(Ordering::Relaxed) {
@@ -1113,7 +1116,7 @@ struct ClusterBudget {
 }
 
 impl ClusterBudget {
-    /// The configured budget in full: static mode, where there is no
+    /// The configured budget in full: without adaptive settings there is no
     /// coefficient and so nothing to carry.
     fn full(burst: u64) -> Self {
         Self {
@@ -1287,7 +1290,8 @@ impl LeasedBucket {
         &self.config.origin
     }
 
-    /// The cluster admission coefficient in force, or `None` in static mode.
+    /// The cluster admission coefficient in force, or `None` without adaptive
+    /// settings or before the first lease.
     pub fn admission_coefficient(&self) -> Option<f64> {
         self.metrics.adaptive_admission_ratio()
     }
@@ -1502,8 +1506,8 @@ impl LeasedBucket {
 
         let limiter = state.limiter_entry(&self.config.limiter_key, burst);
 
-        // This replica's reading of the shared counts: `Some` exactly in
-        // adaptive mode. Every replica reads the same published outcomes, so
+        // This replica's reading of the shared counts: `Some` exactly when the
+        // bucket has adaptive settings. Every replica reads the same published outcomes, so
         // they converge on the same coefficient without any of it being
         // written back — the counts are the shared state, the budget is not.
         let reading = self.config.adaptive.map(|adaptive| {
@@ -1633,7 +1637,7 @@ impl LeasedBucket {
     /// so their lines agree once those counts have settled.
     fn report_throttle(&self, throttle: Option<ClusterThrottle>) {
         let Some(throttle) = throttle else {
-            return; // Static mode: nothing to report, and no series to emit.
+            return; // No adaptive settings: nothing to report, and no series to emit.
         };
         self.metrics
             .record_effective_burst(throttle.effective_burst, Some(throttle.admission_ratio));
@@ -1714,8 +1718,8 @@ enum WriteOutcome {
 struct WindowOutcome {
     granted: u64,
     budget_remaining_after: u64,
-    /// The adaptive state of the window that was just leased, or `None` in
-    /// static mode.
+    /// The adaptive state of the window that was just leased, or `None`
+    /// without adaptive settings.
     throttle: Option<ClusterThrottle>,
     /// Whether the persisted state was modified and must therefore be written
     /// back. Two reasons we'd skip a write: (a) we already had a lease at the
@@ -2846,10 +2850,11 @@ mod tests {
         );
     }
 
-    /// Static cluster mode reports no admission ratio at all: a mode that cannot
-    /// throttle must not emit a series that reads like a live measurement.
+    /// A bucket without adaptive settings reports no admission ratio at all: a
+    /// bucket that cannot throttle must not emit a series that reads like a
+    /// live measurement.
     #[tokio::test]
-    async fn static_mode_reports_no_admission_ratio() {
+    async fn a_bucket_without_adaptive_settings_reports_no_admission_ratio() {
         let bucket = LeasedBucket::new(config_for(10, "a", Duration::from_millis(200)));
         bucket.refresh_lease().await.expect("lease");
         assert_eq!(bucket.admission_coefficient(), None);
