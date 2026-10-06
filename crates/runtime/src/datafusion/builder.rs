@@ -2240,7 +2240,7 @@ enum Keep {
 ///   `dow` / `DOW` / mixed case from Sunday = 1 (Tuesday = 3) where the
 ///   built-in and `EXTRACT(DOW FROM …)` count from 0 on both `DATE` and
 ///   `TIMESTAMP`, and Spark's does not accept a time (#13920). The
-///   registration loop re-binds DataFusion's built-in under `date_part` so
+///   registration loop re-binds `DataFusion`'s built-in under `date_part` so
 ///   the SQL name and `EXTRACT` stay one function even if Spark's would not
 ///   collide.
 /// - `date_trunc`: Spark's accepts only a string as the
@@ -2333,7 +2333,7 @@ fn kept_out<'a, T>(
         .then_some(taken)
 }
 
-/// Bind DataFusion's `date_part` (Sunday = 0 for `dow`) on the session, over
+/// Bind `DataFusion`'s `date_part` (Sunday = 0 for `dow`) on the session, over
 /// Spark's stub if that is what the registry currently holds.
 ///
 /// Spark's `date_part` never evaluates itself: `simplify` rewrites a
