@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -854,6 +855,15 @@ fn collect_vortex_pushdown_conjunct(
     from_dynamic_filter: bool,
     conjuncts: &mut PushdownConjuncts,
 ) -> DFResult<()> {
+    // `try_pushdown_filters` wraps a hash-join dynamic filter as
+    // `DynamicFilter OR col IS NULL` so EXPLAIN and `FilePruner` keep NULL keys
+    // that a min/max bound would drop. Flatten that OR here: unwrap the
+    // `DynamicFilter` (skipping its `InList` membership) and ignore the `IS NULL`
+    // leaves — each min/max conjunct is re-OR'd with `IS NULL` below.
+    if !from_dynamic_filter && contains_dynamic_filter(&expr) && is_or_expr(&expr) {
+        return collect_or_wrapped_dynamic_filter(expr_convertor, expr, schema, conjuncts);
+    }
+
     if let Some(dynamic_filter) = expr.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>() {
         let current = match dynamic_filter.current() {
             Ok(current) => current,
@@ -878,7 +888,16 @@ fn collect_vortex_pushdown_conjunct(
     }
 
     if expr_convertor.can_be_pushed_down(&expr, schema) {
-        conjuncts.pushed.push(expr);
+        let pushed = if from_dynamic_filter {
+            // A min/max bound is NULL, not true, for a NULL key. Null-equal joins
+            // (`IS NOT DISTINCT FROM`) and null-aware anti joins (`NOT IN`) need
+            // those keys; `pred OR col IS NULL` keeps them without changing the
+            // bound for any non-NULL value.
+            or_is_null_on_nullable_columns(expr, schema)
+        } else {
+            expr
+        };
+        conjuncts.pushed.push(pushed);
     } else if from_dynamic_filter || contains_dynamic_filter(&expr) {
         conjuncts.skipped_dynamic.push(expr);
     } else {
@@ -886,6 +905,107 @@ fn collect_vortex_pushdown_conjunct(
     }
 
     Ok(())
+}
+
+fn collect_or_wrapped_dynamic_filter(
+    expr_convertor: &dyn ExpressionConvertor,
+    expr: PhysicalExprRef,
+    schema: &Schema,
+    conjuncts: &mut PushdownConjuncts,
+) -> DFResult<()> {
+    let mut leaves = Vec::new();
+    flatten_or_leaves(&expr, &mut leaves);
+
+    let mut dynamic_leaves = Vec::new();
+    for leaf in leaves {
+        if leaf
+            .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+            .is_some()
+        {
+            dynamic_leaves.push(leaf);
+            continue;
+        }
+        if leaf.downcast_ref::<df_expr::IsNullExpr>().is_some() {
+            continue;
+        }
+        tracing::debug!(
+            filter = ?expr,
+            "Skipping an OR-wrapped dynamic filter with an unexpected disjunct"
+        );
+        conjuncts.skipped_dynamic.push(expr);
+        return Ok(());
+    }
+
+    if dynamic_leaves.is_empty() {
+        conjuncts.skipped_dynamic.push(expr);
+        return Ok(());
+    }
+
+    for dynamic_leaf in dynamic_leaves {
+        collect_vortex_pushdown_conjunct(expr_convertor, dynamic_leaf, schema, false, conjuncts)?;
+    }
+    Ok(())
+}
+
+fn is_or_expr(expr: &PhysicalExprRef) -> bool {
+    expr.downcast_ref::<df_expr::BinaryExpr>()
+        .is_some_and(|binary| matches!(*binary.op(), Operator::Or))
+}
+
+fn flatten_or_leaves(expr: &PhysicalExprRef, out: &mut Vec<PhysicalExprRef>) {
+    if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>()
+        && matches!(*binary.op(), Operator::Or)
+    {
+        flatten_or_leaves(binary.left(), out);
+        flatten_or_leaves(binary.right(), out);
+        return;
+    }
+    out.push(Arc::clone(expr));
+}
+
+/// `expr OR col IS NULL` for every nullable column `expr` reads.
+///
+/// A comparison against a NULL key is NULL, so a min/max dynamic filter would
+/// drop the row. Null-equal joins and null-aware anti joins need those rows;
+/// OR-ing `IS NULL` keeps them. Non-NULL values still have to satisfy `expr`.
+pub(crate) fn or_is_null_on_nullable_columns(
+    expr: PhysicalExprRef,
+    schema: &Schema,
+) -> PhysicalExprRef {
+    let mut names = BTreeSet::new();
+    collect_column_names(&expr, &mut names);
+
+    let mut is_nulls = Vec::new();
+    for name in names {
+        let Ok(field) = schema.field_with_name(&name) else {
+            continue;
+        };
+        if !field.is_nullable() {
+            continue;
+        }
+        let Ok(index) = schema.index_of(&name) else {
+            continue;
+        };
+        let column = Arc::new(df_expr::Column::new(&name, index)) as PhysicalExprRef;
+        is_nulls.push(Arc::new(df_expr::IsNullExpr::new(column)) as PhysicalExprRef);
+    }
+
+    let Some(null_check) = is_nulls.into_iter().reduce(|left, right| {
+        Arc::new(df_expr::BinaryExpr::new(left, Operator::Or, right)) as PhysicalExprRef
+    }) else {
+        return expr;
+    };
+
+    Arc::new(df_expr::BinaryExpr::new(expr, Operator::Or, null_check))
+}
+
+fn collect_column_names(expr: &PhysicalExprRef, names: &mut BTreeSet<String>) {
+    if let Some(column) = expr.downcast_ref::<df_expr::Column>() {
+        names.insert(column.name().to_string());
+    }
+    for child in expr.children() {
+        collect_column_names(child, names);
+    }
 }
 
 fn natural_split_ranges_for_file(
@@ -910,7 +1030,7 @@ fn natural_split_ranges_for_file(
 
 /// Whether `expr` holds a dynamic filter (for example a hash-join or `TopK` bound), whose
 /// value can change after planning.
-fn contains_dynamic_filter(expr: &PhysicalExprRef) -> bool {
+pub(crate) fn contains_dynamic_filter(expr: &PhysicalExprRef) -> bool {
     DynamicFilterTracking::classify(expr).contains_dynamic_filter()
 }
 
@@ -2465,5 +2585,154 @@ mod tests {
             "the InList membership conjunct is declined"
         );
         assert!(conjuncts.skipped_dynamic[0].is::<df_expr::InListExpr>());
+    }
+
+    fn nullable_bounds_and_inlist_dynamic_filter() -> (Schema, PhysicalExprRef) {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as PhysicalExprRef;
+
+        let ge = Arc::new(df_expr::BinaryExpr::new(
+            Arc::clone(&column),
+            Operator::GtEq,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(3)))),
+        )) as PhysicalExprRef;
+        let le = Arc::new(df_expr::BinaryExpr::new(
+            Arc::clone(&column),
+            Operator::LtEq,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(7)))),
+        )) as PhysicalExprRef;
+        let bounds = Arc::new(df_expr::BinaryExpr::new(ge, Operator::And, le)) as PhysicalExprRef;
+
+        let in_list = Arc::new(
+            df_expr::InListExpr::try_new(
+                Arc::clone(&column),
+                vec![
+                    Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(3)))) as PhysicalExprRef,
+                    Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(7)))) as PhysicalExprRef,
+                ],
+                false,
+                &schema,
+            )
+            .expect("IN-list expression should be valid"),
+        ) as PhysicalExprRef;
+
+        let combined =
+            Arc::new(df_expr::BinaryExpr::new(bounds, Operator::And, in_list)) as PhysicalExprRef;
+
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter
+            .update(combined)
+            .expect("dynamic filter update should succeed");
+        (schema, dynamic_filter as PhysicalExprRef)
+    }
+
+    fn expr_contains_is_null(expr: &PhysicalExprRef) -> bool {
+        if expr.downcast_ref::<df_expr::IsNullExpr>().is_some() {
+            return true;
+        }
+        expr.children().into_iter().any(expr_contains_is_null)
+    }
+
+    #[test]
+    fn dynamic_minmax_on_nullable_column_keeps_null_keys() {
+        let convertor = DefaultExpressionConvertor::default();
+        let (schema, filter) = nullable_bounds_and_inlist_dynamic_filter();
+
+        let conjuncts = split_vortex_pushdown_conjuncts(&convertor, &filter, &schema)
+            .expect("split should succeed");
+        assert_eq!(
+            conjuncts.pushed.len(),
+            2,
+            "both min/max bounds conjuncts are pushed into the scan"
+        );
+        assert!(
+            conjuncts.pushed.iter().all(expr_contains_is_null),
+            "each min/max bound must keep NULL keys: {:?}",
+            conjuncts
+                .pushed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert!(conjuncts.unpushed.is_empty());
+        assert_eq!(
+            conjuncts.skipped_dynamic.len(),
+            1,
+            "the InList membership conjunct is declined"
+        );
+        assert!(conjuncts.skipped_dynamic[0].is::<df_expr::InListExpr>());
+    }
+
+    #[test]
+    fn or_wrapped_dynamic_filter_still_skips_inlist_and_keeps_nulls() {
+        let convertor = DefaultExpressionConvertor::default();
+        let (schema, filter) = nullable_bounds_and_inlist_dynamic_filter();
+        let is_null = Arc::new(df_expr::IsNullExpr::new(Arc::new(df_expr::Column::new(
+            "id", 0,
+        )))) as PhysicalExprRef;
+        let wrapped =
+            Arc::new(df_expr::BinaryExpr::new(filter, Operator::Or, is_null)) as PhysicalExprRef;
+
+        let conjuncts = split_vortex_pushdown_conjuncts(&convertor, &wrapped, &schema)
+            .expect("split should succeed");
+        assert_eq!(
+            conjuncts.pushed.len(),
+            2,
+            "OR-wrapped DynamicFilter still pushes both min/max bounds"
+        );
+        assert!(
+            conjuncts.pushed.iter().all(expr_contains_is_null),
+            "OR-wrapped min/max bounds must keep NULL keys"
+        );
+        assert_eq!(
+            conjuncts.skipped_dynamic.len(),
+            1,
+            "InList membership is still declined when the DynamicFilter is OR-wrapped"
+        );
+        assert!(conjuncts.skipped_dynamic[0].is::<df_expr::InListExpr>());
+    }
+
+    /// `try_pushdown_filters` wraps the filter at plan time, when `current()` is
+    /// still `lit(true)`. The join-key columns live on the `DynamicFilter`
+    /// children, so the wrap must find them without waiting for `update()`.
+    #[test]
+    fn unpopulated_dynamic_filter_or_is_null_uses_declared_columns() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as PhysicalExprRef;
+        let dynamic = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        )) as PhysicalExprRef;
+
+        let wrapped = or_is_null_on_nullable_columns(Arc::clone(&dynamic), &schema);
+        assert!(
+            expr_contains_is_null(&wrapped),
+            "an unpopulated DynamicFilter on a nullable column must still OR IS NULL: {wrapped}"
+        );
+        assert_ne!(
+            wrapped.to_string(),
+            dynamic.to_string(),
+            "the wrap must change the planned predicate so EXPLAIN and FilePruner see IS NULL"
+        );
+    }
+
+    #[test]
+    fn unpopulated_dynamic_filter_on_non_nullable_column_is_unchanged() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as PhysicalExprRef;
+        let dynamic = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        )) as PhysicalExprRef;
+
+        let wrapped = or_is_null_on_nullable_columns(Arc::clone(&dynamic), &schema);
+        assert!(
+            !expr_contains_is_null(&wrapped),
+            "a non-nullable column has no NULL keys to keep: {wrapped}"
+        );
+        assert_eq!(wrapped.to_string(), dynamic.to_string());
     }
 }
