@@ -397,12 +397,18 @@ async fn an_overwrite_writes_its_position_deletes_into_its_own_snapshot() {
         .await
         .expect("overwrite repeating keys");
     let published = provider.get_current_snapshot_id();
-    assert_ne!(replaced, published, "the overwrite publishes a new snapshot");
+    assert_ne!(
+        replaced, published,
+        "the overwrite publishes a new snapshot"
+    );
     let delete_files = catalog
         .get_table_delete_files(provider.table_id())
         .await
         .expect("delete files");
-    assert!(!delete_files.is_empty(), "the overwrite hides its repeats by position");
+    assert!(
+        !delete_files.is_empty(),
+        "the overwrite hides its repeats by position"
+    );
     for delete_file in &delete_files {
         assert!(
             delete_file.path.contains(&format!("/{published}/")),
