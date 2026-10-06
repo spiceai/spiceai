@@ -26,7 +26,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use data_components::poly::PolyTableProvider;
-use datafusion::{catalog::TableProvider, datasource::TableType, sql::TableReference};
+use datafusion::{catalog::TableProvider, common::TableReference, datasource::TableType};
 use iceberg_datafusion::IcebergTableProvider;
 use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table::accelerated::AcceleratedTable;
