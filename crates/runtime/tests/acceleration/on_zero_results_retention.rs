@@ -344,9 +344,10 @@ async fn arrow_write_time_retention_sql_does_not_resurrect_via_fallback() -> any
 }
 
 #[cfg(not(target_os = "windows"))]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cayenne_unscheduled_time_retention_does_not_resurrect_via_fallback() -> anyhow::Result<()>
 {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
     test_request_context()
         .scope(async {
