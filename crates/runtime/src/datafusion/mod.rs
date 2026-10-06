@@ -3368,10 +3368,21 @@ impl DataFusion {
                     // inverts `retention_period`.
                     let apply_time_column_keep =
                         !declared_retention_runs || acceleration_settings.engine == Engine::Cayenne;
+                    // Cayenne's scan-time builder keeps only whole seconds
+                    // (`Duration::as_secs`). Using the full duration here would
+                    // keep rows between `floor(period)` and `period` that
+                    // Cayenne already hides.
+                    let time_period = match (
+                        acceleration_settings.engine == Engine::Cayenne,
+                        dataset.retention_period(),
+                    ) {
+                        (true, Some(period)) => Some(Duration::from_secs(period.as_secs())),
+                        (_, period) => period,
+                    };
                     let keep = crate::accelerated::FallbackRetentionKeep::with_time_column_keep(
                         keep,
                         apply_time_column_keep,
-                        dataset.retention_period(),
+                        time_period,
                         dataset.time_column.clone(),
                         dataset.time_format,
                     );

@@ -608,6 +608,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cayenne_time_keep_truncates_subsecond_period() {
+        use arrow::array::{Int64Array, RecordBatch};
+        use datafusion::catalog::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let now_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis(),
+        )
+        .expect("unix millis fit i64");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![
+                    Some(now_ms),
+                    Some(now_ms - 1_200),
+                    None,
+                ])),
+            ],
+        )
+        .expect("batch");
+
+        let collect = |period: Duration| async {
+            let keep = FallbackRetentionKeep::from_time(
+                period,
+                "ts".to_string(),
+                Some(TimeFormat::UnixMillis),
+                None,
+                None,
+            );
+            let keep_expr = keep
+                .keep_filters(&schema)
+                .expect("keep")
+                .into_iter()
+                .next()
+                .expect("one keep predicate");
+            let ctx = SessionContext::new();
+            ctx.register_table(
+                "t",
+                Arc::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]]).expect("mem"),
+                ),
+            )
+            .expect("register");
+            let batches = ctx
+                .table("t")
+                .await
+                .expect("table")
+                .filter(keep_expr)
+                .expect("filter")
+                .collect()
+                .await
+                .expect("collect");
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id")
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<i64>>()
+        };
+
+        assert_eq!(
+            collect(Duration::from_millis(1_500)).await,
+            vec![1, 2, 3],
+            "a 1.5s cutoff keeps the 1.2s-old row"
+        );
+        assert_eq!(
+            collect(Duration::from_secs(Duration::from_millis(1_500).as_secs())).await,
+            vec![1, 3],
+            "Cayenne's as_secs truncation (1s) hides the 1.2s-old row that a 1.5s fallback would keep"
+        );
+    }
+
+    #[tokio::test]
     async fn scheduled_time_keep_uses_partition_and() {
         let schema = partitioned_schema();
         let keep = FallbackRetentionKeep::from_time(

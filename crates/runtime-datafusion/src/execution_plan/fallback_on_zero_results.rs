@@ -320,7 +320,7 @@ mod metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
@@ -544,7 +544,22 @@ mod tests {
                 .expect("should be able to collect results");
 
             assert_eq!(collected_result.len(), 1);
-            assert_eq!(batch_fallback().num_rows(), collected_result[0].num_rows());
+            let batch = &collected_result[0];
+            let a = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("column a");
+            let b = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column b");
+            assert_eq!(a.values(), &[4, 5, 6]);
+            assert_eq!(
+                b.iter().flatten().collect::<Vec<_>>(),
+                vec!["four", "five", "six"]
+            );
         }
     }
 
