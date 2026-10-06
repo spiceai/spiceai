@@ -928,6 +928,77 @@ jobs:
         with:
           working-directory: test_app
 
+  test_cold_start_unkeyed_append:
+    name: 'Cold start: unkeyed Cayenne append loads without rewriting itself'
+    # The nightly `testoperator run cold-start` workflow times every acceleration shape
+    # against the previous release; this is its timing-free bound, cheap enough for the
+    # merge queue. A load into an empty table must not trigger a full compaction.
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    runs-on: spiceai-dev-runners
+    needs:
+      - build
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download artifacts - build_linux_x86_64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Check for the fixture
+        run: |
+          if ! mc stat spice-minio/benchmarks/cold_start/audit_events_3m/_delta_log/_last_checkpoint >/dev/null 2>&1; then
+            echo "The cold-start fixture is missing from MinIO; run the 'testoperator run cold-start' workflow once to seed it."
+            exit 1
+          fi
+
+      - name: Start spiced
+        run: |
+          mkdir -p cold_start_app
+          cp 'test/spicepods/cold_start/delta_lake-cayenne[file]-append_unkeyed_sorted.yaml' cold_start_app/spicepod.yaml
+          cd cold_start_app
+          spiced --cpu-cores 2 --metrics 127.0.0.1:9095 &> spice.log &
+        env:
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Wait for the dataset to be ready
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: cold_start_app
+          timeout: '600'
+
+      - name: Check the load committed no full compaction and holds every row
+        run: |
+          full=$(curl -sf http://127.0.0.1:9095/metrics \
+            | awk '/^cayenne_compaction_outcome_total\{/ && /kind="full"/ && /outcome="committed"/ && /table="audit_events"/ {sum += $NF} END {print sum + 0}')
+          rows=$(curl -sf -X POST -H 'Content-Type: text/plain' --data 'SELECT COUNT(*) AS n FROM audit_events' \
+            http://127.0.0.1:8090/v1/sql | jq '.[0].n')
+          echo "full compactions before ready: ${full}; rows: ${rows}"
+          test "${full}" = 0
+          test "${rows}" = 2940086
+
+      - name: Stop spice and check logs
+        if: always()
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: cold_start_app
+
   test_quickstart_data_postgres:
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
