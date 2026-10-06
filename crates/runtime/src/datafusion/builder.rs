@@ -3151,9 +3151,8 @@ mod tests {
         )
         .build();
 
-        let registered = df
-            .ctx
-            .state()
+        let state = df.ctx.state();
+        let registered = state
             .scalar_functions()
             .get("date_part")
             .expect("date_part must be registered");
@@ -3172,6 +3171,7 @@ mod tests {
             spark_date_part.as_ref(),
             "Spark's date_part shifts dow by +1 (Sunday = 1); it must not be bound"
         );
+        drop(state);
 
         // 2026-01-04 is a Sunday: the one weekday the two conventions name
         // differently at a glance, 0 documented and 1 under Spark's.
