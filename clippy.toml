@@ -1,3 +1,15 @@
 allow-expect-in-tests = true
 future-size-threshold = 45520 # Large futures are in tests
 too-many-lines-threshold = 200
+
+# Direct CPU detection is the bug `crates/cpu-budget` exists to prevent: both of
+# these read only a cgroup CPU *quota* and otherwise report the node's cores, so
+# a pod with `requests.cpu` and no `limits.cpu` sizes itself for the whole node.
+# `cpu_budget::cpu_budget()` resolves the real entitlement and owns every value
+# derived from it; `cpu-budget` itself opts out with `#[expect]` at its one
+# detection site.
+disallowed-methods = [
+    { path = "std::thread::available_parallelism", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
+    { path = "num_cpus::get", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
+    { path = "datafusion_common::utils::get_available_parallelism", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
+]

@@ -1,0 +1,31 @@
+name: 'Wait for Spice ready'
+description: |
+  Polls the runtime's /v1/ready until it reports ready. On timeout, dumps the
+  last response, whether spiced is alive, what holds the port, and spice.log —
+  so a failure names its cause instead of only "the action has timed out" (#12058).
+inputs:
+  working-directory:
+    description: 'Directory the runtime was started from (where spice.log lives)'
+    required: false
+    default: '.'
+  url:
+    description: 'Readiness endpoint to poll'
+    required: false
+    default: 'http://localhost:8090/v1/ready'
+  timeout:
+    description: 'Seconds to wait before failing'
+    required: false
+    default: '300'
+runs:
+  using: 'composite'
+  steps:
+    - name: Wait for Spice runtime is ready
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SPICE_READY_URL: ${{ inputs.url }}
+        SPICE_READY_TIMEOUT: ${{ inputs.timeout }}
+      # The script owns the timeout so it can diagnose before exiting; a step-level
+      # `timeout-minutes` would kill it before it printed anything, which is the
+      # behaviour being fixed.
+      run: bash "${GITHUB_ACTION_PATH}/wait_for_ready.sh"

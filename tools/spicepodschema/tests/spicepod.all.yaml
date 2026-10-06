@@ -120,10 +120,8 @@ runtime:
     api_key:
       enabled: true
       keys:
-        - ReadOnly:
-            key: read-only-api-key-12345
-        - ReadWrite:
-            key: read-write-api-key-67890
+        - read-only-api-key-12345
+        - read-write-api-key-67890:rw
 
   # CORS configuration
   cors:
@@ -436,17 +434,12 @@ datasets:
         username: unique
       on_conflict:
         id: upsert # drop, upsert, upsert_dedup, upsert_dedup_by_row_id
-      partition_by:
-        - name: created_date
-          expression: DATE(created_at)
       snapshots: enabled # disabled, enabled, bootstrap_only, create_only
       params:
         duckdb_file: ./data/postgres.duckdb
         file_watcher: 'true'
-        partition_mode: auto
         connection_pool_size: '5'
         on_refresh_recompute_statistics: 'true'
-        partitioned_write_buffer: '1000'
         optimizer_duckdb_aggregate_pushdown: 'true'
       metrics:
         metrics:
@@ -628,6 +621,11 @@ datasets:
       json_format: jsonl # json, jsonl
       flatten_json: 'true'
       refresh_skip: enabled # enabled, disabled
+      s3_changes_queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/s3-events
+      s3_changes_region: us-east-1
+      s3_changes_key_prefix: data/
+      s3_changes_backfill_interval: 1h
+      s3_on_object_removed: ignore # ignore, rebuild (full listing rebuild, not a row-level delete)
       # CSV params
       csv_has_header: 'true'
       csv_quote: '"'
@@ -806,7 +804,7 @@ datasets:
       mongodb_direct_connection: 'false'
       mongodb_time_zone: UTC
       mongodb_unnest_depth: '3'
-      mongodb_num_docs_to_infer_schema: '100'
+      mongodb_schema_infer_max_records: '100'
       mongodb_pool_min: '1'
       mongodb_pool_max: '10'
 
@@ -1287,7 +1285,9 @@ models:
   - name: google_model
     from: google:gemini-1.5-pro
     params:
-      google_api_key: google-api-key
+      google_project: my-gcp-project
+      google_location: us-central1
+      google_service_account_key: '{"client_email": "spice@my-gcp-project.iam.gserviceaccount.com"}'
       tools: auto
       system_prompt: You are Gemini.
       google_temperature: '0.7'
@@ -1322,7 +1322,7 @@ models:
     from: huggingface:mistralai/Mistral-7B-Instruct-v0.2
     params:
       model_type: mistral
-      huggingface_token: hf_xxx
+      hf_token: hf_xxx
       tools: auto
       system_prompt: You are a helpful assistant.
 
@@ -1377,7 +1377,7 @@ embeddings:
   - name: hf_embeddings
     from: huggingface:sentence-transformers/all-MiniLM-L6-v2
     params:
-      huggingface_token: hf_xxx
+      hf_token: hf_xxx
 
   # File-based embeddings
   - name: file_embeddings

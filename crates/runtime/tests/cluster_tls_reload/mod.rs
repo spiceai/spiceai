@@ -46,10 +46,8 @@ use rand::RngExt;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
-use runtime::{
-    cluster::ClusterTlsConfig,
-    tls::{ReloadScope, flight_incoming::tls_incoming, reload::reload_count_for_tests},
-};
+use runtime::cluster::ClusterTlsConfig;
+use runtime_tls::{ReloadScope, flight_incoming::tls_incoming, reload::reload_count_for_tests};
 use tempfile::TempDir;
 use tonic::{
     Request, Response, Status, Streaming,
@@ -262,7 +260,7 @@ async fn test_cluster_mtls_hot_reload() -> Result<(), anyhow::Error> {
             //    `ClusterPkiBundle` reload callback on the supplied
             //    `TlsControl`; bundle implements both ResolvesServerCert
             //    and ClientCertVerifier).
-            let control = runtime::tls::TlsControl::new()?;
+            let control = runtime_tls::TlsControl::new()?;
             let cluster_tls = ClusterTlsConfig::try_new(
                 ca_path.to_str().expect("utf8"),
                 cert_path.to_str().expect("utf8"),

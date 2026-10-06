@@ -161,8 +161,8 @@ pub(crate) async fn post(
             Ok(m) => {
                 let mut headers = HeaderMap::new();
 
-                if let Some(val) = cache_status.to_header_string().and_then(|v| v.parse().ok()) {
-                    headers.insert("Search-Results-Cache-Status", val);
+                if let Some(val) = cache_status.to_header_string() {
+                    headers.insert("Search-Results-Cache-Status", HeaderValue::from_static(val));
                 }
 
                 // Surface the cache scope so callers can tell whether a MISS

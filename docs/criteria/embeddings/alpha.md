@@ -13,6 +13,7 @@ All criteria must be met for the embedding component to be considered Alpha. As 
 | Databricks              | ➖            |              |
 | File                    | ✅            | @Jeadie      |
 | Hugging Face            | ✅            | @Jeadie      |
+| Model2Vec               | ✅            | @Jeadie      |
 | OpenAI                  | ✅            | @ewgenius    |
 | Spice.ai Cloud Platform | ➖            |              |
 

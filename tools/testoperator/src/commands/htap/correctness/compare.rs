@@ -17,27 +17,44 @@ limitations under the License.
 //! Engine-agnostic numeric comparison shared by the HTAP correctness gates
 //! (`analytical` and `row_count`).
 //!
-//! Postgres (the source of truth) and Cayenne emit the same logical values with
-//! different physical Arrow encodings. These helpers compare *values* — not
-//! their string renderings — with a type-aware tolerance:
-//!   * integer / decimal columns (row counts, money sums): **exact**, zero
-//!     tolerance — a count or a cent that drifts at all is a real defect;
-//!   * floating-point columns: a small relative epsilon — the only place real
-//!     rounding occurs in this pipeline (FP/encoding error here is < 0.001%).
+//! The source engine (Postgres or `MySQL` — the source of truth) and Cayenne emit
+//! the same logical values with different physical Arrow encodings. These
+//! helpers compare *values* — not their string renderings — with a type-aware
+//! tolerance:
+//!   * integers and *exact-reproduction* decimals (row counts, money `SUM`/
+//!     `MIN`/`MAX`): **exact**, zero tolerance — a count or a cent that drifts at
+//!     all is a real defect;
+//!   * floating-point columns and `AVG`/division decimals: a small relative
+//!     epsilon — the only places real rounding occurs in this pipeline (FP /
+//!     encoding / decimal-division error here is < 0.001%).
 //!
-//! Cells are compared after casting to `f64`. That is exact for integers and
-//! decimals whose magnitude stays below 2^53 (~9.0e15), which holds for every
-//! CH-benCH aggregate at the scale factors we run (the largest row counts and
-//! money sums are ~1e9–1e13). This bound is documented here so a future,
+//! Two decimal cells are decided on their **mantissas**, rescaled to a common
+//! scale — never on a `f64` cast, which is not a reliable equality test for them
+//! (see `decimal_pair_to_i256`). Everything else is compared after casting to
+//! `f64`: exact for integers whose magnitude stays below 2^53 (~9.0e15), which
+//! holds for every CH-benCH aggregate at the scale factors we run (the largest
+//! row counts are ~1e9–1e13). That bound is documented here so a future,
 //! enormous scale factor doesn't silently lose integer exactness unnoticed.
+//!
+//! The `f64` cast is still taken for every numeric cell, because the reported
+//! `rel %` and `max_rel_delta` are computed from it. Only the decimal pass/fail
+//! decision is made elsewhere.
 
-use arrow::array::{Array, Float64Array, RecordBatch};
-use arrow::datatypes::DataType;
+use arrow::array::{Array, Decimal256Array, Float64Array, RecordBatch};
+use arrow::compute::CastOptions;
+use arrow::datatypes::{DataType, i256};
 
 /// Relative tolerance for floating-point columns (0.1%). Comfortably above the
 /// real FP/encoding error (< 0.001%) yet far tighter than the legacy 5% gate,
 /// so a genuine sub-5% value drift is now caught instead of passing silently.
 pub const FLOAT_REL_TOLERANCE: f64 = 0.001;
+
+/// Decimal scale of TPC-C money columns (`NUMERIC(_,2)` — cents). Exact
+/// aggregates (`SUM`/`MIN`/`MAX`) preserve this scale, so they stay on the exact
+/// comparison path; only `AVG`/division inflates a decimal result beyond it.
+/// A decimal column whose scale exceeds this is therefore treated as an
+/// approximate (rounding-prone) aggregate. See [`approximate_columns`].
+pub const MONEY_SCALE: i8 = 2;
 
 /// Outcome of comparing the numeric columns of two row-aligned record batches.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -52,6 +69,13 @@ pub struct NumericDelta {
     /// Column / row / values of the worst *offending* cell, for the failure
     /// message. `None` when nothing exceeded tolerance.
     pub worst: Option<String>,
+    /// Row index (0-based) of the worst offending cell, so callers can print
+    /// the surrounding rows for context. `None` when nothing exceeded tolerance
+    /// (or the divergence was a whole-column cast failure with no single row).
+    pub worst_row: Option<usize>,
+    /// Column index of the worst offending cell, matching `worst_row`. `None`
+    /// under the same conditions.
+    pub worst_col: Option<usize>,
 }
 
 /// Whether a column's values are compared numerically by [`numeric_delta`]
@@ -84,12 +108,30 @@ fn is_float(dt: &DataType) -> bool {
     )
 }
 
+/// Decimal scale of a numeric type, or `None` for non-decimals.
+fn decimal_scale(dt: &DataType) -> Option<i8> {
+    match dt {
+        DataType::Decimal128(_, s) | DataType::Decimal256(_, s) => Some(*s),
+        _ => None,
+    }
+}
+
+/// Whether a column is numeric *and* exact — integers and decimals, never
+/// floats. `SUM` over such a column is bit-identical across engines (no
+/// order-dependent rounding), so the fingerprint gate can compare it with zero
+/// tolerance; a floating `SUM` legitimately drifts and must not be summed.
+#[must_use]
+pub fn is_exact_numeric(dt: &DataType) -> bool {
+    is_numeric(dt) && !is_float(dt)
+}
+
 /// Per-column float-ness of a batch's schema, for the `actual_source_floats`
 /// argument of [`numeric_delta`].
 ///
-/// The analytical gate casts Spice's output to the *source* (Postgres) schema
+/// The analytical gate casts Spice's output to the *source* engine's schema
 /// before comparison, which turns an `avg()` that Spice computed as `Float64`
-/// into the `Decimal128` the PG arrow connector returns for `NUMERIC`. Captured
+/// into the `Decimal128` the source arrow connector returns for
+/// `NUMERIC`/`DECIMAL`. Captured
 /// from the pre-alignment actual batch, this lets [`numeric_delta`] keep the
 /// relative float tolerance for those approximate columns instead of demoting
 /// them to the exact integer/decimal path. The fingerprint gate runs identical
@@ -103,6 +145,113 @@ pub fn float_columns(batch: &RecordBatch) -> Vec<bool> {
         .iter()
         .map(|f| is_float(f.data_type()))
         .collect()
+}
+
+/// Analytical-gate generalization of [`float_columns`]: flags a column for
+/// relative float tolerance when either side is float, or the column is a
+/// decimal produced by `AVG`/division. Exact reproductions (`SUM`/`MIN`/`MAX`/
+/// `COUNT`) preserve the operand scale (money is [`MONEY_SCALE`] digits in
+/// TPC-C) and stay exact; `AVG`/division *inflate* the scale — `DataFusion` and
+/// `MySQL` to operand scale + 4, Postgres to ~13 — so their low digits
+/// legitimately differ per-engine and must not be compared bit-exactly.
+///
+/// We detect that inflation directly rather than assuming the two engines
+/// *disagree* on the inflated scale: a decimal column is approximate when the
+/// scales differ **or** the (common) scale exceeds [`MONEY_SCALE`]. The
+/// scales-differ arm alone was Postgres-specific — `MySQL`'s `AVG` scale
+/// (operand + 4 = 6 for `NUMERIC(_,2)`) coincides with `DataFusion`'s, so a
+/// same-scale `AVG` used to fall into the exact path and a benign last-digit
+/// rounding difference tripped `DIVERGE`.
+///
+/// Must run pre-alignment (alignment casts actual to the source scale, erasing
+/// the signal); columns match by position.
+#[must_use]
+pub fn approximate_columns(expected: &RecordBatch, actual: &RecordBatch) -> Vec<bool> {
+    let a_schema = actual.schema();
+    let a_fields = a_schema.fields();
+    expected
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let Some(a) = a_fields.get(i) else {
+                return is_float(e.data_type());
+            };
+            let (e_dt, a_dt) = (e.data_type(), a.data_type());
+            is_float(e_dt)
+                || is_float(a_dt)
+                || matches!(
+                    (decimal_scale(e_dt), decimal_scale(a_dt)),
+                    (Some(es), Some(a_s)) if es != a_s || es.max(a_s) > MONEY_SCALE
+                )
+        })
+        .collect()
+}
+
+/// Two columns' mantissas rescaled to a common decimal scale, expected then actual.
+type RescaledPair = (Vec<Option<i256>>, Vec<Option<i256>>);
+
+/// What [`decimal_pair_to_i256`] could make of a column pair.
+enum ExactDecimals {
+    /// Not a decimal pair; the `f64` comparison applies.
+    NotApplicable,
+    /// Mantissas at a common scale, comparable exactly.
+    Rescaled(RescaledPair),
+    /// A decimal pair that could not be brought to a common scale without
+    /// overflowing. Deliberately NOT the same answer as `NotApplicable`: falling
+    /// back to `f64` here would report two decimals equal whenever `f64` cannot
+    /// tell them apart, which for wide `Decimal256` values is any pair sharing the
+    /// leading ~15 digits. A gate that answers "equal" because it ran out of
+    /// precision is worse than one that is too strict.
+    Unrepresentable,
+}
+
+/// Both columns' values as `i256` mantissas at a common scale.
+///
+/// Exists because comparing two decimals THROUGH `f64` cannot be made reliable:
+/// Arrow casts a decimal to `f64` by dividing the mantissa by `10^scale` in
+/// floating point, and above roughly scale 18 neither operand is representable,
+/// so the quotient stops being correctly rounded. Two sides holding the same
+/// decimal but declaring different scales then land on `f64` values that differ
+/// in the last place. Comparing the mantissas instead is exact by construction.
+///
+/// `i256` rather than `i128` so `Decimal256` is handled natively: narrowing it to
+/// `Decimal128` first would fail for exactly the wide values whose comparison
+/// matters most.
+fn decimal_pair_to_i256(e_col: &dyn Array, a_col: &dyn Array) -> ExactDecimals {
+    let (Some(e_scale), Some(a_scale)) = (
+        decimal_scale(e_col.data_type()),
+        decimal_scale(a_col.data_type()),
+    ) else {
+        return ExactDecimals::NotApplicable;
+    };
+    // Rescale both sides UP to the wider scale: scaling down would discard the
+    // digits a genuine divergence might live in (asserted by
+    // `a_low_digit_difference_at_a_wider_scale_still_diverges`).
+    let common = e_scale.max(a_scale);
+    // `safe: false` so an overflowing rescale ERRORS. The default nulls it out
+    // instead, and a null reads as "skip this row" below — the same silent pass
+    // this function exists to prevent.
+    let options = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    let widen = |col: &dyn Array| -> Option<Vec<Option<i256>>> {
+        let decimal =
+            arrow::compute::cast_with_options(col, &DataType::Decimal256(76, common), &options)
+                .ok()?;
+        let decimal = decimal.as_any().downcast_ref::<Decimal256Array>()?;
+        Some(
+            (0..decimal.len())
+                .map(|r| (!decimal.is_null(r)).then(|| decimal.value(r)))
+                .collect(),
+        )
+    };
+    match (widen(e_col), widen(a_col)) {
+        (Some(e), Some(a)) => ExactDecimals::Rescaled((e, a)),
+        _ => ExactDecimals::Unrepresentable,
+    }
 }
 
 /// Cast both columns to `Float64` for value comparison. Returns `None` if either
@@ -129,18 +278,14 @@ fn cast_pair_to_f64(e_col: &dyn Array, a_col: &dyn Array) -> Option<(Float64Arra
 /// cross-engine text collation / timestamp precision make their MIN/MAX
 /// unreliable to compare directly.
 ///
-/// `actual_source_floats[i]` flags columns the actual engine produced as
-/// floating point *before* any schema alignment (see [`float_columns`]). A
-/// column is compared with the relative float tolerance when either side's
-/// compared type is float *or* its pre-alignment actual type was — so an
-/// `avg()` that Spice computed in `Float64` but the gate cast to the source's
-/// `Decimal128` keeps its tolerance, while money sums and counts (decimal /
-/// integer on both sides, and never float pre-alignment) stay exact.
+/// `approximate[i]` flags columns to compare with relative float tolerance
+/// instead of exactly: the fingerprint gate passes [`float_columns`], the
+/// analytical gate [`approximate_columns`]. Sums and counts stay exact.
 #[must_use]
 pub fn numeric_delta(
     expected: &RecordBatch,
     actual: &RecordBatch,
-    actual_source_floats: &[bool],
+    approximate: &[bool],
 ) -> NumericDelta {
     let mut out = NumericDelta::default();
     let mut worst_rel = 0.0_f64;
@@ -161,13 +306,33 @@ pub fn numeric_delta(
         }
         let float_col = is_float(e_col.data_type())
             || is_float(a_col.data_type())
-            || actual_source_floats.get(c).copied().unwrap_or(false);
+            || approximate.get(c).copied().unwrap_or(false);
         let col_name = field.name();
 
         // Both columns are numeric, so casting to f64 should always succeed.
         // If it somehow doesn't, fail safe: in the fingerprint gate this is the
         // *only* comparator, so silently skipping the column could let a real
         // numeric divergence pass.
+        // Exact decimals are decided on their mantissas, never on the `f64` cast
+        // below (see `decimal_pair_to_i256`). The cast is still taken, because the
+        // reported `rel %` and `max_rel_delta` are computed from it -- only the
+        // pass/fail decision moves.
+        let exact_decimals = if float_col {
+            ExactDecimals::NotApplicable
+        } else {
+            decimal_pair_to_i256(e_col, a_col)
+        };
+        if matches!(exact_decimals, ExactDecimals::Unrepresentable) {
+            // Fail the column rather than guess. See `ExactDecimals::Unrepresentable`.
+            out.exceeded = true;
+            if out.worst.is_none() {
+                out.worst = Some(format!(
+                    "{col_name}: decimal values could not be brought to a common scale for an exact comparison"
+                ));
+            }
+            continue;
+        }
+
         let Some((e_arr, a_arr)) = cast_pair_to_f64(e_col, a_col) else {
             out.exceeded = true;
             if out.worst.is_none() {
@@ -196,10 +361,14 @@ pub fn numeric_delta(
                 out.max_rel_delta = rel;
             }
 
-            let cell_exceeded = if float_col {
-                rel > FLOAT_REL_TOLERANCE
-            } else {
-                diff > 0.0
+            let cell_exceeded = match (&exact_decimals, float_col) {
+                // Same mantissa at a common scale is the same number, whatever the
+                // two `f64` casts made of it.
+                (ExactDecimals::Rescaled((e_dec, a_dec)), _) => {
+                    e_dec.get(r).copied().flatten() != a_dec.get(r).copied().flatten()
+                }
+                (_, true) => rel > FLOAT_REL_TOLERANCE,
+                (_, false) => diff > 0.0,
             };
             if cell_exceeded {
                 out.exceeded = true;
@@ -209,6 +378,8 @@ pub fn numeric_delta(
                         "{col_name}[row {r}]: expected {ev}, actual {av} (rel {:.6}%)",
                         rel * 100.0
                     ));
+                    out.worst_row = Some(r);
+                    out.worst_col = Some(c);
                 }
             }
         }
@@ -258,6 +429,10 @@ mod tests {
         let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(d.exceeded, "any integer diff must exceed (exact tolerance)");
         assert!(d.worst.is_some());
+        // The offending cell's coordinates are surfaced so the gate can print
+        // the surrounding rows for context.
+        assert_eq!(d.worst_row, Some(0));
+        assert_eq!(d.worst_col, Some(0));
     }
 
     #[test]
@@ -338,6 +513,299 @@ mod tests {
                 Decimal128Array::from(raw).with_data_type(DataType::Decimal128(precision, scale)),
             ) as ArrayRef,
         )
+    }
+
+    /// Two decimals holding the SAME number at different scales must compare
+    /// equal, on their rescaled mantissas rather than through `f64`.
+    ///
+    /// Regression: the fingerprint gate compared exact columns via `f64` and
+    /// demanded bit equality, so a `NUMERIC` the source reported at one scale and
+    /// Spice at another failed with a `rel 0.000000%` delta -- the comparator
+    /// printing evidence that the difference was its own cast. It broke SF1000
+    /// `postgres-cayenne` for days, and only passed when every aggregate in the
+    /// fingerprint happened to round identically on both sides.
+    #[test]
+    fn the_same_decimal_at_two_scales_is_not_a_divergence() {
+        // 9290582224.69 at scale 20 against the same number at money scale: the
+        // SF1000 gate's `sum_d_ytd` shape, rejected to the digit as 9290582224.689999
+        // against 9290582224.69 by a comparator that cast both sides to `f64`.
+        //
+        // The two `f64` casts are not asserted to differ: the workspace's `arrow-rs`
+        // fork rounds a decimal into a float from its exact digits
+        // (`docs/dev/fork_patches.md`), so both sides land on the same double and
+        // an f64 disagreement cannot serve as this test's premise. What is pinned
+        // is that the comparator never consults `f64` for an exact column: it
+        // compares the rescaled mantissas (`exact_decimals`), which
+        // `a_one_ulp_decimal_difference_still_diverges` and
+        // `wide_decimals_that_f64_cannot_distinguish_are_not_called_equal` hold to
+        // the digit.
+        let expected = batch_of(
+            "sum_d_ytd",
+            Arc::new(
+                // The money-scale mantissa, restated at scale 20.
+                Decimal128Array::from(vec![929_058_222_469_i128 * 10_i128.pow(18)])
+                    .with_precision_and_scale(38, 20)
+                    .expect("scale 20"),
+            ),
+        );
+        let actual = batch_of(
+            "sum_d_ytd",
+            Arc::new(
+                Decimal128Array::from(vec![929_058_222_469_i128])
+                    .with_precision_and_scale(38, 2)
+                    .expect("scale 2"),
+            ),
+        );
+
+        let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
+        assert!(
+            !delta.exceeded,
+            "the same number at two scales must not diverge, got {:?}",
+            delta.worst
+        );
+    }
+
+    /// The exact path must stay exact: a decimal difference of one unit in the
+    /// last place is a REAL divergence and must still fail, or the fix above
+    /// would have bought a passing gate by blinding it.
+    #[test]
+    fn a_one_ulp_decimal_difference_still_diverges() {
+        let expected = batch_of(
+            "sum_w_ytd",
+            Arc::new(
+                Decimal128Array::from(vec![5_000_000_i128])
+                    .with_precision_and_scale(38, 2)
+                    .expect("scale 2"),
+            ),
+        );
+        let actual = batch_of(
+            "sum_w_ytd",
+            Arc::new(
+                Decimal128Array::from(vec![5_000_001_i128])
+                    .with_precision_and_scale(38, 2)
+                    .expect("scale 2"),
+            ),
+        );
+
+        let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
+        assert!(
+            delta.exceeded,
+            "a genuine one-cent difference must still be caught"
+        );
+    }
+
+    /// A difference living ONLY in the wider scale's low digits must still
+    /// diverge, which is what pins the rescale direction.
+    ///
+    /// The equality test above passes under either direction, so on its own it
+    /// would let an implementation that rescaled DOWN to the narrower scale
+    /// through -- and that one truncates the digits a real divergence hides in,
+    /// silently answering "equal". Here 50000.00 against 50000.0001 differs
+    /// nowhere else: rescaled up to scale 4 the mantissas are 500000000 against
+    /// 500000001 and it is caught, rescaled down to scale 2 both become 5000000
+    /// and it is missed.
+    #[test]
+    fn a_low_digit_difference_at_a_wider_scale_still_diverges() {
+        let expected = batch_of(
+            "sum_w_ytd",
+            Arc::new(
+                Decimal128Array::from(vec![5_000_000_i128])
+                    .with_precision_and_scale(38, 2)
+                    .expect("scale 2"),
+            ),
+        );
+        let actual = batch_of(
+            "sum_w_ytd",
+            Arc::new(
+                // 50000.0001 -- equal to the expected value in every digit the
+                // narrower scale can represent.
+                Decimal128Array::from(vec![500_000_001_i128])
+                    .with_precision_and_scale(38, 4)
+                    .expect("scale 4"),
+            ),
+        );
+
+        let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
+        assert!(
+            delta.exceeded,
+            "a difference below the narrower scale must not be rounded away"
+        );
+    }
+
+    /// Two `Decimal256` values `f64` cannot tell apart must NOT be reported equal.
+    ///
+    /// `is_numeric` accepts `Decimal256`, and `10^40` against `10^40 + 1` collides
+    /// under `f64` (they share every representable digit). Before the tri-state, a
+    /// pair that failed exact conversion was indistinguishable from a non-decimal
+    /// pair, so the comparison fell back to `f64` and answered "equal" — a gate
+    /// silently passing a real divergence, which is worse than the over-strictness
+    /// this whole change set set out to fix.
+    #[test]
+    fn wide_decimals_that_f64_cannot_distinguish_are_not_called_equal() {
+        let ten_pow_40 = i256::from_i128(10_i128.pow(38)) * i256::from_i128(100);
+        let expected = batch_of(
+            "sum_wide",
+            Arc::new(
+                Decimal256Array::from(vec![ten_pow_40])
+                    .with_precision_and_scale(76, 0)
+                    .expect("wide decimal"),
+            ),
+        );
+        let actual = batch_of(
+            "sum_wide",
+            Arc::new(
+                Decimal256Array::from(vec![ten_pow_40 + i256::from_i128(1)])
+                    .with_precision_and_scale(76, 0)
+                    .expect("wide decimal"),
+            ),
+        );
+
+        // Guard the premise: if `f64` could tell these apart, the test would pass
+        // without exercising the exact path at all.
+        let (e_f64, a_f64) =
+            cast_pair_to_f64(expected.column(0).as_ref(), actual.column(0).as_ref())
+                .expect("both cast to f64");
+        #[expect(
+            clippy::float_cmp,
+            reason = "bit-exact f64 equality IS the collision being guarded"
+        )]
+        {
+            assert_eq!(
+                e_f64.value(0),
+                a_f64.value(0),
+                "premise: f64 must collide here, or this test proves nothing"
+            );
+        }
+
+        let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
+        assert!(
+            delta.exceeded,
+            "a difference f64 cannot see must still be caught"
+        );
+    }
+
+    /// A decimal pair that cannot be brought to a common scale must FAIL the
+    /// column, not fall through to `f64`.
+    ///
+    /// Covers the `Unrepresentable` arm and the `safe: false` cast together, which
+    /// nothing else does: the wide-decimal test above uses equal scales, so no
+    /// rescale happens and the arm is never reached. Here a 76-digit mantissa at
+    /// scale 0 is asked to widen to scale 2, which needs 78 digits and overflows
+    /// `Decimal256`. With `safe: true` the cast would null the value instead of
+    /// erroring, and a null reads as "skip this row" — a silent pass.
+    #[test]
+    fn decimals_too_wide_to_bring_to_a_common_scale_fail_the_column() {
+        // 10^75, i.e. 76 significant digits: multiplying by 100 to reach scale 2
+        // exceeds what Decimal256 can hold.
+        let huge = (0..75).fold(i256::from_i128(1), |acc, _| acc * i256::from_i128(10));
+        let expected = batch_of(
+            "sum_wide",
+            Arc::new(
+                Decimal256Array::from(vec![huge])
+                    .with_precision_and_scale(76, 0)
+                    .expect("scale 0"),
+            ),
+        );
+        let actual = batch_of(
+            "sum_wide",
+            Arc::new(
+                Decimal256Array::from(vec![huge])
+                    .with_precision_and_scale(76, 2)
+                    .expect("scale 2"),
+            ),
+        );
+
+        let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
+        assert!(
+            delta.exceeded,
+            "an uncomparable decimal pair must fail rather than be guessed at"
+        );
+        assert!(
+            delta
+                .worst
+                .as_deref()
+                .is_some_and(|w| w.contains("common scale")),
+            "the diagnostic must say why it could not be compared, got {:?}",
+            delta.worst
+        );
+    }
+
+    fn batch_of(name: &str, col: ArrayRef) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name,
+            col.data_type().clone(),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![col]).expect("batch")
+    }
+
+    #[test]
+    fn approximate_columns_flags_scale_mismatched_decimals() {
+        // avg(): both decimal but different scale (Postgres ~13, DataFusion 6) ->
+        // approximate. sum() (money, scale 2 both) and count (integer) stay
+        // exact; a genuinely float column is always approximate.
+        let expected = batch(vec![
+            decimal_col("avg_amount", vec![1_i128], 38, 13),
+            decimal_col("sum_amount", vec![1_i128], 38, 2),
+            int_col("cnt", vec![1]),
+            float_col("ratio", vec![1.0]),
+        ]);
+        let actual = batch(vec![
+            decimal_col("avg_amount", vec![1_i128], 38, 6),
+            decimal_col("sum_amount", vec![1_i128], 38, 2),
+            int_col("cnt", vec![1]),
+            float_col("ratio", vec![1.0]),
+        ]);
+        assert_eq!(
+            approximate_columns(&expected, &actual),
+            vec![true, false, false, true]
+        );
+    }
+
+    #[test]
+    fn approximate_columns_flags_same_scale_inflated_avg() {
+        // MySQL regression (chbench_q1 `avg_amount`): both the source and
+        // DataFusion produce AVG(NUMERIC(_,2)) at scale 6 (operand + 4), so the
+        // scales *match*. The old "scales differ" heuristic left the column on
+        // the exact path, and a 1-ULP rounding difference (959.717385 vs
+        // 959.717384) tripped DIVERGE. Scale 6 > MONEY_SCALE (2) must now flag it
+        // approximate, while the money SUM (scale 2) and count stay exact.
+        let expected = batch(vec![
+            decimal_col("avg_amount", vec![959_717_385_i128], 38, 6),
+            decimal_col("sum_amount", vec![7_i128], 38, 2),
+            int_col("count_order", vec![1]),
+        ]);
+        let actual = batch(vec![
+            decimal_col("avg_amount", vec![959_717_384_i128], 38, 6),
+            decimal_col("sum_amount", vec![7_i128], 38, 2),
+            int_col("count_order", vec![1]),
+        ]);
+        assert_eq!(
+            approximate_columns(&expected, &actual),
+            vec![true, false, false],
+            "same-scale inflated AVG must be approximate; SUM/COUNT stay exact"
+        );
+
+        // With that classification the 1-ULP avg difference is within the
+        // relative float tolerance and must NOT fail the gate.
+        let approx = approximate_columns(&expected, &actual);
+        let delta = numeric_delta(&expected, &actual, &approx);
+        assert!(
+            !delta.exceeded,
+            "same-scale AVG rounding must pass under relative tolerance: {:?}",
+            delta.worst
+        );
+        assert!(delta.max_rel_delta > 0.0 && delta.max_rel_delta < FLOAT_REL_TOLERANCE);
+
+        // But a genuine one-cent drift in the exact money SUM still fails, so the
+        // fix does not weaken the exactness guarantee that matters.
+        let bad_sum = batch(vec![
+            decimal_col("avg_amount", vec![959_717_385_i128], 38, 6),
+            decimal_col("sum_amount", vec![8_i128], 38, 2),
+            int_col("count_order", vec![1]),
+        ]);
+        let delta = numeric_delta(&expected, &bad_sum, &approx);
+        assert!(delta.exceeded, "a one-cent SUM drift must still DIVERGE");
     }
 
     #[test]

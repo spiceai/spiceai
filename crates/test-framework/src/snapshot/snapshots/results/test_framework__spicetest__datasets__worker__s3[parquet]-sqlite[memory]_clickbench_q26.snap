@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: clickbench_q26"
+---
++------------------------------------------------+
+| SearchPhrase                                   |
++------------------------------------------------+
+| 'exis disco ryder injected cuda 7269           |
+| 'kbnyst exfcnm vekmnbdfhrf                     |
+| (095) 500                                      |
+| (http://kommedium=cpc&utm_source=main происход |
+| +100500 4.5 отзывы                             |
+| +100500 4.5 отзывы                             |
+| +100500 4.5 отзывы                             |
+| +100500 4.5 отзывы                             |
+| +100500 4.5 отзывы                             |
+| +100500 4.5 отзывы                             |
++------------------------------------------------+

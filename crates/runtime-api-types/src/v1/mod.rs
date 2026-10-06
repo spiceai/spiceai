@@ -20,12 +20,14 @@ limitations under the License.
 //! Breaking changes should not be made within the v1 version.
 
 pub mod catalogs;
+pub mod component_type;
 pub mod datasets;
 pub mod models;
 pub mod status;
 pub mod workers;
 
 pub use catalogs::CatalogInfo;
+pub use component_type::ComponentType;
 pub use datasets::DatasetInfo;
 pub use models::{ModelInfo, ModelListResponse, ModelMetadata};
 pub use status::{ComponentError, ComponentErrorCategory, ComponentErrorType, ComponentStatus};

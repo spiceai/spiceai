@@ -39,6 +39,41 @@ The `setup_file_hadoop.sh` and `setup_minio_hadoop.sh` files setup each respecti
 
 `setup_file_hadoop.sh` is configured to call `setup_minio_hadoop.sh`, and expects to be used within the Dockerfile image.
 
+## Running `hadoop_catalog_test`
+
+The test builds one catalog per backend and asserts the same expectations against each. Which
+backends it builds is decided by the environment, so no cargo feature has to be enabled:
+
+* `MINIO_ENDPOINT` (**required**) — the MinIO holding the seeded `hadoop` bucket. It drives the
+  `s3a` and `s3-to-s3a-inferred` catalogs. The value depends on where the test process runs, because
+  `docker-compose.yml` only `expose`s port 9000 on the compose network rather than publishing it:
+  * **From the host** — publish the port first (add a `ports: ["9000:9000"]` mapping, or run
+    `docker compose run --publish 9000:9000 …`), then use `http://127.0.0.1:9000`. Without a
+    published port the container address is not routable from the host.
+  * **From another container on the compose network** — use the service name:
+    `http://minio:9000`. No port publishing is needed.
+
+  `MINIO_ACCESS_KEY_ID` and `MINIO_SECRET_ACCESS_KEY` default to `admin` / `password`, matching
+  `docker-compose.yml`.
+* `HADOOP_FILE_WAREHOUSE_ROOT` (optional) — a warehouse directory on the local filesystem, as
+  produced by `setup_file_hadoop.sh` (`/tmp/hadoop_warehouse` by default). Set it to also run the
+  `file` catalog; leave it unset to run the MinIO-backed catalogs alone. It must be an **absolute**
+  directory path — the test converts it to a `file:` URL and panics on a relative one.
+
+Run it from the host, against a published MinIO port:
+
+```bash
+MINIO_ENDPOINT=http://127.0.0.1:9000 \
+  cargo nextest run -p data_components --test hadoop_catalog_test
+```
+
+Or from a container attached to the compose network:
+
+```bash
+MINIO_ENDPOINT=http://minio:9000 \
+  cargo nextest run -p data_components --test hadoop_catalog_test
+```
+
 ## Importing TPCH
 
 This example shows how to import a TPCH dataset from CSV into Iceberg tables under Hadoop, on the local filesystem:

@@ -21,7 +21,11 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::parameters::Parameters;
-use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
+use crate::{
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
+};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::mssql::connection_manager::SqlServerConnectionManager;
@@ -185,7 +189,7 @@ impl CatalogConnector for MssqlCatalog {
 
         let pool = Arc::new(pool);
 
-        let catalog_provider = Arc::new(MssqlCatalogProvider::new(pool, catalog.include.clone()));
+        let catalog_provider = Arc::new(MssqlCatalogProvider::new(pool, table_selector(catalog)));
 
         catalog_provider
             .refresh()

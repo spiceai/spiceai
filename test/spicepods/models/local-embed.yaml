@@ -5,6 +5,10 @@ name: local-embed
 embeddings:
   - from: file:data/models/sentence-transformers/all-MiniLM-L6-v2/model.safetensors
     name: all_minilm_l6_v2
+    params:
+      # all-MiniLM-L6-v2 caps inputs at 256 tokens; discard the tail of an
+      # over-length input instead of failing the embedding call.
+      truncate: END
     files:
       - path: data/models/sentence-transformers/all-MiniLM-L6-v2/config.json
       - path: data/models/sentence-transformers/all-MiniLM-L6-v2/tokenizer.json

@@ -8,13 +8,13 @@ All criteria must be met for the connector to be considered Beta, with exception
 
 | Connector                        | Beta Quality | DRI Sign-off    |
 | -------------------------------- | ------------ | --------------- |
-| ADBC                             | ➖           |                 |
+| ADBC                             | ✅           | @lukekim        |
 | Azure BlobFS                     | ➖           |                 |
 | Clickhouse                       | ➖           |                 |
 | Cosmos DB (NoSQL)                | ✅           | @lukekim        |
 | Databricks (mode: delta_lake)    | ✅           | @Sevenannn      |
 | Databricks (mode: spark_connect) | ✅           | @Sevenannn      |
-| Databricks (mode: sql_warehouse) | ➖           |                 |
+| Databricks (mode: sql_warehouse) | ✅           | @lukekim        |
 | Debezium                         | ➖           |                 |
 | Delta Lake                       | ✅           | @Sevenannn      |
 | Dremio                           | ✅           | @Sevenannn      |
@@ -22,28 +22,28 @@ All criteria must be met for the connector to be considered Beta, with exception
 | DuckLake                         | ✅           | @sgrebnov       |
 | DynamoDB                         | ✅           | @krinart        |
 | File                             | ✅           | @peasee         |
-| FlightSQL                        | ➖           |                 |
+| FlightSQL                        | ✅           | @lukekim        |
 | FTP/SFTP                         | ➖           |                 |
 | GCS                              | ➖           |                 |
 | Git                              | ✅           | @lukekim        |
 | GitHub                           | ✅           | @peasee         |
-| Glue                             | ➖           |                 |
-| GraphQL                          | ➖           |                 |
-| HTTP/HTTPS                       | ➖           |                 |
+| Glue                             | ✅           | @lukekim        |
+| GraphQL                          | ✅           | @peasee         |
+| HTTP/HTTPS                       | ✅           | @lukekim        |
 | Iceberg                          | ✅           | @phillipleblanc |
 | IMAP                             | ➖           |                 |
-| Kafka                            | ➖           |                 |
-| Localpod                         | ➖           |                 |
-| MongoDB                          | ➖           |                 |
+| Kafka                            | ✅           | @lukekim        |
+| Localpod                         | ✅           | @lukekim        |
+| MongoDB                          | ✅           | @lukekim        |
 | MS SQL                           | ✅           | @peasee         |
 | MySQL                            | ✅           | @peasee         |
 | NFS                              | ➖           |                 |
-| ODBC                             | ➖           |                 |
-| Oracle                           | ➖           |                 |
+| ODBC                             | ✅           | @lukekim        |
+| Oracle                           | ✅           | @lukekim        |
 | PostgreSQL                       | ✅           | @Sevenannn      |
 | S3                               | ✅           | @Sevenannn      |
 | ScyllaDB                         | ➖           |                 |
-| Sharepoint                       | ➖           |                 |
+| Sharepoint                       | ✅           | @lukekim        |
 | SMB                              | ➖           |                 |
 | Snowflake                        | ✅           | @phillipleblanc |
 | Spark                            | ✅           | @ewgenius       |

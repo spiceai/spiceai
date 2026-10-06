@@ -10,3 +10,6 @@ app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 snafu.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

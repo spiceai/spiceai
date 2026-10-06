@@ -40,7 +40,7 @@ pub(super) fn plan_distributed_delete(
     dml: &DmlStatement,
     handler: Arc<dyn CatalogDmlHandler>,
 ) -> DFResult<LogicalPlan> {
-    let filters = extract_filters(&dml.input)?;
+    let filters = extract_filters(&dml.input, &dml.table_name.to_string())?;
 
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(DmlExtensionNode::new(

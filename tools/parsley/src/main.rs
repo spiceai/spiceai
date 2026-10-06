@@ -120,7 +120,8 @@ impl Args {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
     // Get raw content.
@@ -138,7 +139,7 @@ fn main() {
 
     // Convert to Utf8 string content. Either use parser, or interpret as raw UTF8.
     let content = if let Some(parser) = args.parser() {
-        match parser.parse(&bytz) {
+        match parser.parse(&bytz).await {
             Ok(doc) => match doc.as_flat_utf8() {
                 Ok(content) => content,
                 Err(e) => {

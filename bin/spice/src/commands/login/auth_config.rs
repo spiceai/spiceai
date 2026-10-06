@@ -21,7 +21,7 @@ limitations under the License.
 use crate::error::{ConfigIoSnafu, Result};
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Merge authentication configuration into the .env file.
 ///
@@ -36,16 +36,11 @@ use std::path::Path;
 ///
 /// Returns an error if the .env file cannot be read or written.
 pub fn merge_auth_config(auth_type: &str, params: &[(&str, &str)]) -> Result<()> {
-    // Determine which env file to use
-    let env_file = if Path::new(".env.local").exists() {
-        ".env.local"
-    } else {
-        ".env"
-    };
+    let env_file = env_file_path();
 
     // Read existing env vars (ignore errors - file might not exist)
-    let mut env_vars: HashMap<String, String> = if Path::new(env_file).exists() {
-        read_env_file(env_file).unwrap_or_default()
+    let mut env_vars: HashMap<String, String> = if env_file.exists() {
+        read_env_file(&env_file).unwrap_or_default()
     } else {
         HashMap::new()
     };
@@ -57,27 +52,62 @@ pub fn merge_auth_config(auth_type: &str, params: &[(&str, &str)]) -> Result<()>
     }
 
     // Write back to file
-    write_env_file(env_file, &env_vars)?;
+    write_env_file(&env_file, &env_vars)?;
 
     // Set file permissions to 0600 (owner read/write only)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let permissions = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(env_file, permissions).context(ConfigIoSnafu {
+        std::fs::set_permissions(&env_file, permissions).context(ConfigIoSnafu {
             operation: "set permissions",
-            path: std::path::PathBuf::from(env_file),
+            path: env_file,
         })?;
     }
 
     Ok(())
 }
 
+/// The env file credentials are read from and written to.
+///
+/// `.env.local` wins when present. Every reader and the writer must agree on
+/// this, or a credential is stored where nothing looks for it.
+#[must_use]
+pub fn env_file_path() -> PathBuf {
+    #[cfg(test)]
+    return test_env_file::path();
+
+    #[cfg(not(test))]
+    if Path::new(".env.local").exists() {
+        PathBuf::from(".env.local")
+    } else {
+        PathBuf::from(".env")
+    }
+}
+
+/// Read one variable from the env file, using the same parse as the writer.
+///
+/// Shares [`read_env_file`] so a value the writer quoted is unquoted the same
+/// way, and `KEY = value` spacing is accepted on both sides.
+#[must_use]
+pub fn read_env_var(var: &str) -> Option<String> {
+    read_env_file(&env_file_path())
+        .ok()?
+        .remove(var)
+        .filter(|value| !value.is_empty())
+}
+
+/// Every variable currently set in the env file.
+#[must_use]
+pub fn env_file_vars() -> HashMap<String, String> {
+    read_env_file(&env_file_path()).unwrap_or_default()
+}
+
 /// Read environment variables from a .env file.
-fn read_env_file(path: &str) -> Result<HashMap<String, String>> {
+fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
     let contents = std::fs::read_to_string(path).context(ConfigIoSnafu {
         operation: "read",
-        path: std::path::PathBuf::from(path),
+        path: path.to_path_buf(),
     })?;
 
     let mut vars = HashMap::new();
@@ -107,7 +137,7 @@ fn read_env_file(path: &str) -> Result<HashMap<String, String>> {
 }
 
 /// Write environment variables to a .env file.
-fn write_env_file(path: &str, vars: &HashMap<String, String>) -> Result<()> {
+fn write_env_file(path: &Path, vars: &HashMap<String, String>) -> Result<()> {
     let mut lines: Vec<String> = vars
         .iter()
         .map(|(k, v)| {
@@ -126,7 +156,7 @@ fn write_env_file(path: &str, vars: &HashMap<String, String>) -> Result<()> {
     let contents = lines.join("\n") + "\n";
     std::fs::write(path, contents).context(ConfigIoSnafu {
         operation: "write",
-        path: std::path::PathBuf::from(path),
+        path: path.to_path_buf(),
     })?;
 
     Ok(())
@@ -143,18 +173,39 @@ fn write_env_file(path: &str, vars: &HashMap<String, String>) -> Result<()> {
 pub fn store_keychain(auth_type: &str, params: &[(&str, &str)]) -> Result<()> {
     for (key, value) in params {
         let account = format!("SPICE_{auth_type}_{key}");
-        let entry = keyring::Entry::new(&account, "spice").map_err(|e| {
+        super::keychain::write(&account, value).map_err(|reason| {
             crate::error::Error::InvalidArgument {
-                message: format!("Failed to create keychain entry for {account}: {e}"),
+                message: format!("Failed to store `{account}` in the keychain: {reason}"),
             }
         })?;
-        entry
-            .set_password(value)
-            .map_err(|e| crate::error::Error::InvalidArgument {
-                message: format!("Failed to store {account} in keychain: {e}"),
-            })?;
     }
     Ok(())
+}
+
+/// Redirects the env-file helpers to a temporary file in tests.
+///
+/// The fallback is also temporary, so a test that forgets to install an
+/// explicit path still cannot touch the developer's real `.env`.
+#[cfg(test)]
+pub(crate) mod test_env_file {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static DIR: RefCell<Option<tempfile::TempDir>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn path() -> PathBuf {
+        DIR.with_borrow_mut(|dir| {
+            dir.get_or_insert_with(|| tempfile::tempdir().expect("create test env directory"))
+                .path()
+                .join(".env")
+        })
+    }
+
+    pub(crate) fn reset() {
+        DIR.with_borrow_mut(|dir| *dir = None);
+    }
 }
 
 #[cfg(test)]

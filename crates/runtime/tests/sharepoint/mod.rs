@@ -50,7 +50,7 @@ use std::{sync::Arc, time::Duration};
 
 use app::AppBuilder;
 use arrow::array::{Int64Array, RecordBatch, UInt64Array};
-use data_components::sharepoint::auth::{DEFAULT_SCOPE, SharepointAuth};
+use connector_sharepoint::sharepoint::auth::{DEFAULT_SCOPE, SharepointAuth};
 use futures::StreamExt;
 use object_store::ObjectStoreExt;
 use runtime::Runtime;
@@ -133,19 +133,19 @@ fn unique_filename(ext: &str) -> String {
 /// kinds it's `{drive-id}/{in-drive}` so the store's `resolve()` can
 /// recover the drive ID from the first path segment.
 fn store_and_delete_path(
-    client: std::sync::Arc<data_components::sharepoint::GraphClient>,
+    client: std::sync::Arc<connector_sharepoint::sharepoint::GraphClient>,
     uri: &str,
 ) -> Result<
     (
-        data_components::sharepoint::object_store::SharepointObjectStore,
+        connector_sharepoint::sharepoint::object_store::SharepointObjectStore,
         object_store::path::Path,
     ),
     anyhow::Error,
 > {
-    use data_components::sharepoint::object_store::{
+    use connector_sharepoint::sharepoint::object_store::{
         DriveKind, SharepointObjectStore, SharepointObjectStoreConfig,
     };
-    use data_components::sharepoint::url::{DriveRef, SharepointUrl};
+    use connector_sharepoint::sharepoint::url::{DriveRef, SharepointUrl};
 
     let parsed = SharepointUrl::parse(uri).map_err(|e| anyhow::anyhow!("parse test uri: {e}"))?;
     let (kind, path) = match &parsed.drive {

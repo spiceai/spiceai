@@ -23,10 +23,12 @@ use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use data_components::s3_vectors::compute_query::{CachedQueryVector, ComputeQueryVector};
 use data_components::s3_vectors::partition::{
-    S3VectorsPartitionedListTable, S3VectorsPartitionedQueryTable,
+    S3VectorsPartitionedListTable, S3VectorsPartitionedQueryTable, all_indexes_in_partition,
 };
 use data_components::s3_vectors::query_provider::S3_VECTOR_DISTANCE_NAME;
-use data_components::s3_vectors::spill::get_last_spill_index_for_virtual_index;
+use data_components::s3_vectors::spill::{
+    all_existing_spill_tables, get_last_spill_index_for_virtual_index,
+};
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier, S3VectorsTable,
     list_provider::S3VectorsListTable, partition::PartitionedIndexName,
@@ -42,15 +44,17 @@ use datafusion::prelude::arrow_cast;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::{LogicalPlanBuilder, ScalarUDF, binary_expr, cast, col};
 use datafusion_functions_json::udfs::json_get_udf;
-use futures::future::try_join_all;
+use futures::future::join_all;
+use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
-use runtime_datafusion_index::Index;
 use runtime_table_partition::insert::partition_batch;
 use snafu::ResultExt;
+use spice_table::Index;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::s3_vectors::compute_query::EmbedQuery;
-use crate::index::{SearchIndex, VectorIndex, embedding_col};
+use crate::index::write_util::extract_and_format_primary_key;
+use crate::index::{MAX_CONCURRENT_INDEX_WRITES, SearchIndex, VectorIndex, embedding_col};
 use crate::metadata::MetadataColumns;
 use datafusion::{
     common::Column,
@@ -152,7 +156,7 @@ impl SearchIndex for S3Vector {
                 let input_dfschema = DFSchema::try_from(Arc::clone(&input_schema))?;
                 let execution_props = ExecutionProps::new();
                 let physical_expr =
-                    create_physical_expr(partition_by, &input_dfschema, &execution_props)?;
+                    create_physical_expr(partition_by, &input_dfschema, &execution_props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default())?;
                 let partitions = partition_batch(&record, physical_expr.as_ref())?;
 
                 let mut data = vec![];
@@ -380,7 +384,156 @@ impl Index for S3Vector {
         let futs = batches
             .into_iter()
             .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
-        try_join_all(futs).await
+        futures::stream::iter(futs)
+            .buffered(MAX_CONCURRENT_INDEX_WRITES)
+            .try_collect()
+            .await
+    }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        let key_strings: Vec<String> =
+            extract_and_format_primary_key(self.name(), &self.primary_key, &keys)
+                .map_err(|e| DataFusionError::External(Box::new(*e)))?
+                .into_iter()
+                .flatten()
+                .collect();
+
+        self.delete_key_strings(key_strings).await
+    }
+}
+
+impl S3Vector {
+    /// Remove every vector stored under `key_strings`, from every physical index a delete
+    /// must reach (see [`Self::delete_target_tables`]).
+    ///
+    /// Shared by [`VectorIndex::delete_by_keys`], which resolves the keys from a batch, and
+    /// by the write path, which already holds them as strings for the rows it rejected.
+    pub(super) async fn delete_key_strings(
+        &self,
+        key_strings: Vec<String>,
+    ) -> Result<(), DataFusionError> {
+        // Resolving the targets lists indexes in AWS, so nothing to delete must cost nothing.
+        if key_strings.is_empty() {
+            return Ok(());
+        }
+        let tables = self.delete_target_tables().await?;
+        self.delete_key_strings_from(tables, key_strings).await
+    }
+
+    /// Remove the vectors a write could not replace, from the index that write is targeting.
+    ///
+    /// The broadcast [`Self::delete_target_tables`] performs exists because a resolved
+    /// delete-key batch cannot say which physical index a key's vector landed in. A write
+    /// does not have that problem for partitioning: it is *inside* the partition it
+    /// evaluated, and `table` is the very index it is about to `PutVectors` into, so the
+    /// stale vector for a rejected row in that partition is in `table` or nowhere. Routing
+    /// there instead of broadcasting keeps a partitioned write linear — the broadcast is
+    /// issued per chunk *and* per partition, and each one re-lists every partition index, so
+    /// it costs O(partitions²) `DeleteVectors` calls for what one call reaches.
+    ///
+    /// Spill writes are the case a write genuinely cannot resolve: which spill index absorbed
+    /// a key depends on write-time AWS quota state, so those still broadcast.
+    ///
+    /// A row whose *partition value* changed leaves its old vector in the old partition index.
+    /// That is untouched here on purpose: the `PutVectors` beside this delete has the same
+    /// blind spot, so a cross-partition move is a pre-existing gap in the write path rather
+    /// than something eviction can close on its own.
+    pub(super) async fn evict_written_keys(
+        &self,
+        table: &S3VectorsTable,
+        key_strings: Vec<String>,
+    ) -> Result<(), DataFusionError> {
+        if key_strings.is_empty() {
+            return Ok(());
+        }
+        let tables = self.evict_target_tables(table).await?;
+        self.delete_key_strings_from(tables, key_strings).await
+    }
+
+    /// The physical indexes [`Self::evict_written_keys`] must reach for a write targeting
+    /// `table`.
+    async fn evict_target_tables(
+        &self,
+        table: &S3VectorsTable,
+    ) -> Result<Vec<S3VectorsTable>, DataFusionError> {
+        if self.spill_writes {
+            return self.delete_target_tables().await;
+        }
+        Ok(vec![table.clone()])
+    }
+
+    async fn delete_key_strings_from(
+        &self,
+        tables: Vec<S3VectorsTable>,
+        key_strings: Vec<String>,
+    ) -> Result<(), DataFusionError> {
+        if key_strings.is_empty() {
+            return Ok(());
+        }
+
+        let num_tables = tables.len();
+
+        let results = join_all(tables.into_iter().map(|table| {
+            let key_strings = key_strings.clone();
+            async move { table.delete_by_keys(key_strings).await }
+        }))
+        .await;
+
+        let errors: Vec<String> = results
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|e| e.to_string())
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(DataFusionError::Execution(format!(
+                "Failed to delete from {} of {num_tables} S3 Vectors index(es): {}",
+                errors.len(),
+                errors.join("; ")
+            )))
+        }
+    }
+
+    /// Every physical S3 Vectors index a delete of `self` must reach.
+    ///
+    /// Broadcasts to every index that could hold a matching key rather than routing to the exact
+    /// one, since:
+    ///  - which spill index a key's vector landed in (see `enable_spill_writes`) depends on
+    ///    write-time AWS quota state and isn't recoverable from the key alone;
+    ///  - which partition index a key's vector landed in requires re-evaluating `partition_by`
+    ///    against the row's original data, which a resolved delete-key batch doesn't carry.
+    ///
+    /// `DeleteVectors` against a key absent from a given index is a no-op, so broadcasting is
+    /// safe — it costs one delete call per existing physical index rather than one overall.
+    ///
+    /// Mirrors the `(spill_writes, partition_by.len())` precedence used by
+    /// [`Self::query_table_provider`]/[`VectorIndex::list_table_provider`]: spill-writes takes
+    /// precedence over partitioning (a dataset combining both is only ever spill-routed for reads
+    /// too).
+    async fn delete_target_tables(&self) -> Result<Vec<S3VectorsTable>, DataFusionError> {
+        if self.spill_writes {
+            return all_existing_spill_tables(&self.table)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)));
+        }
+
+        if !self.partition_by.is_empty() {
+            return match Arc::unwrap_or_clone(Arc::clone(&self.table.idx)) {
+                S3VectorIdentifier::IndexArn(_) => {
+                    tracing::warn!(
+                        "Partitioning is not supported when index ARN is provided. Deleting only from the base index."
+                    );
+                    Ok(vec![self.table.clone()])
+                }
+                S3VectorIdentifier::Index { .. } => {
+                    all_indexes_in_partition(&self.table, &self.embedded_column, &self.partition_by)
+                        .await
+                }
+            };
+        }
+
+        Ok(vec![self.table.clone()])
     }
 }
 
@@ -436,5 +589,356 @@ pub fn s3_vectors_primary_key_cast(primary_key: &[Field]) -> Vec<Expr> {
                 .alias(col_name)
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StringArray;
+    use arrow_schema::Schema;
+    use datafusion::scalar::ScalarValue;
+    use llms::embeddings::EmbeddingInput;
+    use s3_vectors::{
+        CreateIndexInput, CreateVectorBucketInput, DataType as S3DataType, DistanceMetric,
+        PutInputVector, PutVectorsInput, S3Vectors, mock::MockClient,
+    };
+
+    #[derive(Debug)]
+    struct NoopEmbed;
+
+    #[async_trait]
+    impl Embed for NoopEmbed {
+        async fn embed(
+            &self,
+            _input: EmbeddingInput,
+        ) -> llms::embeddings::Result<std::sync::Arc<Vec<Vec<f32>>>> {
+            Ok(std::sync::Arc::new(vec![]))
+        }
+
+        fn size(&self) -> i32 {
+            3
+        }
+    }
+
+    async fn create_index(client: &Arc<dyn S3Vectors + Send + Sync>, index_name: &str) {
+        client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name("test-bucket")
+                    .build()
+                    .expect("valid input"),
+            )
+            .await
+            .ok();
+        client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .index_name(index_name)
+                    .vector_bucket_name("test-bucket")
+                    .data_type(S3DataType::Float32)
+                    .dimension(3)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()
+                    .expect("valid input"),
+            )
+            .await
+            .expect("create_index should succeed");
+    }
+
+    async fn test_s3_vector(client: Arc<dyn S3Vectors + Send + Sync>) -> S3Vector {
+        create_index(&client, "virtual-index").await;
+        let table = S3VectorsTable::try_create_new_table(
+            S3VectorIdentifier::Index {
+                bucket_name: "test-bucket".to_string(),
+                index_name: "virtual-index".to_string(),
+            },
+            client,
+            3,
+            data_components::s3_vectors::MetadataColumns::none(),
+            Some(DistanceMetric::Cosine),
+        )
+        .await
+        .expect("try_create_new_table should succeed")
+        .expect("index exists");
+
+        S3Vector::new(
+            table,
+            "embedding".to_string(),
+            vec![Field::new("id", DataType::Utf8, false)],
+            MetadataColumns::none(),
+            Arc::new(NoopEmbed) as Arc<dyn Embed>,
+            vec![],
+            100,
+        )
+    }
+
+    #[tokio::test]
+    async fn write_fails_when_embedding_source_column_is_missing() {
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let index = test_s3_vector(client).await;
+        let record = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["row-1"]))],
+        )
+        .expect("record batch should be valid");
+
+        let err = write::write(&index, &index.table, record, 100)
+            .await
+            .expect_err("missing embedding source column should fail indexing");
+
+        assert_eq!(
+            err.to_string(),
+            "Cannot write to 's3_vector_index' index, data does not have column 'embedding'."
+        );
+    }
+
+    fn index_names(tables: &[S3VectorsTable]) -> Vec<String> {
+        tables
+            .iter()
+            .map(|t| {
+                t.idx
+                    .index_identifier_variables()
+                    .2
+                    .expect("index-backed identifier")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn delete_target_tables_no_spill_no_partition_targets_just_the_base() {
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let index = test_s3_vector(client).await;
+
+        let tables = index
+            .delete_target_tables()
+            .await
+            .expect("should resolve targets");
+
+        assert_eq!(index_names(&tables), vec!["virtual-index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn delete_target_tables_spill_writes_broadcasts_to_every_spill_index() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index = index.enable_spill_writes();
+
+        create_index(&client, "virtual-index-01").await;
+        create_index(&client, "virtual-index-02").await;
+
+        let tables = index
+            .delete_target_tables()
+            .await
+            .expect("should resolve targets");
+
+        assert_eq!(
+            index_names(&tables),
+            vec![
+                "virtual-index".to_string(),
+                "virtual-index-01".to_string(),
+                "virtual-index-02".to_string(),
+            ]
+        );
+    }
+
+    /// A write already knows which partition index it is writing to, so evicting the rows it
+    /// rejected must go there rather than re-listing and broadcasting to every partition. The
+    /// broadcast is issued per chunk *and* per partition, so leaving it in place costs
+    /// O(partitions²) `DeleteVectors` calls for what one call reaches.
+    #[tokio::test]
+    async fn a_partitioned_write_evicts_only_from_the_index_it_writes_to() {
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index.partition_by = vec![col("region")];
+
+        for value in ["us", "eu"] {
+            let partitioned_name = PartitionedIndexName::new(
+                "virtual-index",
+                &index.embedded_column,
+                &index.partition_by,
+                &ScalarValue::from(value),
+            )
+            .expect("valid partition name")
+            .to_index_name();
+            create_index(&client, &partitioned_name).await;
+        }
+
+        let broadcast = index
+            .delete_target_tables()
+            .await
+            .expect("should resolve targets");
+        assert_eq!(broadcast.len(), 2, "the key-only delete still broadcasts");
+
+        let targeted = index
+            .evict_target_tables(&index.table)
+            .await
+            .expect("should resolve targets");
+        assert_eq!(
+            index_names(&targeted),
+            vec!["virtual-index".to_string()],
+            "the write's own target, not every partition index"
+        );
+    }
+
+    /// Spill writes are the case a write genuinely cannot resolve: which spill index absorbed
+    /// a key depends on write-time AWS quota state, so eviction must still broadcast.
+    #[tokio::test]
+    async fn a_spilling_write_still_evicts_from_every_spill_index() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index = index.enable_spill_writes();
+
+        create_index(&client, "virtual-index-01").await;
+
+        let targeted = index
+            .evict_target_tables(&index.table)
+            .await
+            .expect("should resolve targets");
+
+        assert_eq!(
+            index_names(&targeted),
+            vec!["virtual-index".to_string(), "virtual-index-01".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_target_tables_partitioned_broadcasts_to_every_partition_index() {
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        let column_name = "region";
+        index.partition_by = vec![col(column_name)];
+
+        for value in ["us", "eu"] {
+            let partitioned_name = PartitionedIndexName::new(
+                "virtual-index",
+                &index.embedded_column,
+                &index.partition_by,
+                &ScalarValue::from(value),
+            )
+            .expect("valid partition name")
+            .to_index_name();
+            create_index(&client, &partitioned_name).await;
+        }
+
+        let tables = index
+            .delete_target_tables()
+            .await
+            .expect("should resolve targets");
+
+        assert_eq!(
+            tables.len(),
+            2,
+            "one target per partition value written so far"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_target_tables_spill_writes_takes_precedence_over_partitioning() {
+        // Mirrors the `(spill_writes, partition_by.len())` precedence used by
+        // `query_table_provider`/`list_table_provider`: a dataset combining both is always
+        // spill-routed, never partition-routed.
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index.partition_by = vec![col("region")];
+        index = index.enable_spill_writes();
+
+        let tables = index
+            .delete_target_tables()
+            .await
+            .expect("should resolve targets");
+
+        // No spill indexes exist and no partition indexes were ever created (since the
+        // partitioned name is never computed on this path) — spill-routing over the unpartitioned
+        // base index is the only target.
+        assert_eq!(index_names(&tables), vec!["virtual-index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn delete_target_tables_arn_identifier_with_partitioning_falls_back_to_base() {
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index.table = index.table.with_new_id(S3VectorIdentifier::IndexArn(
+            "arn:aws:s3vectors:us-east-1:123:index/virtual".to_string(),
+        ));
+        index.partition_by = vec![col("region")];
+
+        let tables = index
+            .delete_target_tables()
+            .await
+            .expect("ARN + partitioning must fall back, not error");
+
+        assert_eq!(tables.len(), 1);
+    }
+
+    async fn seed_keys(client: &Arc<dyn S3Vectors + Send + Sync>, index_name: &str, keys: &[&str]) {
+        let vectors: Vec<PutInputVector> = keys
+            .iter()
+            .map(|k| {
+                PutInputVector::builder()
+                    .key(*k)
+                    .build()
+                    .expect("valid put input vector")
+            })
+            .collect();
+        client
+            .put_vectors(
+                &PutVectorsInput::builder()
+                    .index_name(index_name)
+                    .vector_bucket_name("test-bucket")
+                    .set_vectors(Some(vectors))
+                    .build()
+                    .expect("valid put vectors input"),
+            )
+            .await
+            .expect("seed put_vectors should succeed");
+    }
+
+    fn id_key_batch(ids: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(ids.to_vec()))],
+        )
+        .expect("valid key batch")
+    }
+
+    #[tokio::test]
+    async fn delete_by_keys_removes_only_matching_vectors() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let index = test_s3_vector(Arc::clone(&client)).await;
+
+        seed_keys(&client, "virtual-index", &["a", "b", "c"]).await;
+
+        index
+            .delete_by_keys(id_key_batch(&["b"]))
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(mock_client.vector_keys("virtual-index"), vec!["a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn delete_by_keys_broadcasts_the_delete_to_every_spill_index() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index = index.enable_spill_writes();
+
+        create_index(&client, "virtual-index-01").await;
+        seed_keys(&client, "virtual-index", &["a", "b"]).await;
+        seed_keys(&client, "virtual-index-01", &["b", "c"]).await;
+
+        index
+            .delete_by_keys(id_key_batch(&["b"]))
+            .await
+            .expect("delete should succeed");
+
+        // The delete broadcasts to every physical index because a resolved key does not carry
+        // which spill index its vector landed in. Key "b" leaves both; the rest stay.
+        assert_eq!(mock_client.vector_keys("virtual-index"), vec!["a"]);
+        assert_eq!(mock_client.vector_keys("virtual-index-01"), vec!["c"]);
     }
 }

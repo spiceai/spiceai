@@ -27,8 +27,25 @@ mod executor;
 mod state;
 mod store;
 
+use runtime_request_context::{AsyncMarker, RequestContext};
+
 pub use error::{Error, Result};
 pub use executor::JobExecutor;
 pub use state::JobErrorCode;
-pub use state::{DEFAULT_CHUNK_SIZE, JobResult, JobResultManifest, JobSchema, JobState, JobStatus};
+pub use state::{
+    DEFAULT_CHUNK_SIZE, JobResult, JobResultManifest, JobSchema, JobState, JobStatus,
+    PUBLIC_JOB_OWNER,
+};
 pub use store::JobStore;
+
+/// The scope the calling request submits jobs under, and the only scope it may
+/// read or cancel jobs in.
+///
+/// This is the request's cache-namespace storage id, so job ownership follows
+/// exactly the principal boundary the caches already enforce: every request is
+/// `public` when no principal is authenticated, and each authenticated
+/// principal gets its own stable opaque scope.
+pub async fn current_job_owner() -> String {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    context.cache_namespace().storage_id().to_string()
+}

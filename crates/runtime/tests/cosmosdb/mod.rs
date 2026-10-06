@@ -29,12 +29,14 @@ limitations under the License.
 //! not ignored and run in CI.
 //!
 //! The Azure Cosmos emulator (`mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator`)
-//! is intentionally NOT used here: its 3+ GB image and 3–5 minute cold-start
-//! exceeds the budgets of the shared runner and `docker/mod.rs`
-//! `CONTAINER_SEMAPHORE`. A future on-demand CI job can add it behind a
-//! `cosmosdb-emulator` feature flag.
+//! is not used by these tests: its image and cold start exceed the budgets of
+//! the shared runner and `docker/mod.rs` `CONTAINER_SEMAPHORE`. The push-down
+//! round trip in `pushdown_roundtrip.rs` does use its `vnext-preview` build, and
+//! is ignored by default for the same reason.
 
 #![allow(dead_code, clippy::allow_attributes)]
+
+mod pushdown_roundtrip;
 
 use std::collections::HashMap;
 use std::env;
@@ -44,7 +46,10 @@ use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 const DEFAULT_DATABASE: &str = "spice-integration";
 const DEFAULT_CONTAINER: &str = "documents";
@@ -114,6 +119,7 @@ async fn cosmosdb_connector_factory_is_registered() -> Result<(), anyhow::Error>
             // fails to link or the factory panics during registration, this
             // test surfaces it without needing live credentials.
             configure_test_datafusion();
+            register_test_connectors().await;
             let _rt = Runtime::builder()
                 .with_app(AppBuilder::new("cosmosdb_smoke").build())
                 .build()
@@ -145,6 +151,7 @@ async fn cosmosdb_live_select_returns_rows() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
@@ -190,6 +197,7 @@ async fn cosmosdb_live_repeated_queries_share_budget() -> Result<(), anyhow::Err
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 

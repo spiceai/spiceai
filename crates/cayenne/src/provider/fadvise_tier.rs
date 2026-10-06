@@ -64,11 +64,11 @@ use std::path::PathBuf;
 /// `address_space` (the kernel's `ksys_sync_file_range` does NO `FMODE_WRITE`
 /// check; `EBADF` is raised only for an *invalid* fd, not a read-only one) — but
 /// we open `O_RDWR` as zero-cost defense-in-depth: it matches `RocksDB`'s
-/// writable-fd `RangeSync` posture and retires the recurring "sync_file_range
+/// writable-fd `RangeSync` posture and retires the recurring "`sync_file_range`
 /// needs a writable fd" objection. (The real failure axes are filesystem-level
 /// — ZFS no-ops, ext4-on-WSL `ENOSYS` — not fd mode.) The file is a
 /// process-owned, durable, not-yet-published compaction output, so it is always
-/// on a writable mount; Cayenne holds no fd for it (object_store closed the
+/// on a writable mount; Cayenne holds no fd for it (`object_store` closed the
 /// writer), so we re-open.
 #[cfg(target_os = "linux")]
 pub(crate) fn flush_and_evict(path: &std::path::Path) -> io::Result<()> {

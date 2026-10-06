@@ -1,0 +1,420 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Snapshot bootstrap for a file-backed acceleration: download one before the engine
+//! creates its table, and create one before an engine recreates it.
+//!
+//! Lives beside the accelerator contract rather than in `runtime` because the engines
+//! that call it do — they are linked by the binary, not by the orchestrator. The one
+//! thing it needs from the runtime, the acceleration checkpoint to reconcile a
+//! downloaded snapshot against, arrives through
+//! [`AccelerationSource::checkpointer_factory`].
+
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+
+use runtime_acceleration::BootstrapStatus;
+use runtime_acceleration::acceleration::{
+    Acceleration, CAYENNE_DATALAKE_SNAPSHOT_REASON, DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL, Mode,
+    RefreshMode,
+};
+use runtime_acceleration::acceleration_source::{AccelerationSource, resolved_refresh_mode};
+use runtime_acceleration::snapshot::engine::SnapshotEngine;
+use runtime_acceleration::snapshot::notifications;
+use runtime_acceleration::snapshot::{
+    AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager, metrics,
+};
+use snafu::Snafu;
+
+use crate::{AcceleratorEngineRegistry, acceleration_file_path};
+
+/// Whether `mode: file_create` still permits bootstrapping from a snapshot.
+///
+/// `file_create` snapshots the outgoing acceleration and deletes it so the next refresh
+/// rebuilds from the source. Bootstrapping straight back from that snapshot would undo
+/// the delete, so a refresh that replays everything must not bootstrap. A refresh that
+/// does *not* replay from the beginning still needs it, or rows nothing can re-send are
+/// gone.
+///
+/// `refresh_mode` arrives resolved: resolving it consults the connector, which this
+/// crate cannot reach. Erring toward keeping the bootstrap costs `file_create` some of
+/// its effect on a CDC dataset; erring the other way destroys rows nothing can re-send.
+fn mode_allows_snapshot_bootstrap(acceleration: &Acceleration, refresh_mode: RefreshMode) -> bool {
+    if acceleration.mode != Mode::FileCreate {
+        return true;
+    }
+
+    !matches!(refresh_mode, RefreshMode::Full | RefreshMode::Caching)
+}
+
+/// Decides whether a snapshot should be downloaded to bootstrap `layout`, with no side
+/// effects: it only reads configuration and checks whether `layout.primary_path()`
+/// already exists.
+///
+/// Split out of [`download_snapshot_if_needed`] so a caller whose own startup would
+/// otherwise create `primary_path` before the check runs (e.g. Cayenne opening its
+/// metastore) can make this decision first, against the true pre-startup state, and
+/// only then perform whatever side-effecting setup it needs before downloading.
+pub fn should_download_snapshot(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+    layout: &AccelerationLayout,
+    refresh_mode: RefreshMode,
+) -> bool {
+    if !snapshot_bootstrap_enabled(acceleration, source, refresh_mode) {
+        return false;
+    }
+
+    let Some(primary_path) = layout.primary_path() else {
+        tracing::debug!("No primary path for acceleration layout, skipping download");
+        return false;
+    };
+
+    if primary_path.exists() {
+        tracing::info!(
+            "Acceleration already exists at {}, skipping snapshot download",
+            primary_path.display()
+        );
+        return false;
+    }
+
+    !refuses_datalake_bootstrap(acceleration, source)
+}
+
+/// Whether `acceleration` uses a Cayenne datalake tier, which a snapshot cannot restore,
+/// warning that the dataset loads from its source instead. Call it only once a restore
+/// would otherwise happen, so the warning is not logged for a dataset that reopens its
+/// local acceleration.
+pub fn refuses_datalake_bootstrap(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+) -> bool {
+    if !acceleration.uses_cayenne_datalake() {
+        return false;
+    }
+    tracing::warn!(
+        dataset = %source.name(),
+        "Dataset '{}' was not restored from a snapshot, so it loads from its source instead: {CAYENNE_DATALAKE_SNAPSHOT_REASON}",
+        source.name()
+    );
+    true
+}
+
+/// Whether the configuration permits bootstrap. Engines with a shared metastore
+/// must check for the individual table, rather than the metastore directory.
+pub fn snapshot_bootstrap_enabled(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+    refresh_mode: RefreshMode,
+) -> bool {
+    if !acceleration.snapshot_behavior.bootstrap_enabled() {
+        return false;
+    }
+
+    if !mode_allows_snapshot_bootstrap(acceleration, refresh_mode) {
+        tracing::info!(
+            "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
+            source.name()
+        );
+        return false;
+    }
+
+    true
+}
+
+/// Downloads the latest snapshot for `layout` unconditionally.
+///
+/// Callers should first confirm a download is appropriate with
+/// [`should_download_snapshot`]; this function performs no checks of its own before
+/// downloading — it exists so the decision and the (potentially side-effecting) act of
+/// downloading can happen at different points in a caller's startup sequence.
+///
+/// # Errors
+/// Returns an error when snapshot notification configuration is invalid.
+pub async fn download_snapshot(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+    layout: AccelerationLayout,
+    engine: AccelerationEngine,
+    engine_override: Option<Arc<dyn SnapshotEngine>>,
+) -> Result<BootstrapStatus, notifications::Error> {
+    let dataset_name = source.name().to_string();
+    // The source opens its own checkpoint: each engine's checkpointer carries that
+    // engine's sidecar SQL and lives in its own `runtime-checkpoint-*` crate, so it
+    // reaches here as a factory behind the `AccelerationSource` contract rather than
+    // as a type this crate names.
+    let checkpoint_factory = source.checkpointer_factory(acceleration.snapshot_behavior.clone());
+    if let Some(manager) = SnapshotManager::try_new(
+        dataset_name.clone(),
+        acceleration.snapshot_behavior.clone(),
+        layout,
+        engine,
+    )
+    .await
+    {
+        let mut manager = manager.with_checkpointer_factory(checkpoint_factory);
+        if let Some(engine_override) = engine_override {
+            manager = manager.with_snapshot_engine(engine_override);
+        }
+        let manager = Arc::new(manager);
+        let start_time = Instant::now();
+        let snapshot_reader = resolved_refresh_mode(source, acceleration) == RefreshMode::Snapshot;
+        let subscription =
+            if snapshot_reader && let Some(notifications) = source.snapshot_notifications() {
+                notifications
+                    .subscribe_for_behavior(&acceleration.snapshot_behavior, &manager)
+                    .await?
+            } else {
+                None
+            };
+        if snapshot_reader {
+            // Dataset load tasks own potentially unbounded bootstrap waits. Shared
+            // accelerator initialization must finish before any dataset can load.
+            return Ok(BootstrapStatus::Pending {
+                manager,
+                subscription,
+                poll_interval: acceleration
+                    .refresh_check_interval
+                    .unwrap_or(DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL),
+            });
+        }
+        match manager.download_latest_snapshot().await {
+            Ok(Some(info)) => {
+                metrics::record_bootstrap_metrics(
+                    &dataset_name,
+                    start_time.elapsed().as_secs_f64() * 1000.0,
+                    info.bytes_downloaded,
+                    &info.checksum,
+                );
+                Ok(BootstrapStatus::bootstrapped(info, subscription))
+            }
+            Ok(None) => Ok(BootstrapStatus::none()),
+            Err(e) => {
+                tracing::error!(dataset = %dataset_name, error = %e, "Failed to download snapshot");
+                Ok(BootstrapStatus::none())
+            }
+        }
+    } else {
+        Ok(BootstrapStatus::none())
+    }
+}
+
+/// Checks whether a snapshot should be downloaded to bootstrap `layout` and, if so,
+/// downloads it.
+///
+/// Thin composition of [`should_download_snapshot`] and [`download_snapshot`], kept for
+/// callers (`DuckDB`, `SQLite`, Turso) that make the decision and perform the download at
+/// the same point in their startup, with no side-effecting setup of their own in
+/// between.
+///
+/// # Errors
+/// Returns an error when snapshot notification configuration is invalid.
+pub async fn download_snapshot_if_needed(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+    layout: AccelerationLayout,
+    engine: AccelerationEngine,
+    engine_override: Option<Arc<dyn SnapshotEngine>>,
+    refresh_mode: RefreshMode,
+) -> Result<BootstrapStatus, notifications::Error> {
+    if !should_download_snapshot(acceleration, source, &layout, refresh_mode) {
+        return Ok(BootstrapStatus::none());
+    }
+
+    download_snapshot(acceleration, source, layout, engine, engine_override).await
+}
+
+/// Creates a snapshot of the existing acceleration file before it is deleted or recreated.
+///
+/// Called during `file_create` and `file_update` (on schema mismatch) modes to preserve
+/// a copy of the current acceleration data before it is destroyed.
+///
+/// This is a best-effort operation: if snapshotting fails, a warning is logged and the
+/// caller proceeds with recreation.
+///
+/// `engine_override` parallels [`download_snapshot_if_needed`].
+pub async fn snapshot_before_recreate(
+    acceleration: &Acceleration,
+    dataset_name: &str,
+    layout: AccelerationLayout,
+    engine: AccelerationEngine,
+    schema: Arc<arrow_schema::Schema>,
+    engine_override: Option<Arc<dyn SnapshotEngine>>,
+    refresh_mode: RefreshMode,
+) {
+    if !acceleration.snapshot_behavior.create_enabled() {
+        return;
+    }
+
+    // `refresh_mode: snapshot` is a read-only consumer of the snapshot store, so it must
+    // never publish. Its local acceleration is a copy of a snapshot someone else owns,
+    // and creating one makes the uploaded bytes the store's `current-snapshot-id`: a
+    // replica lagging behind would publish its stale copy under a higher id and roll
+    // every other reader back onto it.
+    if refresh_mode == RefreshMode::Snapshot {
+        tracing::debug!(
+            dataset = %dataset_name,
+            "refresh_mode: snapshot consumes snapshots without publishing them; skipping pre-recreation snapshot"
+        );
+        return;
+    }
+
+    // A partitioned Cayenne dataset's metastore slice is incomplete: `export_dataset`
+    // selects every dependent table by the parent's table id, so the partition child
+    // `cayenne_table` rows (and each child's metadata) are not exported, and a restore
+    // fails at `infer_existing_partitions` with `TableNotFound` once the drop cascade has
+    // removed the live child rows. Publishing would make that unrestorable archive the
+    // store's `current-snapshot-id`, so skip until the slice covers child tables.
+    // `build_snapshot_creation_config` applies the same gate to the periodic publish path.
+    if engine == AccelerationEngine::Cayenne && !acceleration.partition_by.is_empty() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "Skipping the pre-recreation snapshot: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
+        );
+        return;
+    }
+
+    // `build_snapshot_creation_config` applies the same gate to the periodic publish path.
+    if acceleration.uses_cayenne_datalake() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "Skipping the pre-recreation snapshot of dataset '{dataset_name}': {CAYENNE_DATALAKE_SNAPSHOT_REASON}"
+        );
+        return;
+    }
+
+    // A Cayenne bootstrap needs the per-dataset metastore slice that only
+    // `CayenneSnapshotEngine` writes, and creating a snapshot makes whatever it uploads
+    // the store's `current-snapshot-id`. Publishing a default-engine archive (a raw
+    // `cayenne.db`, no slice) would replace a restorable current snapshot with one
+    // nothing can load, which is worse than keeping no backup of this wipe. The caller
+    // still recreates the acceleration either way.
+    if engine == AccelerationEngine::Cayenne && engine_override.is_none() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "Skipping the pre-recreation snapshot: this dataset's Cayenne metastore catalog is unavailable, and an archive without its metastore slice could not be restored"
+        );
+        return;
+    }
+
+    let Some(manager) = SnapshotManager::try_new(
+        dataset_name.to_string(),
+        acceleration.snapshot_behavior.clone(),
+        layout,
+        engine,
+    )
+    .await
+    else {
+        return;
+    };
+    let manager = if let Some(engine_override) = engine_override {
+        manager.with_snapshot_engine(engine_override)
+    } else {
+        manager
+    };
+
+    // If the caller provided an empty schema (e.g. during file_create init when the table
+    // provider isn't available yet), try to read the real schema from existing snapshot
+    // metadata. If no stored schema exists either, skip the snapshot to avoid storing an
+    // empty schema that would make this snapshot unrestorable.
+    let snapshot_schema = if schema.fields().is_empty() {
+        let Some(stored) = manager.current_stored_schema().await else {
+            tracing::debug!(dataset = %dataset_name, "No stored schema available for pre-recreation snapshot; skipping");
+            return;
+        };
+        stored
+    } else {
+        Arc::clone(&schema)
+    };
+
+    // Create a mutex just for this one-off snapshot; no other operations are concurrent at init time.
+    let mutex = Arc::new(tokio::sync::Mutex::new(()));
+    let lock_guard = mutex.lock_owned().await;
+
+    match manager
+        .create_snapshot(&snapshot_schema, lock_guard, None, None, ForceCreate(true))
+        .await
+    {
+        Ok(Some(path)) => {
+            tracing::info!(dataset = %dataset_name, snapshot = %path, "Created pre-recreation snapshot");
+        }
+        Ok(None) => {
+            tracing::debug!(dataset = %dataset_name, "No snapshot created before recreation");
+        }
+        Err(e) => {
+            tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create pre-recreation snapshot; proceeding with recreation");
+        }
+    }
+}
+
+/// Rejects a configuration in which two datasets snapshot to the same path.
+///
+/// # Errors
+///
+/// Returns [`SharedAccelerationSnapshotError`] naming the datasets that collide.
+pub async fn validate_snapshot_paths(
+    sources: Vec<Arc<dyn AccelerationSource>>,
+    registry: &AcceleratorEngineRegistry,
+) -> Result<(), SharedAccelerationSnapshotError> {
+    let mut paths: HashMap<PathBuf, Vec<String>> = HashMap::new();
+
+    for source in sources {
+        let Some(acceleration) = source.acceleration() else {
+            continue;
+        };
+
+        if matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled) {
+            continue;
+        }
+
+        if !source.is_file_accelerated() {
+            continue;
+        }
+
+        match acceleration_file_path(source.as_ref(), registry).await {
+            Ok(path) => {
+                paths
+                    .entry(path)
+                    .or_default()
+                    .push(source.name().to_string());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Unable to determine acceleration file path for dataset {} while validating snapshot configuration: {err}",
+                    source.name()
+                );
+            }
+        }
+    }
+
+    if let Some((path, datasets)) = paths.into_iter().find(|(_, ds)| ds.len() > 1) {
+        return Err(SharedAccelerationSnapshotError::DuckDbSharedFile {
+            datasets: datasets.join(", "),
+            path: path.display().to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Snafu)]
+pub enum SharedAccelerationSnapshotError {
+    #[snafu(display(
+        "DuckDB doesn't support snapshots for shared acceleration. \
+        Datasets [{datasets}] share the same file '{path}'. \
+        Configure datasets to point to different location using duckdb_file"
+    ))]
+    DuckDbSharedFile { datasets: String, path: String },
+}

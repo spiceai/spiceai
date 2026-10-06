@@ -47,6 +47,27 @@ pub enum ChatBackend {
     Responses,
 }
 
+impl ChatBackend {
+    /// The values accepted in a Spicepod. The parameter spec validates against this same
+    /// slice, so the documented vocabulary and the parsed one cannot drift.
+    pub const VALUES: &'static [&'static str] = &["enabled", "disabled"];
+}
+
+impl FromStr for ChatBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "disabled" => Ok(Self::ChatCompletions),
+            "enabled" => Ok(Self::Responses),
+            other => Err(format!(
+                "must be one of: {}. Found {other}",
+                Self::VALUES.join(", ")
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UsageTier {
     Free,
@@ -271,5 +292,159 @@ impl<C: Config + Clone> Openai<C> {
             && (self.model.starts_with("gpt-5")
                 || self.model.starts_with("o3")
                 || self.model.starts_with("o4"))
+    }
+}
+
+#[cfg(test)]
+mod chat_backend_tests {
+    use super::ChatBackend;
+
+    #[test]
+    fn parses_the_documented_values_case_insensitively() {
+        for (raw, expected) in [
+            ("disabled", ChatBackend::ChatCompletions),
+            ("Disabled", ChatBackend::ChatCompletions),
+            ("  disabled ", ChatBackend::ChatCompletions),
+            ("enabled", ChatBackend::Responses),
+            ("ENABLED", ChatBackend::Responses),
+        ] {
+            assert_eq!(
+                raw.parse::<ChatBackend>()
+                    .unwrap_or_else(|e| panic!("{raw:?} should parse: {e}")),
+                expected,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_values_outside_the_spec() {
+        for raw in ["", "legacy", "true", "false"] {
+            assert!(
+                raw.parse::<ChatBackend>().is_err(),
+                "{raw:?} should be rejected"
+            );
+        }
+    }
+
+    /// The parameter spec advertises `VALUES`, so every entry has to parse — otherwise
+    /// config validation accepts a value the parser then rejects.
+    #[test]
+    fn every_advertised_value_parses() {
+        for value in ChatBackend::VALUES {
+            value
+                .parse::<ChatBackend>()
+                .unwrap_or_else(|e| panic!("{value:?} is advertised but does not parse: {e}"));
+        }
+    }
+}
+
+/// Guards the `async-openai` fork patch that only sends `Authorization` when there
+/// is a key to send.
+///
+/// Upstream inserts the header unconditionally. Spice builds every `OpenAI` client
+/// through [`new_openai_client_with_chat_backend`], which starts from
+/// `with_api_key("")` on purpose — so the downstream library cannot pick a key up
+/// from the environment — and overrides it only when a key was configured. Without
+/// the patch, a dataset or model with no `api_key` therefore sends
+/// `Authorization: Bearer ` with an empty value to every request, and an
+/// OpenAI-compatible endpoint that needs no key rejects the malformed credential
+/// instead of serving the request.
+///
+/// Both halves are asserted, because the first alone would pass on a client that
+/// had stopped sending the header at all: with no key there must be no
+/// `Authorization` header, and with a key it must carry it as a bearer token.
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a failed set-up in a test should name itself and stop"
+)]
+mod authorization_header_tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{ChatBackend, new_openai_client_with_chat_backend};
+    use crate::chat::Chat as _;
+
+    /// Stand a one-shot HTTP server up and hand back its base URL together with a
+    /// channel carrying the request headers it receives.
+    fn capture_one_request() -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = listener
+            .local_addr()
+            .expect("read the bound address")
+            .port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Read to the end of the headers, which is all that is under assertion.
+            let mut seen = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                seen.push(byte[0]);
+                if seen.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&seen).into_owned());
+
+            // Any answer will do: the request that arrived is the observation, not
+            // what the client makes of the reply.
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        (format!("http://127.0.0.1:{port}/v1"), rx)
+    }
+
+    /// Drive a health check through a client built the way the runtime builds one,
+    /// and return the request headers the endpoint saw.
+    async fn request_headers_for(api_key: Option<&str>) -> String {
+        let (api_base, rx) = capture_one_request();
+        let client = new_openai_client_with_chat_backend(
+            "gpt-4o-mini".to_string(),
+            Some(&api_base),
+            api_key,
+            None,
+            None,
+            None,
+            ChatBackend::ChatCompletions,
+        );
+        // The reply is not a chat completion, so this fails; the request it sent
+        // first is what the assertions read.
+        let _ = tokio::time::timeout(Duration::from_secs(20), client.health()).await;
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("the endpoint received a request")
+    }
+
+    #[tokio::test]
+    async fn a_client_with_no_api_key_sends_no_authorization_header() {
+        let headers = request_headers_for(None).await;
+        assert!(
+            !headers.to_ascii_lowercase().contains("authorization:"),
+            "a model configured with no api_key sent an Authorization header, which carries an \
+             empty bearer token and is refused by an endpoint that needs no key:\n{headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_with_an_api_key_sends_it_as_a_bearer_token() {
+        let headers = request_headers_for(Some("sk-guard-token")).await;
+        assert!(
+            headers.contains("Bearer sk-guard-token"),
+            "the control: a configured api_key has to reach the endpoint as a bearer token, \
+             otherwise the assertion above passes on a client that sends no credential at \
+             all:\n{headers}"
+        );
     }
 }

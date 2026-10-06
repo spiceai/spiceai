@@ -58,11 +58,53 @@ pub enum Error {
     },
 }
 
+/// The two GitHub surfaces this store talks to: raw file content, and the REST
+/// API used for listing (the raw endpoint cannot list a directory).
+///
+/// These are separate from the org/repo/rev because the *bases* are what a test
+/// redirects at a local server, while the path built on top of them stays the
+/// production path — so coverage asserts this store's behaviour rather than
+/// GitHub's availability (spiceai/spiceai#13206).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitHubEndpoints {
+    raw_base: String,
+    api_base: String,
+    /// Whether the raw store may talk plaintext HTTP. Only a loopback stub in
+    /// this module's tests sets this; `github_com` pins it off, so no production
+    /// path can be talked into sending a token over cleartext.
+    allow_http: bool,
+}
+
+impl GitHubEndpoints {
+    /// The public GitHub endpoints, used by every non-test caller.
+    fn github_com() -> Self {
+        Self {
+            raw_base: "https://raw.githubusercontent.com".to_string(),
+            api_base: "https://api.github.com".to_string(),
+            allow_http: false,
+        }
+    }
+
+    /// The revision-scoped prefix every raw file path is resolved against.
+    fn raw_url(&self, org: &str, repo: &str, rev: &str) -> String {
+        format!("{}/{org}/{repo}/{rev}", self.raw_base)
+    }
+
+    /// The recursive git-tree endpoint backing `list`.
+    fn git_tree_url(&self, org: &str, repo: &str, rev: &str) -> String {
+        format!(
+            "{}/repos/{org}/{repo}/git/trees/{rev}?recursive=true",
+            self.api_base
+        )
+    }
+}
+
 struct GitHubClientConfig {
     org: String,
     repo: String,
     rev: String,
     token: Option<String>,
+    endpoints: GitHubEndpoints,
 }
 
 impl std::fmt::Debug for GitHubClientConfig {
@@ -73,17 +115,25 @@ impl std::fmt::Debug for GitHubClientConfig {
             .field("repo", &self.repo)
             .field("rev", &self.rev)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("endpoints", &self.endpoints)
             .finish()
     }
 }
 
 impl GitHubClientConfig {
-    fn new(org: impl Display, repo: impl Display, rev: impl Display, token: Option<&str>) -> Self {
+    fn new(
+        org: impl Display,
+        repo: impl Display,
+        rev: impl Display,
+        token: Option<&str>,
+        endpoints: GitHubEndpoints,
+    ) -> Self {
         Self {
             org: org.to_string(),
             repo: repo.to_string(),
             rev: rev.to_string(),
             token: token.map(ToString::to_string),
+            endpoints,
         }
     }
 }
@@ -137,6 +187,30 @@ impl GitHubRawObjectStore {
         token: Option<&str>,
         io_runtime: Handle,
     ) -> Result<Self, Error> {
+        Self::try_new_with_endpoints(
+            org,
+            repo,
+            rev,
+            token,
+            io_runtime,
+            GitHubEndpoints::github_com(),
+        )
+    }
+
+    /// `try_new`, with the GitHub base URLs supplied rather than hardcoded.
+    ///
+    /// Every caller outside this module's tests goes through `try_new`; the
+    /// paths built on top of the bases, the component validation and the header
+    /// wiring are shared, so a test that redirects the bases still exercises
+    /// this constructor rather than a copy of it.
+    fn try_new_with_endpoints(
+        org: impl Display,
+        repo: impl Display,
+        rev: impl Display,
+        token: Option<&str>,
+        io_runtime: Handle,
+        endpoints: GitHubEndpoints,
+    ) -> Result<Self, Error> {
         let org = org.to_string();
         let repo = repo.to_string();
         let rev = rev.to_string();
@@ -153,16 +227,18 @@ impl GitHubRawObjectStore {
             );
         }
         let http_store = HttpBuilder::new()
-            .with_url(format!(
-                "https://raw.githubusercontent.com/{org}/{repo}/{rev}"
-            ))
-            .with_client_options(ClientOptions::default().with_default_headers(headers))
+            .with_url(endpoints.raw_url(&org, &repo, &rev))
+            .with_client_options(
+                ClientOptions::default()
+                    .with_default_headers(headers)
+                    .with_allow_http(endpoints.allow_http),
+            )
             .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
             .build()
             .context(HttpBuilderFailedSnafu)?;
         Ok(Self {
             http_store,
-            config: Arc::new(GitHubClientConfig::new(&org, &repo, &rev, token)),
+            config: Arc::new(GitHubClientConfig::new(&org, &repo, &rev, token, endpoints)),
         })
     }
 }
@@ -243,7 +319,8 @@ impl ObjectStore for GitHubRawObjectStore {
                     return;
                 }
             };
-            let git_tree = match gh_rest_api.fetch_git_tree(&config.org, &config.repo, &config.rev).await {
+            let tree_url = config.endpoints.git_tree_url(&config.org, &config.repo, &config.rev);
+            let git_tree = match gh_rest_api.fetch_git_tree(&tree_url).await {
                 Ok(tree) => tree,
                 Err(e) => {
                     yield Err(object_store::Error::Generic {
@@ -333,15 +410,12 @@ impl GithubRestClient {
         })
     }
 
+    /// Fetches the recursive git tree from `endpoint`, which
+    /// `GitHubEndpoints::git_tree_url` built.
     async fn fetch_git_tree(
         &self,
-        org: &str,
-        repo: &str,
-        rev: &str,
+        endpoint: &str,
     ) -> Result<GitTree, Box<dyn std::error::Error + Send + Sync + 'static>> {
-        let endpoint =
-            format!("https://api.github.com/repos/{org}/{repo}/git/trees/{rev}?recursive=true");
-
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
         headers.insert(
@@ -357,7 +431,7 @@ impl GithubRestClient {
 
         tracing::debug!("fetch_git_tree: endpoint: {}", endpoint);
 
-        let response = self.client.get(&endpoint).headers(headers).send().await?;
+        let response = self.client.get(endpoint).headers(headers).send().await?;
 
         if response.status().is_success() {
             let git_tree = response.json::<GitTree>().await?;
@@ -379,7 +453,13 @@ mod tests {
 
     #[test]
     fn github_client_config_debug_redacts_token() {
-        let cfg = GitHubClientConfig::new("org", "repo", "main", Some("ghp_supersecret"));
+        let cfg = GitHubClientConfig::new(
+            "org",
+            "repo",
+            "main",
+            Some("ghp_supersecret"),
+            GitHubEndpoints::github_com(),
+        );
         let dbg = format!("{cfg:?}");
         assert!(
             !dbg.contains("ghp_supersecret"),
@@ -388,8 +468,344 @@ mod tests {
         assert!(dbg.contains("org") && dbg.contains("[REDACTED]"));
     }
 
+    /// A request this store made, as the stub server saw it.
+    #[derive(Debug, Clone)]
+    struct SeenRequest {
+        path_and_query: String,
+        authorization: Option<String>,
+    }
+
+    /// A stub for one GitHub surface: it records what the store asked for and
+    /// replies with a canned status and body.
+    #[derive(Clone)]
+    struct StubSurface {
+        seen: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+        status: u16,
+        body: bytes::Bytes,
+    }
+
+    impl StubSurface {
+        fn responding(status: u16, body: impl Into<bytes::Bytes>) -> Self {
+            Self {
+                seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+                status,
+                body: body.into(),
+            }
+        }
+
+        /// Serves the stub on an ephemeral loopback port and returns its base
+        /// URL. Nothing leaves the host, so the result cannot depend on a third
+        /// party's availability (spiceai/spiceai#13206).
+        async fn serve(&self) -> String {
+            use axum::{Router, body::Body, extract::State, http::Request, response::Response};
+
+            async fn handler(
+                State(stub): State<StubSurface>,
+                request: Request<Body>,
+            ) -> Response<Body> {
+                let path_and_query = request
+                    .uri()
+                    .path_and_query()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                let authorization = request
+                    .headers()
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string);
+                stub.seen
+                    .lock()
+                    .expect("the stub's request log is not poisoned")
+                    .push(SeenRequest {
+                        path_and_query,
+                        authorization,
+                    });
+                Response::builder()
+                    .status(stub.status)
+                    .body(Body::from(stub.body))
+                    .expect("the stub response is well-formed")
+            }
+
+            let app = Router::new()
+                .fallback(axum::routing::any(handler))
+                .with_state(self.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("the stub server binds a loopback port");
+            let address = listener
+                .local_addr()
+                .expect("the stub server has an address");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            format!("http://{address}")
+        }
+
+        fn requests(&self) -> Vec<SeenRequest> {
+            self.seen
+                .lock()
+                .expect("the stub's request log is not poisoned")
+                .clone()
+        }
+
+        /// The paths this surface was asked for, in order.
+        fn paths(&self) -> Vec<String> {
+            self.requests()
+                .into_iter()
+                .map(|request| request.path_and_query)
+                .collect()
+        }
+    }
+
+    /// A recursive git-tree payload in the shape the GitHub API returns.
+    fn git_tree_json(entries: &[(&str, &str, i64)]) -> String {
+        let tree: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(path, node_type, size)| {
+                serde_json::json!({ "path": path, "type": node_type, "size": size })
+            })
+            .collect();
+        serde_json::json!({ "tree": tree }).to_string()
+    }
+
+    /// Builds a store whose two surfaces are the supplied stubs. `try_new` is
+    /// the only difference from production: the paths, the validation and the
+    /// header wiring are the same code.
+    async fn store_against(
+        raw: &StubSurface,
+        api: &StubSurface,
+        token: Option<&str>,
+    ) -> GitHubRawObjectStore {
+        let endpoints = GitHubEndpoints {
+            raw_base: raw.serve().await,
+            api_base: api.serve().await,
+            // The stubs are loopback-only, so plaintext is contained to this test.
+            allow_http: true,
+        };
+        GitHubRawObjectStore::try_new_with_endpoints(
+            "spiceai",
+            "spiceai",
+            "refs/heads/trunk",
+            token,
+            Handle::current(),
+            endpoints,
+        )
+        .expect("the store is built from valid components")
+    }
+
+    #[test]
+    fn endpoints_build_revision_scoped_github_urls() {
+        let endpoints = GitHubEndpoints::github_com();
+        assert_eq!(
+            endpoints.raw_url("spiceai", "spiceai", "refs/heads/trunk"),
+            "https://raw.githubusercontent.com/spiceai/spiceai/refs/heads/trunk"
+        );
+        assert_eq!(
+            endpoints.git_tree_url("spiceai", "spiceai", "refs/heads/trunk"),
+            "https://api.github.com/repos/spiceai/spiceai/git/trees/refs/heads/trunk?recursive=true"
+        );
+    }
+
+    /// The plaintext escape hatch exists only for this module's loopback stubs.
+    /// A production store sends the token, so it must be HTTPS-only.
+    #[test]
+    fn production_endpoints_are_https_and_forbid_cleartext() {
+        let endpoints = GitHubEndpoints::github_com();
+        assert!(
+            endpoints.raw_base.starts_with("https://"),
+            "raw base must be HTTPS: {}",
+            endpoints.raw_base
+        );
+        assert!(
+            endpoints.api_base.starts_with("https://"),
+            "API base must be HTTPS: {}",
+            endpoints.api_base
+        );
+        assert!(
+            !endpoints.allow_http,
+            "a production store must not be able to send its token over cleartext"
+        );
+    }
+
     #[tokio::test]
-    async fn test_get_opts() {
+    async fn get_opts_reads_the_path_under_the_revision_prefix() {
+        let raw = StubSurface::responding(200, b"# Spice.ai".to_vec());
+        let api = StubSurface::responding(200, git_tree_json(&[]));
+        let store = store_against(&raw, &api, None).await;
+
+        let result = store
+            .get_opts(&Path::from("README.md"), GetOptions::default())
+            .await
+            .expect("the stub serves README.md");
+        let body = result.bytes().await.expect("the body is readable");
+        assert_eq!(body.as_ref(), b"# Spice.ai");
+
+        let paths = raw.paths();
+        assert!(
+            paths.contains(&"/spiceai/spiceai/refs/heads/trunk/README.md".to_string()),
+            "the fetch must be scoped to org/repo/revision, saw {paths:?}"
+        );
+    }
+
+    /// AC: coverage still fails loudly when the store itself is broken. A 404 is
+    /// used rather than a 429 deliberately — `object_store` retries a 429 ten
+    /// times over ~132s (spiceai/spiceai#13206), which is the cost this issue is
+    /// about, and a non-retryable status keeps the assertion about *this* store.
+    #[tokio::test]
+    async fn get_opts_surfaces_a_missing_object() {
+        let raw = StubSurface::responding(404, b"not found".to_vec());
+        let api = StubSurface::responding(200, git_tree_json(&[]));
+        let store = store_against(&raw, &api, None).await;
+
+        let error = store
+            .get_opts(&Path::from("missing.md"), GetOptions::default())
+            .await
+            .expect_err("a rejected raw fetch must not read as success");
+        assert!(
+            matches!(error, object_store::Error::NotFound { .. }),
+            "a 404 from the raw endpoint must map to NotFound, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_requests_the_recursive_git_tree_for_the_revision() {
+        let raw = StubSurface::responding(200, Vec::new());
+        let api = StubSurface::responding(200, git_tree_json(&[("README.md", "blob", 10)]));
+        let store = store_against(&raw, &api, None).await;
+
+        let _entries: Vec<_> = store.list(None).collect::<Vec<_>>().await;
+
+        let paths = api.paths();
+        assert!(
+            paths.contains(
+                &"/repos/spiceai/spiceai/git/trees/refs/heads/trunk?recursive=true".to_string()
+            ),
+            "listing must ask the API for the revision's recursive tree, saw {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_yields_only_blobs_under_the_prefix() {
+        let raw = StubSurface::responding(200, Vec::new());
+        let api = StubSurface::responding(
+            200,
+            git_tree_json(&[
+                ("docs/release_notes/rc", "tree", 0),
+                ("docs/release_notes/rc/v1.0.0-rc.1.md", "blob", 128),
+                ("docs/release_notes/rc/v1.0.0-rc.2.md", "blob", 256),
+                // A directory entry under the prefix is not an object.
+                ("docs/release_notes/rc/nested", "tree", 0),
+                // Outside the prefix.
+                ("docs/release_notes/v1.0.0.md", "blob", 512),
+                ("README.md", "blob", 10),
+            ]),
+        );
+        let store = store_against(&raw, &api, None).await;
+
+        let entries: Vec<ObjectMeta> = store
+            .list(Some(&Path::from("docs/release_notes/rc")))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .expect("every listed entry is Ok");
+
+        let listed: Vec<(String, u64)> = entries
+            .iter()
+            .map(|meta| (meta.location.to_string(), meta.size))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("docs/release_notes/rc/v1.0.0-rc.1.md".to_string(), 128),
+                ("docs/release_notes/rc/v1.0.0-rc.2.md".to_string(), 256),
+            ],
+            "only blobs under the prefix are objects, and their sizes carry through"
+        );
+    }
+
+    /// The prefix is a directory, so a sibling whose name merely starts with the
+    /// same characters must not be listed.
+    #[tokio::test]
+    async fn list_scopes_a_prefix_without_a_trailing_slash_to_the_directory() {
+        let raw = StubSurface::responding(200, Vec::new());
+        let api = StubSurface::responding(
+            200,
+            git_tree_json(&[
+                ("docs/release_notes/rc/v1.0.0-rc.1.md", "blob", 1),
+                ("docs/release_notes/rc-archive/old.md", "blob", 2),
+            ]),
+        );
+        let store = store_against(&raw, &api, None).await;
+
+        let entries: Vec<ObjectMeta> = store
+            .list(Some(&Path::from("docs/release_notes/rc")))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .expect("every listed entry is Ok");
+
+        let listed: Vec<String> = entries
+            .iter()
+            .map(|meta| meta.location.to_string())
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["docs/release_notes/rc/v1.0.0-rc.1.md".to_string()],
+            "'rc-archive' is a sibling directory, not part of the 'rc' prefix"
+        );
+    }
+
+    /// AC: coverage still fails loudly when the store itself is broken, rather
+    /// than reporting an empty listing.
+    #[tokio::test]
+    async fn list_surfaces_a_failing_github_api() {
+        let raw = StubSurface::responding(200, Vec::new());
+        let api = StubSurface::responding(429, b"rate limited".to_vec());
+        let store = store_against(&raw, &api, None).await;
+
+        let results: Vec<_> = store.list(None).collect::<Vec<_>>().await;
+        let error = match results.as_slice() {
+            [Err(error)] => error.to_string(),
+            other => panic!("a rejected API must yield exactly one error, got {other:?}"),
+        };
+        assert!(
+            error.contains("429"),
+            "the error must name the status the API returned: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_surfaces_send_the_configured_token() {
+        let raw = StubSurface::responding(200, b"# Spice.ai".to_vec());
+        let api = StubSurface::responding(200, git_tree_json(&[("README.md", "blob", 10)]));
+        let store = store_against(&raw, &api, Some("ghp_supersecret")).await;
+
+        let _ = store
+            .get_opts(&Path::from("README.md"), GetOptions::default())
+            .await
+            .expect("the stub serves README.md");
+        let _entries: Vec<_> = store.list(None).collect::<Vec<_>>().await;
+
+        for (surface, requests) in [("raw", raw.requests()), ("api", api.requests())] {
+            assert!(
+                requests.iter().any(
+                    |request| request.authorization.as_deref() == Some("token ghp_supersecret")
+                ),
+                "the {surface} surface must carry the token, saw {requests:?}"
+            );
+        }
+    }
+
+    /// Live coverage against GitHub itself. Deliberately `#[ignore]`d: it is a
+    /// third-party dependency, and the sign-off gate must not be able to fail
+    /// because that third party is rate-limiting or down (spiceai/spiceai#13206).
+    /// The gate runs no ignored tests, so this is opt-in with
+    /// `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "reaches raw.githubusercontent.com and api.github.com; run on demand"]
+    async fn live_github_serves_the_repository_contents() {
         let store = GitHubRawObjectStore::try_new(
             "spiceai",
             "spiceai",
@@ -398,17 +814,15 @@ mod tests {
             Handle::current(),
         )
         .expect("failed to create store");
-        let result = store
+        store
             .get_opts(&Path::from("README.md"), GetOptions::default())
             .await
             .expect("failed to get README");
-        println!("{result:?}");
 
         let files: Vec<_> = store
             .list(Some(&Path::from("docs/release_notes/rc")))
             .collect::<Vec<_>>()
             .await;
-        println!("{files:?}");
         assert!(!files.is_empty());
     }
 

@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Utilities for converting JSON values to Arrow `Decimal128` (scaled `i128`).
 
+use arrow::datatypes::{DECIMAL128_MAX_PRECISION, Decimal128Type, DecimalType};
 use base64::prelude::*;
 use serde_json::Value as Json;
 use snafu::prelude::*;
@@ -45,6 +46,12 @@ pub enum Error {
 
     #[snafu(display("Unsupported JSON type for decimal: {actual_type}"))]
     UnsupportedType { actual_type: &'static str },
+
+    #[snafu(display(
+        "Decimal value {value} does not fit a Decimal128 of precision {precision} (max {} digits)",
+        precision
+    ))]
+    PrecisionExceeded { value: i128, precision: u8 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -110,35 +117,51 @@ fn decode_base64_decimal(s: &str) -> Result<i128> {
 /// Parses the number's string representation directly to avoid `f64` precision loss.
 /// Scientific notation falls back to `f64` rounding.
 ///
+/// The result is bounded by the physical `i128` range only. It is **not** checked
+/// against any column's declared precision — a scaled value can be representable
+/// as an `i128` and still be too wide for the `Decimal128(p, s)` it is destined
+/// for. [`convert_json_to_decimal`] applies that check; callers reaching for this
+/// primitive directly must apply it themselves before building an Arrow array.
+///
 /// # Errors
 /// Returns [`Error::Invalid`] for unparseable input or [`Error::Overflow`] on scaling overflow.
 pub fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Result<i128> {
     let s = n.to_string();
 
-    if s.bytes().any(|b| b == b'e' || b == b'E') {
-        let f: f64 = s.parse().map_err(|_| Error::Invalid {
-            reason: format!("cannot parse '{s}' as decimal"),
-        })?;
-        let scale_factor = 10_i128
-            .checked_pow(u32::from(target_scale.cast_unsigned()))
-            .context(OverflowSnafu)?;
-        #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-        return Ok((f * scale_factor as f64).round() as i128);
-    }
+    // Split an optional exponent off the mantissa. Everything below is exact
+    // integer work: routing scientific notation through `f64` made the stored
+    // decimal depend on how the source spelled the number — `1e23` landed on
+    // the nearest binary float (`99999999999999991611392`) while `100000...0`
+    // parsed exactly, and `1.239e0` rounded to `124` where `1.239` truncates
+    // to `123`.
+    let (mantissa, exponent) = match s.find(['e', 'E']) {
+        Some(pos) => {
+            let (mantissa, rest) = s.split_at(pos);
+            let exponent: i32 = rest[1..].parse().map_err(|_| Error::Invalid {
+                reason: format!("cannot parse exponent of '{s}'"),
+            })?;
+            (mantissa, exponent)
+        }
+        None => (s.as_str(), 0),
+    };
 
-    let negative = s.starts_with('-');
-    let digits = if negative { &s[1..] } else { &s };
+    let negative = mantissa.starts_with('-');
+    let digits = mantissa.strip_prefix(['-', '+']).unwrap_or(mantissa);
 
     let (int_str, frac_str) = match digits.find('.') {
         Some(pos) => (&digits[..pos], &digits[pos + 1..]),
         None => (digits, ""),
     };
 
-    let int_val: i128 = int_str.parse().map_err(|_| Error::Invalid {
-        reason: format!("cannot parse integer part '{int_str}'"),
-    })?;
+    let int_val: i128 = if int_str.is_empty() {
+        0
+    } else {
+        int_str.parse().map_err(|_| Error::Invalid {
+            reason: format!("cannot parse integer part '{int_str}'"),
+        })?
+    };
 
-    let frac_scale = i8::try_from(frac_str.len()).map_err(|_| Error::Invalid {
+    let frac_scale = i32::try_from(frac_str.len()).map_err(|_| Error::Invalid {
         reason: "fractional part too long".to_string(),
     })?;
 
@@ -150,10 +173,20 @@ pub fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Resu
         })?
     };
 
-    let scaled_int = rescale_i128(int_val, 0, target_scale)?;
-    let scaled_frac = rescale_i128(frac_val, frac_scale, target_scale)?;
-    let result = scaled_int + scaled_frac;
+    // Fold the fraction into one unscaled integer at `frac_scale`, then let the
+    // exponent shift that scale: `m * 10^exp` at scale `f` is the same value as
+    // `m` at scale `f - exp`.
+    let pow = u32::try_from(frac_scale).map_err(|_| OverflowSnafu.build())?;
+    let unscaled = int_val
+        .checked_mul(10_i128.checked_pow(pow).context(OverflowSnafu)?)
+        .context(OverflowSnafu)?
+        .checked_add(frac_val)
+        .context(OverflowSnafu)?;
 
+    let effective_scale = frac_scale.checked_sub(exponent).context(OverflowSnafu)?;
+    let src_scale = i8::try_from(effective_scale).map_err(|_| OverflowSnafu.build())?;
+
+    let result = rescale_i128(unscaled, src_scale, target_scale)?;
     Ok(if negative { -result } else { result })
 }
 
@@ -165,27 +198,46 @@ pub fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Resu
 /// - JSON object `{"scale": <int>, "value": "<base64>"}` (Debezium precise mode)
 /// - JSON number: plain decimal (Debezium `decimal.handling.mode=double`)
 ///
+/// `precision` is the destination column's declared precision. A value that does
+/// not fit it is rejected rather than written: `Decimal128Builder` does not check
+/// precision on append, so an unchecked value would produce an array whose
+/// contents contradict its own schema.
+///
 /// # Errors
 /// Returns an [`Error`] variant for invalid input, base64 decode failures, scaling overflow,
-/// missing object fields, or unsupported JSON types.
-pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128>> {
+/// missing object fields, unsupported JSON types, or a value too wide for `precision`.
+pub fn convert_json_to_decimal(v: &Json, precision: u8, target_scale: i8) -> Result<Option<i128>> {
     if !(0..=38).contains(&target_scale) {
         return InvalidSnafu {
             reason: "target_scale must be in 0..=38".to_string(),
         }
         .fail();
     }
+    ensure!(
+        (1..=DECIMAL128_MAX_PRECISION).contains(&precision),
+        InvalidSnafu {
+            reason: format!("precision must be in 1..={DECIMAL128_MAX_PRECISION}, got {precision}")
+        }
+    );
 
-    match v {
+    let unscaled = match v {
         Json::Null => Ok(None),
         Json::String(s) => Ok(Some(decode_base64_decimal(s)?)),
         Json::Object(m) => {
-            #[expect(clippy::cast_possible_truncation)]
-            let src_scale = m
+            let raw_scale = m
                 .get("scale")
                 .context(MissingScaleSnafu)?
                 .as_i64()
-                .context(NonIntegerScaleSnafu)? as i8;
+                .context(NonIntegerScaleSnafu)?;
+            // Truncating this cast would silently reinterpret the value: a
+            // source scale of 256 lands on 0, turning `1` (i.e. 1e-256) into a
+            // whole `1` at the target scale — in range, precision-valid, and
+            // wrong. The scale is source-controlled, so it must be rejected.
+            let src_scale = i8::try_from(raw_scale).map_err(|_| Error::Invalid {
+                reason: format!(
+                    "source scale {raw_scale} is outside the representable range (-128..=127)"
+                ),
+            })?;
 
             let value = m
                 .get("value")
@@ -204,7 +256,17 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128
             };
             UnsupportedTypeSnafu { actual_type }.fail()
         }
+    }?;
+
+    // Every input form funnels through here, so one check covers base64 strings,
+    // `{scale, value}` objects and plain JSON numbers alike.
+    if let Some(value) = unscaled {
+        ensure!(
+            Decimal128Type::is_valid_decimal_precision(value, precision),
+            PrecisionExceededSnafu { value, precision }
+        );
     }
+    Ok(unscaled)
 }
 
 #[cfg(test)]
@@ -245,17 +307,17 @@ mod tests {
         // Debezium encodes -1 as the single byte 0xFF (BigInteger.toByteArray()).
         // Zero-padding to 16 bytes would decode this as 255 — the value must be
         // sign-extended instead.
-        let v =
-            convert_json_to_decimal(&Json::String(b64(&[0xFF])), 0).expect("decode should succeed");
+        let v = convert_json_to_decimal(&Json::String(b64(&[0xFF])), 38, 0)
+            .expect("decode should succeed");
         assert_eq!(v, Some(-1));
 
         // -123 minimally encoded as the single byte 0x85.
-        let v =
-            convert_json_to_decimal(&Json::String(b64(&[0x85])), 0).expect("decode should succeed");
+        let v = convert_json_to_decimal(&Json::String(b64(&[0x85])), 38, 0)
+            .expect("decode should succeed");
         assert_eq!(v, Some(-123));
 
         // A larger negative value, -12_345 == 0xCFC7 in two's complement.
-        let v = convert_json_to_decimal(&Json::String(b64(&[0xCF, 0xC7])), 0)
+        let v = convert_json_to_decimal(&Json::String(b64(&[0xCF, 0xC7])), 38, 0)
             .expect("decode should succeed");
         assert_eq!(v, Some(-12_345));
     }
@@ -264,13 +326,13 @@ mod tests {
     fn positive_minimal_width_base64_is_zero_extended() {
         // 255 minimally encoded as 0x00 0xFF — the leading zero marks it positive
         // and must not be treated as sign-extension.
-        let v = convert_json_to_decimal(&Json::String(b64(&[0x00, 0xFF])), 0)
+        let v = convert_json_to_decimal(&Json::String(b64(&[0x00, 0xFF])), 38, 0)
             .expect("decode should succeed");
         assert_eq!(v, Some(255));
 
         // 127 == 0x7F (top bit clear), single byte.
-        let v =
-            convert_json_to_decimal(&Json::String(b64(&[0x7F])), 0).expect("decode should succeed");
+        let v = convert_json_to_decimal(&Json::String(b64(&[0x7F])), 38, 0)
+            .expect("decode should succeed");
         assert_eq!(v, Some(127));
     }
 
@@ -279,7 +341,7 @@ mod tests {
         // VariableScaleDecimal precise mode: {"scale": 2, "value": <base64>}.
         // -12.34 has unscaled value -1234 == 0xFB2E in two's complement.
         let input = json!({ "scale": 2, "value": b64(&[0xFB, 0x2E]) });
-        let v = convert_json_to_decimal(&input, 2).expect("decode should succeed");
+        let v = convert_json_to_decimal(&input, 38, 2).expect("decode should succeed");
         assert_eq!(v, Some(-1234));
     }
 
@@ -287,18 +349,376 @@ mod tests {
     fn full_width_16_byte_encoding_still_decodes() {
         // A full 16-byte encoding (e.g. produced by i128::to_be_bytes) must keep
         // decoding correctly for both signs.
-        let v = convert_json_to_decimal(&Json::String(b64(&(-12_345_i128).to_be_bytes())), 0)
+        let v = convert_json_to_decimal(&Json::String(b64(&(-12_345_i128).to_be_bytes())), 38, 0)
             .expect("decode should succeed");
         assert_eq!(v, Some(-12_345));
 
-        let v = convert_json_to_decimal(&Json::String(b64(&(98_765_i128).to_be_bytes())), 0)
+        let v = convert_json_to_decimal(&Json::String(b64(&(98_765_i128).to_be_bytes())), 38, 0)
             .expect("decode should succeed");
         assert_eq!(v, Some(98_765));
     }
 
     #[test]
     fn over_16_bytes_is_rejected() {
-        let result = convert_json_to_decimal(&Json::String(b64(&[0x01; 17])), 0);
+        let result = convert_json_to_decimal(&Json::String(b64(&[0x01; 17])), 38, 0);
         result.expect_err("a value wider than 16 bytes must be rejected, not truncated");
+    }
+
+    fn number(literal: &str) -> serde_json::Number {
+        serde_json::from_str::<serde_json::Number>(literal).expect("valid JSON number")
+    }
+
+    /// A float too large for the column must be an error, not `i128::MAX`.
+    /// `as i128` saturates, so an unchecked cast would silently store a wrong
+    /// number in a decimal column.
+    #[test]
+    fn an_out_of_range_scientific_number_overflows_instead_of_saturating() {
+        for literal in ["1e300", "-1e300", "1e39"] {
+            let result = parse_number_to_decimal(&number(literal), 2);
+            assert!(
+                matches!(result, Err(Error::Overflow)),
+                "{literal} must overflow, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scientific_number_within_range_still_converts() {
+        assert_eq!(
+            parse_number_to_decimal(&number("1.5e3"), 2).expect("in range"),
+            150_000
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("-1.5e3"), 2).expect("in range"),
+            -150_000
+        );
+    }
+
+    /// The stored decimal must not depend on how the source spelled the number.
+    /// Routing scientific notation through `f64` made `1e23` land on the nearest
+    /// binary float — `99999999999999991611392` — while the plain form parsed
+    /// exactly, and rounded `1.239e0` to `124` where `1.239` truncates to `123`.
+    #[test]
+    fn lexical_form_does_not_change_the_stored_decimal() {
+        assert_eq!(
+            parse_number_to_decimal(&number("1e23"), 0).expect("1e23 at scale 0"),
+            100_000_000_000_000_000_000_000_i128,
+            "must be exact, not the nearest f64"
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1e23"), 0).expect("scientific"),
+            parse_number_to_decimal(&number("100000000000000000000000"), 0).expect("plain"),
+            "the two spellings of one value must agree"
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1.239e0"), 2).expect("scientific"),
+            parse_number_to_decimal(&number("1.239"), 2).expect("plain"),
+            "an exponent of zero must not change truncation"
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1.239e0"), 2).expect("ok"),
+            123,
+            "truncates toward zero, never rounds"
+        );
+    }
+
+    #[test]
+    fn exponents_shift_the_scale_in_both_directions() {
+        assert_eq!(
+            parse_number_to_decimal(&number("1.5e3"), 2).expect("ok"),
+            150_000
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("-1.5e3"), 2).expect("ok"),
+            -150_000
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1e-2"), 4).expect("ok"),
+            100
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1.25e-1"), 4).expect("ok"),
+            1_250
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1e-2"), 4).expect("scientific"),
+            parse_number_to_decimal(&number("0.01"), 4).expect("plain")
+        );
+    }
+
+    /// Regression test for #12747, case 1: the two halves are each in range but
+    /// their sum is not. `1.8` at scale 38 is `1.0e38 + 0.8e38`, past
+    /// `i128::MAX`. `overflow-checks` is off in release, so an unchecked add
+    /// wrapped this to a large *negative* decimal and served it as fact.
+    #[test]
+    fn a_sum_of_two_in_range_halves_that_overflows_is_an_error() {
+        assert!(
+            matches!(
+                parse_number_to_decimal(&number("1.8"), 38),
+                Err(Error::Overflow)
+            ),
+            "1.8 at scale 38 must overflow rather than wrap negative"
+        );
+        assert!(matches!(
+            parse_number_to_decimal(&number("-1.8"), 38),
+            Err(Error::Overflow)
+        ));
+    }
+
+    /// Regression test for #12747, case 2: a float-to-int `as` cast saturates
+    /// rather than wrapping, so an out-of-range scientific-notation value became
+    /// `i128::MAX` — a plausible-looking wrong number.
+    #[test]
+    fn a_scientific_value_past_the_i128_range_is_an_error_not_i128_max() {
+        let result = parse_number_to_decimal(&number("1e39"), 0);
+        assert!(
+            matches!(result, Err(Error::Overflow)),
+            "1e39 must overflow, got {result:?}"
+        );
+        assert!(matches!(
+            parse_number_to_decimal(&number("-1e39"), 0),
+            Err(Error::Overflow)
+        ));
+    }
+
+    /// `parse_number_to_decimal` guards the physical `i128` range and nothing
+    /// more: `1` at scale 38 scales to `10^38`, which is a 39-digit value that
+    /// no `Decimal128` can hold (max precision is 38). The primitive returns it;
+    /// rejecting it is `convert_json_to_decimal`'s job. Pinned so the split in
+    /// responsibility stays deliberate rather than becoming a silent hole.
+    #[test]
+    fn parse_number_to_decimal_bounds_i128_only_not_decimal128_precision() {
+        let too_wide = parse_number_to_decimal(&number("1"), 38).expect("fits i128");
+        assert_eq!(
+            too_wide,
+            100_000_000_000_000_000_000_000_000_000_000_000_000_i128
+        );
+        assert_eq!(too_wide.to_string().len(), 39, "39 digits: past Decimal128");
+        assert!(matches!(
+            parse_number_to_decimal(&number("2"), 38),
+            Err(Error::Overflow)
+        ));
+    }
+
+    /// The value above must not reach an Arrow array. `Decimal128Builder` does
+    /// not check precision on append, so an unchecked value would build an array
+    /// whose contents contradict its declared schema.
+    #[test]
+    fn a_value_wider_than_the_declared_precision_is_rejected() {
+        for precision in [1_u8, 10, 38] {
+            assert!(
+                matches!(
+                    convert_json_to_decimal(&json!(1), precision, 38),
+                    Err(Error::PrecisionExceeded { .. })
+                ),
+                "10^38 must not pass precision {precision}"
+            );
+        }
+    }
+
+    /// A narrow column is the common case: `Decimal128(3, 2)` holds up to
+    /// `9.99`, so `10.00` has to be refused rather than silently stored.
+    #[test]
+    fn a_narrow_decimal_column_accepts_its_maximum_and_refuses_one_past_it() {
+        assert_eq!(
+            convert_json_to_decimal(&json!(9.99), 3, 2).expect("9.99 fits (3,2)"),
+            Some(999)
+        );
+        assert!(matches!(
+            convert_json_to_decimal(&json!(10.00), 3, 2),
+            Err(Error::PrecisionExceeded {
+                value: 1000,
+                precision: 3
+            })
+        ));
+        assert_eq!(
+            convert_json_to_decimal(&json!(-9.99), 3, 2).expect("-9.99 fits (3,2)"),
+            Some(-999)
+        );
+        assert!(matches!(
+            convert_json_to_decimal(&json!(-10.00), 3, 2),
+            Err(Error::PrecisionExceeded { .. })
+        ));
+    }
+
+    /// The precision check covers every input form, not just plain numbers:
+    /// base64 bytes and `{scale, value}` objects funnel through the same guard.
+    #[test]
+    fn the_precision_check_covers_base64_and_object_forms_too() {
+        assert!(matches!(
+            convert_json_to_decimal(&Json::String(b64(&1000_i128.to_be_bytes())), 3, 2),
+            Err(Error::PrecisionExceeded { .. })
+        ));
+        assert!(matches!(
+            convert_json_to_decimal(
+                &json!({"scale": 2, "value": b64(&1000_i128.to_be_bytes())}),
+                3,
+                2
+            ),
+            Err(Error::PrecisionExceeded { .. })
+        ));
+    }
+
+    /// A precision Arrow itself cannot express is a configuration error, not a
+    /// value error.
+    #[test]
+    fn a_precision_outside_the_decimal128_range_is_rejected() {
+        for precision in [0_u8, 39, u8::MAX] {
+            assert!(matches!(
+                convert_json_to_decimal(&json!(1), precision, 2),
+                Err(Error::Invalid { .. })
+            ));
+        }
+    }
+
+    /// Narrowing the scale truncates toward zero — it does not round — and does
+    /// so identically for both signs, so `-1.239` and `1.239` stay symmetric.
+    #[test]
+    fn narrowing_truncates_toward_zero_for_both_signs() {
+        assert_eq!(
+            parse_number_to_decimal(&number("1.239"), 2).expect("ok"),
+            123
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("-1.239"), 2).expect("ok"),
+            -123
+        );
+        assert_eq!(rescale_i128(1_235, 3, 2).expect("ok"), 123);
+        assert_eq!(rescale_i128(-1_235, 3, 2).expect("ok"), -123);
+    }
+
+    #[test]
+    fn widening_the_scale_is_exact() {
+        assert_eq!(rescale_i128(123, 2, 5).expect("ok"), 123_000);
+        assert_eq!(rescale_i128(-123, 2, 5).expect("ok"), -123_000);
+        assert_eq!(rescale_i128(123, 2, 2).expect("ok"), 123);
+    }
+
+    #[test]
+    fn a_plain_number_keeps_every_declared_digit() {
+        // The string path exists precisely so this does not go through f64.
+        assert_eq!(
+            parse_number_to_decimal(&number("123.456"), 3).expect("ok"),
+            123_456
+        );
+        assert_eq!(parse_number_to_decimal(&number("0"), 4).expect("ok"), 0);
+        assert_eq!(
+            parse_number_to_decimal(&number("-0.5"), 2).expect("ok"),
+            -50
+        );
+    }
+
+    /// `Decimal128` supports scales `0..=38`; anything else is a configuration
+    /// error and must be refused rather than producing a scaled value the
+    /// column cannot store.
+    #[test]
+    fn a_target_scale_outside_the_decimal128_range_is_rejected() {
+        for scale in [-1_i8, 39, i8::MAX, i8::MIN] {
+            assert!(
+                matches!(
+                    convert_json_to_decimal(&json!("AQ=="), 38, scale),
+                    Err(Error::Invalid { .. })
+                ),
+                "scale {scale} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_null_yields_no_decimal_rather_than_zero() {
+        assert_eq!(
+            convert_json_to_decimal(&Json::Null, 38, 2).expect("null is accepted"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_non_decimal_json_type_is_rejected_by_name() {
+        assert!(matches!(
+            convert_json_to_decimal(&json!(true), 38, 2),
+            Err(Error::UnsupportedType {
+                actual_type: "boolean"
+            })
+        ));
+        assert!(matches!(
+            convert_json_to_decimal(&json!([1, 2]), 38, 2),
+            Err(Error::UnsupportedType {
+                actual_type: "array"
+            })
+        ));
+    }
+
+    /// A source scale that does not fit an `i8` must be refused, not truncated.
+    /// `256` wraps to `0`, which reinterprets the unscaled value as a whole
+    /// number: `1` (meaning 1e-256) becomes `1` at the target scale — in range
+    /// and precision-valid, so no later check catches it.
+    #[test]
+    fn a_source_scale_that_does_not_fit_an_i8_is_rejected() {
+        for scale in [256_i64, 128, -129, i64::MAX, i64::MIN] {
+            let value = json!({"scale": scale, "value": b64(&1_i128.to_be_bytes())});
+            assert!(
+                matches!(
+                    convert_json_to_decimal(&value, 38, 20),
+                    Err(Error::Invalid { .. })
+                ),
+                "source scale {scale} must be rejected, not truncated"
+            );
+        }
+    }
+
+    /// 127 is the largest representable source scale, so it clears the `i8`
+    /// gate. It still cannot reach any `Decimal128` scale (`0..=38`), because
+    /// reducing a scale by more than 38 needs a power of ten past `i128`. The
+    /// error *kind* is the point: `Overflow` (an arithmetic limit) rather than
+    /// `Invalid` (the gate) is what proves the scale was carried through
+    /// instead of silently truncated. Before the fix this same message wrapped
+    /// to scale 0 and returned a confident wrong number.
+    #[test]
+    fn a_representable_source_scale_fails_on_arithmetic_not_on_the_gate() {
+        assert!(matches!(
+            convert_json_to_decimal(
+                &json!({"scale": 127, "value": b64(&1_i128.to_be_bytes())}),
+                38,
+                38
+            ),
+            Err(Error::Overflow)
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_source_scale_still_converts() {
+        assert_eq!(
+            convert_json_to_decimal(
+                &json!({"scale": 2, "value": b64(&1_i128.to_be_bytes())}),
+                38,
+                4
+            )
+            .expect("scale 2 is representable"),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn a_decimal_object_missing_a_required_field_is_rejected() {
+        assert!(matches!(
+            convert_json_to_decimal(&json!({"value": "AQ=="}), 38, 2),
+            Err(Error::MissingScale)
+        ));
+        assert!(matches!(
+            convert_json_to_decimal(&json!({"scale": 2}), 38, 2),
+            Err(Error::MissingValue)
+        ));
+        assert!(matches!(
+            convert_json_to_decimal(&json!({"scale": "two", "value": "AQ=="}), 38, 2),
+            Err(Error::NonIntegerScale)
+        ));
+    }
+
+    #[test]
+    fn a_zero_valued_decimal_object_round_trips() {
+        assert_eq!(
+            convert_json_to_decimal(&json!({"scale": 4, "value": b64(&[0])}), 38, 2).expect("ok"),
+            Some(0)
+        );
     }
 }

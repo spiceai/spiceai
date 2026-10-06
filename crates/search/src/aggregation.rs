@@ -74,6 +74,16 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Candidates (in `candidate_sets`) are expected to have columns as per [`super::generation::CandidateGeneration::search`] documentation. Any additional columns are expected to be common across all [`SendableRecordBatchStream`] in `candidate_sets`.
 #[async_trait]
 pub trait CandidateAggregation: Sync + Send {
+    /// Returns the number of candidates each input should provide before aggregation.
+    ///
+    /// Most aggregations only need the final result limit. Algorithms that can
+    /// improve recall by considering additional candidates, such as RRF, should
+    /// override this while the final `limit` remains the user-visible cap.
+    #[must_use]
+    fn candidate_pool_size(&self, limit: usize) -> usize {
+        limit
+    }
+
     /// Consumes `generation_results` and decides how to order the underlying [`SendableRecordBatchStream`] data into a single [`SendableRecordBatchStream`].
     ///
     /// Expect `data` to be non empty, and one [`VectorSearchGenerationResult::data`] to be non-empty.

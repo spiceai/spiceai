@@ -17,6 +17,13 @@ spec:
   {{- end }}
   {{- if .Values.stateful.enabled }}
   serviceName: {{ template "spiceai.fullname" .  }}
+  {{- with .Values.updateStrategy }}
+  updateStrategy: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- else }}
+  {{- with .Values.strategy }}
+  strategy: {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- end }}
   selector:
     matchLabels:
@@ -72,6 +79,23 @@ spec:
             ]
           {{- end }}
           env:
+            {{- /*
+              The pod's own CPU request, so spiced sizes its thread pools and query
+              fan-out for the CPU it was scheduled against rather than for the whole
+              node. Guarded on the request actually being set: with no request,
+              resourceFieldRef falls back to the node's allocatable CPU, which is
+              precisely the over-sizing this passes the request through to avoid.
+              `divisor: 1m` makes the value millicores, which is what the variable's
+              name states -- a `requests.cpu` of 4 arrives as `4000`.
+            */}}
+            {{- if and .Values.resources .Values.resources.requests .Values.resources.requests.cpu }}
+            - name: SPICE_CPU_REQUEST_MILLICORES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: spiceai
+                  resource: requests.cpu
+                  divisor: 1m
+            {{- end }}
             {{- if .Values.additionalEnv }}
             {{- .Values.additionalEnv | toYaml | nindent 12 }}
             {{- end }}

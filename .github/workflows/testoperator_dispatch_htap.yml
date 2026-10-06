@@ -2,14 +2,19 @@ name: testoperator dispatch htap
 
 on:
   schedule:
-    # htap-sf1000, twice daily (0000, 1200) — HTAP CH-benCHmark SF1000 (spiceai-dev-xlarge-runners)
-    - cron: '0 0,12 * * *'
-    # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners)
+    # htap-sf1000-adaptive, every 8 hours (0000, 0800, 1600) — the high-value SF1000 adaptive
+    # configs (mysql + postgres, which also run the Cayenne datalake tier) for frequent adaptive
+    # trend data (spiceai-dev-xlarge-runners). With the daily batch below that is 8 runs/day on
+    # the serialized SF1000 xlarge queue at a 30-minute HTAP window, leaving slack for slow arms.
+    - cron: '0 */8 * * *'
+    # htap-sf1000 (the turso-metastore adaptive configs), once daily (0400) on the xlarge pool.
+    # 0400 sits after the 0000 adaptive batch so it usually starts on an idle slot rather than
+    # queueing immediately.
+    - cron: '0 4 * * *'
+    # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners).
+    # SF1 uses a different runner pool and a unique concurrency group, so it does not serialize
+    # with the SF1000 xlarge queue.
     - cron: '0 6,18 * * *'
-    # htap-sf1000-cold, once daily (0800) — HTAP CH-benCHmark SF1000 cold-object-store tier
-    # (spiceai-dev-xlarge-runners). Lighter once-a-day cadence while the cold tier is new; it shares
-    # the twice-daily sf1000 batch's serialized run concurrency group, so it queues, never contends.
-    - cron: '0 8 * * *'
 
   workflow_dispatch:
     inputs:
@@ -26,22 +31,24 @@ on:
           - 'sf10'
           - 'sf100'
           - 'sf1000'
-          - 'sf1000-cold'
+          - 'sf1000-adaptive'
 
 jobs:
   dispatch-htap:
     name: Dispatch HTAP - ${{ github.event.inputs.scale_factor || github.event.schedule }}
     runs-on: spiceai-dev-runners
-    # On schedule the dispatcher serializes the batch (--max-concurrent 1) and blocks for the sum of
-    # its run durations; an SF1000 batch can run several hours, so raise the cap above GitHub's 6h.
-    timeout-minutes: 720
+    # The dispatcher only fires the workflow_dispatch events (spaced ~80s apart) and exits; the runs
+    # themselves serialize via the htap workflow's queue: max concurrency group, not here. So this
+    # only needs to cover the build + dispatch loop (≤~10 min for the largest batch), not the sum of
+    # run durations.
+    timeout-minutes: 120
     # Per-cron group on schedule (so the SF1/SF100/SF1000 dispatchers don't block each other),
     # per-ref on manual dispatch.
     concurrency:
       group: testoperator-dispatch-htap-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -90,33 +97,29 @@ jobs:
           done
 
       # On manual dispatch the scale factor comes from the input. On schedule, derive it from the
-      # cron that fired. Scheduled batches also serialize (--max-concurrent 1) so each run finishes
-      # before the next is dispatched; --max-concurrent-wait-timeout-mins covers a full run's
-      # wall-clock so the slot wait doesn't give up early. Manual dispatch keeps the original
-      # fire-and-forget behaviour (no serialization flags).
+      # cron that fired. Both manual and scheduled dispatch are fire-and-forget: the runs serialize
+      # via the htap workflow's queue: max concurrency group (FIFO), so the dispatcher no longer
+      # feeds them one at a time with --max-concurrent.
       - name: Resolve scale factor
         id: resolve
         run: |
           SF="${{ github.event.inputs.scale_factor }}"
-          FLAGS=""
           if [ -z "$SF" ]; then
             case "${{ github.event.schedule }}" in
-              '0 0,12 * * *')                 SF=sf1000 ;;
+              '0 */8 * * *')                  SF=sf1000-adaptive ;;
+              '0 4 * * *')                    SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
-              '0 8 * * *')                    SF=sf1000-cold ;;
               *)                              SF= ;;   # unrecognized cron — dispatch nothing
             esac
-            FLAGS="--max-concurrent 1 --max-concurrent-wait-timeout-mins 180"
           fi
-          echo "Resolved scale factor: '$SF' (flags: '$FLAGS')"
+          echo "Resolved scale factor: '$SF'"
           echo "scale_factor=$SF" >> "$GITHUB_OUTPUT"
-          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch Testoperator - HTAP - CH-BenCHmark - ${{ steps.resolve.outputs.scale_factor }}
         if: ${{ steps.resolve.outputs.scale_factor != '' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/${{ steps.resolve.outputs.scale_factor }} \
-            --workflow htap ${{ steps.resolve.outputs.flags }}
+            --workflow htap
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

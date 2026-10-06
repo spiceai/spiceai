@@ -16,12 +16,14 @@ limitations under the License.
 
 use core::time;
 use std::{
+    collections::HashMap,
     convert::Infallible,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use crate::model::LLMChatCompletionsModelStore;
+use crate::model::{LLMChatCompletionsModelStore, ResponsesApiSupport};
+use crate::status::RuntimeStatus;
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
@@ -109,6 +111,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
                 }
             })
         ))),
+        (status = 400, description = "The specified model is an evaluation model; use POST /v1/evaluate"),
         (status = 404, description = "The specified model was not found"),
         (status = 500, description = "An internal server error occurred while processing the chat completion", content((
             serde_json::Value = "application/json",
@@ -120,6 +123,8 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 ))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
+    Extension(responses_api_support): Extension<Arc<RwLock<HashMap<String, ResponsesApiSupport>>>>,
+    Extension(status): Extension<Arc<RuntimeStatus>>,
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
@@ -133,9 +138,7 @@ pub(crate) async fn post(
     );
     span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
 
-    if let Some(traceparent) = context.trace_parent() {
-        crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
-    }
+    crate::task_history::correlation::record_task_history_trace_id(&span, &context);
 
     let span_clone = span.clone();
     async move {
@@ -169,7 +172,19 @@ pub(crate) async fn post(
                     }
                 }
             }
-            None => (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response(),
+            None => {
+                if matches!(
+                    responses_api_support.read().await.get(&model_id),
+                    Some(ResponsesApiSupport::EvaluateOnly { .. })
+                ) {
+                    evaluate_only_chat_response(&model_id)
+                } else {
+                    let message = status
+                        .unavailable_model_reason(&model_id)
+                        .unwrap_or_else(|| format!("model '{model_id}' not found"));
+                    (StatusCode::NOT_FOUND, message).into_response()
+                }
+            }
         }
     }
     .instrument(span)
@@ -352,6 +367,21 @@ impl OpenaiErrorEvent {
     }
 }
 
+/// Chat rejection for an evaluate-only model, in the same `OpenAI` JSON envelope
+/// as `/v1/responses`.
+fn evaluate_only_chat_response(model_id: &str) -> Response {
+    let message = llms::chat::Error::EvaluateOnlyModel {
+        model: model_id.to_string(),
+    }
+    .to_string();
+    openai_error_to_response(OpenAIError::ApiError(async_openai::error::ApiError {
+        message,
+        r#type: Some("invalid_request_error".to_string()),
+        param: Some("model".to_string()),
+        code: Some("invalid_request_error".to_string()),
+    }))
+}
+
 /// Converts `OpenAI` errors to HTTP responses
 /// Preserve the original `OpenAI` error structure to maintain compatibility with `OpenAI` documentation
 #[must_use]
@@ -382,11 +412,13 @@ pub fn openai_error_to_response(e: OpenAIError) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::{
         http::v1::chat::{SPICE_COMPLETION_PROGRESS_HEADER, post},
-        model::LLMChatCompletionsModelStore,
+        model::{LLMChatCompletionsModelStore, ResponsesApiSupport},
+        status::{ComponentStatus, RuntimeStatus},
     };
     use async_openai::{
         error::OpenAIError,
@@ -440,6 +472,7 @@ mod tests {
         let mut store = LLMChatCompletionsModelStore::new();
         store.insert("dummy".to_string(), Arc::new(DummyChat {}));
         let llms = Arc::new(RwLock::new(store));
+        let responses_api_support = Arc::new(RwLock::new(HashMap::new()));
 
         let mut headers = HeaderMap::new();
         if let Some(v) = progress_header {
@@ -465,9 +498,15 @@ mod tests {
 
         let _enter = span.enter();
 
-        let response = post(Extension(llms), headers, Json(req_payload))
-            .instrument(span.clone())
-            .await;
+        let response = post(
+            Extension(llms),
+            Extension(responses_api_support),
+            Extension(RuntimeStatus::new()),
+            headers,
+            Json(req_payload),
+        )
+        .instrument(span.clone())
+        .await;
 
         let body_bytes = response
             .into_body()
@@ -522,5 +561,110 @@ mod tests {
                 "payload".to_string() // From the LLM stream.
             ]
         );
+    }
+
+    /// Evaluate-only models return the `OpenAI` JSON error envelope, not plain text.
+    #[tokio::test]
+    async fn evaluate_only_model_returns_openai_json_400() {
+        let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
+        let responses_api_support = Arc::new(RwLock::new(HashMap::from([(
+            "jev".to_string(),
+            ResponsesApiSupport::EvaluateOnly {
+                provider: "typesafe".to_string(),
+            },
+        )])));
+
+        let req_payload: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "jev",
+            "messages": [
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .expect("request payload");
+
+        let response = post(
+            Extension(llms),
+            Extension(responses_api_support),
+            Extension(RuntimeStatus::new()),
+            HeaderMap::new(),
+            Json(req_payload),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("OpenAI JSON envelope");
+        assert_eq!(
+            body_json["type"].as_str(),
+            Some("invalid_request_error"),
+            "{body_json}"
+        );
+        assert_eq!(body_json["param"].as_str(), Some("model"), "{body_json}");
+        let message = body_json["message"].as_str().expect("message");
+        assert!(
+            message.contains("/v1/evaluate"),
+            "message should direct callers to /v1/evaluate: {message}"
+        );
+    }
+
+    async fn post_to_absent_model(status: Arc<RuntimeStatus>) -> (axum::http::StatusCode, String) {
+        let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
+        let responses_api_support = Arc::new(RwLock::new(HashMap::new()));
+        let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "deepseek",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("request payload");
+
+        let response = post(
+            Extension(llms),
+            Extension(responses_api_support),
+            Extension(status),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await;
+        let code = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        (code, String::from_utf8(body.to_vec()).expect("utf-8 body"))
+    }
+
+    // regression test for #13303
+    #[tokio::test]
+    async fn chat_names_the_load_failure_of_a_configured_model() {
+        let status = RuntimeStatus::new();
+        status.update_model(
+            "deepseek",
+            ComponentStatus::error_with_message(
+                "Failed to load LLM: deepseek. An error occurred: unknown_error: Insufficient Balance",
+            ),
+        );
+
+        let (code, body) = post_to_absent_model(status).await;
+
+        assert_eq!(code, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            body,
+            "Model 'deepseek' failed to load, so it cannot serve requests. Cause: Failed to load LLM: deepseek. An error occurred: unknown_error: Insufficient Balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_reports_an_unconfigured_model_as_not_found() {
+        let (code, body) = post_to_absent_model(RuntimeStatus::new()).await;
+
+        assert_eq!(code, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(body, "model 'deepseek' not found");
     }
 }

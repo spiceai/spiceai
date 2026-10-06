@@ -50,4 +50,4 @@ pub use metadata::{
 pub use outbound_broadcaster::ExecutorOutboundBroadcaster;
 pub use partition_load_tracker::PartitionLoadTracker;
 pub use service::{AssignmentConfig, PartitionService};
-pub use store::{AllocationResult, AssignmentRequest, CopyAssignmentsResult, PartitionStore};
+pub use store::{AssignmentRequest, CopyAssignmentsResult, PartitionStore};

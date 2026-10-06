@@ -15,148 +15,65 @@ limitations under the License.
 */
 
 use crate::AsTableRefs;
-use crate::FailedToInvalidateCacheSnafu;
 use crate::HashBuilder;
 use crate::HashProvider;
+use crate::InvalidationDidNotFinishSnafu;
+use crate::KeyHasher;
 use crate::Result;
 use crate::Sizeable;
 use crate::TabledCacheProvider;
-use crate::backend::{CacheBackend, MokaBackend};
-use crate::key::PassthroughHashBuilder;
+use crate::backend::{CacheBackend, SpiceBackend};
 use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
-use datafusion::sql::TableReference;
-use moka::future::Cache;
+use datafusion::common::TableReference;
+use sharded_cache::{EvictionPolicy, NUM_SHARDS};
 use snafu::ResultExt;
 use spicepod::component::caching::{CacheConfig, CacheEngine, CachingPolicy};
 use std::fmt::Display;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
+use std::sync::Once;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "pingora")]
-use crate::backend::PingoraBackend;
+/// Retained so existing references to the enterprise-only Pingora message still
+/// resolve. The `engine` spicepod field is ignored; `LruCache` always uses the
+/// Spice sharded cache.
+pub const PINGORA_ENTERPRISE_ONLY_MESSAGE: &str = "The Pingora cache engine is included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise";
 
-/// Internal enum to hold either backend type, enabling runtime backend selection.
-enum CacheBackendEnum<V, T>
-where
-    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
-    <T as BuildHasher>::Hasher: Send + Sync + 'static,
-{
-    Moka(MokaBackend<V, T>),
-    #[cfg(feature = "pingora")]
-    Pingora(PingoraBackend<V>),
-    /// Fallback to Moka when Pingora is requested but feature not enabled
-    #[cfg(not(feature = "pingora"))]
-    MokaFallback(MokaBackend<V, T>),
+static IGNORE_ENGINE_WARN: Once = Once::new();
+
+fn warn_ignored_engine(engine: CacheEngine) {
+    if engine != CacheEngine::Pingora {
+        return;
+    }
+    IGNORE_ENGINE_WARN.call_once(|| {
+        tracing::warn!(
+            "The `engine` cache setting is ignored at runtime; SQL, search, and embeddings caches always use the Spice sharded-cache backend (`engine: pingora` no longer selects Pingora). Remove `engine` from the spicepod, or leave it for compatibility. See: https://spiceai.org/docs/features/caching"
+        );
+    });
 }
 
-#[async_trait]
-impl<V, T> CacheBackend<V> for CacheBackendEnum<V, T>
-where
-    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
-    <T as BuildHasher>::Hasher: Send + Sync + 'static,
-{
-    async fn insert(&self, key: u64, value: V) {
-        match self {
-            Self::Moka(backend) => backend.insert(key, value).await,
-            #[cfg(feature = "pingora")]
-            Self::Pingora(backend) => backend.insert(key, value).await,
-            #[cfg(not(feature = "pingora"))]
-            Self::MokaFallback(backend) => backend.insert(key, value).await,
-        }
-    }
-
-    async fn get(&self, key: &u64) -> Option<V> {
-        match self {
-            Self::Moka(backend) => backend.get(key).await,
-            #[cfg(feature = "pingora")]
-            Self::Pingora(backend) => backend.get(key).await,
-            #[cfg(not(feature = "pingora"))]
-            Self::MokaFallback(backend) => backend.get(key).await,
-        }
-    }
-
-    async fn remove(&self, key: &u64) -> Option<V> {
-        match self {
-            Self::Moka(backend) => backend.remove(key).await,
-            #[cfg(feature = "pingora")]
-            Self::Pingora(backend) => backend.remove(key).await,
-            #[cfg(not(feature = "pingora"))]
-            Self::MokaFallback(backend) => backend.remove(key).await,
-        }
-    }
-
-    async fn clear(&self) {
-        match self {
-            Self::Moka(backend) => backend.clear().await,
-            #[cfg(feature = "pingora")]
-            Self::Pingora(backend) => backend.clear().await,
-            #[cfg(not(feature = "pingora"))]
-            Self::MokaFallback(backend) => backend.clear().await,
-        }
-    }
-
-    async fn iter_keys(&self) -> Vec<u64> {
-        match self {
-            Self::Moka(backend) => backend.iter_keys().await,
-            #[cfg(feature = "pingora")]
-            Self::Pingora(backend) => backend.iter_keys().await,
-            #[cfg(not(feature = "pingora"))]
-            Self::MokaFallback(backend) => backend.iter_keys().await,
-        }
-    }
-
-    async fn len(&self) -> usize {
-        match self {
-            Self::Moka(backend) => backend.len().await,
-            #[cfg(feature = "pingora")]
-            Self::Pingora(backend) => backend.len().await,
-            #[cfg(not(feature = "pingora"))]
-            Self::MokaFallback(backend) => backend.len().await,
-        }
-    }
-
-    async fn weighted_size(&self) -> u64 {
-        match self {
-            Self::Moka(backend) => backend.weighted_size().await,
-            #[cfg(feature = "pingora")]
-            Self::Pingora(backend) => backend.weighted_size().await,
-            #[cfg(not(feature = "pingora"))]
-            Self::MokaFallback(backend) => backend.weighted_size().await,
-        }
-    }
-
-    async fn run_pending_tasks(&self) {
-        match self {
-            Self::Moka(backend) => backend.run_pending_tasks().await,
-            #[cfg(feature = "pingora")]
-            Self::Pingora(backend) => backend.run_pending_tasks().await,
-            #[cfg(not(feature = "pingora"))]
-            Self::MokaFallback(backend) => backend.run_pending_tasks().await,
-        }
+fn eviction_policy(caching_policy: CachingPolicy) -> EvictionPolicy {
+    match caching_policy {
+        CachingPolicy::Lru => EvictionPolicy::Lru,
+        CachingPolicy::Lfu => EvictionPolicy::Lfu,
+        CachingPolicy::TinyLfu => EvictionPolicy::TinyLfu,
     }
 }
 
-// 'static is required by a bound from moka::Cache
 pub struct LruCache<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
 > {
-    /// The underlying cache backend (Moka or Pingora)
-    backend: CacheBackendEnum<V, T>,
-    /// Moka cache for table invalidation (only used when Moka engine or for `invalidate_entries_if`)
-    moka_cache: Option<Cache<u64, V, PassthroughHashBuilder<T>>>,
-    /// The selected cache engine
-    engine: CacheEngine,
+    /// Held behind an `Arc` so table invalidation can hand the shard scan to a
+    /// blocking task that outlives the borrow of the cache.
+    backend: Arc<SpiceBackend<V>>,
     hasher: T,
     max_size: u64,
     metrics_last_reported_time: AtomicU64,
@@ -164,6 +81,9 @@ pub struct LruCache<
     initial_instant: Instant,
     hits: AtomicU64,
     total_requests: AtomicU64,
+    /// Table-generation clock so search (and other tabled) entries whose read
+    /// started before an invalidation cannot publish or hit afterward.
+    table_changes: crate::TableChangeClock,
 }
 
 impl<
@@ -175,10 +95,9 @@ impl<
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "max size: {:.2}, item ttl: {:?}, engine: {}",
+            "max size: {:.2}, item ttl: {:?}, shards: {NUM_SHARDS}",
             Byte::from_u64(self.max_size).get_adjusted_unit(byte_unit::Unit::MiB),
             self.ttl,
-            self.engine
         )
     }
 }
@@ -191,7 +110,7 @@ impl<
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LruCache")
-            .field("engine", &self.engine)
+            .field("shards", &NUM_SHARDS)
             .field("max_size", &self.max_size)
             .field(
                 "metrics_reported_last_time",
@@ -201,7 +120,7 @@ impl<
     }
 }
 
-type BuiltLruCache<V> = LruCache<V, HashBuilder, Box<dyn Hasher + Send + Sync + 'static>>;
+type BuiltLruCache<V> = LruCache<V, HashBuilder, KeyHasher>;
 
 /// Builds an LRU cache provider from the given configuration.
 ///
@@ -238,54 +157,18 @@ pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'sta
     )))
 }
 
-// Build the Moka cache (used for Moka backend or for table invalidation support)
-fn build_moka_cache<
-    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
-    H: Hasher + Send + Sync + 'static,
->(
-    cache_max_size: u64,
-    ttl: Duration,
-    hasher: T,
-    caching_policy: CachingPolicy,
-) -> Cache<u64, V, PassthroughHashBuilder<T>> {
-    let moka_eviction_policy = match caching_policy {
-        CachingPolicy::Lru => moka::policy::EvictionPolicy::lru(),
-        CachingPolicy::TinyLfu => moka::policy::EvictionPolicy::tiny_lfu(),
-    };
-
-    Cache::builder()
-        .time_to_live(ttl)
-        .weigher(|_key, value: &V| -> u32 {
-            let val: usize = value.get_memory_size();
-            match val.try_into() {
-                Ok(val) => val,
-                Err(e) => {
-                    tracing::warn!(
-                        "Lru cache: Failed to convert query result size to u32: {}",
-                        e
-                    );
-                    u32::MAX
-                }
-            }
-        })
-        .max_capacity(cache_max_size)
-        .eviction_policy(moka_eviction_policy)
-        .support_invalidation_closures()
-        .eviction_listener(|_key, _value, cause| {
-            if cause.was_evicted() {
-                V::record_eviction();
-            }
-        })
-        .build_with_hasher(PassthroughHashBuilder::new(hasher))
-}
-
 impl<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
 > LruCache<V, T, H>
 {
+    /// Build an `LruCache`.
+    ///
+    /// `engine` is accepted for spicepod compatibility and ignored: the Spice
+    /// sharded-cache backend is always used. `engine: pingora` no longer
+    /// selects Pingora; a configured `pingora` value logs a one-time warning.
+    /// Migration: remove `engine` from the spicepod, or leave it unchanged.
     #[must_use]
     pub fn new(
         cache_max_size: u64,
@@ -297,54 +180,15 @@ impl<
     where
         <T as BuildHasher>::Hasher: Send + Sync + 'static,
     {
-        // Create the appropriate backend and moka_cache based on engine selection
-        #[expect(
-            clippy::type_complexity,
-            reason = "Tuple is used locally for destructuring"
-        )]
-        let (backend, moka_cache, effective_engine): (
-            CacheBackendEnum<V, T>,
-            Option<Cache<u64, V, PassthroughHashBuilder<T>>>,
-            CacheEngine,
-        ) = match engine {
-            CacheEngine::Moka => {
-                tracing::debug!("Using Moka cache engine");
-                let cache = build_moka_cache(cache_max_size, ttl, hasher.clone(), caching_policy);
-                let backend = CacheBackendEnum::Moka(MokaBackend::from_cache(cache.clone()));
-                (backend, Some(cache), CacheEngine::Moka)
-            }
-            CacheEngine::Pingora => {
-                #[cfg(feature = "pingora")]
-                {
-                    tracing::debug!("Using Pingora cache engine.");
-                    if matches!(caching_policy, CachingPolicy::TinyLfu) {
-                        tracing::warn!(
-                            "Pingora cache engine does not support TinyLFU caching policy. Falling back to LRU."
-                        );
-                    }
-
-                    let backend =
-                        CacheBackendEnum::Pingora(PingoraBackend::with_params(cache_max_size, ttl));
-                    (backend, None, CacheEngine::Pingora)
-                }
-                #[cfg(not(feature = "pingora"))]
-                {
-                    tracing::warn!(
-                        "Pingora cache engine requested but 'pingora' feature is not enabled. Falling back to Moka."
-                    );
-                    let cache =
-                        build_moka_cache(cache_max_size, ttl, hasher.clone(), caching_policy);
-                    let backend =
-                        CacheBackendEnum::MokaFallback(MokaBackend::from_cache(cache.clone()));
-                    (backend, Some(cache), CacheEngine::Moka)
-                }
-            }
-        };
+        warn_ignored_engine(engine);
+        let backend = Arc::new(SpiceBackend::new(
+            cache_max_size,
+            ttl,
+            eviction_policy(caching_policy),
+        ));
 
         LruCache {
             backend,
-            moka_cache,
-            engine: effective_engine,
             hasher,
             max_size: cache_max_size,
             metrics_last_reported_time: AtomicU64::new(0),
@@ -352,11 +196,50 @@ impl<
             initial_instant: Instant::now(),
             hits: AtomicU64::new(0),
             total_requests: AtomicU64::new(0),
+            table_changes: crate::TableChangeClock::default(),
         }
     }
 
     pub fn as_provider(self: Arc<Self>) -> Arc<dyn CacheProvider<V> + Send + Sync> {
         self
+    }
+
+    /// Refresh the item-count, size and hit-ratio metrics after a store, at
+    /// most once every 5 seconds across all callers.
+    async fn report_metrics_after_put(&self) {
+        let now_seconds = self.initial_instant.elapsed().as_secs();
+        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
+
+        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
+        // performance is comparable with relaxed load/store
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
+                .metrics_last_reported_time
+                .compare_exchange(
+                    last_emitted,
+                    now_seconds,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            V::record_item_count(self.item_count().await);
+            V::record_size(self.size_bytes().await);
+            V::record_max_size(self.max_size() as u64);
+
+            let hits = self.hits.load(Ordering::Relaxed);
+            let total = self.total_requests.load(Ordering::Relaxed);
+            V::update_hit_ratio(hits, total);
+        }
+    }
+
+    /// `(hits, total_requests)` as fed to the hit-ratio gauge.
+    #[cfg(test)]
+    pub(crate) fn hit_ratio_counters(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.total_requests.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -389,47 +272,52 @@ impl<
     H: Hasher + Send + Sync + 'static,
 > CacheProvider<V> for LruCache<V, T, H>
 {
-    async fn get_raw_key(&self, key: &u64) -> Option<V> {
+    async fn get_raw_key(&self, key: &u64) -> Option<std::sync::Arc<V>> {
+        let always_valid = |_: &V| true;
+        self.get_raw_key_validated(key, &always_valid).await
+    }
+
+    async fn get_raw_key_validated(
+        &self,
+        key: &u64,
+        is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> Option<std::sync::Arc<V>> {
         V::record_request();
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(v) = self.backend.get(key).await {
+        // A value the caller cannot use is a miss, not a hit: counting it as a
+        // hit would make the hit ratio climb precisely when invalidation is
+        // doing its job.
+        let found = self.backend.get(key).await;
+        let usable = found.filter(|value| is_valid(value.as_ref()));
+
+        if usable.is_some() {
             V::record_hit();
             self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(v)
         } else {
             V::record_miss();
-            None
         }
+
+        usable
     }
 
     async fn put_raw_key(&self, key: &u64, value: V) {
         self.backend.insert(*key, value).await;
+        self.report_metrics_after_put().await;
+    }
 
-        let now_seconds = self.initial_instant.elapsed().as_secs();
-        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
+    async fn put_raw_key_with_weight(&self, key: &u64, value: V, weight: usize) {
+        self.backend.insert_with_weight(*key, value, weight).await;
+        self.report_metrics_after_put().await;
+    }
 
-        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
-        // performance is comparable with relaxed load/store
-        if now_seconds.saturating_sub(last_emitted) >= 5
-            && self
-                .metrics_last_reported_time
-                .compare_exchange(
-                    last_emitted,
-                    now_seconds,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            V::record_item_count(self.item_count().await);
-            V::record_size(self.size_bytes().await);
-            V::record_max_size(self.max_size() as u64);
-
-            let hits = self.hits.load(Ordering::Relaxed);
-            let total = self.total_requests.load(Ordering::Relaxed);
-            V::update_hit_ratio(hits, total);
-        }
+    async fn replace_if(
+        &self,
+        key: &u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool {
+        self.backend.replace_if(*key, value, should_replace).await
     }
 
     async fn invalidate_all(&self) {
@@ -457,12 +345,13 @@ impl<
     }
 
     async fn size_bytes(&self) -> u64 {
-        self.backend.run_pending_tasks().await;
+        // Spice evicts on insert. Expired entries stay in the weight until a
+        // get or `checkpoint` observes them; do not scan every shard on the
+        // metrics path (that would stall the Tokio worker).
         self.backend.weighted_size().await
     }
 
     async fn item_count(&self) -> u64 {
-        self.backend.run_pending_tasks().await;
         self.backend.len().await as u64
     }
 
@@ -482,59 +371,58 @@ impl<
     H: Hasher + Send + Sync + 'static,
 > TabledCacheProvider<V> for LruCache<V, T, H>
 {
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
-        let table_name = match &table_ref {
-            TableReference::Bare { table }
-            | TableReference::Partial { table, .. }
-            | TableReference::Full { table, .. } => table,
-        };
-        let table_name_arc = Arc::clone(table_name);
+    async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+        let table_name = crate::invalidated_table_name(&table_ref);
 
-        // For Moka backend, use efficient closure-based invalidation
-        // For Pingora (when moka_cache is None), we need to fall back to manual iteration
-        if let Some(ref moka_cache) = self.moka_cache {
-            moka_cache
-                .invalidate_entries_if(move |_key, value| {
-                    crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
-                })
-                .context(FailedToInvalidateCacheSnafu {
-                    table_name: table_name_arc,
-                })?;
-        } else {
-            // Pingora backend: iterate keys and remove matching entries
-            // This is O(n) but Pingora doesn't support closure-based invalidation
-            tracing::debug!(
-                "Invalidating cache entries for table {} using key iteration (Pingora backend)",
-                table_name
-            );
+        // Stamp before the scan so a search that started before this point and
+        // tries to publish afterward is rejected by `tables_changed_since`.
+        self.table_changes.record_change(&table_ref, Instant::now());
 
-            // Spawn a blocking task to handle the synchronous iteration
-            // Note: This is suboptimal but necessary for Pingora's API
-            let backend = &self.backend;
-            let keys_to_remove: Vec<u64> = futures::executor::block_on(async {
-                let mut keys_to_remove = Vec::new();
-                for key in backend.iter_keys().await {
-                    if let Some(value) = backend.get(&key).await
-                        && crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
-                    {
-                        keys_to_remove.push(key);
-                    }
-                }
-                keys_to_remove
-            });
-
-            for key in keys_to_remove {
-                futures::executor::block_on(backend.remove(&key));
+        // The walk is proportional to the cache size and never yields, so it
+        // runs on the blocking pool. Survivors are not promoted: the scan
+        // inspects values in place (spiceai/spiceai#12674).
+        //
+        // The Spice backend re-scans until its write-epoch is stable under an
+        // invalidate gate, so a concurrent insert into an already-walked shard
+        // cannot survive this return.
+        let backend = Arc::clone(&self.backend);
+        let removed = match tokio::task::spawn_blocking(move || {
+            backend.invalidate_matching(|value| {
+                crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
+            })
+        })
+        .await
+        {
+            Ok(removed) => removed,
+            // Tokio cancels a blocking task only when its runtime is shutting down,
+            // and this in-memory cache is dropped with it, so nothing stale can be
+            // served. A panicked scan is still an error.
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!(
+                    "Cache invalidation for dataset {table_name} was cancelled (likely shutdown)"
+                );
+                return Ok(());
             }
-        }
+            Err(e) => return Err(e).context(InvalidationDidNotFinishSnafu { table_name }),
+        };
 
+        tracing::debug!("Invalidated {removed} cache entries by scanning the shards in place");
         Ok(())
+    }
+
+    fn tables_changed_since(
+        &self,
+        tables: &std::collections::HashSet<TableReference>,
+        since: Instant,
+    ) -> bool {
+        self.table_changes.changed_since(tables, since)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::CacheKey;
+    use crate::metrics::{EvictionReason, InvalidationMode, StaleRejectionReason};
     use crate::result::query::CachedQueryResult;
     use crate::result::search::{CachedAggregationResult, CachedSearchResult};
 
@@ -546,6 +434,11 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::hash::RandomState;
     use std::time::Duration;
+
+    /// Byte budget for tests that store a `CachedQueryResult`. Spice evicts
+    /// synchronously, so a 10-byte cap (the old Moka-lazy default) would drop
+    /// the only entry on insert.
+    const TEST_MAX_SIZE: u64 = 1024 * 1024;
 
     fn create_test_record_batch() -> RecordBatch {
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
@@ -565,14 +458,21 @@ mod tests {
         let encoder = crate::encoding::get_encoder(spicepod::component::caching::Encoding::None);
 
         CachedQueryResult::from_batches(
-            &[record_batch],
+            vec![record_batch],
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             Arc::new(input_tables),
+            std::time::Instant::now(),
             std::time::Instant::now(),
             encoder,
         )
         .await
         .expect("Failed to create cached result")
+    }
+
+    fn cache_intern_schema(
+        schema: arrow::datatypes::SchemaRef,
+    ) -> crate::intern::Interned<arrow::datatypes::Schema> {
+        crate::intern::schema::intern(schema)
     }
 
     fn create_test_cached_search_result() -> CachedSearchResult {
@@ -584,7 +484,7 @@ mod tests {
             primary_keys: Vec::new(),
             data_columns: Vec::new(),
             matches: HashMap::new(),
-            schema,
+            schema: cache_intern_schema(schema),
         };
 
         results.insert(
@@ -594,12 +494,13 @@ mod tests {
             cached_aggregation_result,
         );
 
-        CachedSearchResult {
-            results: Arc::new(results),
-            input_tables: Arc::new(HashSet::from([TableReference::Bare {
+        CachedSearchResult::new(
+            Arc::new(results),
+            Arc::new(HashSet::from([TableReference::Bare {
                 table: Arc::from("test_table"),
             }])),
-        }
+            Instant::now(),
+        )
     }
 
     #[rstest]
@@ -614,7 +515,7 @@ mod tests {
         #[case] hasher: T,
     ) {
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            10,
+            TEST_MAX_SIZE,
             Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
@@ -638,6 +539,50 @@ mod tests {
             .expect("retrieved and result should have same length");
     }
 
+    /// A lookup that finds an entry but rejects it must be accounted as a miss.
+    ///
+    /// Counting it as a hit would make the hit-ratio gauge *rise* as
+    /// invalidation removes more results from circulation — the metric would
+    /// look best exactly when the cache is serving least.
+    #[tokio::test]
+    async fn test_rejected_value_is_counted_as_a_miss_not_a_hit() {
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+        let key = CacheKey::Query("accounting", None).as_raw_key(cache.hasher());
+        cache
+            .put_raw_key(&key.as_u64(), create_test_cached_result().await)
+            .await;
+
+        // Served: one request, one hit.
+        let accept_all = |_: &CachedQueryResult| true;
+        assert!(
+            cache
+                .get_raw_key_validated(&key.as_u64(), &accept_all)
+                .await
+                .is_some()
+        );
+        assert_eq!(cache.hit_ratio_counters(), (1, 1));
+
+        // Found but rejected: a second request, still only one hit.
+        let reject_all = |_: &CachedQueryResult| false;
+        assert!(
+            cache
+                .get_raw_key_validated(&key.as_u64(), &reject_all)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            cache.hit_ratio_counters(),
+            (1, 2),
+            "a rejected entry must not be counted as a hit"
+        );
+    }
+
     #[rstest]
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
@@ -650,7 +595,7 @@ mod tests {
         #[case] hasher: T,
     ) {
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            10,
+            TEST_MAX_SIZE,
             Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
@@ -678,7 +623,7 @@ mod tests {
         #[case] hasher: T,
     ) {
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            10,
+            TEST_MAX_SIZE,
             Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
@@ -704,6 +649,7 @@ mod tests {
         // Invalidate the cache for the table
         cache
             .invalidate_for_table(table_ref)
+            .await
             .expect("should invalidate cache");
 
         // Verify the value is no longer in the cache
@@ -712,6 +658,41 @@ mod tests {
             .is_none()
             .then_some(())
             .expect("cache should not contain key after invalidation");
+    }
+
+    /// A refresh that finishes while the runtime is shutting down still invalidates
+    /// the cache, and Tokio cancels a `spawn_blocking` task on a runtime that is
+    /// already shut down. The cache is dropped with the runtime, so there is nothing
+    /// stale left to serve — this must not surface as an invalidation failure.
+    #[test]
+    fn test_invalidation_cancelled_by_runtime_shutdown_is_not_an_error() {
+        let shut_down = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("build runtime");
+        let shut_down_handle = shut_down.handle().clone();
+        shut_down.shutdown_background();
+
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            TEST_MAX_SIZE,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build runtime");
+        let result = driver.block_on(async {
+            let _entered = shut_down_handle.enter();
+            cache
+                .invalidate_for_table(TableReference::bare("test_table"))
+                .await
+        });
+
+        if let Err(e) = result {
+            panic!("invalidation cancelled by runtime shutdown must not be an error: {e}");
+        }
     }
 
     /// Regression test for #11266: cache invalidation must resolve both the
@@ -756,14 +737,18 @@ mod tests {
         #[case] stored: TableReference,
         #[case] invalidate_with: TableReference,
         #[case] expect_invalidated: bool,
+        // The Spice scan is the only `LruCache` invalidation path; qualification
+        // must still resolve the same way the old Moka predicate and Pingora
+        // scan agreed on.
     ) {
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            10,
+            TEST_MAX_SIZE,
             Duration::from_mins(1),
             RandomState::default(),
             CachingPolicy::Lru,
             CacheEngine::Moka,
         );
+
         let result = create_test_cached_result_with_table(stored).await;
 
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
@@ -776,6 +761,7 @@ mod tests {
 
         cache
             .invalidate_for_table(invalidate_with)
+            .await
             .expect("should invalidate cache");
 
         assert_eq!(
@@ -797,7 +783,7 @@ mod tests {
         #[case] hasher: T,
     ) {
         let cache: LruCache<CachedSearchResult, _, _> = LruCache::new(
-            10,
+            TEST_MAX_SIZE,
             Duration::from_mins(1),
             hasher,
             CachingPolicy::Lru,
@@ -823,6 +809,7 @@ mod tests {
         // Invalidate the cache for the table
         cache
             .invalidate_for_table(table_ref)
+            .await
             .expect("should invalidate cache");
 
         // Verify the value is no longer in the cache
@@ -842,7 +829,7 @@ mod tests {
         let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
 
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            10,
+            TEST_MAX_SIZE,
             Duration::from_millis(100),
             hasher,
             CachingPolicy::Lru,
@@ -882,7 +869,7 @@ mod tests {
         let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
 
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            10,
+            TEST_MAX_SIZE,
             Duration::from_millis(100),
             hasher,
             CachingPolicy::Lru,
@@ -914,12 +901,13 @@ mod tests {
 
     #[rstest]
     #[case::lru(CachingPolicy::Lru)]
+    #[case::lfu(CachingPolicy::Lfu)]
     #[case::tiny_lfu(CachingPolicy::TinyLfu)]
     #[tokio::test]
     async fn test_cache_with_caching_policy(#[case] caching_policy: CachingPolicy) {
         let hasher = RandomState::default();
         let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            10,
+            TEST_MAX_SIZE,
             Duration::from_mins(1),
             hasher,
             caching_policy,
@@ -942,8 +930,42 @@ mod tests {
             .expect("retrieved and result should have same length");
     }
 
-    /// Test that Pingora backend works correctly when the feature is enabled.
-    #[cfg(feature = "pingora")]
+    /// A configured Pingora `engine` is ignored; the Spice sharded cache still
+    /// serves. The enterprise-only message is retained for existing references.
+    #[tokio::test]
+    async fn test_pingora_engine_is_ignored_and_still_serves() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            TEST_MAX_SIZE,
+            Duration::from_mins(1),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        assert!(
+            PINGORA_ENTERPRISE_ONLY_MESSAGE.contains("Enterprise distribution of Spice.ai"),
+            "retained message should use the standard enterprise-only wording"
+        );
+
+        let key = CacheKey::Query("pingora_fallback_query", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result().await;
+        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+        cache.checkpoint().await;
+
+        let retrieved = cache
+            .get_raw_key(&key.as_u64())
+            .await
+            .expect("Spice cache should contain the key when `engine` is pingora");
+        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
+        let result_len = result.records().await.expect("Failed to decode").len();
+        assert_eq!(
+            retrieved_len, result_len,
+            "retrieved and result should have same length"
+        );
+    }
+
+    /// Pingora-named put/get contract, now run against the Spice backend.
     #[tokio::test]
     async fn test_pingora_backend_put_and_get() {
         let hasher = RandomState::default();
@@ -974,8 +996,7 @@ mod tests {
             .expect("retrieved and result should have same length");
     }
 
-    /// Test that Pingora backend cache miss works correctly.
-    #[cfg(feature = "pingora")]
+    /// Pingora-named miss contract, now run against the Spice backend.
     #[tokio::test]
     async fn test_pingora_backend_cache_miss() {
         let hasher = RandomState::default();
@@ -997,8 +1018,7 @@ mod tests {
             .expect("cache should not contain nonexistent key");
     }
 
-    /// Test that Pingora backend `invalidate_all` works correctly.
-    #[cfg(feature = "pingora")]
+    /// Pingora-named `invalidate_all` contract, now run against the Spice backend.
     #[tokio::test]
     async fn test_pingora_backend_invalidate_all() {
         let hasher = RandomState::default();
@@ -1035,8 +1055,7 @@ mod tests {
             .expect("cache should be empty after invalidate_all");
     }
 
-    /// Test that Pingora backend table invalidation works correctly.
-    #[cfg(feature = "pingora")]
+    /// Pingora-named table invalidation contract, now run against the Spice backend.
     #[tokio::test]
     async fn test_pingora_invalidate_for_table() {
         let hasher = RandomState::default();
@@ -1068,6 +1087,7 @@ mod tests {
         // Invalidate the cache for the table
         cache
             .invalidate_for_table(table_ref)
+            .await
             .expect("should invalidate cache for pingora");
 
         // Force pending tasks
@@ -1081,8 +1101,7 @@ mod tests {
             .expect("cache should not contain key after table invalidation");
     }
 
-    /// Test Pingora backend table invalidation with multiple entries - only matching tables removed.
-    #[cfg(feature = "pingora")]
+    /// Pingora-named selective invalidation contract, now run against the Spice backend.
     #[tokio::test]
     async fn test_pingora_invalidate_for_table_selective() {
         let hasher = RandomState::default();
@@ -1105,9 +1124,10 @@ mod tests {
         });
         let encoder = crate::encoding::get_encoder(spicepod::component::caching::Encoding::None);
         let result_other_table = CachedQueryResult::from_batches(
-            &[different_table_batch],
+            vec![different_table_batch],
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             Arc::new(different_input_tables),
+            std::time::Instant::now(),
             std::time::Instant::now(),
             encoder,
         )
@@ -1138,6 +1158,7 @@ mod tests {
         };
         cache
             .invalidate_for_table(table_ref)
+            .await
             .expect("should invalidate cache");
         cache.checkpoint().await;
 
@@ -1154,8 +1175,148 @@ mod tests {
         );
     }
 
+    /// A cached value that records which thread read its table references.
+    ///
+    /// The scan calls [`AsTableRefs::as_table_refs`] on every entry it walks, so recording the
+    /// thread there observes where the scan actually ran — without depending on the scheduler
+    /// doing anything in particular.
+    #[derive(Clone)]
+    struct ThreadRecordingValue {
+        scanned_on: Arc<parking_lot::Mutex<Vec<std::thread::ThreadId>>>,
+    }
+
+    impl Sizeable for ThreadRecordingValue {
+        fn get_memory_size(&self) -> usize {
+            std::mem::size_of::<Self>()
+        }
+    }
+
+    impl CacheMetrics for ThreadRecordingValue {
+        fn record_hit() {}
+        fn record_miss() {}
+        fn record_request() {}
+        fn record_item_count(_count: u64) {}
+        fn record_size(_size: u64) {}
+        fn record_max_size(_size: u64) {}
+        fn record_eviction(_reason: EvictionReason) {}
+        fn record_stale_rejection(_reason: StaleRejectionReason) {}
+        fn record_table_invalidation(_mode: InvalidationMode) {}
+        fn update_hit_ratio(_hits: u64, _total: u64) {}
+        fn publish_counters_at_zero() {}
+    }
+
+    impl AsTableRefs for ThreadRecordingValue {
+        fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+            self.scanned_on.lock().push(std::thread::current().id());
+            let mut refs = HashSet::new();
+            refs.insert(TableReference::Bare {
+                table: Arc::from("test_table"),
+            });
+            Arc::new(refs)
+        }
+    }
+
+    /// The invalidation scan must not run on the runtime worker that called it.
+    ///
+    /// Asserted by observing the thread the scan reads values on rather than by racing a
+    /// concurrently spawned task against it, so the test does not depend on the scan still
+    /// being in flight at any particular moment. When the scan ran inline it read every value
+    /// on the caller's own thread — the Spice backend is in-memory, so none of its futures
+    /// ever return `Poll::Pending` and awaiting them yields at no point, which is why making
+    /// the method `async` alone would not have moved this.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_pingora_invalidate_for_table_scans_off_the_calling_thread() {
+        let hasher = RandomState::default();
+        let cache: LruCache<ThreadRecordingValue, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_mins(1),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        let scanned_on = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let entry_labels: Vec<String> = (0..16).map(|i| format!("scan_entry_{i}")).collect();
+        for label in &entry_labels {
+            let key = CacheKey::Query(label.as_str(), None).as_raw_key(cache.hasher());
+            cache
+                .put_raw_key(
+                    &key.as_u64(),
+                    ThreadRecordingValue {
+                        scanned_on: Arc::clone(&scanned_on),
+                    },
+                )
+                .await;
+        }
+        cache.checkpoint().await;
+
+        // Anything recorded before the invalidation would be an insert-path read, not a scan.
+        scanned_on.lock().clear();
+        let caller_thread = std::thread::current().id();
+
+        cache
+            .invalidate_for_table(TableReference::Bare {
+                table: Arc::from("test_table"),
+            })
+            .await
+            .expect("should invalidate cache");
+
+        let threads = scanned_on.lock().clone();
+        assert!(
+            !threads.is_empty(),
+            "the scan read no values, so this test proves nothing about where it ran"
+        );
+        assert!(
+            !threads.contains(&caller_thread),
+            "the scan read {} value(s) on the calling thread, so it is still running on the \
+             runtime worker instead of the blocking pool",
+            threads.iter().filter(|id| **id == caller_thread).count()
+        );
+    }
+
+    /// Invalidating a table the cache holds nothing for still succeeds, and leaves the
+    /// unrelated entries alone — the scan's empty-match path is the one a refresh on an
+    /// uncached dataset takes on every interval.
+    #[tokio::test]
+    async fn test_pingora_invalidate_for_table_with_no_matches() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_mins(1),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        // An empty cache first: there is not even a key to walk.
+        cache
+            .invalidate_for_table(TableReference::Bare {
+                table: Arc::from("never_cached"),
+            })
+            .await
+            .expect("invalidating an empty cache should succeed");
+
+        let key = CacheKey::Query("query_test_table", None).as_raw_key(cache.hasher());
+        cache
+            .put_raw_key(&key.as_u64(), create_test_cached_result().await)
+            .await;
+        cache.checkpoint().await;
+
+        cache
+            .invalidate_for_table(TableReference::Bare {
+                table: Arc::from("never_cached"),
+            })
+            .await
+            .expect("invalidating an unmatched table should succeed");
+        cache.checkpoint().await;
+
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_some(),
+            "an entry for an unrelated table should survive an unmatched invalidation"
+        );
+    }
+
     /// Test Pingora backend TTL expiration works correctly.
-    #[cfg(feature = "pingora")]
     #[tokio::test]
     async fn test_pingora_ttl_expiration() {
         let hasher = RandomState::default();
@@ -1191,7 +1352,6 @@ mod tests {
     }
 
     /// Test Pingora backend size tracking works correctly.
-    #[cfg(feature = "pingora")]
     #[tokio::test]
     async fn test_pingora_size_tracking() {
         let hasher = RandomState::default();
@@ -1236,7 +1396,6 @@ mod tests {
     }
 
     /// Test Pingora backend with search results table invalidation.
-    #[cfg(feature = "pingora")]
     #[tokio::test]
     async fn test_pingora_search_cache_invalidate_for_table() {
         let hasher = RandomState::default();
@@ -1268,6 +1427,7 @@ mod tests {
         // Invalidate the cache for the table
         cache
             .invalidate_for_table(table_ref)
+            .await
             .expect("should invalidate search cache for pingora");
         cache.checkpoint().await;
 
@@ -1276,5 +1436,253 @@ mod tests {
             cache.get_raw_key(&raw_cache_key).await.is_none(),
             "search result should be removed after table invalidation"
         );
+    }
+
+    /// A cached value whose eviction reports are counted in-process, so a test
+    /// can assert what the cache actually reported without standing up an
+    /// `OpenTelemetry` pipeline. [`CacheMetrics`] is implemented on the type
+    /// rather than on an instance, so each test needs its own type to keep a
+    /// count only it can move.
+    macro_rules! counting_value {
+        // Fixed-weight variant: the value reports `$weight` however large it really is, so a
+        // test can size a cache to hold an exact number of entries and know which admission
+        // pushes it over.
+        ($name:ident, $counter:ident, weight = $weight:expr) => {
+            counting_value!(@decl $name, $counter);
+
+            impl Sizeable for $name {
+                fn get_memory_size(&self) -> usize {
+                    $weight
+                }
+            }
+        };
+        ($name:ident, $counter:ident) => {
+            counting_value!(@decl $name, $counter);
+
+            impl Sizeable for $name {
+                fn get_memory_size(&self) -> usize {
+                    self.0.get_memory_size()
+                }
+            }
+        };
+        (@decl $name:ident, $counter:ident) => {
+            static $counter: AtomicU64 = AtomicU64::new(0);
+
+            #[derive(Clone)]
+            struct $name(CachedQueryResult);
+
+            impl AsTableRefs for $name {
+                fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+                    self.0.as_table_refs()
+                }
+            }
+
+            impl CacheMetrics for $name {
+                fn record_hit() {}
+                fn record_miss() {}
+                fn record_request() {}
+                fn record_item_count(_count: u64) {}
+                fn record_size(_size: u64) {}
+                fn record_max_size(_size: u64) {}
+                fn record_stale_rejection(_reason: StaleRejectionReason) {}
+                fn record_table_invalidation(_mode: InvalidationMode) {}
+                fn update_hit_ratio(_hits: u64, _total: u64) {}
+                fn publish_counters_at_zero() {}
+
+                fn record_eviction(reason: EvictionReason) {
+                    if reason == EvictionReason::Invalidated {
+                        $counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        };
+    }
+
+    counting_value!(MokaCountedValue, MOKA_INVALIDATIONS);
+    counting_value!(ReplaceCountedValue, REPLACE_EVICTIONS);
+
+    /// Regression test for #12687, on the Spice backend: overwriting a key
+    /// leaves it cached (not an eviction); table invalidation removes it and
+    /// must be counted. Size and expiry stay separable — see
+    /// `spice_reasons_map_onto_metric_labels`.
+    #[tokio::test]
+    async fn invalidation_is_an_eviction_but_a_replaced_value_is_not() {
+        let cache: LruCache<ReplaceCountedValue, _, _> = LruCache::new(
+            TEST_MAX_SIZE,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+
+        let table_ref = TableReference::bare("replaced_table");
+        let key = CacheKey::Query("replaced_query", None).as_raw_key(cache.hasher());
+        let first =
+            ReplaceCountedValue(create_test_cached_result_with_table(table_ref.clone()).await);
+        cache.put_raw_key(&key.as_u64(), first).await;
+        let second =
+            ReplaceCountedValue(create_test_cached_result_with_table(table_ref.clone()).await);
+        cache.put_raw_key(&key.as_u64(), second).await;
+        cache.checkpoint().await;
+
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_some(),
+            "a replaced value must still be cached"
+        );
+        assert_eq!(
+            REPLACE_EVICTIONS.load(Ordering::Relaxed),
+            0,
+            "overwriting a key must not be counted as an eviction"
+        );
+
+        cache
+            .invalidate_for_table(table_ref)
+            .await
+            .expect("should invalidate cache");
+        cache.checkpoint().await;
+
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_none(),
+            "invalidation must drop the entry"
+        );
+        assert_eq!(
+            REPLACE_EVICTIONS.load(Ordering::Relaxed),
+            1,
+            "a refresh or DML invalidation removes the entry, so it must be counted"
+        );
+    }
+
+    /// Regression test for #12687: a refresh drops its table's entries through
+    /// `invalidate_entries_if`, which moka reports as `Explicit`. The removal that
+    /// dominates an accelerated dataset has to reach the eviction counter.
+    #[tokio::test]
+    async fn moka_invalidation_is_reported_as_an_eviction() {
+        let cache: LruCache<MokaCountedValue, _, _> = LruCache::new(
+            1024 * 1024,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+
+        let table_ref = TableReference::bare("counted_table");
+        let key = CacheKey::Query("counted_query", None).as_raw_key(cache.hasher());
+        let value = MokaCountedValue(create_test_cached_result_with_table(table_ref.clone()).await);
+        cache.put_raw_key(&key.as_u64(), value).await;
+
+        cache
+            .invalidate_for_table(table_ref)
+            .await
+            .expect("should invalidate cache");
+        cache.checkpoint().await;
+
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_none(),
+            "the entry must actually be gone, or the count below proves nothing"
+        );
+        assert_eq!(
+            MOKA_INVALIDATIONS.load(Ordering::Relaxed),
+            1,
+            "invalidating the entry's table must report one eviction"
+        );
+    }
+
+    counting_value!(PingoraCountedValue, PINGORA_INVALIDATIONS);
+
+    /// The Pingora engine has no moka cache, so its invalidation removes each key
+    /// directly and never reaches an eviction listener. Without the removal path
+    /// recording it, the removal is invisible on every engine build.
+    #[tokio::test]
+    async fn pingora_invalidation_is_reported_as_an_eviction() {
+        let cache: LruCache<PingoraCountedValue, _, _> = LruCache::new(
+            1024 * 1024,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        let table_ref = TableReference::bare("counted_table");
+        let key = CacheKey::Query("counted_query", None).as_raw_key(cache.hasher());
+        let value =
+            PingoraCountedValue(create_test_cached_result_with_table(table_ref.clone()).await);
+        cache.put_raw_key(&key.as_u64(), value).await;
+
+        cache
+            .invalidate_for_table(table_ref)
+            .await
+            .expect("should invalidate cache");
+        cache.checkpoint().await;
+
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_none(),
+            "the entry must actually be gone, or the count below proves nothing"
+        );
+        assert_eq!(
+            PINGORA_INVALIDATIONS.load(Ordering::Relaxed),
+            1,
+            "the Pingora removal path must report the eviction itself"
+        );
+    }
+
+    counting_value!(FixedWeightValue, FIXED_WEIGHT_INVALIDATIONS, weight = 100);
+
+    /// The weight every [`FixedWeightValue`] reports, so a cache can be sized in entries.
+    const FIXED_WEIGHT: u64 = 100;
+
+    /// Regression test for #12674, at the layer an operator sees it: an
+    /// invalidation must not reorder the entries it leaves behind.
+    ///
+    /// A scan that reads each value with `CacheBackend::get` removes and
+    /// re-admits every key it visits, so it rewrites recency across the whole
+    /// cache as scan order — and the next size eviction then discards whichever
+    /// entry that order left coldest instead of the genuinely coldest one.
+    ///
+    /// The keys are multiples of the backend's 16 shards so they share one shard,
+    /// which is the granularity pingora-lru evicts at: with all four in one shard,
+    /// the entry the eviction picks is decided entirely by their relative recency.
+    #[tokio::test]
+    async fn pingora_invalidation_leaves_the_coldest_entry_the_next_eviction_victim() {
+        let shard_keys: [u64; 3] = [16, 32, 48];
+        let overflow_key = 64;
+
+        // Room for exactly the three entries below; the fourth admission has to
+        // evict one of them.
+        let cache: LruCache<FixedWeightValue, _, _> = LruCache::new(
+            3 * FIXED_WEIGHT,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        let cached_table = TableReference::bare("cached_table");
+        for key in shard_keys {
+            let value =
+                FixedWeightValue(create_test_cached_result_with_table(cached_table.clone()).await);
+            cache.put_raw_key(&key, value).await;
+        }
+
+        // Nothing in the cache read this table, so the invalidation must remove
+        // nothing — and, with an in-place scan, touch nothing.
+        cache
+            .invalidate_for_table(TableReference::bare("unrelated_table"))
+            .await
+            .expect("should invalidate cache");
+
+        let overflow = FixedWeightValue(create_test_cached_result_with_table(cached_table).await);
+        cache.put_raw_key(&overflow_key, overflow).await;
+
+        assert!(
+            cache.get_raw_key(&shard_keys[0]).await.is_none(),
+            "the least recently used entry should be the one the size eviction dropped"
+        );
+        for key in &shard_keys[1..] {
+            assert!(
+                cache.get_raw_key(key).await.is_some(),
+                "entry {key} was more recently used than {}, so it should have survived",
+                shard_keys[0]
+            );
+        }
     }
 }

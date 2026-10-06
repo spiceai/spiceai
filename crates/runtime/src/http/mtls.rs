@@ -50,7 +50,7 @@ use runtime_auth::{
 };
 use rustls::pki_types::CertificateDer;
 
-use crate::tls::ClientAuthEnforcement;
+use runtime_tls::ClientAuthEnforcement;
 
 /// Per-connection mTLS context, populated once by the accept loop and
 /// inherited by every HTTP request served on that connection.
@@ -78,7 +78,7 @@ pub(crate) struct PerConnTls {
     pub principal: Option<Arc<dyn AuthPrincipal + Send + Sync>>,
     /// Whether the route-layer gate should reject requests with no
     /// verified peer cert. Copied in once per connection from
-    /// [`crate::tls::TlsConfig::client_auth`].
+    /// [`runtime_tls::TlsConfig::client_auth`].
     pub client_auth: ClientAuthEnforcement,
 }
 

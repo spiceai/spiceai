@@ -1,0 +1,49 @@
+[package]
+name = "cloud-connect-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+description = "Spice Cloud Connect sealed-secret wire crypto: HPKE suite, key-id derivation, AAD construction, and the conformance vectors that hold every implementation to them"
+
+[dependencies]
+base64 = { workspace = true }
+# `std` is what implements `std::error::Error` on its error type, so a failed
+# draw can be the `source` of a typed error rather than a stringified one.
+getrandom = { version = "0.3", features = ["std"] }
+hex = { workspace = true }
+# RFC 9180 HPKE. The suite is fixed (see `suite.rs`), so only what it names is
+# compiled in — the default set adds a post-quantum KEM and its whole
+# dependency tree, which this crate would never reach and every consumer of it
+# would still build.
+hpke = { version = "0.14", default-features = false, features = [
+    "alloc",
+    "chacha",
+    "getrandom",
+    "hkdfsha2",
+    "x25519",
+] }
+# PEM *parsing* only — tolerating whatever a peer wrote is the hard part.
+# Emitting is done in-crate so key material never lands in a buffer the caller
+# cannot zeroize (see `encoding::write_pem`).
+pem = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+snafu = { workspace = true }
+zeroize = "1.8"
+
+[dev-dependencies]
+# An integration test links only against this crate and its dev-dependencies,
+# so the two the conformance-artifact test needs are repeated here.
+hex = { workspace = true }
+serde_json = { workspace = true }
+# A P-256 PKCS#8 PEM to prove the encryption keypair loader rejects the
+# identity key's algorithm.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+# Parses the emitted SPKI back as a SubjectPublicKeyInfo, the way a recipient of
+# `enc_pubkey_pem` does.
+x509-parser = "0.18"
+
+[lints]
+workspace = true

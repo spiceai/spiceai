@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,131 +17,296 @@ limitations under the License.
 
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use bollard::{
     Docker,
     container::{
-        Config, CreateContainerOptions, ListContainersOptions, LogOutput, RemoveContainerOptions,
-        StartContainerOptions,
+        Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StartContainerOptions,
     },
     exec::{CreateExecOptions, StartExecResults},
     image::CreateImageOptions,
-    secret::{
-        ContainerState, ContainerStateStatusEnum, Health, HealthConfig, HealthStatusEnum,
-        HostConfig, PortBinding,
-    },
+    secret::{ContainerStateStatusEnum, HealthConfig, HealthStatusEnum, HostConfig, PortBinding},
 };
-
 use futures::StreamExt;
+use parking_lot::RwLock;
 use tokio::sync::Semaphore;
 
-// Limit the number of concurrent container operations to avoid overwhelming the Docker daemon and containers stopping due to OOM
+// Hold the permit for the container's lifetime to bound the services' memory use.
 static CONTAINER_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(3)));
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub struct RunningContainer<'a> {
-    name: &'a str,
+#[cfg(test)]
+mod tests;
+
+pub struct RunningContainer {
+    name: String,
+    // Only the ID returned by create_container is used for lifecycle operations.
+    id: String,
     docker: Docker,
-    // Store the permit to release it when the container is dropped
+    ports: RwLock<HashMap<u16, u16>>,
+    removed: AtomicBool,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-impl RunningContainer<'_> {
+impl RunningContainer {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The host port Docker allocated atomically for this container's TCP port.
+    pub fn host_port(&self, container_port: u16) -> Result<u16, anyhow::Error> {
+        self.ports
+            .read()
+            .get(&container_port)
+            .copied()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Test container {} ({}) has no published TCP port {container_port}",
+                    self.name,
+                    self.id
+                )
+            })
+    }
+
     pub async fn remove(&self) -> Result<(), anyhow::Error> {
-        remove(&self.docker, self.name).await
+        if self.removed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        remove(&self.docker, &self.id).await?;
+        self.removed.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
-        stop(&self.docker, self.name).await
+        Ok(self.docker.stop_container(&self.id, None).await?)
     }
 
     pub async fn start(&self) -> Result<(), anyhow::Error> {
-        start(&self.docker, self.name).await
+        self.docker
+            .start_container(&self.id, None::<StartContainerOptions<String>>)
+            .await?;
+        let inspected = self.docker.inspect_container(&self.id, None).await?;
+        let bindings = inspected
+            .network_settings
+            .and_then(|settings| settings.ports)
+            .unwrap_or_default();
+        let mut ports = self.ports.write();
+        for (port, host_port) in ports.iter_mut() {
+            *host_port = bindings
+                .get(&format!("{port}/tcp"))
+                .and_then(Option::as_ref)
+                .and_then(|bindings| bindings.first())
+                .and_then(|binding| binding.host_port.as_ref())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Docker did not publish TCP port {port} for {} ({})",
+                        self.name,
+                        self.id
+                    )
+                })?
+                .parse::<u16>()?;
+            anyhow::ensure!(
+                *host_port != 0,
+                "Docker returned an unallocated port for {} ({})",
+                self.name,
+                self.id
+            );
+        }
+        Ok(())
     }
 
     pub async fn exec_cmd(&self, cmd: &str) -> Result<String, anyhow::Error> {
-        let cmd_vec: Vec<String> = cmd
-            .split_whitespace()
-            .map(std::string::ToString::to_string)
-            .collect();
+        self.exec(cmd.split_whitespace()).await
+    }
+
+    /// Execute an argument vector, preserving shell scripts and quoted arguments.
+    pub async fn exec<I, S>(&self, cmd: I) -> Result<String, anyhow::Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let exec = self
             .docker
             .create_exec(
-                self.name,
+                &self.id,
                 CreateExecOptions {
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
-                    cmd: Some(cmd_vec.clone()),
+                    cmd: Some(cmd.into_iter().map(Into::into).collect::<Vec<String>>()),
                     ..Default::default()
                 },
             )
             .await?;
-
-        let exec_result = self.docker.start_exec(&exec.id, None).await?;
-        let mut output_str = String::new();
-
-        if let StartExecResults::Attached { mut output, .. } = exec_result {
-            while let Some(Ok(log)) = output.next().await {
-                match log {
-                    LogOutput::StdOut { message } => {
-                        output_str.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    LogOutput::StdErr { message } => {
-                        return Err(anyhow::anyhow!(
-                            String::from_utf8_lossy(&message).to_string()
-                        ));
+        let mut text = String::new();
+        if let StartExecResults::Attached { mut output, .. } =
+            self.docker.start_exec(&exec.id, None).await?
+        {
+            while let Some(log) = output.next().await {
+                match log? {
+                    LogOutput::StdOut { message } | LogOutput::StdErr { message } => {
+                        text.push_str(&String::from_utf8_lossy(&message));
                     }
                     _ => {}
                 }
             }
         }
-        Ok(output_str)
+        let result = self.docker.inspect_exec(&exec.id).await?;
+        anyhow::ensure!(
+            result.exit_code == Some(0),
+            "Command in test container {} ({}) failed with exit {:?}: {text}",
+            self.name,
+            self.id,
+            result.exit_code
+        );
+        Ok(text)
+    }
+
+    pub async fn wait_healthy(&self, timeout: Option<Duration>) -> Result<(), anyhow::Error> {
+        let timeout = timeout.unwrap_or_else(|| Duration::from_mins(1));
+        let mut last_state = None;
+        let result = tokio::time::timeout(timeout, async {
+            loop {
+                last_state = self.docker.inspect_container(&self.id, None).await?.state;
+                if let Some(state) = &last_state {
+                    anyhow::ensure!(
+                        !matches!(
+                            state.status,
+                            Some(ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD)
+                        ),
+                        "Test container {} ({}) exited: {state:?}",
+                        self.name,
+                        self.id
+                    );
+                    if state.status == Some(ContainerStateStatusEnum::RUNNING)
+                        && state
+                            .health
+                            .as_ref()
+                            .is_none_or(|health| health.status == Some(HealthStatusEnum::HEALTHY))
+                    {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        result.unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "Test container {} ({}) was not healthy within {timeout:?}: {last_state:?}",
+                self.name,
+                self.id
+            ))
+        })
     }
 }
 
-pub async fn remove(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
-    Ok(docker
-        .remove_container(
-            name,
-            Some(RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await?)
+/// Cleanup has its own runtime so it also runs while a test runtime is unwinding.
+/// A hard-killed process or a guard stored in a static cannot run `Drop`.
+impl Drop for RunningContainer {
+    fn drop(&mut self) {
+        if *self.removed.get_mut() {
+            return;
+        }
+        let docker = self.docker.clone();
+        let id = self.id.clone();
+        let removal = std::thread::Builder::new()
+            .name(format!("cleanup-{}", self.name))
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(remove(&docker, &id))
+            });
+        match removal.map(std::thread::JoinHandle::join) {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => eprintln!(
+                "failed to remove test container {} ({}): {e}",
+                self.name, self.id
+            ),
+            Ok(Err(_)) => eprintln!(
+                "cleanup thread for test container {} ({}) panicked",
+                self.name, self.id
+            ),
+            Err(e) => eprintln!(
+                "could not start cleanup for test container {} ({}): {e}",
+                self.name, self.id
+            ),
+        }
+    }
 }
 
-pub async fn stop(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
-    Ok(docker.stop_container(name, None).await?)
+fn has_status(error: &bollard::errors::Error, status: u16) -> bool {
+    matches!(error, bollard::errors::Error::DockerResponseServerError { status_code, .. } if *status_code == status)
 }
 
-pub async fn start(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
-    Ok(docker
-        .start_container(name, None::<StartContainerOptions<String>>)
-        .await?)
+// Wait for this ID to disappear, including when another removal of this same ID
+// is already in progress. Never find or remove a container by its logical name.
+async fn remove(docker: &Docker, id: &str) -> Result<(), anyhow::Error> {
+    tokio::time::timeout(CLEANUP_TIMEOUT, async {
+        if let Err(error) = docker
+            .remove_container(
+                id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true, // Anonymous data volumes belong to the container as well.
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            if has_status(&error, 404) {
+                return Ok(());
+            }
+            if !has_status(&error, 409) {
+                return Err(error.into());
+            }
+        }
+        loop {
+            match docker.inspect_container(id, None).await {
+                Err(error) if has_status(&error, 404) => return Ok(()),
+                Err(error) => return Err(error.into()),
+                Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("Timed out after {CLEANUP_TIMEOUT:?} removing test container {id}")
+    })?
 }
 
-pub struct ContainerRunnerBuilder<'a> {
-    name: &'a str,
+pub struct ContainerRunnerBuilder {
+    name: String,
     image: Option<String>,
-    port_bindings: Vec<(u16, u16)>,
+    ports: Vec<u16>,
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
     command: Option<Vec<String>>,
+    entrypoint: Option<Vec<String>>,
 }
 
-impl<'a> ContainerRunnerBuilder<'a> {
-    pub fn new(name: &'a str) -> Self {
-        ContainerRunnerBuilder {
-            name,
+impl ContainerRunnerBuilder {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: format!("{name}-{}", uuid::Uuid::new_v4()),
             image: None,
-            port_bindings: Vec::new(),
+            ports: Vec::new(),
             env_vars: Vec::new(),
             healthcheck: None,
             command: None,
+            entrypoint: None,
         }
     }
 
@@ -150,13 +315,14 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
-    pub fn add_port_binding(mut self, host_port: u16, container_port: u16) -> Self {
-        self.port_bindings.push((host_port, container_port));
+    /// Publish on loopback with a daemon-assigned host port; read it from the guard.
+    pub fn publish_port(mut self, container_port: u16) -> Self {
+        self.ports.push(container_port);
         self
     }
 
     pub fn add_env_var(mut self, key: &str, value: &str) -> Self {
-        self.env_vars.push((key.to_string(), value.to_string()));
+        self.env_vars.push((key.into(), value.into()));
         self
     }
 
@@ -174,207 +340,140 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
-    pub fn build(self) -> Result<ContainerRunner<'a>, anyhow::Error> {
-        let image = self
-            .image
-            .ok_or_else(|| anyhow::anyhow!("Image must be set"))?;
-        Ok(ContainerRunner::<'a> {
-            name: self.name,
+    pub fn entrypoint<I, S>(mut self, entrypoint: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.entrypoint = Some(entrypoint.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn build(self) -> Result<ContainerRunner, anyhow::Error> {
+        anyhow::ensure!(self.image.is_some(), "Image must be set");
+        Ok(ContainerRunner {
+            builder: self,
             docker: Docker::connect_with_local_defaults()?,
-            image,
-            port_bindings: self.port_bindings,
-            env_vars: self.env_vars,
-            healthcheck: self.healthcheck,
-            command: self.command,
         })
     }
 }
 
-pub struct ContainerRunner<'a> {
-    name: &'a str,
+pub struct ContainerRunner {
+    builder: ContainerRunnerBuilder,
     docker: Docker,
-    image: String,
-    port_bindings: Vec<(u16, u16)>,
-    env_vars: Vec<(String, String)>,
-    healthcheck: Option<HealthConfig>,
-    command: Option<Vec<String>>,
 }
 
-impl<'a> ContainerRunner<'a> {
-    pub async fn run(
-        self,
-        start_timeout: Option<Duration>,
-    ) -> Result<RunningContainer<'a>, anyhow::Error> {
-        if self.container_exist().await? {
-            remove(&self.docker, self.name).await?;
-        }
+impl ContainerRunner {
+    pub async fn run(self, timeout: Option<Duration>) -> Result<RunningContainer, anyhow::Error> {
+        let container = self.start().await?;
+        container.wait_healthy(timeout).await?;
+        Ok(container)
+    }
 
+    /// Start and discover published ports before waiting for health. Services
+    /// advertising an external endpoint can configure it while Docker owns the port.
+    pub async fn start(self) -> Result<RunningContainer, anyhow::Error> {
         let permit = tokio::time::timeout(
-            std::time::Duration::from_mins(5), // Timeout after 5min
-            CONTAINER_SEMAPHORE.clone().acquire_owned(),
+            Duration::from_mins(5),
+            Arc::clone(&CONTAINER_SEMAPHORE).acquire_owned(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Timed out waiting for available container slot"))?
-        .map_err(|_| anyhow::anyhow!("Failed to acquire container permit"))?;
-
+        .map_err(|_| anyhow::anyhow!("Timed out waiting for available container slot"))??;
         self.pull_image().await?;
-
-        let options = CreateContainerOptions {
-            name: self.name,
-            platform: None,
-        };
-
-        let mut port_bindings_map = HashMap::new();
-        for (container_port, host_port) in self.port_bindings {
-            port_bindings_map.insert(
-                format!("{container_port}/tcp"),
-                Some(vec![PortBinding {
-                    host_ip: Some("127.0.0.1".to_string()),
-                    host_port: Some(format!("{host_port}")),
-                }]),
-            );
-        }
-        tracing::debug!("Port bindings: {:?}", port_bindings_map);
-
-        let port_bindings_keys: Vec<String> = port_bindings_map.keys().cloned().collect();
-
-        let (exposed_ports, port_bindings) = if port_bindings_map.is_empty() {
-            (None, None)
-        } else {
-            #[expect(clippy::zero_sized_map_values)]
-            let exposed_ports = port_bindings_keys
-                .iter()
-                .map(|k| (k.as_str(), HashMap::new()))
-                .collect::<HashMap<_, _>>();
-            (Some(exposed_ports), Some(port_bindings_map))
-        };
-
-        let host_config = Some(HostConfig {
-            port_bindings,
-            ..Default::default()
-        });
-
-        let env_vars: Vec<String> = self
-            .env_vars
+        let builder = self.builder;
+        let ports = builder
+            .ports
             .iter()
-            .map(|(k, v)| format!("{k}={v}"))
+            .map(|port| {
+                (
+                    format!("{port}/tcp"),
+                    Some(vec![PortBinding {
+                        host_ip: Some("127.0.0.1".into()),
+                        host_port: Some("0".into()),
+                    }]),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        #[expect(clippy::zero_sized_map_values)]
+        let exposed_ports = ports
+            .keys()
+            .map(|key| (key.clone(), HashMap::new()))
             .collect();
-        let env_vars_str = env_vars.iter().map(String::as_str).collect::<Vec<&str>>();
-
-        let config = Config::<&str> {
-            image: Some(&self.image),
-            env: Some(env_vars_str),
-            host_config,
-            healthcheck: self.healthcheck,
-            exposed_ports,
-            cmd: self
-                .command
-                .as_ref()
-                .map(|v| v.iter().map(String::as_str).collect()),
+        let config = Config::<String> {
+            image: builder.image,
+            env: Some(
+                builder
+                    .env_vars
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect(),
+            ),
+            host_config: Some(HostConfig {
+                port_bindings: Some(ports),
+                init: Some(true), // Reap children so force-removal can kill the service.
+                ..Default::default()
+            }),
+            exposed_ports: Some(exposed_ports),
+            healthcheck: builder.healthcheck,
+            cmd: builder.command,
+            entrypoint: builder.entrypoint,
             ..Default::default()
         };
-
-        let _ = self.docker.create_container(Some(options), config).await?;
-
-        self.docker
-            .start_container(self.name, None::<StartContainerOptions<String>>)
+        let created = self
+            .docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: builder.name.as_str(),
+                    platform: None,
+                }),
+                config,
+            )
             .await?;
-
-        let start_timeout = start_timeout.unwrap_or_else(|| Duration::from_mins(1));
-        let start_time = std::time::Instant::now();
-        loop {
-            let inspect_container = self.docker.inspect_container(self.name, None).await?;
-            tracing::trace!("Container status: {:?}", inspect_container.state);
-
-            if let Some(ContainerState {
-                status: Some(ContainerStateStatusEnum::RUNNING),
-                health:
-                    Some(Health {
-                        status: Some(HealthStatusEnum::HEALTHY),
-                        ..
-                    }),
-                ..
-            }) = inspect_container.state
-            {
-                tracing::debug!("Container running & healthy");
-                break;
-            }
-
-            if start_time.elapsed() > start_timeout {
-                return Err(anyhow::anyhow!(
-                    "Container failed to start (timeout waiting for healthy state)"
-                ));
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        Ok(RunningContainer::<'a> {
-            name: self.name,
+        // Establish ownership before start, inspection or readiness can fail.
+        let container = RunningContainer {
+            name: builder.name,
+            id: created.id,
             docker: self.docker,
+            ports: RwLock::new(builder.ports.into_iter().map(|port| (port, 0)).collect()),
+            removed: AtomicBool::new(false),
             _permit: permit,
-        })
+        };
+        container.start().await?;
+        tracing::debug!(name = container.name, id = container.id, ports = ?container.ports, "Started test container");
+        Ok(container)
     }
 
     async fn pull_image(&self) -> Result<(), anyhow::Error> {
-        // Check if image is already pulled
-        let images = self.docker.list_images::<&str>(None).await?;
-        for image in images {
-            if image.repo_tags.iter().any(|t| t == &self.image) {
-                tracing::debug!("Docker image {} already pulled", self.image);
-                return Ok(());
-            }
+        let image = self
+            .builder
+            .image
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Image must be set"))?;
+        if self
+            .docker
+            .list_images::<&str>(None)
+            .await?
+            .iter()
+            .any(|entry| entry.repo_tags.contains(image))
+        {
+            return Ok(());
         }
-
-        let options = Some(CreateImageOptions::<&str> {
-            from_image: &self.image,
+        let options = Some(CreateImageOptions {
+            from_image: image.as_str(),
             ..Default::default()
         });
-
-        let mut pulling_stream = self.docker.create_image(options, None, None);
-        while let Some(event) = pulling_stream.next().await {
+        let mut pulling = self.docker.create_image(options, None, None);
+        while let Some(event) = pulling.next().await {
             tracing::debug!("Pulling image: {:?}", event?);
         }
-
         Ok(())
-    }
-
-    async fn container_exist(&self) -> Result<bool, anyhow::Error> {
-        let containers = self
-            .docker
-            .list_containers::<&str>(Some(ListContainersOptions {
-                all: true,
-                ..Default::default()
-            }))
-            .await?;
-        for container in containers {
-            let Some(names) = container.names else {
-                continue;
-            };
-            if names.iter().any(|n| {
-                tracing::debug!("Docker container: {n}");
-                n == self.name || n == &format!("/{}", self.name)
-            }) {
-                tracing::debug!("Docker container {} already running", self.name);
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
     }
 }
 
-/// Check if Docker is available on this system.
-///
-/// Returns `true` if Docker daemon is accessible, `false` otherwise.
-/// This is useful for tests that require Docker to skip gracefully
-/// when Docker is not available (e.g., on certain CI runners).
 pub async fn is_docker_available() -> bool {
     let Ok(docker) = Docker::connect_with_local_defaults() else {
         return false;
     };
-
-    // Try to ping the Docker daemon to verify it's actually running
     docker.ping().await.is_ok()
 }
 
@@ -385,19 +484,14 @@ pub async fn wait_for_tcp_port(
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
     let mut last_error = None;
-
     while start_time.elapsed() <= timeout {
         match tokio::net::TcpStream::connect((host, port)).await {
             Ok(_) => return Ok(()),
             Err(error) => last_error = Some(error.to_string()),
         }
-
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-
     Err(anyhow::anyhow!(
-        "Timed out waiting for TCP port {host}:{port} within {}s. Last error: {}",
-        timeout.as_secs(),
-        last_error.unwrap_or_else(|| "none".to_string())
+        "Timed out waiting for TCP port {host}:{port} within {timeout:?}. Last error: {last_error:?}"
     ))
 }

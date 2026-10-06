@@ -26,7 +26,7 @@ use arrow_array::UInt16Array;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraints, project_schema},
+    common::{Constraints, TableReference, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -35,6 +35,7 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
+        metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
         stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
@@ -43,19 +44,19 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
     Client,
-    header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
+    header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
 use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
+use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
     borrow::ToOwned,
     fmt,
     hash::{Hash, Hasher},
     sync::Arc,
+    time::Instant,
     time::{Duration, SystemTime},
 };
-use tokio::sync::RwLock;
 use url::Url;
 use util::{
     RetryError, format_datafusion_error, retry,
@@ -64,22 +65,18 @@ use util::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("HTTP request failed: {source}"))]
-    HttpRequest { source: reqwest::Error },
-
-    #[snafu(display("HTTP request failed with status code {status}"))]
-    HttpServerError { status: u16 },
+    /// Build with [`Error::http_request`].
+    #[snafu(display("HTTP request to {endpoint} failed: {source}"))]
+    HttpRequest {
+        endpoint: String,
+        source: reqwest::Error,
+    },
 
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
 
     #[snafu(display("HTTP request was rate limited: {message}"))]
     RateLimited { message: String },
-
-    #[snafu(display(
-        "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
-    ))]
-    AllRetriesFailed { max_retries: usize, url: String },
 
     #[snafu(display("Invalid URL: {source}"))]
     InvalidUrl { source: url::ParseError },
@@ -101,9 +98,185 @@ pub enum Error {
 
     #[snafu(display("Failed to decompose HTTP response row into declared columns: {source}"))]
     JsonNesting { source: super::json_nest::Error },
+
+    #[snafu(display(
+        "Failed to fetch {endpoint} for {dataset}: the origin answered {status}, so the request \
+        failed rather than becoming data. {} \
+        See: https://spiceai.org/docs/components/data-connectors/https",
+        error_response_remedy(*status)
+    ))]
+    ErrorResponse {
+        status: u16,
+        endpoint: String,
+        dataset: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The part of a *configured* endpoint that is safe to put in an error or a log line:
+/// scheme, host and port, and nothing else.
+///
+/// **Pass the dataset's `base_url`, never a built request URL.** Everything a query
+/// contributes to a request is out of bounds: `request_query_filters` puts a query's own
+/// values in the query string, and `build_request_url` appends a `request_path` the query
+/// chose — which `allowed_request_paths` admits by glob, so a wildcard allowlist lets a
+/// filter name any path under the endpoint.
+///
+/// **The path is dropped even though the operator wrote it**, because a path is a place
+/// credentials are routinely kept rather than a merely descriptive part of a URL: a
+/// webhook endpoint carries its whole secret there, and so do the "unguessable URL"
+/// designs several APIs use in place of a header. The reader of these messages is whoever
+/// ran the query, who need not be the operator who can see the spicepod, so the path is
+/// theirs to keep. Nothing is lost that the reader needs: every message built from this
+/// also names the dataset, which identifies the endpoint uniquely and is what an operator
+/// looks up to fix it.
+fn endpoint_label(url: &Url) -> String {
+    // `Origin::ascii_serialization` renders scheme, host and a non-default port and can
+    // carry nothing else — no path, query, fragment or userinfo — so the redaction is a
+    // property of the type rather than of remembering to clear each field.
+    url.origin().ascii_serialization()
+}
+
+/// The half of an [`Error::ErrorResponse`] message that tells the operator what to do.
+///
+/// It differs by status class because only client errors are selectable — see
+/// [`ErrorResponseAction`] for why. Offering `warn` for any other status would name a
+/// remedy that does not work.
+fn error_response_remedy(status: u16) -> &'static str {
+    if HttpTableProvider::is_retryable_status(status) {
+        "The origin did not recover after the configured retries, and a server error is never \
+         recorded as a row, so the dataset keeps its previous contents. Fix the origin, or raise \
+         `max_retries` if it recovers on its own."
+    } else if (300..400).contains(&status) {
+        "Only a client error can be recorded as a row, so the dataset keeps its previous \
+         contents. A `304` answers a conditional header such as `If-None-Match` sent through \
+         `http_headers` or a `request_headers` filter, and any other `3xx` is a redirect that \
+         was not followed: change the request."
+    } else if !HttpTableProvider::is_recordable_status(status) {
+        "Only a client error can be recorded as a row, so the dataset keeps its previous \
+         contents. Fix the origin or the request."
+    } else {
+        "`on_error_response` treats it as a failed request. Fix the origin, or set \
+         `on_error_response: warn` on this dataset to record the body as a row and log that a \
+         full refresh would replace the dataset's previous contents. `store` records it without \
+         the log line and is not recommended."
+    }
+}
+
+/// What the connector does with a response the origin did not mark as successful.
+///
+/// A non-2xx body is otherwise recorded as an ordinary row, and on a dataset with
+/// `refresh_mode: full` that row *replaces* the previously good contents — a transient
+/// origin failure substitutes error pages for data without the query result marking it
+/// (spiceai/spiceai#13515).
+///
+/// [`Warn`] and [`Store`] reach only client errors, a 4xx other than 429: the class
+/// whose body answers for the resource. Any other status outside 2xx fails the request
+/// whatever the action says. A `3xx` carries no content to record — a `304` answering
+/// a conditional request would replace the dataset with one empty row on a full
+/// refresh. A 5xx or 429 that outlives the retry ladder is a statement about the
+/// origin's health rather than about the resource (RFC 9110 S15.6) — the same line
+/// `cache::batches_cacheable` draws when it keeps a row carrying such a status out of
+/// the results cache. Because the status is refused
+/// before it becomes a row, a caller that keeps its previous result when the origin
+/// fails tells it apart from other failures with [`is_transient_origin_failure`].
+/// Without that scoping, the setting a dataset picks to keep a meaningful 404 working
+/// would also let an outage overwrite its contents (spiceai/spiceai#13578).
+///
+/// [`Warn`]: ErrorResponseAction::Warn
+/// [`Store`]: ErrorResponseAction::Store
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErrorResponseAction {
+    /// Fail the request, so a refresh fails and the accelerated table keeps what it had.
+    #[default]
+    Error,
+    /// Record a client error's response (a 4xx other than 429) as a row, and warn that
+    /// it happened. Any other status still fails — see the type's documentation.
+    Warn,
+    /// Record a client error's response (a 4xx other than 429) as a row, silently. Any
+    /// other status still fails — see the type's documentation.
+    Store,
+}
+
+impl ErrorResponseAction {
+    /// The value that selects this variant in a dataset's `params`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorResponseAction::Error => "error",
+            ErrorResponseAction::Warn => "warn",
+            ErrorResponseAction::Store => "store",
+        }
+    }
+
+    /// Every action, in the order they are listed to the user. Holds the variants
+    /// rather than their spellings so the list and [`Self::as_str`] cannot disagree.
+    pub const VARIANTS: [Self; 3] = [Self::Error, Self::Warn, Self::Store];
+
+    /// The accepted values, joined for a message that has to list them.
+    #[must_use]
+    pub fn accepted_values() -> String {
+        Self::VARIANTS
+            .iter()
+            .map(|action| action.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for ErrorResponseAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ErrorResponseAction {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "error" => Ok(ErrorResponseAction::Error),
+            "warn" => Ok(ErrorResponseAction::Warn),
+            "store" => Ok(ErrorResponseAction::Store),
+            _ => Err(()),
+        }
+    }
+}
+
+impl Error {
+    /// A transport failure on a request to `endpoint`. `reqwest::Error`'s `Display` appends
+    /// the full request URL, so it is stripped and only [`endpoint_label`] is named.
+    fn http_request(endpoint: &Url, source: reqwest::Error) -> Self {
+        Error::HttpRequest {
+            endpoint: endpoint_label(endpoint),
+            source: source.without_url(),
+        }
+    }
+}
+
+/// Whether `error`, or any error it was built from, is this connector refusing a status it
+/// retries (5xx/429) once its retries ran out: an origin that is down, rather than an
+/// answer about the resource.
+///
+/// The connector refuses such a status before it becomes a row (see
+/// [`ErrorResponseAction`]), so a caller that keeps its previous result when the origin
+/// fails sees it as an error rather than as a row carrying the status. This is how such a
+/// caller tells the two kinds of failure apart; the error may arrive wrapped in any number
+/// of `DataFusionError` layers.
+#[must_use]
+pub fn is_transient_origin_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if let Some(Error::ErrorResponse { status, .. }) = err.downcast_ref::<Error>()
+            && HttpTableProvider::is_retryable_status(*status)
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
 
 impl From<Error> for DataFusionError {
     fn from(err: Error) -> Self {
@@ -112,25 +285,35 @@ impl From<Error> for DataFusionError {
             Error::HttpClientError { status, message } => {
                 DataFusionError::Plan(format!("HTTP client error ({status}): {message}"))
             }
-            // Server errors (5xx) are external errors
-            Error::HttpServerError { status } => DataFusionError::External(Box::new(
-                std::io::Error::other(format!("HTTP request failed with status code {status}")),
-            )),
-            // Retry exhaustion is an external error
-            Error::AllRetriesFailed { max_retries, url } => {
-                DataFusionError::External(Box::new(std::io::Error::other(format!(
-                    "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
-                ))))
+            // The origin answered, and said the answer was not a success. Which
+            // DataFusionError this becomes decides whether a *refresh* retries it:
+            // `check_and_mark_retriable_error` wraps everything except `Plan`/`SQL`/
+            // `SchemaError` as retriable, so an `External` 404 would have one refresh
+            // invocation re-asking an origin that will keep saying no. The statuses worth
+            // re-asking are the ones the request ladder already retries, so both read the
+            // same predicate rather than two taxonomies that can drift apart.
+            //
+            // The retryable case keeps the typed error rather than its text, so a caller
+            // can still tell an origin that is down from any other failure once the error
+            // has been wrapped on its way out of the plan — see
+            // [`is_transient_origin_failure`].
+            Error::ErrorResponse { status, .. } => {
+                if HttpTableProvider::is_retryable_status(status) {
+                    DataFusionError::External(Box::new(err))
+                } else {
+                    DataFusionError::Plan(err.to_string())
+                }
             }
             Error::RateLimited { message } => DataFusionError::External(Box::new(
                 std::io::Error::other(format!("HTTP request was rate limited: {message}")),
             )),
             // All other errors are internal/external errors
-            Error::HttpRequest { source } => DataFusionError::External(Box::new(source)),
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
-            err @ Error::JsonNesting { .. } => DataFusionError::External(Box::new(err)),
+            err @ (Error::HttpRequest { .. } | Error::JsonNesting { .. }) => {
+                DataFusionError::External(Box::new(err))
+            }
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
@@ -218,10 +401,33 @@ impl Default for PaginationConfig {
     }
 }
 
+/// The cache directives an origin sent, kept apart from the retention decision
+/// so "the origin said nothing" is distinguishable from "the origin said zero" —
+/// only the former may fall back to a locally configured TTL.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CacheDirectives {
+    /// Whether a `Cache-Control` header was present at all.
+    present: bool,
+    max_age: Option<Duration>,
+    /// Whether anything the origin sent forbids retention. Set by `no-store`,
+    /// `no-cache` and `private`, and also where the origin's intent cannot be
+    /// read at all — an unreadable field, an unparseable or conflicting
+    /// `max-age` — because this path resolves ambiguity against caching. Named
+    /// for what it decides rather than for the one directive that most often
+    /// sets it.
+    forbid_retention: bool,
+    /// `s-maxage`, which overrides `max-age` for a shared cache and is what this
+    /// one is: entries are keyed by request shape and served to whichever query
+    /// asks next, not held per end user.
+    shared_max_age: Option<Duration>,
+}
+
 #[derive(Clone)]
 struct CachedResponse {
     content: Arc<String>,
-    cached_at: SystemTime,
+    /// How long this response may be retained, resolved at admission from the
+    /// origin's directives. The cache expires the entry against this; nothing
+    /// here re-checks it.
     max_age: Duration,
     detected_format: Option<String>,
     response_date: Option<SystemTime>,
@@ -230,12 +436,181 @@ struct CachedResponse {
 }
 
 impl CachedResponse {
-    fn is_fresh(&self) -> bool {
-        self.cached_at
-            .elapsed()
-            .ok()
-            .is_some_and(|elapsed| elapsed < self.max_age)
+    /// Bytes this entry keeps alive, for the cache's byte budget.
+    ///
+    /// The body dominates; the rest is counted so a response with many headers
+    /// and a tiny body is not billed as free.
+    fn retained_bytes(&self) -> usize {
+        // Capacities rather than lengths, and the containers as well as their
+        // contents: a `Vec` of many short headers is dominated by the tuples
+        // themselves, not by the text, so charging only the text can understate
+        // a header-heavy response by more than half. What stays outside is the
+        // cache backend's own per-entry node, which belongs to the backend.
+        std::mem::size_of::<Self>()
+            + self.content.capacity()
+            + self.detected_format.as_ref().map_or(0, String::capacity)
+            + self.response_headers.capacity() * std::mem::size_of::<(String, String)>()
+            + self
+                .response_headers
+                .iter()
+                .map(|(name, value)| name.capacity() + value.capacity())
+                .sum::<usize>()
     }
+
+    /// Rebuilds the fetch result a caller sees, as it was served from here.
+    ///
+    /// The reported window is the entry's own retention rather than anything
+    /// re-derived: it is already the effective value the entry was admitted
+    /// under.
+    fn into_fetch_result(self) -> HttpFetchResult {
+        HttpFetchResult {
+            content: (*self.content).clone(),
+            directives: CacheDirectives {
+                present: true,
+                max_age: Some(self.max_age),
+                forbid_retention: false,
+                // The window carried here is already the effective one this
+                // entry was admitted under, so there is no shared/private split
+                // left to express.
+                shared_max_age: None,
+            },
+            // Zero rather than the origin's age: the window carried here is
+            // already what was left when the entry was admitted.
+            response_age: None,
+            age_measured_at: Instant::now(),
+            detected_format: self.detected_format.unwrap_or_default(),
+            response_date: self.response_date,
+            response_status: self.response_status,
+            response_headers: (*self.response_headers).clone(),
+        }
+    }
+}
+
+/// Default byte budget for [`ResponseCache`] when the dataset does not set one.
+///
+/// Deliberately modest: this cache exists to serve repeats of the *same* request
+/// inside its `max-age`, so its useful working set is small, while the cost of
+/// getting it wrong is memory that no other limit bounds.
+///
+/// Fixed rather than derived from the machine's memory, and the distinction
+/// matters: this budget is held **per dataset**, so what actually multiplies it
+/// is the number of HTTP datasets, which no per-provider derivation can see.
+/// Scaling it with total memory would look like memory accounting while still
+/// missing the term that matters, and would make the same pod behave
+/// differently on a larger host. A predictable default that a dataset can raise
+/// where it earns it is the honest version; bounding the *total* needs one
+/// budget shared across datasets, which is a larger change than a default.
+pub const DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The connector's response cache: bounded in bytes and expiring per entry.
+///
+/// Concurrent misses for the same key are *not* collapsed into one origin
+/// request. Fetching through the cache is what would give that, and it cannot
+/// express this cache's admission rule — whether a response may be kept is only
+/// knowable from the response, while a fetch-through cache stores whatever the
+/// fetch returns.
+///
+/// Bounding is the point. The keys are request-shaped — path, query, body and
+/// headers — so on a request-keyed workload the number of distinct keys is
+/// unbounded by construction, and one entry holds an entire response body. An
+/// unbounded map of those grows with traffic for the life of the process, and it
+/// is invisible to `runtime.caching` limits because it is not one of those
+/// caches.
+///
+/// `moka` supplies both properties directly: a weigher for the byte budget, and
+/// per-entry expiry driven by each response's own retention window.
+///
+/// # Sharing boundary
+///
+/// This cache is shared across *queries* but not across *principals*, and the
+/// distinction is what keeps it clear of RFC 9111 §3.2 — the rule that a shared
+/// cache must not reuse a response to an authenticated request unless the origin
+/// permitted it with `public`, `s-maxage` or `must-revalidate`.
+///
+/// That rule exists to stop one user's authenticated response being served to
+/// another. Here there is only ever one: credentials belong to the provider,
+/// set once through [`HttpTableProvider::with_auth`], and a query cannot
+/// introduce different ones — a `request_headers` filter naming the
+/// authenticator's header is refused at planning time rather than merged into
+/// the request (see `request_headers_filter_rejects_configured_auth_header_name`).
+/// The cache's sharing boundary and the credential's scope are therefore the
+/// same object, so every entry can only be served to a request carrying the
+/// credentials that produced it.
+///
+/// A rotated `OAuth2Auth` token does not break this: it is the same principal
+/// re-authenticating. For a token's *value* to select a different
+/// representation the origin would have to say so with `Vary`, which is
+/// honoured separately and refuses retention when it names the auth header.
+///
+/// **This is a premise, not a property of the cache.** It holds only while
+/// credentials stay provider-scoped and query-time headers cannot reach the
+/// auth header. If either changes — per-request credentials, or that guard
+/// relaxed — admission has to start consulting `public` / `s-maxage` /
+/// `must-revalidate` before retaining an authenticated response.
+type ResponseCache = moka::future::Cache<CacheKey, CachedResponse>;
+
+/// Per-entry expiry taken from the retention resolved at admission.
+///
+/// Each response carries its own window — the origin's `max-age`, or a
+/// configured fallback where the origin said nothing — so a single cache-wide
+/// TTL cannot express it. Every admitted entry has a non-zero window, because
+/// a response that may not be retained is never admitted in the first place.
+struct RetainForItsOwnWindow;
+
+impl moka::Expiry<CacheKey, CachedResponse> for RetainForItsOwnWindow {
+    fn expire_after_create(
+        &self,
+        _key: &CacheKey,
+        value: &CachedResponse,
+        _created_at: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(value.max_age)
+    }
+
+    /// Replacing an entry replaces its window too.
+    ///
+    /// Without this the default keeps the *existing* expiry, so a key
+    /// re-admitted with a shorter window keeps the longer one it had — two
+    /// concurrent misses that both fetch and both insert would leave a
+    /// `max-age=1` response served for the ten minutes its predecessor was
+    /// granted.
+    fn expire_after_update(
+        &self,
+        _key: &CacheKey,
+        value: &CachedResponse,
+        _updated_at: std::time::Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(value.max_age)
+    }
+}
+
+/// What an entry costs the budget, or `None` when that cannot be represented.
+///
+/// `moka` weighs in `u32`, so an entry of 4 GiB or more cannot be charged what
+/// it holds. Such an entry is not admitted: on a cache configured larger than
+/// that, charging two 6 GiB responses 4 GiB each would let 12 GiB sit inside an
+/// 8 GiB budget.
+fn entry_weight(key: &CacheKey, value: &CachedResponse) -> Option<u32> {
+    u32::try_from(key.retained_bytes().saturating_add(value.retained_bytes())).ok()
+}
+
+/// Builds a response cache with `max_bytes` of headroom.
+///
+/// The weigher counts the key as well as the response: the key owns copies of
+/// the request's path, query, body and headers, which is not negligible beside a
+/// small response on a request-keyed workload.
+fn build_response_cache(max_bytes: usize) -> ResponseCache {
+    moka::future::Cache::builder()
+        .max_capacity(max_bytes as u64)
+        .weigher(|key: &CacheKey, value: &CachedResponse| {
+            // Saturating is a backstop, not the bound: an entry that does not fit
+            // a `u32` is refused at admission by `entry_weight`, because charging
+            // it less than it costs is how a budget silently stops holding.
+            entry_weight(key, value).unwrap_or(u32::MAX)
+        })
+        .expire_after(RetainForItsOwnWindow)
+        .build()
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -365,25 +740,19 @@ impl RequestFilterOptions {
 
 struct HttpFetchResult {
     content: String,
-    max_age: Duration,
+    /// What the origin's `Cache-Control` said. The retention decision is made by
+    /// the caller, which is where a configured fallback is in scope.
+    directives: CacheDirectives,
+    /// How long the response had already been alive when `age_measured_at` was
+    /// taken. A response relayed by an intermediary arrives part-spent.
+    response_age: Option<Duration>,
+    /// When [`Self::response_age`] was taken, so a caller deciding retention
+    /// later can bring it forward rather than treat a stale figure as current.
+    age_measured_at: Instant,
     detected_format: String,
     response_date: Option<SystemTime>,
     response_status: u16,
     response_headers: Vec<(String, String)>,
-}
-
-impl HttpFetchResult {
-    fn should_cache(&self) -> bool {
-        // We don't explicitly disable caching for 5xx responses because well-behaved servers
-        // should return Cache-Control: no-cache or max-age=0 for transient error responses.
-        // This keeps the caching logic simple and respects server-specified cache directives.
-        self.max_age.as_secs() > 0
-    }
-}
-
-enum CacheWriteMode {
-    Enabled,
-    Disabled,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -414,17 +783,38 @@ impl CacheKey {
         self.hash(&mut hasher);
         format!("http-cache-key:{:016x}", hasher.finish())
     }
+
+    /// Bytes this key keeps alive. Counted alongside the response because the
+    /// key holds owned copies of the request's path, query, body and headers —
+    /// on a request-keyed workload that is not negligible beside a small
+    /// response.
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.path.capacity()
+            + self.query.as_ref().map_or(0, String::capacity)
+            + self.body.as_ref().map_or(0, String::capacity)
+            + self.request_headers.as_ref().map_or(0, String::capacity)
+    }
 }
 
 /// A table provider that fetches data from HTTP endpoints based on path and query filters
 #[derive(Clone)]
 pub struct HttpTableProvider {
+    table_ref: Option<TableReference>,
     base_url: Url,
     client: Client,
     file_format: String,
     schema: SchemaRef,
     constraints: Constraints,
-    cache: Arc<RwLock<HashMap<CacheKey, CachedResponse>>>,
+    cache: ResponseCache,
+    /// The cache's byte budget, kept beside it so a response too large to ever
+    /// fit can be turned away before it is copied.
+    cache_max_bytes: usize,
+    /// Occupancy counters, shared with whatever reports them per dataset.
+    cache_metrics: Arc<super::metrics::HttpCacheMetrics>,
+    /// Retention to apply when the origin sends no `Cache-Control` at all.
+    /// `None` means such responses are not cached, which is the default.
+    cache_fallback_ttl: Option<Duration>,
     acceleration_enabled: bool,
     retry_strategy: RetryBackoff,
     content_type: Option<String>,
@@ -441,6 +831,10 @@ pub struct HttpTableProvider {
     /// static columns plus a catch-all JSON column. Schema is replaced
     /// with the user-declared columns (all `Utf8`).
     json_nesting: Option<HttpJsonNesting>,
+    error_response_action: ErrorResponseAction,
+    /// The dataset this provider serves, for messages that have to name it. Absent when
+    /// the provider is built outside a dataset (tests, the optimizer's fixtures).
+    dataset_name: Option<String>,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -450,6 +844,7 @@ impl std::fmt::Debug for HttpTableProvider {
             .field("file_format", &self.file_format)
             .field("acceleration_enabled", &self.acceleration_enabled)
             .field("pagination", &self.pagination)
+            .field("error_response_action", &self.error_response_action)
             .finish_non_exhaustive()
     }
 }
@@ -463,6 +858,7 @@ impl HttpTableProvider {
         acceleration_enabled: bool,
     ) -> Self {
         Self {
+            table_ref: None,
             base_url,
             client,
             file_format,
@@ -471,7 +867,13 @@ impl HttpTableProvider {
             // with the same (request_path, request_query, request_body) but different content
             // (e.g., search API results). Caching mode uses filter values as cache keys instead.
             constraints: Constraints::new_unverified(vec![]),
-            cache: Arc::new(RwLock::new(HashMap::new())),
+            cache: build_response_cache(DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES),
+            cache_max_bytes: DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES,
+            cache_metrics: super::metrics::HttpCacheMetrics::new(),
+            // Off by default: an origin that sends no `Cache-Control` is not
+            // cached today, and turning that on silently at upgrade would start
+            // retaining responses nobody asked us to retain.
+            cache_fallback_ttl: None,
             acceleration_enabled,
             retry_strategy: RetryBackoffBuilder::new()
                 .method(BackoffMethod::Fibonacci)
@@ -488,7 +890,61 @@ impl HttpTableProvider {
             rate_limiter: None,
             rate_controller: None,
             json_nesting: None,
+            error_response_action: ErrorResponseAction::default(),
+            dataset_name: None,
         }
+    }
+
+    /// Name the dataset this provider serves, so a failure can say which one it was.
+    /// Several datasets can share one endpoint with different request filters, so the
+    /// endpoint alone does not identify the failure for an operator.
+    #[must_use]
+    pub fn with_dataset_name(mut self, dataset_name: impl Into<String>) -> Self {
+        self.dataset_name = Some(dataset_name.into());
+        self
+    }
+
+    /// The error a response the origin did not mark successful becomes.
+    ///
+    /// One constructor so every refusal — the retry ladder, the accepting attempt, and
+    /// the zero-row guards in `HttpExec` — names the same endpoint and dataset.
+    fn error_response(&self, status: u16) -> Error {
+        Error::ErrorResponse {
+            status,
+            endpoint: endpoint_label(&self.base_url),
+            dataset: self.dataset_subject(),
+        }
+    }
+
+    /// How a message refers to the dataset: by name when there is one, and by a phrase
+    /// that still reads as a sentence when there is not.
+    fn dataset_subject(&self) -> String {
+        self.dataset_name.as_ref().map_or_else(
+            || "this dataset".to_string(),
+            |name| format!("dataset '{name}'"),
+        )
+    }
+
+    /// Set what a response the origin did not mark successful becomes: a failed
+    /// request, or, for a client error, a row (with or without a warning). See
+    /// [`ErrorResponseAction`].
+    #[must_use]
+    pub fn with_error_response_action(mut self, action: ErrorResponseAction) -> Self {
+        self.error_response_action = action;
+        self
+    }
+
+    /// Associates this provider with its registered `DataFusion` table.
+    #[must_use]
+    pub fn with_table_reference(mut self, table_ref: TableReference) -> Self {
+        self.table_ref = Some(table_ref);
+        self
+    }
+
+    /// Returns the registered `DataFusion` table associated with this provider.
+    #[must_use]
+    pub fn table_reference(&self) -> Option<&TableReference> {
+        self.table_ref.as_ref()
     }
 
     #[must_use]
@@ -501,6 +957,52 @@ impl HttpTableProvider {
     pub fn with_rate_controller(mut self, rate_controller: Option<Arc<RateController>>) -> Self {
         self.rate_controller = rate_controller;
         self
+    }
+
+    /// Sets the response cache's byte budget and, optionally, the retention to
+    /// apply to a response whose origin sent no `Cache-Control` at all.
+    ///
+    /// `max_bytes` of zero disables the cache. `ttl` is a fallback, not a
+    /// ceiling: it never shortens or overrides what an origin asked for, and an
+    /// origin that did send `Cache-Control` is always honoured instead —
+    /// including its refusals. Leaving it `None` keeps a header-less response
+    /// uncached, so the cache then stores nothing unless the origin sent a
+    /// positive `max-age`.
+    #[must_use]
+    pub fn with_cache_limits(self, max_bytes: usize, ttl: Option<Duration>) -> Self {
+        // Replaced rather than mutated: the budget governs a structure that has
+        // already been allocated, and anything cached before the limits were
+        // known was admitted under the wrong one.
+        Self {
+            cache: build_response_cache(max_bytes),
+            cache_max_bytes: max_bytes,
+            cache_fallback_ttl: ttl,
+            ..self
+        }
+    }
+
+    /// Publishes the cache's occupancy into the counters a metrics provider
+    /// reports from.
+    ///
+    /// Without this the cache is invisible: it is not one of the caches under
+    /// `runtime.caching`, so nothing else reports it and memory it holds shows
+    /// up only as unexplained process RSS.
+    fn record_cache_gauges(&self) {
+        self.cache_metrics
+            .record(self.cache.weighted_size(), self.cache.entry_count());
+    }
+
+    /// Reports this provider's cache occupancy into `metrics`.
+    ///
+    /// The counters are owned by the caller rather than handed out from here,
+    /// because the thing that publishes them is registered against the dataset
+    /// before the table provider exists.
+    #[must_use]
+    pub fn with_cache_metrics(self, metrics: Arc<super::metrics::HttpCacheMetrics>) -> Self {
+        Self {
+            cache_metrics: metrics,
+            ..self
+        }
     }
 
     /// Configure JSON schema decomposition. Replaces the provider's
@@ -618,9 +1120,15 @@ impl HttpTableProvider {
                 message: format!("Invalid request_header_allowlist entry '{raw}': {e}"),
             })?;
             ensure!(
-                !(self.auth.is_some() && parsed == AUTHORIZATION),
+                !self
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.header_name() == parsed),
                 ConfigurationSnafu {
-                    message: "request_header_allowlist cannot include 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_header_allowlist or disable HTTP authentication.".to_string()
+                    message: format!(
+                        "request_header_allowlist cannot include '{name}' when HTTP authentication is configured; that header carries the auth token. Remove '{name}' from request_header_allowlist or disable HTTP authentication.",
+                        name = parsed.as_str(),
+                    )
                 }
             );
             allowed_headers.insert(parsed);
@@ -714,8 +1222,8 @@ impl HttpTableProvider {
     }
 
     /// Attach an [`HttpAuthenticator`](super::auth::HttpAuthenticator) that decorates
-    /// every outgoing data request (e.g. to apply a bearer token refreshed in the
-    /// background by [`RefreshTokenAuth`](super::auth::RefreshTokenAuth)).
+    /// every outgoing data request (e.g. to apply an access token refreshed in the
+    /// background by [`OAuth2Auth`](super::auth::OAuth2Auth)).
     #[must_use]
     pub fn with_auth(mut self, auth: Arc<dyn super::auth::HttpAuthenticator>) -> Self {
         self.auth = Some(auth);
@@ -826,6 +1334,13 @@ impl HttpTableProvider {
 
     #[must_use]
     pub fn base_table_schema() -> Schema {
+        // The `HTTP_RESPONSE_STATUS_METADATA_KEY` marker lives on the
+        // *schema*, not the `response_status` field: it is a provenance
+        // signal ("this batch really came from the HTTP connector's own
+        // fetch"), not a per-column attribute, so it must survive being
+        // rebuilt into a narrower, decomposed schema (see
+        // `build_json_nest_schema`) the same way whether or not
+        // `response_status` itself is one of the columns kept.
         Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
             Field::new("request_query", DataType::Utf8, true),
@@ -854,6 +1369,10 @@ impl HttpTableProvider {
                 true,
             ),
         ])
+        .with_metadata(std::collections::HashMap::from([(
+            crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+            "1".to_string(),
+        )]))
     }
 
     /// Extract path and query from filters
@@ -892,7 +1411,9 @@ impl HttpTableProvider {
             test_url
         };
 
-        tracing::debug!("Validating HTTP endpoint: {test_url}");
+        // The probe URL keeps the configured query string, so log only its origin.
+        let endpoint = endpoint_label(&test_url);
+        tracing::debug!("Validating HTTP endpoint: {endpoint}");
 
         let _rate_control_permit = self.acquire_rate_control_permit().await?;
 
@@ -903,22 +1424,21 @@ impl HttpTableProvider {
                 let status = response.status();
                 if self.health_probe.is_some() {
                     tracing::debug!(
-                        "HTTP endpoint validation response using health probe: {test_url} (status: {status})"
+                        "HTTP endpoint validation response using health probe: {endpoint} (status: {status})"
                     );
                     // For custom health probe, require successful status (2xx)
                     if !status.is_success() {
                         return Err(Error::HttpClientError {
                             status: status.as_u16(),
                             message: format!(
-                                "Failed to validate HTTP endpoint {}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
-                                self.base_url,
+                                "Failed to validate HTTP endpoint {endpoint}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
                                 test_url.path()
                             ),
                         });
                     }
                 } else {
                     tracing::debug!(
-                        "HTTP endpoint validation response: {test_url} (status: {status}). Any status (including 404) is expected for the random probe path."
+                        "HTTP endpoint validation response: {endpoint} (status: {status}). Any status (including 404) is expected for the random probe path."
                     );
                     // Any response (including 404) means the endpoint is reachable
                 }
@@ -926,26 +1446,161 @@ impl HttpTableProvider {
             }
             Err(e) => {
                 // Check the error type to provide more specific messages and just return the error
-                Err(Error::HttpRequest { source: e })
+                Err(Error::http_request(&self.base_url, e))
             }
         }
     }
 
-    fn parse_cache_control(cache_control_header: Option<&str>) -> Duration {
-        let mut max_age = Duration::from_secs(0);
+    /// The single-field form, for tests that are not about repetition.
+    ///
+    /// The fetch path reads every `Cache-Control` field the response carried, so
+    /// this exists only to keep those tests legible.
+    #[cfg(test)]
+    fn parse_cache_control(cache_control_header: Option<&str>) -> CacheDirectives {
+        Self::parse_cache_control_values(cache_control_header.map(Some).into_iter())
+    }
 
-        if let Some(header) = cache_control_header {
+    /// Reads the directives from every `Cache-Control` field the response
+    /// carried.
+    ///
+    /// HTTP allows the header to be repeated, and the repeats are as binding as
+    /// a single combined one: reading only the first would admit a response that
+    /// sent `max-age` there and `no-store` in the next field. A `None` item is a
+    /// field whose bytes are not valid text — the origin spoke and we could not
+    /// read it, which is treated as a refusal rather than as silence, because
+    /// the alternative is to fall back to a locally configured TTL on a response
+    /// that may well have said `no-store`.
+    fn parse_cache_control_values<'a>(
+        values: impl Iterator<Item = Option<&'a str>>,
+    ) -> CacheDirectives {
+        let mut directives = CacheDirectives::default();
+
+        for value in values {
+            directives.present = true;
+            let Some(header) = value else {
+                directives.forbid_retention = true;
+                continue;
+            };
             for directive in header.split(',') {
-                let directive = directive.trim();
-                if let Some(value) = directive.strip_prefix("max-age=")
-                    && let Ok(seconds) = value.parse::<u64>()
+                // Directive *names* are case-insensitive, so they are compared
+                // that way; splitting name from value also absorbs whitespace
+                // around the `=` without a second prefix to try.
+                let (name, value) = match directive.split_once('=') {
+                    Some((name, value)) => (name.trim(), Some(value.trim())),
+                    None => (directive.trim(), None),
+                };
+
+                // A freshness directive is usable only if it carries a value we
+                // can read and has not already been given. A missing value, an
+                // unreadable one, or a second one leaves the origin's intent
+                // ambiguous, and ambiguity refuses: `max-age=0, max-age=600`
+                // must not be resolved in favour of ten minutes, and leaving it
+                // simply unset would let a configured fallback stand in for a
+                // directive the origin did send.
+                if name.eq_ignore_ascii_case("max-age") {
+                    match value.and_then(|value| value.parse::<u64>().ok()) {
+                        Some(seconds) if directives.max_age.is_none() => {
+                            directives.max_age = Some(Duration::from_secs(seconds));
+                        }
+                        _ => {
+                            directives.max_age = None;
+                            directives.forbid_retention = true;
+                        }
+                    }
+                } else if name.eq_ignore_ascii_case("s-maxage") {
+                    match value.and_then(|value| value.parse::<u64>().ok()) {
+                        Some(seconds) if directives.shared_max_age.is_none() => {
+                            directives.shared_max_age = Some(Duration::from_secs(seconds));
+                        }
+                        _ => {
+                            directives.shared_max_age = None;
+                            directives.forbid_retention = true;
+                        }
+                    }
+                } else if name.eq_ignore_ascii_case("no-store")
+                    || name.eq_ignore_ascii_case("no-cache")
+                    // `private` marks a response as belonging to one end user.
+                    // This cache is keyed by request shape and serves whichever
+                    // query asks next, which is exactly the reuse `private`
+                    // exists to forbid.
+                    || name.eq_ignore_ascii_case("private")
                 {
-                    max_age = Duration::from_secs(seconds);
+                    directives.forbid_retention = true;
                 }
             }
         }
 
-        max_age
+        directives
+    }
+
+    /// How long a response may be retained, or `None` when it must not be
+    /// cached at all.
+    ///
+    /// The origin decides first and its refusal is absolute: `no-store` and
+    /// `no-cache` win over everything, including a `max-age` sent alongside
+    /// them, and over any locally configured fallback. Only when the origin
+    /// said nothing at all does `fallback_ttl` apply — and it is `None` by
+    /// default, so a header-less origin stays uncached unless an operator asks
+    /// for it.
+    fn effective_retention(
+        directives: &CacheDirectives,
+        fallback_ttl: Option<Duration>,
+        response_age: Option<Duration>,
+    ) -> Option<Duration> {
+        if directives.forbid_retention {
+            return None;
+        }
+        // `s-maxage` is the window addressed to shared caches, and outranks
+        // `max-age` where both were sent: an origin that says
+        // `s-maxage=0, max-age=600` is telling this cache not to reuse the
+        // response at all while allowing a private one ten minutes.
+        match directives.shared_max_age.or(directives.max_age) {
+            // `max-age` is measured from when the origin generated the response,
+            // not from when it reached us, so what may be retained is the part
+            // that has not already elapsed. A response relayed with `Age: 599`
+            // against `max-age: 600` has a second left, and keeping it for the
+            // full window would serve it stale for the rest.
+            Some(max_age) if max_age.as_secs() > 0 => {
+                let remaining = max_age.saturating_sub(response_age.unwrap_or(Duration::ZERO));
+                (!remaining.is_zero()).then_some(remaining)
+            }
+            // A `Cache-Control` that carried no usable `max-age` is still the
+            // origin having spoken, so the local fallback does not step in.
+            Some(_) => None,
+            None if directives.present => None,
+            // The fallback is not reduced by `Age`: it is how long the operator
+            // asked us to keep a response the origin said nothing about, rather
+            // than a claim about how fresh the origin considered it.
+            //
+            // A zero fallback is a configured refusal to retain, not a window
+            // of no length: returning it would admit an entry that is expired
+            // on arrival but still occupies the byte budget.
+            None => fallback_ttl.filter(|ttl| !ttl.is_zero()),
+        }
+    }
+
+    /// How old a response already was when it arrived (RFC 9111 §4.2.3).
+    ///
+    /// `Age` counts from when the origin generated the response, so the wait for
+    /// it to arrive is added to that figure — but *not* to the age its `Date`
+    /// implies, which is measured on arrival and already contains that wait.
+    /// Adding the wait to both charges it twice and turns away short-lived
+    /// responses that are still fresh. The greater of the two is taken, so an
+    /// origin that declares an `Age` smaller than its own `Date` implies does
+    /// not get the benefit of the smaller figure.
+    ///
+    /// Saturating, because `Age` is untrusted response data: a value near
+    /// `u64::MAX` would otherwise overflow the addition and panic.
+    fn age_on_arrival(
+        header_age: Option<Duration>,
+        apparent_age: Duration,
+        response_delay: Duration,
+    ) -> Duration {
+        apparent_age.max(
+            header_age
+                .unwrap_or_default()
+                .saturating_add(response_delay),
+        )
     }
 
     /// Detect file format from Content-Type header, path extension, or content
@@ -1046,11 +1701,13 @@ impl HttpTableProvider {
             url.set_query(Some(q));
         }
 
-        let final_url = url.as_str().to_owned();
-        final_url
+        url.as_str()
             .parse::<Uri>()
             .map_err(|err| Error::FilterRejected {
-                message: format!("Constructed request URI '{final_url}' is invalid: {err}"),
+                message: format!(
+                    "Constructed request URI for {} is invalid: {err}",
+                    endpoint_label(&url)
+                ),
             })?;
 
         Ok(url)
@@ -1085,29 +1742,6 @@ impl HttpTableProvider {
         }
     }
 
-    async fn cache_response(
-        &self,
-        path: &str,
-        query: Option<&str>,
-        body: Option<&str>,
-        request_headers: Option<&str>,
-        result: &HttpFetchResult,
-    ) {
-        let cache_key = Self::get_cache_key(path, query, body, request_headers);
-        let cached_response = CachedResponse {
-            content: Arc::new(result.content.clone()),
-            cached_at: SystemTime::now(),
-            max_age: result.max_age,
-            detected_format: Some(result.detected_format.clone()),
-            response_date: result.response_date,
-            response_status: result.response_status,
-            response_headers: Arc::new(result.response_headers.clone()),
-        };
-
-        let mut cache_write = self.cache.write().await;
-        cache_write.insert(cache_key, cached_response);
-    }
-
     async fn perform_request_with_retry(
         &self,
         url: Url,
@@ -1122,7 +1756,11 @@ impl HttpTableProvider {
         let request_headers_owned = request_headers.cloned();
         let path_owned = path_label.to_string();
 
-        let result = retry(retry_strategy, || {
+        // The ladder spends exactly the configured budget: no request follows the last
+        // attempt it allows. When that attempt ended on a 5xx/429, its error is the
+        // request's answer, because a retryable status is never recorded as a row under
+        // any `on_error_response` (see [`ErrorResponseAction`]).
+        retry(retry_strategy, || {
             let this = this.clone();
             let url = url_clone.clone();
             let body = body_owned.clone();
@@ -1130,33 +1768,11 @@ impl HttpTableProvider {
             let path = path_owned.clone();
 
             async move {
-                this.perform_single_request(
-                    &url,
-                    body.as_deref(),
-                    request_headers.as_ref(),
-                    &path,
-                    false,
-                )
-                .await
+                this.perform_single_request(&url, body.as_deref(), request_headers.as_ref(), &path)
+                    .await
             }
         })
-        .await;
-
-        // If retries exhausted due to transient errors (5xx/429), make one final attempt
-        // and return whatever response we get - the response is still valid data.
-        // Don't retry on permanent errors (e.g., failed to read response body).
-        if let Ok(fetch_result) = result {
-            Ok(fetch_result)
-        } else {
-            tracing::debug!(
-                "Retries exhausted for {url}, making final attempt accepting any status"
-            );
-            self.perform_single_request(&url, body, request_headers, path_label, true)
-                .await
-                .map_err(|e| match e {
-                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
-                })
-        }
+        .await
     }
 
     /// Returns true for HTTP status codes that should trigger retry with backoff.
@@ -1168,22 +1784,38 @@ impl HttpTableProvider {
         (500..600).contains(&status_code) || status_code == 429
     }
 
+    /// Whether `on_error_response: warn` or `store` may record a response with this
+    /// status as a row: a client error (4xx) this connector does not retry. Anything
+    /// else outside 2xx is refused under every action — see [`ErrorResponseAction`].
+    fn is_recordable_status(status_code: u16) -> bool {
+        (400..500).contains(&status_code) && !Self::is_retryable_status(status_code)
+    }
+
     /// Perform a single HTTP request without retry logic.
     ///
-    /// If `accept_retryable` is false, returns a transient error on 5xx/429 to trigger retry.
-    /// If `accept_retryable` is true, accepts any status code and returns the response.
+    /// A 5xx/429 is returned as a transient error, so the ladder retries it while its
+    /// budget lasts and answers with it once the budget is spent.
     async fn perform_single_request(
         &self,
         url: &Url,
         body: Option<&str>,
         request_headers: Option<&HeaderMap>,
         path_label: &str,
-        accept_retryable: bool,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        // Held until the body below has been read, so a response still streaming counts
+        // against the rate controller's concurrency limit.
         let _rate_control_permit = self
             .acquire_rate_control_permit()
             .await
             .map_err(RetryError::transient)?;
+
+        // The freshness window is spent from the moment the origin generated the
+        // response, so the round trip spends it too — waiting on the origin and
+        // downloading the body alike. A `max-age=1` response that takes two
+        // seconds to arrive is stale before it lands, and timing nothing would
+        // admit it for another second. Timed per attempt, so a retry is not
+        // charged for the attempt that failed before it.
+        let attempt_started = Instant::now();
 
         let mut request_builder = if let Some(body_content) = body {
             let mut req = self.client.post(url.clone());
@@ -1213,8 +1845,9 @@ impl HttpTableProvider {
         }
 
         let response = request_builder.send().await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {e}");
-            RetryError::transient(Error::HttpRequest { source: e })
+            let err = Error::http_request(&self.base_url, e);
+            tracing::debug!("{err}");
+            RetryError::transient(err)
         })?;
 
         let status_code = response.status().as_u16();
@@ -1222,29 +1855,66 @@ impl HttpTableProvider {
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
 
-        // 5xx/429: retry with backoff (transient server issue or rate limiting)
-        // After retries exhausted, we'll accept the response as valid data.
-        if !accept_retryable && Self::is_retryable_status(status_code) {
+        // 5xx/429: retry with backoff (transient server issue or rate limiting). The body
+        // is not read, on this attempt or on the last one the budget allows: a retryable
+        // status fails the request whatever `on_error_response` says, because it is an
+        // origin that is down rather than an answer about the resource, and recording one
+        // would let the setting a dataset picked to keep a 404 working overwrite its
+        // contents during an outage. See [`ErrorResponseAction`].
+        if Self::is_retryable_status(status_code) {
             tracing::debug!("HTTP retryable status ({status_code}), will retry");
-            if let Err(e) = response.error_for_status() {
-                return Err(RetryError::transient(Error::HttpRequest { source: e }));
-            }
-            // Defensive: should never reach here since 4xx and 5xx always produce error_for_status Err
-            return Err(RetryError::transient(Error::HttpServerError {
-                status: status_code,
-            }));
+            return Err(RetryError::transient(self.error_response(status_code)));
         }
 
-        // 2xx, 3xx, 4xx (and 5xx/429 when accept_retryable=true): valid response
-        // 4xx like 404 "not found" is a valid business response, not an error
-        Self::extract_response(response, status_code, path_label).await
+        // A non-2xx that reaches here is a status this connector does not retry.
+        // `error_response_action` decides whether a client error's body is data — a 404
+        // "not found" can be a business fact for an API-shaped dataset. Any other status
+        // is refused under every action: a `3xx` (a `304` answering a conditional header,
+        // or a redirect that was not followed) carries no content to record. Anything that
+        // is not recorded has to answer here rather than downstream of the row: the row is
+        // what a full refresh writes over good data with.
+        let is_error_response = !(200..300).contains(&status_code);
+
+        if is_error_response
+            && (self.error_response_action == ErrorResponseAction::Error
+                || !Self::is_recordable_status(status_code))
+        {
+            // Permanent: asking again would get the same answer.
+            return Err(RetryError::Permanent(self.error_response(status_code)));
+        }
+
+        let fetched = Self::extract_response(
+            response,
+            &self.base_url,
+            status_code,
+            path_label,
+            attempt_started,
+            self.auth.as_ref().map(|auth| auth.header_name()),
+        )
+        .await?;
+
+        // Warned only once the body is in hand. `extract_response` treats a broken read as
+        // transient and the request is retried, so warning before it would claim a row on
+        // every attempt, including the ones that never produce one.
+        if is_error_response && self.error_response_action == ErrorResponseAction::Warn {
+            tracing::warn!(
+                "The request to {} for {} answered {status_code}. If that response body parses, it is recorded as a row, and on a full refresh that row replaces the dataset's previous contents. Set `on_error_response: error` to fail the request instead, so a refresh keeps what it had. See: https://spiceai.org/docs/components/data-connectors/https",
+                endpoint_label(&self.base_url),
+                self.dataset_subject()
+            );
+        }
+
+        Ok(fetched)
     }
 
     /// Extract content and metadata from an HTTP response.
     async fn extract_response(
         response: reqwest::Response,
+        endpoint: &Url,
         status_code: u16,
         path_label: &str,
+        attempt_started: Instant,
+        auth_header_name: Option<&HeaderName>,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         let detected_format = Self::detect_file_format(&response, path_label);
         tracing::debug!(
@@ -1252,11 +1922,70 @@ impl HttpTableProvider {
             detected_format
         );
 
-        let cache_control_header = response
+        let mut directives = Self::parse_cache_control_values(
+            response
+                .headers()
+                .get_all(CACHE_CONTROL)
+                .iter()
+                .map(|value| value.to_str().ok()),
+        );
+
+        // `Vary` names what the origin selects a representation on, so an entry
+        // may only be reused for a request that matches on every named field.
+        // Retention is refused unless that can be shown:
+        //
+        // * `*` never matches a later request, whatever the key holds.
+        // * A field whose bytes are not text leaves the selection unknown, and
+        //   unknown resolves against caching here as it does elsewhere.
+        // * A field naming the authenticator's header is refused because that
+        //   value is *not* stable: an `OAuth2Auth` token is refreshed in the
+        //   background, so a later request can carry a different credential than
+        //   the one the stored representation was selected for.
+        //
+        // Any other named field is safe here, and this is the reasoning the
+        // narrowness rests on: what differs between requests is the path, query,
+        // body and the request headers a query supplies, and all four are in the
+        // cache key. The connector's remaining headers are fixed when the
+        // provider is built.
+        let auth_header = auth_header_name;
+        for value in &response.headers().get_all(reqwest::header::VARY) {
+            let Ok(value) = value.to_str() else {
+                directives.forbid_retention = true;
+                continue;
+            };
+            for field in value.split(',') {
+                let field = field.trim();
+                if field == "*"
+                    || auth_header.is_some_and(|name| field.eq_ignore_ascii_case(name.as_str()))
+                {
+                    directives.forbid_retention = true;
+                }
+            }
+        }
+
+        // What the origin declared about how much of the response's freshness
+        // was already spent. Read beside the age its `Date` implies, further
+        // down: an intermediary is required to add `Age`, but one that does not
+        // still leaves the origin's `Date` behind, and taking only `Age` there
+        // would hand a full window to a response that is already spent.
+        let header_age = response
             .headers()
-            .get(CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok());
-        let max_age = Self::parse_cache_control(cache_control_header);
+            .get(reqwest::header::AGE)
+            .and_then(|value| {
+                let parsed = value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                // An `Age` we cannot read leaves the response's remaining freshness
+                // unknown, and treating it as zero would hand back a full window to
+                // a response that may have almost none left. Unreadable resolves
+                // against caching here as it does for `Cache-Control`.
+                if parsed.is_none() {
+                    directives.forbid_retention = true;
+                }
+                parsed
+            });
 
         // Extract Date header from response
         let response_date = response
@@ -1267,6 +1996,23 @@ impl HttpTableProvider {
                 // Parse HTTP date format (RFC 2822/RFC 1123)
                 httpdate::parse_http_date(date_str).ok()
             });
+
+        // The response is now in hand, headers and all. Everything after this
+        // point is time the entry spends with us rather than time in flight.
+        let headers_received = Instant::now();
+
+        // What the response's own `Date` implies about its age, measured against
+        // the moment it arrived. Clamped at zero, so an origin clock running
+        // ahead of ours reads as "brand new" rather than as negative age; an
+        // origin clock running behind makes us cache less, which is the safe
+        // direction. This is the age an intermediary that relayed the response
+        // without adding `Age` leaves behind.
+        let apparent_age = response_date
+            .and_then(|date| SystemTime::now().duration_since(date).ok())
+            .unwrap_or_default();
+
+        let response_delay = headers_received.saturating_duration_since(attempt_started);
+        let age_on_arrival = Self::age_on_arrival(header_age, apparent_age, response_delay);
 
         // Capture response headers before consuming the response body
         let response_headers: Vec<(String, String)> = response
@@ -1287,7 +2033,7 @@ impl HttpTableProvider {
         let content = response
             .text()
             .await
-            .map_err(|e| RetryError::transient(Error::HttpRequest { source: e }))?;
+            .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -1299,7 +2045,14 @@ impl HttpTableProvider {
 
         Ok(HttpFetchResult {
             content,
-            max_age,
+            directives,
+            // The age on arrival plus the time spent here since — reading the
+            // body and getting to admission. Saturating throughout, because
+            // `Age` is untrusted response data and a value near `u64::MAX` would
+            // otherwise overflow the addition and panic; saturating leaves no
+            // freshness to retain, which is the right answer for an absurd age.
+            response_age: Some(age_on_arrival.saturating_add(headers_received.elapsed())),
+            age_measured_at: Instant::now(),
             detected_format,
             response_date,
             response_status: status_code,
@@ -1313,11 +2066,9 @@ impl HttpTableProvider {
         query: Option<&str>,
         body: Option<&str>,
         request_headers: Option<&str>,
-        cache_write_mode: CacheWriteMode,
     ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
-        let query_owned = query.map(ToOwned::to_owned);
         let body_owned = body.map(ToOwned::to_owned);
         let request_headers_owned = request_headers.map(ToOwned::to_owned);
         let parsed_request_headers = request_headers_owned
@@ -1334,29 +2085,10 @@ impl HttpTableProvider {
             )
             .await?;
 
-        if matches!(cache_write_mode, CacheWriteMode::Enabled) && fetch_result.should_cache() {
-            self.cache_response(
-                &path_owned,
-                query_owned.as_deref(),
-                body_owned.as_deref(),
-                request_headers_owned.as_deref(),
-                &fetch_result,
-            )
-            .await;
-        }
-
+        // Fetching only. Whether the result is worth keeping is decided by
+        // `get_response`, which is where the configured fallback is in scope;
+        // callers that bypass the cache entirely reach this directly.
         Ok(fetch_result)
-    }
-
-    async fn fetch_and_cache(
-        &self,
-        path: &str,
-        query: Option<&str>,
-        body: Option<&str>,
-        request_headers: Option<&str>,
-    ) -> Result<HttpFetchResult> {
-        self.fetch_response(path, query, body, request_headers, CacheWriteMode::Enabled)
-            .await
     }
 
     async fn get_response(
@@ -1369,46 +2101,116 @@ impl HttpTableProvider {
         // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it.
         if self.acceleration_enabled {
             return self
-                .fetch_response(path, query, body, request_headers, CacheWriteMode::Disabled)
+                .fetch_response(path, query, body, request_headers)
                 .await;
         }
 
         let cache_key = Self::get_cache_key(path, query, body, request_headers);
 
-        // Try to get from cache
-        let cached = {
-            let cache = self.cache.read().await;
-            cache.get(&cache_key).cloned()
-        };
+        let cached = self.cache.get(&cache_key).await;
+        // Reported here rather than only on the hit: a lookup that finds an
+        // expired entry drops it, so a miss moves occupancy too.
+        self.record_cache_gauges();
 
-        if let Some(cached_response) = cached
-            && cached_response.is_fresh()
-        {
+        if let Some(cached) = cached {
             if tracing::enabled!(tracing::Level::DEBUG) {
-                let cache_key_label = cache_key.redacted_label();
-                if let Some(ref format) = cached_response.detected_format {
-                    tracing::debug!(
-                        "Returning fresh cached content for {} (detected format: {})",
-                        cache_key_label,
-                        format
-                    );
-                } else {
-                    tracing::debug!("Returning fresh cached content for {}", cache_key_label);
-                }
+                tracing::debug!(
+                    "Serving {} from the response cache",
+                    cache_key.redacted_label()
+                );
             }
-            return Ok(HttpFetchResult {
-                content: (*cached_response.content).clone(),
-                max_age: cached_response.max_age,
-                detected_format: cached_response.detected_format.clone().unwrap_or_default(),
-                response_date: cached_response.response_date,
-                response_status: cached_response.response_status,
-                response_headers: (*cached_response.response_headers).clone(),
-            });
+            return Ok(cached.into_fetch_result());
         }
 
-        // Fetch fresh content
-        self.fetch_and_cache(path, query, body, request_headers)
-            .await
+        let fetch_result = self
+            .fetch_response(path, query, body, request_headers)
+            .await?;
+
+        // Retention is resolved here because this is the only place both the
+        // origin's directives and the locally configured fallback are in scope.
+        // `None` means the response is not to be kept: the origin refused, or
+        // said nothing and no fallback was configured.
+        //
+        // The response is *fetched, then admitted* rather than fetched through
+        // the cache, because whether it may be retained is only knowable from
+        // the response. Admitting it with a zero window instead — letting expiry
+        // stand in for the refusal — does not hold: such an entry is not
+        // reliably discarded, and where it is kept it stays resident and counted
+        // against the byte budget until something evicts it. A `no-store`
+        // workload, which is the API-proxy shape this cache exists for, would
+        // then fill the budget with responses the origin forbade storing and
+        // evict the ones it was allowed to keep. The refusal has to be honoured
+        // here, where it is unconditional.
+        // The response's age brought forward to the moment it is asked for,
+        // rather than the figure taken when the response arrived.
+        let age_now = || {
+            fetch_result
+                .response_age
+                .map(|age| age.saturating_add(fetch_result.age_measured_at.elapsed()))
+        };
+        let retention_now = || {
+            Self::effective_retention(&fetch_result.directives, self.cache_fallback_ttl, age_now())
+        };
+
+        // Asked twice, and the first is only a gate: it decides whether copying
+        // the response is worth doing at all, so a refused response is never
+        // copied. The window actually granted is the second one, taken after the
+        // copy, because copying a large body spends real time and a window
+        // computed before it would grant freshness the response no longer has.
+        if retention_now().is_some() {
+            // A body that cannot fit the budget on its own is turned away
+            // before it is copied. Admitting it would clone the whole response
+            // only for the cache to evict it again, and on the way it would
+            // push out every entry that did fit.
+            if fetch_result.content.len() > self.cache_max_bytes {
+                tracing::debug!(
+                    "Not retaining {}: the response is larger than the whole cache budget",
+                    cache_key.redacted_label()
+                );
+                return Ok(fetch_result);
+            }
+
+            let content = Arc::new(fetch_result.content.clone());
+            let response_headers = Arc::new(fetch_result.response_headers.clone());
+
+            // After the copy: what is left now is what the entry may be granted,
+            // and a response whose freshness the copy exhausted is not admitted.
+            let Some(retain_for) = retention_now() else {
+                tracing::debug!(
+                    "Not retaining {}: no freshness left by the time it could be stored",
+                    cache_key.redacted_label()
+                );
+                return Ok(fetch_result);
+            };
+
+            let entry = CachedResponse {
+                content,
+                max_age: retain_for,
+                detected_format: Some(fetch_result.detected_format.clone()),
+                response_date: fetch_result.response_date,
+                response_status: fetch_result.response_status,
+                response_headers,
+            };
+            // An entry the budget cannot charge for is not admitted: it would be
+            // billed less than it holds, which is how a byte bound stops binding.
+            if entry_weight(&cache_key, &entry).is_some() {
+                self.cache.insert(cache_key, entry).await;
+                // Occupancy is `moka`'s own deferred bookkeeping, so it answers
+                // for the last settled state rather than for this insert.
+                // Settling here keeps the gauges from describing a cache one
+                // write out of date for as long as the dataset stays idle. Only
+                // on admission: a hit moves nothing worth the housekeeping.
+                self.cache.run_pending_tasks().await;
+            } else {
+                tracing::debug!(
+                    "Not retaining {}: the response is larger than the cache can account for",
+                    cache_key.redacted_label()
+                );
+            }
+            self.record_cache_gauges();
+        }
+
+        Ok(fetch_result)
     }
 
     fn get_projected_schema(
@@ -1512,6 +2314,13 @@ pub struct HttpExec {
     /// When `true`, the partitions are a template that will be expanded
     /// at runtime by `HttpWithDeferredParamsExec`. Display shows `partitions=deferred`.
     deferred_partitions: bool,
+    /// Counts fetches that turned into a successful batch despite carrying a
+    /// retryable `response_status` (5xx/429) — see
+    /// [`crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME`]. Lives on the plan tree
+    /// rather than the batch schema, so it survives a user projection that
+    /// prunes `response_status` out of the batch before `cache::batches_cacheable`
+    /// ever sees it.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl HttpExec {
@@ -1565,6 +2374,7 @@ impl HttpExec {
             limit,
             properties,
             deferred_partitions: false,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -1635,12 +2445,23 @@ impl HttpExec {
             existing.len(),
         );
 
-        Ok(Self::new(
+        // Share `self.metrics` rather than starting a fresh
+        // `ExecutionPlanMetricsSet`: `HttpWithDeferredParamsExec::execute`
+        // dynamically rewrites and runs a fresh `HttpExec` built from this
+        // method, discarding it once the stream completes, while the plan
+        // tree `cache::plan_saw_transient_http_failure` walks still holds
+        // only the original, pre-rewrite `HttpExec` template. Cloning
+        // `ExecutionPlanMetricsSet` shares its underlying metrics set, so a
+        // counter incremented on the rewritten exec is visible through the
+        // template's `metrics()` too.
+        let mut expanded = Self::new(
             Arc::clone(&self.projected_schema),
             Arc::clone(&self.provider),
             new_partitions,
             self.limit,
-        ))
+        );
+        expanded.metrics = self.metrics.clone();
+        Ok(expanded)
     }
 
     async fn fetch_and_create_batch(
@@ -1679,14 +2500,41 @@ impl HttpExec {
         let content_rows =
             parse_content_with_map_to_array(&result.content, self.limit, map_to_array);
 
-        self.create_batch_from_rows(
+        let batch = self.create_batch_from_rows(
             path.as_deref(),
             query.as_deref(),
             body.as_deref(),
             request_headers.as_deref(),
             &content_rows,
             &result,
-        )
+        )?;
+
+        if HttpTableProvider::is_retryable_status(result.response_status) {
+            MetricBuilder::new(&self.metrics)
+                .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, partition)
+                .add(1);
+        }
+
+        Ok(batch)
+    }
+
+    /// `self.projected_schema` with [`crate::HTTP_RESPONSE_STATUS_METADATA_KEY`]
+    /// overridden to `status`, so a batch carries the real HTTP status of the
+    /// fetch that produced it even when a JSON-decomposed dataset's declared
+    /// schema has no `response_status` column to hold it. The value also
+    /// doubles as the provenance signal `cache::http_fetch_status` checks
+    /// (only this connector ever sets it) -- a plain presence check, not a
+    /// fixed sentinel, since the value now varies per fetch.
+    fn schema_with_fetch_status(&self, status: u16) -> SchemaRef {
+        let mut metadata = self.projected_schema.metadata().clone();
+        metadata.insert(
+            crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+            status.to_string(),
+        );
+        Arc::new(Schema::new_with_metadata(
+            self.projected_schema.fields().clone(),
+            metadata,
+        ))
     }
 
     /// Create a `RecordBatch` from pre-parsed content rows and HTTP response metadata.
@@ -1699,9 +2547,35 @@ impl HttpExec {
         content_rows: &[String],
         fetch_result: &HttpFetchResult,
     ) -> DataFusionResult<RecordBatch> {
+        // A body that decomposes to zero rows is ambiguous on its own: for a 2xx
+        // response it is a legitimate empty result, but for a retryable failure
+        // (5xx/429, e.g. an empty or `[]` error body) there are no rows to carry
+        // `response_status` on at all — an empty batch here would be
+        // indistinguishable from a real empty result to `cache::batches_cacheable`
+        // and to any caller, which is the empty-result shape #14157 was reported
+        // against. A row-count-independent signal is needed, and this connector
+        // has no side channel to carry one through `TableProvider::scan` — so
+        // surface it as an actual fetch error instead of a successful empty
+        // batch. `CacheRefreshHelper::handle_cache_miss`'s existing `Err` arm
+        // already implements stale-if-error correctly (serve the cached copy
+        // inside the window, propagate the error past it or with nothing
+        // cached), and for any other refresh mode or an unaccelerated query the
+        // error reaches the caller directly rather than being cached by the
+        // independent SQL results cache as if it were data.
         let num_rows = content_rows.len();
 
         if num_rows == 0 {
+            if HttpTableProvider::is_retryable_status(fetch_result.response_status) {
+                return Err(if fetch_result.response_status == 429 {
+                    Error::RateLimited {
+                        message: "the origin answered 429 Too Many Requests with an empty body"
+                            .to_string(),
+                    }
+                } else {
+                    self.provider.error_response(fetch_result.response_status)
+                }
+                .into());
+            }
             return RecordBatch::try_new(
                 Arc::clone(&self.projected_schema),
                 self.projected_schema
@@ -1760,8 +2634,11 @@ impl HttpExec {
             })
             .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
 
-        let batch = RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
-            .map_err(DataFusionError::from)?;
+        let batch = RecordBatch::try_new(
+            self.schema_with_fetch_status(fetch_result.response_status),
+            columns,
+        )
+        .map_err(DataFusionError::from)?;
         Ok(batch)
     }
 
@@ -1899,7 +2776,7 @@ impl HttpExec {
             .filter(|f| !nesting.metadata_fields.contains(f.name()))
             .map(|f| f.name().as_str())
             .collect();
-        let catchall_projected = body_field_names.contains(&nesting.json_field_name.as_str());
+        let catchall_projected = body_field_names.contains(&nesting.json_field_name());
 
         // Build body-derived columns via string builders, in projected
         // (not full-schema) order, restricted to non-metadata fields.
@@ -1984,8 +2861,11 @@ impl HttpExec {
             }
         }
 
-        RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
-            .map_err(DataFusionError::from)
+        RecordBatch::try_new(
+            self.schema_with_fetch_status(fetch_result.response_status),
+            columns,
+        )
+        .map_err(DataFusionError::from)
     }
 
     /// Parse content into individual rows
@@ -2095,6 +2975,17 @@ impl ExecutionPlan for HttpExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -2104,6 +2995,10 @@ impl ExecutionPlan for HttpExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn execute(
@@ -2375,8 +3270,30 @@ impl ExecutionPlan for HttpExec {
                             state.done = true;
                         }
 
-                        // Skip empty pages internally — loop again instead of yielding
+                        // Skip empty pages internally — loop again instead of yielding.
+                        // An empty page is ambiguous the same way a non-paginated empty
+                        // body is (see `create_batch_from_rows`): a retryable status
+                        // (5xx/429) with no rows means this page carries an origin
+                        // failure, not a legitimate end of data, and `state.done` being
+                        // true for it — the common case, since a failed page usually
+                        // carries no valid `next` link either — would otherwise let
+                        // pagination end the stream with `Ok(None)` before this fetch's
+                        // status is ever checked, bypassing `create_batch_from_rows`
+                        // entirely.
                         if content_rows.is_empty() {
+                            if HttpTableProvider::is_retryable_status(fetch_result.response_status)
+                            {
+                                return Err(if fetch_result.response_status == 429 {
+                                    Error::RateLimited {
+                                        message: "the origin answered 429 Too Many Requests \
+                                            with an empty body"
+                                            .to_string(),
+                                    }
+                                } else {
+                                    exec.provider.error_response(fetch_result.response_status)
+                                }
+                                .into());
+                            }
                             if state.done {
                                 return Ok(None);
                             }
@@ -2392,6 +3309,12 @@ impl ExecutionPlan for HttpExec {
                             &content_rows,
                             &fetch_result,
                         )?;
+
+                        if HttpTableProvider::is_retryable_status(fetch_result.response_status) {
+                            MetricBuilder::new(&exec.metrics)
+                                .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, partition)
+                                .add(1);
+                        }
 
                         state.rows_fetched += num_rows;
 
@@ -2494,8 +3417,8 @@ fn resolve_and_validate_url(raw: &str, base_url: &Url, context: &str) -> Result<
         return Err(Error::Pagination {
             message: format!(
                 "{context} URL origin '{}' does not match base URL origin '{}'. The next page URL must stay on the same origin.",
-                resolved.origin().ascii_serialization(),
-                base_url.origin().ascii_serialization(),
+                endpoint_label(&resolved),
+                endpoint_label(base_url),
             ),
         });
     }
@@ -3307,9 +4230,16 @@ impl HttpTableProvider {
                 });
             }
 
-            if self.auth.is_some() && header_name == AUTHORIZATION {
+            if self
+                .auth
+                .as_ref()
+                .is_some_and(|auth| auth.header_name() == header_name)
+            {
                 return Err(Error::FilterRejected {
-                    message: "The 'request_headers' object cannot set 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_headers or disable HTTP authentication.".to_string(),
+                    message: format!(
+                        "The 'request_headers' object cannot set '{name}' when HTTP authentication is configured; that header carries the auth token. Remove '{name}' from request_headers or disable HTTP authentication.",
+                        name = header_name.as_str(),
+                    ),
                 });
             }
 
@@ -3365,6 +4295,1090 @@ impl HttpTableProvider {
 }
 
 #[cfg(test)]
+mod response_cache_tests {
+    use super::{
+        CacheKey, CachedResponse, HttpTableProvider, ResponseCache, build_response_cache,
+        entry_weight,
+    };
+    use reqwest::Client;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+    use url::Url;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A provider pointed at `origin`, with acceleration off so the response
+    /// cache is the thing under test.
+    fn provider_for(origin: &MockServer) -> HttpTableProvider {
+        HttpTableProvider::new(
+            Url::parse(&origin.uri()).expect("the mock server's URI is a valid URL"),
+            Client::new(),
+            "json".to_string(),
+            false,
+        )
+    }
+
+    fn entry(body_bytes: usize, retain_for: Duration) -> CachedResponse {
+        CachedResponse {
+            content: Arc::new("x".repeat(body_bytes)),
+            max_age: retain_for,
+            detected_format: Some("json".to_string()),
+            response_date: None,
+            response_status: 200,
+            response_headers: Arc::new(Vec::new()),
+        }
+    }
+
+    fn key(id: usize) -> CacheKey {
+        CacheKey {
+            path: "/v1/messages".to_string(),
+            query: Some(format!("id={id}")),
+            body: None,
+            request_headers: None,
+        }
+    }
+
+    /// Settles the cache's deferred bookkeeping, which its size and count are
+    /// reported from.
+    async fn settle(cache: &ResponseCache) {
+        cache.run_pending_tasks().await;
+    }
+
+    /// The budget is what makes this cache safe on a request-keyed workload,
+    /// where the number of distinct keys is unbounded by construction.
+    #[tokio::test]
+    async fn insertion_past_the_budget_evicts_rather_than_growing() {
+        let body = 4096;
+        // Room for roughly four entries.
+        let cache = build_response_cache(body * 4);
+
+        for id in 0..200 {
+            cache
+                .insert(key(id), entry(body, Duration::from_mins(5)))
+                .await;
+        }
+        settle(&cache).await;
+
+        let budget = (body * 4) as u64;
+        assert!(
+            cache.weighted_size() <= budget,
+            "the cache must stay inside its byte budget, but holds {} of {budget}",
+            cache.weighted_size()
+        );
+        assert!(
+            cache.entry_count() < 200,
+            "200 distinct keys must not all be retained under a four-entry budget"
+        );
+    }
+
+    /// Retention follows the window resolved at admission. Declining to *serve* a
+    /// stale entry while keeping it is what let this cache hold every response a
+    /// process ever fetched.
+    #[tokio::test]
+    async fn an_entry_past_its_window_is_not_served() {
+        let cache = build_response_cache(1024 * 1024);
+        // A zero window cannot contain any elapsed time, so this is already past
+        // it — which is also how a `no-store` response is handed to its caller
+        // without being kept.
+        cache.insert(key(1), entry(4096, Duration::ZERO)).await;
+        settle(&cache).await;
+
+        assert!(
+            cache.get(&key(1)).await.is_none(),
+            "an entry past its retention window must not be served"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_entry_is_served() {
+        let cache = build_response_cache(1024 * 1024);
+        cache
+            .insert(key(1), entry(4096, Duration::from_mins(5)))
+            .await;
+        settle(&cache).await;
+        assert!(cache.get(&key(1)).await.is_some());
+    }
+
+    /// The invariant the admission path exists to hold: a response the origin
+    /// refused to have stored is served to its caller and kept by nobody.
+    ///
+    /// Driven through `get_response` rather than asserted on
+    /// `effective_retention`, because the claim is about *admission*. Deciding
+    /// correctly and storing anyway is precisely the failure this guards.
+    #[tokio::test]
+    async fn a_no_store_response_is_served_but_never_admitted() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/report"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    // A `max-age` beside `no-store` is the case that used to be
+                    // cached in defiance of the directive.
+                    .insert_header("cache-control", "no-store, max-age=600")
+                    .set_body_string(r#"{"rows":1}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        let served = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served to its caller");
+        assert_eq!(served.content, r#"{"rows":1}"#);
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a no-store response must not be retained"
+        );
+        assert_eq!(
+            provider.cache.weighted_size(),
+            0,
+            "and must not occupy the byte budget"
+        );
+    }
+
+    /// The regression this admission path was rebuilt for.
+    ///
+    /// Storing a refused response and expiring it immediately is not the same as
+    /// not storing it: an entry admitted with a zero window stays resident and
+    /// billed until something evicts it. A workload of nothing but `no-store`
+    /// responses — an API proxy, the shape this cache exists for — would fill
+    /// the whole budget with responses it was forbidden to keep, evicting the
+    /// ones it was allowed to.
+    #[tokio::test]
+    async fn a_no_store_workload_accumulates_nothing() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "no-store")
+                    .set_body_string("x".repeat(4096)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        for id in 0..200 {
+            provider
+                .get_response(&format!("/report/{id}"), None, None, None)
+                .await
+                .expect("each response is served");
+        }
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "200 refused responses must leave nothing behind"
+        );
+        assert_eq!(provider.cache.weighted_size(), 0);
+    }
+
+    /// A response can be stale before it lands. `max-age` is spent from when the
+    /// origin generated the response, so a round trip longer than the window
+    /// leaves nothing to retain — admitting it would serve data the origin
+    /// already considered expired.
+    ///
+    /// This is the one place a fixed delay is the subject rather than a
+    /// readiness wait: the elapsed round trip is exactly what is under test.
+    #[tokio::test]
+    async fn a_response_slower_than_its_freshness_window_is_not_admitted() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=1")
+                    .set_body_string(r#"{"rows":6}"#)
+                    .set_delay(Duration::from_millis(1500)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        let served = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served to its caller");
+        assert_eq!(served.content, r#"{"rows":6}"#);
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response whose freshness elapsed in transit must not be retained"
+        );
+    }
+
+    /// An `Age` that cannot be read leaves the remaining freshness unknown.
+    /// Treating it as zero would hand a full window back to a response that may
+    /// have almost none left, so it refuses retention as an unreadable
+    /// `Cache-Control` does.
+    #[tokio::test]
+    async fn an_unreadable_age_refuses_retention() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("age", "not-a-number")
+                    .set_body_string(r#"{"rows":7}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "an unreadable Age must not yield a fresh full window"
+        );
+    }
+
+    /// `Age` is untrusted response data. A value near `u64::MAX` overflows the
+    /// addition of the elapsed round trip and panics, taking down the query
+    /// rather than declining to cache.
+    ///
+    /// The delay is load-bearing, not a readiness wait: `Duration` carries into
+    /// its seconds field only once the elapsed time reaches a second, so without
+    /// it the addition stays inside the nanosecond field and cannot overflow —
+    /// the test would then pass whether or not the addition saturates.
+    #[tokio::test]
+    async fn an_absurd_age_neither_panics_nor_is_retained() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("age", "18446744073709551615")
+                    .set_body_string(r#"{"rows":8}"#)
+                    .set_delay(Duration::from_millis(1100)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        let served = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is served rather than panicking the query");
+        assert_eq!(served.content, r#"{"rows":8}"#);
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response older than any window has no freshness left to retain"
+        );
+    }
+
+    /// Replacing an entry replaces its window. `moka`'s default keeps the
+    /// existing expiry on an update, so without an `expire_after_update` a key
+    /// re-admitted with a shorter window keeps the longer one it had — and two
+    /// concurrent misses that both fetch and both insert are exactly that.
+    #[tokio::test]
+    async fn re_admitting_a_key_takes_the_new_window_not_the_old() {
+        let cache = build_response_cache(1024 * 1024);
+        cache
+            .insert(key(1), entry(64, Duration::from_mins(10)))
+            .await;
+        cache.run_pending_tasks().await;
+        cache
+            .insert(key(1), entry(64, Duration::from_millis(200)))
+            .await;
+        cache.run_pending_tasks().await;
+
+        // Long enough for the *new* window to have elapsed, far short of the old
+        // one. Time is the subject here, so the wait is the test.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cache.run_pending_tasks().await;
+
+        assert!(
+            cache.get(&key(1)).await.is_none(),
+            "the replacement's window must govern, or a short-lived response is served for its predecessor's window"
+        );
+    }
+
+    /// This cache is shared: entries are keyed by request shape and served to
+    /// whichever query asks next. `private` is the origin forbidding exactly
+    /// that reuse.
+    #[test]
+    fn private_forbids_retention_in_a_shared_cache() {
+        let directives = HttpTableProvider::parse_cache_control(Some("private, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "a private response must not be retained by a cache that serves other queries"
+        );
+    }
+
+    /// `s-maxage` is addressed to shared caches and outranks `max-age`, so
+    /// `s-maxage=0` refuses this cache while still allowing a private one the
+    /// ten minutes `max-age` grants.
+    #[test]
+    fn s_maxage_outranks_max_age() {
+        let refused = HttpTableProvider::parse_cache_control(Some("s-maxage=0, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&refused, None, None),
+            None
+        );
+
+        let shortened = HttpTableProvider::parse_cache_control(Some("s-maxage=60, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&shortened, None, None),
+            Some(Duration::from_mins(1)),
+            "the shared window governs where both were sent"
+        );
+    }
+
+    /// The weigher charges for the containers, not only the text they hold. A
+    /// response of many short headers is dominated by the tuples themselves, so
+    /// charging only the text understates it badly.
+    #[test]
+    fn many_short_headers_are_charged_for_their_containers() {
+        let headers: Vec<(String, String)> = (0..64)
+            .map(|i| (format!("x-h{i}"), "v".to_string()))
+            .collect();
+        let text: usize = headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        let with_headers = CachedResponse {
+            content: Arc::new(String::new()),
+            max_age: Duration::from_mins(5),
+            detected_format: None,
+            response_date: None,
+            response_status: 200,
+            response_headers: Arc::new(headers),
+        };
+        assert!(
+            with_headers.retained_bytes() > text * 2,
+            "64 header tuples cost far more than their {text} bytes of text, but were charged {}",
+            with_headers.retained_bytes()
+        );
+    }
+
+    /// A body larger than the whole budget can never fit, so it is turned away
+    /// before it is copied — admitting it would clone the response only to evict
+    /// it again, pushing out every entry that did fit on the way.
+    #[tokio::test]
+    async fn a_body_larger_than_the_budget_evicts_nothing() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/small"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .set_body_string("small"),
+            )
+            .mount(&origin)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/huge"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .set_body_string("x".repeat(8192)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin).with_cache_limits(4096, None);
+        provider
+            .get_response("/small", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(provider.cache.entry_count(), 1, "the small entry is held");
+
+        provider
+            .get_response("/huge", None, None, None)
+            .await
+            .expect("the oversized response is still served to its caller");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "the oversized response must neither be retained nor displace what fit"
+        );
+    }
+
+    /// An intermediary that relays a response without adding `Age` still leaves
+    /// the origin's `Date` behind. Reading only `Age` there would hand back a
+    /// full window to a response whose freshness is already spent.
+    #[tokio::test]
+    async fn an_old_date_without_an_age_header_is_not_retained() {
+        let origin = MockServer::start().await;
+        let an_hour_ago = httpdate::fmt_http_date(SystemTime::now() - Duration::from_hours(1));
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("date", an_hour_ago.as_str())
+                    .set_body_string(r#"{"rows":9}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response dated an hour ago has none of its ten-minute window left"
+        );
+    }
+
+    /// An origin clock running ahead of ours must read as "brand new" rather
+    /// than as a negative age, or a skewed clock would silently disable caching.
+    #[tokio::test]
+    async fn a_future_date_does_not_prevent_caching() {
+        let origin = MockServer::start().await;
+        let an_hour_ahead = httpdate::fmt_http_date(SystemTime::now() + Duration::from_hours(1));
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("date", an_hour_ahead.as_str())
+                    .set_body_string(r#"{"rows":10}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "a clock ahead of ours must not read as negative age"
+        );
+    }
+
+    /// Directive *names* are case-insensitive. Matching them exactly let
+    /// `S-MaxAge=0` slip past the shared-cache refusal and keep the response for
+    /// the ten minutes `max-age` granted.
+    #[test]
+    fn directive_names_are_matched_case_insensitively() {
+        let shouted = HttpTableProvider::parse_cache_control(Some("S-MaxAge=0, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&shouted, None, None),
+            None,
+            "a shared-cache refusal binds however it is spelled"
+        );
+
+        for spelling in ["NO-STORE", "No-Cache", "PRIVATE"] {
+            let directives = HttpTableProvider::parse_cache_control(Some(spelling));
+            assert_eq!(
+                HttpTableProvider::effective_retention(
+                    &directives,
+                    Some(Duration::from_mins(1)),
+                    None
+                ),
+                None,
+                "{spelling} must refuse retention"
+            );
+        }
+
+        let mixed = HttpTableProvider::parse_cache_control(Some("Max-Age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&mixed, None, None),
+            Some(Duration::from_mins(10)),
+            "a freshness directive is honoured however it is spelled"
+        );
+    }
+
+    /// A `max-age` sent with no value at all is not a usable freshness, and must
+    /// not fall through to a configured fallback as though the origin had said
+    /// nothing.
+    #[test]
+    fn a_valueless_max_age_refuses_retention() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None
+        );
+    }
+
+    /// The wait for a response counts against an `Age` the origin declared, but
+    /// not against the age its `Date` already implies — that one is measured on
+    /// arrival and contains the wait already. Charging both turns away
+    /// short-lived responses that are still fresh.
+    ///
+    /// Asserted on the arithmetic rather than against a live server: the window
+    /// that distinguishes the right answer from the double-counted one is only
+    /// as wide as the wait itself, so a wall-clock test of it is inherently
+    /// marginal and flakes under load. This is where the bug lived.
+    #[test]
+    fn the_wait_is_charged_to_age_but_not_to_the_date() {
+        let three_seconds = Duration::from_secs(3);
+        let two_seconds = Duration::from_secs(2);
+
+        // `Date` says three seconds; the two-second wait is already inside that.
+        assert_eq!(
+            HttpTableProvider::age_on_arrival(None, three_seconds, two_seconds),
+            three_seconds,
+            "the wait must not be added to an age measured on arrival"
+        );
+
+        // `Age` says three seconds as of when the origin sent it, so the wait is.
+        assert_eq!(
+            HttpTableProvider::age_on_arrival(Some(three_seconds), Duration::ZERO, two_seconds),
+            Duration::from_secs(5),
+            "the wait must be added to an age declared at the origin"
+        );
+
+        // Both present: the greater wins, so an origin under-declaring `Age`
+        // gains nothing by it.
+        assert_eq!(
+            HttpTableProvider::age_on_arrival(
+                Some(Duration::from_secs(1)),
+                Duration::from_hours(1),
+                two_seconds
+            ),
+            Duration::from_hours(1)
+        );
+    }
+
+    /// `Age` is untrusted, so the addition saturates rather than panicking.
+    /// Saturation lands on `Duration::MAX`, which carries the sub-second part
+    /// too — the point is that it neither panics nor wraps to something small.
+    #[test]
+    fn an_absurd_age_saturates_rather_than_overflowing() {
+        let saturated = HttpTableProvider::age_on_arrival(
+            Some(Duration::from_secs(u64::MAX)),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        assert_eq!(saturated, Duration::MAX);
+        assert!(
+            saturated > Duration::from_secs(u64::MAX / 2),
+            "an absurd age must stay absurd rather than wrapping to something servable"
+        );
+    }
+
+    /// `Vary: *` says the response must never satisfy a later request. No
+    /// freshness window makes it reusable, so it is refused outright — otherwise
+    /// an endpoint returning changing data behind `max-age` would have its first
+    /// body served to every query for the rest of the window.
+    #[tokio::test]
+    async fn vary_star_refuses_retention() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "*")
+                    .set_body_string(r#"{"rows":12}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response that may never be reused must not be retained"
+        );
+    }
+
+    /// A named `Vary` is not treated the same way, and that is the point of
+    /// matching only `*`: what varies between requests here — path, query, body
+    /// and the headers a query supplies — is already the cache key, so a named
+    /// field cannot make one request's response answer a different request.
+    #[tokio::test]
+    async fn a_named_vary_field_still_caches() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "accept-encoding, accept")
+                    .set_body_string(r#"{"rows":13}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "a named Vary must not be read as a blanket refusal"
+        );
+    }
+
+    /// `Vary` naming the authenticator's header is refused, because that value
+    /// is the one connector header that is *not* stable: an OAuth token is
+    /// refreshed in the background, so a later request can carry a different
+    /// credential than the stored representation was selected for.
+    #[tokio::test]
+    async fn vary_on_the_auth_header_refuses_retention() {
+        #[derive(Debug)]
+        struct RotatingAuth;
+        impl super::super::auth::HttpAuthenticator for RotatingAuth {
+            fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+                builder.header(reqwest::header::AUTHORIZATION, "Bearer whatever")
+            }
+            fn header_name(&self) -> &reqwest::header::HeaderName {
+                &reqwest::header::AUTHORIZATION
+            }
+        }
+
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "authorization")
+                    .set_body_string(r#"{"rows":14}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        // Without the authenticator the same response is cacheable, which is
+        // what makes this about the rotating credential rather than about
+        // `Vary` naming anything at all.
+        let unauthenticated = provider_for(&origin);
+        unauthenticated
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&unauthenticated.cache).await;
+        assert_eq!(unauthenticated.cache.entry_count(), 1);
+
+        let authenticated = provider_for(&origin).with_auth(Arc::new(RotatingAuth));
+        authenticated
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&authenticated.cache).await;
+        assert_eq!(
+            authenticated.cache.entry_count(),
+            0,
+            "a representation selected on a credential that rotates must not be retained"
+        );
+    }
+
+    /// An unreadable `Vary` leaves the selection unknown, and unknown resolves
+    /// against caching here as it does for `Cache-Control` and `Age`.
+    #[tokio::test]
+    async fn an_unreadable_vary_refuses_retention() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header(
+                        "vary",
+                        reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe])
+                            .expect("bytes are a legal header value even though they are not text"),
+                    )
+                    .set_body_string(r#"{"rows":15}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a Vary we cannot read must not be treated as no Vary at all"
+        );
+    }
+
+    /// The positive control: a response the origin *does* allow to be cached is
+    /// admitted, and the next identical request is served without reaching the
+    /// origin again. Without this, a cache that admitted nothing at all would
+    /// pass every test above.
+    #[tokio::test]
+    async fn a_cacheable_response_is_admitted_and_then_served_without_the_origin() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/report"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .set_body_string(r#"{"rows":2}"#),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        for _ in 0..3 {
+            let served = provider
+                .get_response("/report", None, None, None)
+                .await
+                .expect("the response is served");
+            assert_eq!(served.content, r#"{"rows":2}"#);
+        }
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "the cacheable response is retained"
+        );
+        // `expect(1)` on the mock is verified on drop: three calls, one origin
+        // request.
+        drop(origin);
+    }
+
+    /// An origin that says nothing is not cached unless a fallback was
+    /// configured for exactly that case.
+    #[tokio::test]
+    async fn a_silent_origin_is_admitted_only_under_a_configured_fallback() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"rows":3}"#))
+            .mount(&origin)
+            .await;
+
+        let without_fallback = provider_for(&origin);
+        without_fallback
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&without_fallback.cache).await;
+        assert_eq!(
+            without_fallback.cache.entry_count(),
+            0,
+            "with no fallback configured, a silent origin is not retained"
+        );
+
+        let with_fallback =
+            provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::from_mins(5)));
+        with_fallback
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&with_fallback.cache).await;
+        assert_eq!(
+            with_fallback.cache.entry_count(),
+            1,
+            "the fallback applies where the origin said nothing"
+        );
+    }
+
+    /// A zero fallback is a configured refusal, not a window of no length —
+    /// otherwise it would admit entries that are expired on arrival and still
+    /// occupy the budget.
+    #[tokio::test]
+    async fn a_zero_fallback_retains_nothing() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"rows":4}"#))
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::ZERO));
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(provider.cache.entry_count(), 0);
+    }
+
+    /// A zero budget disables the cache rather than admitting an entry and
+    /// immediately evicting it.
+    #[tokio::test]
+    async fn a_zero_budget_retains_nothing() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .set_body_string(r#"{"rows":5}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin).with_cache_limits(0, None);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(provider.cache.entry_count(), 0);
+        assert_eq!(provider.cache.weighted_size(), 0);
+    }
+
+    /// An error body is not served back from the cache afterwards.
+    ///
+    /// What keeps an error body out of the cache is that the origin never marked it
+    /// retainable — not that the fetch refused it. Worth pinning because retaining one
+    /// would serve it for the whole of its window, long after the origin recovered.
+    ///
+    /// A 404 under `store` is the status that still reaches admission: it is content by
+    /// the dataset's own choice, so the assertion below is about this cache rather than
+    /// about the fetch path. A 500 would not do — it is refused before a body exists
+    /// (see [`crate::http::provider::ErrorResponseAction`]), which would leave the cache
+    /// empty however broken admission was.
+    #[tokio::test]
+    async fn an_unmarked_error_body_is_not_retained() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such report"))
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin)
+            .with_error_response_action(crate::http::provider::ErrorResponseAction::Store);
+        let fetched = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("`store` must answer a 404 with its body, or this asserts nothing");
+        assert_eq!(
+            fetched.response_status, 404,
+            "the body under test has to be the error response itself"
+        );
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "an error response the origin did not mark retainable must leave nothing behind"
+        );
+    }
+
+    /// A second `max-age` makes the response's freshness ambiguous. Letting the
+    /// later value win would retain `max-age=0, max-age=600` for ten minutes
+    /// when the origin also said not to reuse it at all.
+    #[test]
+    fn conflicting_max_age_directives_refuse_retention() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=0, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "an ambiguous freshness must not be resolved in favour of caching"
+        );
+
+        // Also across repeated fields, which is the same ambiguity.
+        let split = HttpTableProvider::parse_cache_control_values(
+            [Some("max-age=0"), Some("max-age=600")].into_iter(),
+        );
+        assert_eq!(
+            HttpTableProvider::effective_retention(&split, None, None),
+            None
+        );
+    }
+
+    /// The byte budget only binds while every entry can be charged what it
+    /// holds, and `moka` weighs in `u32`, so an entry of 4 GiB or more cannot
+    /// be. Admission refuses those rather than storing them at a discount.
+    ///
+    /// Only the chargeable side is asserted here: the refusal branch needs a
+    /// 4 GiB body to reach, which is not worth allocating in a unit test. What
+    /// this does guard is the inversion that would actually bite — a guard that
+    /// rejects ordinary responses and silently empties the cache. That an
+    /// ordinary response is still admitted end to end is covered by
+    /// `a_cacheable_response_is_admitted_and_then_served_without_the_origin`.
+    #[test]
+    fn an_ordinary_entry_is_chargeable() {
+        assert!(
+            entry_weight(&key(1), &entry(4096, Duration::from_mins(5))).is_some(),
+            "an ordinary response must be chargeable, or nothing would ever be cached"
+        );
+    }
+
+    /// A repeated `Cache-Control` field binds as much as a single combined one.
+    /// Reading only the first would admit a response that put `max-age` there
+    /// and `no-store` in the next field.
+    #[test]
+    fn a_refusal_in_a_later_cache_control_field_still_binds() {
+        let directives = HttpTableProvider::parse_cache_control_values(
+            [Some("max-age=600"), Some("no-store")].into_iter(),
+        );
+        assert!(directives.forbid_retention);
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "a no-store in any field refuses retention"
+        );
+    }
+
+    /// A header we cannot read is the origin having spoken, not silence. Treating
+    /// it as absent would let a configured fallback retain a response that may
+    /// well have refused retention.
+    #[test]
+    fn an_unreadable_cache_control_refuses_retention() {
+        let directives = HttpTableProvider::parse_cache_control_values([None].into_iter());
+        assert!(directives.present, "the origin did send a header");
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "an unreadable directive must not fall through to the fallback"
+        );
+    }
+
+    /// Likewise a `max-age` whose value will not parse.
+    #[test]
+    fn an_unreadable_max_age_refuses_retention() {
+        let directives = HttpTableProvider::parse_cache_control("max-age=soon".into());
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None
+        );
+    }
+
+    /// `max-age` runs from when the origin generated the response, so a response
+    /// relayed by an intermediary arrives part-spent and may only be kept for
+    /// what is left. Keeping it for the full window would serve it stale.
+    #[test]
+    fn an_aged_response_is_retained_only_for_what_is_left() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(
+                &directives,
+                None,
+                Some(Duration::from_secs(599))
+            ),
+            Some(Duration::from_secs(1)),
+            "600s of freshness minus 599s already spent leaves one second"
+        );
+    }
+
+    #[test]
+    fn a_response_whose_freshness_is_spent_is_not_retained() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(
+                &directives,
+                None,
+                Some(Duration::from_mins(10))
+            ),
+            None,
+            "a response that arrives already stale must not be admitted"
+        );
+    }
+
+    /// The fallback is how long the operator asked us to keep a response the
+    /// origin said nothing about, so an `Age` from an intermediary does not eat
+    /// into it.
+    #[test]
+    fn age_does_not_shorten_the_configured_fallback() {
+        let silent = HttpTableProvider::parse_cache_control(None);
+        assert_eq!(
+            HttpTableProvider::effective_retention(
+                &silent,
+                Some(Duration::from_mins(5)),
+                Some(Duration::from_hours(1))
+            ),
+            Some(Duration::from_mins(5))
+        );
+    }
+
+    /// `no-store` is the origin refusing retention, and it wins over a `max-age`
+    /// sent beside it. Parsing only `max-age` meant such a response was cached in
+    /// defiance of the directive.
+    #[test]
+    fn no_store_beats_a_max_age_sent_with_it() {
+        let directives = HttpTableProvider::parse_cache_control(Some("no-store, max-age=600"));
+        assert!(directives.forbid_retention);
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "an origin that says no-store must not be retained, fallback or not"
+        );
+    }
+
+    #[test]
+    fn no_cache_is_also_a_refusal() {
+        let directives = HttpTableProvider::parse_cache_control(Some("no-cache"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None
+        );
+    }
+
+    /// The origin's own window is honoured exactly when it sends one.
+    #[test]
+    fn the_origins_max_age_is_used_when_present() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=300"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            Some(Duration::from_mins(5)),
+            "the origin decides its own freshness, not the local fallback"
+        );
+    }
+
+    /// The fallback applies only where the origin said nothing at all — and with
+    /// none configured, such a response stays uncached, which is the behaviour
+    /// before this option existed.
+    #[test]
+    fn the_fallback_applies_only_when_the_origin_was_silent() {
+        let silent = HttpTableProvider::parse_cache_control(None);
+        assert_eq!(
+            HttpTableProvider::effective_retention(&silent, Some(Duration::from_mins(1)), None),
+            Some(Duration::from_mins(1)),
+            "a header-less origin may use the configured fallback"
+        );
+        assert_eq!(
+            HttpTableProvider::effective_retention(&silent, None, None),
+            None,
+            "and with no fallback it is not cached, as before"
+        );
+    }
+
+    /// A `Cache-Control` that carried no usable `max-age` is still the origin
+    /// having spoken, so the local fallback must not override it.
+    #[test]
+    fn a_zero_max_age_is_not_overridden_by_the_fallback() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=0"));
+        assert_eq!(directives.max_age, Some(Duration::ZERO));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "max-age=0 means do not reuse this response"
+        );
+    }
+
+    /// The key is weighed alongside the response: it owns copies of the
+    /// request's path, query, body and headers, which is not negligible beside a
+    /// small response on a request-keyed workload.
+    #[tokio::test]
+    async fn the_key_is_weighed_alongside_the_response() {
+        let cache = build_response_cache(1024 * 1024);
+        cache.insert(key(1), entry(0, Duration::from_mins(5))).await;
+        settle(&cache).await;
+        assert!(
+            cache.weighted_size() > 0,
+            "an empty response still costs its key"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::arrow::array::Array;
@@ -3372,8 +5386,17 @@ mod tests {
     use datafusion::common::Column;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use reqwest::header::AUTHORIZATION;
+    use runtime_rate_control::{RateControllerBuilder, RateControllerMetrics};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
     use url::Url;
 
     #[derive(Debug)]
@@ -3382,6 +5405,25 @@ mod tests {
     impl super::super::auth::HttpAuthenticator for TestAuthenticator {
         fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
             builder.header(AUTHORIZATION, "Bearer token")
+        }
+
+        fn header_name(&self) -> &reqwest::header::HeaderName {
+            &AUTHORIZATION
+        }
+    }
+
+    /// Authenticator that writes a non-standard header, to exercise the
+    /// configured-header-name conflict guards.
+    #[derive(Debug)]
+    struct CustomHeaderAuthenticator(reqwest::header::HeaderName);
+
+    impl super::super::auth::HttpAuthenticator for CustomHeaderAuthenticator {
+        fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+            builder.header(&self.0, "secret-token")
+        }
+
+        fn header_name(&self) -> &reqwest::header::HeaderName {
+            &self.0
         }
     }
 
@@ -3442,6 +5484,430 @@ mod tests {
             "json".to_string(),
             false,
         )
+    }
+
+    async fn retry_test_server(
+        replies: Vec<(u16, String)>,
+        delay: Duration,
+    ) -> (Url, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test origin");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("origin address")
+        ))
+        .expect("valid origin URL");
+        let count = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::clone(&count);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let ordinal = requests.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = &replies[ordinal.min(replies.len() - 1)];
+                let mut buffer = [0; 4096];
+                if stream.read(&mut buffer).await.is_err() {
+                    continue;
+                }
+                tokio::time::sleep(delay).await;
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nX-Reply: {ordinal}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (url, count, task)
+    }
+
+    fn retry_test_provider(
+        url: Url,
+        max_retries: usize,
+        timeout: Duration,
+    ) -> (HttpTableProvider, Arc<RateControllerMetrics>) {
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let controller = RateControllerBuilder::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_max_concurrent_requests(4)
+            .build();
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("HTTP test client");
+        let mut provider = HttpTableProvider::new(url, client, "json".to_string(), false)
+            .with_rate_controller(Some(controller))
+            .with_max_retries(u32::try_from(max_retries).expect("small retry count"));
+        provider.retry_strategy = RetryBackoffBuilder::new()
+            .max_retries(Some(max_retries))
+            .base_interval(Duration::from_millis(1))
+            .method(BackoffMethod::Linear)
+            .randomization_factor(0.0)
+            .build();
+        (provider, metrics)
+    }
+
+    #[tokio::test]
+    async fn http_retry_budget_transport_failure_and_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refusal socket");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("socket address")
+        ))
+        .expect("valid URL");
+        drop(listener);
+        for budget in [0, 2] {
+            let (provider, permits) =
+                retry_test_provider(url.clone(), budget, Duration::from_secs(2));
+            let Err(error) = provider
+                .perform_request_with_retry(url.clone(), None, None, "/lookup")
+                .await
+            else {
+                panic!("connection refusal should fail");
+            };
+            assert!(matches!(error, Error::HttpRequest { source, .. } if source.is_connect()));
+            assert_eq!(permits.permits_acquired_total(), budget as u64 + 1);
+        }
+
+        let (url, requests, server) =
+            retry_test_server(vec![(200, "{}".to_string())], Duration::from_millis(300)).await;
+        let (provider, permits) = retry_test_provider(url.clone(), 0, Duration::from_millis(50));
+        let Err(error) = provider
+            .perform_request_with_retry(url, None, None, "/lookup")
+            .await
+        else {
+            panic!("timed out origin should fail");
+        };
+        assert!(matches!(error, Error::HttpRequest { source, .. } if source.is_timeout()));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(permits.permits_acquired_total(), 1);
+        server.abort();
+    }
+
+    /// A transport failure names the endpoint's origin and nothing a URL can carry a
+    /// secret in: userinfo, path or query (regression test for #13534).
+    #[tokio::test]
+    async fn http_transport_failure_does_not_render_request_url() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refusal socket");
+        let addr = listener.local_addr().expect("socket address");
+        drop(listener);
+        let url = Url::parse(&format!(
+            "http://user:pass-secret@{addr}/path-secret?api_key=query-secret"
+        ))
+        .expect("valid URL");
+        let origin = format!("http://{addr}");
+        let (provider, _) = retry_test_provider(url.clone(), 0, Duration::from_secs(2));
+
+        let Err(send_error) = provider
+            .perform_request_with_retry(url, None, None, "/path-secret")
+            .await
+        else {
+            panic!("connection refusal should fail");
+        };
+        let validate_error = provider
+            .validate_endpoint()
+            .await
+            .expect_err("connection refusal should fail validation");
+
+        for error in [send_error, validate_error] {
+            assert!(matches!(&error, Error::HttpRequest { source, .. } if source.is_connect()));
+            let rendered = [error.to_string(), DataFusionError::from(error).to_string()];
+            for message in rendered {
+                assert_names_only_origin(&message, &origin);
+            }
+        }
+    }
+
+    /// A health probe that answers non-2xx names the endpoint's origin, not the configured
+    /// URL with its userinfo and query (regression test for #13534).
+    #[tokio::test]
+    async fn http_health_probe_failure_does_not_render_configured_url() {
+        let (mut url, _, server) =
+            retry_test_server(vec![(404, String::new())], Duration::ZERO).await;
+        let origin = endpoint_label(&url);
+        url.set_username("user").expect("set username");
+        url.set_password(Some("pass-secret")).expect("set password");
+        url.set_path("/path-secret");
+        url.set_query(Some("api_key=query-secret"));
+        let (provider, _) = retry_test_provider(url, 0, Duration::from_secs(2));
+        let provider = provider
+            .with_health_probe(Some("/health".to_string()))
+            .expect("valid health probe");
+
+        let error = provider
+            .validate_endpoint()
+            .await
+            .expect_err("a 404 health probe should fail validation");
+        assert_names_only_origin(&error.to_string(), &origin);
+        server.abort();
+    }
+
+    fn assert_names_only_origin(message: &str, origin: &str) {
+        assert!(message.contains(origin), "names the origin: {message}");
+        for secret in ["pass-secret", "path-secret", "query-secret", "user:"] {
+            assert!(!message.contains(secret), "leaks {secret}: {message}");
+        }
+    }
+
+    /// The ladder spends exactly the configured budget, and a retryable status that
+    /// outlives it fails the request under every `on_error_response`: a 5xx or 429 is
+    /// never recorded as a row, so its last body is not read either.
+    #[tokio::test]
+    async fn http_retry_budget_refuses_the_last_retryable_status() {
+        for action in ErrorResponseAction::VARIANTS {
+            for status in [429, 500, 503] {
+                for budget in [0, 2] {
+                    // One reply past the budget, so an extra attempt would be answered
+                    // rather than hang, and would show in the request count.
+                    let replies = (0..=budget + 1)
+                        .map(|i| (status, format!("{{\"attempt\":{i}}}")))
+                        .collect::<Vec<_>>();
+                    let (url, requests, server) = retry_test_server(replies, Duration::ZERO).await;
+                    let (provider, permits) =
+                        retry_test_provider(url.clone(), budget, Duration::from_secs(3));
+                    let provider = provider.with_error_response_action(action);
+                    let Err(error) = provider
+                        .perform_request_with_retry(url, None, None, "/lookup")
+                        .await
+                    else {
+                        panic!("{status} under `{action}` must fail the request");
+                    };
+                    assert!(
+                        matches!(error, Error::ErrorResponse { status: refused, .. } if refused == status),
+                        "{status} under `{action}`: {error}"
+                    );
+                    assert_eq!(requests.load(Ordering::SeqCst), budget + 1);
+                    assert_eq!(permits.permits_acquired_total(), (budget + 1) as u64);
+                    server.abort();
+                }
+            }
+        }
+    }
+
+    /// A body that is recorded as a row is read under the rate-control permit, so a
+    /// response still streaming counts against the concurrency limit. A 404 under
+    /// `store` is the non-2xx case whose body is read.
+    #[tokio::test]
+    async fn http_retry_budget_holds_permit_until_final_body_is_read() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind streaming origin");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("streaming origin address")
+        ))
+        .expect("valid URL");
+        let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+        let (release_body, mut body_ready) = tokio::sync::oneshot::channel();
+        let (second_accepted, second_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = [0; 4096];
+            let bytes_read = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(bytes_read, 0, "request must contain bytes");
+            let body = "{\"message\":\"final-response\"}";
+            let headers = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            headers_sent.send(()).expect("signal response headers");
+            tokio::select! {
+                second = listener.accept() => {
+                    second.expect("accept second request");
+                    second_accepted.send(()).expect("signal second request");
+                    body_ready.await.expect("body release signal");
+                }
+                result = &mut body_ready => {
+                    result.expect("body release signal");
+                }
+            }
+            stream
+                .write_all(body.as_bytes())
+                .await
+                .expect("write response body");
+        });
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let controller = RateControllerBuilder::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_max_concurrent_requests(1)
+            .build();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("streaming test client");
+        let provider = HttpTableProvider::new(url.clone(), client, "json".to_string(), false)
+            .with_rate_controller(Some(controller))
+            .with_max_retries(0)
+            .with_error_response_action(ErrorResponseAction::Store);
+        let second_provider = provider.clone();
+        let second_url = url.clone();
+        let request = tokio::spawn(async move {
+            provider
+                .perform_request_with_retry(url, None, None, "/lookup")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), headers_received)
+            .await
+            .expect("response headers arrived in time")
+            .expect("headers signal sent");
+        let second_request = tokio::spawn(async move {
+            second_provider
+                .perform_request_with_retry(second_url, None, None, "/lookup")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), second_received)
+                .await
+                .is_err(),
+            "the next origin request must wait for the first response body"
+        );
+        assert_eq!(metrics.permits_acquired_total(), 1);
+        assert_eq!(
+            metrics.inflight_permits(),
+            1,
+            "response body still in flight"
+        );
+        second_request.abort();
+        release_body.send(()).expect("release response body");
+        let result = request
+            .await
+            .expect("request task completed")
+            .expect("final HTTP response retained");
+        assert_eq!(result.response_status, 404);
+        assert_eq!(result.content, "{\"message\":\"final-response\"}");
+        assert_eq!(metrics.inflight_permits(), 0);
+        server.await.expect("streaming origin finished");
+    }
+
+    /// A refused retryable status is answered from its status line: the request fails
+    /// without waiting for a body it will not record, and gives its permit back.
+    #[tokio::test]
+    async fn http_retry_budget_refuses_a_retryable_status_without_reading_its_body() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind streaming origin");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("streaming origin address")
+        ))
+        .expect("valid URL");
+        let (release_body, body_ready) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = [0; 4096];
+            let bytes_read = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(bytes_read, 0, "request must contain bytes");
+            let body = "{\"error\":\"unavailable\"}";
+            let headers = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            // The body is withheld until the request has already answered.
+            let _ = body_ready.await;
+            let _ = stream.write_all(body.as_bytes()).await;
+        });
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let controller = RateControllerBuilder::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_max_concurrent_requests(1)
+            .build();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("streaming test client");
+        let provider = HttpTableProvider::new(url.clone(), client, "json".to_string(), false)
+            .with_rate_controller(Some(controller))
+            .with_max_retries(0)
+            .with_error_response_action(ErrorResponseAction::Store);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.perform_request_with_retry(url, None, None, "/lookup"),
+        )
+        .await
+        .expect("the refusal must not wait for the withheld body");
+        let Err(error) = result else {
+            panic!("a 503 must fail the request even under `store`");
+        };
+        assert!(
+            matches!(error, Error::ErrorResponse { status: 503, .. }),
+            "{error}"
+        );
+        assert_eq!(metrics.permits_acquired_total(), 1);
+        assert_eq!(metrics.inflight_permits(), 0, "the permit is released");
+        let _ = release_body.send(());
+        server.await.expect("streaming origin finished");
+    }
+
+    #[tokio::test]
+    async fn http_retry_budget_success_and_permanent_status() {
+        for (replies, budget, expected_status, expected_body, expected_attempts) in [
+            (
+                vec![(503, "{\"attempt\":0}"), (200, "{\"attempt\":1}")],
+                2,
+                200,
+                "{\"attempt\":1}",
+                2,
+            ),
+            (vec![(200, "{\"ok\":true}")], 2, 200, "{\"ok\":true}", 1),
+            (
+                vec![(404, "{\"message\":\"missing\"}")],
+                2,
+                404,
+                "{\"message\":\"missing\"}",
+                1,
+            ),
+        ] {
+            let replies = replies
+                .into_iter()
+                .map(|(status, body)| (status, body.to_string()))
+                .collect();
+            let (url, requests, server) = retry_test_server(replies, Duration::ZERO).await;
+            let (provider, permits) =
+                retry_test_provider(url.clone(), budget, Duration::from_secs(3));
+            // `store`, so the 404 body is data and the case can assert what was read.
+            let provider = provider.with_error_response_action(ErrorResponseAction::Store);
+            let result = provider
+                .perform_request_with_retry(url, None, None, "/lookup")
+                .await
+                .expect("HTTP response should remain available");
+            assert_eq!(result.response_status, expected_status);
+            assert_eq!(result.content, expected_body);
+            assert_eq!(requests.load(Ordering::SeqCst), expected_attempts);
+            assert_eq!(permits.permits_acquired_total(), expected_attempts as u64);
+            server.abort();
+        }
+
+        // Under the default `error` the same 404 fails the request, still after one
+        // request: a status this connector does not retry is not asked again.
+        let (url, requests, server) = retry_test_server(
+            vec![(404, "{\"message\":\"missing\"}".to_string())],
+            Duration::ZERO,
+        )
+        .await;
+        let (provider, permits) = retry_test_provider(url.clone(), 2, Duration::from_secs(3));
+        let Err(error) = provider
+            .perform_request_with_retry(url, None, None, "/lookup")
+            .await
+        else {
+            panic!("a 404 under the default `on_error_response` must fail the request");
+        };
+        assert!(
+            matches!(error, Error::ErrorResponse { status: 404, .. }),
+            "{error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(permits.permits_acquired_total(), 1);
+        server.abort();
     }
 
     /// Test helper: build the legacy all-Utf8 nesting schema that
@@ -4012,6 +6478,82 @@ mod tests {
     }
 
     #[test]
+    fn enable_header_filters_guards_configured_auth_header_name() {
+        let auth = Arc::new(CustomHeaderAuthenticator(HeaderName::from_static(
+            "x-shopify-access-token",
+        )));
+
+        // Allowlisting the exact header the auth token occupies is rejected.
+        let err = base_provider()
+            .with_auth(Arc::clone(&auth) as Arc<dyn super::super::auth::HttpAuthenticator>)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-shopify-access-token"])
+            .expect_err("allowlisting the configured auth header must be rejected");
+        match err {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("x-shopify-access-token"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("HTTP authentication"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+
+        // A different header name is unaffected — the guard is keyed on the
+        // configured name, not hard-coded to `authorization`.
+        base_provider()
+            .with_auth(auth as Arc<dyn super::super::auth::HttpAuthenticator>)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-region"])
+            .expect("a non-auth header name should be allowlisted fine");
+    }
+
+    #[test]
+    fn request_headers_filter_rejects_configured_auth_header_name() {
+        // Allowlist the custom header before auth is configured, then attach an
+        // authenticator that uses it — a query-time filter must not be able to
+        // overwrite the auth token's header.
+        let provider = base_provider()
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-shopify-access-token"])
+            .expect("allowlisted before auth configured")
+            .with_auth(Arc::new(CustomHeaderAuthenticator(HeaderName::from_static(
+                "x-shopify-access-token",
+            )))
+                as Arc<dyn super::super::auth::HttpAuthenticator>);
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"x-shopify-access-token":"secret"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection of the configured auth header");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(
+                    message.contains("x-shopify-access-token"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("HTTP authentication"),
+                    "message: {message}"
+                );
+                assert!(
+                    !message.contains("secret"),
+                    "must not leak the value: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_request_headers_filter_rejects_invalid_json() {
         let provider = header_provider();
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -4265,7 +6807,14 @@ mod tests {
         let request_headers = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
         let fetch_result = HttpFetchResult {
             content: r#"[{"id":1},{"id":2}]"#.to_string(),
-            max_age: Duration::from_mins(1),
+            directives: CacheDirectives {
+                present: true,
+                max_age: Some(Duration::from_mins(1)),
+                forbid_retention: false,
+                shared_max_age: None,
+            },
+            response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,
@@ -4274,8 +6823,21 @@ mod tests {
                 ("x-request-id".to_string(), "req-123".to_string()),
             ],
         };
+        // Seeded directly, because admission is part of `get_response` rather
+        // than a write path a test can call on its own.
         provider
-            .cache_response("/posts", None, None, Some(&request_headers), &fetch_result)
+            .cache
+            .insert(
+                HttpTableProvider::get_cache_key("/posts", None, None, Some(&request_headers)),
+                CachedResponse {
+                    content: Arc::new(fetch_result.content.clone()),
+                    max_age: Duration::from_mins(1),
+                    detected_format: Some(fetch_result.detected_format.clone()),
+                    response_date: fetch_result.response_date,
+                    response_status: fetch_result.response_status,
+                    response_headers: Arc::new(fetch_result.response_headers.clone()),
+                },
+            )
             .await;
 
         let exec = HttpExec::new(
@@ -4513,8 +7075,8 @@ mod tests {
             HttpTableProvider::is_retryable_status(429),
             "429 should be retryable"
         );
-        // 2xx/3xx success-ish and 4xx client errors (other than 429) are NOT retried —
-        // they are deterministic responses the caller should see, not transient faults.
+        // 2xx, 3xx and 4xx (other than 429) are NOT retried — asking again would get
+        // the same answer, unlike a transient fault.
         for status in [200_u16, 204, 301, 400, 401, 403, 404, 410, 422, 600] {
             assert!(
                 !HttpTableProvider::is_retryable_status(status),
@@ -5106,6 +7668,9 @@ mod tests {
         // Use an invalid route that returns 404 with JSON error body
         let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
         let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            // What this asserts is that the connector can record an error response as a
+            // row, which is `store` rather than the default.
+            .with_error_response_action(ErrorResponseAction::Store)
             .with_allowed_paths(vec!["/search/invalid_404".to_string()])
             .expect("allowed paths");
 
@@ -5154,54 +7719,39 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "hits a live external API (httpbin.org); not deterministic in CI — run with --ignored"]
-    async fn test_integration_httpbin_500_server_error() {
+    async fn test_integration_httpbin_500_server_error_is_refused_under_every_action() {
         use datafusion::prelude::SessionContext;
 
-        // httpbin.org provides endpoints that return specific HTTP status codes
-        let url = Url::parse("https://httpbin.org").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/status/500".to_string()])
-            .expect("allowed paths");
+        // The live counterpart of the unit coverage: a server error is refused by its
+        // status class, so even `store` — the action a dataset picks to keep a 404
+        // working — does not record one. See [`ErrorResponseAction`].
+        for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+            // httpbin.org provides endpoints that return specific HTTP status codes
+            let url = Url::parse("https://httpbin.org").expect("valid URL");
+            let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+                // The ladder is not what this asserts, and every retry is a real sleep.
+                .with_max_retries(0)
+                .with_error_response_action(action)
+                .with_allowed_paths(vec!["/status/500".to_string()])
+                .expect("allowed paths");
 
-        let ctx = SessionContext::new();
-        ctx.register_table("httpbin", Arc::new(provider))
-            .expect("register table");
+            let ctx = SessionContext::new();
+            ctx.register_table("httpbin", Arc::new(provider))
+                .expect("register table");
 
-        // Query for a 500 status endpoint - should return a row with 500 status
-        let df = ctx
-            .sql("SELECT request_path, content, response_status FROM httpbin WHERE request_path = '/status/500'")
-            .await
-            .expect("query should succeed");
+            let error = ctx
+                .sql("SELECT request_path, content, response_status FROM httpbin WHERE request_path = '/status/500'")
+                .await
+                .expect("query should plan")
+                .collect()
+                .await
+                .expect_err("a server error must not be answered with rows");
 
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results even for 5xx");
-
-        let batch = &results[0];
-        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
-
-        // Validate response_status is 500
-        let status_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt16Array>()
-            .expect("response_status should be UInt16Array");
-        assert_eq!(
-            status_col.value(0),
-            500,
-            "Server error should have response_status 500"
-        );
-
-        // Validate content is empty (httpbin /status/500 returns empty body)
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-        let content = content_col.value(0);
-        assert!(
-            content.is_empty(),
-            "httpbin 500 response should have empty content body"
-        );
+            assert!(
+                error.to_string().contains("500"),
+                "{action}: the failure must name the status the origin gave: {error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5893,6 +8443,109 @@ mod tests {
         )
     }
 
+    /// Like [`start_query_param_pagination_server`], but the final "page" is a
+    /// retryable origin failure (`503` with an empty body) rather than a
+    /// legitimate empty page.
+    async fn start_query_param_pagination_server_with_failing_final_page(
+        stop_offset: usize,
+    ) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+
+                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                    let request_target = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let request_url = Url::parse(&format!("http://localhost{request_target}"))
+                        .expect("request target should form a valid URL");
+                    let offset = request_url
+                        .query_pairs()
+                        .find_map(|(key, value)| {
+                            (key == "offset")
+                                .then(|| value.parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+
+                    let response = if offset < stop_offset {
+                        let body = format!(r#"{{"docs":[{{"id":{offset}}}]}}"#);
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        let body = r#"{"docs":[]}"#;
+                        format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid")
+    }
+
+    /// Regression test: a paginated fetch that ends on a retryable-status,
+    /// empty-body page (e.g. the origin starts answering `503` mid-pagination)
+    /// must surface that as an error rather than the "no more pages" case at
+    /// provider.rs's pagination loop, which returns `Ok(None)` before
+    /// `create_batch_from_rows`'s own retryable-status check ever runs.
+    #[tokio::test]
+    async fn test_pagination_surfaces_a_retryable_empty_final_page_as_an_error() {
+        use datafusion::prelude::SessionContext;
+
+        let base_url = start_query_param_pagination_server_with_failing_final_page(2).await;
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            .with_max_retries(0)
+            .with_pagination(PaginationConfig {
+                query_params: Some("offset={offset}&limit={limit}".to_string()),
+                page_size: Some(1),
+                data_pointer: Some("/docs".to_string()),
+                max_pages: None,
+                use_link_header: false,
+                ..Default::default()
+            })
+            .expect("pagination config should be valid");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+
+        let result = ctx
+            .sql("SELECT content FROM items")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a 503 on the final page must surface as an error, not a silently truncated \
+            successful result"
+        );
+    }
+
     #[tokio::test]
     async fn test_pagination_without_max_pages_fetches_past_default_limit() {
         use datafusion::prelude::SessionContext;
@@ -5932,6 +8585,729 @@ mod tests {
             request_count.load(Ordering::SeqCst) > DEFAULT_PAGINATION_MAX_PAGES,
             "execution should request pages beyond the old safety limit"
         );
+    }
+
+    /// Serve `status` with `body` on every request, counting them, and return the URL to
+    /// point a provider at. Kept off `wiremock` so the request count is observed the same
+    /// way the sibling pagination server does it.
+    async fn start_status_server(status: u16, body: &'static str) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+
+                    let response = format!(
+                        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    const TEST_DATASET: &str = "http_items";
+
+    fn status_provider(base_url: Url, action: ErrorResponseAction) -> HttpTableProvider {
+        HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            // The ladder is not what these assert, and every retry is a real sleep.
+            .with_max_retries(0)
+            .with_error_response_action(action)
+            .with_dataset_name(TEST_DATASET)
+    }
+
+    /// Run `SELECT content, response_status` against a provider serving one status.
+    async fn scan_status_dataset(
+        base_url: Url,
+        action: ErrorResponseAction,
+    ) -> std::result::Result<Vec<RecordBatch>, DataFusionError> {
+        scan_provider(status_provider(base_url, action)).await
+    }
+
+    /// Run `SELECT content, response_status` against `provider`.
+    async fn scan_provider(
+        provider: HttpTableProvider,
+    ) -> std::result::Result<Vec<RecordBatch>, DataFusionError> {
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+        ctx.sql("SELECT content, response_status FROM items")
+            .await?
+            .collect()
+            .await
+    }
+
+    #[test]
+    fn refusing_a_permanent_status_is_not_a_retriable_refresh_failure() {
+        use datafusion_table_providers::util::retriable_error::is_retriable_error;
+
+        // What this pins is not the DataFusionError variant but what the refresh layer
+        // does with it: `check_and_mark_retriable_error` treats everything except
+        // Plan/SQL/SchemaError as retriable, so an over-broad mapping has one refresh
+        // invocation re-asking an origin that will keep answering 404.
+        for status in [400, 401, 403, 404, 410, 451] {
+            let df: DataFusionError = Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com/items".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into();
+            assert!(
+                !is_retriable_error(&check_retriable(df)),
+                "{status} will not change on a retry, so a refresh must not re-ask for it"
+            );
+        }
+
+        // The statuses the request ladder itself retries are the ones a later refresh may
+        // usefully retry too; the two read the same predicate so they cannot drift.
+        for status in [429, 500, 502, 503, 504] {
+            let df: DataFusionError = Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com/items".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into();
+            assert!(
+                is_retriable_error(&check_retriable(df)),
+                "{status} is transient, so a later refresh should retry it"
+            );
+        }
+    }
+
+    /// Put a `DataFusionError` through the same wrapping the refresh path applies before
+    /// it asks whether the error is retriable.
+    fn check_retriable(err: DataFusionError) -> DataFusionError {
+        datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error(err)
+    }
+
+    #[test]
+    fn a_refused_transient_status_is_recognisable_through_any_wrapping() {
+        let refused = |status| -> DataFusionError {
+            Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into()
+        };
+        for status in [429, 500, 503] {
+            assert!(is_transient_origin_failure(&refused(status)), "{status}");
+            // The shapes an execution error takes on its way out of a plan.
+            let wrapped = DataFusionError::Context(
+                "scan".to_string(),
+                Box::new(DataFusionError::Shared(Arc::new(refused(status)))),
+            );
+            assert!(is_transient_origin_failure(&wrapped), "{status} wrapped");
+        }
+        for status in [400, 404] {
+            assert!(
+                !is_transient_origin_failure(&refused(status)),
+                "{status} is an answer about the resource, not an origin that is down"
+            );
+        }
+        assert!(!is_transient_origin_failure(&DataFusionError::Execution(
+            "connection reset".to_string()
+        )));
+    }
+
+    #[test]
+    fn an_error_never_prints_the_part_of_a_url_that_carries_secrets() {
+        let url = Url::parse(
+            "https://tenant:hunter2@api.example.com:8443/v1/items?api_key=SECRET&cursor=TOKEN#frag",
+        )
+        .expect("valid URL");
+
+        let label = endpoint_label(&url);
+        for secret in ["hunter2", "tenant", "SECRET", "TOKEN", "api_key", "frag"] {
+            assert!(
+                !label.contains(secret),
+                "the label must not carry '{secret}': {label}"
+            );
+        }
+
+        // Still has to say which host was fetched, or the error is not worth reading.
+        assert!(
+            label.contains("api.example.com"),
+            "the label must still name the host: {label}"
+        );
+        assert!(
+            label.contains("8443"),
+            "a non-default port is part of the endpoint: {label}"
+        );
+        // The path goes too. An operator keeps credentials there — a webhook's secret is
+        // the path — and the reader of this message is whoever ran the query, not
+        // necessarily someone entitled to see the spicepod. The dataset named alongside it
+        // is what identifies the endpoint.
+        assert!(
+            !label.contains("/v1/items"),
+            "the configured path is not the reader's to see: {label}"
+        );
+
+        // And the message built from it inherits that, on both the error and the row-keeping
+        // path — the warning interpolates the same label.
+        let message = Error::ErrorResponse {
+            status: 503,
+            endpoint: label,
+            dataset: "dataset 'items'".to_string(),
+        }
+        .to_string();
+        assert!(
+            !message.contains("SECRET") && !message.contains("hunter2"),
+            "the rendered error must not carry the query or userinfo: {message}"
+        );
+    }
+
+    /// The secret-in-the-path shape specifically: a webhook endpoint keeps its whole
+    /// credential in the path the operator configured, so a label that renders the path
+    /// hands it to anyone who can provoke a non-2xx.
+    #[test]
+    fn an_error_never_prints_a_secret_the_configured_path_carries() {
+        let url = Url::parse("https://hooks.example.com/services/T0000/B0000/tOkEnSeCrEt")
+            .expect("valid URL");
+
+        let label = endpoint_label(&url);
+        for secret in ["tOkEnSeCrEt", "B0000", "T0000", "services"] {
+            assert!(
+                !label.contains(secret),
+                "the label must not carry '{secret}' from the path: {label}"
+            );
+        }
+        assert_eq!(label, "https://hooks.example.com");
+
+        let message = Error::ErrorResponse {
+            status: 401,
+            endpoint: label,
+            dataset: "dataset 'alerts'".to_string(),
+        }
+        .to_string();
+        assert!(
+            !message.contains("tOkEnSeCrEt"),
+            "the rendered error must not carry the path secret: {message}"
+        );
+        // The message is still actionable: it names the dataset to look up.
+        assert!(
+            message.contains("dataset 'alerts'"),
+            "the error must still name the dataset: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_never_prints_a_path_the_query_chose() {
+        // `allowed_request_paths` admits paths by glob, so a wildcard allowlist lets a
+        // SQL filter name any path under the endpoint — and `build_request_url` appends
+        // it. A path segment can therefore be a webhook secret or an embedded token, so
+        // the label has to come from the configured endpoint rather than the request.
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+        let provider = status_provider(base_url, ErrorResponseAction::Error)
+            .with_allowed_paths(vec!["/*".to_string()])
+            .expect("a wildcard allowlist is valid");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+
+        let error = ctx
+            .sql("SELECT content FROM items WHERE request_path = '/webhook/PATH-TOKEN'")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect_err("a 404 must not be answered with rows");
+
+        let message = error.to_string();
+        assert!(
+            !message.contains("PATH-TOKEN"),
+            "a path the query chose must not reach the failure: {message}"
+        );
+        assert!(
+            message.contains("404"),
+            "the failure must still name the status: {message}"
+        );
+    }
+
+    #[test]
+    fn error_response_action_reads_every_documented_value() {
+        for action in ErrorResponseAction::VARIANTS {
+            let spelling = action.as_str();
+            let parsed: ErrorResponseAction = spelling
+                .parse()
+                .unwrap_or_else(|()| panic!("'{spelling}' is documented and must parse"));
+            assert_eq!(
+                parsed, action,
+                "'{spelling}' must round-trip through as_str"
+            );
+            assert!(
+                ErrorResponseAction::accepted_values().contains(spelling),
+                "'{spelling}' must be listed to the user"
+            );
+        }
+
+        // Case and surrounding whitespace are the operator's, not the parser's.
+        assert_eq!(
+            "  ERROR ".parse::<ErrorResponseAction>(),
+            Ok(ErrorResponseAction::Error)
+        );
+
+        // A value that is not one of them must not fall back to a policy: the connector
+        // reports it, and the operator learns their setting did not take.
+        for rejected in ["", "fail", "retain", "eror", "true"] {
+            assert!(
+                rejected.parse::<ErrorResponseAction>().is_err(),
+                "'{rejected}' is not a documented action and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn error_response_action_defaults_to_refusing() {
+        // The default decides whether an origin failure can replace an accelerated
+        // table's contents with error bodies (#13515), so it is asserted rather than
+        // left to the derive.
+        assert_eq!(ErrorResponseAction::default(), ErrorResponseAction::Error);
+    }
+
+    #[tokio::test]
+    async fn a_server_error_response_does_not_become_a_row() {
+        use std::sync::atomic::Ordering;
+
+        let (base_url, request_count) =
+            start_status_server(503, r#"{"error":"unavailable"}"#).await;
+
+        let error = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect_err("a 503 must not be answered with rows");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("503"),
+            "the failure must name the status the origin gave: {message}"
+        );
+        assert!(
+            message.contains("spiceai.org/docs/components/data-connectors/https"),
+            "the failure must link the connector's docs: {message}"
+        );
+        // A 503 is refused by its status class, not by the action, so the remedy must not
+        // name a setting that would not change it. Offering `warn` here would send the
+        // operator to a value that leaves the refusal exactly where it was.
+        assert!(
+            !message.contains("`on_error_response: warn`")
+                && !message.contains("`on_error_response: store`"),
+            "no action records a server error, so neither may be offered as the remedy: {message}"
+        );
+        assert!(
+            message.contains("max_retries"),
+            "the remedy for an origin that stayed down is the retry budget: {message}"
+        );
+        // Several datasets can share one endpoint with different request filters, so the
+        // endpoint alone does not say which one failed.
+        assert!(
+            message.contains(TEST_DATASET),
+            "the failure must name the dataset: {message}"
+        );
+
+        // The extra request that existed only to turn an exhausted retry into a row is
+        // not worth spending on an origin that has already failed.
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "refusing must not cost a second request"
+        );
+    }
+
+    /// Hang up on the first `hangups` connections without answering, then answer
+    /// `status`: a ladder that meets a network failure before the status it ends on.
+    async fn start_hangup_then_status_server(
+        hangups: usize,
+        status: u16,
+        body: &'static str,
+    ) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    let seen = request_count.fetch_add(1, Ordering::SeqCst);
+                    if seen < hangups {
+                        drop(stream);
+                        return;
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_transient_status_after_a_network_failure_is_still_refused() {
+        use std::sync::atomic::Ordering;
+
+        // A ladder whose earlier attempt failed on the network and whose last allowed
+        // attempt is answered with a 5xx: the status is refused rather than recorded
+        // under every action, and nothing is asked past the budget.
+        for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+            let (base_url, requests) =
+                start_hangup_then_status_server(1, 503, r#"{"error":"upstream is down"}"#).await;
+
+            let error = scan_provider(status_provider(base_url, action).with_max_retries(1))
+                .await
+                .expect_err("the last allowed attempt must not record a 503 either");
+
+            assert!(
+                error.to_string().contains("503"),
+                "{action}: the failure must name the status the origin gave: {error}"
+            );
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                2,
+                "{action}: one hung-up attempt, then the one retry the budget allows"
+            );
+        }
+    }
+
+    /// Serve `status` with a `Content-Length` that overstates the body, then hang up — the
+    /// read fails after a valid status line, which `extract_response` treats as transient.
+    async fn start_truncated_body_server(status: u16) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: 400\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(b"{\"partial\":").await;
+                    let _ = stream.flush().await;
+                    drop(stream);
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    /// Collect the `warn`-level lines emitted while `body` runs.
+    async fn warnings_emitted_during<F>(body: F) -> Vec<String>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buffer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        // `set_default` rather than `with_default`: the latter takes a closure, which would
+        // force a `block_on` inside the test's own current-thread runtime and deadlock
+        // against the mock server's spawned tasks. The guard covers the provider's
+        // emissions because `#[tokio::test]` keeps this future on one thread.
+        let guard = tracing::subscriber::set_default(subscriber);
+        body.await;
+        drop(guard);
+
+        let captured = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8_lossy(&captured)
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn warn_speaks_only_for_a_body_it_actually_has() {
+        use std::sync::atomic::Ordering;
+
+        // The warning claims a row is being recorded. `extract_response` treats a broken
+        // read as transient and the request is retried, so a warning emitted before it
+        // would make that claim on every attempt while producing no row at all. A 404,
+        // because `warn` reaches the body read only for a status it may record: a 5xx is
+        // refused before that, which would leave this test passing whatever the
+        // warning's placement.
+        let (base_url, request_count) = start_truncated_body_server(404).await;
+        let url = base_url.clone();
+
+        let warnings = warnings_emitted_during(async move {
+            let _ = scan_status_dataset(url, ErrorResponseAction::Warn).await;
+        })
+        .await;
+
+        assert!(
+            request_count.load(Ordering::SeqCst) >= 1,
+            "the server must have been asked at least once"
+        );
+        assert!(
+            warnings.is_empty(),
+            "no row was produced, so nothing should have claimed one: {warnings:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_speaks_once_for_the_row_it_records() {
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+        let url = base_url.clone();
+
+        let warnings = warnings_emitted_during(async move {
+            let _ = scan_status_dataset(url, ErrorResponseAction::Warn).await;
+        })
+        .await;
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one recorded row is one warning: {warnings:#?}"
+        );
+        assert!(
+            warnings[0].contains("404") && warnings[0].contains("on_error_response"),
+            "the warning must name the status and the parameter: {warnings:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_error_response_does_not_become_a_row() {
+        // 404 is never retried, so it reaches the decision on the first response rather
+        // than through the exhausted ladder — a separate route to the same substitution.
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+        let error = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect_err("a 404 must not be answered with rows");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("404"),
+            "the failure must name the status the origin gave: {message}"
+        );
+        // A client error *is* selectable, so this is the message that must carry the
+        // remedy — and it has to be `warn`, which records the body and says so, not the
+        // silent `store` this parameter exists to stop being the accident.
+        assert!(
+            message.contains("`on_error_response: warn`"),
+            "a selectable status must offer `warn` as the remedy: {message}"
+        );
+        assert!(
+            !message.contains("`on_error_response: store`"),
+            "the failure must not offer the silent form as the remedy: {message}"
+        );
+    }
+
+    /// `warn` and `store` record client errors only, as the parameter documents. A
+    /// `304` answers a conditional request header, and a `300` or a `302` without a
+    /// `Location` is a redirect the client did not follow: none carries content to
+    /// record, so none becomes a row under any action, asking again would get the same
+    /// answer, and the failure does not offer `warn` as the remedy.
+    #[tokio::test]
+    async fn a_status_outside_the_client_error_class_is_never_recorded() {
+        use std::sync::atomic::Ordering;
+
+        for status in [300, 302, 304] {
+            for action in ErrorResponseAction::VARIANTS {
+                let (base_url, requests) = start_status_server(status, "").await;
+
+                let error = scan_provider(status_provider(base_url, action).with_max_retries(2))
+                    .await
+                    .expect_err("a status outside the client-error class must not become a row");
+                assert_eq!(
+                    requests.load(Ordering::SeqCst),
+                    1,
+                    "{action}/{status}: a status that is not retried is asked once"
+                );
+
+                let message = error.to_string();
+                assert!(
+                    message.contains(&status.to_string()),
+                    "{action}/{status}: the failure must name the status: {message}"
+                );
+                assert!(
+                    !message.contains("`on_error_response: warn`"),
+                    "{action}/{status}: `warn` cannot record this status, so it must not be offered: {message}"
+                );
+            }
+        }
+    }
+
+    /// The redirect wording belongs to `3xx` only. Any other status outside the
+    /// recordable class still names the remedy that applies, without `warn`.
+    #[test]
+    fn the_remedy_names_redirects_only_for_a_redirect() {
+        for status in [100, 600, 999] {
+            let remedy = error_response_remedy(status);
+            assert!(
+                !remedy.contains("304") && !remedy.contains("redirect"),
+                "{status}: {remedy}"
+            );
+            assert!(
+                !remedy.contains("`on_error_response: warn`"),
+                "{status}: {remedy}"
+            );
+        }
+        assert!(error_response_remedy(304).contains("If-None-Match"));
+    }
+
+    #[tokio::test]
+    async fn store_keeps_recording_an_error_response_as_a_row() {
+        // The 404-as-a-business-fact dataset this connector already serves: `store` is
+        // the setting that keeps it working, so it is what makes the default a choice
+        // rather than a removal.
+        for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+            let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+            let batches = scan_status_dataset(base_url, action)
+                .await
+                .unwrap_or_else(|e| panic!("{action} must answer with the response body: {e}"));
+
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(total_rows, 1, "{action} must record the response as a row");
+
+            let statuses = batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("response_status should be UInt16Array");
+            assert_eq!(
+                statuses.value(0),
+                404,
+                "{action} must record the status the origin gave"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_transient_status_is_never_recorded_as_a_row() {
+        use std::sync::atomic::Ordering;
+
+        // `store`/`warn` exist for the dataset that reads a 404 body as a business fact;
+        // a 5xx or 429 is never that (see [`ErrorResponseAction`]). Admitting one here
+        // would let an outage replace an accelerated table's contents under the very
+        // setting chosen to keep a 404 working — the gap spiceai/spiceai#13578 reports.
+        for status in [500, 502, 503, 504, 429] {
+            for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+                let (base_url, requests) =
+                    start_status_server(status, r#"{"error":"upstream is down"}"#).await;
+
+                let error = scan_status_dataset(base_url, action)
+                    .await
+                    .expect_err("a transient status must not be answered with rows");
+
+                assert!(
+                    error.to_string().contains(&status.to_string()),
+                    "the failure must name the status the origin gave: {error}"
+                );
+                assert_eq!(
+                    requests.load(Ordering::SeqCst),
+                    1,
+                    "{action}/{status}: one request, the whole of a zero-retry budget"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refusing_an_error_response_leaves_a_successful_one_alone() {
+        // The control for the two refusal tests: the guard must decide on the status,
+        // not on every response reaching it.
+        let (base_url, _) = start_status_server(200, r#"{"id":1}"#).await;
+
+        let batches = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect("a 200 must still be answered with rows");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 1, "a successful response is still data");
     }
 
     #[test]
@@ -6663,6 +10039,7 @@ mod tests {
             column_order.iter().map(|s| (*s).to_string()).collect(),
             json_field.to_string(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(
             base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
@@ -6675,12 +10052,91 @@ mod tests {
     fn empty_fetch_result() -> HttpFetchResult {
         HttpFetchResult {
             content: String::new(),
-            max_age: std::time::Duration::from_secs(0),
+            directives: CacheDirectives::default(),
+            response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "application/json".to_string(),
             response_date: None,
             response_status: 200,
             response_headers: Vec::new(),
         }
+    }
+
+    /// Regression coverage for #14157's empty-result shape: a retryable
+    /// status (5xx) whose body decomposes to zero content rows has nothing
+    /// to carry `response_status` on, so a successful empty batch here would
+    /// be indistinguishable from a real empty result to every caller
+    /// (`cache::batches_cacheable`, the independent SQL results cache, and a
+    /// plain unaccelerated query) regardless of refresh mode. Must surface as
+    /// an error instead.
+    #[test]
+    fn create_batch_from_rows_errors_on_a_retryable_zero_row_5xx_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 503,
+            ..empty_fetch_result()
+        };
+
+        let err = exec
+            .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect_err("a zero-row 503 must be an error, not a successful empty batch");
+        assert!(
+            err.to_string().contains("503"),
+            "error should name the status code, got: {err}"
+        );
+    }
+
+    /// Same as above for a zero-row 429 (rate limited), which uses a
+    /// different error variant than a 5xx.
+    #[test]
+    fn create_batch_from_rows_errors_on_a_retryable_zero_row_429_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 429,
+            ..empty_fetch_result()
+        };
+
+        exec.create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect_err("a zero-row 429 must be an error, not a successful empty batch");
+    }
+
+    /// A genuinely empty 2xx result (the origin really has no rows to
+    /// return) must stay a successful empty batch.
+    #[test]
+    fn create_batch_from_rows_stays_empty_for_a_genuine_2xx_empty_result() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+
+        let batch = exec
+            .create_batch_from_rows(None, None, None, None, &[], &empty_fetch_result())
+            .expect("a genuine empty 2xx result must not error");
+
+        assert_eq!(batch.num_rows(), 0);
+    }
+
+    /// A non-retryable zero-row status (e.g. a 4xx with an empty body) is not
+    /// this connector's problem to second-guess: stays a successful empty
+    /// batch, matching a 2xx.
+    #[test]
+    fn create_batch_from_rows_stays_empty_for_a_zero_row_4xx_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 404,
+            ..empty_fetch_result()
+        };
+
+        let batch = exec
+            .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect("a zero-row 4xx must not error");
+
+        assert_eq!(batch.num_rows(), 0);
     }
 
     /// Like `nested_exec`, but accepts an explicit Arrow schema so a
@@ -6727,6 +10183,7 @@ mod tests {
                 "details".to_string(),
             ],
             "details".to_string(),
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
         let schema: SchemaRef = Arc::new(Schema::new(vec![
@@ -6966,6 +10423,7 @@ mod tests {
             vec!["id".to_string(), "name".to_string(), "details".to_string()],
             "details".to_string(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(
             base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
@@ -7008,6 +10466,7 @@ mod tests {
             vec!["id".to_string(), "details".to_string()],
             "details".to_string(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(
             base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
@@ -7041,6 +10500,7 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             vec!["id".to_string(), "details".to_string()],
             "details".to_string(),
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
         let provider = Arc::new(
@@ -7091,6 +10551,12 @@ mod tests {
             ["request_path".to_string(), "response_status".to_string()]
                 .into_iter()
                 .collect(),
+            // Both are user-declared in `column_order` above, so both
+            // legitimately take a same-named body key away from the
+            // catch-all — this test is exercising exactly that case.
+            ["request_path".to_string(), "response_status".to_string()]
+                .into_iter()
+                .collect(),
         );
         let provider = Arc::new(
             base_provider()
@@ -7122,7 +10588,9 @@ mod tests {
         );
         let fetch_result = HttpFetchResult {
             content: String::new(),
-            max_age: Duration::from_secs(0),
+            directives: CacheDirectives::default(),
+            response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 201,
@@ -7195,7 +10663,9 @@ mod tests {
         ];
         let fetch_result = HttpFetchResult {
             content: String::new(),
-            max_age: Duration::from_secs(0),
+            directives: CacheDirectives::default(),
+            response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,
@@ -7288,6 +10758,36 @@ mod tests {
         assert_eq!(result.partitions[4].1, Some("q2".to_string()));
         assert_eq!(result.partitions[5].0, Some("/b".to_string()));
         assert_eq!(result.partitions[5].1, Some("q3".to_string()));
+    }
+
+    /// `HttpWithDeferredParamsExec::execute` runs a fresh `HttpExec` built by
+    /// `with_expanded_params` and discards it once the stream completes, while
+    /// `cache::plan_saw_transient_http_failure` only ever walks the original,
+    /// pre-expansion template captured in the plan tree — so the expanded
+    /// exec must increment the *same* `HTTP_TRANSIENT_FAILURE_METRIC_NAME`
+    /// counter as its template, not a fresh one, for that fallback to see it.
+    #[test]
+    fn test_with_expanded_params_shares_metrics_with_template() {
+        let exec = make_exec(vec![(None, None, None, None)], None);
+        let expanded = exec
+            .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
+            .expect("expand should succeed");
+
+        MetricBuilder::new(&expanded.metrics)
+            .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, 0)
+            .add(1);
+
+        let template_count = exec
+            .metrics()
+            .and_then(|m| m.sum_by_name(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME))
+            .map(|v| v.as_usize());
+        assert_eq!(
+            template_count,
+            Some(1),
+            "a counter incremented on the expanded exec must be visible through the \
+            original template's metrics(), since that template is what the plan tree \
+            (and cache::plan_saw_transient_http_failure) still holds after expansion"
+        );
     }
 
     #[test]

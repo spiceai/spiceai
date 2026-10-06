@@ -85,35 +85,45 @@ limitations under the License.
 //! The read path automatically detects the storage format (TEXT vs INTEGER) and converts
 //! to the Arrow schema's expected timestamp type and unit.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use arrow::{
     array::{
-        Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-        Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray,
-        DurationNanosecondArray, DurationSecondArray, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int32Builder, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray,
-        IntervalYearMonthArray, LargeBinaryArray, LargeStringArray, ListBuilder, MapBuilder,
-        RecordBatch, StringArray, StringBuilder, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-        UInt16Array, UInt32Array,
+        Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+        Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray,
+        DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray,
+        Float64Array, GenericListArray, Int8Array, Int16Array, Int32Array, Int64Array,
+        IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray,
+        LargeStringArray, MapArray, OffsetSizeTrait, RecordBatch, StringArray, StringViewArray,
+        StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array, make_array, new_empty_array,
     },
+    buffer::{NullBuffer, OffsetBuffer},
+    compute::{CastOptions, cast, cast_with_options, take},
     datatypes::{
-        DataType, Field, IntervalDayTime, IntervalMonthDayNano, Schema, SchemaRef, TimeUnit, i256,
+        DataType, Field, FieldRef, IntervalDayTime, IntervalMonthDayNano, Schema, SchemaRef,
+        TimeUnit, i256,
     },
+    row::{RowConverter, SortField},
 };
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{SchemaExt, utils::quote_identifier},
+    common::TableReference,
+    common::{
+        SchemaExt,
+        tree_node::{TreeNode, TreeNodeRecursion},
+        utils::quote_identifier,
+    },
     datasource::{
         TableProvider,
         sink::{DataSink, DataSinkExec},
     },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, TableProviderFilterPushDown, TableType, dml::InsertOp},
+    logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -122,7 +132,6 @@ use datafusion::{
     },
     scalar::ScalarValue,
     sql::{
-        TableReference,
         sqlparser::ast::{self as sqlast, VisitMut, VisitorMut},
         unparser::{
             Unparser,
@@ -282,6 +291,13 @@ impl Dialect for TursoDialect {
 
     fn supports_column_alias_in_table_alias(&self) -> bool {
         self.inner.supports_column_alias_in_table_alias()
+    }
+
+    /// Forwarded rather than inherited: the trait's default says a derived table
+    /// fixes a volatile value, and libSQL flattens one the way `SQLite` does, so the
+    /// default would let a filter on such an output through as wrong rows.
+    fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
+        self.inner.derived_table_evaluates_volatile_outputs_once()
     }
 
     fn interval_style(&self) -> IntervalStyle {
@@ -527,625 +543,633 @@ impl TursoTableProvider {
     /// - Dates: Date32, Date64
     /// - Time: Time32, Time64
     /// - Duration, Interval, Decimal128, Decimal256
-    /// - Complex types: List, Map (serialized as JSON)
+    /// - Complex types: List, `LargeList`, `FixedSizeList`, Map (serialized as JSON)
+    /// - Dictionary, over any of the above value types
+    pub fn values_to_record_batch(
+        rows: &[Vec<TursoValue>],
+        schema: &SchemaRef,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
+
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            columns.push(Self::column_from_turso_values(
+                rows,
+                col_idx,
+                field.name(),
+                field.data_type(),
+            )?);
+        }
+
+        let batch = RecordBatch::try_new(Arc::clone(schema), columns)?;
+        Self::warn_on_conversion_failures(rows, &batch);
+        Ok(batch)
+    }
+
+    /// Rebuilds one column as the Arrow type its field declares, from the values stored for it.
+    ///
+    /// The inverse of [`scalar_value_to_turso`], and it must stay one: a type that function stores
+    /// but this one cannot rebuild is a column that writes without error and cannot be read back.
+    ///
+    /// Recurses for `Dictionary`, whose values the write path stores unwrapped. `column` is the
+    /// field's name, so an error names the column at fault rather than leaving a dataset with
+    /// several columns of the same type to guess. It is user-chosen, so every message escapes
+    /// it: a name carrying a newline must not break a message that has to stay on one line.
     #[expect(
         clippy::too_many_lines,
         clippy::match_same_arms,
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation
     )]
-    pub fn values_to_record_batch(
+    fn column_from_turso_values(
         rows: &[Vec<TursoValue>],
-        schema: &SchemaRef,
-    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        let mut columns: Vec<Arc<dyn Array>> = Vec::new();
+        col_idx: usize,
+        column: &str,
+        data_type: &DataType,
+    ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
+        let column: ArrayRef = match data_type {
+            DataType::Int8 => {
+                let values: Vec<Option<i8>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => i8::try_from(*i).ok(),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(Int8Array::from(values))
+            }
+            DataType::Int16 => {
+                let values: Vec<Option<i16>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => i16::try_from(*i).ok(),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(Int16Array::from(values))
+            }
+            DataType::Int32 => {
+                let values: Vec<Option<i32>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => i32::try_from(*i).ok(),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(Int32Array::from(values))
+            }
+            DataType::Int64 => {
+                let values: Vec<Option<i64>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => Some(*i),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(Int64Array::from(values))
+            }
+            DataType::UInt8 => {
+                let values: Vec<Option<u8>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => u8::try_from(*i).ok(),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(UInt8Array::from(values))
+            }
+            DataType::UInt16 => {
+                let values: Vec<Option<u16>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => u16::try_from(*i).ok(),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(UInt16Array::from(values))
+            }
+            DataType::UInt32 => {
+                let values: Vec<Option<u32>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => u32::try_from(*i).ok(),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(UInt32Array::from(values))
+            }
+            DataType::UInt64 => {
+                let values: Vec<Option<u64>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => u64::try_from(*i).ok(),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(arrow::array::UInt64Array::from(values))
+            }
+            DataType::Float64 => {
+                let values: Vec<Option<f64>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Real(f) => Some(*f),
+                        TursoValue::Integer(i) => Some(*i as f64),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(Float64Array::from(values))
+            }
+            DataType::Float32 => {
+                let values: Vec<Option<f32>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Real(f) => Some(*f as f32),
+                        TursoValue::Integer(i) => Some(*i as f32),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(arrow::array::Float32Array::from(values))
+            }
+            // `half::f16` is not a dependency of this crate, so the stored REAL is narrowed by
+            // Arrow's own cast. A value outside `f16`'s range reads as NULL, which is the same
+            // soft failure the integer arms above take on overflow.
+            DataType::Float16 => {
+                let values: Vec<Option<f64>> = rows
+                    .iter()
+                    .map(|row| match row.get(col_idx) {
+                        Some(TursoValue::Real(f)) => Some(*f),
+                        Some(TursoValue::Integer(i)) => Some(*i as f64),
+                        _ => None,
+                    })
+                    .collect();
+                cast(&Float64Array::from(values), &DataType::Float16)?
+            }
+            DataType::Utf8 => {
+                let values: Vec<Option<String>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Text(s) => Some(s.clone()),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(StringArray::from(values))
+            }
+            DataType::LargeUtf8 => {
+                let values: Vec<Option<String>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Text(s) => Some(s.clone()),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(LargeStringArray::from(values))
+            }
+            DataType::Utf8View => {
+                let values: Vec<Option<&str>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Text(s) => Some(s.as_str()),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(StringViewArray::from(values))
+            }
+            DataType::Boolean => {
+                let values: Vec<Option<bool>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => Some(*i != 0),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(BooleanArray::from(values))
+            }
+            DataType::Binary => {
+                let values: Vec<Option<&[u8]>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Blob(b) => Some(b.as_slice()),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(BinaryArray::from(values))
+            }
+            DataType::LargeBinary => {
+                let values: Vec<Option<&[u8]>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Blob(b) => Some(b.as_slice()),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(LargeBinaryArray::from(values))
+            }
+            DataType::BinaryView => {
+                let values: Vec<Option<&[u8]>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Blob(b) => Some(b.as_slice()),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(BinaryViewArray::from(values))
+            }
+            // A blob of the wrong width cannot be placed in a fixed-width cell at all, so it
+            // reads as NULL rather than being padded or truncated to fit.
+            DataType::FixedSizeBinary(width) => {
+                let expected = usize::try_from(*width).map_err(|_| {
+                        format!("Failed to read the column '{}' from Turso: {width} is not a valid fixed-size binary width", column.escape_debug())
+                    })?;
+                let values = rows.iter().map(|row| match row.get(col_idx) {
+                    Some(TursoValue::Blob(b)) if b.len() == expected => Some(b.as_slice()),
+                    _ => None,
+                });
+                Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    values, *width,
+                )?)
+            }
+            DataType::Timestamp(unit, tz) => {
+                // Timestamps can be stored in two formats:
+                // 1. RFC3339 TEXT (default): Full precision + timezone preservation
+                // 2. INTEGER milliseconds (performance): Millisecond precision only
+                //
+                // The read path automatically detects and converts both formats to the
+                // schema's expected timestamp type and unit.
+                use timestamp_conversion::{MICROS_PER_MILLI, MILLIS_PER_SECOND, NANOS_PER_MILLI};
 
-        for (col_idx, field) in schema.fields().iter().enumerate() {
-            let column: Arc<dyn arrow::array::Array> = match field.data_type() {
-                DataType::Int8 => {
-                    let values: Vec<Option<i8>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => i8::try_from(*i).ok(),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(Int8Array::from(values))
-                }
-                DataType::Int16 => {
-                    let values: Vec<Option<i16>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => i16::try_from(*i).ok(),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(Int16Array::from(values))
-                }
-                DataType::Int32 => {
-                    let values: Vec<Option<i32>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => i32::try_from(*i).ok(),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(Int32Array::from(values))
-                }
-                DataType::Int64 => {
-                    let values: Vec<Option<i64>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => Some(*i),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(Int64Array::from(values))
-                }
-                DataType::UInt8 => {
-                    let values: Vec<Option<u8>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => u8::try_from(*i).ok(),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(UInt8Array::from(values))
-                }
-                DataType::UInt16 => {
-                    let values: Vec<Option<u16>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => u16::try_from(*i).ok(),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(UInt16Array::from(values))
-                }
-                DataType::UInt32 => {
-                    let values: Vec<Option<u32>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => u32::try_from(*i).ok(),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(UInt32Array::from(values))
-                }
-                DataType::UInt64 => {
-                    let values: Vec<Option<u64>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => u64::try_from(*i).ok(),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(arrow::array::UInt64Array::from(values))
-                }
-                DataType::Float64 => {
-                    let values: Vec<Option<f64>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Real(f) => Some(*f),
-                            TursoValue::Integer(i) => Some(*i as f64),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(Float64Array::from(values))
-                }
-                DataType::Float32 => {
-                    let values: Vec<Option<f32>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Real(f) => Some(*f as f32),
-                            TursoValue::Integer(i) => Some(*i as f32),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(arrow::array::Float32Array::from(values))
-                }
-                DataType::Utf8 => {
-                    let values: Vec<Option<String>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Text(s) => Some(s.clone()),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(StringArray::from(values))
-                }
-                DataType::LargeUtf8 => {
-                    let values: Vec<Option<String>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Text(s) => Some(s.clone()),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(LargeStringArray::from(values))
-                }
-                DataType::Boolean => {
-                    let values: Vec<Option<bool>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => Some(*i != 0),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(BooleanArray::from(values))
-                }
-                DataType::Binary => {
-                    let values: Vec<Option<&[u8]>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Blob(b) => Some(b.as_slice()),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(BinaryArray::from(values))
-                }
-                DataType::LargeBinary => {
-                    let values: Vec<Option<&[u8]>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Blob(b) => Some(b.as_slice()),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(LargeBinaryArray::from(values))
-                }
-                DataType::Timestamp(unit, tz) => {
-                    // Timestamps can be stored in two formats:
-                    // 1. RFC3339 TEXT (default): Full precision + timezone preservation
-                    // 2. INTEGER milliseconds (performance): Millisecond precision only
-                    //
-                    // The read path automatically detects and converts both formats to the
-                    // schema's expected timestamp type and unit.
-                    use timestamp_conversion::{
-                        MICROS_PER_MILLI, MILLIS_PER_SECOND, NANOS_PER_MILLI,
-                    };
+                let values: Vec<Option<i64>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(millis) => {
+                            // Integer format: Convert from stored milliseconds to the target unit.
+                            // Use checked arithmetic for Nanosecond to avoid silent overflow
+                            // for dates outside ~1677-2262 (same range as timestamp_nanos_opt).
+                            match unit {
+                                TimeUnit::Second => Some(millis / MILLIS_PER_SECOND),
+                                TimeUnit::Millisecond => Some(*millis),
+                                TimeUnit::Microsecond => millis.checked_mul(MICROS_PER_MILLI),
+                                TimeUnit::Nanosecond => millis.checked_mul(NANOS_PER_MILLI),
+                            }
+                        }
+                        TursoValue::Text(rfc3339_str) => {
+                            // RFC3339 TEXT format: Parse and convert to target unit.
+                            // Use unit-appropriate methods to avoid i64 nanosecond overflow
+                            // for dates outside ~1677-2262.
+                            use chrono::DateTime;
 
-                    let values: Vec<Option<i64>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(millis) => {
-                                // Integer format: Convert from stored milliseconds to the target unit.
-                                // Use checked arithmetic for Nanosecond to avoid silent overflow
-                                // for dates outside ~1677-2262 (same range as timestamp_nanos_opt).
+                            // Parse RFC3339 string
+                            if let Ok(dt) = DateTime::parse_from_rfc3339(rfc3339_str) {
                                 match unit {
-                                    TimeUnit::Second => Some(millis / MILLIS_PER_SECOND),
-                                    TimeUnit::Millisecond => Some(*millis),
-                                    TimeUnit::Microsecond => millis.checked_mul(MICROS_PER_MILLI),
-                                    TimeUnit::Nanosecond => millis.checked_mul(NANOS_PER_MILLI),
+                                    TimeUnit::Second => Some(dt.timestamp()),
+                                    TimeUnit::Millisecond => Some(dt.timestamp_millis()),
+                                    TimeUnit::Microsecond => Some(dt.timestamp_micros()),
+                                    TimeUnit::Nanosecond => dt.timestamp_nanos_opt(),
                                 }
+                            } else {
+                                // Parse failed, return NULL (lenient read behavior)
+                                None
                             }
-                            TursoValue::Text(rfc3339_str) => {
-                                // RFC3339 TEXT format: Parse and convert to target unit.
-                                // Use unit-appropriate methods to avoid i64 nanosecond overflow
-                                // for dates outside ~1677-2262.
-                                use chrono::DateTime;
+                        }
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
 
-                                // Parse RFC3339 string
-                                if let Ok(dt) = DateTime::parse_from_rfc3339(rfc3339_str) {
-                                    match unit {
-                                        TimeUnit::Second => Some(dt.timestamp()),
-                                        TimeUnit::Millisecond => Some(dt.timestamp_millis()),
-                                        TimeUnit::Microsecond => Some(dt.timestamp_micros()),
-                                        TimeUnit::Nanosecond => dt.timestamp_nanos_opt(),
-                                    }
-                                } else {
-                                    // Parse failed, return NULL (lenient read behavior)
-                                    None
+                match unit {
+                    TimeUnit::Second => {
+                        Arc::new(TimestampSecondArray::from(values).with_timezone_opt(tz.clone()))
+                    }
+                    TimeUnit::Millisecond => Arc::new(
+                        TimestampMillisecondArray::from(values).with_timezone_opt(tz.clone()),
+                    ),
+                    TimeUnit::Microsecond => Arc::new(
+                        TimestampMicrosecondArray::from(values).with_timezone_opt(tz.clone()),
+                    ),
+                    TimeUnit::Nanosecond => Arc::new(
+                        TimestampNanosecondArray::from(values).with_timezone_opt(tz.clone()),
+                    ),
+                }
+            }
+            DataType::Date32 => {
+                // Date32 stored as ISO-8601 date string (e.g. '1993-07-01')
+                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                    .ok_or_else(|| Error::MissingColumnValue { col_idx })?;
+                let values: Vec<Option<i32>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Text(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                            .ok()
+                            .and_then(|d| {
+                                i32::try_from(d.signed_duration_since(epoch).num_days()).ok()
+                            }),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(Date32Array::from(values))
+            }
+            DataType::Date64 => {
+                // Date64 stored as ISO-8601 date string (e.g. '1993-07-01')
+                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                    .ok_or_else(|| Error::MissingColumnValue { col_idx })?;
+                let values: Vec<Option<i64>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Text(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                            .ok()
+                            .map(|d| d.signed_duration_since(epoch).num_days() * 86_400_000),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(Date64Array::from(values))
+            }
+            DataType::Time32(unit) => {
+                // Time32 stored as INTEGER (milliseconds or seconds since midnight)
+                let values: Vec<Option<i32>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => i32::try_from(*i).ok(),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                match unit {
+                    TimeUnit::Millisecond => Arc::new(Time32MillisecondArray::from(values)),
+                    TimeUnit::Second => Arc::new(Time32SecondArray::from(values)),
+                    _ => {
+                        // Fallback to string for unsupported time units
+                        let values: Vec<Option<String>> = rows
+                            .iter()
+                            .map(|row| match &row[col_idx] {
+                                TursoValue::Integer(i) => Some(i.to_string()),
+                                TursoValue::Null => None,
+                                _ => None,
+                            })
+                            .collect();
+                        Arc::new(StringArray::from(values))
+                    }
+                }
+            }
+            DataType::Time64(unit) => {
+                // Time64 stored as INTEGER (microseconds or nanoseconds since midnight)
+                let values: Vec<Option<i64>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => Some(*i),
+                        TursoValue::Null => None,
+                        _ => None,
+                    })
+                    .collect();
+                match unit {
+                    TimeUnit::Microsecond => Arc::new(Time64MicrosecondArray::from(values)),
+                    TimeUnit::Nanosecond => Arc::new(Time64NanosecondArray::from(values)),
+                    _ => {
+                        // Fallback to string for unsupported time units
+                        let values: Vec<Option<String>> = rows
+                            .iter()
+                            .map(|row| match &row[col_idx] {
+                                TursoValue::Integer(i) => Some(i.to_string()),
+                                TursoValue::Null => None,
+                                _ => None,
+                            })
+                            .collect();
+                        Arc::new(StringArray::from(values))
+                    }
+                }
+            }
+            DataType::Duration(unit) => {
+                // Duration stored as INTEGER
+                let values: Vec<Option<i64>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Integer(i) => Some(*i),
+                        _ => None,
+                    })
+                    .collect();
+                match unit {
+                    TimeUnit::Second => Arc::new(DurationSecondArray::from(values)),
+                    TimeUnit::Millisecond => Arc::new(DurationMillisecondArray::from(values)),
+                    TimeUnit::Microsecond => Arc::new(DurationMicrosecondArray::from(values)),
+                    TimeUnit::Nanosecond => Arc::new(DurationNanosecondArray::from(values)),
+                }
+            }
+            DataType::Interval(unit) => {
+                // Interval stored as INTEGER
+                use arrow::datatypes::IntervalUnit;
+
+                match unit {
+                    IntervalUnit::YearMonth => {
+                        let values: Vec<Option<i32>> = rows
+                            .iter()
+                            .map(|row| match &row[col_idx] {
+                                TursoValue::Integer(i) => i32::try_from(*i).ok(),
+                                _ => None,
+                            })
+                            .collect();
+                        Arc::new(IntervalYearMonthArray::from(values))
+                    }
+                    IntervalUnit::DayTime => {
+                        let values: Vec<Option<IntervalDayTime>> = rows
+                            .iter()
+                            .map(|row| match &row[col_idx] {
+                                TursoValue::Integer(i) => {
+                                    // Unpack i64: upper 32 bits = days, lower 32 bits = milliseconds
+                                    const BITS_PER_I32: i32 = 32;
+                                    const LOWER_32_MASK: i64 = 0xFFFF_FFFF;
+
+                                    let days = (*i >> BITS_PER_I32) as i32;
+                                    let milliseconds = (*i & LOWER_32_MASK) as i32;
+                                    Some(IntervalDayTime::new(days, milliseconds))
                                 }
-                            }
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-
-                    match unit {
-                        TimeUnit::Second => Arc::new(
-                            TimestampSecondArray::from(values).with_timezone_opt(tz.clone()),
-                        ),
-                        TimeUnit::Millisecond => Arc::new(
-                            TimestampMillisecondArray::from(values).with_timezone_opt(tz.clone()),
-                        ),
-                        TimeUnit::Microsecond => Arc::new(
-                            TimestampMicrosecondArray::from(values).with_timezone_opt(tz.clone()),
-                        ),
-                        TimeUnit::Nanosecond => Arc::new(
-                            TimestampNanosecondArray::from(values).with_timezone_opt(tz.clone()),
-                        ),
+                                _ => None,
+                            })
+                            .collect();
+                        Arc::new(IntervalDayTimeArray::from(values))
                     }
-                }
-                DataType::Date32 => {
-                    // Date32 stored as ISO-8601 date string (e.g. '1993-07-01')
-                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
-                        .ok_or_else(|| Error::MissingColumnValue { col_idx })?;
-                    let values: Vec<Option<i32>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Text(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                                .ok()
-                                .and_then(|d| {
-                                    i32::try_from(d.signed_duration_since(epoch).num_days()).ok()
-                                }),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(Date32Array::from(values))
-                }
-                DataType::Date64 => {
-                    // Date64 stored as ISO-8601 date string (e.g. '1993-07-01')
-                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
-                        .ok_or_else(|| Error::MissingColumnValue { col_idx })?;
-                    let values: Vec<Option<i64>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Text(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                                .ok()
-                                .map(|d| d.signed_duration_since(epoch).num_days() * 86_400_000),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(Date64Array::from(values))
-                }
-                DataType::Time32(unit) => {
-                    // Time32 stored as INTEGER (milliseconds or seconds since midnight)
-                    let values: Vec<Option<i32>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => i32::try_from(*i).ok(),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    match unit {
-                        TimeUnit::Millisecond => Arc::new(Time32MillisecondArray::from(values)),
-                        TimeUnit::Second => Arc::new(Time32SecondArray::from(values)),
-                        _ => {
-                            // Fallback to string for unsupported time units
-                            let values: Vec<Option<String>> = rows
-                                .iter()
-                                .map(|row| match &row[col_idx] {
-                                    TursoValue::Integer(i) => Some(i.to_string()),
-                                    TursoValue::Null => None,
-                                    _ => None,
-                                })
-                                .collect();
-                            Arc::new(StringArray::from(values))
-                        }
-                    }
-                }
-                DataType::Time64(unit) => {
-                    // Time64 stored as INTEGER (microseconds or nanoseconds since midnight)
-                    let values: Vec<Option<i64>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => Some(*i),
-                            TursoValue::Null => None,
-                            _ => None,
-                        })
-                        .collect();
-                    match unit {
-                        TimeUnit::Microsecond => Arc::new(Time64MicrosecondArray::from(values)),
-                        TimeUnit::Nanosecond => Arc::new(Time64NanosecondArray::from(values)),
-                        _ => {
-                            // Fallback to string for unsupported time units
-                            let values: Vec<Option<String>> = rows
-                                .iter()
-                                .map(|row| match &row[col_idx] {
-                                    TursoValue::Integer(i) => Some(i.to_string()),
-                                    TursoValue::Null => None,
-                                    _ => None,
-                                })
-                                .collect();
-                            Arc::new(StringArray::from(values))
-                        }
-                    }
-                }
-                DataType::Duration(unit) => {
-                    // Duration stored as INTEGER
-                    let values: Vec<Option<i64>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => Some(*i),
-                            _ => None,
-                        })
-                        .collect();
-                    match unit {
-                        TimeUnit::Second => Arc::new(DurationSecondArray::from(values)),
-                        TimeUnit::Millisecond => Arc::new(DurationMillisecondArray::from(values)),
-                        TimeUnit::Microsecond => Arc::new(DurationMicrosecondArray::from(values)),
-                        TimeUnit::Nanosecond => Arc::new(DurationNanosecondArray::from(values)),
-                    }
-                }
-                DataType::Interval(unit) => {
-                    // Interval stored as INTEGER
-                    use arrow::datatypes::IntervalUnit;
-
-                    match unit {
-                        IntervalUnit::YearMonth => {
-                            let values: Vec<Option<i32>> = rows
-                                .iter()
-                                .map(|row| match &row[col_idx] {
-                                    TursoValue::Integer(i) => i32::try_from(*i).ok(),
-                                    _ => None,
-                                })
-                                .collect();
-                            Arc::new(IntervalYearMonthArray::from(values))
-                        }
-                        IntervalUnit::DayTime => {
-                            let values: Vec<Option<IntervalDayTime>> = rows
-                                .iter()
-                                .map(|row| match &row[col_idx] {
-                                    TursoValue::Integer(i) => {
-                                        // Unpack i64: upper 32 bits = days, lower 32 bits = milliseconds
-                                        const BITS_PER_I32: i32 = 32;
-                                        const LOWER_32_MASK: i64 = 0xFFFF_FFFF;
-
-                                        let days = (*i >> BITS_PER_I32) as i32;
-                                        let milliseconds = (*i & LOWER_32_MASK) as i32;
-                                        Some(IntervalDayTime::new(days, milliseconds))
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
-                            Arc::new(IntervalDayTimeArray::from(values))
-                        }
-                        IntervalUnit::MonthDayNano => {
-                            let values: Vec<Option<IntervalMonthDayNano>> = rows
-                                .iter()
-                                .map(|row| match &row[col_idx] {
-                                    TursoValue::Text(s) => {
-                                        // Deserialize from JSON
-                                        serde_json::from_str::<serde_json::Value>(s).ok().and_then(
-                                            |v| {
-                                                let months =
-                                                    i32::try_from(v["months"].as_i64()?).ok()?;
-                                                let days =
-                                                    i32::try_from(v["days"].as_i64()?).ok()?;
-                                                let nanoseconds = v["nanoseconds"].as_i64()?;
-                                                Some(IntervalMonthDayNano::new(
-                                                    months,
-                                                    days,
-                                                    nanoseconds,
-                                                ))
-                                            },
-                                        )
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
-                            Arc::new(IntervalMonthDayNanoArray::from(values))
-                        }
-                    }
-                }
-                DataType::List(field) => {
-                    // List stored as TEXT (JSON serialized)
-                    // Reconstruct the list arrays from JSON - only support Int32 lists for now
-                    if matches!(field.data_type(), DataType::Int32) {
-                        const ESTIMATED_LIST_SIZE: usize = 3;
-                        let mut list_builder =
-                            ListBuilder::new(Int32Array::builder(rows.len() * ESTIMATED_LIST_SIZE));
-
-                        for row in rows {
-                            match &row[col_idx] {
-                                TursoValue::Text(json_str) => {
-                                    // Parse JSON array
-                                    if let Ok(values) = serde_json::from_str::<Vec<i32>>(json_str) {
-                                        for val in values {
-                                            list_builder.values().append_value(val);
-                                        }
-                                        list_builder.append(true);
-                                    } else {
-                                        list_builder.append_null();
-                                    }
+                    IntervalUnit::MonthDayNano => {
+                        let values: Vec<Option<IntervalMonthDayNano>> = rows
+                            .iter()
+                            .map(|row| match &row[col_idx] {
+                                TursoValue::Text(s) => {
+                                    // Deserialize from JSON
+                                    serde_json::from_str::<serde_json::Value>(s).ok().and_then(
+                                        |v| {
+                                            let months =
+                                                i32::try_from(v["months"].as_i64()?).ok()?;
+                                            let days = i32::try_from(v["days"].as_i64()?).ok()?;
+                                            let nanoseconds = v["nanoseconds"].as_i64()?;
+                                            Some(IntervalMonthDayNano::new(
+                                                months,
+                                                days,
+                                                nanoseconds,
+                                            ))
+                                        },
+                                    )
                                 }
-                                _ => {
-                                    list_builder.append_null();
-                                }
-                            }
-                        }
-
-                        Arc::new(list_builder.finish())
-                    } else {
-                        // For unsupported list element types, return empty list array
-                        let mut list_builder = ListBuilder::new(Int32Array::builder(0));
-                        for _ in rows {
-                            list_builder.append_null();
-                        }
-                        Arc::new(list_builder.finish())
+                                _ => None,
+                            })
+                            .collect();
+                        Arc::new(IntervalMonthDayNanoArray::from(values))
                     }
                 }
-                DataType::Map(entries_field, _sorted) => {
-                    // Map stored as TEXT (JSON serialized)
-                    // Reconstruct map arrays from JSON
-                    // For now, only support Utf8 keys to Int32 values
+            }
+            DataType::List(element_field) => list_column::<i32>(rows, col_idx, element_field)?,
+            DataType::LargeList(element_field) => list_column::<i64>(rows, col_idx, element_field)?,
+            DataType::FixedSizeList(element_field, width) => {
+                let decoded = decode_stored_fixed_size_lists(rows, col_idx, element_field, *width)?;
+                Arc::new(FixedSizeListArray::try_new(
+                    Arc::clone(element_field),
+                    *width,
+                    decoded.elements,
+                    Some(NullBuffer::from(decoded.validity)),
+                )?)
+            }
+            DataType::Map(entries_field, sorted) => {
+                let DataType::Struct(entry_fields) = entries_field.data_type() else {
+                    return Err(format!(
+                            "Failed to read a map column from Turso: its entries are declared {}, not a struct of a key and a value. \
+                            Re-create the dataset, or accelerate it with a different engine. \
+                            See: https://spiceai.org/docs/components/data-accelerators/turso",
+                            entries_field.data_type()
+                        )
+                        .into());
+                };
+                let (Some(key_field), Some(value_field)) = (
+                    entry_fields.get(MAP_KEY_COLUMN),
+                    entry_fields.get(MAP_VALUE_COLUMN),
+                ) else {
+                    return Err(format!(
+                            "Failed to read a map column from Turso: its entries declare {} fields, not a key and a value. \
+                            Re-create the dataset, or accelerate it with a different engine. \
+                            See: https://spiceai.org/docs/components/data-accelerators/turso",
+                            entry_fields.len()
+                        )
+                        .into());
+                };
 
-                    // Extract field names from the schema's entries field
-                    use arrow::array::MapFieldNames;
-                    let field_names = if let DataType::Struct(fields) = entries_field.data_type() {
-                        if fields.len() >= 2 {
-                            MapFieldNames {
-                                entry: entries_field.name().clone(),
-                                key: fields[0].name().clone(),
-                                value: fields[1].name().clone(),
-                            }
-                        } else {
-                            MapFieldNames::default()
+                let decoded = decode_stored_maps(rows, col_idx, key_field, value_field)?;
+                let entries = StructArray::try_new(
+                    entry_fields.clone(),
+                    vec![decoded.keys, decoded.values],
+                    None,
+                )?;
+                Arc::new(MapArray::try_new(
+                    Arc::clone(entries_field),
+                    OffsetBuffer::from_lengths(decoded.lengths),
+                    entries,
+                    Some(NullBuffer::from(decoded.validity)),
+                    *sorted,
+                )?)
+            }
+            DataType::Decimal128(precision, scale) => {
+                // Decimal128 stored as REAL in database
+                // Convert back to i128 scaled value
+                const DECIMAL_BASE: i128 = 10;
+                #[expect(clippy::cast_sign_loss)]
+                let scale_factor = DECIMAL_BASE.pow(*scale as u32);
+                let values: Vec<Option<i128>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Real(f) => {
+                            // Convert float to scaled integer
+                            #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+                            let scaled = (f * scale_factor as f64).round() as i128;
+                            Some(scaled)
                         }
-                    } else {
-                        MapFieldNames::default()
-                    };
-
-                    let keys_builder = StringBuilder::new();
-                    let values_builder = Int32Builder::new();
-                    let mut map_builder =
-                        MapBuilder::new(Some(field_names), keys_builder, values_builder);
-
-                    for row in rows {
-                        match &row[col_idx] {
-                            TursoValue::Text(json_str) => {
-                                // Parse JSON object
-                                if let Ok(map) = serde_json::from_str::<
-                                    serde_json::Map<String, serde_json::Value>,
-                                >(json_str)
-                                {
-                                    for (key, value) in map {
-                                        map_builder.keys().append_value(&key);
-                                        if let Some(int_val) = value.as_i64() {
-                                            #[expect(clippy::cast_possible_truncation)]
-                                            let val = int_val as i32;
-                                            map_builder.values().append_value(val);
-                                        } else {
-                                            map_builder.values().append_null();
-                                        }
-                                    }
-                                    map_builder.append(true).map_err(|e| {
-                                        Box::new(std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData,
-                                            format!("Failed to append map: {e}"),
-                                        ))
-                                            as Box<dyn std::error::Error + Send + Sync>
-                                    })?;
-                                } else {
-                                    map_builder.append(false).map_err(|e| {
-                                        Box::new(std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData,
-                                            format!("Failed to append null map: {e}"),
-                                        ))
-                                            as Box<dyn std::error::Error + Send + Sync>
-                                    })?;
-                                }
-                            }
-                            _ => {
-                                map_builder.append(false).map_err(|e| {
-                                    Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        format!("Failed to append null map: {e}"),
-                                    ))
-                                        as Box<dyn std::error::Error + Send + Sync>
-                                })?;
-                            }
+                        TursoValue::Integer(i) => {
+                            // If stored as integer, scale it
+                            Some(i128::from(*i) * scale_factor)
                         }
-                    }
-
-                    Arc::new(map_builder.finish())
-                }
-                DataType::Decimal128(precision, scale) => {
-                    // Decimal128 stored as REAL in database
-                    // Convert back to i128 scaled value
-                    const DECIMAL_BASE: i128 = 10;
-                    #[expect(clippy::cast_sign_loss)]
-                    let scale_factor = DECIMAL_BASE.pow(*scale as u32);
-                    let values: Vec<Option<i128>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Real(f) => {
-                                // Convert float to scaled integer
-                                #[expect(
-                                    clippy::cast_possible_truncation,
-                                    clippy::cast_precision_loss
-                                )]
-                                let scaled = (f * scale_factor as f64).round() as i128;
-                                Some(scaled)
-                            }
-                            TursoValue::Integer(i) => {
-                                // If stored as integer, scale it
-                                Some(i128::from(*i) * scale_factor)
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(
-                        Decimal128Array::from(values)
-                            .with_precision_and_scale(*precision, *scale)
-                            .map_err(|e| {
-                                Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("Invalid decimal128 precision/scale: {e}"),
-                                ))
-                                    as Box<dyn std::error::Error + Send + Sync>
-                            })?,
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(
+                    Decimal128Array::from(values)
+                        .with_precision_and_scale(*precision, *scale)
+                        .map_err(|e| {
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Invalid decimal128 precision/scale: {e}"),
+                            ))
+                                as Box<dyn std::error::Error + Send + Sync>
+                        })?,
+                )
+            }
+            DataType::Decimal256(precision, scale) => {
+                // Decimal256 stored as REAL in database
+                // Convert back to i256 scaled value
+                const DECIMAL_BASE: i128 = 10;
+                #[expect(clippy::cast_sign_loss)]
+                let scale_factor = DECIMAL_BASE.pow(*scale as u32);
+                let values: Vec<Option<i256>> = rows
+                    .iter()
+                    .map(|row| match &row[col_idx] {
+                        TursoValue::Real(f) => {
+                            // Convert float to scaled integer
+                            #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+                            let scaled = (f * scale_factor as f64).round() as i128;
+                            Some(i256::from_i128(scaled))
+                        }
+                        TursoValue::Integer(i) => {
+                            // If stored as integer, scale it
+                            let scaled = i128::from(*i) * scale_factor;
+                            Some(i256::from_i128(scaled))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(
+                    Decimal256Array::from(values)
+                        .with_precision_and_scale(*precision, *scale)
+                        .map_err(|e| {
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Invalid decimal256 precision/scale: {e}"),
+                            ))
+                                as Box<dyn std::error::Error + Send + Sync>
+                        })?,
+                )
+            }
+            // `scalar_value_to_turso` stores a dictionary value unwrapped, so what is stored is
+            // whatever the value type stores. Rebuild that, then dictionary-encode it directly:
+            // `cast` packs only primitive, string and binary value types, so a dictionary over a
+            // list, map, boolean, duration or interval column would write but fail every scan.
+            DataType::Dictionary(key_type, value_type) => {
+                let values = Self::column_from_turso_values(rows, col_idx, column, value_type)?;
+                dictionary_encode(&values, key_type, data_type, column)?
+            }
+            // Rebuilding an unhandled type as a string only defers the failure to
+            // `RecordBatch::try_new`, which reports it as a mismatch against whichever column
+            // it compares first, so name the type here instead.
+            other => {
+                return Err(format!(
+                        "Failed to read the column '{}' from Turso: the {other} type is not supported by the Turso accelerator. \
+                        Cast the column to a supported type, or accelerate this dataset with a different engine. \
+                        See: https://spiceai.org/docs/components/data-accelerators/turso",
+                        column.escape_debug()
                     )
-                }
-                DataType::Decimal256(precision, scale) => {
-                    // Decimal256 stored as REAL in database
-                    // Convert back to i256 scaled value
-                    const DECIMAL_BASE: i128 = 10;
-                    #[expect(clippy::cast_sign_loss)]
-                    let scale_factor = DECIMAL_BASE.pow(*scale as u32);
-                    let values: Vec<Option<i256>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Real(f) => {
-                                // Convert float to scaled integer
-                                #[expect(
-                                    clippy::cast_possible_truncation,
-                                    clippy::cast_precision_loss
-                                )]
-                                let scaled = (f * scale_factor as f64).round() as i128;
-                                Some(i256::from_i128(scaled))
-                            }
-                            TursoValue::Integer(i) => {
-                                // If stored as integer, scale it
-                                let scaled = i128::from(*i) * scale_factor;
-                                Some(i256::from_i128(scaled))
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    Arc::new(
-                        Decimal256Array::from(values)
-                            .with_precision_and_scale(*precision, *scale)
-                            .map_err(|e| {
-                                Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("Invalid decimal256 precision/scale: {e}"),
-                                ))
-                                    as Box<dyn std::error::Error + Send + Sync>
-                            })?,
-                    )
-                }
-                _ => {
-                    // Default to string representation for unsupported types
-                    let values: Vec<Option<String>> = rows
-                        .iter()
-                        .map(|row| match &row[col_idx] {
-                            TursoValue::Text(s) => Some(s.clone()),
-                            TursoValue::Integer(i) => Some(i.to_string()),
-                            TursoValue::Real(f) => Some(f.to_string()),
-                            TursoValue::Null => None,
-                            TursoValue::Blob(_) => Some("[BLOB]".to_string()),
-                        })
-                        .collect();
-                    Arc::new(StringArray::from(values))
-                }
-            };
-            columns.push(column);
-        }
+                    .into());
+            }
+        };
 
-        let batch = RecordBatch::try_new(Arc::clone(schema), columns)?;
-        Self::warn_on_conversion_failures(rows, &batch);
-        Ok(batch)
+        Ok(column)
     }
 
     /// Counts, per column, stored values that were non-NULL in Turso but produced a NULL
@@ -1216,23 +1240,6 @@ impl TursoTableProvider {
             Ok(ast)
         })
     }
-
-    /// Returns `true` if the expression contains any subquery or outer reference column.
-    fn contains_subquery_or_outer_ref(expr: &Expr) -> bool {
-        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-        let mut found = false;
-        let _ = expr.apply(|e| match e {
-            Expr::ScalarSubquery(_)
-            | Expr::InSubquery(_)
-            | Expr::Exists(_)
-            | Expr::OuterReferenceColumn(_, _) => {
-                found = true;
-                Ok(TreeNodeRecursion::Stop)
-            }
-            _ => Ok(TreeNodeRecursion::Continue),
-        });
-        found
-    }
 }
 
 #[async_trait]
@@ -1254,12 +1261,16 @@ impl TableProvider for TursoTableProvider {
 
         let mut filter_push_down = vec![];
         for filter in filters {
-            // Expressions containing subqueries or outer references must not be pushed down.
-            // For federated providers, subqueries are handled at the plan level and pushing them
-            // into `TableScan.full_filters` is not beneficial. Subqueries may also reference tables
-            // in other databases not accessible from this Turso connection, and outer references
-            // refer to columns from an enclosing query that the table provider cannot resolve.
-            let pushdown = if Self::contains_subquery_or_outer_ref(filter) {
+            // An expression the scan cannot evaluate — a subquery in any of its
+            // forms, an outer reference, an unnest — must stay above the scan for
+            // decorrelation. The federation analyzer runs filter pushdown over the
+            // whole plan before decorrelation, so a subquery accepted here is written
+            // into the scan and rendered as Turso SQL verbatim: `v > ANY (SELECT …)`
+            // is a syntax error there (issue #14041), and a subquery may also name a
+            // table this connection cannot reach. The shared helper is exhaustive
+            // over `Expr`, so a new variant is a build failure rather than a filter
+            // the unparser happens to render and Turso then rejects.
+            let pushdown = if util::expr::cannot_be_evaluated_at_scan(filter) {
                 TableProviderFilterPushDown::Unsupported
             } else {
                 match unparser.expr_to_sql(filter) {
@@ -1360,6 +1371,23 @@ impl TursoTableProvider {
     }
 }
 
+/// Whether any expression of `plan`, including those of the subqueries nested in
+/// its expressions, is a quantified comparison (`ANY`/`ALL`).
+fn plan_contains_set_comparison(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            found = expr.exists(|e| Ok(matches!(e, Expr::SetComparison(_))))?;
+            if found {
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+    });
+    found
+}
+
 #[async_trait]
 impl SQLExecutor for TursoTableProvider {
     fn name(&self) -> &str {
@@ -1368,6 +1396,17 @@ impl SQLExecutor for TursoTableProvider {
 
     fn compute_context(&self) -> Option<String> {
         Some(self.pool.db_path().to_string())
+    }
+
+    /// A quantified comparison (`ANY`/`ALL`) has no spelling in Turso's SQL
+    /// grammar, and the federation analyzer resolves the subqueries under
+    /// `EXISTS`, `IN` and scalar subqueries but not the one under a
+    /// `SetComparison`, so a plan carrying one would be rendered verbatim and
+    /// rejected with a syntax error (issue #14041). Refusing the plan makes the
+    /// analyzer federate its children instead and leaves the comparison to
+    /// `DataFusion`, which rewrites it into `EXISTS` form and decorrelates it.
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        !plan_contains_set_comparison(plan)
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
@@ -1475,12 +1514,7 @@ impl SQLExecutor for TursoTableProvider {
                 TursoValue::Integer(not_null),
             ) = (&col_name, &col_type, &not_null)
             {
-                let data_type = match col_type.to_uppercase().as_str() {
-                    "INTEGER" | "BLOB" => DataType::Int64,
-                    "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
-                    "DATE_TEXT" => DataType::Date32,
-                    _ => DataType::Utf8,
-                };
+                let data_type = sqlite_declared_type_to_arrow(col_type);
                 let nullable = *not_null == 0;
                 fields.push(Field::new(col_name.as_str(), data_type, nullable));
             }
@@ -1608,6 +1642,17 @@ impl ExecutionPlan for TursoExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -1700,7 +1745,10 @@ impl TursoDeletionSink {
 
 #[async_trait]
 impl DeletionSink for TursoDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Build WHERE clause using SQLite dialect unparser
         let where_clause = if self.filters.is_empty() {
             String::new()
@@ -1953,6 +2001,19 @@ impl DataSink for TursoDataSink {
     }
 }
 
+/// Maps a `SQLite`/Turso declared column type (as reported by `PRAGMA` `table_info`) to the Arrow [`DataType`] used when inferring a table schema.
+///
+/// `SQLite` type affinity is loose, so this matches the declared type names Turso emits and falls back to [`DataType::Utf8`] (`TEXT` affinity) for anything unrecognized. `BLOB` maps to [`DataType::Binary`] so blob columns round-trip through [`TursoValue::Blob`] instead of being coerced to [`DataType::Int64`].
+fn sqlite_declared_type_to_arrow(declared_type: &str) -> DataType {
+    match declared_type.to_uppercase().as_str() {
+        "INTEGER" => DataType::Int64,
+        "BLOB" => DataType::Binary,
+        "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
+        "DATE_TEXT" => DataType::Date32,
+        _ => DataType::Utf8,
+    }
+}
+
 /// Converts a timestamp value to Turso storage format (RFC3339 TEXT or INTEGER milliseconds).
 ///
 /// # Arguments
@@ -2038,7 +2099,13 @@ fn convert_timestamp_to_turso(
             }
 
             match unit {
-                TimeUnit::Second => Ok(TursoValue::Integer(value * timestamp_conversion::MILLIS_PER_SECOND)),
+                TimeUnit::Second => value
+                    .checked_mul(timestamp_conversion::MILLIS_PER_SECOND)
+                    .map(TursoValue::Integer)
+                    .ok_or_else(|| {
+                        format!("Timestamp value {value}s overflows millisecond conversion")
+                    })
+                    .map_err(Into::into),
                 TimeUnit::Millisecond => Ok(TursoValue::Integer(value)),
                 TimeUnit::Microsecond => Err(
                     "TimestampMicrosecond not supported with integer_millis format - use rfc3339 format to preserve sub-millisecond precision"
@@ -2077,12 +2144,29 @@ fn convert_timestamp_to_turso(
 /// - `Timestamp*(_, Some(_))` → ERROR
 ///
 /// Configure via spicepod.yaml: `acceleration.params.internal_timestamp_format: "rfc3339"` or `"integer_millis"`
+///
+/// # Unsupported types
+///
+/// A type this function cannot represent returns an error rather than `NULL`, so a column the
+/// accelerator cannot store fails the write instead of reading back as a column of nulls.
+///
+/// # Read support must stay as wide
+///
+/// [`TursoTableProvider::values_to_record_batch`] is the inverse of this function. A type this
+/// function stores but that one cannot rebuild is a column that writes without error and can
+/// never be read back, so a new arm here needs its counterpart there.
 #[expect(clippy::match_same_arms)]
 fn scalar_value_to_turso(
     value: ScalarValue,
     timestamp_format: TimestampFormat,
 ) -> Result<TursoValue, Box<dyn std::error::Error + Send + Sync>> {
-    use arrow::array::{Array, MapArray};
+    use arrow::array::Array;
+
+    // A null of any type stores as SQL NULL. Testing this up front lets the arms below match only
+    // on `Some(..)` and still leave a genuine null distinguishable from an unsupported type.
+    if value.is_null() {
+        return Ok(TursoValue::Null);
+    }
 
     let turso_value = match value {
         ScalarValue::Int64(Some(v)) => TursoValue::Integer(v),
@@ -2101,9 +2185,18 @@ fn scalar_value_to_turso(
         ScalarValue::UInt8(Some(v)) => TursoValue::Integer(i64::from(v)),
         ScalarValue::Float64(Some(v)) => TursoValue::Real(v),
         ScalarValue::Float32(Some(v)) => TursoValue::Real(f64::from(v)),
-        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => TursoValue::Text(v),
+        ScalarValue::Float16(Some(v)) => TursoValue::Real(f64::from(v)),
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::LargeUtf8(Some(v))
+        | ScalarValue::Utf8View(Some(v)) => TursoValue::Text(v),
         ScalarValue::Boolean(Some(v)) => TursoValue::Integer(i64::from(v)),
-        ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => TursoValue::Blob(v),
+        ScalarValue::Binary(Some(v))
+        | ScalarValue::LargeBinary(Some(v))
+        | ScalarValue::BinaryView(Some(v))
+        | ScalarValue::FixedSizeBinary(_, Some(v)) => TursoValue::Blob(v),
+
+        // A dictionary only encodes how the value is stored, not what it is.
+        ScalarValue::Dictionary(_, inner) => scalar_value_to_turso(*inner, timestamp_format)?,
 
         // Timestamp conversions: Format depends on configuration
         ScalarValue::TimestampSecond(Some(v), tz) => {
@@ -2176,30 +2269,16 @@ fn scalar_value_to_turso(
                 .map_err(|e| format!("Failed to parse Decimal256 value '{v_str}' as f64: {e}"))?;
             TursoValue::Real(v_f64 / scale_factor)
         }
-        ScalarValue::List(list_arr) => {
-            // Serialize list as JSON
-            let mut json_values = Vec::new();
-            for i in 0..list_arr.len() {
-                if list_arr.is_null(i) {
-                    json_values.push(serde_json::Value::Null);
-                } else {
-                    let elem = ScalarValue::try_from_array(list_arr.as_ref(), i)?;
-                    match elem {
-                        ScalarValue::Int32(Some(v)) => json_values.push(serde_json::Value::from(v)),
-                        ScalarValue::Int64(Some(v)) => json_values.push(serde_json::Value::from(v)),
-                        ScalarValue::Utf8(Some(v)) => json_values.push(serde_json::Value::from(v)),
-                        _ => json_values.push(serde_json::Value::Null),
-                    }
-                }
-            }
-            TursoValue::Text(
-                serde_json::to_string(&json_values)
-                    .map_err(|e| format!("Failed to serialize List as JSON: {e}"))?,
-            )
+        // A list scalar holds a one-row array whose single row *is* the list, so the elements to
+        // serialize are that row's values, not the rows of the wrapper.
+        ScalarValue::List(list_arr) => TursoValue::Text(list_elements_to_json(&list_arr.value(0))?),
+        ScalarValue::LargeList(list_arr) => {
+            TursoValue::Text(list_elements_to_json(&list_arr.value(0))?)
+        }
+        ScalarValue::FixedSizeList(list_arr) => {
+            TursoValue::Text(list_elements_to_json(&list_arr.value(0))?)
         }
         ScalarValue::Map(map_arr) => {
-            // Map is a StructArray with "entries" containing keys and values
-            // Serialize as JSON object
             let map_array = map_arr
                 .as_ref()
                 .as_any()
@@ -2211,30 +2290,28 @@ fn scalar_value_to_turso(
                     )) as Box<dyn std::error::Error + Send + Sync>
                 })?;
 
-            let mut json_map = serde_json::Map::new();
+            // `value(0)` applies the row's offsets; `keys()`/`values()` would return the entries of
+            // every row the array was sliced from.
+            let entries = map_array.value(0);
+            let keys = entries.column(MAP_KEY_COLUMN);
+            let values = entries.column(MAP_VALUE_COLUMN);
 
-            // Get keys and values from the map
-            let keys = map_array.keys();
-            let values = map_array.values();
+            let mut json_map = serde_json::Map::with_capacity(keys.len());
+            let key_type = keys.data_type();
 
             for i in 0..keys.len() {
-                if !keys.is_null(i) && !values.is_null(i) {
-                    // Extract key as string
-                    let key_scalar = ScalarValue::try_from_array(keys.as_ref(), i)?;
-                    let ScalarValue::Utf8(Some(key_str)) = key_scalar else {
-                        continue;
-                    };
+                let key_scalar = ScalarValue::try_from_array(keys.as_ref(), i)?;
+                let serde_json::Value::String(key_str) = scalar_value_to_json(key_scalar)? else {
+                    return Err(format!(
+                        "Failed to write a map value to Turso: map keys must be strings, found {key_type}. \
+                        Cast the map's key type to a string, or accelerate this dataset with a different engine. \
+                        See: https://spiceai.org/docs/components/data-accelerators/turso"
+                    )
+                    .into());
+                };
 
-                    // Extract value
-                    let val_scalar = ScalarValue::try_from_array(values.as_ref(), i)?;
-                    let val_json = match val_scalar {
-                        ScalarValue::Int32(Some(v)) => serde_json::Value::from(v),
-                        ScalarValue::Int64(Some(v)) => serde_json::Value::from(v),
-                        _ => serde_json::Value::Null,
-                    };
-
-                    json_map.insert(key_str, val_json);
-                }
+                let val_scalar = ScalarValue::try_from_array(values.as_ref(), i)?;
+                json_map.insert(key_str, scalar_value_to_json(val_scalar)?);
             }
 
             TursoValue::Text(
@@ -2242,10 +2319,669 @@ fn scalar_value_to_turso(
                     .map_err(|e| format!("Failed to serialize Map as JSON: {e}"))?,
             )
         }
-        _ => TursoValue::Null,
+        // Storing an unsupported type as NULL would report a successful write of a column that
+        // reads back empty, so refuse it instead.
+        other => {
+            return Err(format!(
+                "Failed to write a value to Turso: the {} type is not supported by the Turso accelerator. \
+                Cast the column to a supported type, or accelerate this dataset with a different engine. \
+                See: https://spiceai.org/docs/components/data-accelerators/turso",
+                other.data_type()
+            )
+            .into());
+        }
     };
 
     Ok(turso_value)
+}
+
+/// Position of the key column in a `MapArray`'s entries struct.
+const MAP_KEY_COLUMN: usize = 0;
+/// Position of the value column in a `MapArray`'s entries struct.
+const MAP_VALUE_COLUMN: usize = 1;
+
+/// Version of the encoding written for a list value's elements.
+///
+/// A payload carrying this version was written by an encoder whose output the reader can trust. It
+/// is not the only payload the reader will serve, because a version marker is not what makes a
+/// stored list correct — see [`classify_stored_list`] for what an unversioned payload is judged on.
+const LIST_ENCODING_VERSION: u64 = 1;
+
+/// The one payload the pre-version writer produced, for every list whatever the list held: a JSON
+/// array of exactly one null.
+///
+/// A list that genuinely holds a single null encodes to the same bytes, so an *unversioned* payload
+/// of this shape cannot be attributed to either writer and is refused. Any other unversioned shape
+/// is proof of a writer that was not the broken one, so it is served.
+///
+/// Only a `List` column can hold such a payload — see [`PreVersionWriter`].
+fn is_pre_version_list_shape(elements: &[serde_json::Value]) -> bool {
+    matches!(elements, [serde_json::Value::Null])
+}
+
+/// Whether the pre-version writer could have stored anything under the column being read.
+///
+/// It had one list arm, for `ScalarValue::List`. `LargeList` and `FixedSizeList` values reached the
+/// unsupported-type path instead and never became rows, so a payload under one of those columns can
+/// only have come from a writer that serialized the list's real contents — including the one that
+/// encodes to a bare array of a single null. Applying the ambiguity there would refuse correct data
+/// for a collision that cannot have happened.
+#[derive(Clone, Copy)]
+enum PreVersionWriter {
+    /// A column type it stored, so its one ambiguous shape is undecidable here.
+    CouldHaveStored,
+    /// A column type it never stored, so no payload under this column is its output.
+    NeverStored,
+}
+
+/// Envelope member naming the [`LIST_ENCODING_VERSION`] a payload was written under.
+const LIST_ENCODING_VERSION_KEY: &str = "v";
+
+/// Envelope member holding a list payload's elements.
+const LIST_ENCODING_ELEMENTS_KEY: &str = "e";
+
+/// Serializes the elements of one list value for storage in a `TEXT` column, as a JSON envelope
+/// naming the encoding version the elements were written under.
+fn list_elements_to_json(
+    elements: &ArrayRef,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut json_values = Vec::with_capacity(elements.len());
+    for i in 0..elements.len() {
+        json_values.push(scalar_value_to_json(ScalarValue::try_from_array(
+            elements.as_ref(),
+            i,
+        )?)?);
+    }
+
+    let mut envelope = serde_json::Map::with_capacity(2);
+    envelope.insert(
+        LIST_ENCODING_VERSION_KEY.to_string(),
+        serde_json::Value::from(LIST_ENCODING_VERSION),
+    );
+    envelope.insert(
+        LIST_ENCODING_ELEMENTS_KEY.to_string(),
+        serde_json::Value::Array(json_values),
+    );
+
+    serde_json::to_string(&envelope)
+        .map_err(|e| format!("Failed to serialize List as JSON: {e}").into())
+}
+
+/// Converts a scalar element of a list or map to the JSON value stored for it.
+///
+/// Only the types JSON represents exactly are accepted; anything else is an error rather than a
+/// `null`, so an element the accelerator cannot store cannot be mistaken for one that was null.
+fn scalar_value_to_json(
+    value: ScalarValue,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    if value.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+
+    let json_value = match value {
+        ScalarValue::Boolean(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Int8(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Int16(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Int32(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Int64(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::UInt8(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::UInt16(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::UInt32(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::UInt64(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Float16(Some(v)) => finite_json_number(f64::from(v))?,
+        ScalarValue::Float32(Some(v)) => finite_json_number(f64::from(v))?,
+        ScalarValue::Float64(Some(v)) => finite_json_number(v)?,
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::LargeUtf8(Some(v))
+        | ScalarValue::Utf8View(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Dictionary(_, inner) => scalar_value_to_json(*inner)?,
+        other => {
+            return Err(format!(
+                "Failed to write a nested value to Turso: the {} element type is not supported by the Turso accelerator. \
+                Cast the elements to a number, boolean, or string, or accelerate this dataset with a different engine. \
+                See: https://spiceai.org/docs/components/data-accelerators/turso",
+                other.data_type()
+            )
+            .into());
+        }
+    };
+
+    Ok(json_value)
+}
+
+/// Converts a float to a JSON number, rejecting the values JSON cannot represent.
+///
+/// `serde_json` encodes NaN and the infinities as `null`, which would make them indistinguishable
+/// from a missing element on read.
+fn finite_json_number(
+    value: f64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    serde_json::Number::from_f64(value)
+        .map(serde_json::Value::Number)
+        .ok_or_else(|| {
+            format!(
+                "Failed to write a nested value to Turso: {value} has no JSON representation. \
+                Filter out non-finite floats, or accelerate this dataset with a different engine. \
+                See: https://spiceai.org/docs/components/data-accelerators/turso"
+            )
+            .into()
+        })
+}
+
+/// A `List` or `LargeList` column decoded from its stored JSON: the flat element array, how many
+/// elements each row contributes, and which rows hold a list at all.
+struct DecodedLists {
+    elements: ArrayRef,
+    lengths: Vec<usize>,
+    validity: Vec<bool>,
+}
+
+/// A `FixedSizeList` column decoded from its stored JSON. Every row occupies the same number of
+/// element slots, so there are no per-row lengths.
+struct DecodedFixedSizeLists {
+    elements: ArrayRef,
+    validity: Vec<bool>,
+}
+
+/// A `Map` column decoded from its stored JSON, as the two entry-struct children plus the offsets
+/// and validity of the rows over them.
+struct DecodedMaps {
+    keys: ArrayRef,
+    values: ArrayRef,
+    lengths: Vec<usize>,
+    validity: Vec<bool>,
+}
+
+/// Dictionary-encodes `values` as `dictionary_type`, whose keys are `key_type`.
+///
+/// `arrow::compute::cast` packs only primitive, string and binary value types into a dictionary,
+/// so a dictionary over a list, map, boolean, duration or interval column that the write path
+/// stored without complaint would fail every scan with a raw `CastError`. This builds the array
+/// directly instead. Distinct values are found through the row format (see [`row_encodable`]),
+/// so the dictionary is as compact as `cast` makes one and the keys a scan needs grow with the
+/// distinct values, not the row count; a value type the row format cannot express at all gets
+/// one entry per row. Either way a NULL stays a NULL key, and a column with more entries than
+/// `key_type` can index is refused with an error that names the column and the key type rather
+/// than an Arrow-internal one.
+fn dictionary_encode(
+    values: &ArrayRef,
+    key_type: &DataType,
+    dictionary_type: &DataType,
+    column: &str,
+) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
+    let (keys, distinct): (Vec<Option<u64>>, ArrayRef) =
+        if let Some(encodable) = row_encodable(values) {
+            let rows = RowConverter::new(vec![SortField::new(encodable.data_type().clone())])?
+                .convert_columns(std::slice::from_ref(&encodable))?;
+            let rows: Vec<_> = rows.iter().collect();
+            let mut key_of_row: HashMap<&[u8], u64> = HashMap::new();
+            let mut distinct_indices: Vec<u64> = Vec::new();
+            let keys = (0..values.len())
+                .map(|index| {
+                    if values.is_null(index) {
+                        return None;
+                    }
+                    let next_key = distinct_indices.len() as u64;
+                    let key = *key_of_row.entry(rows[index].as_ref()).or_insert_with(|| {
+                        distinct_indices.push(index as u64);
+                        next_key
+                    });
+                    Some(key)
+                })
+                .collect();
+            let distinct = take(values.as_ref(), &UInt64Array::from(distinct_indices), None)?;
+            (keys, distinct)
+        } else {
+            let keys = (0..values.len())
+                .map(|index| (!values.is_null(index)).then_some(index as u64))
+                .collect();
+            (keys, Arc::clone(values))
+        };
+
+    let data = cast_with_options(
+        &UInt64Array::from(keys),
+        key_type,
+        &CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| {
+        format!(
+            "Failed to read the dictionary column '{}' from Turso: its {} entries do not fit the {key_type} keys the column declares ({e}). \
+            Re-create the dataset with a wider dictionary key type, or accelerate it with a different engine. \
+            See: https://spiceai.org/docs/components/data-accelerators/turso",
+            column.escape_debug(),
+            distinct.len()
+        )
+    })?
+    .to_data()
+    .into_builder()
+    .data_type(dictionary_type.clone())
+    .add_child_data(distinct.to_data())
+    .build()?;
+    Ok(make_array(data))
+}
+
+/// The array whose rows stand in for `values` in the row format: `values` itself where the row
+/// format supports its type, a map as the list of entry structs it is stored as (the row format
+/// encodes lists and structs but not maps), or `None` when neither is encodable.
+///
+/// Re-reading a map as a list is exact: a `MapArray` is a `ListArray` of its entries with a
+/// different type tag, so equal maps encode to equal rows and different maps to different ones.
+fn row_encodable(values: &ArrayRef) -> Option<ArrayRef> {
+    let supports = |array: &ArrayRef| {
+        RowConverter::supports_fields(&[SortField::new(array.data_type().clone())])
+    };
+    if supports(values) {
+        return Some(Arc::clone(values));
+    }
+    let DataType::Map(entries_field, _) = values.data_type() else {
+        return None;
+    };
+    let map = values.as_any().downcast_ref::<MapArray>()?;
+    let entries: ArrayRef = Arc::new(map.entries().clone());
+    let list: ArrayRef = Arc::new(
+        GenericListArray::<i32>::try_new(
+            Arc::clone(entries_field),
+            map.offsets().clone(),
+            entries,
+            map.nulls().cloned(),
+        )
+        .ok()?,
+    );
+    supports(&list).then_some(list)
+}
+
+/// Rebuilds a `List` or `LargeList` column, which differ only in the width of their offsets.
+fn list_column<O: OffsetSizeTrait>(
+    rows: &[Vec<TursoValue>],
+    col_idx: usize,
+    element_field: &FieldRef,
+) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
+    // 32-bit offsets are a `List`, which the pre-version writer stored; 64-bit offsets are a
+    // `LargeList`, which it did not.
+    let pre_version_writer = if O::IS_LARGE {
+        PreVersionWriter::NeverStored
+    } else {
+        PreVersionWriter::CouldHaveStored
+    };
+    let decoded = decode_stored_lists(rows, col_idx, element_field, pre_version_writer)?;
+    Ok(Arc::new(GenericListArray::<O>::try_new(
+        Arc::clone(element_field),
+        OffsetBuffer::from_lengths(decoded.lengths),
+        decoded.elements,
+        Some(NullBuffer::from(decoded.validity)),
+    )?))
+}
+
+/// Decodes the JSON array stored for each row of a `List` or `LargeList` column, as the inverse of
+/// [`list_elements_to_json`].
+fn decode_stored_lists(
+    rows: &[Vec<TursoValue>],
+    col_idx: usize,
+    element_field: &FieldRef,
+    pre_version_writer: PreVersionWriter,
+) -> Result<DecodedLists, Box<dyn std::error::Error + Send + Sync>> {
+    let element_type = element_field.data_type();
+    let mut elements: Vec<ScalarValue> = Vec::new();
+    let mut lengths = Vec::with_capacity(rows.len());
+    let mut validity = Vec::with_capacity(rows.len());
+    let mut refusals = ListRefusals::default();
+
+    for row in rows {
+        if let Some(values) = decode_stored_list_row(
+            row.get(col_idx),
+            element_type,
+            pre_version_writer,
+            &mut refusals,
+        ) {
+            lengths.push(values.len());
+            validity.push(true);
+            elements.extend(values);
+        } else {
+            lengths.push(0);
+            validity.push(false);
+        }
+    }
+
+    warn_on_refused_list_payloads(&refusals);
+
+    Ok(DecodedLists {
+        elements: scalars_to_array(elements, element_type)?,
+        lengths,
+        validity,
+    })
+}
+
+/// Decodes a `FixedSizeList` column, where every row occupies exactly `width` element slots.
+///
+/// A stored list that is not exactly `width` long reads as null: padding it would invent elements
+/// and truncating it would drop them.
+fn decode_stored_fixed_size_lists(
+    rows: &[Vec<TursoValue>],
+    col_idx: usize,
+    element_field: &FieldRef,
+    width: i32,
+) -> Result<DecodedFixedSizeLists, Box<dyn std::error::Error + Send + Sync>> {
+    let slots = usize::try_from(width).map_err(|_| {
+        format!("Failed to read a column from Turso: {width} is not a valid fixed-size list width")
+    })?;
+    let element_type = element_field.data_type();
+    let unset = ScalarValue::try_from(element_type)?;
+
+    // The width comes from the schema, so it is not bounded by anything stored: reserve for the
+    // rows and let the element vector grow, rather than trusting `rows * width` as a capacity.
+    let mut elements: Vec<ScalarValue> = Vec::with_capacity(rows.len());
+    let mut validity = Vec::with_capacity(rows.len());
+    let mut refusals = ListRefusals::default();
+
+    for row in rows {
+        if let Some(values) = decode_stored_list_row(
+            row.get(col_idx),
+            element_type,
+            // The pre-version writer never stored a `FixedSizeList`.
+            PreVersionWriter::NeverStored,
+            &mut refusals,
+        )
+        .filter(|values| values.len() == slots)
+        {
+            validity.push(true);
+            elements.extend(values);
+        } else {
+            // A null row still owns its slots in the element array.
+            validity.push(false);
+            elements.extend(std::iter::repeat_n(unset.clone(), slots));
+        }
+    }
+
+    warn_on_refused_list_payloads(&refusals);
+
+    Ok(DecodedFixedSizeLists {
+        elements: scalars_to_array(elements, element_type)?,
+        validity,
+    })
+}
+
+/// Decodes the JSON object stored for each row of a `Map` column into its key and value arrays, as
+/// the inverse of the `ScalarValue::Map` arm of [`scalar_value_to_turso`].
+fn decode_stored_maps(
+    rows: &[Vec<TursoValue>],
+    col_idx: usize,
+    key_field: &FieldRef,
+    value_field: &FieldRef,
+) -> Result<DecodedMaps, Box<dyn std::error::Error + Send + Sync>> {
+    let (key_type, value_type) = (key_field.data_type(), value_field.data_type());
+    let mut keys: Vec<ScalarValue> = Vec::new();
+    let mut values: Vec<ScalarValue> = Vec::new();
+    let mut lengths = Vec::with_capacity(rows.len());
+    let mut validity = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        if let Some(entries) = decode_stored_map_row(row.get(col_idx), key_type, value_type) {
+            lengths.push(entries.len());
+            validity.push(true);
+            for (key, value) in entries {
+                keys.push(key);
+                values.push(value);
+            }
+        } else {
+            lengths.push(0);
+            validity.push(false);
+        }
+    }
+
+    Ok(DecodedMaps {
+        keys: scalars_to_array(keys, key_type)?,
+        values: scalars_to_array(values, value_type)?,
+        lengths,
+        validity,
+    })
+}
+
+/// What a stored list payload turns out to be, decided in one parse so that a refused cell can say
+/// why without the payload being read twice.
+enum StoredListPayload {
+    /// Elements to decode as the column's element type.
+    Elements(Vec<serde_json::Value>),
+    /// An unversioned payload of the one shape the broken writer produced, under a column that
+    /// writer stored — see [`is_pre_version_list_shape`] and [`PreVersionWriter`]. Undecidable, so
+    /// refused.
+    AmbiguousPreVersion,
+    /// An envelope naming an encoding version this build does not write, so its shape is not one
+    /// this reader knows how to interpret.
+    UnknownVersion,
+    /// Not a list payload this reader recognises at all.
+    Unreadable,
+}
+
+/// Decides what a stored list payload is.
+///
+/// An envelope is served when it names [`LIST_ENCODING_VERSION`]. A bare array carries no version,
+/// so it predates the marker — but that alone does not condemn it: the broken writer emitted exactly
+/// one shape, so only that shape is ambiguous and every other bare array is provably from a writer
+/// that serialized the list's real contents. Refusing all of them would discard correct data to no
+/// benefit.
+///
+/// The same argument bounds which columns the ambiguity applies to at all: under a column the broken
+/// writer never stored, even that one shape is unambiguous. `pre_version_writer` carries which kind
+/// of column this is — see [`PreVersionWriter`].
+fn classify_stored_list(json: &str, pre_version_writer: PreVersionWriter) -> StoredListPayload {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Object(mut envelope)) => {
+            let version = envelope
+                .get(LIST_ENCODING_VERSION_KEY)
+                .and_then(serde_json::Value::as_u64);
+            if version != Some(LIST_ENCODING_VERSION) {
+                return StoredListPayload::UnknownVersion;
+            }
+            match envelope.remove(LIST_ENCODING_ELEMENTS_KEY) {
+                Some(serde_json::Value::Array(elements)) => StoredListPayload::Elements(elements),
+                // Claims a version whose shape it does not have, so it is corrupt rather than
+                // written under a rule this reader could apply.
+                _ => StoredListPayload::Unreadable,
+            }
+        }
+        Ok(serde_json::Value::Array(elements)) => match pre_version_writer {
+            PreVersionWriter::CouldHaveStored if is_pre_version_list_shape(&elements) => {
+                StoredListPayload::AmbiguousPreVersion
+            }
+            _ => StoredListPayload::Elements(elements),
+        },
+        _ => StoredListPayload::Unreadable,
+    }
+}
+
+/// Per-column tally of stored list cells refused for a reason an operator can act on.
+///
+/// Counted rather than logged per row so a scan reports once instead of once per cell.
+#[derive(Default)]
+struct ListRefusals {
+    /// Payloads of the shape the broken writer produced, which cannot be attributed.
+    ambiguous_pre_version: usize,
+    /// Payloads written under an encoding version newer than this build's.
+    unknown_version: usize,
+}
+
+/// The elements of one stored list, or `None` if nothing was stored for it, it cannot be
+/// attributed, or it does not decode as the declared element type.
+///
+/// Records the refusals worth reporting in `refusals`; a payload that is simply unreadable is not
+/// one of them, because the existing conversion-failure WARN already covers it as drift.
+fn decode_stored_list_row(
+    stored: Option<&TursoValue>,
+    element_type: &DataType,
+    pre_version_writer: PreVersionWriter,
+    refusals: &mut ListRefusals,
+) -> Option<Vec<ScalarValue>> {
+    let Some(TursoValue::Text(json)) = stored else {
+        return None;
+    };
+    let elements = match classify_stored_list(json, pre_version_writer) {
+        StoredListPayload::Elements(elements) => elements,
+        StoredListPayload::AmbiguousPreVersion => {
+            refusals.ambiguous_pre_version += 1;
+            return None;
+        }
+        StoredListPayload::UnknownVersion => {
+            refusals.unknown_version += 1;
+            return None;
+        }
+        StoredListPayload::Unreadable => return None,
+    };
+    elements
+        .iter()
+        .map(|element| json_value_to_scalar(element, element_type))
+        .collect()
+}
+
+/// Emits one WARN per refusal reason a scanned list column hit, each naming its own remedy.
+///
+/// Separate from the per-scan conversion-failure WARN, which reports the same cells as type drift.
+/// These say what actually happened and what fixes it.
+fn warn_on_refused_list_payloads(refusals: &ListRefusals) {
+    if refusals.ambiguous_pre_version > 0 {
+        let count = refusals.ambiguous_pre_version;
+        tracing::warn!(
+            "Turso read: {count} stored list value(s) hold the single-null payload that a build \
+             predating the list encoding version wrote for every list, whatever the list held. \
+             That is also what a list genuinely holding one null looks like, so these cannot be \
+             attributed and were returned as NULL rather than served. Refresh this dataset to \
+             rebuild them."
+        );
+    }
+    if refusals.unknown_version > 0 {
+        let count = refusals.unknown_version;
+        tracing::warn!(
+            "Turso read: {count} stored list value(s) name a list encoding version this build does \
+             not write, and were returned as NULL. This acceleration was written by a newer build \
+             than the one reading it: upgrade this build, or refresh the dataset to rewrite them."
+        );
+    }
+}
+
+/// The entries of one stored map, or `None` if nothing was stored for it or it does not decode as a
+/// JSON object of the declared key and value types.
+///
+/// The write path rejects a map whose keys are not strings, so a key is decoded from the JSON member
+/// name.
+fn decode_stored_map_row(
+    stored: Option<&TursoValue>,
+    key_type: &DataType,
+    value_type: &DataType,
+) -> Option<Vec<(ScalarValue, ScalarValue)>> {
+    let Some(TursoValue::Text(json)) = stored else {
+        return None;
+    };
+    let entries: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).ok()?;
+    entries
+        .into_iter()
+        .map(|(key, value)| {
+            Some((
+                json_value_to_scalar(&serde_json::Value::String(key), key_type)?,
+                json_value_to_scalar(&value, value_type)?,
+            ))
+        })
+        .collect()
+}
+
+/// Decodes one stored JSON element as the Arrow type its field declares, the inverse of
+/// [`scalar_value_to_json`].
+///
+/// `None` means the element cannot be represented as that type: a number that does not fit it, or a
+/// JSON shape that function never writes. The caller nulls the whole cell rather than the single
+/// element, so a value that does not fit can never read back as a different one — and unlike a
+/// dropped element, a null cell over a non-NULL stored value is what
+/// [`TursoTableProvider::count_conversion_failures`] counts.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "narrowing to f32 is checked for overflow below; the write path stored an f32"
+)]
+fn json_value_to_scalar(value: &serde_json::Value, data_type: &DataType) -> Option<ScalarValue> {
+    // A dictionary element is stored as its unwrapped value, so decode that and re-wrap it.
+    if let DataType::Dictionary(key_type, value_type) = data_type {
+        let inner = json_value_to_scalar(value, value_type)?;
+        return Some(ScalarValue::Dictionary(key_type.clone(), Box::new(inner)));
+    }
+
+    if value.is_null() {
+        // A null element is a null of the declared type, not a failure to decode one.
+        return ScalarValue::try_from(data_type).ok();
+    }
+
+    match data_type {
+        DataType::Boolean => value.as_bool().map(|v| ScalarValue::Boolean(Some(v))),
+        DataType::Int8 => int_element(value).map(|v| ScalarValue::Int8(Some(v))),
+        DataType::Int16 => int_element(value).map(|v| ScalarValue::Int16(Some(v))),
+        DataType::Int32 => int_element(value).map(|v| ScalarValue::Int32(Some(v))),
+        DataType::Int64 => value.as_i64().map(|v| ScalarValue::Int64(Some(v))),
+        DataType::UInt8 => uint_element(value).map(|v| ScalarValue::UInt8(Some(v))),
+        DataType::UInt16 => uint_element(value).map(|v| ScalarValue::UInt16(Some(v))),
+        DataType::UInt32 => uint_element(value).map(|v| ScalarValue::UInt32(Some(v))),
+        DataType::UInt64 => value.as_u64().map(|v| ScalarValue::UInt64(Some(v))),
+        // Decoded as `Float64` and narrowed by `scalars_to_array`, because `half::f16` is not a
+        // dependency of this crate.
+        DataType::Float16 | DataType::Float64 => {
+            value.as_f64().map(|v| ScalarValue::Float64(Some(v)))
+        }
+        DataType::Float32 => value.as_f64().and_then(|v| {
+            let narrowed = v as f32;
+            narrowed
+                .is_finite()
+                .then_some(ScalarValue::Float32(Some(narrowed)))
+        }),
+        DataType::Utf8 => value
+            .as_str()
+            .map(|v| ScalarValue::Utf8(Some(v.to_string()))),
+        DataType::LargeUtf8 => value
+            .as_str()
+            .map(|v| ScalarValue::LargeUtf8(Some(v.to_string()))),
+        DataType::Utf8View => value
+            .as_str()
+            .map(|v| ScalarValue::Utf8View(Some(v.to_string()))),
+        _ => None,
+    }
+}
+
+/// A JSON number as a narrower signed integer, or `None` if it does not fit — never the truncation
+/// an `as` cast would give.
+fn int_element<T: TryFrom<i64>>(value: &serde_json::Value) -> Option<T> {
+    T::try_from(value.as_i64()?).ok()
+}
+
+/// A JSON number as a narrower unsigned integer, or `None` if it is negative or does not fit.
+fn uint_element<T: TryFrom<u64>>(value: &serde_json::Value) -> Option<T> {
+    T::try_from(value.as_u64()?).ok()
+}
+
+/// Builds an array of exactly `data_type` from scalars decoded for it.
+///
+/// [`ScalarValue::iter_to_array`] infers the type from the first scalar and rejects an empty
+/// iterator, so a column of only empty or null lists needs the declared type supplied directly.
+fn scalars_to_array(
+    scalars: Vec<ScalarValue>,
+    data_type: &DataType,
+) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
+    if scalars.is_empty() {
+        return Ok(new_empty_array(data_type));
+    }
+
+    let array = ScalarValue::iter_to_array(scalars)?;
+    if array.data_type() == data_type {
+        return Ok(array);
+    }
+
+    // `json_value_to_scalar` decodes every type as the one declared except `Float16`, which it
+    // decodes as `Float64`. `safe: false` so an out-of-range value fails rather than becoming a
+    // null element, which nothing downstream would count.
+    Ok(cast_with_options(
+        &array,
+        data_type,
+        &CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )?)
 }
 
 /// An AST visitor that rewrites numeric `BETWEEN` expressions into explicit
@@ -2384,10 +3120,14 @@ impl VisitorMut for TursoBetweenVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{
+        ArrayRef, DictionaryArray, FixedSizeListBuilder, Int32Builder, Int64Array, Int64Builder,
+        ListArray, ListBuilder, MapBuilder, StringArray, StringBuilder,
+    };
+    use arrow::datatypes::{DataType, Field, Int8Type, Schema};
     use datafusion::datasource::sink::DataSink;
     use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::prelude::SessionContext;
     use datafusion::sql::sqlparser::parser::Parser;
 
     async fn create_turso_sink(table_name: &str) -> (Arc<TursoConnectionPool>, TursoDataSink) {
@@ -2494,6 +3234,211 @@ mod tests {
             let _ = stmt.visit(&mut visitor);
         }
         stmts[0].to_string()
+    }
+
+    /// The quantified comparisons #14041 reports, each paired with the ids it
+    /// returns over [`quantified_comparison_fixture`]. The expected ids are the
+    /// ones the same fixture yields through every other accelerator.
+    const QUANTIFIED_COMPARISON_QUERIES: &[(&str, &[i64])] = &[
+        (
+            "SELECT id FROM items WHERE v > ANY (SELECT val FROM details)",
+            &[1, 2, 4],
+        ),
+        (
+            "SELECT id FROM items WHERE v >= ALL (SELECT val FROM details)",
+            &[2, 4],
+        ),
+        (
+            "SELECT id FROM items WHERE id > ALL (SELECT item_id FROM details)",
+            &[],
+        ),
+        (
+            "SELECT id FROM items WHERE v > ALL (SELECT val FROM details WHERE val > 100)",
+            &[1, 2, 3, 4],
+        ),
+        (
+            "SELECT id FROM items WHERE v > ANY (SELECT val FROM details WHERE item_id = id)",
+            &[2],
+        ),
+        (
+            "SELECT id FROM items WHERE v >= ALL (SELECT val FROM details WHERE item_id = id)",
+            &[2, 3, 4],
+        ),
+    ];
+
+    /// Two Turso tables registered through the federation analyzer, the way the
+    /// runtime registers an accelerator. The analyzer runs filter pushdown over
+    /// the whole plan before decorrelation, so a `WHERE` the provider accepts
+    /// as `Exact` is written into the scan and rendered as Turso SQL verbatim.
+    async fn quantified_comparison_fixture() -> (Arc<TursoConnectionPool>, SessionContext) {
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("in-memory Turso pool should be created"),
+        );
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        for sql in [
+            "CREATE TABLE items (id INTEGER, v INTEGER)",
+            "INSERT INTO items VALUES (1, 10), (2, 20), (3, NULL), (4, 40)",
+            "CREATE TABLE details (item_id INTEGER, val INTEGER)",
+            "INSERT INTO details VALUES (1, 10), (1, 20), (2, 5), (NULL, 7)",
+        ] {
+            conn.execute(sql, ())
+                .await
+                .expect("fixture statement should execute");
+        }
+
+        let ctx = SessionContext::new_with_state(datafusion_federation::default_session_state());
+        for (table, schema) in [
+            ("items", items_schema()),
+            (
+                "details",
+                Arc::new(Schema::new(vec![
+                    Field::new("item_id", DataType::Int64, true),
+                    Field::new("val", DataType::Int64, false),
+                ])),
+            ),
+        ] {
+            let provider = Arc::new(TursoTableProvider::new(
+                schema,
+                table.to_string(),
+                Arc::clone(&pool),
+            ));
+            let federated = provider
+                .create_federated_table_provider()
+                .expect("federated table provider should be created");
+            ctx.register_table(table, Arc::new(federated))
+                .expect("table should register");
+        }
+        (pool, ctx)
+    }
+
+    fn items_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ]))
+    }
+
+    fn sorted_ids(batches: &[RecordBatch]) -> Vec<i64> {
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("the query returns BIGINT ids")
+                    .iter()
+                    .flatten()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn quantified_comparisons_are_answered_rather_than_pushed_into_turso_sql() {
+        let (_pool, ctx) = quantified_comparison_fixture().await;
+        let mut failures = Vec::new();
+        for &(query, expected) in QUANTIFIED_COMPARISON_QUERIES {
+            let result = async { ctx.sql(query).await?.collect().await }.await;
+            match result {
+                Ok(batches) => {
+                    let ids = sorted_ids(&batches);
+                    if ids != expected {
+                        failures.push(format!("{query}: expected {expected:?}, got {ids:?}"));
+                    }
+                }
+                Err(error) => failures.push(format!("{query}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "an ANY/ALL comparison must stay above the scan for decorrelation, not be rendered \
+             as Turso SQL:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_set_comparison_filter_is_declined_for_pushdown() {
+        let (pool, ctx) = quantified_comparison_fixture().await;
+        let plan = ctx
+            .state()
+            .create_logical_plan("SELECT id FROM items WHERE v > ANY (SELECT val FROM details)")
+            .await
+            .expect("the statement should plan");
+        let mut predicate = None;
+        plan.apply(|node| {
+            if let LogicalPlan::Filter(filter) = node {
+                predicate = Some(filter.predicate.clone());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("the plan walk cannot fail");
+        let predicate = predicate.expect("the statement has a WHERE clause");
+        assert!(
+            matches!(predicate, Expr::SetComparison(_)),
+            "the premise: the planner keeps ANY/ALL as a SetComparison, got {predicate}"
+        );
+
+        let provider = TursoTableProvider::new(items_schema(), "items".to_string(), pool);
+        let support = TableProvider::supports_filters_pushdown(&provider, &[&predicate])
+            .expect("pushdown support should be reported");
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported],
+            "a filter the scan cannot evaluate must be declined, not claimed Exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_carrying_a_set_comparison_is_refused_for_federation() {
+        let (pool, ctx) = quantified_comparison_fixture().await;
+        let provider = TursoTableProvider::new(items_schema(), "items".to_string(), pool);
+        let plan_for = |sql: &'static str| {
+            let state = ctx.state();
+            async move {
+                state
+                    .create_logical_plan(sql)
+                    .await
+                    .expect("the statement should plan")
+            }
+        };
+
+        let quantified =
+            plan_for("SELECT id FROM items WHERE v > ANY (SELECT val FROM details)").await;
+        assert!(
+            !SQLExecutor::can_execute_plan(&provider, &quantified),
+            "Turso has no ANY/ALL, so the plan must stay with DataFusion:\n{}",
+            quantified.display_indent()
+        );
+
+        // Nested one level down, where a walk that ignores subqueries misses it.
+        let nested = plan_for(
+            "SELECT id FROM items WHERE id IN (SELECT item_id FROM details WHERE val > ANY (SELECT v FROM items))",
+        )
+        .await;
+        assert!(
+            !SQLExecutor::can_execute_plan(&provider, &nested),
+            "a comparison inside a subquery is rendered too:\n{}",
+            nested.display_indent()
+        );
+
+        // The control: the shapes the analyzer does resolve keep federating.
+        let control =
+            plan_for("SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id) AND v > 5")
+                .await;
+        assert!(
+            SQLExecutor::can_execute_plan(&provider, &control),
+            "EXISTS and plain filters are still federated:\n{}",
+            control.display_indent()
+        );
     }
 
     #[tokio::test]
@@ -2683,6 +3628,19 @@ mod tests {
             )
             .await,
             vec![3, 1, 2, 4]
+        );
+    }
+
+    /// The Turso dialect wraps `SqliteDialect` and forwards each answer by hand, so a
+    /// method added to the trait with a default reaches Turso as that default unless
+    /// it is forwarded. This one must not: libSQL flattens a derived table like
+    /// SQLite, and the default (`true`) would let the unparser read a volatile
+    /// projection output through one and return rows the predicate excluded.
+    #[test]
+    fn test_turso_dialect_reports_that_a_derived_table_does_not_fix_a_volatile_value() {
+        assert!(
+            !TursoDialect::new().derived_table_evaluates_volatile_outputs_once(),
+            "TursoDialect must forward SqliteDialect's answer, not inherit the trait default"
         );
     }
 
@@ -2996,6 +3954,1221 @@ mod tests {
             failures,
             vec![0],
             "no conversion failures when every non-NULL value converts cleanly"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_declared_type_to_arrow_mapping() {
+        // Guardrail over the full set of declared types this mapper recognizes.
+        // BLOB must map to Binary (regression: it was previously coerced to Int64,
+        // which lost the bytes and mis-typed the inferred schema).
+        let cases: &[(&str, DataType)] = &[
+            ("INTEGER", DataType::Int64),
+            ("BLOB", DataType::Binary),
+            ("REAL", DataType::Float64),
+            ("FLOAT", DataType::Float64),
+            ("DOUBLE", DataType::Float64),
+            ("DATE_TEXT", DataType::Date32),
+            ("TEXT", DataType::Utf8),
+            // Unknown / SQLite affinity fallthrough -> TEXT (Utf8).
+            ("VARCHAR(255)", DataType::Utf8),
+        ];
+        for (declared, expected) in cases {
+            assert_eq!(
+                &sqlite_declared_type_to_arrow(declared),
+                expected,
+                "declared type {declared} should map to {expected:?}"
+            );
+            // PRAGMA table_info can report the type in any case; mapping is
+            // case-insensitive, so the lowercased form must map identically.
+            assert_eq!(
+                &sqlite_declared_type_to_arrow(&declared.to_lowercase()),
+                expected,
+                "declared type {} (lowercased) should map to {expected:?}",
+                declared.to_lowercase()
+            );
+        }
+    }
+
+    #[test]
+    fn test_blob_column_roundtrips_as_binary() {
+        use arrow::array::BinaryArray;
+
+        // A column inferred as Binary (from a BLOB declared type) must decode
+        // TursoValue::Blob rows into a BinaryArray preserving the exact bytes,
+        // with NULLs surfaced as null entries.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Blob(vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF])],
+            vec![TursoValue::Null],
+            vec![TursoValue::Blob(Vec::new())],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("BLOB rows should build a Binary batch");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("column should be a BinaryArray");
+
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.value(0), &[0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(arr.is_null(1), "TursoValue::Null should decode to null");
+        assert_eq!(arr.value(2), &[] as &[u8], "empty blob should round-trip");
+    }
+
+    #[test]
+    fn test_convert_timestamp_to_turso_integer_millis_second_overflow_returns_error() {
+        // integer_millis multiplies a seconds value by 1_000; i64::MAX seconds
+        // overflows that multiplication and must return an error rather than
+        // silently wrapping to a bogus millisecond value.
+        let result = convert_timestamp_to_turso(
+            i64::MAX,
+            TimeUnit::Second,
+            None,
+            TimestampFormat::IntegerMillis,
+        );
+        let Err(e) = result else {
+            panic!("i64::MAX seconds should overflow the millisecond conversion");
+        };
+        assert!(
+            e.to_string().contains("overflows millisecond conversion"),
+            "unexpected error message: {e}"
+        );
+
+        // A value that fits must still succeed and be scaled by 1_000.
+        let ok =
+            convert_timestamp_to_turso(5, TimeUnit::Second, None, TimestampFormat::IntegerMillis);
+        let Ok(TursoValue::Integer(millis)) = ok else {
+            panic!("in-range seconds value should convert to an integer millis value");
+        };
+        assert_eq!(millis, 5_000, "5s should convert to 5000ms");
+    }
+    /// The map `{"k": 1}` as a one-row `Utf8` to `Int64` map scalar.
+    fn single_entry_map() -> ScalarValue {
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        map.keys().append_value("k");
+        map.values().append_value(1);
+        map.append(true).expect("map row should append");
+        ScalarValue::Map(Arc::new(map.finish()))
+    }
+
+    /// Builds a `ScalarValue::List` holding one list of nullable `Int32` elements.
+    fn int32_list_scalar(elements: Vec<Option<i32>>) -> ScalarValue {
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for element in elements {
+            builder.values().append_option(element);
+        }
+        builder.append(true);
+        ScalarValue::List(Arc::new(builder.finish()))
+    }
+
+    /// The stored form of a list payload written under the current encoding version.
+    ///
+    /// Built rather than written as a literal so that a test asserts the envelope's shape without
+    /// depending on the member order `serde_json::Map` happens to keep — see [`stored_json`].
+    fn list_envelope(elements: serde_json::Value) -> serde_json::Value {
+        let mut envelope = serde_json::Map::with_capacity(2);
+        envelope.insert(
+            LIST_ENCODING_VERSION_KEY.to_string(),
+            serde_json::Value::from(LIST_ENCODING_VERSION),
+        );
+        envelope.insert(LIST_ENCODING_ELEMENTS_KEY.to_string(), elements);
+        serde_json::Value::Object(envelope)
+    }
+
+    /// Regression test for #12628: a list scalar wraps its elements in a one-row array, so
+    /// iterating the wrapper serialized one null per list instead of the list's contents.
+    #[test]
+    fn test_scalar_value_to_turso_serializes_list_elements() {
+        let value = scalar_value_to_turso(
+            int32_list_scalar(vec![Some(1), Some(2), Some(3)]),
+            TimestampFormat::default(),
+        )
+        .expect("an Int32 list should convert");
+
+        assert_eq!(
+            stored_json(&value),
+            list_envelope(serde_json::json!([1, 2, 3])),
+            "the list's elements should be serialized, not the wrapper array"
+        );
+    }
+
+    /// A null *element* is a null inside the list, and must not collapse the whole list to null.
+    #[test]
+    fn test_scalar_value_to_turso_keeps_a_null_list_element() {
+        let value = scalar_value_to_turso(
+            int32_list_scalar(vec![Some(1), None, Some(3)]),
+            TimestampFormat::default(),
+        )
+        .expect("a list with a null element should convert");
+
+        assert_eq!(
+            stored_json(&value),
+            list_envelope(serde_json::json!([1, null, 3]))
+        );
+    }
+
+    /// An empty list is distinct from a null list.
+    #[test]
+    fn test_scalar_value_to_turso_serializes_an_empty_list() {
+        let value = scalar_value_to_turso(int32_list_scalar(vec![]), TimestampFormat::default())
+            .expect("an empty list should convert");
+
+        assert_eq!(stored_json(&value), list_envelope(serde_json::json!([])));
+    }
+
+    /// The `List<Int32>` type the stored-payload tests below read against.
+    fn int32_list_type() -> DataType {
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+    }
+
+    /// Reads one already-stored value back as the declared type, the way a scan does — the entry
+    /// point a payload written by an older build arrives through.
+    fn read_stored(stored: TursoValue, data_type: DataType) -> ArrayRef {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("c", data_type, true)]));
+        let batch = TursoTableProvider::values_to_record_batch(&[vec![stored]], &schema)
+            .expect("the stored value should be readable");
+        Arc::clone(batch.column(0))
+    }
+
+    /// Regression test for #12632: a `mode: file` acceleration keeps its payloads across an
+    /// upgrade, and every list the pre-#12628 writer stored is the literal single-null array,
+    /// whatever the list held. Reading that as a one-element list holding null serves a value the
+    /// source never had — and stops warning about it, because it now parses.
+    #[test]
+    fn test_an_ambiguous_pre_version_list_payload_is_not_served_as_data() {
+        let column = read_stored(TursoValue::Text("[null]".to_string()), int32_list_type());
+
+        assert!(
+            column.is_null(0),
+            "the one payload shape the broken writer produced should read as NULL, not as a \
+             one-element list holding null"
+        );
+    }
+
+    /// The refusal is confined to the one ambiguous shape. An unversioned payload holding anything
+    /// else could not have come from the broken writer — that writer emitted a single null for
+    /// every list — so it is real data and must still be served, rather than being discarded for
+    /// merely predating the marker.
+    #[test]
+    fn test_an_unversioned_list_payload_holding_contents_is_still_served() {
+        let mut expected = ListBuilder::new(Int32Builder::new());
+        for element in [1, 2, 3] {
+            expected.values().append_value(element);
+        }
+        expected.append(true);
+        let expected = ScalarValue::List(Arc::new(expected.finish()))
+            .to_array()
+            .expect("the list should build an array");
+
+        assert_eq!(
+            read_stored(TursoValue::Text("[1,2,3]".to_string()), int32_list_type()).as_ref(),
+            expected.as_ref(),
+            "an unversioned payload the broken writer could not have produced should be served"
+        );
+    }
+
+    /// An unversioned empty list is in the same class: the broken writer wrote a single null even
+    /// for an empty list, so a stored empty array is proof of a writer that was not it.
+    #[test]
+    fn test_an_unversioned_empty_list_payload_is_still_served() {
+        let column = read_stored(TursoValue::Text("[]".to_string()), int32_list_type());
+
+        assert!(
+            !column.is_null(0),
+            "an unversioned empty list should be served, not refused for lacking a version"
+        );
+        assert_eq!(column.len(), 1, "the batch should hold the one row read");
+    }
+
+    /// The other half of the same rule: a list of one null written by the *current* encoder is
+    /// real data and must survive. Without the version marker this is the same stored text as the
+    /// corrupt payload above, which is why the marker exists.
+    #[test]
+    fn test_a_versioned_single_null_list_still_reads_back() {
+        assert_round_trips(&int32_list_scalar(vec![None]));
+    }
+
+    /// A refused payload is a non-NULL stored value that read as NULL, so the existing per-scan
+    /// conversion-failure WARN counts it. Nothing about the upgrade is silent.
+    #[test]
+    fn test_an_ambiguous_pre_version_list_payload_is_counted_as_a_conversion_failure() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("c", int32_list_type(), true)]));
+        let rows = vec![vec![TursoValue::Text("[null]".to_string())]];
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("the stored value should be readable");
+
+        assert_eq!(
+            TursoTableProvider::count_conversion_failures(&rows, &batch),
+            vec![1],
+            "a refused legacy payload should be reported, not counted as genuinely NULL"
+        );
+    }
+
+    /// The ambiguity is bounded by which columns the broken writer could have written, not only by
+    /// the payload's shape. It had one list arm, for `ScalarValue::List`; a `FixedSizeList` reached
+    /// the unsupported-type path and never became a row. So a single-null array under a fixed-size
+    /// column is the current encoder's output for a list that genuinely holds one null, and
+    /// refusing it would discard data on a collision that cannot have happened.
+    #[test]
+    fn test_a_single_null_fixed_size_list_payload_is_served_as_data() {
+        let column = read_stored(
+            TursoValue::Text("[null]".to_string()),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 1),
+        );
+
+        assert!(
+            !column.is_null(0),
+            "no payload under a fixed-size list column can be the broken writer's, so this is data"
+        );
+
+        let elements = column
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeListArray>()
+            .expect("the column should read back as a fixed-size list")
+            .value(0);
+        assert_eq!(elements.len(), 1, "the list should hold its one element");
+        assert!(
+            elements.is_null(0),
+            "that element is the null that was stored"
+        );
+    }
+
+    /// `LargeList` is in the same class as `FixedSizeList`, and for the same reason: the broken
+    /// writer had no arm for it either, so its single-null payload is data rather than a collision.
+    #[test]
+    fn test_a_single_null_large_list_payload_is_served_as_data() {
+        let column = read_stored(
+            TursoValue::Text("[null]".to_string()),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
+        );
+
+        assert!(
+            !column.is_null(0),
+            "no payload under a large list column can be the broken writer's, so this is data"
+        );
+
+        let elements = column
+            .as_any()
+            .downcast_ref::<arrow::array::LargeListArray>()
+            .expect("the column should read back as a large list")
+            .value(0);
+        assert_eq!(elements.len(), 1, "the list should hold its one element");
+        assert!(
+            elements.is_null(0),
+            "that element is the null that was stored"
+        );
+    }
+
+    /// A payload naming a version this build does not write is refused rather than read under the
+    /// current rules, so a file written by a newer build cannot be misread by an older one.
+    #[test]
+    fn test_a_list_envelope_of_another_version_is_not_served() {
+        let stored = serde_json::json!({
+            LIST_ENCODING_VERSION_KEY: LIST_ENCODING_VERSION + 1,
+            LIST_ENCODING_ELEMENTS_KEY: [1, 2, 3],
+        })
+        .to_string();
+
+        assert!(
+            read_stored(TursoValue::Text(stored), int32_list_type()).is_null(0),
+            "an envelope naming an unknown encoding version should read as NULL"
+        );
+    }
+
+    /// The version must be the integer this build writes, not merely something that reads as one.
+    /// A float, a string, or a boolean in that member means the payload was not written by an
+    /// encoder this reader knows, so accepting any of them would serve a shape on a coincidence.
+    #[test]
+    fn test_a_list_envelope_whose_version_is_not_an_integer_is_not_served() {
+        for version in [
+            serde_json::json!(1.0),
+            serde_json::json!("1"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            let mut envelope = serde_json::Map::with_capacity(2);
+            envelope.insert(LIST_ENCODING_VERSION_KEY.to_string(), version.clone());
+            envelope.insert(
+                LIST_ENCODING_ELEMENTS_KEY.to_string(),
+                serde_json::json!([1, 2, 3]),
+            );
+            let stored = serde_json::Value::Object(envelope).to_string();
+
+            assert!(
+                read_stored(TursoValue::Text(stored), int32_list_type()).is_null(0),
+                "an envelope whose version member is {version} should read as NULL"
+            );
+        }
+    }
+
+    /// An envelope whose elements member is missing or is not an array names a version whose shape
+    /// it does not have, so it is refused rather than read as an empty list.
+    #[test]
+    fn test_a_list_envelope_without_an_elements_array_is_not_served() {
+        for elements in [None, Some(serde_json::json!(7))] {
+            let mut envelope = serde_json::Map::with_capacity(2);
+            envelope.insert(
+                LIST_ENCODING_VERSION_KEY.to_string(),
+                serde_json::Value::from(LIST_ENCODING_VERSION),
+            );
+            if let Some(elements) = &elements {
+                envelope.insert(LIST_ENCODING_ELEMENTS_KEY.to_string(), elements.clone());
+            }
+            let stored = serde_json::Value::Object(envelope).to_string();
+
+            assert!(
+                read_stored(TursoValue::Text(stored), int32_list_type()).is_null(0),
+                "an envelope with elements {elements:?} should read as NULL"
+            );
+        }
+    }
+
+    /// A null list is SQL NULL, not the text `[]`.
+    #[test]
+    fn test_scalar_value_to_turso_writes_a_null_list_as_null() {
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.append_null();
+        let value = scalar_value_to_turso(
+            ScalarValue::List(Arc::new(builder.finish())),
+            TimestampFormat::default(),
+        )
+        .expect("a null list should convert");
+
+        assert_eq!(value, TursoValue::Null);
+    }
+
+    /// The element types JSON represents exactly must survive; the previous element match accepted
+    /// only `Int32`, `Int64` and `Utf8` and wrote null for everything else.
+    #[test]
+    fn test_scalar_value_to_turso_serializes_non_integer_list_elements() {
+        let mut builder = ListBuilder::new(arrow::array::Float64Builder::new());
+        builder.values().append_value(1.5);
+        builder.values().append_value(-2.25);
+        builder.append(true);
+
+        let value = scalar_value_to_turso(
+            ScalarValue::List(Arc::new(builder.finish())),
+            TimestampFormat::default(),
+        )
+        .expect("a Float64 list should convert");
+
+        assert_eq!(
+            stored_json(&value),
+            list_envelope(serde_json::json!([1.5, -2.25]))
+        );
+    }
+
+    /// `LargeList` and `FixedSizeList` are declared `TEXT` by the accelerator's DDL, so they have
+    /// to serialize like `List` rather than fall through to the unsupported-type arm.
+    #[test]
+    fn test_scalar_value_to_turso_serializes_large_and_fixed_size_lists() {
+        let mut large = arrow::array::LargeListBuilder::new(Int32Builder::new());
+        large.values().append_value(7);
+        large.values().append_value(8);
+        large.append(true);
+        let large_value = scalar_value_to_turso(
+            ScalarValue::LargeList(Arc::new(large.finish())),
+            TimestampFormat::default(),
+        )
+        .expect("a LargeList should convert");
+        assert_eq!(
+            stored_json(&large_value),
+            list_envelope(serde_json::json!([7, 8]))
+        );
+
+        let mut fixed = arrow::array::FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        fixed.values().append_value(9);
+        fixed.values().append_value(10);
+        fixed.append(true);
+        let fixed_value = scalar_value_to_turso(
+            ScalarValue::FixedSizeList(Arc::new(fixed.finish())),
+            TimestampFormat::default(),
+        )
+        .expect("a FixedSizeList should convert");
+        assert_eq!(
+            stored_json(&fixed_value),
+            list_envelope(serde_json::json!([9, 10]))
+        );
+    }
+
+    /// A non-finite float has no JSON form; `serde_json` encodes it as `null`, which would be
+    /// indistinguishable from a null element.
+    #[test]
+    fn test_scalar_value_to_turso_rejects_a_non_finite_list_element() {
+        let mut builder = ListBuilder::new(arrow::array::Float64Builder::new());
+        builder.values().append_value(f64::NAN);
+        builder.append(true);
+
+        let Err(e) = scalar_value_to_turso(
+            ScalarValue::List(Arc::new(builder.finish())),
+            TimestampFormat::default(),
+        ) else {
+            panic!("a NaN list element should be rejected, not written as null");
+        };
+        assert!(
+            e.to_string().contains("no JSON representation"),
+            "unexpected error message: {e}"
+        );
+    }
+
+    /// A view-typed string or binary carries the same value as its non-view sibling; both were
+    /// written as NULL because neither variant had an arm.
+    #[test]
+    fn test_scalar_value_to_turso_writes_view_types() {
+        assert_eq!(
+            scalar_value_to_turso(
+                ScalarValue::Utf8View(Some("hello".to_string())),
+                TimestampFormat::default()
+            )
+            .expect("a Utf8View should convert"),
+            TursoValue::Text("hello".to_string())
+        );
+        assert_eq!(
+            scalar_value_to_turso(
+                ScalarValue::BinaryView(Some(vec![1, 2, 3])),
+                TimestampFormat::default()
+            )
+            .expect("a BinaryView should convert"),
+            TursoValue::Blob(vec![1, 2, 3])
+        );
+    }
+
+    /// A dictionary describes the encoding, not the value, so it has to store as its inner value.
+    #[test]
+    fn test_scalar_value_to_turso_unwraps_a_dictionary() {
+        let value = scalar_value_to_turso(
+            ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some("encoded".to_string()))),
+            ),
+            TimestampFormat::default(),
+        )
+        .expect("a dictionary value should convert");
+
+        assert_eq!(value, TursoValue::Text("encoded".to_string()));
+    }
+
+    /// A null of any type is still SQL NULL after the unsupported-type arm started returning an
+    /// error.
+    #[test]
+    fn test_scalar_value_to_turso_writes_typed_nulls_as_null() {
+        for null_value in [
+            ScalarValue::Int64(None),
+            ScalarValue::Utf8(None),
+            ScalarValue::Utf8View(None),
+            ScalarValue::Boolean(None),
+            ScalarValue::TimestampMillisecond(None, None),
+            ScalarValue::Null,
+        ] {
+            let described = null_value.to_string();
+            assert_eq!(
+                scalar_value_to_turso(null_value, TimestampFormat::default())
+                    .expect("a null should convert"),
+                TursoValue::Null,
+                "{described} should store as NULL"
+            );
+        }
+    }
+
+    /// An unsupported type used to store as NULL, which reported a successful write of a column
+    /// that reads back empty.
+    #[test]
+    fn test_scalar_value_to_turso_rejects_an_unsupported_type() {
+        let struct_value = ScalarValue::Struct(Arc::new(arrow::array::StructArray::from(vec![(
+            Arc::new(Field::new("a", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+        )])));
+
+        let Err(e) = scalar_value_to_turso(struct_value, TimestampFormat::default()) else {
+            panic!("a struct should be rejected, not silently written as NULL");
+        };
+        assert!(
+            e.to_string()
+                .contains("not supported by the Turso accelerator"),
+            "unexpected error message: {e}"
+        );
+    }
+
+    /// Parses a map value's stored text so an assertion does not depend on the order
+    /// `serde_json::Map` happens to keep. `crates/runtime` enables `serde_json/preserve_order`, and
+    /// cargo unifies that across the workspace, so the key order differs between a scoped
+    /// `cargo test -p data_components` and the `make nextest` gate.
+    fn stored_json(value: &TursoValue) -> serde_json::Value {
+        let TursoValue::Text(text) = value else {
+            panic!("expected a text value, got {value:?}");
+        };
+        serde_json::from_str(text).expect("stored text should be valid JSON")
+    }
+
+    /// A map scalar sliced out of a multi-row batch keeps the whole entries child array, so reading
+    /// `keys()`/`values()` directly serialized every row's entries into every row.
+    #[test]
+    fn test_scalar_value_to_turso_serializes_only_its_own_map_row() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        builder.keys().append_value("first");
+        builder.values().append_value(1);
+        builder.append(true).expect("first map row should append");
+        builder.keys().append_value("second");
+        builder.values().append_value(2);
+        builder.append(true).expect("second map row should append");
+        let map_array = builder.finish();
+
+        let second_row = ScalarValue::try_from_array(&map_array, 1).expect("row 1 should convert");
+        let value = scalar_value_to_turso(second_row, TimestampFormat::default())
+            .expect("a map value should convert");
+
+        assert_eq!(
+            stored_json(&value),
+            serde_json::json!({"second": 2}),
+            "only the scalar's own row entries should be serialized"
+        );
+    }
+
+    /// A map entry whose value is null is still an entry; it used to be dropped from the object.
+    #[test]
+    fn test_scalar_value_to_turso_keeps_a_null_map_value() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        builder.keys().append_value("present");
+        builder.values().append_value(1);
+        builder.keys().append_value("absent");
+        builder.values().append_null();
+        builder.append(true).expect("map row should append");
+
+        let value = scalar_value_to_turso(
+            ScalarValue::Map(Arc::new(builder.finish())),
+            TimestampFormat::default(),
+        )
+        .expect("a map value should convert");
+
+        assert_eq!(
+            stored_json(&value),
+            serde_json::json!({"present": 1, "absent": null})
+        );
+    }
+
+    /// End-to-end through the sink: a `List<Int32>` column must reach Turso as its own JSON array,
+    /// which is what the read path parses back into a list.
+    #[tokio::test]
+    async fn test_turso_append_writes_list_column_contents() {
+        let table_name = "append_list_column";
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("in-memory Turso pool should be created"),
+        );
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        conn.execute(
+            format!(
+                "CREATE TABLE {} (id INTEGER PRIMARY KEY, tags TEXT)",
+                quote_identifier(table_name)
+            ),
+            (),
+        )
+        .await
+        .expect("test table should be created");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+        ]));
+
+        let mut tags = ListBuilder::new(Int32Builder::new());
+        tags.values().append_value(10);
+        tags.values().append_value(20);
+        tags.append(true);
+        tags.append_null();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(tags.finish()) as ArrayRef,
+            ],
+        )
+        .expect("record batch should be created");
+
+        let sink = TursoDataSink::new(
+            Arc::clone(&pool),
+            table_name.to_string(),
+            Arc::clone(&schema),
+            InsertOp::Append,
+        );
+        let written = sink
+            .write_all(
+                stream(Arc::clone(&schema), vec![batch]),
+                &Arc::new(TaskContext::default()),
+            )
+            .await
+            .expect("write should succeed");
+        assert_eq!(written, 2);
+
+        let mut rows = conn
+            .query(
+                format!(
+                    "SELECT tags FROM {} ORDER BY id",
+                    quote_identifier(table_name)
+                ),
+                (),
+            )
+            .await
+            .expect("query should execute");
+
+        let mut stored = Vec::new();
+        while let Some(row) = rows.next().await.expect("row should be read") {
+            stored.push(row.get_value(0).expect("tags should be present"));
+        }
+
+        let [tags_row, null_row] = stored.as_slice() else {
+            panic!("both written rows should be stored, got {stored:?}");
+        };
+        assert_eq!(
+            stored_json(tags_row),
+            list_envelope(serde_json::json!([10, 20])),
+            "the list's elements should be stored"
+        );
+        assert_eq!(*null_row, TursoValue::Null, "a null list should stay NULL");
+    }
+    /// The read path pairs with the write path: a stored list whose element is null must come back
+    /// as a list holding a null, not as a null list.
+    #[test]
+    fn test_values_to_record_batch_reads_a_null_list_element() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]));
+        let rows = vec![vec![TursoValue::Text("[10,null,20]".to_string())]];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("a stored list should be read back");
+
+        let lists = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .expect("column should be a list");
+        assert!(lists.is_valid(0), "the list itself is not null");
+
+        let elements = lists.value(0);
+        let elements = elements
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("elements should be Int32");
+        assert_eq!(elements.len(), 3);
+        assert_eq!(elements.value(0), 10);
+        assert!(elements.is_null(1), "the null element should survive");
+        assert_eq!(elements.value(2), 20);
+    }
+    /// A JSON object needs string keys; a non-string key used to be dropped from the object,
+    /// silently losing the entry.
+    #[test]
+    fn test_scalar_value_to_turso_rejects_a_non_string_map_key() {
+        let mut builder = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+        builder.keys().append_value(1);
+        builder.values().append_value(2);
+        builder.append(true).expect("map row should append");
+
+        let Err(e) = scalar_value_to_turso(
+            ScalarValue::Map(Arc::new(builder.finish())),
+            TimestampFormat::default(),
+        ) else {
+            panic!("an integer-keyed map should be rejected, not silently emptied");
+        };
+        assert!(
+            e.to_string().contains("map keys must be strings"),
+            "unexpected error message: {e}"
+        );
+    }
+    /// View-typed strings and binaries round-trip: they are written as their value and read back as
+    /// the view array the schema declares, rather than stored as NULL.
+    #[test]
+    fn test_values_to_record_batch_reads_view_types() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("b", DataType::BinaryView, true),
+        ]));
+        let rows = vec![
+            vec![
+                TursoValue::Text("hello".to_string()),
+                TursoValue::Blob(vec![1, 2, 3]),
+            ],
+            vec![TursoValue::Null, TursoValue::Null],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("view-typed columns should be read back");
+
+        let strings = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("column should be a string view");
+        assert_eq!(strings.value(0), "hello");
+        assert!(strings.is_null(1));
+
+        let binaries = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .expect("column should be a binary view");
+        assert_eq!(binaries.value(0), &[1, 2, 3]);
+        assert!(binaries.is_null(1));
+    }
+
+    /// Stores one value through the write path and reads it back through the read path, against a
+    /// schema declaring the value's own type.
+    fn round_trip(value: ScalarValue) -> ArrayRef {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("c", value.data_type(), true)]));
+        let stored = scalar_value_to_turso(value, TimestampFormat::default())
+            .expect("the value should be storable");
+
+        let batch = TursoTableProvider::values_to_record_batch(&[vec![stored]], &schema)
+            .expect("the stored value should be readable");
+        Arc::clone(batch.column(0))
+    }
+
+    /// Asserts the two paths are inverses for `value`: what comes back is what went in.
+    fn assert_round_trips(value: &ScalarValue) {
+        let expected = value.to_array().expect("the value should build an array");
+        assert_eq!(
+            round_trip(value.clone()).as_ref(),
+            expected.as_ref(),
+            "{} did not survive the round trip",
+            value.data_type()
+        );
+    }
+
+    /// The reader rebuilt lists only with `Int32` elements, so a list of any other element type came
+    /// back as a `List<Int32>` of nulls and failed its scan against the declared schema.
+    #[test]
+    fn test_values_to_record_batch_reads_a_list_of_each_element_type() {
+        let mut floats = ListBuilder::new(arrow::array::Float64Builder::new());
+        floats.values().append_value(1.5);
+        floats.values().append_value(-2.25);
+        floats.append(true);
+        assert_round_trips(&ScalarValue::List(Arc::new(floats.finish())));
+
+        let mut strings = ListBuilder::new(StringBuilder::new());
+        strings.values().append_value("a");
+        strings.values().append_value("b");
+        strings.append(true);
+        assert_round_trips(&ScalarValue::List(Arc::new(strings.finish())));
+
+        let mut booleans = ListBuilder::new(arrow::array::BooleanBuilder::new());
+        booleans.values().append_value(true);
+        booleans.values().append_value(false);
+        booleans.append(true);
+        assert_round_trips(&ScalarValue::List(Arc::new(booleans.finish())));
+
+        let mut wide = ListBuilder::new(Int64Builder::new());
+        wide.values().append_value(i64::MAX);
+        wide.append(true);
+        assert_round_trips(&ScalarValue::List(Arc::new(wide.finish())));
+    }
+
+    /// `LargeList` and `FixedSizeList` had no arm at all, so both fell to the string fallback.
+    #[test]
+    fn test_values_to_record_batch_reads_large_and_fixed_size_lists() {
+        let mut large = arrow::array::LargeListBuilder::new(Int32Builder::new());
+        large.values().append_value(7);
+        large.values().append_value(8);
+        large.append(true);
+        assert_round_trips(&ScalarValue::LargeList(Arc::new(large.finish())));
+
+        let mut fixed = arrow::array::FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        fixed.values().append_value(3);
+        fixed.values().append_value(4);
+        fixed.append(true);
+        assert_round_trips(&ScalarValue::FixedSizeList(Arc::new(fixed.finish())));
+    }
+
+    /// A stored list of the wrong width cannot fill a `FixedSizeList` cell, so it reads as null
+    /// rather than being padded or truncated into one.
+    #[test]
+    fn test_values_to_record_batch_nulls_a_fixed_size_list_of_the_wrong_width() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 2),
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Text("[1,2]".to_string())],
+            // Both directions: one too long to fit, and one too short to fill.
+            vec![TursoValue::Text("[1,2,3]".to_string())],
+            vec![TursoValue::Text("[1]".to_string())],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("the column should still be readable");
+
+        let lists = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("column should be a fixed-size list");
+        assert!(lists.is_valid(0), "a list of the declared width is kept");
+        assert!(
+            lists.is_null(1),
+            "a longer list must not be truncated to fit"
+        );
+        assert!(lists.is_null(2), "a shorter list must not be padded to fit");
+        assert_eq!(
+            TursoTableProvider::count_conversion_failures(&rows, &batch),
+            vec![2],
+            "both unreadable rows should be reported, not silently reshaped"
+        );
+    }
+
+    /// A map's values were read with `as_i64() as i32`, which wrapped a value too large for the
+    /// declared type into a different, valid-looking one.
+    #[test]
+    fn test_values_to_record_batch_never_truncates_a_map_value() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Int32, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        )]));
+        // 3_000_000_000 does not fit an i32; `as i32` gave -1_294_967_296.
+        let rows = vec![vec![TursoValue::Text(r#"{"k":3000000000}"#.to_string())]];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("the column should still be readable");
+
+        assert!(
+            batch.column(0).is_null(0),
+            "a value that does not fit must not read back as a different one"
+        );
+        assert_eq!(
+            TursoTableProvider::count_conversion_failures(&rows, &batch),
+            vec![1],
+            "the unreadable row should be reported"
+        );
+    }
+
+    /// Maps were read only as `Utf8` keys to `Int32` values; any other value type failed its scan.
+    #[test]
+    fn test_values_to_record_batch_reads_a_map_of_each_value_type() {
+        let mut wide = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        wide.keys().append_value("k");
+        wide.values().append_value(i64::from(i32::MAX) + 1);
+        wide.append(true).expect("map row should append");
+        assert_round_trips(&ScalarValue::Map(Arc::new(wide.finish())));
+
+        let mut text = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        text.keys().append_value("k");
+        text.values().append_value("v");
+        text.append(true).expect("map row should append");
+        assert_round_trips(&ScalarValue::Map(Arc::new(text.finish())));
+    }
+
+    /// The write path stores a dictionary value unwrapped, and the reader had no arm for the
+    /// dictionary type, so the column came back as the bare value type.
+    #[test]
+    fn test_values_to_record_batch_reads_a_dictionary() {
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::Utf8(Some("hello".to_string()))),
+        ));
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::UInt16),
+            Box::new(ScalarValue::Int64(Some(-9))),
+        ));
+
+        // The value array is built first and then dictionary-encoded, so a NULL has to survive both
+        // steps.
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Text("a".to_string())],
+            vec![TursoValue::Null],
+        ];
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("a dictionary column should be readable");
+        assert!(batch.column(0).is_valid(0));
+        assert!(batch.column(0).is_null(1), "a NULL should stay NULL");
+    }
+
+    /// A dictionary over a nested, boolean, duration or interval value type round-trips. `cast`
+    /// cannot dictionary-pack any of those value types, so the reader has to build the dictionary
+    /// itself; a column it could not would write without error and never read back.
+    #[test]
+    fn test_values_to_record_batch_reads_a_dictionary_over_each_unpackable_value_type() {
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(int32_list_scalar(vec![Some(7)])),
+        ));
+
+        let mut fixed = FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        fixed.values().append_value(1);
+        fixed.values().append_value(2);
+        fixed.append(true);
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::UInt8),
+            Box::new(ScalarValue::FixedSizeList(Arc::new(fixed.finish()))),
+        ));
+
+        // The row format cannot encode a map; it is re-read as the list of entry structs it is.
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(single_entry_map()),
+        ));
+
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int16),
+            Box::new(ScalarValue::Boolean(Some(true))),
+        ));
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::DurationMillisecond(Some(1_500))),
+        ));
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::IntervalYearMonth(Some(14))),
+        ));
+    }
+
+    /// Rows holding the same value share one dictionary entry, a NULL stays a NULL key, and the
+    /// keys are built as the type the column declares.
+    #[test]
+    fn test_values_to_record_batch_dictionary_encodes_repeated_nested_values_once() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Int32,
+                    true,
+                )))),
+            ),
+            true,
+        )]));
+        let stored = |elements: Vec<Option<i32>>| {
+            scalar_value_to_turso(int32_list_scalar(elements), TimestampFormat::default())
+                .expect("a list should be storable")
+        };
+        let rows = vec![
+            vec![stored(vec![Some(1), Some(2)])],
+            vec![stored(vec![Some(3)])],
+            vec![stored(vec![Some(1), Some(2)])],
+            vec![TursoValue::Null],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("a dictionary of lists should be readable");
+
+        let dictionary = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .expect("column should be a dictionary with the declared Int8 keys");
+        let values = dictionary
+            .values()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("dictionary values should be lists");
+        assert_eq!(
+            values.len(),
+            2,
+            "two distinct lists should make two entries"
+        );
+        assert_eq!(
+            dictionary.keys().value(0),
+            dictionary.keys().value(2),
+            "equal lists should share an entry"
+        );
+        assert_ne!(dictionary.keys().value(0), dictionary.keys().value(1));
+        assert!(dictionary.is_null(3), "a NULL should stay NULL");
+        let first_key =
+            usize::try_from(dictionary.keys().value(0)).expect("a key should index the values");
+        let first = values.value(first_key);
+        let elements = first
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("elements should be Int32");
+        assert_eq!(elements.values(), &[1, 2]);
+    }
+
+    /// Equal maps share one dictionary entry too, so the keys a scan needs grow with the distinct
+    /// maps rather than with the rows: a run of NULLs and repeated maps longer than the key type's
+    /// range reads back, where one key per row would have overflowed it.
+    #[test]
+    fn test_values_to_record_batch_dictionary_of_maps_shares_entries_past_the_key_range() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(single_entry_map().data_type()),
+            ),
+            true,
+        )]));
+        let stored = scalar_value_to_turso(single_entry_map(), TimestampFormat::default())
+            .expect("a map should be storable");
+        // 128 NULL rows push every later row position past an Int8 key, then 129 equal maps.
+        let rows: Vec<Vec<TursoValue>> = std::iter::repeat_n(vec![TursoValue::Null], 128)
+            .chain(std::iter::repeat_n(vec![stored], 129))
+            .collect();
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("repeated maps need one key, however many rows hold them");
+
+        let dictionary = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .expect("column should be a dictionary with the declared Int8 keys");
+        assert_eq!(
+            dictionary.values().len(),
+            1,
+            "equal maps should share one entry"
+        );
+        assert!(dictionary.is_null(0) && dictionary.is_null(127));
+        assert!(dictionary.is_valid(128) && dictionary.is_valid(256));
+        assert_eq!(dictionary.keys().value(128), dictionary.keys().value(256));
+    }
+
+    /// A column with more distinct values than its declared key type can index is refused with an
+    /// error that names the key type, not with an Arrow-internal message.
+    #[test]
+    fn test_values_to_record_batch_names_a_dictionary_whose_keys_overflow() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        // Int8 keys index 128 entries; one more distinct value has nowhere to go.
+        let rows: Vec<Vec<TursoValue>> = (0..129)
+            .map(|i| vec![TursoValue::Text(format!("v{i}"))])
+            .collect();
+
+        let Err(e) = TursoTableProvider::values_to_record_batch(&rows, &schema) else {
+            panic!("129 distinct values cannot be indexed by Int8 keys");
+        };
+        let message = e.to_string();
+        assert!(
+            message.contains("column 'c'")
+                && message.contains("Int8")
+                && message.contains("129 entries"),
+            "the error should name the column, the key type and the entry count: {message}"
+        );
+    }
+
+    /// `FixedSizeBinary` had no arm, and a blob of another width cannot fill the cell.
+    #[test]
+    fn test_values_to_record_batch_reads_fixed_size_binary() {
+        assert_round_trips(&ScalarValue::FixedSizeBinary(3, Some(vec![1, 2, 3])));
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::FixedSizeBinary(3),
+            true,
+        )]));
+        let rows = vec![vec![TursoValue::Blob(vec![1, 2])]];
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("the column should still be readable");
+        assert!(
+            batch.column(0).is_null(0),
+            "a blob of another width must not be padded into the cell"
+        );
+    }
+
+    /// `Float16` had no arm, so the column fell to the string fallback and failed its scan.
+    #[test]
+    fn test_values_to_record_batch_reads_float16() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("c", DataType::Float16, true)]));
+        let rows = vec![vec![TursoValue::Real(1.5)], vec![TursoValue::Null]];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("a half-precision column should be readable");
+
+        let floats = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float16Array>()
+            .expect("column should be half-precision");
+        // 1.5 is exact in every float width here, so the round trip is bit-for-bit.
+        assert!((floats.value(0).to_f32() - 1.5).abs() < f32::EPSILON);
+        assert!(floats.is_null(1));
+    }
+
+    /// A column of empty lists holds no elements at all, which is the case
+    /// `ScalarValue::iter_to_array` cannot infer a type from.
+    #[test]
+    fn test_values_to_record_batch_reads_a_column_of_empty_lists() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Text("[]".to_string())],
+            vec![TursoValue::Null],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("a column of empty lists should be readable");
+
+        let lists = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .expect("column should be a list");
+        assert!(lists.is_valid(0), "an empty list is a list, not a null");
+        assert_eq!(lists.value(0).len(), 0);
+        assert!(lists.is_null(1));
+    }
+
+    /// An unhandled type used to be rebuilt as a string, which `RecordBatch::try_new` then reported
+    /// as a mismatch against whichever column it compared first.
+    #[test]
+    fn test_values_to_record_batch_names_an_unsupported_type() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Struct(vec![Field::new("f", DataType::Int32, true)].into()),
+            true,
+        )]));
+        let rows = vec![vec![TursoValue::Null]];
+
+        let Err(e) = TursoTableProvider::values_to_record_batch(&rows, &schema) else {
+            panic!("a struct column should be refused, not rebuilt as a string");
+        };
+        let message = e.to_string();
+        assert!(
+            message.contains("Struct") && message.contains("not supported"),
+            "the error should name the type it could not read: {message}"
         );
     }
 }

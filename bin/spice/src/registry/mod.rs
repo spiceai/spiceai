@@ -72,6 +72,18 @@ pub enum Error {
     #[snafu(display("Failed to fetch Spicepod '{pod}' from spicerack.org: {message}"))]
     FetchFailed { pod: String, message: String },
 
+    /// The registry answered with a success status but the body is not a Spicepod archive
+    #[snafu(display(
+        "Failed to fetch Spicepod '{pod}' from spicerack.org: the registry answered HTTP {status} with a {body_len}-byte body that is not a Spicepod archive (content-type: {content_type}). Registry message: {message}. Retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs"
+    ))]
+    NotAnArchive {
+        pod: String,
+        status: u16,
+        content_type: String,
+        body_len: usize,
+        message: String,
+    },
+
     /// Zip extraction error
     #[snafu(display("Failed to extract Spicepod archive: {source}"))]
     ZipExtraction { source: zip::result::ZipError },

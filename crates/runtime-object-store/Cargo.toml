@@ -13,8 +13,10 @@ async-stream.workspace = true
 async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bb8 = { workspace = true, optional = true }
+blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+dashmap = "6.1.0"
 datafusion.workspace = true
 fundu.workspace = true
 
@@ -35,10 +37,15 @@ url.workspace = true
 util = { path = "../util", default-features = false }
 
 [dev-dependencies]
+axum.workspace = true
 insta = { workspace = true, features = ["json", "redactions"] }
+serde_json.workspace = true
 
 [features]
 ftp = ["dep:suppaftp", "dep:bb8"]
 nfs = ["dep:libnfs", "dep:nix"]
 sftp = ["dep:ssh2"]
 smb = ["dep:smb", "dep:bb8"]
+
+[lints]
+workspace = true

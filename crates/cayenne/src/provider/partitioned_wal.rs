@@ -36,19 +36,14 @@ limitations under the License.
 //! 3. On success, the coordinator removes the WAL file.
 //!
 //! A file under `_partitioned_wal/` after a process restart indicates a
-//! coordinator that crashed mid-barrier; the per-partition staging WALs
-//! that exist on disk correspond to partitions named in the top-level
-//! record. **Today this file is a diagnostic / manual-recovery anchor**:
-//! the existing per-partition `ensure_no_incomplete_write` check at table
-//! open blocks subsequent writes until an operator clears the leftover
-//! per-partition WALs. Wiring an automated replay-or-rollback driver into
-//! `PartitionTableProvider::open` (or anywhere else upstream of those
-//! checks) is a follow-up; the format and IO helpers in this module are
-//! the load-bearing primitive that driver will consume.
+//! coordinator that crashed before cleanup. Per-partition provider open first
+//! converges each staged WAL according to the transactional catalog pointer;
+//! the runtime coordinator then validates that the full pointer set is either
+//! committed or uncommitted and removes this set anchor. A mixed pointer set is
+//! rejected as an invariant violation rather than guessed at.
 //!
-//! This module is intentionally just the format + IO primitives. Any
-//! recovery logic would live where the coordinator does, because it needs
-//! access to per-partition `CayenneTableProvider` handles.
+//! This module remains the format + IO primitive; set-level recovery lives in
+//! the runtime coordinator where per-partition providers are available.
 
 use std::path::{Path, PathBuf};
 
@@ -87,6 +82,10 @@ pub struct PartitionedWalEntry {
     /// uses this to find the partition's `CayenneTableProvider` in the
     /// already-loaded partition map.
     pub table_id: String,
+    /// Fresh snapshot containing the complete post-commit partition contents.
+    /// Optional for compatibility with WALs written before deferred snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_snapshot_id: Option<String>,
     /// Absolute path of this partition's own per-partition staging WAL file,
     /// if it had one staged when the cross-partition WAL was written. May be
     /// `None` for partitions that were beyond the coordinator's prepare
@@ -158,8 +157,11 @@ impl PartitionedWal {
     }
 
     /// Return the on-disk path for this WAL under the given table root.
-    #[must_use]
-    pub fn path_under(&self, table_root: &Path) -> PathBuf {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the commit ID is not a canonical UUID.
+    pub fn path_under(&self, table_root: &Path) -> Result<PathBuf> {
         wal_path(table_root, &self.commit_id)
     }
 
@@ -183,6 +185,7 @@ impl PartitionedWal {
     /// Returns an error if the directory cannot be created, the file cannot
     /// be written, serialization fails, or the atomic rename / fsync fails.
     pub async fn write_to(&self, table_root: &Path) -> Result<PathBuf> {
+        validate_commit_id(&self.commit_id)?;
         let wal_dir = table_root.join(PARTITIONED_WAL_DIR);
 
         // Ensure the _partitioned_wal/ subdirectory exists and, if we just
@@ -236,17 +239,8 @@ impl PartitionedWal {
 
         // Step 3: fsync the parent dir (ordering tier) so the rename is
         // written through before dependent work proceeds.
-        if let Ok(dir) = tokio::fs::File::open(&wal_dir).await
-            && let Err(e) = super::fsync_tier::ordering_sync_dir_tokio_file(&dir).await
-        {
-            // Directory fsync is best-effort: on some filesystems / OSes it
-            // is a no-op anyway. Log the failure but don't abort — the WAL
-            // file itself is already fsync'd and renamed.
-            tracing::warn!(
-                "Failed to fsync partitioned WAL parent dir {}: {e}",
-                wal_dir.display(),
-            );
-        }
+        let dir = tokio::fs::File::open(&wal_dir).await?;
+        super::fsync_tier::ordering_sync_dir_tokio_file(&dir).await?;
 
         tracing::debug!(
             "Wrote partitioned WAL at {} for {} partition(s)",
@@ -279,6 +273,7 @@ impl PartitionedWal {
         store: &dyn ObjectStore,
         base_prefix: &ObjectStorePath,
     ) -> Result<ObjectStorePath> {
+        validate_commit_id(&self.commit_id)?;
         let wal_dir = base_prefix.clone().join(PARTITIONED_WAL_DIR);
         let final_key = wal_dir.clone().join(format!("{}.json", self.commit_id));
         let tmp_key = wal_dir.join(format!("{}.json.tmp", self.commit_id));
@@ -330,7 +325,7 @@ impl PartitionedWal {
     ///
     /// Returns an error if the file exists but cannot be removed.
     pub async fn remove(table_root: &Path, commit_id: &str) -> Result<()> {
-        let path = wal_path(table_root, commit_id);
+        let path = wal_path(table_root, commit_id)?;
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {
                 tracing::debug!(
@@ -380,6 +375,37 @@ impl PartitionedWal {
         }
     }
 
+    /// Remove an object-store partitioned WAL and any leftover temporary key.
+    /// Missing keys are treated as success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid commit ID or object-store deletion failure.
+    pub async fn remove_from_object_store(
+        store: &dyn ObjectStore,
+        base_prefix: &ObjectStorePath,
+        commit_id: &str,
+    ) -> Result<()> {
+        validate_commit_id(commit_id)?;
+        let wal_dir = base_prefix.clone().join(PARTITIONED_WAL_DIR);
+        for key in [
+            wal_dir.clone().join(format!("{commit_id}.json")),
+            wal_dir.join(format!("{commit_id}.json.tmp")),
+        ] {
+            match store.delete(&key).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(source) => {
+                    return Err(Error::ObjectStore {
+                        operation: "remove partitioned WAL",
+                        table: base_prefix.to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Read every partitioned WAL file under `table_root/_partitioned_wal/`.
     ///
     /// Files that fail to parse are logged as warnings and skipped (rather
@@ -427,12 +453,81 @@ impl PartitionedWal {
 
         Ok(out)
     }
+
+    /// Read every committed top-level WAL object beneath `base_prefix`.
+    /// Temporary objects and malformed records are ignored with warnings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing or reading a listed WAL object fails.
+    pub async fn read_all_in_object_store(
+        store: &dyn ObjectStore,
+        base_prefix: &ObjectStorePath,
+    ) -> Result<Vec<Self>> {
+        use futures::TryStreamExt;
+
+        let wal_dir = base_prefix.clone().join(PARTITIONED_WAL_DIR);
+        let objects = store
+            .list(Some(&wal_dir))
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|source| Error::ObjectStore {
+                operation: "list partitioned WALs",
+                table: base_prefix.to_string(),
+                source,
+            })?;
+        let mut out = Vec::new();
+        for object in objects {
+            let path = object.location.as_ref();
+            if !std::path::Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
+                continue;
+            }
+            let bytes = match store.get(&object.location).await {
+                Ok(result) => result.bytes().await.map_err(|source| Error::ObjectStore {
+                    operation: "read partitioned WAL",
+                    table: base_prefix.to_string(),
+                    source,
+                })?,
+                Err(source) => {
+                    tracing::warn!(wal = %object.location, %source, "Failed to read partitioned WAL object");
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<Self>(&bytes) {
+                Ok(wal) => out.push(wal),
+                Err(error) => tracing::warn!(
+                    wal = %object.location,
+                    %error,
+                    "Skipping unparseable partitioned WAL object"
+                ),
+            }
+        }
+        Ok(out)
+    }
 }
 
-fn wal_path(table_root: &Path, commit_id: &str) -> PathBuf {
-    table_root
+fn wal_path(table_root: &Path, commit_id: &str) -> Result<PathBuf> {
+    validate_commit_id(commit_id)?;
+    Ok(table_root
         .join(PARTITIONED_WAL_DIR)
-        .join(format!("{commit_id}.json"))
+        .join(format!("{commit_id}.json")))
+}
+
+fn validate_commit_id(commit_id: &str) -> Result<()> {
+    let parsed = uuid::Uuid::parse_str(commit_id).map_err(|source| Error::Internal {
+        table: PARTITIONED_WAL_DIR.to_string(),
+        message: format!("Invalid cross-partition commit id '{commit_id}': {source}"),
+    })?;
+    if parsed.to_string() != commit_id {
+        return Err(Error::Internal {
+            table: PARTITIONED_WAL_DIR.to_string(),
+            message: format!("Cross-partition commit id '{commit_id}' is not canonical"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -442,17 +537,19 @@ mod tests {
 
     fn sample_wal() -> PartitionedWal {
         PartitionedWal::new(
-            "01HX0000000000000000000000",
+            "018f1000-0000-7000-8000-000000000000",
             "/data/table_root",
             vec![
                 PartitionedWalEntry {
                     table_id: "01HY0000000000000000000001".to_string(),
+                    target_snapshot_id: None,
                     staging_wal_path: Some(
                         "/data/p1/_staging/01HZ0000000000000000000000/_wal.json".to_string(),
                     ),
                 },
                 PartitionedWalEntry {
                     table_id: "01HY0000000000000000000002".to_string(),
+                    target_snapshot_id: None,
                     staging_wal_path: None,
                 },
             ],
@@ -494,7 +591,7 @@ mod tests {
         let mut commits = Vec::new();
         for i in 0..5 {
             let mut w = sample_wal();
-            w.commit_id = format!("01HX000000000000000000000{i}");
+            w.commit_id = format!("018f1000-0000-7000-8000-{i:012}");
             w.write_to(tmp.path()).await.expect("write");
             commits.push(w.commit_id.clone());
         }
@@ -549,7 +646,7 @@ mod tests {
     #[tokio::test]
     async fn remove_tolerates_not_found() {
         let tmp = TempDir::new().expect("tempdir");
-        PartitionedWal::remove(tmp.path(), "01HX0000000000000000000000")
+        PartitionedWal::remove(tmp.path(), "018f1000-0000-7000-8000-000000000000")
             .await
             .expect("idempotent remove on absent file");
 
@@ -569,6 +666,27 @@ mod tests {
                 .await
                 .expect("read after remove")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_path_traversal_commit_id() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut wal = sample_wal();
+        wal.commit_id = "../../escape".to_string();
+
+        wal.write_to(tmp.path())
+            .await
+            .expect_err("write_to must reject a path-traversal commit_id");
+        PartitionedWal::remove(tmp.path(), "../../escape")
+            .await
+            .expect_err("remove must reject a path-traversal commit_id");
+        assert!(
+            !tmp.path()
+                .parent()
+                .expect("parent")
+                .join("escape.json")
+                .exists()
         );
     }
 
@@ -613,5 +731,77 @@ mod tests {
             .get(&final_key)
             .await
             .expect("final key exists after WAL commit");
+    }
+
+    #[tokio::test]
+    async fn object_store_read_filters_temporary_and_malformed_wals() {
+        use object_store::PutPayload;
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjectStorePath;
+
+        let store = InMemory::new();
+        let base = ObjectStorePath::from("table_root");
+        let wal = sample_wal();
+        wal.write_to_object_store(&store, &base)
+            .await
+            .expect("write valid WAL");
+        let wal_dir = base.clone().join(PARTITIONED_WAL_DIR);
+        store
+            .put(
+                &wal_dir.clone().join("ignored.json.tmp"),
+                PutPayload::from_static(b"{}"),
+            )
+            .await
+            .expect("write temporary object");
+        store
+            .put(
+                &wal_dir.join("malformed.json"),
+                PutPayload::from_static(b"not-json"),
+            )
+            .await
+            .expect("write malformed object");
+
+        let recovered = PartitionedWal::read_all_in_object_store(&store, &base)
+            .await
+            .expect("read object-store WALs");
+        assert_eq!(recovered, vec![wal]);
+    }
+
+    #[tokio::test]
+    async fn object_store_remove_is_idempotent_and_cleans_tmp() {
+        use object_store::PutPayload;
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjectStorePath;
+
+        let store = InMemory::new();
+        let base = ObjectStorePath::from("table_root");
+        let wal = sample_wal();
+        let final_key = wal
+            .write_to_object_store(&store, &base)
+            .await
+            .expect("write WAL");
+        let tmp_key = base
+            .clone()
+            .join(PARTITIONED_WAL_DIR)
+            .join(format!("{}.json.tmp", wal.commit_id));
+        store
+            .put(&tmp_key, PutPayload::from_static(b"partial"))
+            .await
+            .expect("restore interrupted temporary object");
+
+        PartitionedWal::remove_from_object_store(&store, &base, &wal.commit_id)
+            .await
+            .expect("remove final and temporary WALs");
+        PartitionedWal::remove_from_object_store(&store, &base, &wal.commit_id)
+            .await
+            .expect("idempotent second removal");
+        assert!(matches!(
+            store.get(&final_key).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(matches!(
+            store.get(&tmp_key).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 }

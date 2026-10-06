@@ -22,6 +22,7 @@ limitations under the License.
 use std::time::SystemTime;
 
 use ::rand::{Rng, RngExt};
+use rust_decimal::Decimal;
 use tokio_postgres::Client;
 
 use crate::Result;
@@ -120,7 +121,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
                 source,
             })?;
 
-        let total_amount: f64 = sum_row.get(0);
+        let total_amount: Decimal = sum_row.get(0);
 
         // 7. UPDATE customer balance
         tx.execute(

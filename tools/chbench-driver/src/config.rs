@@ -89,3 +89,63 @@ impl PostgresSourceConfig {
         )
     }
 }
+
+/// `MySQL`-specific connection configuration.
+///
+/// The source server must have binary logging enabled for Spice CDC
+/// (`log_bin = ON`, `binlog_format = ROW`, `binlog_row_image = FULL`), and the
+/// user needs `REPLICATION SLAVE` + `REPLICATION CLIENT` alongside DDL rights.
+pub struct MysqlSourceConfig {
+    /// `MySQL` host.
+    pub host: String,
+
+    /// `MySQL` port.
+    pub port: u16,
+
+    /// `MySQL` database name.
+    pub db: String,
+
+    /// `MySQL` user.
+    pub user: String,
+
+    /// `MySQL` password.
+    pub pass: String,
+}
+
+impl Default for MysqlSourceConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 3306,
+            db: "chbench".into(),
+            user: "bench".into(),
+            pass: "bench".into(),
+        }
+    }
+}
+
+impl MysqlSourceConfig {
+    /// Build `mysql_async` connection options from this config.
+    ///
+    /// Uses `OptsBuilder` rather than a formatted `mysql://` URL so credentials
+    /// or a database name containing URL-reserved characters (`@`, `:`, `/`,
+    /// `#`, `%`, ...) are passed through verbatim instead of being misparsed or
+    /// silently requiring percent-encoding.
+    #[must_use]
+    pub fn opts(&self) -> mysql_async::Opts {
+        mysql_async::OptsBuilder::default()
+            .ip_or_hostname(self.host.clone())
+            .tcp_port(self.port)
+            .user(Some(self.user.clone()))
+            .pass(Some(self.pass.clone()))
+            .db_name(Some(self.db.clone()))
+            // The OLTP workload prepares 40+ distinct statements per terminal
+            // connection (ten s_dist_XX SELECT variants, eleven order_line
+            // INSERT arities, plus each transaction's fixed set). mysql_async
+            // caches prepared statements per connection with an LRU capacity of
+            // 32 by default, so the workload constantly evicts and re-prepares
+            // statements — an extra PREPARE round trip per evicted statement.
+            .stmt_cache_size(256)
+            .into()
+    }
+}

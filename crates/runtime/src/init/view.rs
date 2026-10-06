@@ -20,20 +20,25 @@ use crate::{
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
     Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
-    metrics,
+    datafusion::DeferredRefreshOutcome,
     secrets::Secrets,
-    status, view, warn_spaced,
+    status, view,
 };
 use app::App;
-use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
+use datafusion::{
+    common::TableReference,
+    sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect},
+};
 #[cfg(feature = "duckdb")]
 use futures::stream::StreamExt;
 use itertools::Itertools;
+use runtime_metrics as metrics;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 use util::topological_ordering::{
     construct_effected_in_topological_order, construct_topological_ordering,
 };
+use util::warn_spaced;
 
 /// Represents a validated view with its parsed dependencies
 pub(crate) struct ValidatedView {
@@ -97,7 +102,11 @@ fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<
 
 impl Runtime {
     pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
-        let validated_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        // `LogErrors(false)`: `load_datasets` is this function's only caller and it has
+        // already validated the same views with `LogErrors(true)` before its snapshot
+        // checks, so reporting again here only prints each view's load error, and each
+        // view's discarded-acceleration warning, twice per startup.
+        let validated_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
 
         // Determine the dependency order for views based on their SQL dependencies
         let views_in_dependency_order = order_views_by_dependencies(&validated_views)
@@ -120,7 +129,6 @@ impl Runtime {
 
     /// Returns a list of valid views from the given App, with SQL validated and dependencies extracted.
     /// Skips any that fail to parse and logs an error for them.
-    #[expect(clippy::result_large_err)]
     pub(crate) fn get_valid_views(
         self: Arc<Self>,
         app: &Arc<App>,
@@ -129,8 +137,15 @@ impl Runtime {
         let rt_ref = Arc::clone(&self);
         let status = Arc::clone(&self.status);
 
+        // `LogErrors(false)` regardless of this call's own flag: this is a name
+        // lookup, not a dataset load. Both paths that reach here with
+        // `LogErrors(true)` — `load_datasets`, and `apply_dataset_diff` ahead of
+        // `apply_view_diff` — already call `get_valid_datasets(app,
+        // LogErrors(true))` themselves, so nothing is silenced by this; passing
+        // the flag through only made each dataset's load error, and each
+        // dataset's discarded-acceleration warning, print twice per load.
         let datasets = Arc::clone(&self)
-            .get_valid_datasets(app, log_errors)
+            .get_valid_datasets(app, LogErrors(false))
             .iter()
             .map(|ds| ds.name.clone())
             .collect::<HashSet<_>>();
@@ -218,6 +233,23 @@ impl Runtime {
                     // Extract dependencies from the validated statement
                     let dependencies = view::get_dependent_table_names(&statement);
 
+                    // What the acceleration block asks for and the runtime will not do as
+                    // written — settings `enabled: false` discards (#13514), the deprecated
+                    // `acceleration.ready_state` (#13749) — is the same for a view as for a
+                    // dataset. Reported from here — the load path, behind `log_errors` —
+                    // rather than from `ViewBuilder::try_from`, which read-only callers run too.
+                    //
+                    // Last, after every rejection above has had its chance: a view that
+                    // collides with a dataset name or fails SQL validation never loads, so
+                    // nothing of its acceleration block is silently discarded and warning
+                    // about it would only add noise to the error that actually matters.
+                    crate::init::dataset::warn_about_acceleration_block(
+                        crate::component::AcceleratedComponent::View,
+                        &spicepod_view.name,
+                        spicepod_view.acceleration.as_ref(),
+                        log_errors,
+                    );
+
                     Some(ValidatedView {
                         view: Arc::new(view),
                         dependencies,
@@ -232,6 +264,34 @@ impl Runtime {
                 }
             })
             .collect()
+    }
+
+    #[cfg(feature = "duckdb")]
+    pub(crate) async fn get_initialized_views(
+        self: Arc<Self>,
+        app: &Arc<App>,
+        log_errors: LogErrors,
+    ) -> Vec<Arc<View>> {
+        let valid_views = Arc::clone(&self).get_valid_views(app, log_errors);
+        futures::stream::iter(valid_views)
+            .filter_map(|validated_view| async move {
+                let view = &validated_view.view;
+                match (view.is_accelerated(), view.is_accelerator_initialized().await) {
+                    (true, true) | (false, _) => Some(Arc::clone(view)),
+                    (true, false) => {
+                        if log_errors.0 {
+                            metrics::views::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
+                                "View {view_name} is accelerated but the accelerator failed to initialize.",
+                                view_name = &view.name.to_string(),
+                            );
+                        }
+                        None
+                    }
+                }
+            })
+            .collect()
+            .await
     }
 
     /// Initialize views configured with accelerators before registering the datasets.
@@ -292,35 +352,6 @@ impl Runtime {
         }
     }
 
-    #[cfg(feature = "duckdb")]
-    pub(crate) async fn get_initialized_views(
-        self: Arc<Self>,
-        app: &Arc<App>,
-        log_errors: LogErrors,
-    ) -> Vec<Arc<View>> {
-        let valid_views = Arc::clone(&self).get_valid_views(app, log_errors);
-        futures::stream::iter(valid_views)
-            .filter_map(|validated_view| async move {
-                let view = &validated_view.view;
-                match (view.is_accelerated(), view.is_accelerator_initialized().await) {
-                    (true, true) | (false, _) => Some(Arc::clone(view)),
-                    (true, false) => {
-                        if log_errors.0 {
-                            metrics::views::LOAD_ERROR.add(1, &[]);
-                            tracing::error!(
-                                "View {view_name} is accelerated but the accelerator failed to initialize.",
-                                view_name = &view.name.to_string(),
-                            );
-                        }
-                        None
-                    }
-                }
-            })
-            .collect()
-            .await
-    }
-
-    #[expect(clippy::result_large_err)]
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
         let df = Arc::clone(&self.df);
         let register_task = df
@@ -335,13 +366,49 @@ impl Runtime {
 
         let runtime = Arc::clone(&self);
         let view = Arc::clone(view);
+        let df = Arc::clone(&self.df);
 
         tokio::task::spawn(async move {
             let view_name = view.name.clone();
             let notifier = register_task.await;
             match notifier {
-                Ok(Some(notifier)) => {
-                    notifier.notified().await;
+                Ok(Some((instance, completion))) => {
+                    // `instance` was captured where the view was registered, so
+                    // the schedule below is checked against the view this task
+                    // actually registered rather than against whatever the name
+                    // resolves to once the refresh lands.
+                    match df
+                        .await_refresh_completion(instance, Some(completion))
+                        .await
+                    {
+                        DeferredRefreshOutcome::Apply => {}
+                        DeferredRefreshOutcome::Abandoned => {
+                            // The accelerated table was dropped before its initial
+                            // refresh landed. Creating the schedule now would
+                            // resurrect one for a view that is no longer there.
+                            tracing::debug!(
+                                "Accelerated view '{view_name}' was removed before its initial refresh completed; not creating a refresh schedule."
+                            );
+                            return;
+                        }
+                        DeferredRefreshOutcome::Failed => {
+                            tracing::debug!(
+                                "Accelerated view '{view_name}' initial refresh failed terminally; not creating a refresh schedule."
+                            );
+                            return;
+                        }
+                        DeferredRefreshOutcome::TableChanged => {
+                            // A `remove_view` landed after the completion was
+                            // recorded, so this would give a removed view a live
+                            // refresh schedule, or a replaced one a schedule built
+                            // from its predecessor's settings.
+                            tracing::debug!(
+                                "Accelerated view '{view_name}' was removed or replaced after its initial refresh completed; not creating a refresh schedule."
+                            );
+                            return;
+                        }
+                    }
+
                     if let Err(e) = runtime.create_dataset_or_view_schedule(view).await {
                         tracing::error!(
                             "Failed to create refresh schedule for accelerated view '{view_name}': {e}."

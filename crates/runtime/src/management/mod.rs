@@ -18,6 +18,7 @@ const TASK_HISTORY_SINK_REMOTE_TABLE: &str = "runtime.task_history";
 const TASK_HISTORY_SINK_TABLE: &str = "scp.task_history";
 const DEFAULT_EXPORT_INTERVAL_SECS: u64 = 5;
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -28,12 +29,12 @@ use arrow::array::RecordBatch;
 use chrono::{DateTime, Utc};
 use datafusion::{
     catalog::TableProvider,
+    common::TableReference,
     datasource::DefaultTableSource,
     error::DataFusionError,
     execution::SessionStateBuilder,
     logical_expr::LogicalPlanBuilder,
     prelude::{DataFrame, SessionContext, col, lit},
-    sql::TableReference,
 };
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
@@ -298,18 +299,19 @@ async fn get_spiceai_table_provider(
 
     dataset.access = AccessMode::ReadWrite;
 
-    let params = ConnectorParamsBuilder::new("spice.ai".into(), (&dataset).into())
+    let params = ConnectorParamsBuilder::for_dataset("spice.ai".into(), &dataset)
         .build(secrets, tokio_io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 
-    let data_connector = create_new_connector("spice.ai", params)
+    let context = RuntimeConnectorContext::for_dataset(&dataset);
+    let data_connector = create_new_connector("spice.ai", params, &context)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateDataConnectorSnafu)?;
 
     let source_table_provider = data_connector
-        .read_write_provider(&dataset)
+        .read_write_provider(&context, &dataset)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateCloudTableProviderSnafu)?;
@@ -402,7 +404,7 @@ fn is_table_not_ready_error(e: &DataFusionError) -> bool {
 
 // Resolve a secret by key, returning the secret string if found, or the original key if not.
 async fn resolve_secret(secrets: &Arc<RwLock<Secrets>>, key: &str) -> SecretString {
-    let secrets = secrets.read().await;
+    let secrets = Secrets::snapshot(secrets).await;
     if let Ok(Some(secret)) = secrets.get_secret(key).await {
         secret
     } else {

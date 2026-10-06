@@ -88,9 +88,7 @@ pub async fn execute_add_or_connect(
     // Fetch the Spicepod
     let download_path = registry::get_pod(pod_path, ctx.pods_dir(), &headers, ctx.http_client())
         .await
-        .map_err(|e| crate::error::Error::InvalidArgument {
-            message: e.to_string(),
-        })?;
+        .map_err(|e| registry_error(&e))?;
 
     // Get relative path for display
     let relative_path = get_relative_path(ctx.app_dir(), &download_path);
@@ -115,6 +113,25 @@ pub async fn execute_add_or_connect(
     println!("added {relative_path}");
 
     Ok(())
+}
+
+/// Classify a registry failure so the user is told whose fault it is.
+///
+/// Only the arms that describe the requested pod are the caller's argument; a registry that
+/// answers badly is not, and reporting it as `invalid_argument` sends the user - and any script
+/// reading the machine error code - looking for a mistake they did not make.
+fn registry_error(error: &registry::Error) -> crate::error::Error {
+    let message = error.to_string();
+    match error {
+        registry::Error::FetchFailed { .. }
+        | registry::Error::NotAnArchive { .. }
+        | registry::Error::ZipExtraction { .. } => crate::error::Error::Registry { message },
+        registry::Error::NotFound { .. }
+        | registry::Error::DirectoryNotFound { .. }
+        | registry::Error::InvalidSpicepod { .. }
+        | registry::Error::NestedLocalInstall { .. }
+        | registry::Error::Io { .. } => crate::error::Error::InvalidArgument { message },
+    }
 }
 
 /// Get a relative path from a base directory.
@@ -147,6 +164,41 @@ fn dependency_reference(pod_path: &str, base: &Path, download_path: &Path) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry that answers badly is not a bad argument - see #12116.
+    #[test]
+    fn a_registry_side_failure_is_not_reported_as_a_bad_argument() {
+        let served_a_json_error = registry::Error::NotAnArchive {
+            pod: "spiceai/quickstart".to_string(),
+            status: 200,
+            content_type: "application/zip".to_string(),
+            body_len: 152,
+            message: "selected encoding not supported".to_string(),
+        };
+        let rendered = registry_error(&served_a_json_error).to_string();
+        assert!(
+            matches!(
+                registry_error(&served_a_json_error),
+                crate::error::Error::Registry { .. }
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.starts_with("Failed to fetch Spicepod 'spiceai/quickstart'"),
+            "the registry's own message is displayed verbatim: {rendered}"
+        );
+
+        let no_such_pod = registry::Error::NotFound {
+            path: "spiceai/nope".to_string(),
+        };
+        assert!(
+            matches!(
+                registry_error(&no_such_pod),
+                crate::error::Error::InvalidArgument { .. }
+            ),
+            "a pod that does not exist stays the caller's argument"
+        );
+    }
 
     #[test]
     fn dependency_reference_preserves_remote_version_pin() {

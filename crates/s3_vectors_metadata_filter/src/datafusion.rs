@@ -44,13 +44,13 @@ pub fn supports_filter_expr(columns: &[String], filter: &Expr) -> bool {
                     // Recurse into children to validate sub-expressions.
                     return Ok(TreeNodeRecursion::Continue);
                 }
-                DFOperator::Eq
-                | DFOperator::NotEq
-                | DFOperator::Lt
-                | DFOperator::LtEq
-                | DFOperator::Gt
-                | DFOperator::GtEq => {
-                    supports_column_ref(columns, &binary.left) && is_literal(&binary.right)
+                DFOperator::Eq | DFOperator::NotEq => {
+                    supports_column_ref(columns, &binary.left)
+                        && is_supported_primitive_literal(&binary.right)
+                }
+                DFOperator::Lt | DFOperator::LtEq | DFOperator::Gt | DFOperator::GtEq => {
+                    supports_column_ref(columns, &binary.left)
+                        && is_supported_numeric_literal(&binary.right)
                 }
                 _ => false,
             },
@@ -85,12 +85,13 @@ pub fn convert_datafusion_filters_to_s3_vectors(
         // Single filter - convert directly
         convert_expr_to_filter(&filters[0])
     } else {
-        // Multiple filters - combine with AND
+        // Multiple filters - combine with AND only when every filter converts faithfully.
         let mut and_filters = Vec::new();
         for filter in filters {
-            if let Some(expr) = convert_expr_to_filter_expression(filter)? {
-                and_filters.push(expr);
-            }
+            let Some(expr) = convert_expr_to_filter_expression(filter)? else {
+                return Ok(None);
+            };
+            and_filters.push(expr);
         }
 
         if and_filters.is_empty() {
@@ -128,13 +129,51 @@ fn supports_in_list(columns: &[String], in_list: &datafusion::logical_expr::expr
         return false;
     }
 
-    // Check that all items in the list are literals
-    in_list.list.iter().all(is_literal)
+    // S3 Vectors requires a non-empty array of primitive metadata values.
+    !in_list.list.is_empty() && in_list.list.iter().all(is_supported_primitive_literal)
 }
 
-/// Checks if an expression is a literal value
-fn is_literal(expr: &Expr) -> bool {
-    matches!(expr, Expr::Literal(..))
+/// Checks whether an expression is a primitive literal supported by S3 Vectors.
+fn is_supported_primitive_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(scalar, _) => is_supported_primitive_scalar(scalar),
+        _ => false,
+    }
+}
+
+/// Checks whether an expression is a numeric literal supported by S3 Vectors range filters.
+fn is_supported_numeric_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(scalar, _) => is_supported_numeric_scalar(scalar),
+        _ => false,
+    }
+}
+
+/// Checks whether a scalar can be represented as an S3 Vectors primitive metadata value.
+fn is_supported_primitive_scalar(scalar: &ScalarValue) -> bool {
+    matches!(
+        scalar,
+        ScalarValue::Boolean(Some(_))
+            | ScalarValue::Utf8(Some(_))
+            | ScalarValue::LargeUtf8(Some(_))
+    ) || is_supported_numeric_scalar(scalar)
+}
+
+/// Checks whether a scalar can be represented as a finite S3 Vectors numeric metadata value.
+fn is_supported_numeric_scalar(scalar: &ScalarValue) -> bool {
+    match scalar {
+        ScalarValue::Int8(Some(_))
+        | ScalarValue::Int16(Some(_))
+        | ScalarValue::Int32(Some(_))
+        | ScalarValue::Int64(Some(_))
+        | ScalarValue::UInt8(Some(_))
+        | ScalarValue::UInt16(Some(_))
+        | ScalarValue::UInt32(Some(_))
+        | ScalarValue::UInt64(Some(_)) => true,
+        ScalarValue::Float32(Some(value)) => value.is_finite(),
+        ScalarValue::Float64(Some(value)) => value.is_finite(),
+        _ => false,
+    }
 }
 
 /// Converts a single `DataFusion` Expr to a `MetadataFilter`
@@ -219,8 +258,7 @@ fn convert_logical_and(left: &Expr, right: &Expr) -> DataFusionResult<Option<Fil
             };
             Ok(Some(FilterExpression::Logical(logical_op)))
         }
-        (Some(expr), None) | (None, Some(expr)) => Ok(Some(expr)),
-        (None, None) => Ok(None),
+        _ => Ok(None),
     }
 }
 
@@ -237,8 +275,7 @@ fn convert_logical_or(left: &Expr, right: &Expr) -> DataFusionResult<Option<Filt
             };
             Ok(Some(FilterExpression::Logical(logical_op)))
         }
-        (Some(expr), None) | (None, Some(expr)) => Ok(Some(expr)),
-        (None, None) => Ok(None),
+        _ => Ok(None),
     }
 }
 
@@ -597,17 +634,18 @@ mod tests {
     use datafusion::sql::unparser::{Unparser, dialect::DefaultDialect};
 
     #[test]
-    fn test_valid_datafusion_expressions() {
+    fn test_supported_s3_vectors_filter_conversions() {
         let columns = vec![
             "genre".to_string(),
             "year".to_string(),
             "rating".to_string(),
             "budget".to_string(),
+            "active".to_string(),
             "optional_field".to_string(),
         ];
 
         let test_cases = vec![
-            // Simple equality
+            // Equality supports string, boolean, and numeric metadata values.
             (
                 Expr::BinaryExpr(BinaryExpr::new(
                     Box::new(col("genre")),
@@ -616,7 +654,39 @@ mod tests {
                 )),
                 r#"{"genre":{"$eq":"documentary"}}"#,
             ),
-            // Numeric comparisons
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("active")),
+                    Operator::Eq,
+                    Box::new(lit(true)),
+                )),
+                r#"{"active":{"$eq":true}}"#,
+            ),
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("year")),
+                    Operator::Eq,
+                    Box::new(lit(ScalarValue::UInt32(Some(2020)))),
+                )),
+                r#"{"year":{"$eq":2020}}"#,
+            ),
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("genre")),
+                    Operator::NotEq,
+                    Box::new(lit("drama")),
+                )),
+                r#"{"genre":{"$ne":"drama"}}"#,
+            ),
+            // Range comparisons support numeric metadata values only.
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("year")),
+                    Operator::Gt,
+                    Box::new(lit(ScalarValue::Int32(Some(2019)))),
+                )),
+                r#"{"year":{"$gt":2019}}"#,
+            ),
             (
                 Expr::BinaryExpr(BinaryExpr::new(
                     Box::new(col("year")),
@@ -640,6 +710,14 @@ mod tests {
                     Box::new(lit(ScalarValue::Float64(Some(8.5)))),
                 )),
                 r#"{"rating":{"$gte":8.5}}"#,
+            ),
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("budget")),
+                    Operator::LtEq,
+                    Box::new(lit(ScalarValue::UInt64(Some(1_000_000)))),
+                )),
+                r#"{"budget":{"$lte":1000000}}"#,
             ),
             // Array operations
             (
@@ -703,24 +781,128 @@ mod tests {
         ];
 
         for (expr, expected_json) in test_cases {
-            assert!(supports_filter_expr(&columns, &expr));
+            assert!(
+                supports_filter_expr(&columns, &expr),
+                "supported filter was not advertised for pushdown: {expr}"
+            );
             let result = convert_datafusion_filters_to_s3_vectors(&[expr])
                 .expect("Failed to convert DataFusion filters to S3 Vectors filters");
-            if let Some(filter) = result {
-                filter.validate().expect("Should be a valid filter");
+            let filter = result.expect("supported filter should be converted");
+            filter.validate().expect("Should be a valid filter");
 
-                let json_result = filter.to_json().expect("Failed to convert filter to JSON");
-                let parsed_value: serde_json::Value =
-                    serde_json::from_str(&json_result).expect("Failed to parse JSON");
-                let expected_value: serde_json::Value =
-                    serde_json::from_str(expected_json).expect("Failed to parse expected JSON");
+            let json_result = filter.to_json().expect("Failed to convert filter to JSON");
+            let parsed_value: serde_json::Value =
+                serde_json::from_str(&json_result).expect("Failed to parse JSON");
+            let expected_value: serde_json::Value =
+                serde_json::from_str(expected_json).expect("Failed to parse expected JSON");
 
-                assert_eq!(
-                    parsed_value, expected_value,
-                    "Expression conversion mismatch.\nActual: {json_result}\nExpected: {expected_json}"
-                );
-            }
+            assert_eq!(
+                parsed_value, expected_value,
+                "Expression conversion mismatch.\nActual: {json_result}\nExpected: {expected_json}"
+            );
         }
+    }
+
+    #[test]
+    fn test_multiple_supported_filters_are_combined_with_and() {
+        let filters = vec![
+            col("genre").eq(lit("documentary")),
+            col("year").gt_eq(lit(ScalarValue::Int64(Some(2020)))),
+        ];
+
+        let filter = convert_datafusion_filters_to_s3_vectors(&filters)
+            .expect("Failed to convert DataFusion filters to S3 Vectors filters")
+            .expect("supported filters should be converted");
+        filter.validate().expect("Should be a valid filter");
+
+        let json_result = filter.to_json().expect("Failed to convert filter to JSON");
+        let parsed_value: serde_json::Value =
+            serde_json::from_str(&json_result).expect("Failed to parse JSON");
+        let expected_value: serde_json::Value = serde_json::json!({
+            "$and": [
+                {"genre": {"$eq": "documentary"}},
+                {"year": {"$gte": 2020}},
+            ],
+        });
+
+        assert_eq!(parsed_value, expected_value);
+    }
+
+    #[test]
+    fn test_filter_pushdown_requires_supported_operator_literal_pairs() {
+        let columns = vec!["category".to_string(), "year".to_string()];
+
+        let numeric_range = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("year")),
+            Operator::GtEq,
+            Box::new(lit(ScalarValue::Int64(Some(2020)))),
+        ));
+        assert!(supports_filter_expr(&columns, &numeric_range));
+
+        let string_range = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("category")),
+            Operator::Gt,
+            Box::new(lit("m")),
+        ));
+        assert!(!supports_filter_expr(&columns, &string_range));
+
+        let null_equality = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("category")),
+            Operator::Eq,
+            Box::new(lit(ScalarValue::Utf8(None))),
+        ));
+        assert!(!supports_filter_expr(&columns, &null_equality));
+
+        let non_finite_range = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("year")),
+            Operator::Lt,
+            Box::new(lit(ScalarValue::Float64(Some(f64::NAN)))),
+        ));
+        assert!(!supports_filter_expr(&columns, &non_finite_range));
+
+        let empty_in_list = Expr::InList(datafusion::logical_expr::expr::InList::new(
+            Box::new(col("category")),
+            vec![],
+            false,
+        ));
+        assert!(!supports_filter_expr(&columns, &empty_in_list));
+
+        let null_in_list = Expr::InList(datafusion::logical_expr::expr::InList::new(
+            Box::new(col("category")),
+            vec![lit(ScalarValue::Utf8(None))],
+            false,
+        ));
+        assert!(!supports_filter_expr(&columns, &null_in_list));
+    }
+
+    #[test]
+    fn partial_logical_and_conversion_returns_none() {
+        let supported = binary_expr(col("genre"), Operator::Eq, lit("drama"));
+        let unsupported = binary_expr(col("year"), Operator::Plus, lit(1));
+        let expr = binary_expr(supported, Operator::And, unsupported);
+
+        let result = convert_datafusion_filters_to_s3_vectors(&[expr])
+            .expect("partial logical AND conversion should not fail");
+
+        assert!(
+            result.is_none(),
+            "a partially converted AND predicate must not be pushed down"
+        );
+    }
+
+    #[test]
+    fn partial_logical_or_conversion_returns_none() {
+        let supported = binary_expr(col("genre"), Operator::Eq, lit("drama"));
+        let unsupported = binary_expr(col("year"), Operator::Plus, lit(1));
+        let expr = binary_expr(supported, Operator::Or, unsupported);
+
+        let result = convert_datafusion_filters_to_s3_vectors(&[expr])
+            .expect("partial logical OR conversion should not fail");
+
+        assert!(
+            result.is_none(),
+            "a partially converted OR predicate must not be pushed down"
+        );
     }
 
     #[test]

@@ -39,14 +39,14 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
-use datafusion::execution::config::SessionConfig;
+use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_catalog::TableProvider;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -242,24 +242,33 @@ impl FileBasedDeletionSink {
     ) -> crate::provider::Result<u64> {
         let mut total_rows: u64 = 0;
         let mut deleted_count: u64 = 0;
+        let mut retired_cache_paths = HashSet::new();
+        let mut delete_error = None;
+
+        if !eligible_files.is_empty() {
+            // The write lock and listing fence keep new captures out until the
+            // deletion finishes. Reject cached views before unlinking any file.
+            self.provider.invalidate_scan_views_before_file_removal();
+        }
 
         for (meta, num_rows) in eligible_files {
+            let row_count = num_rows.unwrap_or(0);
+            let Ok(rows) = u64::try_from(row_count) else {
+                delete_error = Some(Error::Internal {
+                    table: self.table_name.clone(),
+                    message: format!(
+                        "Retention: invalid row count {row_count} for file {} (cannot convert to u64)",
+                        meta.location
+                    ),
+                });
+                break;
+            };
             // Delete the file from the object store. This does not invalidate the listing table cache; cache invalidation is handled separately.
             match object_store.delete(&meta.location).await {
                 Ok(()) => {
-                    let row_count = num_rows.unwrap_or(0);
-                    let Ok(rows) = u64::try_from(row_count) else {
-                        return Err(Error::Internal {
-                            table: self.table_name.clone(),
-                            message: format!(
-                                "Retention: invalid row count {row_count} for file {} (cannot convert to u64)",
-                                meta.location
-                            ),
-                        });
-                    };
-
                     total_rows = total_rows.saturating_add(rows);
                     deleted_count += 1;
+                    retired_cache_paths.insert(meta.location.clone());
 
                     tracing::debug!(
                         table = %self.table_name,
@@ -271,6 +280,7 @@ impl FileBasedDeletionSink {
                 }
                 Err(object_store::Error::NotFound { .. }) => {
                     // File already deleted (race with another retention check) — safe to ignore
+                    retired_cache_paths.insert(meta.location.clone());
                     tracing::debug!(
                         table = %self.table_name,
                         path = %meta.location,
@@ -284,13 +294,26 @@ impl FileBasedDeletionSink {
                         error = %e,
                         "Retention: failed to delete expired file"
                     );
-                    return Err(Error::ObjectStore {
+                    delete_error = Some(Error::ObjectStore {
                         operation: "delete expired retention file",
                         table: self.table_name.clone(),
                         source: e,
                     });
+                    break;
                 }
             }
+        }
+
+        // Exact paths are invalidated only after DeleteObject confirms that the
+        // object is absent. Do this even when a later delete failed so every
+        // file already removed by this partial batch releases its cached
+        // segments immediately and cannot disappear from a later directory
+        // listing before ever being invalidated.
+        self.provider
+            .invalidate_retired_paths(retired_cache_paths)
+            .await;
+        if let Some(error) = delete_error {
+            return Err(error);
         }
 
         tracing::debug!(
@@ -330,7 +353,7 @@ impl FileBasedDeletionSink {
         // Vortex footer/segment caches live inside the VortexFormat embedded in the
         // shared ListingTable and are unaffected by this SessionContext.
         let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             Arc::clone(&self.runtime_env),
         );
 
@@ -419,7 +442,10 @@ impl FileBasedDeletionSink {
 
 #[async_trait]
 impl DeletionSink for FileBasedDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock to prevent racing with concurrent inserts or catalog refreshes.
         let _write_guard = self.write_lock.lock().await;
         // Acquire the listing fence in write mode so new scan plan-builds
@@ -445,8 +471,8 @@ impl DeletionSink for FileBasedDeletionSink {
         // a lock-free, throttled background pass on the dedicated compaction runtime
         // (`schedule_orphan_dv_sweep`), so it never extends the `write_lock` /
         // `listing_fence` window that CDC ingest and scans contend on here. We only
-        // signal it; it no-ops when `orphaned_dv_cleanup_min_files` is disabled
-        // (None — i.e. the spicepod param set to 0).
+        // signal it; the sweep is throttled and will only reclaim orphaned DVs once enough
+        // orphans accumulate (see `ORPHANED_DV_CLEANUP_MIN_FILES`).
         if !result.emptied_snapshot_ids.is_empty() {
             self.cleanup_emptied_snapshots(&result.emptied_snapshot_ids)
                 .await;
@@ -461,9 +487,14 @@ impl FileBasedDeletionSink {
     /// Clean up protected snapshots that were fully emptied by file-based retention.
     ///
     /// For each emptied snapshot:
-    /// 1. Remove the snapshot sequence from the catalog.
-    /// 2. Remove the entry from the in-memory `protected_snapshots` map.
-    /// 3. Delete the now-empty snapshot directory from disk.
+    /// 1. Remove the snapshot sequence (roster row) from the catalog.
+    /// 2. Delete the snapshot's `cayenne_snapshot_file` manifest rows and its
+    ///    `cayenne_snapshot_file_statistics` stats-cache rows from the catalog.
+    ///    The append maintenance lane wrote these rows while the snapshot was
+    ///    live and populated; nothing else reconciles them once retention has
+    ///    physically removed the files, so skipping this leaks metastore rows.
+    /// 3. Remove the entry from the in-memory `protected_snapshots` map.
+    /// 4. Delete the now-empty snapshot directory from disk.
     ///
     /// Errors are logged as warnings but do not fail the overall delete operation
     /// — the data files are already removed, so cleanup is best-effort.
@@ -482,14 +513,29 @@ impl FileBasedDeletionSink {
                 continue;
             }
 
-            // 2. Remove from in-memory map (copy-on-write atomic publish)
+            // 2. Delete the snapshot's manifest rows and stats-cache rows so
+            //    they do not leak once retention has removed the physical files.
+            //    Best-effort: on failure warn and continue, the roster row is
+            //    already gone.
+            if let Err(e) = self
+                .catalog
+                .clear_snapshot_cached_metadata(&self.table_id, snapshot_id)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to clear cached metadata for snapshot {snapshot_id} in table {}: {e}",
+                    self.table_name
+                );
+            }
+
+            // 3. Remove from in-memory map (copy-on-write atomic publish)
             self.protected_snapshots.rcu(|current| {
                 let mut new_map = (**current).clone();
                 new_map.remove(snapshot_id);
                 Arc::new(new_map)
             });
 
-            // 3. Delete the empty snapshot directory
+            // 4. Delete the empty snapshot directory
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)
                 .join(&self.table_id)
                 .join(snapshot_id);

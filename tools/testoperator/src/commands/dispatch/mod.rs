@@ -36,6 +36,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         update_snapshots,
         max_concurrent,
         max_concurrent_wait_timeout_mins,
+        schedule,
         ..
     } = args;
     if !path.is_dir() && !path.is_file() {
@@ -66,6 +67,14 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
     let mut tests_to_dispatch = Vec::new();
 
     for (path, test_file) in tests {
+        if !test_file.is_on_schedule(schedule) {
+            println!(
+                "Skipping {}: it runs on the {} schedule",
+                path.display(),
+                test_file.schedule
+            );
+            continue;
+        }
         match test_type {
             TestType::Benchmark => {
                 for bench in &test_file.tests.bench {
@@ -168,7 +177,18 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ));
                 }
             }
-            _ => {
+            TestType::Search => {
+                for search in &test_file.tests.search {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: search.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::DataConsistency => {
                 println!("Test type {test_type} not supported for dispatching");
             }
         }
@@ -185,9 +205,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         payload = map_numbers_to_strings(payload);
 
         println!(
-            "{}/{} - Dispatching {test_type} test from {}",
+            "{}/{total_tests} - Dispatching {test_type} test from {}",
             index + 1,
-            total_tests,
             path.display(),
         );
 
@@ -233,19 +252,20 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             }
             None => {
                 // Dispatch workflow without concurrency limit
-                workflow.send(octo_client.actions(), Some(payload)).await
+                workflow.run_workflow(&octo_client, Some(payload)).await
             }
         };
-
-        if let Err(e) = result {
-            eprintln!("Failed to dispatch {}. Error: {e:?}", path.display());
-            failed_dispatches.push((path.display().to_string(), e));
-            continue;
+        match result {
+            Err(e) => {
+                eprintln!("❌ Failed to dispatch {}. Error: {e:?}", path.display());
+                failed_dispatches.push((path.display().to_string(), e));
+            }
+            Ok(run_url) => {
+                // sleep to space out runs
+                println!("✅ {run_url} is running");
+                tokio::time::sleep(std::time::Duration::from_secs(80)).await;
+            }
         }
-
-        // sleep to space out runs
-        println!("Waiting for next run...");
-        tokio::time::sleep(std::time::Duration::from_secs(80)).await;
     }
 
     if !failed_dispatches.is_empty() {
@@ -263,13 +283,15 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
 /// or until the 30 minutes max wait time expires.
 ///
 /// - `max_concurrent`: maximum number of active runs allowed
+///
+/// Returns a URL to the Github workflow run.
 async fn dispatch_workflow_with_concurrency(
     workflow: GitHubWorkflow,
     octo: &Octocrab,
     input: Option<serde_json::Value>,
     max_concurrent: usize,
     slot_wait_timeout: Duration,
-) -> Result<()> {
+) -> Result<String> {
     println!(
         "Checking for available slot to run workflow (limit: {max_concurrent} concurrent runs, waiting up to {} min)...",
         slot_wait_timeout.as_secs() / 60
@@ -278,7 +300,7 @@ async fn dispatch_workflow_with_concurrency(
         eprintln!("Error waiting for slot: {err}");
     }
 
-    workflow.send(octo.actions(), input).await
+    workflow.run_workflow(octo, input).await
 }
 
 /// Waits until the number of already queued runs is below the given limit,

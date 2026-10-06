@@ -11,7 +11,7 @@ description: "Query: tpch_q4"
 |               |       Projection: orders.O_ORDERPRIORITY                                                                                                                             |
 |               |         LeftSemi Join: orders.O_ORDERKEY = __correlated_sq_1.L_ORDERKEY                                                                                              |
 |               |           Projection: orders.O_ORDERKEY, orders.O_ORDERPRIORITY                                                                                                      |
-|               |             Filter: orders.O_ORDERDATE >= Date32("1993-07-01") AND orders.O_ORDERDATE < Date32("1993-10-01")                                                         |
+|               |             Filter: orders.O_ORDERDATE >= TimestampSecond(741484800, None) AND orders.O_ORDERDATE < TimestampSecond(749433600, None)                                 |
 |               |               TableScan: orders projection=[O_ORDERKEY, O_ORDERDATE, O_ORDERPRIORITY]                                                                                |
 |               |           SubqueryAlias: __correlated_sq_1                                                                                                                           |
 |               |             TableScan: lineitem projection=[L_ORDERKEY], full_filters=[lineitem.L_RECEIPTDATE > lineitem.L_COMMITDATE]                                               |
@@ -23,7 +23,7 @@ description: "Query: tpch_q4"
 |               |           AggregateExec: mode=Partial, gby=[O_ORDERPRIORITY@0 as O_ORDERPRIORITY], aggr=[count(Int64(1))]                                                            |
 |               |             HashJoinExec: mode=Partitioned, join_type=LeftSemi, accumulator=MinMaxLeftAccumulator, on=[(O_ORDERKEY@0, L_ORDERKEY@0)], projection=[O_ORDERPRIORITY@1] |
 |               |               RepartitionExec: partitioning=Hash([O_ORDERKEY@0], 32), input_partitions=32                                                                            |
-|               |                 FilterExec: O_ORDERDATE@1 >= 1993-07-01 AND O_ORDERDATE@1 < 1993-10-01, projection=[O_ORDERKEY@0, O_ORDERPRIORITY@2]                                 |
+|               |                 FilterExec: O_ORDERDATE@1 >= 741484800 AND O_ORDERDATE@1 < 749433600, projection=[O_ORDERKEY@0, O_ORDERPRIORITY@2]                                   |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                              |
 |               |                     BytesProcessedExec                                                                                                                               |
 |               |                       OracleExec sql=SELECT "O_ORDERKEY", "O_ORDERDATE", "O_ORDERPRIORITY" FROM "TPCH_SF1"."ORDERS"                                                  |

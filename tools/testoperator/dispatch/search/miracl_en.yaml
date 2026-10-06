@@ -1,0 +1,33 @@
+tests:
+  search:
+    - spicepod_path: test/spicepods/search/mteb/miracl_en/full_text_search-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: miracl_en_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/miracl_en/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: miracl_en_retrieval
+      ready_wait: 1800
+    # Disabled: CPU-bound all-MiniLM-L6-v2 embedding of the 178,768-doc corpus averages
+    # ~15 rows/s, so a full load takes ~3.3 hours — far beyond any reasonable ready_wait.
+    # Re-enable once embedding throughput improves or this uses a smaller corpus subset.
+    # - spicepod_path: test/spicepods/search/mteb/miracl_en/hf[all-minilm-l6-v2]-arrow.yaml
+    #   runner_type: spiceai-dev-runners
+    #   benchmark_dataset: miracl_en_retrieval
+    #   ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/miracl_en/hybrid[model2vec[potion-multilingual-128M]]-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: miracl_en_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/miracl_en/model2vec[potion-multilingual-128M]-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: miracl_en_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/miracl_en/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: miracl_en_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/miracl_en/model2vec[potion-multilingual-128M]-s3_vectors.yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: miracl_en_retrieval
+      ready_wait: 1800

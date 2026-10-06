@@ -23,19 +23,24 @@ limitations under the License.
 //!
 //! The picker buckets files by size into tiers — small, mid, large — and emits
 //! a [`CompactionCandidate`] when the smallest non-empty tier has enough files
-//! whose combined size is worth a rewrite. The current runner (in
-//! [`crate::provider::table`]) uses that candidate as an eligibility and
-//! observability signal, then atomically rewrites the entire current snapshot.
-//! The rewrite goes through `write_to_snapshot`, which honors `target_partitions`
-//! and the configured target file size, so a pass typically produces one or a
-//! small number of consolidated Vortex files rather than guaranteeing exactly
-//! one.
+//! whose combined size is worth a rewrite. The warm-tier runner (in
+//! [`crate::provider::table`]) rewrites **only** `candidate.paths` for
+//! key-delete / append-only tables with no protected snapshots, and carries
+//! unpicked settled files into the new snapshot via hardlink (local FS) or copy
+//! (S3 / cross-device) — warm subset compaction. Position-delete tables, tables
+//! with configured `sort_columns`, and tables carrying protected snapshots (which
+//! the rewrite has to fold) still full-rewrite the current snapshot. The rewrite
+//! goes through
+//! `write_to_snapshot`, which honors `target_partitions` and the configured
+//! target file size, so a pass typically produces one or a small number of
+//! consolidated Vortex files for the picked tier.
 //!
 //! The module also owns [`BackgroundCompactor`], a per-table tokio task that
 //! periodically invokes the runner. The task is `Semaphore`-gated so a fleet of
 //! tables can't overwhelm the writer pool.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -63,10 +68,145 @@ use tokio::task::JoinHandle;
 /// on the ambient runtime, preserving prior behavior.
 static COMPACTION_RUNTIME: LazyLock<RwLock<Option<Handle>>> = LazyLock::new(|| RwLock::new(None));
 
+/// Process-wide budget bounding how many Cayenne interval background
+/// compactions run at once. Every table in the process draws on it, however it
+/// was created.
+///
+/// Two engines open Cayenne tables — the accelerator, and `CREATE TABLE …
+/// PARTITIONED BY` — and a catalog-level table has no narrower owner to charge
+/// than the process itself. One budget for both is what holds total compaction
+/// concurrency at the CPU budget regardless of the mix: a budget per engine
+/// would let a process running both oversubscribe the writer pool by a factor
+/// of two, and a budget per table would fan out without any ceiling at all.
+///
+/// Sized like the other Cayenne maintenance budgets, from
+/// [`compaction_budget_permits`]. Post-write compaction
+/// (`schedule_post_write_compaction`) is scheduled independently and does not
+/// draw on this.
+static COMPACTION_BUDGET: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(compaction_budget_permits())));
+
+static COMPACTION_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static IN_FLIGHT_COMPACTION_PASSES: LazyLock<CompactionPassTracker> =
+    LazyLock::new(CompactionPassTracker::default);
+
+#[derive(Default)]
+struct CompactionPassTracker {
+    count: AtomicUsize,
+    notify: Notify,
+}
+
+impl CompactionPassTracker {
+    fn start(&self) -> CompactionPassGuard<'_> {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        CompactionPassGuard { tracker: self }
+    }
+
+    fn finish(&self) {
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
+
+    async fn drain(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.in_flight() == 0 {
+                return true;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.in_flight() == 0;
+            }
+
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register before the second count check so a pass that finishes
+            // after the first check cannot notify between `in_flight()` and the
+            // await setup, which would otherwise sleep until the timeout.
+            notified.as_mut().enable();
+            if self.in_flight() == 0 {
+                return true;
+            }
+
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.in_flight() == 0;
+            }
+        }
+    }
+}
+
+/// RAII marker for one active Cayenne maintenance pass that may be inside a
+/// Vortex read/write pipeline on the compaction runtime.
+pub(crate) struct CompactionPassGuard<'a> {
+    tracker: &'a CompactionPassTracker,
+}
+
+impl Drop for CompactionPassGuard<'_> {
+    fn drop(&mut self) {
+        self.tracker.finish();
+    }
+}
+
+/// Mark a Vortex-producing Cayenne maintenance pass as active unless compaction
+/// shutdown has already begun.
+///
+/// The background schedulers themselves are long-lived sleep loops; tracking
+/// those tasks would make shutdown wait forever. Track only the bounded pass
+/// bodies (subset/full compaction, mem-tier checkpoint, cold promotion) so
+/// runtime shutdown can avoid dropping Vortex CPU tasks while they are still
+/// being awaited.
+pub(crate) fn try_track_compaction_pass() -> Option<CompactionPassGuard<'static>> {
+    let guard = IN_FLIGHT_COMPACTION_PASSES.start();
+    if COMPACTION_SHUTTING_DOWN.load(Ordering::Acquire) {
+        drop(guard);
+        None
+    } else {
+        Some(guard)
+    }
+}
+
+/// The process-wide compaction budget every Cayenne table's interval
+/// background compactor draws on. See [`COMPACTION_BUDGET`].
+#[must_use]
+pub fn compaction_budget() -> Arc<Semaphore> {
+    Arc::clone(&COMPACTION_BUDGET)
+}
+
+/// Permits in the process-wide compaction budget — its ceiling, which the
+/// semaphore itself cannot report (it only exposes *available* permits).
+#[must_use]
+pub fn compaction_budget_permits() -> usize {
+    cpu_budget::cpu_budget().cayenne_compaction_permits()
+}
+
+/// Prevent new Cayenne compaction-runtime maintenance passes from starting.
+/// Existing pass guards remain counted and can be drained via
+/// [`drain_compaction_tasks`].
+pub fn begin_compaction_shutdown() {
+    COMPACTION_SHUTTING_DOWN.store(true, Ordering::Release);
+}
+
+/// Allow Cayenne compaction-runtime maintenance passes to start again.
+///
+/// Runtime construction calls this so tests or embedded runtimes that create a
+/// fresh runtime after shutting down a prior one do not inherit stale global
+/// shutdown state. Normal `spiced` startup also resets via
+/// [`set_compaction_runtime_handle`].
+pub fn reset_compaction_shutdown() {
+    COMPACTION_SHUTTING_DOWN.store(false, Ordering::Release);
+}
+
 /// Inject the dedicated compaction runtime handle. Called once at process
 /// startup. Later calls replace the previous handle so tests that create a new
 /// runtime after dropping an old one do not retain stale global state.
 pub fn set_compaction_runtime_handle(handle: Handle) {
+    reset_compaction_shutdown();
     let mut guard = COMPACTION_RUNTIME.write();
     if guard.is_some() {
         tracing::debug!(
@@ -91,6 +231,22 @@ where
 {
     let handle = COMPACTION_RUNTIME.read().clone();
     spawn_on(handle.as_ref(), future)
+}
+
+/// Wait for active Vortex-producing Cayenne maintenance passes to finish.
+///
+/// Runtime shutdown uses this before the dedicated compaction Tokio runtime is
+/// dropped. That gives in-flight Vortex writes a bounded chance to drain
+/// naturally; otherwise Tokio can drop the runtime underneath pending Vortex
+/// `Task`s, which can panic in `vortex-io`.
+pub async fn drain_compaction_tasks(timeout: Duration) -> bool {
+    IN_FLIGHT_COMPACTION_PASSES.drain(timeout).await
+}
+
+/// Number of Vortex-producing Cayenne maintenance passes currently in flight.
+#[must_use]
+pub fn in_flight_compaction_tasks() -> usize {
+    IN_FLIGHT_COMPACTION_PASSES.in_flight()
 }
 
 /// Spawn `future` on `handle` if provided, otherwise on the ambient runtime via
@@ -204,8 +360,11 @@ pub(crate) struct CompactionPickerConfig {
     /// Minimum number of files in a tier required to consider compaction.
     pub trigger_files: usize,
     /// Maximum number of file paths retained in the candidate for tracing and
-    /// selection. The current runner still rewrites the whole snapshot once a
-    /// candidate is found.
+    /// selection. When the candidate is a proper subset of the current snapshot
+    /// (key-delete, no protected snapshots, no sort columns),
+    /// `compact_current_snapshot_small_files` rewrites only those paths and
+    /// hard-links the rest; otherwise the runner falls back to a full-snapshot
+    /// rewrite.
     pub max_files_per_pick: usize,
     /// Tier thresholds derived from `target_vortex_file_size_mb`.
     pub tiers: CompactionTiers,
@@ -348,6 +507,17 @@ pub(crate) trait CompactionRunner: Send + Sync {
     /// other [`CompactionRunner`] impls (e.g. test stubs) need not implement it.
     fn on_background_tick(&self) {}
 
+    /// Called once per background wake, alongside [`Self::on_background_tick`],
+    /// for per-tick observability that has to await — the footprint sample,
+    /// which reads the metastore's own file accounting.
+    ///
+    /// Separate from `on_background_tick` because that hook is synchronous and
+    /// these gauges need a metastore round trip. Kept off every write path
+    /// deliberately: this tick is the one place a table can afford aggregate
+    /// queries over its manifest. Default no-op so scheduler stubs need not
+    /// implement it.
+    async fn sample_footprint_metrics(&self) {}
+
     /// The (possibly dynamically-tuned) background interval to use for the NEXT
     /// wake. `None` keeps the spawn-time interval. Lets the auto-tuner widen or
     /// tighten the compaction cadence at runtime. Default `None`.
@@ -419,6 +589,7 @@ impl BackgroundCompactor {
                 // Runs before draining and before re-reading the interval so a
                 // just-applied cadence change takes effect on the next sleep.
                 runner.on_background_tick();
+                runner.sample_footprint_metrics().await;
                 if let Some(next) = runner.background_interval_hint() {
                     current = next;
                 }
@@ -443,6 +614,7 @@ impl BackgroundCompactor {
                     // `run_compaction_trigger` below is intentionally never
                     // interrupted, so a pass still drains to completion on drop (see
                     // `COMPACTOR_SHUTDOWN_DRAIN` and the drain-in-flight test).
+                    let acquire_start = Instant::now();
                     let _permit = tokio::select! {
                         biased;
                         () = shutdown_task.notified() => break 'wake,
@@ -452,6 +624,16 @@ impl BackgroundCompactor {
                             Err(_) => break 'wake,
                         },
                     };
+                    // Attribute the wait for a compaction slot: a high value means
+                    // peer tables saturate the fleet-wide semaphore, starving this
+                    // table's compaction (protected set / read-amp run away).
+                    telemetry::cayenne::track_compaction_acquire_wait(
+                        acquire_start.elapsed(),
+                        &[telemetry::KeyValue::new(
+                            "table",
+                            runner.compaction_target_name().to_string(),
+                        )],
+                    );
 
                     match runner.run_compaction_trigger().await {
                         Ok(true) => {
@@ -490,18 +672,17 @@ impl BackgroundCompactor {
 /// How long the detached drain thread lets an in-flight compaction finish its
 /// current Vortex write before force-aborting. Bounded so shutdown can never hang.
 ///
-/// Sized to outlast a realistic compaction pass: a pass rewrites the whole
-/// current snapshot (see `run_one_compaction_pass` / `rewrite_current_snapshot_for_compaction`),
-/// so its duration scales with table size. At large scale factors that rewrite
-/// can take well over the original 5s, so the abort fired mid-write and vortex-io
-/// panicked ("Runtime dropped task without completing it"). 30s covers a realistic
-/// large-table pass and coincides with the runtime's connection-drain window.
+/// Sized to outlast the large seq-prefix/subset passes seen during SF100
+/// CH-benCH: individual passes can legitimately run for 60-90s while the
+/// benchmark is still applying CDC. Aborting those writes mid-flight can leave
+/// Vortex layout tasks awaiting CPU jobs that Tokio has cancelled, which panics
+/// in `vortex-io` ("Runtime dropped task without completing it").
 ///
-/// This is a mitigation, not a cure: a pass that still exceeds the window aborts
-/// mid-write and panics on shutdown. The durable fix is incremental (tiered) merge
-/// of the picked candidate files instead of a full-snapshot rewrite, which keeps a
-/// pass short enough to always drain — see the picker's `CompactionCandidate`.
-const COMPACTOR_SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
+/// This is still a mitigation: a pass that exceeds the window may be aborted.
+/// The durable performance fix is to keep each pass shorter (incremental merge
+/// width / bake sizing) so shutdown and provider replacement rarely need this
+/// backstop.
+const COMPACTOR_SHUTDOWN_DRAIN: Duration = Duration::from_mins(2);
 
 fn drain_and_abort_compactor(handle: &JoinHandle<()>) {
     // Let an in-flight compaction finish its current write before the
@@ -652,6 +833,9 @@ impl BackgroundMemTierCheckpointer {
                 // One checkpoint per tick. The tick itself is a no-op on an empty
                 // or unarmed tier and takes the per-table lock only when there is
                 // something to flush, so an idle table costs one cheap wake.
+                let Some(_pass) = try_track_compaction_pass() else {
+                    break;
+                };
                 runner.run_mem_tier_checkpoint_tick().await;
             }
         });
@@ -776,9 +960,12 @@ impl BackgroundColdTierPromoter {
                 tracing::trace!(
                     target: "cayenne::compaction",
                     table = runner.cold_tier_promotion_target_name(),
-                    "Periodic cold-tier promotion wake",
+                    "Datalake background tiering check: wake",
                 );
 
+                let Some(_pass) = try_track_compaction_pass() else {
+                    break;
+                };
                 runner.run_cold_tier_promotion_tick().await;
             }
         });
@@ -1013,6 +1200,32 @@ mod tests {
         // max_files_per_pick=0 should be clamped to 2 as well.
         let cfg = CompactionPickerConfig::new(8, 0, 128 * 1024 * 1024);
         assert!(cfg.max_files_per_pick >= 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Active compaction pass tracker tests
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compaction_pass_tracker_drains_when_guard_drops() {
+        let tracker = Arc::new(CompactionPassTracker::default());
+        let guard = tracker.start();
+        assert_eq!(tracker.in_flight(), 1);
+
+        let drain_tracker = Arc::clone(&tracker);
+        let drain = tokio::spawn(async move { drain_tracker.drain(Duration::from_secs(5)).await });
+
+        // Give the drain task a chance to observe the active pass and register
+        // for notification, then finish the pass.
+        tokio::task::yield_now().await;
+        drop(guard);
+
+        let drained = tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain should not wait for its full timeout")
+            .expect("drain task should not panic");
+        assert!(drained);
+        assert_eq!(tracker.in_flight(), 0);
     }
 
     // ------------------------------------------------------------------

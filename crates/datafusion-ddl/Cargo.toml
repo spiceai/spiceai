@@ -13,3 +13,6 @@ arrow.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 spicepod = { path = "../spicepod" }
+
+[lints]
+workspace = true

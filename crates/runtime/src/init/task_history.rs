@@ -20,7 +20,7 @@ use crate::{
     task_history,
 };
 use datafusion::catalog::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::prelude::*;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -125,7 +125,7 @@ impl Runtime {
                 // Register the local table under a separate name for RPC handlers to use
                 // This avoids infinite recursion when peers query each other
                 let local_table_provider: Arc<dyn TableProvider> =
-                    local_table as Arc<dyn TableProvider>;
+                    local_table.into_table() as Arc<dyn TableProvider>;
                 self.df
                     .register_table_as_writable_and_with_schema(
                         TableReference::partial(
@@ -146,7 +146,7 @@ impl Runtime {
                 );
                 Arc::new(federated)
             }
-            _ => local_table,
+            _ => local_table.into_table() as Arc<dyn TableProvider>,
         };
 
         self.df

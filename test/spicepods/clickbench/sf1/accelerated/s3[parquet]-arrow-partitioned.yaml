@@ -17,5 +17,3 @@ datasets:
       refresh_sql: "SELECT * FROM hits LIMIT 50000000" # dev-runners do not have enough memory for full clickbench in-memory
       partition_by:
         - bucket(5, "EventDate")
-      params:
-        partition_mode: tables

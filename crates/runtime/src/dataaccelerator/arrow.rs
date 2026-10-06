@@ -21,7 +21,6 @@ use datafusion::{
     catalog::TableProviderFactory,
     common::{Constraint, Constraints},
     datasource::TableProvider,
-    execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use runtime_table_partition::expression::PartitionedBy;
@@ -30,9 +29,10 @@ use std::{any::Any, sync::Arc};
 
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::parameters::ParameterSpec;
-use crate::register_data_accelerator;
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator};
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption, unsupported_sidecar};
+use runtime_checkpoint_api::CheckpointError;
 
 pub struct ArrowAccelerator {
     arrow_factory: ArrowFactory,
@@ -126,12 +126,23 @@ impl DataAccelerator for ArrowAccelerator {
 
         enable_hash_index_for_primary_key_or_indexes(&mut cmd);
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let table_provider = TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
             .await
             .boxed()?;
 
         Ok(table_provider)
+    }
+
+    async fn sidecar(
+        &self,
+        _source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        _open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        // In-memory: there is no database to keep sidecar tables in, and nothing would
+        // survive a restart if there were.
+        Err(unsupported_sidecar("arrow", "sidecar"))
     }
 
     fn prefix(&self) -> &'static str {
@@ -143,4 +154,69 @@ impl DataAccelerator for ArrowAccelerator {
     }
 }
 
-register_data_accelerator!(Engine::Arrow, ArrowAccelerator);
+data_accelerator_api::register_data_accelerator!(Engine::Arrow, ArrowAccelerator);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::schema_inference::apply_inferred_schema;
+    use crate::parameters::Parameters;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use data_components::inferred_schema::{InferredSchema, InferredSortColumn};
+    use runtime_secrets::{Secrets, get_params_with_secrets};
+    use tokio::sync::RwLock;
+
+    /// Regression test for #14023: the sort order schema inference writes into
+    /// the acceleration params must be spelled the way this accelerator's
+    /// parameter validation accepts it. An unprefixed `sort_columns` is dropped
+    /// by `Parameters::try_new` with a warning about a parameter the user never
+    /// wrote, so this drives the inferred params through the same validation the
+    /// runtime applies before the table is created.
+    #[tokio::test]
+    async fn inferred_sort_columns_survive_arrow_parameter_validation() {
+        let mut acceleration = Acceleration {
+            engine: Engine::Arrow,
+            ..Acceleration::default()
+        };
+        let inferred = InferredSchema {
+            sort_columns: vec![InferredSortColumn {
+                column: "id".to_string(),
+                desc: false,
+                nulls_first: None,
+            }],
+            ..InferredSchema::default()
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        apply_inferred_schema(
+            &mut acceleration,
+            &inferred,
+            &schema,
+            "ds",
+            RefreshMode::Full,
+        );
+
+        // The same conversion and validation the runtime applies before it
+        // creates the accelerated table.
+        let accelerator = ArrowAccelerator::new();
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let params_with_secrets =
+            get_params_with_secrets(Arc::clone(&secrets), &acceleration.params).await;
+        let params = Parameters::try_new(
+            "accelerator arrow",
+            params_with_secrets.into_iter().collect(),
+            accelerator.prefix(),
+            secrets,
+            accelerator.parameters(),
+        )
+        .await
+        .expect("inferred acceleration params validate");
+
+        let sort_columns = params
+            .get("sort_columns")
+            .expose()
+            .ok()
+            .expect("inferred sort order must survive parameter validation");
+        assert_eq!(sort_columns, "id ASC");
+    }
+}

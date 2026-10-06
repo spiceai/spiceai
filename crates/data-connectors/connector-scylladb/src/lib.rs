@@ -23,19 +23,27 @@ limitations under the License.
 //! incremental builds - changes to this connector only require rebuilding
 //! this crate, not the entire runtime.
 
+// The scylladb provider module is exported (as it was in data_components) so that its
+// public API items are treated as exported API by clippy's avoid-breaking-exported-api,
+// matching the original crate. The missing_errors_doc relaxation mirrors data_components
+// and connector-git for the moved provider code.
+#![allow(clippy::missing_errors_doc)]
+
+pub mod scylladb;
+
+use crate::scylladb::ScyllaDbTableFactory;
+use crate::scylladb::pool::ScyllaDbConnectionPool;
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::scylladb::ScyllaDbTableFactory;
-use datafusion::datasource::TableProvider;
-use db_connection_pool::scylladbpool::ScyllaDbConnectionPool;
-use ns_lookup::verify_ns_lookup_and_tcp_connect;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
-use runtime::parameters::ParameterSpec;
-use runtime_parameters::Parameters;
+use datafusion::datasource::TableProvider;
+use ns_lookup::verify_ns_lookup_and_tcp_connect;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use snafu::prelude::*;
@@ -49,7 +57,8 @@ use std::time::Duration;
 pub enum Error {
     #[snafu(display("Failed to connect to ScyllaDB: {source}"))]
     UnableToCreateSession {
-        source: scylla::errors::NewSessionError,
+        #[snafu(source(from(scylla::errors::NewSessionError, Box::new)))]
+        source: Box<scylla::errors::NewSessionError>,
     },
 
     #[snafu(display(
@@ -203,10 +212,11 @@ impl DataConnectorFactory for ScyllaDbFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             match create_scylladb_connector(params.parameters).await {
                 Ok((session, keyspace, compute_context)) => {
@@ -305,7 +315,8 @@ impl DataConnector for ScyllaDb {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.scylladb_factory, dataset.path().into())
@@ -429,7 +440,9 @@ async fn create_scylladb_connector(params: Parameters) -> Result<(Arc<Session>, 
         if error_str.contains("authentication") || error_str.contains("auth") {
             Error::AuthenticationError
         } else {
-            Error::UnableToCreateSession { source: e }
+            Error::UnableToCreateSession {
+                source: Box::new(e),
+            }
         }
     })?;
 
@@ -659,3 +672,13 @@ mod tests {
         assert_eq!(factory.prefix(), "scylladb");
     }
 }
+
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_scylladb as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+data_connector_api::register_data_connector!(
+    register_scylladb_connector,
+    SCYLLADB_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    ScyllaDbFactory
+);

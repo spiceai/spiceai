@@ -20,16 +20,99 @@ limitations under the License.
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
+use crate::catalogconnector::postgres_accelerated::{
+    AcceleratedCatalogProvider, NoEligibleTablesError, SlotInUseError,
+};
+use crate::{
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
+};
 use async_trait::async_trait;
-use data_components::RefreshableCatalogProvider;
+use data_components::federation::create_spice_federated_table_provider;
 use data_components::postgres::provider::PostgresCatalogProvider;
-use datafusion_table_providers::postgres::PostgresTableFactory;
+use data_components::{Read, RefreshableCatalogProvider};
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::TableReference;
+use datafusion::datasource::TableProvider;
+use datafusion::sql::unparser::dialect::PostgreSqlDialect;
+use datafusion_table_providers::UnsupportedTypeAction;
+use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
+use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
+use snafu::Snafu;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Parses the `unsupported_type_action` dataset param threaded through the
+/// catalog's `dataset_params` (the same mechanism used by the Databricks and
+/// Unity Catalog catalog connectors to pass per-table dataset params). Absent
+/// a value, defaults to `String`, matching the direct `PostgreSQL` data
+/// connector's default (see `connector-postgres`). See #11728.
+fn parse_unsupported_type_action(
+    dataset_params: &HashMap<String, String>,
+) -> Result<UnsupportedTypeAction, String> {
+    match dataset_params.get("unsupported_type_action") {
+        None => Ok(UnsupportedTypeAction::String),
+        Some(value) => {
+            let trimmed = value.trim();
+            match trimmed.to_ascii_lowercase().as_str() {
+                "string" => Ok(UnsupportedTypeAction::String),
+                "error" => Ok(UnsupportedTypeAction::Error),
+                "warn" => Ok(UnsupportedTypeAction::Warn),
+                "ignore" => Ok(UnsupportedTypeAction::Ignore),
+                _ => Err(format!(
+                    "Invalid value '{trimmed}' for `unsupported_type_action`. Expected one of: error, warn, ignore, string. Docs: {POSTGRES_CONNECTOR_DOCS}"
+                )),
+            }
+        }
+    }
+}
+
 pub const PREFIX: &str = "pg";
+
+/// Connection parameters and `unsupported_type_action` behave identically for a
+/// dataset using the `PostgreSQL` data connector, and are documented with the
+/// connector, so the connector's page is the one that answers them here too.
+const POSTGRES_CONNECTOR_DOCS: &str =
+    "https://spiceai.org/docs/components/data-connectors/postgres";
+
+/// The connection failure reported when a catalog cannot reach its database,
+/// worded for the person who wrote the Spicepod.
+///
+/// It carries the cause as text and exposes no `source`: the catalog error that
+/// wraps it renders the whole chain, so a nested source would append the cause a
+/// second time -- after the documentation link, where it reads as part of it.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Failed to connect to PostgreSQL{server}: {cause}. Check the catalog's `pg_host`, `pg_port`, `pg_db`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
+))]
+struct ConnectionFailed {
+    /// ` at host:port`, or empty when the catalog configures no `pg_host`.
+    ///
+    /// Which server a catalog reaches is worth naming -- a secret store can
+    /// supply a host the person reading the log never typed. Only `pg_host` and
+    /// `pg_port` are ever rendered: `pg_connection_string` carries the password,
+    /// so a catalog configured that way names no server rather than risking one
+    /// character of it reaching a log.
+    server: String,
+    cause: String,
+}
+
+/// ` at host:port` for a catalog that names a host, and an empty string
+/// otherwise. See [`ConnectionFailed::server`].
+fn connection_target(params: &ConnectorParams) -> String {
+    let Some(host) = params.parameters.get("host").expose().ok() else {
+        return String::new();
+    };
+    match params.parameters.get("port").expose().ok() {
+        Some(port) => format!(" at {host}:{port}"),
+        None => format!(" at {host}"),
+    }
+}
 
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
@@ -48,6 +131,104 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sslrootcert")
         .description("The path to, or inline PEM content for, the SSL root certificate."),
 ];
+
+/// A [`Read`] for `PostgreSQL` catalog tables that installs the Spice function
+/// deny-list.
+///
+/// `PostgresTableFactory` carries no function-support seam: both of its read
+/// constructors hand to a private `finish_table_provider` that applies the
+/// dialect and federates unconditionally, so a catalog built on it unparses
+/// every Spice-only UDF -- the `json_get_*` set, the embedding and distance
+/// UDFs, every user-registered function -- into the SQL sent to `PostgreSQL`,
+/// which answers "function does not exist".
+///
+/// So this builds the `SqlTable` itself and routes the federation wrapping
+/// through [`create_spice_federated_table_provider`] with the deny-list,
+/// exactly as the `PostgreSQL` *dataset* connector's read path does. Keeping
+/// the synchronous `new_with_schema` constructor matters: the catalog resolves
+/// a whole namespace's schemas in one query, and a [`Read`] that implemented
+/// only [`Read::table_provider`] would turn discovery back into a round trip
+/// per table. See issues #10703 and #13664.
+struct FederatedPostgresTableFactory {
+    pool: Arc<DynPostgresConnectionPool>,
+    /// Built once per catalog rather than per table: the policy is the same for
+    /// every table, and deriving it walks the nested-function list and takes a
+    /// read lock on the user-function registry each time. Building it once also
+    /// means every table in a catalog federates under the same snapshot of the
+    /// registered user functions, instead of whichever one its own turn in the
+    /// refresh happened to see.
+    function_support: FunctionSupport,
+}
+
+impl FederatedPostgresTableFactory {
+    /// The dialect and federation wrapping both constructors share, so a table
+    /// cannot plan differently for having been discovered with its schema
+    /// already in hand.
+    fn finish<T: 'static, P: 'static>(
+        &self,
+        table: SqlTable<T, P>,
+        table_reference: TableReference,
+    ) -> Arc<dyn TableProvider + 'static> {
+        let table = Arc::new(table.with_dialect(Arc::new(PostgreSqlDialect {})));
+        let schema = table.schema();
+        Arc::new(create_spice_federated_table_provider(
+            table,
+            schema,
+            table_reference,
+            Some(self.function_support.clone()),
+        ))
+    }
+}
+
+#[async_trait]
+impl Read for FederatedPostgresTableFactory {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let table = SqlTable::new(
+            "postgres",
+            &self.pool,
+            table_reference.clone(),
+            Some(Engine::Postgres),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(self.finish(table, table_reference))
+    }
+
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: TableReference,
+        schema: SchemaRef,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let table = SqlTable::new_with_schema(
+            "postgres",
+            &self.pool,
+            schema,
+            table_reference.clone(),
+            Some(Engine::Postgres),
+        );
+
+        Ok(self.finish(table, table_reference))
+    }
+}
+
+/// The read path a `PostgreSQL` catalog's tables are built through, with the
+/// Spice function deny-list installed.
+///
+/// Public so the integration tests in `tests/postgres/catalog.rs` build their
+/// providers the way the connector does. A test holding a bare
+/// `PostgresTableFactory` asserts against a provider no user is given, which
+/// is how this gap survived the connector's own test suite.
+#[must_use]
+pub fn build_table_factory(pool: Arc<PostgresConnectionPool>) -> Arc<dyn Read> {
+    Arc::new(FederatedPostgresTableFactory {
+        pool,
+        function_support: deny_spice_functions_for_postgres_table_providers(),
+    })
+}
 
 /// A catalog connector for `PostgreSQL`, providing access to schemas and tables
 /// within a `PostgreSQL` database. Also usable for Redshift.
@@ -76,33 +257,165 @@ impl CatalogConnector for PostgresCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
+        let unsupported_type_action = parse_unsupported_type_action(&catalog.dataset_params)
+            .map_err(|message| super::Error::InvalidConfigurationNoSource {
+                connector: PREFIX.to_string(),
+                connector_component: connector_component.clone(),
+                message,
+            })?;
+
         let pool = PostgresConnectionPool::new(self.params.parameters.to_secret_map())
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
                 connector_component: connector_component.clone(),
-                source: Box::new(e),
-            })?;
+                // The pool reports a connection failure in its own words, over
+                // several lines and without naming a parameter to change. Keep
+                // what it observed, and say what to do about it.
+                source: Box::new(ConnectionFailed {
+                    server: connection_target(&self.params),
+                    cause: super::error_with_causes(&e)
+                        .trim_end_matches(['.', ' '])
+                        .to_string(),
+                }),
+            })?
+            .with_unsupported_type_action(unsupported_type_action);
 
         let pool = Arc::new(pool);
-        let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
 
-        let catalog_provider = Arc::new(PostgresCatalogProvider::new(
-            catalog.name.clone(),
-            pool,
-            table_factory,
-            catalog.include.clone(),
-        ));
+        let catalog_provider: Arc<dyn RefreshableCatalogProvider> =
+            if let Some(acceleration) = catalog.acceleration.as_ref() {
+                Arc::new(AcceleratedCatalogProvider::new(catalog, acceleration, pool))
+            } else {
+                let table_factory = build_table_factory(Arc::clone(&pool));
+                Arc::new(PostgresCatalogProvider::new(
+                    catalog.name.clone(),
+                    pool,
+                    table_factory,
+                    table_selector(catalog),
+                ))
+            };
 
-        catalog_provider
-            .refresh()
-            .await
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
-                connector_component,
-                source: e,
-            })?;
+        catalog_provider.refresh().await.map_err(|e| {
+            // Two classes of permanent (non-retryable) configuration problem,
+            // surfaced as a terminal ERROR status instead of retried forever:
+            //   - zero eligible tables: this is the *initial* refresh, so failing
+            //     it means the catalog never registers and never gets a periodic
+            //     refresh -- fixing the source/filters then requires a restart, so
+            //     surface it loudly rather than starting an empty catalog; and
+            //   - the catalog's replication slot already actively held by another
+            //     live consumer after the bounded wait (running two instances
+            //     against one catalog is a misconfiguration, not a transient).
+            if e.downcast_ref::<NoEligibleTablesError>().is_some()
+                || e.downcast_ref::<SlotInUseError>().is_some()
+            {
+                super::Error::InvalidConfiguration {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    message: e.to_string(),
+                    source: e,
+                }
+            } else {
+                super::Error::UnableToGetCatalogProvider {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    source: e,
+                }
+            }
+        })?;
 
-        Ok(catalog_provider as Arc<dyn RefreshableCatalogProvider>)
+        Ok(catalog_provider)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dataset_params(action: &str) -> HashMap<String, String> {
+        HashMap::from([("unsupported_type_action".to_string(), action.to_string())])
+    }
+
+    /// A rejected `unsupported_type_action` is a permanent configuration error,
+    /// so its message is the whole of what the user gets to work from: it has to
+    /// quote what they wrote, list what is accepted, and link the documentation.
+    #[test]
+    fn an_invalid_unsupported_type_action_names_the_value_and_the_alternatives() {
+        let message = parse_unsupported_type_action(&dataset_params("strng"))
+            .expect_err("'strng' is not a valid action");
+
+        assert!(
+            message.contains("Invalid value 'strng'"),
+            "quotes what was configured: {message}"
+        );
+        assert!(
+            message.contains("error, warn, ignore, string"),
+            "lists every accepted value: {message}"
+        );
+        assert!(
+            message.contains(POSTGRES_CONNECTOR_DOCS),
+            "links the documentation: {message}"
+        );
+        assert!(!message.contains('\n'), "stays on one line: {message:?}");
+    }
+
+    #[test]
+    fn a_valid_unsupported_type_action_is_accepted_in_any_case() {
+        for value in ["error", " ERROR ", "Error"] {
+            assert!(
+                matches!(
+                    parse_unsupported_type_action(&dataset_params(value)),
+                    Ok(UnsupportedTypeAction::Error)
+                ),
+                "'{value}' should parse as `error`"
+            );
+        }
+    }
+
+    /// The connection failure the pool reports names no parameter and spans
+    /// several lines; what reaches the user must name both, on one line.
+    #[test]
+    fn a_connection_failure_names_the_parameters_to_check() {
+        let message = ConnectionFailed {
+            server: " at db.internal:5432".to_string(),
+            cause: "PostgreSQL connection failed. db error: FATAL: password authentication failed"
+                .to_string(),
+        }
+        .to_string();
+
+        assert!(
+            message.contains("password authentication failed"),
+            "keeps what the database said: {message}"
+        );
+        assert!(
+            message.contains("`pg_user`") && message.contains("`pg_pass`"),
+            "names the parameters to check: {message}"
+        );
+        assert!(
+            message.contains("PostgreSQL at db.internal:5432"),
+            "names the server it could not reach -- a secret store can supply a host the reader never typed: {message}"
+        );
+        assert!(
+            ConnectionFailed {
+                server: String::new(),
+                cause: "connection refused".to_string(),
+            }
+            .to_string()
+            .starts_with("Failed to connect to PostgreSQL: connection refused"),
+            "a catalog configured by connection string names no server rather than risking the password reaching a log"
+        );
+        assert!(
+            message.contains(POSTGRES_CONNECTOR_DOCS),
+            "links the documentation: {message}"
+        );
+        assert!(!message.contains('\n'), "stays on one line: {message:?}");
+        assert!(
+            std::error::Error::source(&ConnectionFailed {
+                server: String::new(),
+                cause: "x".to_string()
+            })
+            .is_none(),
+            "the cause is carried as text, so the catalog error that wraps this cannot append it after the documentation link"
+        );
     }
 }

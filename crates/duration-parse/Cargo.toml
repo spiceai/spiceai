@@ -10,3 +10,6 @@ description = "Human-readable duration parsing and formatting for Spice.ai"
 snafu.workspace = true
 
 [dev-dependencies]
+
+[lints]
+workspace = true

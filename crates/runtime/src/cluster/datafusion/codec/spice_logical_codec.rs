@@ -23,9 +23,9 @@ use crate::udtfs::{ListUDFTable, ListUDFTableFunc};
 use arrow_schema::SchemaRef;
 use ballista_core::serde::BallistaLogicalExtensionCodec;
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference as SqlTableReference;
 use datafusion::common::{DataFusionError, Result, ScalarValue, TableReference, exec_err};
 use datafusion::execution::TaskContext;
-use datafusion::sql::TableReference as SqlTableReference;
 use datafusion_expr::registry::FunctionRegistry;
 use datafusion_expr::{Extension, LogicalPlan, ScalarUDF};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
@@ -338,7 +338,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         buf: &mut Vec<u8>,
     ) -> Result<()> {
         // Check for ListUDFTable
-        if node.downcast_ref::<ListUDFTable>().is_some() {
+        if node.is::<ListUDFTable>() {
             let args = UdtfArgs::list_udfs();
             buf.extend_from_slice(&args.encode_to_vec());
             return Ok(());

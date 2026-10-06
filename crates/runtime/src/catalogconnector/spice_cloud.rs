@@ -21,10 +21,13 @@ use crate::catalogconnector::iceberg::{
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::{
     App, Runtime,
-    component::{catalog::Catalog, dataset::Dataset},
+    component::{
+        catalog::{Catalog, table_selector},
+        dataset::Dataset,
+    },
     dataconnector::{
         DataConnector, DataConnectorFactory,
-        parameters::{ConnectorParams, ConnectorParamsBuilder},
+        parameters::{ConnectorParams, ConnectorParamsBuilder, RuntimeConnectorContext},
         spiceai::{SpiceAI, SpiceAIDatasetPath, SpiceAIFactory},
     },
     parameters::ExposedParamLookup,
@@ -81,7 +84,7 @@ impl SpiceCloudPlatformCatalog {
             Arc::new(catalog_client),
             namespace_ident,
             read_provider,
-            catalog.include.clone(),
+            table_selector(catalog),
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -284,18 +287,16 @@ impl SpiceCloudPlatformCatalog {
     ) -> super::Result<Arc<dyn DataConnector>> {
         SpiceAIFactory::new()
             .create(
-                ConnectorParamsBuilder::new(
-                    "spice.ai".into(),
-                    ConnectorComponent::Dataset(Arc::new(template_dataset)),
-                )
-                .build(runtime.secrets(), runtime.tokio_io_runtime())
-                .await
-                .map_err(|e| super::Error::InvalidConfiguration {
-                    connector: "spice.ai".into(),
-                    connector_component: ConnectorComponent::from(catalog),
-                    message: e.to_string(),
-                    source: e,
-                })?,
+                ConnectorParamsBuilder::for_dataset("spice.ai".into(), &template_dataset)
+                    .build(runtime.secrets(), runtime.tokio_io_runtime())
+                    .await
+                    .map_err(|e| super::Error::InvalidConfiguration {
+                        connector: "spice.ai".into(),
+                        connector_component: ConnectorComponent::from(catalog),
+                        message: e.to_string(),
+                        source: e,
+                    })?,
+                &RuntimeConnectorContext::for_dataset(&template_dataset),
             )
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {

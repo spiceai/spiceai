@@ -1,0 +1,133 @@
+version: v1
+kind: Spicepod
+name: chbench-writeback-local
+
+# CH-benCH **direct-write-to-Spice** local variant.
+#
+# Unlike the standard chbench Cayenne pods (writes go to Postgres, Spice ingests read-only via
+# CDC), here the mutated TPC-C tables are configured for durable WRITE-BACK: a client writes
+# DIRECTLY into Spice (HTTP /v1/sql `BEGIN … COMMIT` gated transactions), Cayenne commits to the
+# local accelerator under per-key optimistic concurrency, and a per-table worker reconciles the
+# committed rows back to Postgres. This exercises exactly the #11870 serializable-transaction /
+# per-key-OCC path (and the maintained-aggregate IVM path) that PR "close per-key OCC
+# missed-conflict holes and fused-txn IVM staleness" touches.
+#
+# Requirements for write-back (enforced by the runtime, see crates/runtime/src/lib.rs +
+# crates/runtime/src/init/dataset.rs):
+#   - dataset-level access: read_write            (write_mode only applies to a writable dataset)
+#   - acceleration.refresh_mode: changes          (CDC bootstrap + ongoing sync)
+#   - acceleration.on_conflict: upsert            (a write-back table upserts by PK)
+#   - acceleration.write_mode: write_back         (WriteMode::WriteBack)
+#   - dataset-level replication.enabled: true     (opt in to async source durability)
+#
+# Scale: intended for a small local seed (SF1) on macOS — this is a CORRECTNESS variant, not a
+# perf run (a laptop cannot sustain chbench CDC at scale; see the perf pods for m7a runs).
+#
+# Env: CHBENCH_PG_HOST must point at the seeded Postgres (see the sibling README.md).
+
+postgres_connection_params: &postgres_params
+  pg_host: ${env:CHBENCH_PG_HOST}
+  pg_port: 5432
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+runtime:
+  # Keep results-cache OFF so gate reads and post-commit aggregate reads always see live committed
+  # state (a stale cached result would mask the very IVM-staleness behavior we are validating).
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+
+datasets:
+  # ---- Direct-write (write-back) TPC-C tables the driver mutates via /v1/sql transactions ----
+
+  - from: postgres:district
+    name: district
+    access: read_write
+    replication:
+      enabled: true
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_wb_district
+      pg_replication_initial_snapshot: 'true'
+    acceleration: &cayenne_wb
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      write_mode: write_back
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+
+  - from: postgres:stock
+    name: stock
+    access: read_write
+    replication:
+      enabled: true
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_wb_stock
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_wb
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+      # Maintained aggregate on the column the driver's gated transactions UPDATE. After a
+      # committed transaction, a query over this aggregate MUST reflect the update — the exact
+      # fused-txn IVM-staleness bug this PR fixes (the driver's IVM oracle checks
+      # maintained-aggregate == base-scan after each commit round).
+      maintained_aggregates:
+        - group_by: [s_w_id]
+          aggregates:
+            - function: sum
+              column: s_quantity
+            - function: count
+
+  - from: postgres:oorder
+    name: oorder
+    access: read_write
+    replication:
+      enabled: true
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_wb_oorder
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_wb
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+
+  # ---- Static reference tables (read-only, full refresh — not written by the driver) ----
+
+  - from: postgres:warehouse
+    name: warehouse
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+
+  - from: postgres:item
+    name: item
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert

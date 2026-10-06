@@ -7,12 +7,13 @@ mod flight_prepared_statements {
     use arrow_flight::sql::client::{FlightSqlServiceClient, PreparedStatement};
     use futures::TryStreamExt as _;
     use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
-    use spicepod::component::runtime::ApiKey;
+    use spicepod::component::{caching::SQLResultsCacheConfig, runtime::ApiKey};
     use tonic::transport::Channel;
 
     use crate::{
         flight::{
-            create_flight_client, start_spice_test_app, test_record_batch, write_record_batches,
+            create_flight_client, start_spice_test_app, start_spice_test_app_with_cache,
+            test_record_batch, write_record_batches,
         },
         init_tracing,
         utils::test_request_context,
@@ -1139,5 +1140,142 @@ mod flight_prepared_statements {
                 Ok(())
             })
             .await
+    }
+
+    /// A stale-while-revalidate revalidation of a Flight SQL prepared statement
+    /// must re-bind its parameter values.
+    ///
+    /// Flight SQL is where this matters most: a JDBC or ADBC client binds
+    /// parameters on every query, so the placeholder path is the normal one
+    /// rather than an edge case. The revalidation rebuilds the query from the
+    /// SQL text, which still holds its placeholders -- without the values it
+    /// fails with `Placeholder '$1' was not provided a value for execution`, the
+    /// stale entry is never replaced, and every later request inside the window
+    /// is served a result older than `item_ttl` asked for.
+    ///
+    /// The oracle is the ROWS, which is both the user-visible symptom and the
+    /// only signal that belongs to this test alone. A row is added after the
+    /// entry is populated, so the stale result and the revalidated one differ:
+    /// until the revalidation lands the query keeps returning the old set, and
+    /// when it lands the new row appears. A counter could not do this job --
+    /// `results_cache_swr_revalidations` is process-global with no per-test
+    /// label, so a sibling test's revalidation would satisfy it.
+    #[tokio::test]
+    async fn swr_revalidation_of_a_prepared_statement_rebinds_its_values()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                // `>=` rather than `=` so the result set can grow: an equality
+                // predicate returns the same row whatever else the table holds,
+                // which would make a stale entry indistinguishable from a fresh
+                // one.
+                const SQL: &str = "SELECT a FROM my_table WHERE a >= $1 ORDER BY a";
+
+                let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                    as Arc<dyn FlightBasicAuth + Send + Sync>;
+                // `cache_key_type: sql` keys results on the SQL text and the
+                // bound values, so the stale hit lands before a plan exists --
+                // the route with no bound plan for the revalidation to re-run.
+                let (channel, _df) = start_spice_test_app_with_cache(
+                    Some(auth),
+                    SQLResultsCacheConfig {
+                        enabled: true,
+                        item_ttl: Some("1s".to_string()),
+                        stale_while_revalidate_ttl: Some("5m".to_string()),
+                        cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+
+                // `public.my_table` is registered schema-only, so it holds no
+                // rows until something writes them.
+                let mut put_client = create_flight_client(channel.clone(), Some("valid"))?;
+                write_record_batches(&mut put_client, vec![test_record_batch()?]).await?;
+
+                let mut client = FlightSqlServiceClient::new(channel);
+                client.handshake("", "valid").await?;
+
+                let bind = || {
+                    create_param_batch(
+                        vec![("$1", arrow::datatypes::DataType::Int32, false)],
+                        vec![Arc::new(Int32Array::from(vec![2])) as ArrayRef],
+                    )
+                };
+
+                let populated = execute_parameterized_query(&mut client, SQL, bind()?).await?;
+                assert_eq!(
+                    rows_of(&populated),
+                    vec![2, 3],
+                    "binding 2 must select the rows at or above it"
+                );
+
+                // Change what a correct revalidation would return.
+                write_record_batches(&mut put_client, vec![extra_row_batch(4)?]).await?;
+
+                // Age the entry past `item_ttl` into the stale-while-revalidate
+                // window. The sleep is the behavior under test (TTL expiry), not
+                // a readiness wait.
+                tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+                // Poll rather than sleeping a fixed interval: the revalidation
+                // runs on a background task, and each request inside the window
+                // both serves the stale entry and triggers one.
+                let mut rows = Vec::new();
+                for _ in 0..100 {
+                    rows = rows_of(&execute_parameterized_query(&mut client, SQL, bind()?).await?);
+                    if rows == vec![2, 3, 4] {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+
+                assert_eq!(
+                    rows,
+                    vec![2, 3, 4],
+                    "the stale entry was never replaced, so this prepared statement keeps being \
+                     served a result older than item_ttl asked for -- the revalidation could not \
+                     re-execute because its bound values were dropped when the query was rebuilt \
+                     from its SQL text"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The `a` column of every returned batch.
+    fn rows_of(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("column `a` is Int32")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// One extra row for `public.my_table`, matching its `(a, b)` schema.
+    fn extra_row_batch(a: i32) -> Result<RecordBatch, anyhow::Error> {
+        let schema = arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("b", arrow::datatypes::DataType::Utf8, false),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![a])) as ArrayRef,
+                Arc::new(StringArray::from(vec![format!("row_{a}")])) as ArrayRef,
+            ],
+        )
+        .map_err(Into::into)
     }
 }

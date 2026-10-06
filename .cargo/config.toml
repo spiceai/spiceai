@@ -9,3 +9,26 @@
 [target.aarch64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-Ctarget-feature=+neon,+fp16,+fhm", "-Clink-arg=-fuse-ld=lld"]
+
+# libtest gives each test thread the std default 2 MiB of stack, which is not
+# enough for cayenne's debug-built async futures: a scan or a CDC write nests
+# several large `async fn` frames (scan-input capture, one plan-build per tier
+# branch, keyset rebuild, promotion), and a test that drives two of them at once
+# (`tokio::join!` of a write and a promotion, or a property test's mutation
+# sequences) overflows while the future is being constructed.
+#
+# That failure mode is silent in a way an assertion failure is not: the process
+# aborts with "has overflowed its stack" and the test contributes NO result line,
+# so the coverage disappears instead of going red. On a 2 MiB stack
+# `cayenne mutation_property_test prop_sequential_{cold,key,position}_impl_turso`
+# and `cold_tier_test …promotion_racing_stage_b_finalize_impl_turso` abort rather
+# than run, and `prop_sequential_memory_impl_turso` sits within 64 KiB of the
+# limit, so unrelated code motion flips it either way.
+#
+# 8 MiB matches what the runtime binary is separately documented to want for deep
+# plans (`crates/test-framework/src/queries/README.md`) and clears the measured
+# requirement with room to spare. `force = false` leaves a developer's own larger
+# value alone. This relaxes no assertion and raises no timeout — it stops a stack
+# limit from masking tests.
+[env]
+RUST_MIN_STACK = { value = "8388608", force = false }

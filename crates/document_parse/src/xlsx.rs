@@ -49,8 +49,9 @@ impl XlsxParser {
     }
 }
 
+#[async_trait::async_trait]
 impl DocumentParser for XlsxParser {
-    fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
+    async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
         let cursor = Cursor::new(raw.clone());
         let mut wb: Xlsx<_> =
             open_workbook_from_rs(cursor)

@@ -109,17 +109,32 @@ impl GitHubClient {
         })
     }
 
-    /// Download a file with progress tracking.
-    pub async fn download_with_progress<F>(
+    /// Download a release asset with progress tracking, verifying the body is the whole asset.
+    ///
+    /// The releases API publishes an exact `size` for every asset, so a body of any other
+    /// length is a failed download — a dropped connection, a truncating proxy, or an
+    /// interstitial page served with a `200`. Verifying it here means the bytes only ever
+    /// reach a decoder once they are known to be the right ones; otherwise a short body
+    /// surfaces as whatever the decoder makes of it, which reads as a corrupt archive
+    /// rather than as the transfer failure it is.
+    ///
+    /// The asset is taken whole rather than as a URL and a length so that the size checked
+    /// against is always the one published for the body being fetched. `Content-Length` is
+    /// deliberately not the authority: it describes whatever the server chose to send, so a
+    /// proxy substituting its own complete response satisfies it. Any `Content-Encoding` is
+    /// a transport wrapper the client unwraps before this sees the body, leaving the stored
+    /// bytes the published size refers to.
+    pub async fn download_asset<F>(
         &self,
-        url: &str,
+        asset: &ReleaseAsset,
         mut on_progress: F,
     ) -> Result<Vec<u8>, GitHubError>
     where
-        F: FnMut(u64, Option<u64>),
+        F: FnMut(u64),
     {
         use futures::StreamExt;
 
+        let url = &asset.browser_download_url;
         let mut request = self
             .client
             .get(url)
@@ -143,7 +158,6 @@ impl GitHubClient {
             });
         }
 
-        let total_size = response.content_length();
         let mut downloaded: u64 = 0;
         let mut data = Vec::new();
         let mut stream = response.bytes_stream();
@@ -154,7 +168,15 @@ impl GitHubClient {
             })?;
             downloaded += chunk.len() as u64;
             data.extend_from_slice(&chunk);
-            on_progress(downloaded, total_size);
+            on_progress(downloaded);
+        }
+
+        if downloaded != asset.size {
+            return Err(GitHubError::IncompleteDownload {
+                name: asset.name.clone(),
+                expected: asset.size,
+                received: downloaded,
+            });
         }
 
         Ok(data)
@@ -179,13 +201,31 @@ impl GitHubClient {
 /// Errors that can occur when interacting with GitHub.
 #[derive(Debug)]
 pub enum GitHubError {
-    Request { message: String },
+    Request {
+        message: String,
+    },
     Unauthorized,
-    Api { status: u16, message: String },
-    Parse { message: String },
-    AssetNotFound { name: String },
-    ReleaseNotFound { version: String },
-    Io { message: String },
+    Api {
+        status: u16,
+        message: String,
+    },
+    Parse {
+        message: String,
+    },
+    AssetNotFound {
+        name: String,
+    },
+    ReleaseNotFound {
+        version: String,
+    },
+    IncompleteDownload {
+        name: String,
+        expected: u64,
+        received: u64,
+    },
+    Io {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for GitHubError {
@@ -202,6 +242,16 @@ impl std::fmt::Display for GitHubError {
             Self::Parse { message } => write!(f, "Failed to parse response: {message}"),
             Self::AssetNotFound { name } => write!(f, "Asset not found: {name}"),
             Self::ReleaseNotFound { version } => write!(f, "Release not found: {version}"),
+            // Exact byte counts, not human-readable sizes: rounding would print an expected
+            // and a received figure that read as identical for a small truncation.
+            Self::IncompleteDownload {
+                name,
+                expected,
+                received,
+            } => write!(
+                f,
+                "Download of {name} did not complete: expected {expected} bytes but received {received}. Check the network connection and any proxy between this machine and GitHub, then run the command again."
+            ),
             Self::Io { message } => write!(f, "IO error: {message}"),
         }
     }

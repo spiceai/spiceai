@@ -20,13 +20,13 @@ limitations under the License.
 //!
 //! - **Legacy / metadata listing**: `from: sharepoint:me/root` or
 //!   `from: sharepoint:driveId:{id}/path:{path}`. Returns a
-//!   [`data_components::sharepoint::table::SharepointTableProvider`] — one
+//!   [`crate::sharepoint::table::SharepointTableProvider`] — one
 //!   row per drive item with optional file-content column. Good for PDF/PPTX
 //!   metadata workflows where each row represents a document.
 //!
 //! - **Object-store tabular / blob**: `from: sharepoint://me/Documents/...`.
 //!   Delegates to [`SharepointListingConnector`] which implements
-//!   [`runtime::dataconnector::listing::ListingTableConnector`]. DataFusion's
+//!   [`data_connector_api::listing::ListingTableConnector`]. DataFusion's
 //!   `ListingTable` provides `SELECT`, `INSERT INTO`, `COPY TO`, `COPY FROM`
 //!   for CSV/JSON/Parquet; binary formats (PDF, PPTX, etc.) go through the
 //!   `ObjectStore` as raw bytes. Writes create new versions by default —
@@ -36,29 +36,34 @@ limitations under the License.
     clippy::doc_markdown,
     reason = "prose-frequent identifiers (SharePoint, DataFusion, OneDrive) are clearer without backticks"
 )]
+#![allow(clippy::missing_errors_doc)]
 
-use async_trait::async_trait;
-use data_components::sharepoint::auth::{SharepointAuth, saml::SamlBearerConfig};
-use data_components::sharepoint::client::SharepointClient;
-use data_components::sharepoint::object_store::{
+pub mod sharepoint;
+
+use crate::sharepoint::auth::{SharepointAuth, saml::SamlBearerConfig};
+use crate::sharepoint::client::SharepointClient;
+use crate::sharepoint::object_store::{
     ConflictBehavior, DriveKind, SharepointObjectStore, SharepointObjectStoreConfig,
 };
-use data_components::sharepoint::table::SharepointTableProvider;
-use data_components::sharepoint::url::DriveRef;
-use datafusion::datasource::TableProvider;
-use datafusion::execution::runtime_env::RuntimeEnv;
-use document_parse::DocumentParser;
-use graph_rs_sdk::GraphClient;
-use runtime::Runtime;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::listing::{
+use crate::sharepoint::table::SharepointTableProvider;
+use crate::sharepoint::url::DriveRef;
+use app::App;
+use async_trait::async_trait;
+use data_connector_api::ConnectorContext;
+use data_connector_api::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType,
 };
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use datafusion::datasource::TableProvider;
+use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use document_parse::DocumentParser;
+use graph_rs_sdk::GraphClient;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
@@ -93,7 +98,7 @@ pub enum Error {
 
     #[snafu(display("Failed to build GraphClient: {source}"))]
     AuthBuild {
-        source: data_components::sharepoint::auth::Error,
+        source: crate::sharepoint::auth::Error,
     },
 
     #[snafu(display(
@@ -116,7 +121,10 @@ pub struct Sharepoint {
     client: Arc<GraphClient>,
     params: Parameters,
     tokio_io_runtime: tokio::runtime::Handle,
-    runtime: Option<Runtime>,
+    app: Option<Arc<App>>,
+    /// The runtime's own session, whose `RuntimeEnv` is where a store must be
+    /// registered for a scan against the registered `ListingTable` to resolve it.
+    datafusion_session_context: Option<Arc<SessionContext>>,
 }
 
 impl fmt::Debug for Sharepoint {
@@ -137,7 +145,8 @@ impl Sharepoint {
     async fn new(
         params: Parameters,
         tokio_io_runtime: tokio::runtime::Handle,
-        runtime: Option<Runtime>,
+        app: Option<Arc<App>>,
+        datafusion_session_context: Option<Arc<SessionContext>>,
     ) -> Result<Self> {
         let auth = build_auth_from_params(&params)?;
         let client = auth.build_graph_client().await.context(AuthBuildSnafu)?;
@@ -145,7 +154,8 @@ impl Sharepoint {
             client,
             params,
             tokio_io_runtime,
-            runtime,
+            app,
+            datafusion_session_context,
         })
     }
 
@@ -153,7 +163,7 @@ impl Sharepoint {
     /// explicit `file_format=` param first, then falls back to the URL's
     /// trailing extension. `None` means "no document parsing" — raw bytes
     /// are surfaced as text, which is the right default for `.md` / `.txt`.
-    async fn get_formatter(&self, dataset: &Dataset) -> Option<Arc<dyn DocumentParser>> {
+    async fn get_formatter(&self, dataset: &DatasetSpec) -> Option<Arc<dyn DocumentParser>> {
         let key = dataset
             .params
             .get("file_format")
@@ -171,7 +181,7 @@ impl Sharepoint {
     /// URL schemes are case-insensitive, so we parse and compare on scheme
     /// and authority rather than a raw prefix match — `SharePoint://me/…`
     /// should route the same as `sharepoint://me/…`.
-    fn uses_object_store(dataset: &Dataset) -> bool {
+    fn uses_object_store(dataset: &DatasetSpec) -> bool {
         match Url::parse(&dataset.from) {
             Ok(u) => u.scheme().eq_ignore_ascii_case(CONNECTOR_NAME) && u.has_authority(),
             Err(_) => false,
@@ -195,7 +205,7 @@ impl Sharepoint {
     /// format for non-tabular extensions like `.xlsx`/`.pdf`.
     fn listing_connector(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<SharepointListingConnector> {
         let (store_url, kind, config) = parse_object_store_components(&self.params, dataset)?;
         let mut params = self.params.clone();
@@ -214,10 +224,10 @@ impl Sharepoint {
         // register_object_stores() is only called on the cluster path, not on the
         // normal single-node dataset init path, so this is the only place where the
         // collision is reliably caught in the standard runtime.
-        if let Some(rt) = &self.runtime {
+        if let Some(session_context) = &self.datafusion_session_context {
             let fingerprint = store_fingerprint(&self.params, kind, &config);
             let key_url = registry_key_for(&store_url);
-            let env_id = Arc::as_ptr(&rt.datafusion().ctx.runtime_env()) as usize;
+            let env_id = Arc::as_ptr(&session_context.runtime_env()) as usize;
             let map_key = (env_id, key_url.clone());
             let fps = SHAREPOINT_STORE_FINGERPRINTS
                 .lock()
@@ -253,7 +263,8 @@ impl Sharepoint {
             config,
             params,
             tokio_io_runtime: self.tokio_io_runtime.clone(),
-            runtime: self.runtime.clone(),
+            app: self.app.clone(),
+            datafusion_session_context: self.datafusion_session_context.clone(),
         })
     }
 }
@@ -354,16 +365,18 @@ fn store_fingerprint(
     // Use the effective scope — same default applied by SharepointAuth — so
     // a dataset with no scope param and one explicitly setting the default
     // scope hash identically and are not rejected as a false-positive collision.
-    let effective_scope = params.get("scope").expose().ok().map_or(
-        data_components::sharepoint::auth::DEFAULT_SCOPE,
-        |s| {
-            if s.is_empty() {
-                data_components::sharepoint::auth::DEFAULT_SCOPE
-            } else {
-                s
-            }
-        },
-    );
+    let effective_scope =
+        params
+            .get("scope")
+            .expose()
+            .ok()
+            .map_or(crate::sharepoint::auth::DEFAULT_SCOPE, |s| {
+                if s.is_empty() {
+                    crate::sharepoint::auth::DEFAULT_SCOPE
+                } else {
+                    s
+                }
+            });
     effective_scope.hash(&mut h);
     drive_kind.map(|k| format!("{k:?}")).hash(&mut h);
     config.conflict_behavior.hash(&mut h);
@@ -402,7 +415,7 @@ fn register_sharepoint_store(
     store_url: &Url,
     store: Arc<SharepointObjectStore>,
     fingerprint: u64,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> DataConnectorResult<()> {
     let key_url = registry_key_for(store_url);
     let env_id = Arc::as_ptr(runtime_env) as usize;
@@ -464,7 +477,7 @@ fn register_sharepoint_store_on_fresh(
 /// drive-kind routing, and config.
 fn parse_object_store_components(
     params: &Parameters,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> DataConnectorResult<(Url, Option<DriveKind>, SharepointObjectStoreConfig)> {
     let store_url =
         Url::parse(&dataset.from).map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -476,15 +489,14 @@ fn parse_object_store_components(
             connector_component: ConnectorComponent::from(dataset),
             source: Box::new(e),
         })?;
-    let sp_url =
-        data_components::sharepoint::url::SharepointUrl::from_url(&store_url).map_err(|e| {
-            DataConnectorError::InvalidConfiguration {
-                dataconnector: CONNECTOR_NAME.to_string(),
-                message: format!("{e}"),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            }
-        })?;
+    let sp_url = crate::sharepoint::url::SharepointUrl::from_url(&store_url).map_err(|e| {
+        DataConnectorError::InvalidConfiguration {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            message: format!("{e}"),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        }
+    })?;
     let kind = match sp_url.drive {
         DriveRef::Me => None,
         DriveRef::Drive(_) => Some(DriveKind::Drives),
@@ -514,6 +526,15 @@ fn parse_object_store_components(
             max_put_bytes,
         },
     ))
+}
+
+/// The user-facing name of `parameter`, noting the `flow` parameter that requires it.
+fn required_with(params: &Parameters, parameter: &str, flow: &str) -> String {
+    format!(
+        "`{}` (required with `{}`)",
+        params.user_param(parameter),
+        params.user_param(flow)
+    )
 }
 
 fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
@@ -562,10 +583,10 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     }
     if let Some(assertion) = saml_assertion {
         let tenant = tenant.ok_or_else(|| Error::MissingParameter {
-            parameter: "tenant_id".into(),
+            parameter: format!("`{}`", params.user_param("tenant_id")),
         })?;
         let client_id = client_id.ok_or_else(|| Error::MissingParameter {
-            parameter: "client_id".into(),
+            parameter: format!("`{}`", params.user_param("client_id")),
         })?;
         return Ok(SharepointAuth::SamlBearer(SamlBearerConfig {
             tenant_id: tenant,
@@ -577,22 +598,22 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     }
 
     let tenant = tenant.ok_or_else(|| Error::MissingParameter {
-        parameter: "tenant_id".into(),
+        parameter: format!("`{}`", params.user_param("tenant_id")),
     })?;
     let client_id = client_id.ok_or_else(|| Error::MissingParameter {
-        parameter: "client_id".into(),
+        parameter: format!("`{}`", params.user_param("client_id")),
     })?;
 
     if let Some(code) = auth_code {
         let secret = client_secret.ok_or_else(|| Error::MissingParameter {
-            parameter: "client_secret (required with auth_code)".into(),
+            parameter: required_with(params, "client_secret", "auth_code"),
         })?;
         let redirect = params
             .get("redirect_uri")
             .expose()
             .ok()
             .ok_or_else(|| Error::MissingParameter {
-                parameter: "redirect_uri (required with auth_code)".into(),
+                parameter: required_with(params, "redirect_uri", "auth_code"),
             })?
             .to_string();
         return Ok(SharepointAuth::AuthCode {
@@ -606,7 +627,7 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     }
     if let Some(token) = refresh_token {
         let secret = client_secret.ok_or_else(|| Error::MissingParameter {
-            parameter: "client_secret (required with refresh_token)".into(),
+            parameter: required_with(params, "client_secret", "refresh_token"),
         })?;
         return Ok(SharepointAuth::RefreshToken {
             tenant_id: tenant,
@@ -700,14 +721,17 @@ impl DataConnectorFactory for SharepointFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let io_runtime = params.io_runtime.clone();
-            let runtime = params.runtime.clone().map(Arc::unwrap_or_clone);
-            let connector = Sharepoint::new(params.parameters, io_runtime, runtime).await?;
+            let app = Some(context.app());
+            let session_context = Some(context.datafusion_session_context());
+            let connector =
+                Sharepoint::new(params.parameters, io_runtime, app, session_context).await?;
             Ok(Arc::new(connector) as Arc<dyn DataConnector>)
         })
     }
@@ -729,12 +753,13 @@ impl DataConnector for Sharepoint {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if Self::uses_object_store(dataset) {
             return self
                 .listing_connector(dataset)?
-                .read_provider(dataset)
+                .read_provider(context, dataset)
                 .await;
         }
         // Legacy path — metadata-listing table provider.
@@ -755,7 +780,8 @@ impl DataConnector for Sharepoint {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         if !Self::uses_object_store(dataset) {
             return None;
@@ -764,12 +790,12 @@ impl DataConnector for Sharepoint {
             Ok(c) => c,
             Err(e) => return Some(Err(e)),
         };
-        Some(connector.read_provider(dataset).await)
+        Some(connector.read_provider(context, dataset).await)
     }
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         if !dataset.has_metadata_table {
             return None;
@@ -800,7 +826,7 @@ impl DataConnector for Sharepoint {
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         if !Self::uses_object_store(dataset) {
@@ -845,7 +871,8 @@ struct SharepointListingConnector {
     config: SharepointObjectStoreConfig,
     params: Parameters,
     tokio_io_runtime: tokio::runtime::Handle,
-    runtime: Option<Runtime>,
+    app: Option<Arc<App>>,
+    datafusion_session_context: Option<Arc<SessionContext>>,
 }
 
 impl fmt::Debug for SharepointListingConnector {
@@ -884,8 +911,8 @@ impl ListingTableConnector for SharepointListingConnector {
         self.tokio_io_runtime.clone()
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     fn object_versioning_type(&self) -> Option<ObjectVersionType> {
@@ -894,7 +921,7 @@ impl ListingTableConnector for SharepointListingConnector {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url_str = url.unwrap_or(dataset.from.as_str());
@@ -909,7 +936,7 @@ impl ListingTableConnector for SharepointListingConnector {
         // Validate scheme, authority kind, and structure via SharepointUrl::from_url
         // so unsupported authority kinds (e.g. sharepoint://unknown/...) fail here
         // with a clear error rather than later during store construction.
-        data_components::sharepoint::url::SharepointUrl::from_url(&parsed).map_err(|e| {
+        crate::sharepoint::url::SharepointUrl::from_url(&parsed).map_err(|e| {
             DataConnectorError::InvalidConfiguration {
                 dataconnector: CONNECTOR_NAME.to_string(),
                 message: format!("{e}"),
@@ -925,7 +952,7 @@ impl ListingTableConnector for SharepointListingConnector {
     /// dataset, and `SpiceObjectStoreRegistry` doesn't.
     fn get_object_store(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn datafusion::object_store::ObjectStore>> {
         Ok(self.build_object_store())
     }
@@ -953,8 +980,7 @@ impl ListingTableConnector for SharepointListingConnector {
         // Record the fingerprint after registering so that listing_connector()'s
         // collision check can find it on the next dataset — without this the map
         // stays empty on the single-node path and the check never fires.
-        if let Some(rt) = &self.runtime {
-            let ctx = Arc::clone(&rt.datafusion().ctx);
+        if let Some(ctx) = self.datafusion_session_context.clone() {
             let key_url = registry_key_for(&self.store_url);
             let fingerprint = store_fingerprint(&self.params, self.kind, &self.config);
             let env_id = Arc::as_ptr(&ctx.runtime_env()) as usize;
@@ -973,15 +999,8 @@ impl ListingTableConnector for SharepointListingConnector {
         // Fallback for contexts where the runtime isn't wired in (e.g. tests,
         // cluster schema-inference). Build a fresh session with a dedicated
         // RuntimeEnv and register the store on that.
-        let mut config = runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG
-            .read()
-            .map_or_else(|_| datafusion::prelude::SessionConfig::new(), |c| c.clone());
-        config
-            .options_mut()
-            .execution
-            .listing_table_ignore_subdirectory = false;
         let ctx = SessionContext::new_with_config_rt(
-            config,
+            runtime_datafusion::session_config::get_df_default_config(),
             default_runtime_env(self.tokio_io_runtime.clone()),
         );
         register_sharepoint_store_on_fresh(
@@ -1035,9 +1054,71 @@ mod tests {
         );
     }
 
+    fn auth_error(params: &[(&str, &str)]) -> String {
+        let params = Parameters::new(
+            params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), SecretString::from((*v).to_string())))
+                .collect(),
+            CONNECTOR_NAME,
+            PARAMETERS.as_slice(),
+        );
+        match build_auth_from_params(&params) {
+            Ok(_) => panic!("authentication should be refused"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn missing_parameter_errors_name_the_spicepod_keys() {
+        assert_eq!(
+            auth_error(&[("auth_code", "code")]),
+            "Missing required parameter: `sharepoint_tenant_id`. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[("auth_code", "code"), ("tenant_id", "t")]),
+            "Missing required parameter: `sharepoint_client_id`. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[
+                ("auth_code", "code"),
+                ("tenant_id", "t"),
+                ("client_id", "c")
+            ]),
+            "Missing required parameter: `sharepoint_client_secret` (required with `sharepoint_auth_code`). Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[
+                ("auth_code", "code"),
+                ("tenant_id", "t"),
+                ("client_id", "c"),
+                ("client_secret", "s"),
+            ]),
+            "Missing required parameter: `sharepoint_redirect_uri` (required with `sharepoint_auth_code`). Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[
+                ("refresh_token", "r"),
+                ("tenant_id", "t"),
+                ("client_id", "c")
+            ]),
+            "Missing required parameter: `sharepoint_client_secret` (required with `sharepoint_refresh_token`). Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+    }
+
     #[test]
     fn url_extension_none_when_no_dot() {
         assert!(url_extension("sharepoint://me/Documents/folder").is_none());
         assert!(url_extension("sharepoint://drives/id").is_none());
     }
 }
+
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_sharepoint as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+data_connector_api::register_data_connector!(
+    register_sharepoint_connector,
+    SHAREPOINT_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    SharepointFactory
+);

@@ -344,6 +344,10 @@ pub struct CitationSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {
+    // Vertex AI's streaming `generateContent` chunks may omit this before any tokens have
+    // been counted yet (unlike the Google AI Studio API, which always includes it) — default
+    // to 0 rather than failing the whole chunk over non-critical usage metadata.
+    #[serde(default)]
     pub prompt_token_count: u32,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -358,6 +362,7 @@ pub struct UsageMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thoughts_token_count: Option<u32>,
 
+    #[serde(default)]
     pub total_token_count: u32,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,4 +385,22 @@ pub struct TokenCountDetails {
     pub modality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_count: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_metadata_defaults_missing_token_counts_to_zero() {
+        // Vertex AI's streaming generateContent chunks have been observed omitting
+        // `promptTokenCount`/`totalTokenCount` (e.g. before any tokens are counted yet),
+        // unlike the Google AI Studio API which always includes them.
+        let json = r#"{"candidatesTokenCount": 5}"#;
+        let usage: UsageMetadata =
+            serde_json::from_str(json).expect("missing token counts should not fail parsing");
+        assert_eq!(usage.prompt_token_count, 0);
+        assert_eq!(usage.total_token_count, 0);
+        assert_eq!(usage.candidates_token_count, Some(5));
+    }
 }

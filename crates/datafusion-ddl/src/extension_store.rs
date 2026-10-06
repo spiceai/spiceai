@@ -21,13 +21,14 @@ limitations under the License.
 //!   - `acceleration.*` — acceleration engine, mode, refresh settings, etc.
 //!   - `dataset.*` — dataset-level settings like `time_column` and `time_format`.
 //! - `PARTITION BY` clauses (stored as the raw sqlparser `Expr`).
+//! - `CLUSTER BY` clauses (stored as raw sqlparser expressions).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::sql::sqlparser::ast::Expr as SqlParserExpr;
-use datafusion::sql::{ResolvedTableReference, TableReference};
 use spicepod::acceleration::{self, Acceleration};
 use spicepod::component::dataset::TimeFormat as SpicepodTimeFormat;
 
@@ -53,6 +54,9 @@ pub struct CreateTableStatementExtension {
     /// Partitioning expression from a `PARTITION BY` clause.
     /// The raw SQL expression as parsed by sqlparser.
     pub partition_by: Option<Box<SqlParserExpr>>,
+    /// Clustering columns from a `CLUSTER BY` clause.
+    /// Catalog handlers validate which expression forms they support.
+    pub cluster_by: Vec<SqlParserExpr>,
 }
 
 /// Stores DDL extensions extracted from `CREATE TABLE` statements.
@@ -144,6 +148,7 @@ pub fn parse_ddl_table_options(
         acceleration,
         dataset,
         partition_by: None,
+        cluster_by: Vec::new(),
     })
 }
 
@@ -256,11 +261,12 @@ fn parse_time_format(value: &str) -> DFResult<SpicepodTimeFormat> {
         "timestamptz" => Ok(SpicepodTimeFormat::Timestamptz),
         "unix_seconds" | "unixseconds" => Ok(SpicepodTimeFormat::UnixSeconds),
         "unix_millis" | "unixmillis" => Ok(SpicepodTimeFormat::UnixMillis),
+        "unix_nanos" | "unixnanos" => Ok(SpicepodTimeFormat::UnixNanos),
         "iso8601" => Ok(SpicepodTimeFormat::ISO8601),
         "date" => Ok(SpicepodTimeFormat::Date),
         _ => Err(DataFusionError::Plan(format!(
             "Invalid value for 'dataset.time_format': '{value}'. \
-             Expected 'timestamp', 'timestamptz', 'unix_seconds', 'unix_millis', 'ISO8601', or 'date'."
+             Expected 'timestamp', 'timestamptz', 'unix_seconds', 'unix_millis', 'unix_nanos', 'ISO8601', or 'date'."
         ))),
     }
 }
@@ -302,7 +308,7 @@ fn parse_refresh_mode(value: &str) -> DFResult<acceleration::RefreshMode> {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     use super::*;
 
@@ -352,6 +358,9 @@ mod tests {
             ("timestamp", SpicepodTimeFormat::Timestamp),
             ("timestamptz", SpicepodTimeFormat::Timestamptz),
             ("unix_seconds", SpicepodTimeFormat::UnixSeconds),
+            ("unix_millis", SpicepodTimeFormat::UnixMillis),
+            ("unix_nanos", SpicepodTimeFormat::UnixNanos),
+            ("unixnanos", SpicepodTimeFormat::UnixNanos),
             ("iso8601", SpicepodTimeFormat::ISO8601),
         ] {
             let opts = vec![("dataset.time_format".to_string(), input.to_string())];

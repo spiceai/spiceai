@@ -15,8 +15,34 @@ limitations under the License.
 */
 
 pub mod embeddings;
+pub(crate) mod prefetch;
 pub mod query;
 pub mod search;
+
+use arrow::array::RecordBatch;
+
+/// Readies batches for long-term retention in a cache entry.
+///
+/// Every store of raw batches funnels through here rather than through its call
+/// sites, so both of the things a retained batch needs happen exactly once:
+///
+/// * **Compaction.** `LIMIT`/`OFFSET` and top-k plans emit zero-copy slices of
+///   the scan batches they came from, and an entry built from one of those pins
+///   the whole scan batch for the lifetime of the entry.
+/// * **Schema interning.** Every `RecordBatch` carries its own `SchemaRef`, and
+///   nothing upstream shares them — batches do not even share with the stream
+///   that carried them — so a collection of small batches re-holds one schema
+///   per element.
+///
+/// Encoded entries need neither: serialization writes only the rows a batch
+/// holds, and writes the schema once.
+pub(crate) fn prepare_for_storage(mut batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
+    for batch in &mut batches {
+        *batch = arrow_tools::record_batch::compact_retained_buffers(batch);
+    }
+    crate::intern::schema::intern_batch_schemas(&mut batches);
+    batches
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStatus {
@@ -34,13 +60,13 @@ pub enum CacheStatus {
 
 impl CacheStatus {
     #[must_use]
-    pub fn to_header_string(&self) -> Option<String> {
+    pub fn to_header_string(self) -> Option<&'static str> {
         match self {
             CacheStatus::CacheDisabled => None,
-            CacheStatus::CacheBypass => Some("BYPASS".to_string()),
-            CacheStatus::CacheHit => Some("HIT".to_string()),
-            CacheStatus::CacheMiss => Some("MISS".to_string()),
-            CacheStatus::CacheStaleWhileRevalidate => Some("STALE".to_string()),
+            CacheStatus::CacheBypass => Some("BYPASS"),
+            CacheStatus::CacheHit => Some("HIT"),
+            CacheStatus::CacheMiss => Some("MISS"),
+            CacheStatus::CacheStaleWhileRevalidate => Some("STALE"),
         }
     }
 }

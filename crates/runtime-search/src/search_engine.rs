@@ -17,13 +17,18 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use std::collections::HashSet;
+use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 
 use super::embeddings::table::EmbeddingTable;
 use crate::candidate::vector::ChunkedNonIndexVectorGeneration;
 use crate::candidate::vector_udtf::VectorUDTFGeneration;
-use crate::error::{DataFusionSnafu, Error, FormattingSnafu, Result, SearchPipelineSnafu};
+use crate::error::{
+    AdditionalColumnNotFoundSnafu, CannotSearchDatasetSnafu, DataFusionSnafu, Error,
+    FormattingSnafu, Result, SearchPipelineSnafu,
+};
 use crate::table_provider_explorer::TableProviderExplorer;
+use snafu::ensure;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
@@ -33,14 +38,13 @@ use cache::key::{CacheKey, RawCacheKey, SearchKey};
 use cache::result::CacheStatus;
 use cache::result::query::CachedStream;
 use cache::result::search::{CachedAggregationResult, CachedSearchResult};
-use cache::{Sizeable, TabledCacheProvider};
+use cache::{AsTableRefs, Sizeable, TabledCacheProvider};
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference;
 use datafusion::common::{Column, DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
 use datafusion_expr::Expr;
-use datafusion_expr::sqlparser::ast;
 use futures::StreamExt;
 use itertools::Itertools;
 #[cfg(feature = "models")]
@@ -51,6 +55,7 @@ use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
+use search::index::compound::CompoundVectorIndex;
 #[cfg(feature = "duckdb")]
 use search::index::duckdb::DuckDBVectorIndex;
 use search::index::native_vector::NativeVectorIndex;
@@ -111,33 +116,29 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     async fn user_tables_that_can_search(&self) -> Result<Vec<TableReference>> {
         let mut searchable_tables = Vec::new();
         for t in self.df.get_user_table_names() {
-            if self
-                .embedding_columns_from_table(&t)
-                .await
-                .is_some_and(|cols| !cols.is_empty())
-            {
-                searchable_tables.push(t);
-                continue;
-            }
-            if self
-                .full_text_search_candidates(&t)
-                .await
-                .is_some_and(|fts_res| fts_res.is_ok_and(|c| !c.is_empty()))
-            {
+            if self.table_can_search(&t).await {
                 searchable_tables.push(t);
             }
         }
         Ok(searchable_tables)
     }
 
+    /// The error a scan of `tbl` would fail with because its data is not loaded
+    /// yet, or `None` when it can be searched. An unknown table is reported as
+    /// scannable so the existing not-found handling still owns that error.
+    async fn not_ready_error(&self, tbl: &TableReference) -> Option<DataFusionError> {
+        let table_provider = self.df.get_table(tbl).await?;
+        self.explorer.not_ready_error(&table_provider)
+    }
+
     async fn embedding_columns_from_table(&self, tbl: &TableReference) -> Option<Vec<String>> {
         let table_provider = self.df.get_table(tbl).await?;
         let mut embedding_columns: HashSet<String> = HashSet::default();
 
-        if let Some(embedding_table) = self
-            .explorer
-            .find_concrete::<EmbeddingTable>(&table_provider)
-        {
+        if let Some(embedding_table) = spice_table::find_layer::<EmbeddingTable>(
+            table_provider.as_ref(),
+            spice_table::LayerWalk::Read,
+        ) {
             for c in embedding_table.get_embedding_columns() {
                 embedding_columns.insert(c);
             }
@@ -154,6 +155,13 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         if let Some((indexes, _)) = self
             .explorer
             .find_index::<ChunkedSearchIndex>(&table_provider)
+        {
+            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+        }
+
+        if let Some((indexes, _)) = self
+            .explorer
+            .find_index::<CompoundVectorIndex>(&table_provider)
         {
             embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
         }
@@ -189,20 +197,45 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
         use crate::full_text::as_candidate_generations;
         #[cfg(feature = "elasticsearch")]
-        use crate::full_text::as_es_text_candidate_generations;
-        use runtime_datafusion_index::IndexedTableProvider;
+        use crate::full_text::{
+            as_compound_text_candidate_generations, as_es_text_candidate_generations,
+        };
         use search::generation::text_search::index::FullTextDatabaseIndex;
 
         let base_table_provider = self.df.get_table(tbl).await?;
 
-        let Some(indexed_table) = self
-            .explorer
-            .find_concrete::<IndexedTableProvider>(&base_table_provider)
-        else {
-            return Some(Ok(vec![]));
-        };
+        // Compound (write-through) full-text index: a warm Tantivy primary paired with an
+        // external Elasticsearch secondary. Registered instead of the concrete indexes for
+        // single-column FTS datasets with an external store, so this must precede the concrete
+        // `FullTextDatabaseIndex` branch below. A `CompoundSearchIndex` may compose *vector*
+        // tiers, so only text compounds (those without a vector view) back FTS discovery.
+        #[cfg(feature = "elasticsearch")]
+        {
+            use search::index::compound::CompoundSearchIndex;
+            if let Some((compounds, _)) = self
+                .explorer
+                .find_index::<CompoundSearchIndex>(&base_table_provider)
+                && let Some(compound) = compounds
+                    .into_iter()
+                    .find(|c| Arc::new((*c).clone()).as_vector_index().is_none())
+            {
+                return Some(
+                    as_compound_text_candidate_generations(
+                        compound.search_column(),
+                        Arc::clone(&self.df),
+                        tbl.clone(),
+                    )
+                    .await
+                    .map_err(|source| Error::SearchGenerationError { source }),
+                );
+            }
+        }
 
-        if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
+        if let Some((fts, _)) = self
+            .explorer
+            .find_index::<FullTextDatabaseIndex>(&base_table_provider)
+            && let Some(fts) = fts.first()
+        {
             return Some(
                 as_candidate_generations(
                     &fts.with_new_base(Arc::clone(&base_table_provider)),
@@ -217,8 +250,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         #[cfg(feature = "elasticsearch")]
         {
             use search::index::elasticsearch::ElasticsearchTextIndex;
-            let es_indexes = indexed_table.get_indexes::<ElasticsearchTextIndex>();
-            if !es_indexes.is_empty() {
+            if let Some((es_indexes, _)) = self
+                .explorer
+                .find_index::<ElasticsearchTextIndex>(&base_table_provider)
+                && !es_indexes.is_empty()
+            {
                 return Some(
                     as_es_text_candidate_generations(es_indexes, Arc::clone(&self.df), tbl.clone())
                         .await
@@ -228,6 +264,16 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         }
 
         Some(Ok(vec![]))
+    }
+
+    async fn table_can_search(&self, tbl: &TableReference) -> bool {
+        self.embedding_columns_from_table(tbl)
+            .await
+            .is_some_and(|cols| !cols.is_empty())
+            || self
+                .full_text_search_candidates(tbl)
+                .await
+                .is_some_and(|res| res.is_ok_and(|c| !c.is_empty()))
     }
 
     fn get_vector_index(
@@ -254,6 +300,14 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
         #[cfg(feature = "duckdb")]
         if let Some((indexes, _)) = self.explorer.find_index::<DuckDBVectorIndex>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        if let Some((indexes, _)) = self.explorer.find_index::<CompoundVectorIndex>(tbl)
             && let Some(index) = indexes
                 .into_iter()
                 .find(|idx| idx.search_column() == embedding_column)
@@ -300,10 +354,10 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 is_chunked,
             )))
         } else {
-            let Some(embedding_table) = self
-                .explorer
-                .find_concrete::<EmbeddingTable>(&table_provider)
-            else {
+            let Some(embedding_table) = spice_table::find_layer::<EmbeddingTable>(
+                table_provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            ) else {
                 return Err(Error::CannotVectorSearchDataset {
                     data_source: tbl.clone(),
                 });
@@ -364,6 +418,61 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         }
     }
 
+    async fn validate_request(
+        &self,
+        tables: &[TableReference],
+        explicit_datasets_requested: bool,
+        additional_columns: &[Column],
+    ) -> Result<()> {
+        for tbl in tables {
+            let table_provider =
+                self.df
+                    .get_table(tbl)
+                    .await
+                    .ok_or_else(|| Error::DataSourcesNotFound {
+                        data_source: vec![tbl.clone()],
+                    })?;
+
+            if explicit_datasets_requested {
+                ensure!(
+                    self.table_can_search(tbl).await,
+                    CannotSearchDatasetSnafu {
+                        data_source: tbl.clone()
+                    }
+                );
+            }
+
+            let schema = table_provider.schema();
+            for col in additional_columns {
+                let col_applies = col.relation.as_ref().is_none_or(|rel| {
+                    tbl.clone()
+                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                        == rel
+                            .clone()
+                            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                });
+
+                if col_applies {
+                    ensure!(
+                        schema.column_with_name(&col.name).is_some(),
+                        AdditionalColumnNotFoundSnafu {
+                            column: col.name.clone(),
+                            data_source: tbl.clone(),
+                            available_columns: schema
+                                .fields()
+                                .iter()
+                                .map(|f| f.name().as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        }
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn search_with_cache(
         &self,
         req: &SearchRequest,
@@ -372,7 +481,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
             tracing::trace!("Search cache is enabled");
-            let search_key = SearchKey::from(req.clone());
+            let search_key = SearchKey::from(req);
             let cache_control = request_context.cache_control();
 
             let scoped_user_cache_key =
@@ -392,15 +501,26 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 cache_key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
             };
 
-            match (
-                cache_control,
-                cache_provider.get_raw_key(&raw_cache_key.as_u64()).await,
-            ) {
+            let cached = cache_provider
+                .get_raw_key_validated(&raw_cache_key.as_u64(), &|value| {
+                    !cache_provider.tables_changed_since(
+                        value.as_table_refs().as_ref(),
+                        value.read_started_at(),
+                    )
+                })
+                .await;
+            match (cache_control, cached) {
                 (CacheControl::NoCache, _) => {
                     tracing::trace!("Search cache bypass");
+                    let read_started_at = Instant::now();
                     let results = self.search(req).await?;
                     (
-                        wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                        wrap_cache_to_result(
+                            raw_cache_key,
+                            results,
+                            Arc::clone(&cache_provider),
+                            read_started_at,
+                        ),
                         CacheStatus::CacheBypass,
                     )
                 }
@@ -412,9 +532,15 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                     None,
                 ) => {
                     tracing::trace!("Search cache miss");
+                    let read_started_at = Instant::now();
                     let results = self.search(req).await?;
                     (
-                        wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                        wrap_cache_to_result(
+                            raw_cache_key,
+                            results,
+                            Arc::clone(&cache_provider),
+                            read_started_at,
+                        ),
                         CacheStatus::CacheMiss,
                     )
                 }
@@ -432,7 +558,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                         let result = AggregationResult {
                             data: Box::pin(CachedStream::new(
                                 Arc::clone(&cached_aggregation_result.records),
-                                Arc::clone(&cached_aggregation_result.schema),
+                                cached_aggregation_result.schema.arc(),
                             )),
                             primary_key: cached_aggregation_result.primary_keys.clone(),
                             data_columns: cached_aggregation_result.data_columns.clone(),
@@ -470,6 +596,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             return Err(Error::NoTablesWithSearchFound {});
         }
 
+        self.validate_request(&tables, explicit_datasets_requested, additional_columns)
+            .await?;
+
         let span = match Span::current() {
             span if matches!(span.metadata(), Some(metadata) if metadata.name() == "search") => {
                 span
@@ -484,13 +613,34 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             let table_primary_keys = get_primary_keys_with_overrides(&self.df, &tables, &self.explicit_primary_keys)
                 .await?;
 
+            // Stringify the WHERE filter once; per-table work only rebinds it to each schema.
+            // `&str` / `&[String]` are `Copy`, so each parallel task can capture them without cloning.
+            let where_filter_sql = where_cond.as_ref().map(ToString::to_string);
+            let where_filter_sql = where_filter_sql.as_deref();
+            let keywords = keywords.as_slice();
+
             // Search for each table is independent, but done in parallel.
             let response: HashMap<TableReference, AggregationResult> = futures::future::try_join_all(tables.into_iter().map(|tbl| {
-                let keywords = keywords.clone();
                 let primary_keys = table_primary_keys.get(&tbl).map_or(&[] as &[String], |v| v.as_slice());
 
                 async move {
                     let request_context = RequestContext::current(AsyncMarker::new().await);
+
+                    // A dataset still loading its initial data cannot serve a search. Check
+                    // before building the plan: the query text is embedded during logical
+                    // optimization, so reaching this at physical planning instead would mean
+                    // paying for an embedding round trip only to be rejected. An explicitly
+                    // requested dataset is an error; when searching every searchable dataset,
+                    // skip it rather than failing the whole request — mirroring how an
+                    // unsearchable dataset is handled below.
+                    if let Some(not_ready) = self.not_ready_error(&tbl).await {
+                        if explicit_datasets_requested {
+                            return Err(Error::DataFusionError { source: not_ready });
+                        }
+                        tracing::debug!("Excluding dataset {tbl} from search: {not_ready}");
+                        return Ok((tbl.clone(), None));
+                    }
+
                     let embedding_columns = self.embedding_columns_from_table(&tbl).await.unwrap_or_default();
                     let mut generators: Vec<Arc<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
                     for (i, col) in embedding_columns.iter().enumerate() {
@@ -526,7 +676,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                     let agg_result = pipe.run(
                         query.clone(),
                         &tbl,
-                        get_filter_for_table(&self.df, &tbl, where_cond.as_ref()).await?,
+                        get_filter_for_table(&self.df, &tbl, where_filter_sql).await?,
                         table_cols,
                         primary_keys.iter().map(|pk| Column::from_name(pk.clone()) ).collect::<Vec<Column>>(),
                         keywords,
@@ -535,7 +685,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
                     Ok((tbl.clone(), agg_result))
                 }
-            }).collect::<Vec<_>>()).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
+            })).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
 
             Ok(response)
 
@@ -564,9 +714,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 async fn get_filter_for_table(
     df: &Arc<dyn QueryEngine>,
     tbl: &TableReference,
-    filter_opt: Option<&ast::Expr>,
+    filter_sql: Option<&str>,
 ) -> Result<Option<Expr>, Error> {
-    let Some(filter) = filter_opt else {
+    let Some(filter_sql) = filter_sql else {
         return Ok(None);
     };
 
@@ -579,13 +729,12 @@ async fn get_filter_for_table(
     match df
         .session_context()
         .state()
-        .create_logical_expr(&filter.to_string(), &schema)
+        .create_logical_expr(filter_sql, &schema)
     {
         Ok(f) => Ok(Some(f)),
         Err(e) if is_field_not_found_on_unrelated_table(tbl, &e) => {
             tracing::debug!(
-                "Ignoring SQL filter ('{}') on table {tbl:?} for search request as its columns do not reference this table",
-                filter
+                "Ignoring SQL filter ('{filter_sql}') on table {tbl:?} for search request as its columns do not reference this table"
             );
             Ok(None)
         }
@@ -622,6 +771,7 @@ fn wrap_cache_to_result(
     key: RawCacheKey,
     aggregation_result: HashMap<TableReference, AggregationResult>,
     cache_provider: Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>,
+    read_started_at: Instant,
 ) -> HashMap<TableReference, AggregationResult> {
     // each hashmap entry is an aggregation result which contains a sendable record batch stream
     // for each table reference, we need to wrap the batch stream in another stream to pull out the record batches
@@ -656,16 +806,34 @@ fn wrap_cache_to_result(
             while let Some(batch_result) = stream.next().await {
                 if records_size < cache_max_size
                     && let Ok(batch) = &batch_result {
-                        records.push(batch.clone());
-                        records_size += batch.get_array_memory_size();
+                        // Accumulate compacted batches: a top-k plan yields
+                        // zero-copy slices, so holding one keeps its whole scan
+                        // batch alive and bills the entry for it — which would
+                        // reject a small result whose parent happens to be
+                        // large. Measure first so the copy is only paid for a
+                        // result that can still be cached.
+                        records_size = records_size.saturating_add(
+                            arrow_tools::record_batch::compacted_memory_size(batch),
+                        );
+                        if records_size < cache_max_size {
+                            records.push(arrow_tools::record_batch::compact_retained_buffers(batch));
+                        } else {
+                            records.clear();
+                            records.shrink_to_fit();
+                        }
                     }
 
                 yield batch_result;
             }
 
-            if records_size < cache_max_size {
+            // The compaction above cannot decouple every shape: a dictionary
+            // below the top level has no copy at all, so an entry over it would
+            // pin the producer's allocation while being billed only for the
+            // buffers it declares. The SQL results cache declines such a result
+            // at its own admission; this one has the same budget to keep.
+            if records_size < cache_max_size && cache::batches_boundable(&records) {
                 let cached_result = CachedAggregationResult::new(
-                    Arc::new(records),
+                    records,
                     cloned_primary_key,
                     cloned_data_columns,
                     cloned_matches,
@@ -713,13 +881,22 @@ fn wrap_cache_to_result(
 
         tracing::trace!("Caching search results for key: {}", key.as_u64());
 
-        let result = CachedSearchResult {
-            results: Arc::new(results),
-            input_tables: Arc::new(expected_keys),
-        };
+        let result = CachedSearchResult::new(
+            Arc::new(results),
+            Arc::new(expected_keys.clone()),
+            read_started_at,
+        );
 
         if result.get_memory_size() > cache_provider.max_size() {
             tracing::trace!("Search results exceed cache size, not caching");
+            return;
+        }
+
+        // A table invalidation that landed after this search began must not
+        // publish a stale result (the gate alone only orders concurrent inserts
+        // against the scan, not work that started earlier and finishes later).
+        if cache_provider.tables_changed_since(&expected_keys, read_started_at) {
+            tracing::trace!("Skipping search cache put; a table changed since the search began");
             return;
         }
 

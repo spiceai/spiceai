@@ -24,10 +24,11 @@ use std::sync::Arc;
 use opentelemetry::KeyValue;
 
 use crate::{
-    Runtime, metrics,
+    Runtime,
     model::{ENABLE_MODEL_SUPPORT_MESSAGE, rerank::HealthFailedSnafu, try_to_rerank_model},
     status,
 };
+use runtime_metrics as metrics;
 use snafu::ResultExt;
 
 impl Runtime {

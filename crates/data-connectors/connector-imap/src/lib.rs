@@ -14,19 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_trait::async_trait;
-use data_components::imap::{
+// The imap provider module is exported (as it was in data_components) so its public
+// provider API stays reachable and its public items are treated as exported API by
+// clippy's avoid-breaking-exported-api. missing_errors_doc mirrors data_components.
+#![allow(clippy::missing_errors_doc)]
+
+pub mod imap;
+
+use crate::imap::{
     ImapTableProvider,
     session::{ImapAuthMode, ImapAuthModeParameter, ImapSSLMode, ImapSession},
 };
-use datafusion::datasource::TableProvider;
-use regex::Regex;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
+use async_trait::async_trait;
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::ParameterSpec;
+use datafusion::datasource::TableProvider;
+use regex::Regex;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::ParameterSpec;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{
@@ -202,10 +210,11 @@ impl DataConnectorFactory for ImapFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let host = Self::parse_host(&mut params)?;
 
@@ -286,7 +295,8 @@ impl DataConnector for Imap {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(ImapTableProvider::new(
             self.session.clone(),
@@ -303,3 +313,13 @@ pub const CONNECTOR_NAME: &str = "imap";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     ImapFactory::new_arc()
 }
+
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_imap as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+data_connector_api::register_data_connector!(
+    register_imap_connector,
+    IMAP_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    ImapFactory
+);

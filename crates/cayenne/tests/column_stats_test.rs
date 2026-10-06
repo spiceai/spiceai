@@ -70,6 +70,7 @@ async fn test_table_statistics_crud(
         statistics_blob: dummy_blob.clone(),
         num_rows: 100,
         ndv_sketches: Some(dummy_ndv.clone()),
+        num_rows_exact: true,
     };
     catalog.upsert_table_statistics(&table_stats).await?;
 
@@ -88,6 +89,7 @@ async fn test_table_statistics_crud(
         statistics_blob: vec![5, 6, 7, 8],
         num_rows: 200,
         ndv_sketches: None,
+        num_rows_exact: true,
     };
     catalog.upsert_table_statistics(&updated).await?;
 
@@ -134,6 +136,7 @@ async fn test_stats_cleared_on_drop_table(
             statistics_blob: vec![1, 2, 3],
             num_rows: 100,
             ndv_sketches: None,
+            num_rows_exact: true,
         })
         .await?;
 

@@ -16,11 +16,17 @@ limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
-use datafusion::sql::TableReference;
+use arrow::datatypes::{Schema, SchemaRef};
+use datafusion::common::TableReference;
 
+use crate::intern::Interned;
+use crate::intern::table_set::table_reference_heap_size;
+use crate::sizing::{
+    BUFFER_OVERHEAD_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, string_vec_heap_size,
+};
 use crate::{AsTableRefs, Sizeable};
 
 #[derive(Clone)]
@@ -29,60 +35,294 @@ pub struct CachedAggregationResult {
     pub primary_keys: Vec<String>,
     pub data_columns: Vec<String>,
     pub matches: HashMap<String, Vec<String>>,
-    pub schema: SchemaRef,
+    /// [`Interned`] for the same reason as [`crate::CachedQueryResult::schema`]:
+    /// it can only have come from the pool, so it is shared and the weigher's
+    /// decision not to charge for it holds however this struct is built.
+    pub schema: Interned<Schema>,
 }
 
 impl CachedAggregationResult {
+    /// Batches are compacted and their schemas interned on the way in, for the
+    /// same reasons [`crate::CachedQueryResult`] does both: a top-k search plan
+    /// emits zero-copy slices, and storing one as it arrives would pin — and,
+    /// through [`Sizeable`] below, bill — the whole scan batch it was carved
+    /// from; and every batch otherwise re-holds its own copy of one schema.
     #[must_use]
     pub fn new(
-        records: Arc<Vec<RecordBatch>>,
+        records: Vec<RecordBatch>,
         primary_keys: Vec<String>,
         data_columns: Vec<String>,
         matches: HashMap<String, Vec<String>>,
         schema: SchemaRef,
     ) -> Self {
         Self {
-            records,
+            records: Arc::new(crate::result::prepare_for_storage(records)),
             primary_keys,
             data_columns,
             matches,
-            schema,
+            schema: crate::intern::schema::intern(schema),
         }
+    }
+
+    /// The memory one table's aggregated results hold, excluding the struct
+    /// itself — the caller charges that through the map slot holding it.
+    ///
+    /// The schema is interned and shared across every entry over the same
+    /// shape, so it is not a per-entry cost and is reported by the interner
+    /// rather than charged here. A schema unique to one entry is likewise not
+    /// charged — deliberately; see
+    /// [`crate::result::query::CachedQueryResult::memory_size`] for why that
+    /// tradeoff was taken and what reports the residual.
+    fn heap_size(&self) -> usize {
+        arc_heap_size::<Vec<RecordBatch>>()
+            + self.records.len() * std::mem::size_of::<RecordBatch>()
+            + self
+                .records
+                .iter()
+                .map(|batch| {
+                    // The bytes the arrays asked for, plus what each of their
+                    // buffers costs beyond that — the same allowance a cached
+                    // query result is charged, for the same reason. Without it a
+                    // search entry is underweighted exactly where its schema and
+                    // table set stopped being charged.
+                    batch.get_array_memory_size()
+                        + BUFFER_OVERHEAD_BYTES * arrow_tools::record_batch::buffers_in_batch(batch)
+                })
+                .sum::<usize>()
+            + string_vec_heap_size(&self.primary_keys)
+            + string_vec_heap_size(&self.data_columns)
+            + self.matches.capacity() * std::mem::size_of::<(String, Vec<String>)>()
+            + self
+                .matches
+                .iter()
+                .map(|(key, values)| key.capacity() + string_vec_heap_size(values))
+                .sum::<usize>()
     }
 }
 
 #[derive(Clone)]
 pub struct CachedSearchResult {
     pub results: Arc<HashMap<TableReference, CachedAggregationResult>>,
-    pub input_tables: Arc<HashSet<TableReference>>,
+    /// Private so every entry is built through [`Self::new`], which interns it.
+    /// A public field would let a new call site store an un-shared copy, and
+    /// nothing would fail — the entry would simply stop being billed for memory
+    /// it privately holds.
+    input_tables: Interned<HashSet<TableReference>>,
+    /// When the search that produced this entry began reading its tables.
+    /// Used with [`crate::TableChangeClock`] so a result whose tables were
+    /// invalidated mid-flight cannot publish or serve as a hit afterward.
+    read_started_at: Instant,
+}
+
+impl CachedSearchResult {
+    /// Builds an entry, interning the input-table set so entries over the same
+    /// tables share one allocation. See [`crate::intern::table_set`].
+    ///
+    /// `read_started_at` must be the instant the search began (before table
+    /// reads), so mid-flight invalidation can reject this entry on put/get.
+    #[must_use]
+    pub fn new(
+        results: Arc<HashMap<TableReference, CachedAggregationResult>>,
+        input_tables: Arc<HashSet<TableReference>>,
+        read_started_at: Instant,
+    ) -> Self {
+        Self {
+            results,
+            input_tables: crate::intern::table_set::intern(input_tables),
+            read_started_at,
+        }
+    }
+
+    #[must_use]
+    pub fn read_started_at(&self) -> Instant {
+        self.read_started_at
+    }
 }
 
 impl AsTableRefs for CachedSearchResult {
     fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
-        Arc::clone(&self.input_tables)
+        self.input_tables.arc()
     }
 }
 
 impl Sizeable for CachedSearchResult {
     fn get_memory_size(&self) -> usize {
-        self.results
-            .values()
-            .map(|result| {
-                result
-                    .records
-                    .iter()
-                    .map(arrow::array::RecordBatch::get_array_memory_size)
-                    .sum::<usize>()
-                    + (result.primary_keys.len() * std::mem::size_of::<String>())
-                    + (result.data_columns.len() * std::mem::size_of::<String>())
-                    + result
-                        .matches
-                        .iter()
-                        .map(|(key, values)| {
-                            key.len() + values.iter().map(std::string::String::len).sum::<usize>()
-                        })
-                        .sum::<usize>()
+        std::mem::size_of::<Self>()
+            + arc_heap_size::<HashMap<TableReference, CachedAggregationResult>>()
+            + self.results.capacity()
+                * std::mem::size_of::<(TableReference, CachedAggregationResult)>()
+            + self
+                .results
+                .iter()
+                .map(|(table, result)| table_reference_heap_size(table) + result.heap_size())
+                .sum::<usize>()
+            + ENTRY_OVERHEAD_BYTES
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12921>.
+    /// A top-k search plan emits slices, and an entry built from one must not
+    /// hold — or be billed — the scan batch it was carved out of.
+    #[test]
+    fn a_sliced_search_result_is_billed_its_own_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            false,
+        )]));
+        let payloads: Vec<String> = (0..2_000)
+            .map(|row| {
+                std::iter::repeat_n(
+                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
+                    4_096,
+                )
+                .collect()
             })
-            .sum()
+            .collect();
+        let scan_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(payloads))],
+        )
+        .expect("should create batch");
+        let sliced = scan_batch.slice(1_000, 1);
+        let expected = sliced
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("payload is a StringArray")
+            .value(0)
+            .to_string();
+
+        let result = CachedAggregationResult::new(
+            vec![sliced],
+            vec!["id".to_string()],
+            vec!["payload".to_string()],
+            HashMap::new(),
+            schema,
+        );
+
+        let cached = CachedSearchResult::new(
+            Arc::new(HashMap::from([(
+                TableReference::bare("docs"),
+                result.clone(),
+            )])),
+            Arc::new(HashSet::new()),
+            Instant::now(),
+        );
+        assert!(
+            cached.get_memory_size() * 100 < scan_batch.get_array_memory_size(),
+            "a one-row search entry should be billed a small fraction of its parent, got {} of {}",
+            cached.get_memory_size(),
+            scan_batch.get_array_memory_size()
+        );
+
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(
+            result.records[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("payload is a StringArray")
+                .value(0),
+            expected,
+            "compacting the entry must not change the row it holds"
+        );
+    }
+
+    fn empty_result_over(schema: SchemaRef, primary_keys: Vec<String>) -> CachedSearchResult {
+        CachedSearchResult::new(
+            Arc::new(HashMap::from([(
+                TableReference::bare("docs"),
+                CachedAggregationResult::new(
+                    Vec::new(),
+                    primary_keys,
+                    Vec::new(),
+                    HashMap::new(),
+                    schema,
+                ),
+            )])),
+            Arc::new(HashSet::from([TableReference::bare("docs")])),
+            Instant::now(),
+        )
+    }
+
+    fn schema_of_width(columns: usize) -> SchemaRef {
+        Arc::new(Schema::new(
+            (0..columns)
+                .map(|i| Field::new(format!("column_{i}"), DataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12931>,
+    /// the same defect on the search cache: an entry that matched nothing
+    /// counted zero bytes, so no number of them could exhaust the budget.
+    #[test]
+    fn a_search_result_that_matched_nothing_is_still_billed() {
+        let empty = empty_result_over(schema_of_width(4), Vec::new());
+
+        assert!(
+            empty.get_memory_size() > std::mem::size_of::<CachedSearchResult>(),
+            "an entry holding a schema and a table set costs more than its own struct, got {}",
+            empty.get_memory_size()
+        );
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12933>,
+    /// the search cache's half: a schema shared by every entry over the same
+    /// shape is not a per-entry cost, so widening it must not make the entry
+    /// heavier.
+    #[test]
+    fn schema_width_does_not_change_what_a_search_entry_is_billed() {
+        let narrow = empty_result_over(schema_of_width(4), Vec::new());
+        let wide = empty_result_over(schema_of_width(200), Vec::new());
+
+        assert_eq!(
+            narrow.get_memory_size(),
+            wide.get_memory_size(),
+            "an interned schema is shared, so its width is not the entry's cost"
+        );
+    }
+
+    #[test]
+    fn search_entries_over_the_same_shape_share_one_schema() {
+        let first = empty_result_over(schema_of_width(200), Vec::new());
+        let second = empty_result_over(schema_of_width(200), Vec::new());
+
+        let schema_of = |result: &CachedSearchResult| {
+            result
+                .results
+                .values()
+                .next()
+                .expect("one aggregated result")
+                .schema
+                .arc()
+        };
+
+        assert!(
+            Arc::ptr_eq(&schema_of(&first), &schema_of(&second)),
+            "search entries of the same shape must share one schema allocation"
+        );
+    }
+
+    /// The pre-fix accounting charged `primary_keys.len() * size_of::<String>()`,
+    /// which is the pointer triple and never the characters behind it.
+    #[test]
+    fn a_long_primary_key_name_is_billed_its_characters() {
+        let short = empty_result_over(schema_of_width(1), vec!["id".to_string()]);
+        let long = empty_result_over(schema_of_width(1), vec!["k".repeat(4_096)]);
+
+        assert!(
+            long.get_memory_size() >= short.get_memory_size() + 4_000,
+            "a 4 KiB key name must be charged its bytes, got {} vs {}",
+            long.get_memory_size(),
+            short.get_memory_size()
+        );
     }
 }

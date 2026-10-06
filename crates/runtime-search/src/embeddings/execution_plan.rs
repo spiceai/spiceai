@@ -42,7 +42,7 @@ use llms::embeddings::Embed;
 use rayon::prelude::*;
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::{sync::Arc, thread};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use super::EmbeddingModelStore;
 use crate::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
@@ -62,7 +62,7 @@ pub struct EmbeddingTableExec {
 
     base_plan: Arc<dyn ExecutionPlan>,
 
-    embedded_columns: HashMap<String, EmbeddingColumnConfig>,
+    embedded_columns: Arc<HashMap<String, EmbeddingColumnConfig>>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
@@ -96,6 +96,17 @@ impl ExecutionPlan for EmbeddingTableExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.base_plan.apply_expressions(f)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.base_plan.children()
     }
@@ -108,8 +119,13 @@ impl ExecutionPlan for EmbeddingTableExec {
             &Arc::clone(&self.projected_schema),
             &self.filters,
             self.limit,
-            Arc::clone(&self.base_plan).with_new_children(children)?,
-            self.embedded_columns.clone(),
+            Arc::clone(&self.base_plan).replace_children(
+                children,
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )?,
+            Arc::clone(&self.embedded_columns),
             Arc::clone(&self.embedding_models),
         )) as Arc<dyn ExecutionPlan>)
     }
@@ -125,7 +141,7 @@ impl ExecutionPlan for EmbeddingTableExec {
             to_sendable_stream(
                 s,
                 Arc::clone(&self.projected_schema),
-                self.embedded_columns.clone(),
+                Arc::clone(&self.embedded_columns),
                 Arc::clone(&self.embedding_models),
             ),
         )))
@@ -139,7 +155,7 @@ impl EmbeddingTableExec {
         filters: &[Expr],
         limit: Option<usize>,
         base_plan: Arc<dyn ExecutionPlan>,
-        embedded_columns: HashMap<String, EmbeddingColumnConfig>,
+        embedded_columns: Arc<HashMap<String, EmbeddingColumnConfig>>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Self {
         Self {
@@ -173,7 +189,7 @@ impl EmbeddingTableExec {
 fn to_sendable_stream(
     mut base_stream: SendableRecordBatchStream,
     projected_schema: SchemaRef,
-    embedded_columns: HashMap<String, EmbeddingColumnConfig>,
+    embedded_columns: Arc<HashMap<String, EmbeddingColumnConfig>>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
@@ -276,13 +292,19 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
             ..
         } = cfg;
         tracing::trace!("Embedding column '{col}' with model {model_name}");
-        let read_guard = embedding_models.read().await;
-
-        let Some(model) = read_guard.get(model_name) else {
-            tracing::debug!(
-                "When embedding col='{col}', model {model_name} expected, but not found"
-            );
-            continue;
+        // Clone the model handle (a cheap Arc refcount bump) and drop the store
+        // read guard before embedding, so the potentially multi-second, network
+        // bound embed call does not hold the lock and stall model reloads.
+        let model = {
+            let read_guard = embedding_models.read().await;
+            if let Some(model) = read_guard.get(model_name) {
+                Arc::clone(model)
+            } else {
+                tracing::debug!(
+                    "When embedding col='{col}', model {model_name} expected, but not found"
+                );
+                continue;
+            }
         };
 
         let Some(raw_data) = rb.column_by_name(col) else {
@@ -307,14 +329,14 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
             };
 
             let list_array = if model.supports_sync_embeddings() {
-                let task_model = Arc::clone(model);
+                let task_model = Arc::clone(&model);
                 let vector_size = cfg.vector_size;
                 task::spawn_blocking(move || {
                     get_vectors_per_list_element_in_process(rows, &task_model, vector_size)
                 })
                 .await??
             } else {
-                get_vectors_per_list_element(rows, &**model, cfg.vector_size).await?
+                get_vectors_per_list_element(rows, &*model, cfg.vector_size).await?
             };
 
             tracing::trace!("Successfully embedded column '{col}' in multi-vector mode");
@@ -333,14 +355,14 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
 
         let list_array = if let Some(chunker) = chunker_opt {
             let (vectors, offsets) =
-                get_vectors_with_chunker(arr_iter, Arc::clone(chunker), Arc::clone(model)).await?;
+                get_vectors_with_chunker(arr_iter, Arc::clone(chunker), Arc::clone(&model)).await?;
             tracing::trace!("Successfully embedded column '{col}' with chunking");
             embed_arrays.insert(offset_col!(col), Arc::new(offsets) as ArrayRef);
 
             Arc::new(vectors) as ArrayRef
         } else {
             let fixed_size_array = if model.supports_sync_embeddings() {
-                let task_model = Arc::clone(model);
+                let task_model = Arc::clone(&model);
                 let batch: Vec<_> = arr_iter.map(|o| o.map(str::to_string)).collect();
                 let vector_size = cfg.vector_size;
 
@@ -349,7 +371,7 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
                 })
                 .await??
             } else {
-                get_vectors(arr_iter, &**model, cfg.vector_size).await?
+                get_vectors(arr_iter, &*model, cfg.vector_size).await?
             };
 
             tracing::trace!("Successfully embedded column '{col}'");
@@ -413,7 +435,8 @@ pub(super) async fn get_vectors(
         .collect();
 
     tracing::trace!("Sending request to upstream embedding model");
-    let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
+    let embedded_data =
+        std::sync::Arc::unwrap_or_clone(model.embed(EmbeddingInput::StringArray(column)).await?);
     tracing::trace!("Received response from upstream embedding model");
 
     let mut builder = FixedSizeListBuilder::with_capacity(
@@ -510,9 +533,11 @@ pub(super) fn get_vectors_in_process(
                 .collect::<Result<Vec<_>, _>>()
         })?;
 
-        for embed in embeds.iter().flatten() {
-            builder.values().append_slice(embed);
-            builder.append(true);
+        for batch in &embeds {
+            for embed in batch.iter() {
+                builder.values().append_slice(embed);
+                builder.append(true);
+            }
         }
     }
 
@@ -768,7 +793,7 @@ pub(super) async fn get_vectors_per_list_element(
     let embedded: Vec<Vec<f32>> = if flat.is_empty() {
         Vec::new()
     } else {
-        model.embed(EmbeddingInput::StringArray(flat)).await?
+        std::sync::Arc::unwrap_or_clone(model.embed(EmbeddingInput::StringArray(flat)).await?)
     };
 
     build_multi_vector_list_array(&validity, &lengths, &embedded, vector_length)
@@ -793,7 +818,10 @@ pub(super) fn get_vectors_per_list_element_in_process(
                 .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
                 .collect::<Result<Vec<_>, _>>()
         })?;
-        batches.into_iter().flatten().collect()
+        batches
+            .into_iter()
+            .flat_map(std::sync::Arc::unwrap_or_clone)
+            .collect()
     };
 
     build_multi_vector_list_array(&validity, &lengths, &embedded, vector_length)
@@ -847,11 +875,11 @@ async fn get_vectors_with_chunker(
     let embedded_data: Vec<Vec<f32>> = if model.supports_sync_embeddings() {
         let pool = build_embedding_pool(model.parallelism())?;
         let model = Arc::clone(&model);
-        let sync_embed_chunks = chunks.clone();
 
+        // Sync path must move `chunks` into spawn_blocking (no further use after this branch).
         let batches = task::spawn_blocking(move || {
             pool.install(|| {
-                sync_embed_chunks
+                chunks
                     .into_par_iter()
                     .chunks(32)
                     .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
@@ -860,12 +888,18 @@ async fn get_vectors_with_chunker(
         })
         .await??;
 
-        batches.into_iter().flatten().collect()
+        batches
+            .into_iter()
+            .flat_map(std::sync::Arc::unwrap_or_clone)
+            .collect()
     } else {
-        model
-            .embed(EmbeddingInput::StringArray(chunks.clone()))
-            .await
-            .boxed()?
+        // Move chunks into embed; avoid cloning the full Vec<String>.
+        std::sync::Arc::unwrap_or_clone(
+            model
+                .embed(EmbeddingInput::StringArray(chunks))
+                .await
+                .boxed()?,
+        )
     };
 
     let vector_length = model.size();
@@ -943,25 +977,33 @@ async fn get_vectors_with_chunker(
     Ok((vectors, content_offsets))
 }
 
+/// Rayon thread pools reused across embedding batches, keyed by thread count.
+/// Building a pool spawns OS threads, so it must not happen once per record
+/// batch per column on the in-process embedding path.
+static EMBEDDING_POOLS: LazyLock<Mutex<HashMap<usize, Arc<ThreadPool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn build_embedding_pool(
     model_parallelism: Option<usize>,
-) -> Result<ThreadPool, Box<dyn std::error::Error + Send + Sync>> {
-    let parallelism = match (model_parallelism, thread::available_parallelism()) {
-        (Some(p), _) => p,
-        (None, Ok(host_parallelism)) => host_parallelism.get(),
-        (_, Err(e)) => {
-            let default_parallelism = 2;
-            tracing::trace!(
-                "Defaulting to parallelism {default_parallelism}, error determining host parallelism: {e} "
-            );
-            default_parallelism
-        }
-    };
+) -> Result<Arc<ThreadPool>, Box<dyn std::error::Error + Send + Sync>> {
+    let parallelism =
+        model_parallelism.unwrap_or_else(|| cpu_budget::cpu_budget().embedding_pool_threads());
 
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(parallelism)
-        .build()
-        .map_err(Into::into)
+    let mut pools = EMBEDDING_POOLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+
+    if let Some(pool) = pools.get(&parallelism) {
+        return Ok(Arc::clone(pool));
+    }
+
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(parallelism)
+            .build()?,
+    );
+    pools.insert(parallelism, Arc::clone(&pool));
+    Ok(pool)
 }
 
 #[expect(clippy::float_cmp)]
@@ -995,18 +1037,21 @@ mod tests {
             -1
         }
 
-        async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, embeddings::Error> {
+        async fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> Result<std::sync::Arc<Vec<Vec<f32>>>, embeddings::Error> {
             match input {
                 EmbeddingInput::String(s) => {
                     let v = self.map.get(&s).cloned().unwrap_or_default();
-                    Ok(vec![v])
+                    Ok(std::sync::Arc::new(vec![v]))
                 }
                 EmbeddingInput::StringArray(arr) => {
                     let v = arr
                         .iter()
                         .map(|s| self.map.get(s).cloned().unwrap_or_default())
                         .collect();
-                    Ok(v)
+                    Ok(std::sync::Arc::new(v))
                 }
                 _ => Err(embeddings::Error::FailedToCreateEmbedding {
                     source: Box::<dyn std::error::Error + Send + Sync>::from(

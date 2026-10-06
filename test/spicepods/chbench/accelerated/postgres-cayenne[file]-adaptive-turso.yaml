@@ -13,14 +13,15 @@ name: postgres-cayenne[file]-adaptive-turso
 # host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
 # within the environment-derived [floor, ceiling] as the workload shifts.
 #
-# `schema_inference: extended` (per dataset) does double duty here, so nothing else is hand-set:
+# Schema inference (always on) does double duty here, so nothing else is hand-set:
 #   - It auto-detects the primary key, secondary indexes, and (non-CDC) sort columns from the
 #     PostgreSQL source and seeds an `upsert` on_conflict on the inferred PK — exactly what
 #     `refresh_mode: changes` needs to apply UPDATE/DELETE events. So PK / on_conflict / indexes
 #     are intentionally NOT declared below; inference fills them (it is gap-filling only and never
 #     overrides a user-set value, so declaring them would just suppress the very thing we test).
-#   - It supplies the inferred row_count/table_bytes the adaptive loop's data-aware warm-start
-#     gates on; without extended inference adaptive silently falls back to `auto` (static).
+#   - It supplies inferred row_count/table_bytes that sharpen the adaptive loop's data-aware
+#     warm-start. Adaptive is set explicitly, so it runs regardless; without inferred metadata
+#     the loop just relearns the row width from observed ingest.
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
 # tick. No per-ACTUATOR knob value is set anywhere: an explicit knob would *pin* it under adaptive
 # (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
@@ -30,6 +31,19 @@ name: postgres-cayenne[file]-adaptive-turso
 #
 # sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
 # comparison isolates the effect of adaptive tuning, not caching/history overhead.
+#
+# DATALAKE (COLD) TIER: the six high-volume CDC tables (district, customer, new_order, oorder,
+# order_line, stock) also carry the datalake tier, so this config runs all three storage tiers:
+# RAM mem-tier -> warm local-disk Vortex -> cold object store. No datalake knob is an adaptive
+# actuator, and only the tier's location and credentials are set, so warm data moves on the
+# engine default trigger: 16 x the 512 MB cold file size (8 GiB) of warm data. Small scale
+# factors stay below it. warehouse and the full-refresh reference tables stay on the warm tier.
+# The cold store is the shared MinIO (`s3://benchmarks`). Each run writes under its own prefix,
+# the Actions run id, so the HTAP workflow can delete that run's objects afterwards without
+# touching a concurrent run's.
+# spiced does not resolve `${env:…}` in `cayenne_datalake_location` yet (#14711), so the HTAP
+# workflow substitutes the run id into it before spiced starts. A move holds the table's write
+# lock for its whole duration (#12849), so CDC apply on that table pauses while it runs.
 
 postgres_connection_params: &postgres_params
   pg_host: ${env:CHBENCH_PG_HOST}
@@ -40,6 +54,8 @@ postgres_connection_params: &postgres_params
   pg_sslmode: disable
 
 runtime:
+  query:
+    cte_materialization: auto
   flight:
     ipc_compression: lz4_frame
   caching:
@@ -62,16 +78,15 @@ runtime:
 
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
-  # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
+  # No primary_key / on_conflict / indexes: schema inference (always on) detects them from the
   # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires.
 
   - from: postgres:warehouse
     name: warehouse
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_warehouse
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
     acceleration: &cayenne_accel
       enabled: true
       engine: cayenne
@@ -94,64 +109,68 @@ datasets:
 
   - from: postgres:district
     name: district
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_district
-      pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel
+      pg_replication_initial_snapshot: auto
+    acceleration: &cayenne_accel_cold
+      <<: *cayenne_accel
+      params:
+        <<: *cayenne_params
+        # Datalake (cold) tier: location and credentials only (see the header).
+        cayenne_datalake_location: s3://benchmarks/cayenne-datalake/${env:GITHUB_RUN_ID}/
+        cayenne_datalake_s3_auth: key
+        cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
+        cayenne_datalake_s3_key: ${secrets:S3_KEY}
+        cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
+        cayenne_datalake_s3_allow_http: 'true'
 
   - from: postgres:customer
     name: customer
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_customer
-      pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel
+      pg_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel_cold
 
   - from: postgres:new_order
     name: new_order
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_new_order
-      pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel
+      pg_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel_cold
 
   - from: postgres:oorder
     name: oorder
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_oorder
-      pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel
+      pg_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel_cold
 
   - from: postgres:order_line
     name: order_line
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_order_line
-      pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel
+      pg_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel_cold
 
   - from: postgres:stock
     name: stock
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_stock
-      pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel
+      pg_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel_cold
 
   # ---- Static reference tables (no OLTP mutations, full refresh) ----
-  # Same: PK / on_conflict / indexes come from extended inference.
+  # Same: PK / indexes come from schema inference (always on); on_conflict is seeded only
+  # for CDC (changes) datasets — a full refresh replaces the table and needs no upsert.
 
   - from: postgres:item
     name: item
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: &cayenne_accel_full
@@ -163,21 +182,18 @@ datasets:
 
   - from: postgres:region
     name: region
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full
 
   - from: postgres:nation
     name: nation
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full
 
   - from: postgres:supplier
     name: supplier
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full

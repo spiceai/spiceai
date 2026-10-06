@@ -4,6 +4,7 @@ compute:
     image_tag: ${SPIDAPTER_IMAGE_TAG:-}
     scheduler_state_location: ${SCHEDULER_STATE_LOCATION:-}
     organization_tag: ${SPIDAPTER_ORGANIZATION_TAG:-}
+    cluster_name: ${SPIDAPTER_CLUSTER_NAME:-}
     resources:
       app_memory: ${SPIDAPTER_APP_MEMORY_LIMIT:-64Gi}
       ephemeral_storage_gb: ${SPIDAPTER_EPHEMERAL_STORAGE_LIMIT_GB:-}
@@ -12,3 +13,9 @@ source:
   mongodb_streams:
     connect:
       uri: ${MONGODB_ATLAS_URI}
+# Optional: deploy a full tuned/adaptive spicepod verbatim instead of generating one.
+# Set MONGO_SPICEPOD_PATH to an ABSOLUTE path to a pods/mongo/*.yaml — in the spidapter
+# image that is /app/scenarios/pods/mongo/<pod>.yaml (e.g. mongo-sf100-tuned.yaml).
+# A relative value is resolved against the scenario base path (--scenario-base-path),
+# NOT the process CWD. Empty/unset → generate the default pod (previous behaviour).
+spicepod: ${MONGO_SPICEPOD_PATH:-}

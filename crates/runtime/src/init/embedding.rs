@@ -19,12 +19,12 @@ use std::sync::Arc;
 use crate::{
     Result, Runtime, UnableToInitializeEmbeddingModelSnafu,
     embeddings::task::TaskEmbed,
-    metrics,
     model::{ENABLE_MODEL_SUPPORT_MESSAGE, try_to_embedding},
     status,
 };
 use llms::embeddings::Embed;
 use opentelemetry::KeyValue;
+use runtime_metrics as metrics;
 use snafu::prelude::*;
 use spicepod::component::embeddings::Embeddings;
 

@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
 use std::{any::Any, sync::Arc};
 
 use super::DataConnector;
-use crate::component::{ComponentInitialization, dataset::Dataset};
+use crate::component::ComponentInitialization;
+use crate::component::dataset::DatasetSpec;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -52,6 +54,7 @@ impl DeferredConnector {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl DataConnector for DeferredConnector {
     fn as_any(&self) -> &dyn Any {
@@ -60,21 +63,23 @@ impl DataConnector for DeferredConnector {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        _dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(self.clone()))
     }
 
     async fn read_write_provider(
         &self,
-        _dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        _dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> super::DataConnectorResult<()> {
         self.inner
@@ -93,13 +98,31 @@ impl DataConnector for DeferredConnector {
         false
     }
 
-    fn changes_stream(
+    // Unlike the stream capabilities above, this is a static property of the
+    // source the deferred dataset will eventually load from, not of the
+    // placeholder — so it forwards, matching `resolve_refresh_mode`. Answering
+    // `false` here would reject a durable-write-back dataset whose real source
+    // is perfectly safe.
+    fn supports_durable_write_back_delivery(&self) -> bool {
+        self.inner.supports_durable_write_back_delivery()
+    }
+
+    async fn write_back_deliverer(
         &self,
-        _federated_table: Arc<crate::federated_table::FederatedTable>,
-        _dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
+    ) -> Option<
+        data_connector_api::DataConnectorResult<Arc<dyn data_connector_api::WriteBackDeliverer>>,
+    > {
+        self.inner.write_back_deliverer(context, dataset).await
+    }
+
+    async fn changes_stream(
+        &self,
+        _context: &dyn ConnectorContext,
+        _federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
+        _dataset: &DatasetSpec,
+        _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
     }
@@ -110,37 +133,37 @@ impl DataConnector for DeferredConnector {
 
     fn append_stream(
         &self,
-        _federated_table: Arc<crate::federated_table::FederatedTable>,
+        _federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
     }
 
     async fn metadata_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
 
     async fn on_accelerator_setup(
         &self,
-        dataset: &Dataset,
-        builder: &mut crate::accelerated_table::Builder,
+        dataset: &DatasetSpec,
+        accelerator: &mut dyn data_connector_api::accelerated::AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.on_accelerator_setup(dataset, builder).await
+        self.inner.on_accelerator_setup(dataset, accelerator).await
     }
 
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
-        accelerated_table: &mut crate::accelerated_table::AcceleratedTable,
+        dataset: &DatasetSpec,
+        accelerated_table: &mut dyn data_connector_api::accelerated::RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner
             .on_accelerated_table_registration(dataset, accelerated_table)
             .await
     }
 
-    fn metrics_provider(&self) -> Option<Arc<dyn crate::component::metrics::MetricsProvider>> {
+    fn metrics_provider(&self) -> Option<Arc<dyn runtime_metrics::component::MetricsProvider>> {
         self.inner.metrics_provider()
     }
 
@@ -148,7 +171,7 @@ impl DataConnector for DeferredConnector {
         ComponentInitialization::OnTrigger
     }
 
-    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(&self, _dataset: &DatasetSpec) -> ComponentInitialization {
         ComponentInitialization::OnTrigger
     }
 }

@@ -20,7 +20,7 @@ mod startup;
 
 use std::collections::HashMap;
 
-use datafusion::sql::ResolvedTableReference;
+use datafusion::common::ResolvedTableReference;
 use datafusion_expr::Expr;
 use snafu::Snafu;
 
@@ -79,6 +79,11 @@ pub enum Error {
 
     #[snafu(display("Timed out waiting for table {table} to be registered"))]
     TableRegistrationTimeout { table: String },
+
+    #[snafu(display(
+        "Stopped waiting for table {table} to be registered: the runtime is shutting down"
+    ))]
+    ShutdownBeforeTableRegistered { table: String },
 
     #[snafu(display("Table {table} is not an accelerated table"))]
     NotAcceleratedTable { table: String },
@@ -153,12 +158,15 @@ pub fn get_partition_filter_exprs(
 /// assignments — see `init::dataset`), so this goes through the generic table
 /// provider rather than a `PartitionTableProvider`.
 ///
-/// Best-effort: returns `None` when no statistics are available.
+/// Returns `None` only when the table has no local provider; when the provider
+/// exists but no aggregate/footer statistics are available yet, returns
+/// *unknown* statistics (`num_rows` `Absent`) so the executor still emits a
+/// per-table report to the coordinator.
 ///
 /// [`Statistics`]: datafusion::common::Statistics
 pub(crate) async fn local_executor_table_statistics(
     df: &crate::datafusion::DataFusion,
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
 ) -> Option<(datafusion::common::Statistics, Vec<String>)> {
     let provider = df.get_table(table).await?;
     let schema = provider.schema();
@@ -184,7 +192,12 @@ pub(crate) async fn local_executor_table_statistics(
     // present AND at least one column carries a min/max bound.
     let session_state = df.ctx.state();
     let scan_stats = match provider.scan(&session_state, None, &[], None).await {
-        Ok(plan) => plan.partition_statistics(None).ok(),
+        Ok(plan) => datafusion::physical_plan::StatisticsContext::new()
+            .compute(
+                plan.as_ref(),
+                &datafusion::physical_plan::StatisticsArgs::new(),
+            )
+            .ok(),
         Err(_) => None,
     };
     if let Some(stats) = scan_stats
@@ -194,8 +207,17 @@ pub(crate) async fn local_executor_table_statistics(
         return Some(((*stats).clone(), column_names));
     }
 
-    tracing::debug!(table = %table, "No local statistics available for executor table");
-    None
+    // Provider exists but no usable aggregate/footer stats yet. Report *unknown*
+    // stats rather than nothing so the coordinator still receives a per-table
+    // report: this lets it gate query-readiness on "heard from the executor"
+    // (see `ExecutorRegistry::has_statistics_for`) without a table that can't
+    // produce stats hanging `/v1/ready` forever. The coordinator logs a warning
+    // when the reported stats are unusable for join sizing.
+    tracing::debug!(table = %table, "No local statistics available for executor table; reporting unknown stats");
+    Some((
+        datafusion::common::Statistics::new_unknown(&schema),
+        column_names,
+    ))
 }
 
 /// Rewrite each integer column's reported max to the effective max

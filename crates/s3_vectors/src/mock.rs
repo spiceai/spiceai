@@ -73,6 +73,7 @@ pub struct MockData {
     pub quota_limits: HashMap<String, usize>,  // Configurable quota limits per index
     pub list_indexes_calls: HashMap<String, usize>, // bucket -> call count
     pub create_index_calls: usize,
+    pub get_vector_bucket_calls: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,6 +106,23 @@ impl MockClient {
         *data.vector_counts.get(index_name).unwrap_or(&0)
     }
 
+    /// Get the keys currently stored in an index, sorted. Reflects every `put_vectors` insert
+    /// minus every `delete_vectors` removal, so a delete test can assert the surviving set.
+    #[must_use]
+    pub fn vector_keys(&self, index_name: &str) -> Vec<String> {
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        let mut keys: Vec<String> = data
+            .vectors
+            .get(index_name)
+            .map(|vs| vs.iter().map(|v| v.key().to_string()).collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+
     /// Get the call count for `list_indexes` on a specific bucket
     #[must_use]
     pub fn get_list_indexes_call_count(&self, bucket: &str) -> usize {
@@ -125,6 +143,16 @@ impl MockClient {
         data.create_index_calls
     }
 
+    /// Get the total call count for `get_vector_bucket`
+    #[must_use]
+    pub fn get_vector_bucket_call_count(&self) -> usize {
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        data.get_vector_bucket_calls
+    }
+
     /// Reset all call counts
     pub fn reset_call_counts(&self) {
         let mut data = match self.data.lock() {
@@ -133,6 +161,7 @@ impl MockClient {
         };
         data.list_indexes_calls.clear();
         data.create_index_calls = 0;
+        data.get_vector_bucket_calls = 0;
     }
 }
 
@@ -213,9 +242,23 @@ impl S3Vectors for MockClient {
 
     async fn delete_vectors(
         &self,
-        _input: &DeleteVectorsInput,
+        input: &DeleteVectorsInput,
     ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError>> {
-        unimplemented!()
+        let index_name = input.index_name().unwrap_or_default();
+        let mut data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+
+        // Deleting a key absent from the index is a no-op, matching the real `DeleteVectors`.
+        if let Some(stored) = data.vectors.get_mut(index_name) {
+            let to_delete: std::collections::HashSet<&str> =
+                input.keys().iter().map(String::as_str).collect();
+            stored.retain(|v| !to_delete.contains(v.key()));
+        }
+        let new_count = data.vectors.get(index_name).map_or(0, Vec::len);
+        data.vector_counts.insert(index_name.to_string(), new_count);
+        Ok(DeleteVectorsOutput::builder().build())
     }
 
     async fn get_index(
@@ -276,6 +319,11 @@ impl S3Vectors for MockClient {
         &self,
         _input: &GetVectorBucketInput,
     ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError>> {
+        let mut data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        data.get_vector_bucket_calls += 1;
         Ok(GetVectorBucketOutput::builder().build())
     }
 
@@ -382,7 +430,25 @@ impl S3Vectors for MockClient {
             ));
         }
 
-        let new_count = current_count + num_vectors;
+        // Upsert each vector into the tracked store, keyed by its S3 Vectors key, so tests can
+        // assert exactly which entries a later `delete_vectors` removes. The quota check above
+        // still uses the incoming count, so spill/quota tests are unaffected.
+        {
+            let stored = data.vectors.entry(index_name.to_string()).or_default();
+            for v in input.vectors() {
+                let key = v.key().to_string();
+                let entry = ListOutputVector::builder()
+                    .key(&key)
+                    .build()
+                    .map_err(|_| SdkError::construction_failure("build"))?;
+                if let Some(existing) = stored.iter_mut().find(|e| e.key() == key) {
+                    *existing = entry;
+                } else {
+                    stored.push(entry);
+                }
+            }
+        }
+        let new_count = data.vectors.get(index_name).map_or(0, Vec::len);
         data.vector_counts.insert(index_name.to_string(), new_count);
         Ok(PutVectorsOutput::builder().build())
     }

@@ -2,19 +2,19 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q4"
 ---
-+---------------+-----------------------------------------------------------------------------+
-| plan_type     | plan                                                                        |
-+---------------+-----------------------------------------------------------------------------+
-| logical_plan  | Aggregate: groupBy=[[]], aggr=[[avg(CAST(hits.UserID AS Float64))]]         |
-|               |   TableScan: hits projection=[UserID]                                       |
-| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[avg(hits.UserID)]                  |
-|               |   CoalescePartitionsExec                                                    |
-|               |     AggregateExec: mode=Partial, gby=[], aggr=[avg(hits.UserID)]            |
-|               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
-|               |         SchemaCastScanExec                                                  |
-|               |           FallbackOnZeroResultsScanExec                                     |
-|               |             CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0   |
-|               |               BytesProcessedExec                                            |
-|               |                 EmptyExec                                                   |
-|               |                                                                             |
-+---------------+-----------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------+
+| plan_type     | plan                                                                          |
++---------------+-------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[avg(CAST(hits.UserID AS Float64))]]           |
+|               |   TableScan: hits projection=[UserID]                                         |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[avg(hits.UserID)]                    |
+|               |   CoalescePartitionsExec                                                      |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[avg(hits.UserID)]              |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1   |
+|               |         SchemaCastScanExec                                                    |
+|               |           FallbackOnZeroResultsScanExec                                       |
+|               |             CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N> |
+|               |               BytesProcessedExec                                              |
+|               |                 EmptyExec                                                     |
+|               |                                                                               |
++---------------+-------------------------------------------------------------------------------+

@@ -1,0 +1,986 @@
+use bytes::Bytes;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
+
+use crate::config::ReplicationConfig;
+use crate::error::{PgWireError, Result};
+use crate::lsn::Lsn;
+use crate::protocol::framing::{
+    read_backend_message, write_copy_data, write_copy_done, write_password_message, write_query,
+    write_startup_message, FrameReader,
+};
+use crate::protocol::messages::{parse_auth_request, parse_error_response};
+use crate::protocol::replication::{
+    encode_standby_status_update, parse_copy_data, ReplicationCopyData, PG_EPOCH_MICROS,
+};
+
+/// Shared replication progress updated by the consumer and read by the worker.
+///
+/// Stored as an `AtomicU64` so progress updates are cheap and monotonic
+/// without async backpressure.
+pub struct SharedProgress {
+    applied: AtomicU64,
+}
+
+impl SharedProgress {
+    pub fn new(start: Lsn) -> Self {
+        Self {
+            applied: AtomicU64::new(start.as_u64()),
+        }
+    }
+
+    #[inline]
+    pub fn load_applied(&self) -> Lsn {
+        Lsn::from_u64(self.applied.load(Ordering::Acquire))
+    }
+
+    /// Monotonic update: if `lsn` is lower than the currently stored applied LSN,
+    /// this is a no-op.
+    #[inline]
+    pub fn update_applied(&self, lsn: Lsn) {
+        let new = lsn.as_u64();
+        let mut cur = self.applied.load(Ordering::Relaxed);
+
+        while new > cur {
+            match self
+                .applied
+                .compare_exchange_weak(cur, new, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+}
+
+/// Events emitted by the replication worker.
+#[derive(Debug, Clone)]
+pub enum ReplicationEvent {
+    /// Server heartbeat message.
+    KeepAlive {
+        /// Current server WAL end position
+        wal_end: Lsn,
+        /// Whether server requested a reply (already handled internally)
+        reply_requested: bool,
+        /// Server timestamp (microseconds since 2000-01-01)
+        server_time_micros: i64,
+    },
+
+    /// Start of a transaction (pgoutput Begin message).
+    Begin {
+        final_lsn: Lsn,
+        xid: u32,
+        commit_time_micros: i64,
+    },
+
+    /// WAL data containing transaction changes.
+    XLogData {
+        /// WAL position where this data starts
+        wal_start: Lsn,
+        /// WAL end position (may be 0 for mid-transaction messages)
+        wal_end: Lsn,
+        /// Server timestamp (microseconds since 2000-01-01)
+        server_time_micros: i64,
+        /// pgoutput-encoded change data
+        data: Bytes,
+    },
+
+    /// End of a transaction (pgoutput Commit message).
+    Commit {
+        lsn: Lsn,
+        end_lsn: Lsn,
+        commit_time_micros: i64,
+    },
+
+    /// Logical decoding message emitted via `pg_logical_emit_message()`.
+    ///
+    /// Transactional messages are delivered only after the enclosing
+    /// transaction commits. Non-transactional messages are delivered
+    /// immediately.
+    Message {
+        /// Whether the message was emitted inside a transaction.
+        transactional: bool,
+        /// LSN of the message in the WAL.
+        lsn: Lsn,
+        /// Application-defined message prefix (e.g. `"myapp.checkpoint"`).
+        prefix: String,
+        /// Raw message content bytes.
+        content: Bytes,
+    },
+
+    /// Emitted when `stop_at_lsn` has been reached.
+    ///
+    /// After this event, no more events will be emitted and the
+    /// replication stream will be closed.
+    StoppedAt {
+        /// The LSN that triggered the stop condition
+        reached: Lsn,
+    },
+}
+
+/// Channel receiver type for replication events.
+pub type ReplicationEventReceiver =
+    mpsc::Receiver<std::result::Result<ReplicationEvent, PgWireError>>;
+
+/// Internal worker state.
+pub struct WorkerState {
+    cfg: ReplicationConfig,
+    progress: Arc<SharedProgress>,
+    stop_rx: watch::Receiver<bool>,
+    out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
+}
+
+impl WorkerState {
+    pub fn new(
+        cfg: ReplicationConfig,
+        progress: Arc<SharedProgress>,
+        stop_rx: watch::Receiver<bool>,
+        out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
+    ) -> Self {
+        Self {
+            cfg,
+            progress,
+            stop_rx,
+            out,
+        }
+    }
+
+    /// Run the replication protocol on the given stream.
+    pub async fn run_on_stream<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<()> {
+        // No intermediate `BufReader`: the streaming loop reads through a
+        // `FrameReader`, which owns a single growable buffer it fills straight
+        // from the socket (kernel -> one buffer, frames are zero-copy slices of
+        // it). Handshake reads are exact and never over-read past a message
+        // boundary, so nothing is lost handing the raw stream to `stream_loop`.
+        self.startup(stream).await?;
+        self.authenticate(stream).await?;
+        self.start_replication(stream).await?;
+        self.stream_loop(stream).await
+    }
+
+    /// Send startup message with replication parameters.
+    async fn startup<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<()> {
+        let params = [
+            ("user", self.cfg.user.as_str()),
+            ("database", self.cfg.database.as_str()),
+            ("replication", "database"),
+            ("client_encoding", "UTF8"),
+            ("application_name", "pgwire-replication"),
+        ];
+        write_startup_message(stream, 196_608, &params).await
+    }
+
+    /// Start the logical replication stream.
+    async fn start_replication<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: &mut S,
+    ) -> Result<()> {
+        // Escape single quotes in publication name
+        let publication = self.cfg.publication.replace('\'', "''");
+        // pgoutput options. `binary 'true'` is only appended when requested;
+        // omitting it preserves the historical text-format wire and keeps the
+        // query identical to prior versions for text consumers.
+        let mut options = format!(
+            "proto_version '{}', publication_names '{}', messages 'true'",
+            self.cfg.proto_version, publication,
+        );
+        if matches!(self.cfg.format, crate::config::PgOutputFormat::Binary) {
+            options.push_str(", binary 'true'");
+        }
+        let sql = format!(
+            "START_REPLICATION SLOT {} LOGICAL {} ({options})",
+            self.cfg.slot, self.cfg.start_lsn,
+        );
+        write_query(stream, &sql).await?;
+
+        // Wait for CopyBothResponse
+        loop {
+            let msg = read_backend_message(stream).await?;
+            match msg.tag {
+                b'W' => return Ok(()), // CopyBothResponse - ready to stream
+                b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
+                // Notice / ParameterStatus / BackendKeyData / anything else: keep waiting.
+                _ => {}
+            }
+        }
+    }
+
+    /// Main replication streaming loop.
+    ///
+    /// Uses a two-phase approach for throughput:
+    /// 1. **Drain phase**: while the [`FrameReader`] already has whole frames
+    ///    buffered, read them in a tight loop without `select!` or timeout
+    ///    overhead.
+    /// 2. **Wait phase**: when no complete frame is buffered, fall back to
+    ///    `select!` with timeout + stop signal to handle idle keepalives and
+    ///    graceful shutdown.
+    ///
+    /// [`FrameReader`] reads straight from the socket into a single growable
+    /// buffer (no per-message zero-fill, no intermediate `BufReader` copy) and
+    /// hands out frames as zero-copy slices. It is cancellation-safe — partial
+    /// reads survive a dropped future — so the wait-phase `select!` cannot lose
+    /// bytes.
+    async fn stream_loop<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<()> {
+        // How many messages to process in the tight loop before checking
+        // stop signal and sending periodic status feedback.
+        const DRAIN_BATCH: usize = 256;
+
+        let mut last_status_sent = Instant::now() - self.cfg.status_interval;
+        let mut last_applied = self.progress.load_applied();
+        // Incremental, zero-copy, cancellation-safe reader.
+        let mut reader = FrameReader::new(self.cfg.max_message_size);
+
+        loop {
+            // Update applied LSN from client
+            let current_applied = self.progress.load_applied();
+            if current_applied != last_applied {
+                last_applied = current_applied;
+            }
+
+            // Send periodic status feedback
+            if last_status_sent.elapsed() >= self.cfg.status_interval {
+                self.send_feedback(stream, last_applied, false).await?;
+                last_status_sent = Instant::now();
+            }
+
+            // ── Drain phase: tight loop while whole frames are already buffered ──
+            // A single socket read often delivers many WAL messages into the
+            // FrameReader's buffer. Slice them out in a tight loop (no await on
+            // the socket, no select!/timeout overhead per message).
+            let mut drained = 0usize;
+            while drained < DRAIN_BATCH && reader.has_buffered_frame() {
+                let msg = reader.next(stream).await?;
+                drained += 1;
+                if msg.tag == b'E' {
+                    return Err(PgWireError::Server(parse_error_response(&msg.payload)));
+                }
+                if msg.tag == b'd'
+                    && self
+                        .handle_copy_data(
+                            stream,
+                            msg.payload,
+                            &mut last_applied,
+                            &mut last_status_sent,
+                        )
+                        .await?
+                {
+                    return Ok(());
+                }
+            }
+
+            // If we drained messages, loop back to check stop/status before
+            // potentially blocking on the next read.
+            if drained > 0 {
+                // Check stop signal without blocking
+                if self.stop_rx.has_changed().unwrap_or(false) && *self.stop_rx.borrow() {
+                    let _ = write_copy_done(stream).await;
+                    return Ok(());
+                }
+                continue;
+            }
+
+            // ── Wait phase: no whole frame buffered, wait for socket data ──
+            //
+            // Both `stop_rx.changed()` and the timeout can drop the read future
+            // mid-message. `FrameReader::next` is cancellation-safe — a partial
+            // frame stays in the reader's buffer and is preserved across the
+            // drop, so the next iteration resumes the read without losing bytes.
+            let msg = tokio::select! {
+                biased;
+
+                _ = self.stop_rx.changed() => {
+                    if *self.stop_rx.borrow() {
+                        let _ = write_copy_done(stream).await;
+                        return Ok(());
+                    }
+                    continue;
+                }
+
+                msg_result = tokio::time::timeout(
+                    self.cfg.idle_wakeup_interval,
+                    reader.next(stream),
+                ) => {
+                    if let Ok(res) = msg_result { res? } else {
+                        let applied = self.progress.load_applied();
+                        last_applied = applied;
+                        self.send_feedback(stream, applied, false).await?;
+                        last_status_sent = Instant::now();
+                        continue;
+                    }
+                }
+            };
+
+            if msg.tag == b'E' {
+                return Err(PgWireError::Server(parse_error_response(&msg.payload)));
+            }
+            if msg.tag == b'd'
+                && self
+                    .handle_copy_data(
+                        stream,
+                        msg.payload,
+                        &mut last_applied,
+                        &mut last_status_sent,
+                    )
+                    .await?
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Handle a `CopyData` message. Returns true if we should stop.
+    async fn handle_copy_data<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        payload: Bytes,
+        last_applied: &mut Lsn,
+        last_status_sent: &mut Instant,
+    ) -> Result<bool> {
+        let cd = parse_copy_data(payload)?;
+
+        match cd {
+            ReplicationCopyData::KeepAlive {
+                wal_end,
+                server_time_micros,
+                reply_requested,
+            } => {
+                // Respond immediately if server requests it
+                if reply_requested {
+                    let applied = self.progress.load_applied();
+                    *last_applied = applied;
+                    self.send_feedback(stream, applied, true).await?;
+                    *last_status_sent = Instant::now();
+                }
+
+                self.send_event(
+                    stream,
+                    Ok(ReplicationEvent::KeepAlive {
+                        wal_end,
+                        reply_requested,
+                        server_time_micros,
+                    }),
+                    last_status_sent,
+                )
+                .await?;
+
+                Ok(false)
+            }
+            ReplicationCopyData::XLogData {
+                wal_start,
+                wal_end,
+                server_time_micros,
+                data,
+            } => {
+                // If the payload is a pgoutput Begin/Commit message, emit only the boundary event.
+                if let Some(boundary_ev) = parse_pgoutput_boundary(&data)? {
+                    let reached_lsn = match boundary_ev {
+                        ReplicationEvent::Begin { final_lsn, .. } => final_lsn,
+                        ReplicationEvent::Commit { end_lsn, .. } => end_lsn,
+                        _ => wal_end, // should never happen if parser only returns Begin/Commit
+                    };
+
+                    self.send_event(stream, Ok(boundary_ev), last_status_sent)
+                        .await?;
+
+                    // Stop condition (prefer boundary LSN semantics when available)
+                    if let Some(stop_lsn) = self.cfg.stop_at_lsn {
+                        if reached_lsn >= stop_lsn {
+                            self.send_event(
+                                stream,
+                                Ok(ReplicationEvent::StoppedAt {
+                                    reached: reached_lsn,
+                                }),
+                                last_status_sent,
+                            )
+                            .await?;
+                            let _ = write_copy_done(stream).await;
+                            return Ok(true); // should stop.
+                        }
+                    }
+
+                    return Ok(false);
+                }
+                // Otherwise, emit raw payload
+                // Check stop condition
+                if let Some(stop_lsn) = self.cfg.stop_at_lsn {
+                    if wal_end >= stop_lsn {
+                        // Send final event, then stop signal
+                        self.send_event(
+                            stream,
+                            Ok(ReplicationEvent::XLogData {
+                                wal_start,
+                                wal_end,
+                                server_time_micros,
+                                data,
+                            }),
+                            last_status_sent,
+                        )
+                        .await?;
+
+                        self.send_event(
+                            stream,
+                            Ok(ReplicationEvent::StoppedAt { reached: wal_end }),
+                            last_status_sent,
+                        )
+                        .await?;
+
+                        let _ = write_copy_done(stream).await;
+                        return Ok(true);
+                    }
+                }
+
+                self.send_event(
+                    stream,
+                    Ok(ReplicationEvent::XLogData {
+                        wal_start,
+                        wal_end,
+                        server_time_micros,
+                        data,
+                    }),
+                    last_status_sent,
+                )
+                .await?;
+
+                Ok(false)
+            }
+        }
+    }
+
+    /// Send an event to the consumer channel without letting a full channel
+    /// starve server feedback.
+    ///
+    /// A plain `out.send().await` on a full events channel parks the entire
+    /// worker until the consumer drains — and while parked, the worker sends no
+    /// standby status updates and services no keepalives. `PostgreSQL` then sees
+    /// no feedback for `> wal_sender_timeout` and terminates the walsender
+    /// (connection reset), forcing a reconnect and WAL replay. This is the
+    /// coupling this method breaks.
+    ///
+    /// Hot path: a non-blocking `try_reserve` sends immediately (no timer, no
+    /// `select!`). Only when the channel is full do we enter a loop that keeps
+    /// emitting standby status updates every [`status_interval`] while awaiting
+    /// capacity, so the server's liveness window is satisfied regardless of
+    /// consumer progress.
+    ///
+    /// While parked here the worker is not reading the socket, so a server
+    /// keepalive with `reply_requested=true` may sit unread — that is fine,
+    /// because the proactive feedback we send on `status_interval` satisfies
+    /// `wal_sender_timeout` whether or not the request byte was observed.
+    ///
+    /// Gated by [`ReplicationConfig::feedback_while_backpressured`] (default
+    /// `true`); when disabled this reverts to the original blocking `send`.
+    ///
+    /// [`status_interval`]: ReplicationConfig::status_interval
+    /// [`ReplicationConfig::feedback_while_backpressured`]: ReplicationConfig::feedback_while_backpressured
+    async fn send_event<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        event: std::result::Result<ReplicationEvent, PgWireError>,
+        last_status_sent: &mut Instant,
+    ) -> Result<()> {
+        // Opt-out: original hard-backpressure semantics.
+        if !self.cfg.feedback_while_backpressured {
+            if self.out.send(event).await.is_err() {
+                tracing::debug!("event channel closed, client may have disconnected");
+            }
+            return Ok(());
+        }
+
+        // Hot path: capacity available right now — no timer/select overhead.
+        match self.out.try_reserve() {
+            Ok(permit) => {
+                permit.send(event);
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing::debug!("event channel closed, client may have disconnected");
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {}
+        }
+
+        // Backpressured: wait for capacity, but keep the server alive by
+        // re-sending standby status feedback every `status_interval`.
+        loop {
+            let feedback_deadline = *last_status_sent + self.cfg.status_interval;
+            tokio::select! {
+                biased;
+
+                // Shutdown must be able to interrupt a stalled send.
+                _ = self.stop_rx.changed() => {
+                    if *self.stop_rx.borrow() {
+                        // Caller's loop observes stop on the next iteration and
+                        // finishes; the event is dropped along with the stream.
+                        return Ok(());
+                    }
+                }
+
+                reserved = tokio::time::timeout_at(feedback_deadline, self.out.reserve()) => {
+                    match reserved {
+                        Ok(Ok(permit)) => {
+                            permit.send(event);
+                            return Ok(());
+                        }
+                        Ok(Err(_)) => {
+                            tracing::debug!("event channel closed, client may have disconnected");
+                            return Ok(());
+                        }
+                        Err(_elapsed) => {
+                            let applied = self.progress.load_applied();
+                            self.send_feedback(stream, applied, false).await?;
+                            *last_status_sent = Instant::now();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle `PostgreSQL` authentication exchange.
+    async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<()> {
+        loop {
+            let msg = read_backend_message(stream).await?;
+            match msg.tag {
+                b'R' => {
+                    let (code, rest) = parse_auth_request(&msg.payload)?;
+                    self.handle_auth_request(stream, code, rest).await?;
+                }
+                b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
+                b'Z' => return Ok(()), // ReadyForQuery - auth complete
+                // ParameterStatus / BackendKeyData / anything else - ignore
+                _ => {}
+            }
+        }
+    }
+
+    /// Handle a specific authentication request.
+    async fn handle_auth_request<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        code: i32,
+        data: &[u8],
+    ) -> Result<()> {
+        match code {
+            0 => Ok(()), // AuthenticationOk
+            3 => {
+                // Cleartext password
+                let mut payload = Vec::from(self.cfg.password.as_bytes());
+                payload.push(0);
+                write_password_message(stream, &payload).await
+            }
+            10 => {
+                // SASL (SCRAM-SHA-256)
+                self.auth_scram(stream, data).await
+            }
+            #[cfg(feature = "md5")]
+            5 => {
+                // MD5 password
+                if data.len() != 4 {
+                    return Err(PgWireError::Protocol(
+                        "MD5 auth: expected 4-byte salt".into(),
+                    ));
+                }
+                let mut salt = [0u8; 4];
+                salt.copy_from_slice(&data[..4]);
+
+                let hash = postgres_md5(&self.cfg.password, &self.cfg.user, salt);
+                let mut payload = hash.into_bytes();
+                payload.push(0);
+                write_password_message(stream, &payload).await
+            }
+            _ => Err(PgWireError::Auth(format!(
+                "unsupported auth method code: {code}"
+            ))),
+        }
+    }
+
+    /// Perform SCRAM-SHA-256 authentication.
+    async fn auth_scram<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        mechanisms_data: &[u8],
+    ) -> Result<()> {
+        // Parse offered mechanisms
+        let mechanisms = parse_sasl_mechanisms(mechanisms_data);
+
+        if !mechanisms.iter().any(|m| m == "SCRAM-SHA-256") {
+            return Err(PgWireError::Auth(format!(
+                "server doesn't offer SCRAM-SHA-256, available: {mechanisms:?}"
+            )));
+        }
+
+        #[cfg(not(feature = "scram"))]
+        return Err(PgWireError::Auth(
+            "SCRAM authentication required but 'scram' feature not enabled".into(),
+        ));
+
+        #[cfg(feature = "scram")]
+        {
+            use crate::auth::scram::ScramClient;
+
+            let scram = ScramClient::new(&self.cfg.user);
+
+            // Send SASLInitialResponse
+            let mut init = Vec::new();
+            init.extend_from_slice(b"SCRAM-SHA-256\0");
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "SASL client-first length (nonce + username) is far below i32::MAX"
+            )]
+            let client_first_len = scram.client_first.len() as i32;
+            init.extend_from_slice(&client_first_len.to_be_bytes());
+            init.extend_from_slice(scram.client_first.as_bytes());
+            write_password_message(stream, &init).await?;
+
+            // Receive AuthenticationSASLContinue (code 11)
+            let server_first = read_auth_data(stream, 11).await?;
+            let server_first_str = String::from_utf8_lossy(&server_first);
+
+            // Compute and send client-final
+            let (client_final, auth_message, salted_password) =
+                scram.client_final(&self.cfg.password, &server_first_str)?;
+            write_password_message(stream, client_final.as_bytes()).await?;
+
+            // Receive and verify AuthenticationSASLFinal (code 12)
+            let server_final = read_auth_data(stream, 12).await?;
+            let server_final_str = String::from_utf8_lossy(&server_final);
+            ScramClient::verify_server_final(&server_final_str, &salted_password, &auth_message)?;
+
+            Ok(())
+        }
+    }
+
+    /// Send standby status update to server.
+    async fn send_feedback<S: AsyncWrite + Unpin>(
+        &self,
+        stream: &mut S,
+        applied: Lsn,
+        reply_requested: bool,
+    ) -> Result<()> {
+        let client_time = current_pg_timestamp();
+        let payload = encode_standby_status_update(applied, client_time, reply_requested);
+        write_copy_data(stream, &payload).await
+    }
+}
+
+/// Parse SASL mechanism list from auth data.
+fn parse_sasl_mechanisms(data: &[u8]) -> Vec<String> {
+    let mut mechanisms = Vec::new();
+    let mut remaining = data;
+
+    while !remaining.is_empty() {
+        if let Some(pos) = remaining.iter().position(|&x| x == 0) {
+            if pos == 0 {
+                break; // Empty string terminates list
+            }
+            mechanisms.push(String::from_utf8_lossy(&remaining[..pos]).to_string());
+            remaining = &remaining[pos + 1..];
+        } else {
+            break;
+        }
+    }
+
+    mechanisms
+}
+
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "pgoutput LSNs, xid, and content length are unsigned values carried as \
+              signed integers on the wire; these casts are bit-preserving"
+)]
+fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "a pgoutput flags byte is a signed i8 on the wire"
+    )]
+    fn take_i8(p: &mut &[u8]) -> Result<i8> {
+        if p.is_empty() {
+            return Err(PgWireError::Protocol("pgoutput: truncated i8".into()));
+        }
+        let v = p[0] as i8;
+        *p = &p[1..];
+        Ok(v)
+    }
+
+    fn take_i32(p: &mut &[u8]) -> Result<i32> {
+        if p.len() < 4 {
+            return Err(PgWireError::Protocol("pgoutput: truncated i32".into()));
+        }
+        let (head, tail) = p.split_at(4);
+        *p = tail;
+        let mut b = [0u8; 4];
+        b.copy_from_slice(head);
+        Ok(i32::from_be_bytes(b))
+    }
+
+    fn take_i64(p: &mut &[u8]) -> Result<i64> {
+        if p.len() < 8 {
+            return Err(PgWireError::Protocol("pgoutput: truncated i64".into()));
+        }
+        let (head, tail) = p.split_at(8);
+        *p = tail;
+        let mut b = [0u8; 8];
+        b.copy_from_slice(head);
+        Ok(i64::from_be_bytes(b))
+    }
+
+    if data.is_empty() {
+        return Ok(None);
+    }
+
+    let tag = data[0];
+    let mut p = &data[1..];
+
+    match tag {
+        b'B' => {
+            let final_lsn = Lsn::from_u64(take_i64(&mut p)? as u64);
+            let commit_time_micros = take_i64(&mut p)?;
+            let xid = take_i32(&mut p)? as u32;
+
+            Ok(Some(ReplicationEvent::Begin {
+                final_lsn,
+                commit_time_micros,
+                xid,
+            }))
+        }
+        b'C' => {
+            let _flags = take_i8(&mut p)?;
+            let lsn = Lsn::from_u64(take_i64(&mut p)? as u64); // should be safe
+            let end_lsn = Lsn::from_u64(take_i64(&mut p)? as u64);
+            let commit_time_micros = take_i64(&mut p)?;
+
+            Ok(Some(ReplicationEvent::Commit {
+                lsn,
+                end_lsn,
+                commit_time_micros,
+            }))
+        }
+        b'M' => {
+            // Logical decoding message (pg_logical_emit_message)
+            // Wire: flags(1) + lsn(8) + prefix(null-terminated) + content_len(4) + content(n)
+            let flags = take_i8(&mut p)?;
+            let transactional = (flags & 1) != 0;
+            let lsn = Lsn::from_u64(take_i64(&mut p)? as u64);
+
+            // Read null-terminated prefix string
+            let prefix_end = p.iter().position(|&b| b == 0).ok_or_else(|| {
+                PgWireError::Protocol("pgoutput Message: missing null terminator for prefix".into())
+            })?;
+            let prefix = String::from_utf8_lossy(&p[..prefix_end]).into_owned();
+            p = &p[prefix_end + 1..]; // advance past null byte
+
+            let content_len = take_i32(&mut p)? as usize;
+            if p.len() < content_len {
+                return Err(PgWireError::Protocol(format!(
+                    "pgoutput Message: expected {} content bytes, got {}",
+                    content_len,
+                    p.len()
+                )));
+            }
+            let content = Bytes::copy_from_slice(&p[..content_len]);
+
+            Ok(Some(ReplicationEvent::Message {
+                transactional,
+                lsn,
+                prefix,
+                content,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Read authentication response data for a specific auth code.
+async fn read_auth_data<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    expected_code: i32,
+) -> Result<Vec<u8>> {
+    loop {
+        let msg = read_backend_message(stream).await?;
+        match msg.tag {
+            b'R' => {
+                let (code, data) = parse_auth_request(&msg.payload)?;
+                if code == expected_code {
+                    return Ok(data.to_vec());
+                }
+                return Err(PgWireError::Auth(format!(
+                    "unexpected auth code {code}, expected {expected_code}"
+                )));
+            }
+            b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
+            _ => {} // Skip other messages
+        }
+    }
+}
+
+/// Get current time as `PostgreSQL` timestamp (microseconds since 2000-01-01).
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "seconds since the UNIX epoch fit in i64 for the next ~292 billion years"
+)]
+fn current_pg_timestamp() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let unix_micros = (now.as_secs() as i64) * 1_000_000 + i64::from(now.subsec_micros());
+    unix_micros - PG_EPOCH_MICROS
+}
+
+/// Compute `PostgreSQL` MD5 password hash.
+#[cfg(feature = "md5")]
+fn postgres_md5(password: &str, user: &str, salt: [u8; 4]) -> String {
+    fn md5_hex(data: &[u8]) -> String {
+        format!("{:x}", md5::compute(data))
+    }
+
+    // First hash: md5(password + username)
+    let inner = md5_hex(format!("{password}{user}").as_bytes());
+
+    // Second hash: md5(inner_hash + salt)
+    let mut outer_input = inner.into_bytes();
+    outer_input.extend_from_slice(&salt);
+
+    format!("md5{}", md5_hex(&outer_input))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sasl_mechanisms_single() {
+        let data = b"SCRAM-SHA-256\0\0";
+        let mechs = parse_sasl_mechanisms(data);
+        assert_eq!(mechs, vec!["SCRAM-SHA-256"]);
+    }
+
+    #[test]
+    fn parse_sasl_mechanisms_multiple() {
+        let data = b"SCRAM-SHA-256\0SCRAM-SHA-256-PLUS\0\0";
+        let mechs = parse_sasl_mechanisms(data);
+        assert_eq!(mechs, vec!["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]);
+    }
+
+    #[test]
+    fn parse_sasl_mechanisms_empty() {
+        let mechs = parse_sasl_mechanisms(b"\0");
+        assert!(mechs.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "md5")]
+    fn postgres_md5_known_value() {
+        // Test vector: user="md5_user", password="md5_pass", salt=[0x01, 0x02, 0x03, 0x04]
+        // Can verify with: SELECT 'md5' || md5(md5('md5_passmd5_user') || E'\\x01020304');
+        let hash = postgres_md5("md5_pass", "md5_user", [0x01, 0x02, 0x03, 0x04]);
+        assert!(hash.starts_with("md5"));
+        assert_eq!(hash.len(), 35); // "md5" + 32 hex chars
+    }
+
+    #[test]
+    fn current_pg_timestamp_is_positive() {
+        // Any time after 2000-01-01 should be positive
+        let ts = current_pg_timestamp();
+        assert!(ts > 0);
+    }
+
+    /// Regression test for the feedback/backpressure coupling: when the consumer
+    /// stops draining the events channel, `send_event` must keep emitting standby
+    /// status updates every `status_interval` instead of parking silently. If it
+    /// didn't, Postgres would see no feedback and terminate the walsender on
+    /// `wal_sender_timeout`.
+    #[tokio::test]
+    async fn feedback_continues_while_events_channel_is_full() {
+        use tokio::io::{duplex, AsyncReadExt};
+
+        // Capacity-1 consumer channel, primed to full and never drained. `_rx`
+        // keeps it open so `send_event` blocks on backpressure (not closure).
+        let (out_tx, _rx) = mpsc::channel::<std::result::Result<ReplicationEvent, PgWireError>>(1);
+        out_tx
+            .try_send(Ok(ReplicationEvent::KeepAlive {
+                wal_end: Lsn(0),
+                reply_requested: false,
+                server_time_micros: 0,
+            }))
+            .expect("prime channel to full");
+
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        // Short real interval so the three feedback sends complete quickly.
+        let cfg = ReplicationConfig {
+            status_interval: std::time::Duration::from_millis(20),
+            feedback_while_backpressured: true,
+            ..Default::default()
+        };
+        let progress = Arc::new(SharedProgress::new(Lsn(42)));
+        let mut worker = WorkerState::new(cfg, progress, stop_rx, out_tx.clone());
+
+        // In-memory socket; the worker writes standby status updates on its side.
+        let (client_io, mut server_io) = duplex(64 * 1024);
+
+        let send = tokio::spawn(async move {
+            let mut stream = client_io;
+            let mut last_status_sent = Instant::now();
+            worker
+                .send_event(
+                    &mut stream,
+                    Ok(ReplicationEvent::KeepAlive {
+                        wal_end: Lsn(0),
+                        reply_requested: false,
+                        server_time_micros: 0,
+                    }),
+                    &mut last_status_sent,
+                )
+                .await
+        });
+
+        // Read three standby status updates, one per `status_interval`. Under the
+        // old coupling zero frames would ever arrive and `read_exact` would hang.
+        for _ in 0..3 {
+            let mut tag = [0u8; 1];
+            server_io
+                .read_exact(&mut tag)
+                .await
+                .expect("read frame tag");
+            assert_eq!(tag[0], b'd', "expected a CopyData frame");
+            let mut len = [0u8; 4];
+            server_io
+                .read_exact(&mut len)
+                .await
+                .expect("read frame len");
+            let payload_len = (u32::from_be_bytes(len) as usize) - 4;
+            let mut payload = vec![0u8; payload_len];
+            server_io
+                .read_exact(&mut payload)
+                .await
+                .expect("read frame payload");
+            assert_eq!(
+                payload[0], b'r',
+                "CopyData payload should be a standby status update"
+            );
+        }
+
+        // Feedback flowed *while* the send was still backpressured — the point of
+        // the fix.
+        assert!(
+            !send.is_finished(),
+            "send_event should still be parked on the full channel"
+        );
+        send.abort();
+    }
+}

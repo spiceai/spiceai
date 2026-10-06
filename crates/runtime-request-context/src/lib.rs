@@ -26,5 +26,7 @@ pub mod protocol;
 pub use protocol::*;
 pub mod user_agent;
 pub use user_agent::*;
+pub mod trace_id;
+pub use trace_id::*;
 pub mod traceparent;
 pub use traceparent::*;

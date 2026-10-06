@@ -21,6 +21,7 @@ use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
+    common::TableReference,
     common::{Column, Constraint, Constraints, DFSchemaRef, JoinType},
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
@@ -29,7 +30,6 @@ use datafusion::{
     },
     physical_plan::ExecutionPlan,
     prelude::{Expr, array_element, binary_expr, cast, col, ident, lit, substring},
-    sql::TableReference,
 };
 use datafusion_expr::select_expr::SelectExpr;
 use futures::future::BoxFuture;
@@ -207,6 +207,22 @@ impl SearchQueryProvider {
         ))
     }
 
+    /// The tighter of [`Self::pre_limit`] (the `limit` argument the caller gave
+    /// `vector_search()` / `text_search()`) and any limit `DataFusion` pushed into the scan,
+    /// or `None` when neither side asked for one.
+    ///
+    /// This has to bound the provider's *output*, not just its search-index input:
+    /// [`Self::join_with_base`] joins on [`Self::primary_key`], and nothing requires the base
+    /// table to hold exactly one row per key, so the join can emit more rows than it consumed.
+    ///
+    /// The bound is a row count, and rows sharing a key tie under the sort below (`_score`
+    /// then primary key), so which of them survives is unspecified — and `N` rows can
+    /// represent fewer than `N` distinct hits. [`Self::new`] separately advertises that key as
+    /// a `PrimaryKey` constraint it has not verified. #13289 tracks both.
+    fn effective_limit(pre_limit: Option<usize>, limit: Option<usize>) -> Option<usize> {
+        [pre_limit, limit].into_iter().flatten().min()
+    }
+
     /// Build the underlying table scan, removing search index metadata columns from projection
     fn underlying_table_scan(
         &self,
@@ -313,7 +329,11 @@ impl SearchQueryProvider {
             .alias("search_index")?
             .join(
                 self.underlying_table_scan(projection_column_names, filters, &search_index_schema)?,
-                JoinType::Left,
+                // The base table decides which rows exist, so a hit whose primary key is
+                // not there is a stale index entry rather than a result. An outer join
+                // would emit it with the base-table columns NULL-padded and a real
+                // `_score`, turning index staleness into a row the dataset does not have.
+                JoinType::Inner,
                 self.primary_key
                     .iter()
                     .map(|pk| {
@@ -370,13 +390,15 @@ impl SearchQueryProvider {
         &self,
         projection: Option<&Vec<usize>>,
         input: LogicalPlanBuilder,
+        match_required_by_filter: bool,
     ) -> Result<LogicalPlanBuilder, DataFusionError> {
         let search_col = self.search_column.as_str();
         let search_offset = ChunkedSearchIndex::chunking_offset_col(search_col);
         // If projection doesn't include/need the 'match' column, early exit.
         // Or if its not a chunked search query (doesn't have offsets in schema).
-        let match_not_required = projection
-            .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)));
+        let match_not_required = !match_required_by_filter
+            && projection
+                .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)));
         let chunked_search_field = self
             .schema()
             .column_with_name(search_offset.as_str())
@@ -407,7 +429,7 @@ impl SearchQueryProvider {
                 //  'Utf8') as '_match'
                 cast(
                     substring(
-                        col(search_col),
+                        ident(search_col),
                         binary_expr(first.clone(), Operator::Plus, lit(1)),
                         binary_expr(second, Operator::Minus, first),
                     ),
@@ -525,8 +547,19 @@ impl TableProvider for SearchQueryProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        // Like `ViewTable`, a filter is added on `scan` when needed
-        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+        // `_match` is synthesized after the search index and base table are joined, so it
+        // cannot be applied by either input scan. Keep its predicate above this provider.
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if expr_references_match_column(filter) {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    // Like `ViewTable`, a filter is added on `scan` when needed.
+                    TableProviderFilterPushDown::Exact
+                }
+            })
+            .collect())
     }
 
     async fn scan(
@@ -539,6 +572,14 @@ impl TableProvider for SearchQueryProvider {
         if let Some(ref callback) = self.scan_callback {
             callback().await;
         }
+
+        // `_match` is synthesized below, after the search index and base table are joined.
+        // Do not pass predicates that reference it to either input plan.
+        let (match_filters, input_filters): (Vec<Expr>, Vec<Expr>) = filters
+            .iter()
+            .cloned()
+            .partition(expr_references_match_column);
+        let match_required_by_filter = !match_filters.is_empty();
 
         // Final schema to match requested projection
         let schema_proj: SchemaRef = match projection {
@@ -557,7 +598,7 @@ impl TableProvider for SearchQueryProvider {
             let Some(match_idx) = self.match_column_index() else {
                 return proj;
             };
-            if !proj.contains(&match_idx) {
+            if !match_required_by_filter && !proj.contains(&match_idx) {
                 return proj;
             }
             let mut proj2 = proj;
@@ -583,9 +624,12 @@ impl TableProvider for SearchQueryProvider {
         let just_use_index = self.search_index_table_is_sufficient(
             &Arc::clone(self.search_index_query.schema()),
             inner_proj.as_ref(),
-            filters,
+            &input_filters,
         )?;
-        let search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
+        let mut search_lp = match (
+            just_use_index,
+            input_filters.iter().cloned().reduce(Expr::and),
+        ) {
             (true, None) => search_base.limit(0, self.pre_limit)?.limit(0, limit)?,
             (true, Some(filter)) => search_base
                 .filter(filter)?
@@ -595,7 +639,7 @@ impl TableProvider for SearchQueryProvider {
                 // Add supported filters BEFORE the pre_limit so they can be pushed down
                 // into the search index scan by DataFusion's PushDownFilter optimizer.
                 let search_index = if let Some(filter) =
-                    exprs_supported(filters, search_base.schema())
+                    exprs_supported(&input_filters, search_base.schema())
                         .iter()
                         .cloned()
                         .reduce(Expr::and)
@@ -605,10 +649,17 @@ impl TableProvider for SearchQueryProvider {
                     search_base.limit(0, self.pre_limit)?
                 };
 
-                self.join_with_base(inner_proj.as_ref(), search_index, filters)?
+                self.join_with_base(inner_proj.as_ref(), search_index, &input_filters)?
             }
+        };
+
+        search_lp =
+            self.add_match_column(inner_proj.as_ref(), search_lp, match_required_by_filter)?;
+        if let Some(filter) = match_filters.into_iter().reduce(Expr::and) {
+            search_lp = search_lp.filter(filter)?;
         }
-        .sort_with_limit(
+
+        let search_lp = search_lp.sort_with_limit(
             {
                 let mut sort_exprs = vec![SortExpr::new(
                     Expr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
@@ -624,12 +675,11 @@ impl TableProvider for SearchQueryProvider {
                 }));
                 sort_exprs
             },
-            limit,
+            Self::effective_limit(self.pre_limit, limit),
         )?;
 
         // Add final
-        let final_plan = self
-            .add_match_column(inner_proj.as_ref(), search_lp)?
+        let final_plan = search_lp
             .project(
                 schema_proj
                     .fields()
@@ -671,6 +721,12 @@ fn columns_missing_from(expr: &[Expr], schema: &DFSchemaRef) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn expr_references_match_column(expr: &Expr) -> bool {
+    expr.column_refs()
+        .iter()
+        .any(|column| column.name() == SEARCH_MATCH_COLUMN_NAME)
+}
+
 // Returns all expr in exprs that are supported by the `schema`.
 fn exprs_supported(exprs: &[Expr], schema: &DFSchemaRef) -> Vec<Expr> {
     let schema_cols = schema
@@ -690,4 +746,439 @@ fn exprs_supported(exprs: &[Expr], schema: &DFSchemaRef) -> Vec<Expr> {
         })
         .cloned()
         .collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{
+        Array, FixedSizeListArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    };
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
+    /// A base table of `(id, content, extra)` rows. `extra` is deliberately absent from the
+    /// search index so a `SELECT *` cannot be served by the index alone and the join under
+    /// test is actually planned.
+    fn base_table_of(
+        rows: &[(i64, &str, &str)],
+    ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(_, content, _)| *content)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, _, extra)| *extra).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+
+    /// Base table: the source of truth, one row per `id`.
+    fn base_table() -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        base_table_of(&[(1, "dog elephant", "a"), (2, "cat", "b")])
+    }
+
+    /// A base table holding **two** rows for `id = 1`, so an inner join on `id` emits more
+    /// rows than the search index handed it. This is in-contract: in production the join key
+    /// is whatever the index declared through `SearchIndex::primary_fields()`, and no
+    /// uniqueness check stands between that declaration and the join.
+    fn base_table_with_repeated_key() -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        base_table_of(&[
+            (1, "dog elephant", "a1"),
+            (1, "dog elephant", "a2"),
+            (2, "cat", "b"),
+        ])
+    }
+
+    /// A provider over [`base_table_with_repeated_key`], with `pre_limit` carrying the
+    /// caller's `vector_search(.., N)` argument.
+    fn provider_over_repeated_key(
+        hits: &[(i64, f64)],
+        pre_limit: Option<usize>,
+    ) -> Result<SearchQueryProvider, DataFusionError> {
+        Ok(SearchQueryProvider::new(
+            search_index_plan(hits)?,
+            base_table_with_repeated_key()?,
+            "content".to_string(),
+            vec!["id".to_string()],
+            pre_limit,
+        ))
+    }
+
+    /// Run `sql` against [`provider_over_repeated_key`] registered as `searched`.
+    async fn search_repeated_key(
+        hits: &[(i64, f64)],
+        pre_limit: Option<usize>,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "searched",
+            Arc::new(provider_over_repeated_key(hits, pre_limit)?),
+        )?;
+        ctx.sql(sql).await?.collect().await
+    }
+
+    fn row_count(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// A search index holding one entry per `(id, score)` pair. An `id` absent
+    /// from [`base_table`] stands in for an entry the source row no longer backs.
+    fn search_index_plan(hits: &[(i64, f64)]) -> Result<Arc<LogicalPlan>, DataFusionError> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(
+                    hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec!["dog elephant"; hits.len()])),
+                Arc::new(Float64Array::from(
+                    hits.iter().map(|(_, score)| *score).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+        let index: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+
+        Ok(Arc::new(
+            LogicalPlanBuilder::scan(
+                "search_index_source",
+                Arc::new(DefaultTableSource::new(index)),
+                None,
+            )?
+            .build()?,
+        ))
+    }
+
+    fn chunked_search_index_plan() -> Result<Arc<LogicalPlan>, DataFusionError> {
+        let offset_field = Arc::new(Field::new("item", DataType::Int32, false));
+        let offset_column = ChunkedSearchIndex::chunking_offset_col("content");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(
+                offset_column,
+                DataType::FixedSizeList(Arc::clone(&offset_field), 2),
+                false,
+            ),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, true),
+        ]));
+        let offsets = FixedSizeListArray::try_new(
+            offset_field,
+            2,
+            Arc::new(Int32Array::from(vec![0, 3])),
+            None,
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["dog elephant"])),
+                Arc::new(offsets),
+                Arc::new(Float64Array::from(vec![0.5])),
+            ],
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let index: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+
+        Ok(Arc::new(
+            LogicalPlanBuilder::scan(
+                "chunked_search_index_source",
+                Arc::new(DefaultTableSource::new(index)),
+                None,
+            )?
+            .build()?,
+        ))
+    }
+
+    /// `SELECT id, extra` over a search of [`base_table`] whose index holds `hits`.
+    async fn search_ids_and_extra(
+        hits: &[(i64, f64)],
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let provider = SearchQueryProvider::new(
+            search_index_plan(hits)?,
+            base_table()?,
+            "content".to_string(),
+            vec!["id".to_string()],
+            None,
+        );
+
+        let ctx = SessionContext::new();
+        ctx.register_table("searched", Arc::new(provider))?;
+        ctx.sql("SELECT id, extra FROM searched ORDER BY id")
+            .await?
+            .collect()
+            .await
+    }
+
+    fn ids(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column is Int64");
+                (0..b.num_rows()).map(|i| col.value(i)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Regression test for #12089: an unfiltered search must not surface an index
+    /// entry whose primary key is absent from the base table. Under an outer join
+    /// the stale `id = 999` entry came back with `extra` NULL and a real `_score` —
+    /// a row the dataset does not contain — and because it scored highest it was
+    /// the first result a top-k search would spend a slot on.
+    #[tokio::test]
+    async fn a_hit_with_no_base_row_is_dropped() -> Result<(), DataFusionError> {
+        let batches = search_ids_and_extra(&[(1, 0.5), (999, 0.98)]).await?;
+
+        assert_eq!(
+            ids(&batches),
+            vec![1],
+            "only the hit backed by a base-table row should be returned"
+        );
+
+        // The surviving row must carry real base-table values, not NULL padding.
+        let extra = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("extra column is Utf8");
+        assert!(
+            !extra.is_null(0),
+            "base-table columns must be populated for a live hit"
+        );
+        assert_eq!(extra.value(0), "a");
+
+        Ok(())
+    }
+
+    /// The join must not drop live hits: every base row the index knows about is
+    /// still returned, so the fix cannot pass by filtering too aggressively.
+    #[tokio::test]
+    async fn every_hit_backed_by_a_base_row_survives() -> Result<(), DataFusionError> {
+        let batches = search_ids_and_extra(&[(1, 0.5), (2, 0.25)]).await?;
+
+        assert_eq!(
+            ids(&batches),
+            vec![1, 2],
+            "both live hits should be returned"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for #12233: `_match` exists only after the provider joins
+    /// chunked search results with the base table, so its predicate must not be
+    /// planned against the base-table scan.
+    #[tokio::test]
+    async fn match_filter_is_applied_after_match_column_is_synthesized()
+    -> Result<(), DataFusionError> {
+        let provider = SearchQueryProvider::new(
+            chunked_search_index_plan()?,
+            base_table()?,
+            "content".to_string(),
+            vec!["id".to_string()],
+            None,
+        );
+        let ctx = SessionContext::new();
+        ctx.register_table("searched", Arc::new(provider))?;
+
+        let batches = ctx
+            .sql("SELECT id, extra FROM searched WHERE _match LIKE '%dog%'")
+            .await?
+            .collect()
+            .await?;
+
+        assert_eq!(ids(&batches), vec![1]);
+        Ok(())
+    }
+
+    /// Regression test for #13274: the `limit` argument to `vector_search()` /
+    /// `text_search()` bounds the provider's output, not just how many entries it
+    /// reads from the search index. The limit was applied only to the search-index
+    /// input, so the join with the base table emitted `2` rows for a requested `1`.
+    #[tokio::test]
+    async fn a_requested_limit_survives_a_join_that_fans_out() -> Result<(), DataFusionError> {
+        let batches = search_repeated_key(
+            &[(1, 0.9), (2, 0.5)],
+            Some(1),
+            "SELECT id, extra FROM searched",
+        )
+        .await?;
+
+        assert_eq!(
+            row_count(&batches),
+            1,
+            "a search asked for 1 row must return at most 1 row, however many base-table rows the join finds for that key"
+        );
+
+        Ok(())
+    }
+
+    /// The rows kept under the limit must be the highest-ranked ones. Capping the
+    /// output is only correct if it drops the *worst* rows: keeping both `id = 1`
+    /// rows and dropping the better-scoring `id = 2` would satisfy a count-only
+    /// assertion while returning the wrong results.
+    #[tokio::test]
+    async fn the_rows_kept_under_the_limit_are_the_highest_scoring() -> Result<(), DataFusionError>
+    {
+        let batches = search_repeated_key(
+            &[(1, 0.5), (2, 0.98)],
+            Some(2),
+            "SELECT id, extra FROM searched ORDER BY id",
+        )
+        .await?;
+
+        assert_eq!(
+            ids(&batches),
+            vec![1, 2],
+            "the top-scoring hit must keep its slot; the surplus row of the lower-scoring key is the one dropped"
+        );
+
+        Ok(())
+    }
+
+    /// Every combination of the rule, asserted where the provider actually decides it. The
+    /// end-to-end form of the tighter-SQL-limit direction proves nothing on its own: the outer
+    /// `LIMIT` bounds the result whatever this provider returns.
+    #[test]
+    fn the_effective_limit_is_the_tighter_of_the_two() {
+        let effective = SearchQueryProvider::effective_limit;
+
+        assert_eq!(
+            effective(Some(5), Some(1)),
+            Some(1),
+            "a tighter limit from the SQL plan wins"
+        );
+        assert_eq!(
+            effective(Some(1), Some(5)),
+            Some(1),
+            "the caller's search argument wins over a looser SQL limit"
+        );
+        assert_eq!(
+            effective(Some(3), None),
+            Some(3),
+            "the caller's search argument applies with no SQL limit at all"
+        );
+        assert_eq!(
+            effective(None, Some(3)),
+            Some(3),
+            "a SQL limit applies with no search argument"
+        );
+        assert_eq!(
+            effective(None, None),
+            None,
+            "neither side asked for a limit, so none is invented"
+        );
+    }
+
+    /// The caller's argument bounds the output end to end, where only this provider
+    /// can enforce it: a looser SQL limit leaves the surplus join rows to it.
+    #[tokio::test]
+    async fn the_search_argument_wins_over_a_looser_sql_limit() -> Result<(), DataFusionError> {
+        let batches = search_repeated_key(
+            &[(1, 0.9), (2, 0.5)],
+            Some(1),
+            "SELECT id, extra FROM searched LIMIT 5",
+        )
+        .await?;
+
+        assert_eq!(row_count(&batches), 1);
+        Ok(())
+    }
+
+    /// The cap must not be invented: with no limit on either side every joined row
+    /// is still returned, including the surplus rows of a repeated key.
+    #[tokio::test]
+    async fn an_unlimited_search_still_returns_every_joined_row() -> Result<(), DataFusionError> {
+        let batches = search_repeated_key(
+            &[(1, 0.9), (2, 0.5)],
+            None,
+            "SELECT id, extra FROM searched",
+        )
+        .await?;
+
+        assert_eq!(
+            row_count(&batches),
+            3,
+            "two rows for id = 1 plus one for id = 2"
+        );
+
+        Ok(())
+    }
+
+    /// The plan-shape half of #13274, and the acceptance criterion stated directly: the
+    /// requested limit must survive as a fetch *above* the join, not only on the search-index
+    /// side beneath it. It is asserted on the plan rather than on a row count because the
+    /// property does not depend on how much the join fans out — the sibling tests above cover
+    /// the one fan-out shape this module can build, while a deployment can multiply rows for
+    /// reasons a unit test cannot reproduce.
+    ///
+    /// Deliberately shape-locked, so it is coupled to `DataFusion`'s rendered operator names.
+    /// The SQL must carry no outer `LIMIT`: that would plant a `fetch=` of its own above the
+    /// join and the assertion would pass with the fix reverted, so the fetch value is pinned
+    /// to `pre_limit` to make such a change fail rather than go quiet.
+    #[tokio::test]
+    async fn the_fetch_is_planned_above_the_join() -> Result<(), DataFusionError> {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "searched",
+            Arc::new(provider_over_repeated_key(&[(1, 0.9), (2, 0.5)], Some(1))?),
+        )?;
+
+        let plan = ctx
+            .sql("SELECT id, extra FROM searched")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(false)
+            .to_string();
+
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let (join_line, join_indent) = rendered
+            .lines()
+            .enumerate()
+            .find_map(|(i, line)| line.contains("HashJoinExec").then(|| (i, indent(line))))
+            .unwrap_or_else(|| {
+                panic!("the base-table join is what the limit has to survive:\n{rendered}")
+            });
+
+        assert!(
+            rendered
+                .lines()
+                .take(join_line)
+                .any(|line| line.contains("fetch=1") && indent(line) < join_indent),
+            "the requested limit of 1 must be planned as a fetch above the join, not only below it:\n{rendered}"
+        );
+
+        Ok(())
+    }
 }

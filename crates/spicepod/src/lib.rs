@@ -39,6 +39,7 @@ use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod acceleration;
 pub mod component;
+pub mod drasi;
 pub mod extension;
 pub mod fts;
 mod keywords;
@@ -131,6 +132,24 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Whether the Spicepod file is absent, as opposed to present but
+    /// unloadable.
+    ///
+    /// A caller that tolerates a missing Spicepod — a Cloud Connect instance
+    /// that has connected but not yet received a deployment — must not also
+    /// tolerate a malformed one: silently serving nothing because of a YAML
+    /// typo hides the mistake instead of reporting it.
+    #[must_use]
+    pub fn is_spicepod_missing(&self) -> bool {
+        match self {
+            Self::SpicepodNotFound { .. } => true,
+            Self::UnableToOpenSpicepod { source, .. } => source.is_not_found(),
+            _ => false,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Spicepod {
@@ -410,6 +429,8 @@ impl Spicepod {
             let spicepod_rdr = fs
                 .open_yaml(path.clone(), "spicepod")
                 .await
+                .map_err(Box::new)
+                .context(UnableToOpenSpicepodSnafu { path: path.clone() })?
                 .context(SpicepodNotFoundSnafu { path: path.clone() })?;
             (spicepod_rdr, path.as_ref())
         };
@@ -430,6 +451,8 @@ impl Spicepod {
         let spicepod_rdr = fs
             .open_yaml(path.clone(), "spicepod")
             .await
+            .map_err(Box::new)
+            .context(UnableToOpenSpicepodSnafu { path: path.clone() })?
             .context(SpicepodNotFoundSnafu { path: path.clone() })?;
 
         let spicepod_definition: SpicepodDefinition =
@@ -515,6 +538,21 @@ mod tests {
             Spicepod::load_exact(&path)
                 .await
                 .expect("Should load spicepod");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_catalog_acceleration_example_spicepods_load() {
+        const FILES: [&str; 2] = [
+            "../../test/spicepods/tpch/sf1/accelerated/postgres[catalog][changes].yaml",
+            "../../tools/spicepodschema/tests/spicepod.catalogs.yaml",
+        ];
+
+        for file in FILES {
+            let path = PathBuf::from(file);
+            Spicepod::load_exact(&path)
+                .await
+                .unwrap_or_else(|e| panic!("Should load spicepod {file}: {e}"));
         }
     }
 
@@ -606,9 +644,9 @@ mod tests {
 ///   v2 uses `runtime.query.memory_limit`/`runtime.query.temp_directory`
 /// - v2 adds `runtime.ready_state`, `runtime.flight.do_put_rate_limit_enabled`,
 ///   `runtime.flight.ipc_compression`, `runtime.flight.batch_size`,
-///   `runtime.scheduler` partition assignment fields
+///   `runtime.scheduler` partition assignment fields, `runtime.state`
 /// - v2 adds `read_write_create` access mode
-/// - v2 adds `stale_while_revalidate_ttl` and `encoding` to `SQLResultsCacheConfig`
+/// - v2 adds `stale_while_revalidate_ttl`, `encoding`, and `warmup` to `SQLResultsCacheConfig`
 #[cfg(test)]
 mod version_tests {
     use super::*;
@@ -1095,7 +1133,10 @@ mod version_tests {
             .scheduler
             .as_ref()
             .expect("scheduler should be present");
-        assert_eq!(scheduler.state_location, "s3://my-bucket/scheduler-state");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://my-bucket/scheduler-state")
+        );
         assert_eq!(scheduler.partition_assignment_interval, "15s");
         assert_eq!(scheduler.max_partition_assignments_per_interval, 50);
         assert_eq!(scheduler.max_partitions_per_executor, 500);
@@ -1220,6 +1261,74 @@ mod version_tests {
         assert!(source_rate_control.params.is_some());
     }
 
+    #[test]
+    fn test_runtime_state_deserializes() {
+        let yaml = r"
+            state:
+              location: s3://my-bucket/spice-state
+              params:
+                s3_region: us-east-1
+                s3_auth: iam_role
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let state = runtime.state.as_ref().expect("state section should exist");
+        assert_eq!(state.location, "s3://my-bucket/spice-state");
+        assert!(state.params.is_some());
+        let scheduler = runtime
+            .resolved_scheduler()
+            .expect("runtime.state should fill scheduler state");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://my-bucket/spice-state")
+        );
+    }
+
+    #[test]
+    fn test_runtime_scheduler_state_location_overrides_shared_state() {
+        let yaml = r"
+            state:
+              location: s3://shared/spice-state
+            scheduler:
+              state_location: s3://cluster/scheduler-state
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let scheduler = runtime
+            .resolved_scheduler()
+            .expect("scheduler section should exist");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://cluster/scheduler-state")
+        );
+    }
+
+    #[test]
+    fn test_runtime_scheduler_inherits_state_location_field_level() {
+        let yaml = r"
+            state:
+              location: s3://shared/spice-state
+              params:
+                s3_region: us-east-1
+            scheduler:
+              partition_assignment_interval: 15s
+              max_partitions_per_executor: 42
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let scheduler = runtime
+            .resolved_scheduler()
+            .expect("scheduler section should exist");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://shared/spice-state"),
+            "omitted scheduler.state_location must fall back to runtime.state.location"
+        );
+        assert_eq!(scheduler.partition_assignment_interval, "15s");
+        assert_eq!(scheduler.max_partitions_per_executor, 42);
+        assert!(
+            scheduler.params.is_some(),
+            "omitted scheduler.params must fall back to runtime.state.params"
+        );
+    }
+
     /// `read_write_create` access mode deserializes.
     #[test]
     fn test_access_mode_read_write_create() {
@@ -1261,6 +1370,24 @@ mod version_tests {
         assert_eq!(config.item_ttl, Some("30s".to_string()));
         assert_eq!(config.stale_while_revalidate_ttl, Some("60s".to_string()));
         assert_eq!(config.encoding, Encoding::Zstd);
+        assert_eq!(
+            config.warmup,
+            component::caching::ResultsCacheWarmup::Disabled
+        );
+    }
+
+    #[test]
+    fn test_sql_results_cache_warmup_on_first_refresh() {
+        let yaml = r"
+            enabled: true
+            warmup: on_first_refresh
+        ";
+        let config: component::caching::SQLResultsCacheConfig =
+            yaml::from_str(yaml).expect("Should parse SQLResultsCacheConfig");
+        assert_eq!(
+            config.warmup,
+            component::caching::ResultsCacheWarmup::OnFirstRefresh
+        );
     }
 
     /// `Query` struct with `spill_compression`.
@@ -1392,6 +1519,58 @@ mod version_tests {
             .await
             .expect("load_from should find spicepod.yaml in a directory");
         assert_eq!(pod.name, "test_pod");
+    }
+
+    #[tokio::test]
+    async fn is_spicepod_missing_distinguishes_absent_from_unloadable() {
+        struct PermissionDeniedFilesystem;
+
+        #[async_trait::async_trait]
+        impl reader::ReadablePath for PermissionDeniedFilesystem {
+            async fn open(
+                &self,
+                path: PathBuf,
+            ) -> reader::Result<Box<dyn std::io::Read + Send + Sync>> {
+                Err(reader::Error::UnableToOpenPath {
+                    source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    path,
+                })
+            }
+        }
+
+        impl reader::ReadableYaml for PermissionDeniedFilesystem {}
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        let absent_in_dir = Spicepod::load_from(&reader::StdFileSystem, dir.path())
+            .await
+            .expect_err("an empty directory has no spicepod.yaml");
+        assert!(absent_in_dir.is_spicepod_missing());
+
+        let absent_file = Spicepod::load_from(&reader::StdFileSystem, dir.path().join("pod.yaml"))
+            .await
+            .expect_err("a named file that does not exist cannot load");
+        assert!(absent_file.is_spicepod_missing());
+
+        std::fs::write(
+            dir.path().join("spicepod.yaml"),
+            "version: v1\nkind: Spicepod\n",
+        )
+        .expect("write spicepod.yaml");
+        let malformed = Spicepod::load_from(&reader::StdFileSystem, dir.path())
+            .await
+            .expect_err("a spicepod.yaml with no name does not match the schema");
+        assert!(!malformed.is_spicepod_missing());
+
+        let Err(unreadable) = Spicepod::load_from(&PermissionDeniedFilesystem, dir.path()).await
+        else {
+            panic!("permission denied must fail to load");
+        };
+        assert!(
+            matches!(unreadable, Error::UnableToOpenSpicepod { .. }),
+            "the original open error must be preserved: {unreadable}"
+        );
+        assert!(!unreadable.is_spicepod_missing());
     }
 
     /// A directory with dots/dashes in its name (e.g. `my.app-sample`)
@@ -1709,7 +1888,10 @@ mod version_tests {
         ";
         let scheduler: component::runtime::Scheduler =
             yaml::from_str(yaml).expect("Should parse Scheduler");
-        assert_eq!(scheduler.state_location, "s3://bucket/state");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://bucket/state")
+        );
         assert_eq!(
             scheduler.max_partitions_per_executor, 1000,
             "partition assignment fields should default when not specified"

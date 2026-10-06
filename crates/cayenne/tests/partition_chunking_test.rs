@@ -376,48 +376,51 @@ async fn test_timestamp_partition_with_date_part_impl(
     println!("\n--- Inserting timestamped data ---");
 
     // January 2024 data (month="2024-01")
-    for i in 0..1000 {
-        let timestamp_ms = 1_704_067_200_000_i64 + (i * 3_600_000); // Jan 1, 2024 00:00:00 UTC + i hours
-        let month = "2024-01";
-        let value = i;
-
-        ctx.sql(&format!(
-            "INSERT INTO timestamp_partitioned_table VALUES ({i}, {timestamp_ms}, {value}, '{month}')",
-        ))
-        .await?
-        .collect()
-        .await?;
-    }
+    let rows = (0..1000)
+        .map(|i| {
+            let timestamp_ms = 1_704_067_200_000_i64 + (i * 3_600_000); // Jan 1, 2024 00:00:00 UTC + i hours
+            format!("({i}, {timestamp_ms}, {i}, '2024-01')")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    ctx.sql(&format!(
+        "INSERT INTO timestamp_partitioned_table SELECT * FROM (VALUES {rows})",
+    ))
+    .await?
+    .collect()
+    .await?;
     println!("✓ Inserted 1000 rows for January (month=2024-01)");
 
     // February 2024 data (month="2024-02")
-    for i in 1000..2000 {
-        let timestamp_ms = 1_706_745_600_000_i64 + ((i - 1000) * 3_600_000); // Feb 1, 2024 00:00:00 UTC
-        let month = "2024-02";
-        let value = i;
-
-        ctx.sql(&format!(
-            "INSERT INTO timestamp_partitioned_table VALUES ({i}, {timestamp_ms}, {value}, '{month}')",
-        ))
-        .await?
-        .collect()
-        .await?;
-    }
+    let rows = (1000..2000)
+        .map(|i| {
+            let timestamp_ms = 1_706_745_600_000_i64 + ((i - 1000) * 3_600_000); // Feb 1, 2024 00:00:00 UTC
+            format!("({i}, {timestamp_ms}, {i}, '2024-02')")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    ctx.sql(&format!(
+        "INSERT INTO timestamp_partitioned_table SELECT * FROM (VALUES {rows})",
+    ))
+    .await?
+    .collect()
+    .await?;
     println!("✓ Inserted 1000 rows for February (month=2024-02)");
 
     // March 2024 data (month="2024-03")
-    for i in 2000..2500 {
-        let timestamp_ms = 1_709_251_200_000_i64 + ((i - 2000) * 3_600_000); // Mar 1, 2024 00:00:00 UTC
-        let month = "2024-03";
-        let value = i;
-
-        ctx.sql(&format!(
-            "INSERT INTO timestamp_partitioned_table VALUES ({i}, {timestamp_ms}, {value}, '{month}')",
-        ))
-        .await?
-        .collect()
-        .await?;
-    }
+    let rows = (2000..2500)
+        .map(|i| {
+            let timestamp_ms = 1_709_251_200_000_i64 + ((i - 2000) * 3_600_000); // Mar 1, 2024 00:00:00 UTC
+            format!("({i}, {timestamp_ms}, {i}, '2024-03')")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    ctx.sql(&format!(
+        "INSERT INTO timestamp_partitioned_table SELECT * FROM (VALUES {rows})",
+    ))
+    .await?
+    .collect()
+    .await?;
     println!("✓ Inserted 500 rows for March (month=2024-03)");
 
     println!("\n--- Querying partitioned timestamp data ---");

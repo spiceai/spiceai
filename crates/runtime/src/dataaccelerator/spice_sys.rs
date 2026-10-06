@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,465 +14,226 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Durable storage for Spice operational data related to acceleration.
+//! Resolving a dataset to the sidecar stores its accelerator keeps for it.
+//!
+//! The `spice_sys_*` tables — CDC stream positions, the dataset schema checkpoint, the
+//! caching engine's fetch marker — live inside the dataset's own accelerator database.
+//! The per-engine SQL for them lives in the `runtime-checkpoint-{duckdb,sqlite,turso,
+//! postgres}` crates, behind [`AcceleratorSidecar`].
+//!
+//! What is left here is only the *resolution*: a dataset names an engine, the registry
+//! hands back that engine, and the engine hands back its sidecar. Nothing in this
+//! module names a connection pool or a driver, which is what lets the engines move
+//! below `runtime`.
 
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso",
-    feature = "postgres-accel"
-))]
-use std::path::Path;
-#[cfg(any(feature = "duckdb", feature = "turso"))]
 use std::sync::Arc;
 
+use runtime_acceleration::{
+    dataset_checkpoint::{
+        DatasetCheckpointer, DatasetCheckpointerFactory, make_checkpointer_factory,
+    },
+    sidecar::{AcceleratorSidecar, OpenOption},
+    snapshot::SnapshotBehavior,
+};
+use runtime_checkpoint_api::{BlobCheckpointStore, CheckpointError};
+
 use super::AccelerationSource;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso",
-    feature = "postgres-accel"
-))]
-use snafu::ResultExt;
-use snafu::{OptionExt, Snafu};
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 
-#[cfg(feature = "postgres-accel")]
-use {
-    datafusion_table_providers::sql::db_connection_pool::postgrespool::{
-        self, PostgresConnectionPool,
-    },
-    datafusion_table_providers::util::secrets::to_secret_map,
-};
-
-#[cfg(all(not(windows), feature = "sqlite"))]
-use super::DataAccelerator;
-#[cfg(all(not(windows), feature = "sqlite"))]
-use super::cayenne::{CayenneAccelerator, Error as CayenneError};
-#[cfg(feature = "turso")]
-use super::turso::{Error as TursoError, TursoAccelerator};
-#[cfg(feature = "duckdb")]
-use {
-    super::duckdb::{DuckDBAccelerator, Error as DuckDbError},
-    super::partitioned_duckdb::{Error as PartitionedDuckDbError, PartitionedDuckDBAccelerator},
-    datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
-};
-#[cfg(feature = "sqlite")]
-use {
-    super::sqlite::{Error as SqliteError, SqliteAccelerator},
-    datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
-};
-
-use crate::component::dataset::acceleration::Engine;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso",
-    feature = "postgres-accel"
-))]
-use crate::dataaccelerator::get_registered_accelerator;
-
-pub mod dataset_checkpoint;
-#[cfg(feature = "debezium")]
-pub mod debezium_kafka;
-
-#[cfg(feature = "kafka")]
-pub mod kafka;
-
-#[cfg(feature = "dynamodb")]
-pub mod dynamodb;
-
-#[cfg(feature = "mongodb")]
-pub mod mongodb;
-
-#[cfg(any(feature = "kafka", feature = "debezium"))]
-mod offsets;
-
-pub mod caching_engine;
-
-enum AccelerationConnection {
-    #[cfg(feature = "duckdb")]
-    DuckDB(Arc<DuckDbConnectionPool>),
-    #[cfg(feature = "postgres-accel")]
-    Postgres(PostgresConnectionPool),
-    #[cfg(feature = "sqlite")]
-    SQLite(SqliteConnectionPool),
-    #[cfg(feature = "turso")]
-    Turso(Arc<super::turso::TursoConnectionPool>),
-    #[cfg(all(not(windows), feature = "sqlite"))]
-    Cayenne(SqliteConnectionPool),
-}
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Acceleration is not enabled"))]
-    AccelerationNotEnabled,
-
-    #[snafu(display("{engine:?} accelerator engine not available"))]
-    AcceleratorEngineUnavailable { engine: Engine },
-
-    #[cfg(feature = "duckdb")]
-    #[snafu(display("Failed to resolve DuckDB file path: {source}"))]
-    DuckDbFilePath { source: DuckDbError },
-
-    #[cfg(feature = "duckdb")]
-    #[snafu(display("DuckDB file does not exist at {path}"))]
-    DuckDbFileMissing { path: String },
-
-    #[cfg(feature = "duckdb")]
-    #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
-    DuckDbPool { source: DuckDbError },
-
-    #[cfg(feature = "duckdb")]
-    #[snafu(display("Unable to create Partitioned DuckDB connection pool: {source}"))]
-    PartitionedDuckDbPool { source: PartitionedDuckDbError },
-
-    #[cfg(feature = "sqlite")]
-    #[snafu(display("Failed to resolve SQLite file path: {source}"))]
-    SqliteFilePath { source: SqliteError },
-
-    #[cfg(feature = "sqlite")]
-    #[snafu(display("SQLite file does not exist at {path}"))]
-    SqliteFileMissing { path: String },
-
-    #[cfg(feature = "sqlite")]
-    #[snafu(display("Unable to create SQLite connection pool: {source}"))]
-    SqlitePool { source: SqliteError },
-
-    #[cfg(feature = "postgres-accel")]
-    #[snafu(display("Unable to create PostgreSQL connection pool: {source}"))]
-    PostgresPool { source: postgrespool::Error },
-
-    #[cfg(not(feature = "duckdb"))]
-    #[snafu(display("Spice wasn't built with DuckDB support enabled"))]
-    DuckDbFeatureNotEnabled,
-
-    #[cfg(not(feature = "sqlite"))]
-    #[snafu(display("Spice wasn't built with SQLite support enabled"))]
-    SqliteFeatureNotEnabled,
-
-    #[cfg(not(feature = "postgres-accel"))]
-    #[snafu(display("Spice wasn't built with PostgreSQL acceleration support enabled"))]
-    PostgresFeatureNotEnabled,
-
-    #[cfg(feature = "turso")]
-    #[snafu(display("Failed to resolve Turso file path: {source}"))]
-    TursoFilePath { source: TursoError },
-
-    #[cfg(feature = "turso")]
-    #[snafu(display("Turso file does not exist at {path}"))]
-    TursoFileMissing { path: String },
-
-    #[cfg(feature = "turso")]
-    #[snafu(display("Unable to create Turso connection: {source}"))]
-    TursoConnection { source: TursoError },
-
-    #[cfg(not(feature = "turso"))]
-    #[snafu(display("Spice wasn't built with Turso support enabled"))]
-    TursoFeatureNotEnabled,
-
-    #[cfg(all(not(windows), feature = "sqlite"))]
-    #[snafu(display("Failed to resolve Cayenne file path: {source}"))]
-    CayenneFilePath { source: CayenneError },
-
-    #[cfg(all(not(windows), feature = "sqlite"))]
-    #[snafu(display("Cayenne metadata directory does not exist at {path}"))]
-    CayenneMetadataMissing { path: String },
-
-    #[cfg(all(not(windows), feature = "sqlite"))]
-    #[snafu(display("Unable to create Cayenne connection pool: {source}"))]
-    CayennePool {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{engine} acceleration not supported"))]
-    UnsupportedEngine { engine: Engine },
-
-    #[snafu(display("No acceleration connection available"))]
-    NoAccelerationConnection,
-
-    #[snafu(display(
-        "Failed to process accelerated data: internal type conversion error for '{target}'"
-    ))]
-    DowncastFailed { target: &'static str },
-
-    #[snafu(display("Acceleration error: {source}"))]
-    External {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
-
-impl Error {
-    #[cfg(any(
-        feature = "sqlite",
-        feature = "duckdb",
-        feature = "postgres",
-        feature = "turso",
-        feature = "kafka",
-        feature = "mongodb"
-    ))]
-    fn external(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self::External { source: err.into() }
-    }
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub enum OpenOption {
-    CreateIfNotExists,
-    OpenExisting,
-}
-
-async fn acceleration_connection(
+/// Resolves `source`'s sidecar through its configured accelerator engine.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] when acceleration is disabled, the engine is not
+/// registered (not compiled in), or the engine cannot open its sidecar.
+pub async fn sidecar_for(
     source: &dyn AccelerationSource,
-    #[cfg_attr(
-        not(any(feature = "duckdb", feature = "sqlite", feature = "turso")),
-        expect(unused_variables)
-    )]
+    registry: Arc<AcceleratorEngineRegistry>,
     open_option: OpenOption,
-) -> Result<AccelerationConnection> {
-    let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
-    match acceleration_settings.engine {
-        #[cfg(feature = "duckdb")]
-        Engine::DuckDB => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineUnavailableSnafu {
-                    engine: Engine::DuckDB,
-                })?;
+) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+    let acceleration = source
+        .acceleration()
+        .ok_or_else(|| CheckpointError::Store {
+            source: "Acceleration is not enabled".into(),
+        })?;
+    let engine = acceleration.engine;
 
-            let duckdb_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<DuckDBAccelerator>()
-                .context(DowncastFailedSnafu {
-                    target: "DuckDBAccelerator",
-                })?;
+    let accelerator = registry
+        .get_accelerator_engine(engine)
+        .await
+        .ok_or_else(|| CheckpointError::Store {
+            source: format!("{engine} accelerator engine not available").into(),
+        })?;
 
-            let duckdb_file = duckdb_accelerator
-                .duckdb_file_path(source)
-                .context(DuckDbFilePathSnafu)?;
-            if open_option == OpenOption::OpenExisting && !Path::new(&duckdb_file).exists() {
-                return DuckDbFileMissingSnafu { path: duckdb_file }.fail();
-            }
+    accelerator
+        .sidecar(source, Arc::clone(&registry), open_option)
+        .await
+}
 
-            let pool = duckdb_accelerator
-                .get_shared_pool(source)
-                .await
-                .context(DuckDbPoolSnafu)?;
+/// The dataset's sidecar, resolved from the runtime handle it carries.
+async fn dataset_sidecar(
+    dataset: &crate::component::dataset::Dataset,
+    open_option: OpenOption,
+) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+    let registry = dataset.runtime.accelerator_engine_registry();
+    sidecar_for(dataset, registry, open_option).await
+}
 
-            Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
+/// Construct the per-dataset **blob** checkpoint store backed by the dataset's own
+/// accelerator, writing into the sidecar `table_name`.
+///
+/// Returns `None` when the dataset has no usable accelerator connection (acceleration
+/// disabled, or the engine isn't compiled in), so a CDC connector degrades to
+/// re-bootstrapping from scratch rather than failing.
+pub async fn checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+    table_name: &'static str,
+) -> Option<Arc<dyn BlobCheckpointStore>> {
+    let sidecar = match dataset_sidecar(dataset, OpenOption::CreateIfNotExists).await {
+        Ok(sidecar) => sidecar,
+        Err(e) => {
+            // Surface *why* checkpointing is unavailable (missing engine feature,
+            // missing file, pool-init failure, …) instead of a silent `None`.
+            tracing::warn!(
+                dataset = %dataset.name,
+                error = %e,
+                "Could not resolve the dataset's accelerator connection for checkpoint storage; the connector will run without a persisted checkpoint"
+            );
+            return None;
         }
-        #[cfg(feature = "duckdb")]
-        Engine::PartitionedDuckDB => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineUnavailableSnafu {
-                    engine: Engine::PartitionedDuckDB,
-                })?;
-            let duckdb_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<PartitionedDuckDBAccelerator>()
-                .context(DowncastFailedSnafu {
-                    target: "PartitionedDuckDBAccelerator",
-                })?;
+    };
 
-            let pool = duckdb_accelerator
-                .get_shared_pool(source)
-                .await
-                .context(PartitionedDuckDbPoolSnafu)?;
-
-            Ok(AccelerationConnection::DuckDB(pool))
+    match sidecar.blob_checkpoint_store(table_name) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!(
+                dataset = %dataset.name,
+                error = %e,
+                "The dataset's accelerator does not store connector checkpoints; the connector will run without a persisted checkpoint"
+            );
+            None
         }
-        #[cfg(feature = "duckdb")]
-        Engine::TableModePartitionedDuckDB => {
-            use crate::dataaccelerator::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineUnavailableSnafu {
-                    engine: Engine::TableModePartitionedDuckDB,
-                })?;
-            let duckdb_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<TablesModePartitionedDuckDBAccelerator>()
-                .context(DowncastFailedSnafu {
-                    target: "TableModePartitionedDuckDBAccelerator",
-                })?;
-
-            let pool = duckdb_accelerator
-                .get_shared_pool(source)
-                .await
-                .context(PartitionedDuckDbPoolSnafu)?;
-
-            Ok(AccelerationConnection::DuckDB(pool))
-        }
-        #[cfg(not(feature = "duckdb"))]
-        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
-            DuckDbFeatureNotEnabledSnafu.fail()
-        }
-        #[cfg(feature = "sqlite")]
-        Engine::Sqlite => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineUnavailableSnafu {
-                    engine: Engine::Sqlite,
-                })?;
-            let sqlite_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<SqliteAccelerator>()
-                .context(DowncastFailedSnafu {
-                    target: "SqliteAccelerator",
-                })?;
-
-            let sqlite_file = sqlite_accelerator
-                .sqlite_file_path(source)
-                .context(SqliteFilePathSnafu)?;
-            if open_option == OpenOption::OpenExisting && !Path::new(&sqlite_file).exists() {
-                return SqliteFileMissingSnafu { path: sqlite_file }.fail();
-            }
-
-            let conn = sqlite_accelerator
-                .get_shared_pool(source)
-                .await
-                .context(SqlitePoolSnafu)?;
-
-            Ok(AccelerationConnection::SQLite(conn))
-        }
-        #[cfg(not(feature = "sqlite"))]
-        Engine::Sqlite => SqliteFeatureNotEnabledSnafu.fail(),
-        #[cfg(feature = "postgres-accel")]
-        Engine::PostgreSQL => {
-            let secret_map = to_secret_map(acceleration_settings.params.clone());
-
-            let pool = PostgresConnectionPool::new(secret_map)
-                .await
-                .context(PostgresPoolSnafu)?;
-
-            Ok(AccelerationConnection::Postgres(pool))
-        }
-        #[cfg(not(feature = "postgres-accel"))]
-        Engine::PostgreSQL => PostgresFeatureNotEnabledSnafu.fail(),
-
-        #[cfg(feature = "turso")]
-        Engine::Turso => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineUnavailableSnafu {
-                    engine: Engine::Turso,
-                })?;
-            let turso_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<TursoAccelerator>()
-                .context(DowncastFailedSnafu {
-                    target: "TursoAccelerator",
-                })?;
-
-            let turso_file = turso_accelerator
-                .turso_file_path(source)
-                .context(TursoFilePathSnafu)?;
-            if open_option == OpenOption::OpenExisting && !Path::new(&turso_file).exists() {
-                return TursoFileMissingSnafu { path: turso_file }.fail();
-            }
-
-            let pool = turso_accelerator
-                .get_shared_pool(source)
-                .await
-                .context(TursoConnectionSnafu)?;
-
-            Ok(AccelerationConnection::Turso(pool))
-        }
-        #[cfg(not(feature = "turso"))]
-        Engine::Turso => TursoFeatureNotEnabledSnafu.fail(),
-        #[cfg(all(not(windows), feature = "sqlite"))]
-        Engine::Cayenne => {
-            use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
-            use std::sync::Arc;
-
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineUnavailableSnafu {
-                    engine: Engine::Cayenne,
-                })?;
-            let cayenne_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<CayenneAccelerator>()
-                .context(DowncastFailedSnafu {
-                    target: "CayenneAccelerator",
-                })?;
-
-            // Validate that we can resolve the file path (used for file existence check validation)
-            let _ = cayenne_accelerator
-                .file_path(source)
-                .map_err(|e| Error::CayenneFilePath {
-                    source: super::cayenne::Error::InvalidConfiguration {
-                        detail: std::sync::Arc::from(format!("{e}")),
-                    },
-                })?;
-
-            // Derive metadata directory using shared resolution logic
-            let metadata_dir = CayenneAccelerator::resolve_metadata_dir(source.acceleration());
-
-            let metadata_db_path = format!("{metadata_dir}/cayenne.db");
-
-            if open_option == OpenOption::OpenExisting && !Path::new(&metadata_db_path).exists() {
-                return CayenneMetadataMissingSnafu {
-                    path: metadata_db_path,
-                }
-                .fail();
-            }
-
-            // Ensure metadata directory exists
-            if let Some(parent) = Path::new(&metadata_db_path).parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| Error::CayennePool {
-                        source: Box::new(e),
-                    })?;
-            }
-
-            // When the Cayenne metastore backend is Turso, it owns `cayenne.db` as a
-            // libSQL/MVCC database. Route the checkpoint through a Turso connection
-            // on that same file rather than opening it as a raw SQLite pool, which
-            // would re-stamp it SQLite-WAL and conflict with the metastore.
-            #[cfg(feature = "turso")]
-            {
-                let metastore_type = source
-                    .acceleration()
-                    .and_then(|a| a.params.get("cayenne_metastore"))
-                    .map_or("sqlite", String::as_str);
-                if metastore_type == "turso" {
-                    let pool = super::turso::TursoConnectionPool::new(&metadata_db_path)
-                        .await
-                        .map_err(|e| Error::CayennePool {
-                            source: Box::new(e),
-                        })?;
-                    return Ok(AccelerationConnection::Turso(Arc::new(pool)));
-                }
-            }
-
-            // Create SQLite connection pool for cayenne metadata using the factory
-            let sqlite_factory = SqliteTableProviderFactory::new();
-            let pool = sqlite_factory
-                .get_or_init_instance(
-                    Arc::from(metadata_db_path.as_str()),
-                    datafusion_table_providers::sql::db_connection_pool::Mode::File,
-                    std::time::Duration::from_secs(5),
-                )
-                .await
-                .map_err(|e| Error::CayennePool {
-                    source: Box::new(e),
-                })?;
-
-            Ok(AccelerationConnection::Cayenne(pool))
-        }
-        #[cfg(any(windows, not(feature = "sqlite")))]
-        Engine::Cayenne => UnsupportedEngineSnafu {
-            engine: Engine::Cayenne,
-        }
-        .fail(),
-        Engine::Arrow | Engine::PartitionedArrow => UnsupportedEngineSnafu {
-            engine: acceleration_settings.engine,
-        }
-        .fail(),
     }
+}
+
+/// Construct the **Kafka** checkpoint store over this dataset's accelerator.
+///
+/// Unlike [`checkpoint_store`] this reports a resolution failure as an error: the Kafka
+/// connector refuses to register a dataset whose offsets it cannot persist, because
+/// replaying a topic from the beginning into an append accelerator duplicates rows.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] when the sidecar cannot be resolved.
+pub async fn kafka_checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> Result<Arc<dyn runtime_checkpoint_api::kafka::KafkaCheckpointStore>, CheckpointError> {
+    dataset_sidecar(dataset, OpenOption::CreateIfNotExists)
+        .await?
+        .kafka_checkpoint_store()
+}
+
+/// Construct the **Debezium** checkpoint store over this dataset's accelerator.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] when the sidecar cannot be resolved.
+pub async fn debezium_checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> Result<Arc<dyn runtime_checkpoint_api::debezium::DebeziumCheckpointStore>, CheckpointError> {
+    dataset_sidecar(dataset, OpenOption::CreateIfNotExists)
+        .await?
+        .debezium_checkpoint_store()
+}
+
+/// Construct the **`MySQL` binlog** position store over this dataset's accelerator.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] when the sidecar cannot be resolved.
+pub async fn mysql_binlog_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> Result<Arc<dyn runtime_checkpoint_api::mysql_binlog::MySqlBinlogStore>, CheckpointError> {
+    dataset_sidecar(dataset, OpenOption::CreateIfNotExists)
+        .await?
+        .mysql_binlog_store()
+}
+
+/// Construct the **`MongoDB`** resume-token store over this dataset's accelerator.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] when the sidecar cannot be resolved.
+pub async fn mongo_checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> Result<Arc<dyn runtime_checkpoint_api::mongodb::MongoCheckpointStore>, CheckpointError> {
+    dataset_sidecar(dataset, OpenOption::CreateIfNotExists)
+        .await?
+        .mongo_checkpoint_store()
+}
+
+/// Records that the caching engine fetched this dataset just now.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] when the sidecar cannot be resolved, or when the
+/// dataset's engine does not serve cached results.
+pub async fn update_caching_engine_fetched_at(
+    dataset: &crate::component::dataset::Dataset,
+) -> Result<(), CheckpointError> {
+    dataset_sidecar(dataset, OpenOption::OpenExisting)
+        .await?
+        .update_caching_engine_fetched_at()
+        .await
+}
+
+/// A [`DatasetCheckpointerFactory`] over `source`'s acceleration checkpoint, opened
+/// read-only.
+///
+/// This is what satisfies `AccelerationSource::checkpointer_factory` for every source
+/// the runtime owns. It exists so the snapshot bootstrap — which lives below `runtime`
+/// — can reconcile a downloaded snapshot against the stored checkpoint without naming
+/// an engine.
+///
+/// A factory rather than the checkpointer itself because opening one touches the
+/// accelerator, and the caller decides whether it needs to.
+pub(crate) fn checkpointer_factory(
+    source: &dyn AccelerationSource,
+    registry: Arc<AcceleratorEngineRegistry>,
+    snapshot_behavior: SnapshotBehavior,
+) -> DatasetCheckpointerFactory {
+    let source = source.clone_arc();
+    make_checkpointer_factory(move || {
+        let source = Arc::clone(&source);
+        let registry = Arc::clone(&registry);
+        let snapshot_behavior = snapshot_behavior.clone();
+        async move {
+            dataset_checkpointer(
+                source.as_ref(),
+                registry,
+                OpenOption::OpenExisting,
+                snapshot_behavior,
+            )
+            .await
+            .map_err(Into::into)
+        }
+    })
+}
+
+/// The dataset schema/refresh-SQL checkpoint held by `source`'s accelerator.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] when the sidecar cannot be resolved, or when the
+/// engine cannot host a checkpoint.
+pub async fn dataset_checkpointer(
+    source: &dyn AccelerationSource,
+    registry: Arc<AcceleratorEngineRegistry>,
+    open_option: OpenOption,
+    snapshot_behavior: SnapshotBehavior,
+) -> Result<Arc<dyn DatasetCheckpointer>, CheckpointError> {
+    sidecar_for(source, registry, open_option)
+        .await?
+        .dataset_checkpointer(snapshot_behavior)
+        .await
 }

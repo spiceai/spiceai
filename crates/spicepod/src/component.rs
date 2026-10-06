@@ -125,6 +125,12 @@ pub enum Error {
 
     #[snafu(display("The component referenced by {} does not exist", path.display()))]
     InvalidComponentReference { path: PathBuf },
+
+    #[snafu(display("Unable to open spicepod component {}: {source}", path.display()))]
+    UnableToOpenSpicepodComponent {
+        source: Box<reader::Error>,
+        path: PathBuf,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -152,6 +158,10 @@ where
                         let component_rdr = fs
                             .open_yaml(component_base_path.clone(), component_name)
                             .await
+                            .map_err(Box::new)
+                            .context(UnableToOpenSpicepodComponentSnafu {
+                                path: component_base_path.clone(),
+                            })?
                             .ok_or_else(|| Error::InvalidComponentReference {
                                 path: component_base_path.clone(),
                             })?;

@@ -30,6 +30,11 @@ on:
         required: false
         type: string
         default: ''
+      additional_features:
+        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,duckdb). Leave empty for defaults only.'
+        required: false
+        type: string
+        default: ''
   # Mirror the dispatch inputs so other workflows (e.g. the cluster-bench
   # dispatch) can call this as a reusable workflow to build a commit-pinned
   # spiced image and feed the resulting tag into downstream jobs.
@@ -51,6 +56,11 @@ on:
         required: false
         type: string
         default: ''
+      additional_features:
+        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,duckdb). Leave empty for defaults only.'
+        required: false
+        type: string
+        default: ''
     outputs:
       image:
         description: 'Fully-qualified image reference, including tag'
@@ -69,8 +79,11 @@ jobs:
       run_arm64: ${{ steps.set_targets.outputs.run_arm64 }}
       image: ${{ steps.set_image_metadata.outputs.image }}
       tag: ${{ steps.set_image_metadata.outputs.tag }}
+      revision: ${{ steps.provenance.outputs.revision }}
+      on_trunk: ${{ steps.provenance.outputs.on_trunk }}
+      cargo_features: ${{ steps.set_cargo_features.outputs.cargo_features }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
 
@@ -98,6 +111,24 @@ jobs:
           echo "dev_label=${dev_label}" >> $GITHUB_OUTPUT
           echo "Building dev image with version: \"${version}\""
 
+      - name: Determine build provenance
+        id: provenance
+        run: |
+          # Raw commit actually built (HEAD = `inputs.ref || github.sha`).
+          revision="$(git rev-parse HEAD)"
+          # "Is this trunk code": is the built commit reachable from trunk's tip?
+          # Only trunk's recent history is needed, so fetch a shallow slice rather
+          # than the whole repo.
+          git fetch --depth=100 --no-tags origin trunk
+          if git merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
+            on_trunk=true
+          else
+            on_trunk=false
+          fi
+          echo "revision=${revision}" >> "$GITHUB_OUTPUT"
+          echo "on_trunk=${on_trunk}" >> "$GITHUB_OUTPUT"
+          echo "Provenance: revision=${revision} on_trunk=${on_trunk} ref_type=${GITHUB_REF_TYPE} ref_name=${GITHUB_REF_NAME}"
+
       - name: Set target architectures
         id: set_targets
         run: |
@@ -122,6 +153,37 @@ jobs:
               ;;
           esac
 
+      - name: Set cargo features
+        id: set_cargo_features
+        env:
+          VARIANT: ${{ inputs.variant }}
+          ADDITIONAL_FEATURES: ${{ inputs.additional_features }}
+        run: |
+          if [ "$VARIANT" = "models" ]; then
+            features="release,models,spicebench"
+          else
+            features="release,spicebench"
+          fi
+
+          # Append optional extras (comma-separated). Trim whitespace and
+          # collapse empty segments so "postgres, duckdb," → "postgres,duckdb".
+          if [ -n "$ADDITIONAL_FEATURES" ]; then
+            cleaned=$(printf '%s' "$ADDITIONAL_FEATURES" | tr -d '[:space:]' | sed 's/,\+/,/g; s/^,//; s/,$//')
+            if [ -n "$cleaned" ]; then
+              # Cargo feature names are identifiers; reject anything else so a
+              # hostile dispatch input cannot inject shell metacharacters into
+              # later build steps that expand CARGO_FEATURES.
+              if ! printf '%s' "$cleaned" | grep -Eq '^[A-Za-z0-9_,-]+$'; then
+                echo "additional_features contains invalid characters: ${cleaned}" >&2
+                exit 1
+              fi
+              features="${features},${cleaned}"
+            fi
+          fi
+
+          echo "cargo_features=${features}" >> "$GITHUB_OUTPUT"
+          echo "Building with CARGO_FEATURES=${features}"
+
   build-arm64:
     needs: setup
     if: needs.setup.outputs.run_arm64 == 'true'
@@ -130,7 +192,7 @@ jobs:
       RUST_PROFILE: release
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
 
@@ -167,28 +229,19 @@ jobs:
           sudo chown $USER /var/run/docker.sock
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (rust, debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Set cargo features
-        run: |
-          variant="${{ inputs.variant }}"
-          if [ "$variant" = "models" ]; then
-            echo "CARGO_FEATURES=release,models,spicebench" >> $GITHUB_ENV
-          else
-            echo "CARGO_FEATURES=release,spicebench" >> $GITHUB_ENV
-          fi
-
       - name: Build ARM64 image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -197,8 +250,15 @@ jobs:
           cache-from: type=gha,scope=build-dev-arm64
           cache-to: type=gha,scope=build-dev-arm64,mode=max
           build-args: |
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            CARGO_FEATURES=${{ needs.setup.outputs.cargo_features }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
+          # Provenance labels baked into the image config (survive the multi-arch
+          # `imagetools create` in publish, readable via `docker inspect`).
+          labels: |
+            org.opencontainers.image.revision=${{ needs.setup.outputs.revision }}
+            build.on_trunk=${{ needs.setup.outputs.on_trunk }}
+            build.ref_type=${{ github.ref_type }}
+            build.ref_name=${{ github.ref_name }}
 
       - name: Validate ARM64 image
         run: |
@@ -219,7 +279,7 @@ jobs:
       RUST_PROFILE: release
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
 
@@ -237,28 +297,19 @@ jobs:
           grep '^version =' Cargo.toml
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (rust, debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Set cargo features
-        run: |
-          variant="${{ inputs.variant }}"
-          if [ "$variant" = "models" ]; then
-            echo "CARGO_FEATURES=release,models,spicebench" >> $GITHUB_ENV
-          else
-            echo "CARGO_FEATURES=release,spicebench" >> $GITHUB_ENV
-          fi
-
       - name: Build AMD64 image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -267,8 +318,15 @@ jobs:
           cache-from: type=gha,scope=build-dev-amd64
           cache-to: type=gha,scope=build-dev-amd64,mode=max
           build-args: |
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            CARGO_FEATURES=${{ needs.setup.outputs.cargo_features }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
+          # Provenance labels baked into the image config (survive the multi-arch
+          # `imagetools create` in publish, readable via `docker inspect`).
+          labels: |
+            org.opencontainers.image.revision=${{ needs.setup.outputs.revision }}
+            build.on_trunk=${{ needs.setup.outputs.on_trunk }}
+            build.ref_type=${{ github.ref_type }}
+            build.ref_name=${{ github.ref_name }}
 
       - name: Validate AMD64 image
         run: |
@@ -298,14 +356,14 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before pulling so we use the authenticated
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -315,7 +373,7 @@ jobs:
           docker run -d -p 5000:5000 --restart=always --name registry registry:2
 
       - name: Login to GitHub Package Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -365,12 +423,15 @@ jobs:
         env:
           IMAGE_TAG: ${{ inputs.tag }}
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+          CARGO_FEATURES: ${{ needs.setup.outputs.cargo_features }}
         run: |
           echo "## 🐳 Dev Docker Image Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Images:**" >> $GITHUB_STEP_SUMMARY
           echo "- \`ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}\`" >> $GITHUB_STEP_SUMMARY
           echo "- \`ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}-${REL_VERSION}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Cargo features:** \`${CARGO_FEATURES}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Pull command:**" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY

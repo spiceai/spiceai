@@ -137,6 +137,13 @@ pub enum Error {
 
     #[snafu(display("scale must be integer"))]
     NonIntegerScaleForVariableScaleDecimal,
+
+    #[snafu(display(
+        "Failed to ingest a change event: decimal value {value} is too wide for the column's declared precision {precision}. \
+        Widen the column's decimal precision in the source schema, or exclude the column. \
+        See: https://spiceai.org/docs/components/data-connectors/debezium"
+    ))]
+    DecimalPrecisionExceeded { value: i128, precision: u8 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -226,9 +233,9 @@ fn append_field_value_to_builder(
             let bool_builder = downcast_builder::<BooleanBuilder>(builder)?;
             bool_builder.append_option(field_value.as_bool());
         }
-        DataType::Decimal128(_, scale) => {
+        DataType::Decimal128(precision, scale) => {
             let decimal_builder = downcast_builder::<Decimal128Builder>(builder)?;
-            match convert_json_to_decimal(field_value, *scale)? {
+            match convert_json_to_decimal(field_value, *precision, *scale)? {
                 Some(val) => decimal_builder.append_value(val),
                 None => decimal_builder.append_null(),
             }
@@ -439,8 +446,8 @@ pub(crate) fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) 
 
 /// Parse a decimal from a Debezium JSON field value.
 /// Delegates to [`arrow_tools::decimal::convert_json_to_decimal`].
-pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128>> {
-    decimal::convert_json_to_decimal(v, target_scale).map_err(|e| match e {
+pub fn convert_json_to_decimal(v: &Json, precision: u8, target_scale: i8) -> Result<Option<i128>> {
+    decimal::convert_json_to_decimal(v, precision, target_scale).map_err(|e| match e {
         decimal::Error::Overflow => Error::VariableScaleDecimalParsingOverflow,
         decimal::Error::Invalid { reason } => Error::InvalidDecimalJson { reason },
         decimal::Error::Base64Decode { source } => Error::UnableToDecodeBase64 { source },
@@ -452,6 +459,9 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128
             Error::UnsupportedTypeForVariableScaleDecimal {
                 actual_type: actual_type.to_string(),
             }
+        }
+        decimal::Error::PrecisionExceeded { value, precision } => {
+            Error::DecimalPrecisionExceeded { value, precision }
         }
     })
 }
@@ -556,7 +566,7 @@ mod tests {
     fn test_string_valid_no_scale() {
         let n: i128 = 12_345;
         let input = json!(i128_to_base64(n));
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         assert_eq!(result.ok().flatten(), Some(n));
     }
 
@@ -564,7 +574,7 @@ mod tests {
     fn test_object_valid_same_scale() {
         let n: i128 = 12_345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
@@ -572,7 +582,7 @@ mod tests {
     fn test_object_rescale_up() {
         let n: i128 = 12345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 4);
+        let result = convert_json_to_decimal(&input, 38, 4);
         assert_eq!(result.ok().flatten(), Some(1_234_500));
     }
 
@@ -580,7 +590,7 @@ mod tests {
     fn test_object_rescale_down() {
         let n: i128 = 1_234_500;
         let input = json!({"scale": 4, "value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
@@ -588,7 +598,7 @@ mod tests {
     fn test_target_scale_too_low() {
         let n: i128 = 1;
         let input = json!(i128_to_base64(n));
-        let result = convert_json_to_decimal(&input, -1);
+        let result = convert_json_to_decimal(&input, 38, -1);
         result.expect_err("Should fail for too low target scale");
     }
 
@@ -596,7 +606,7 @@ mod tests {
     fn test_target_scale_too_high() {
         let n: i128 = 1;
         let input = json!(i128_to_base64(n));
-        let result = convert_json_to_decimal(&input, 39);
+        let result = convert_json_to_decimal(&input, 38, 39);
         result.expect_err("Should fail for too high target scale");
     }
 
@@ -604,7 +614,7 @@ mod tests {
     fn test_object_missing_scale() {
         let n: i128 = 12_345;
         let input = json!({"value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         result.expect_err("Should fail for missing scale");
     }
 
@@ -613,7 +623,7 @@ mod tests {
     fn test_number_integer_value() {
         // 123 with scale 2 → 12300
         let input = json!(123);
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         assert_eq!(result.ok().flatten(), Some(12_300));
     }
 
@@ -621,7 +631,7 @@ mod tests {
     fn test_number_with_fractional_exact_scale() {
         // 123.45 with scale 2 → 12345
         let input = json!(123.45_f64);
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
@@ -629,7 +639,7 @@ mod tests {
     fn test_number_with_fractional_fewer_digits_than_scale() {
         // 123.4 with scale 2 → 12340
         let input = json!(123.4_f64);
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         assert_eq!(result.ok().flatten(), Some(12_340));
     }
 
@@ -637,7 +647,7 @@ mod tests {
     fn test_number_with_fractional_more_digits_than_scale() {
         // 123.456 with scale 2 → 12345 (truncated)
         let input = json!(123.456_f64);
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
@@ -645,14 +655,14 @@ mod tests {
     fn test_number_negative() {
         // -123.45 with scale 2 → -12345
         let input = json!(-123.45_f64);
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         assert_eq!(result.ok().flatten(), Some(-12_345));
     }
 
     #[test]
     fn test_number_zero() {
         let input = json!(0);
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         assert_eq!(result.ok().flatten(), Some(0));
     }
 
@@ -660,24 +670,24 @@ mod tests {
     fn test_object_scale_not_integer() {
         let n: i128 = 12_345;
         let input = json!({"scale": "abc", "value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         result.expect_err("Should fail for non-integer scale");
     }
 
     #[test]
     fn test_object_missing_value() {
         let input = json!({"scale": 2});
-        let result = convert_json_to_decimal(&input, 2);
+        let result = convert_json_to_decimal(&input, 38, 2);
         result.expect_err("Should fail for missing value");
     }
 
     #[test]
     fn test_wrong_json_type() {
         // Bool and Array are genuinely unsupported types.
-        let result = convert_json_to_decimal(&json!(true), 2);
+        let result = convert_json_to_decimal(&json!(true), 38, 2);
         result.expect_err("Should fail for boolean JSON type");
 
-        let result = convert_json_to_decimal(&json!([1, 2, 3]), 2);
+        let result = convert_json_to_decimal(&json!([1, 2, 3]), 38, 2);
         result.expect_err("Should fail for array JSON type");
     }
 
@@ -685,7 +695,7 @@ mod tests {
     fn test_plain_number_is_supported() {
         // A plain JSON number is valid: treat it as the unscaled value and
         // rescale to the target scale.  12345 at scale=2 → 1234500.
-        let result = convert_json_to_decimal(&json!(12345_i64), 2);
+        let result = convert_json_to_decimal(&json!(12345_i64), 38, 2);
         assert_eq!(result.expect("number should be valid"), Some(1_234_500));
     }
 

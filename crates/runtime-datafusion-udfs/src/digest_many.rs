@@ -30,6 +30,7 @@ use std::fmt::{Debug, Write};
 use std::sync::{Arc, LazyLock};
 
 pub static DIGEST_UDF_NAME: &str = "digest_many";
+runtime_udfs_api::register_spice_function!(DIGEST_SPICE_FUNCTION, DIGEST_UDF_NAME);
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),
@@ -77,20 +78,24 @@ impl DigestMany {
     fn make_scalar_function_args(
         args: Vec<ColumnarValue>,
         return_field: FieldRef,
+        config_options: Arc<ConfigOptions>,
     ) -> ScalarFunctionArgs {
         ScalarFunctionArgs {
             args,
             number_rows: 1,
             arg_fields: vec![],
             return_field,
-            config_options: Arc::new(ConfigOptions::default()),
+            config_options,
         }
     }
 
     fn get_hash_fn_return_field(hash_fn: &ScalarUDF) -> DataFusionResult<FieldRef> {
+        static DUMMY_SCALAR: LazyLock<ScalarValue> =
+            LazyLock::new(|| ScalarValue::Utf8(Some(String::new())));
+
         hash_fn.return_field_from_args(ReturnFieldArgs {
             arg_fields: &[FieldRef::new(Field::new("dummy", DataType::Utf8, false))],
-            scalar_arguments: &[Some(&ScalarValue::Utf8(Some(String::new())))],
+            scalar_arguments: &[Some(&DUMMY_SCALAR)],
         })
     }
 
@@ -178,6 +183,7 @@ impl ScalarUDFImpl for DigestMany {
             return hash_fn.invoke_with_args(Self::make_scalar_function_args(
                 vec![ColumnarValue::Scalar(ScalarValue::Utf8(Some(hash_me)))],
                 return_field,
+                Arc::clone(&scalar_args.config_options),
             ));
         }
 
@@ -230,7 +236,7 @@ impl ScalarUDFImpl for DigestMany {
             number_rows: num_rows,
             arg_fields: vec![],
             return_field,
-            config_options: Arc::new(ConfigOptions::default()),
+            config_options: Arc::clone(&scalar_args.config_options),
         })
     }
 

@@ -1,0 +1,4 @@
+# Written by the fixtures when they are run in place; a real eval run should
+# point EVIDENCE_LOG at its own output directory instead.
+.invocations.jsonl
+__pycache__/

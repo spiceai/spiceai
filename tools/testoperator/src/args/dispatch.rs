@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use test_framework::TestType;
 
 use super::dataset::{QueryOverridesArg, QuerySetArg};
+use super::search::SearchDatasetArg;
 
 #[derive(Parser, Debug, Clone)]
 pub struct DispatchArgs {
@@ -57,6 +58,30 @@ pub struct DispatchArgs {
     /// Dry run mode - print the workflow dispatch request without sending it
     #[arg(long, default_value = "false")]
     pub(crate) dry_run: bool,
+
+    /// Dispatch only the test files on this schedule (a file without a `schedule` key is
+    /// `daily`). Without it, every test file is dispatched.
+    #[arg(long, value_enum)]
+    pub(crate) schedule: Option<Schedule>,
+}
+
+/// Which scheduled run dispatches a test file.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Schedule {
+    #[default]
+    Daily,
+    /// For tests whose source is a hosted service.
+    Weekly,
+}
+
+impl std::fmt::Display for Schedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Schedule::Daily => write!(f, "daily"),
+            Schedule::Weekly => write!(f, "weekly"),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -66,6 +91,7 @@ pub enum Workflow {
     Load,
     Append,
     DataConsistency,
+    Search,
     TextToSql,
     StreamingBench,
     StreamingCorrectness,
@@ -81,6 +107,7 @@ impl From<Workflow> for TestType {
             Workflow::Load => TestType::Load,
             Workflow::Append => TestType::Append,
             Workflow::DataConsistency => TestType::DataConsistency,
+            Workflow::Search => TestType::Search,
             Workflow::TextToSql => TestType::TextToSql,
             Workflow::StreamingBench => TestType::Streaming,
             Workflow::StreamingCorrectness => TestType::StreamingCorrectness,
@@ -93,7 +120,19 @@ impl From<Workflow> for TestType {
 /// Represents a single test file payload
 #[derive(Debug, Clone, Deserialize)]
 pub struct DispatchTestFile {
+    /// Which scheduled run dispatches the file's tests.
+    #[serde(default)]
+    pub schedule: Schedule,
     pub tests: DispatchTests,
+}
+
+impl DispatchTestFile {
+    /// Whether a dispatch restricted to `schedule` includes this file. An unrestricted
+    /// dispatch (`None`) includes every file.
+    #[must_use]
+    pub fn is_on_schedule(&self, schedule: Option<Schedule>) -> bool {
+        schedule.is_none_or(|schedule| schedule == self.schedule)
+    }
 }
 
 /// Represents the tests that can be defined in a test file
@@ -110,6 +149,8 @@ pub struct DispatchTests {
     pub load: Vec<LoadArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub append: Vec<AppendArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub search: Vec<SearchArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub text_to_sql: Vec<TextToSqlArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
@@ -245,6 +286,23 @@ pub struct AppendArgs {
     pub with_conflict_data: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with_retention_data: Option<bool>,
+    /// Verify the query results against their expected answers once the loads
+    /// finish. Defaults to on in the workflow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validate_results: Option<bool>,
+}
+
+/// Search benchmark workflow arguments, defined in the test files. Should match inputs in
+/// `.github/workflows/testoperator_run_search.yml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchArgs {
+    pub spicepod_path: PathBuf,
+    pub runner_type: RunnerType,
+    /// Built-in MTEB benchmark dataset. Omitted for a custom run against `spicepod_path` as-is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benchmark_dataset: Option<SearchDatasetArg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_wait: Option<u64>,
 }
 
 /// Schema test workflow arguments, defined in the test files
@@ -430,7 +488,13 @@ pub struct StreamingCorrectnessDispatchArgs {
 
 /// HTAP workflow arguments.
 ///
-/// Mirrors the inputs of `testoperator_run_htap.yml`.
+/// A subset of the inputs of `testoperator_run_htap.yml` — only the ones
+/// scheduled/test-file dispatch needs to set (`spiced_commit` is handled by
+/// the `WorkflowArgs` wrapper). Deliberately also omits `skip_analytic_gate`:
+/// scheduled dispatch (`testoperator_dispatch_htap.yml`) builds its payload
+/// from this struct, so leaving the field out means the dispatched workflow
+/// run always falls back to the workflow's `false` default and the
+/// analytical-correctness gate always runs on schedule.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HtapDispatchArgs {
     pub spicepod_path: PathBuf,
@@ -628,6 +692,53 @@ tests:
     }
 
     #[test]
+    fn test_schedule_defaults_to_daily() {
+        let yaml = "
+tests:
+  bench:
+    spicepod_path: federated/file[parquet].yaml
+    query_set: tpch
+    runner_type: spiceai-dev-runners
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert_eq!(test_file.schedule, Schedule::Daily);
+        assert!(test_file.is_on_schedule(None));
+        assert!(test_file.is_on_schedule(Some(Schedule::Daily)));
+        assert!(!test_file.is_on_schedule(Some(Schedule::Weekly)));
+    }
+
+    #[test]
+    fn test_weekly_schedule_is_skipped_by_the_daily_dispatch() {
+        let yaml = "
+schedule: weekly
+tests:
+  bench:
+    spicepod_path: federated/oracle.yaml
+    query_set: tpch
+    runner_type: spiceai-dev-runners
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert_eq!(test_file.schedule, Schedule::Weekly);
+        assert!(test_file.is_on_schedule(None));
+        assert!(!test_file.is_on_schedule(Some(Schedule::Daily)));
+        assert!(test_file.is_on_schedule(Some(Schedule::Weekly)));
+    }
+
+    #[test]
+    fn test_unknown_schedule_is_rejected() {
+        let yaml = "
+schedule: weeky
+tests: {}
+";
+
+        yaml::from_str::<DispatchTestFile>(yaml).expect_err("an unknown schedule must not parse");
+    }
+
+    #[test]
     fn test_empty_sections_default_to_empty_vec() {
         let yaml = "
 tests: {}
@@ -726,5 +837,284 @@ tests:
         let serialized =
             serde_json::to_value(&test_file.tests.htap[0]).expect("Failed to serialize");
         assert_eq!(serialized["runner_type"], "spiceai-dev-xlarge-runners");
+    }
+
+    #[test]
+    fn test_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: quora_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert_eq!(test_file.tests.search.len(), 1);
+        assert_eq!(
+            test_file.tests.search[0].spicepod_path.to_string_lossy(),
+            "test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml"
+        );
+        assert!(matches!(
+            test_file.tests.search[0].runner_type,
+            RunnerType::Dev
+        ));
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::QuoraRetrieval)
+        ));
+        assert_eq!(test_file.tests.search[0].ready_wait, Some(1800));
+
+        // Verify benchmark_dataset serializes back to the exact string the workflow expects
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "quora_retrieval");
+    }
+
+    #[test]
+    fn test_miracl_en_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/miracl_en/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: miracl_en_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::MiraclEnRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "miracl_en_retrieval");
+    }
+
+    #[test]
+    fn test_fiqa_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: fiqa_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::FiqaRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "fiqa_retrieval");
+    }
+
+    #[test]
+    fn test_trec_covid_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/trec_covid/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: trec_covid_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::TrecCovidRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "trec_covid_retrieval");
+    }
+
+    #[test]
+    fn test_arguana_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/arguana/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: arguana_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::ArguanaRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "arguana_retrieval");
+    }
+
+    #[test]
+    fn test_scidocs_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/scidocs/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: scidocs_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::ScidocsRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "scidocs_retrieval");
+    }
+
+    #[test]
+    fn test_scifact_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/scifact/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: scifact_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::ScifactRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "scifact_retrieval");
+    }
+
+    #[test]
+    fn test_nfcorpus_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/nfcorpus/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: nfcorpus_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::NfcorpusRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "nfcorpus_retrieval");
+    }
+
+    #[test]
+    fn test_touche2020_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/touche2020/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: touche2020_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::Touche2020Retrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "touche2020_retrieval");
+    }
+
+    #[test]
+    fn test_msmarco_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/msmarco/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: msmarco_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::MsmarcoRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "msmarco_retrieval");
+    }
+
+    #[test]
+    fn test_stackoverflow_qa_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/stackoverflow_qa/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: stackoverflow_qa_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::StackoverflowQaRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(
+            serialized["benchmark_dataset"],
+            "stackoverflow_qa_retrieval"
+        );
+    }
+
+    #[test]
+    fn test_custom_search_section_omits_benchmark_dataset() {
+        // A custom run leaves `benchmark_dataset` unset. It must deserialize to `None` and, so the
+        // dispatch workflow input stays absent (letting the workflow default to a custom run), it
+        // must not serialize the field back out.
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/custom/my-spicepod.yaml
+    runner_type: spiceai-dev-runners
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(test_file.tests.search[0].benchmark_dataset.is_none());
+
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert!(serialized.get("benchmark_dataset").is_none());
     }
 }

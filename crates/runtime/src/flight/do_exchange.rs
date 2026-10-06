@@ -20,14 +20,14 @@ use arrow::array::{ListArray, StringArray, StructArray};
 use arrow::array::{ListBuilder, RecordBatch, StringBuilder, new_null_array};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow_flight::{FlightData, SchemaAsIpc, flight_service_server::FlightService};
-use arrow_ipc::writer::{self, CompressionContext, DictionaryTracker, IpcDataGenerator};
+use arrow_ipc::writer::{self, DictionaryTracker, IpcDataGenerator, IpcWriteContext};
 use async_stream::try_stream;
 use data_components::cdc::changes_schema;
+use datafusion::common::TableReference;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::sql::TableReference;
 use futures::StreamExt;
 use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};
@@ -108,7 +108,7 @@ fn update_stats(update: &DataUpdate) -> (usize, usize, usize) {
 struct ChangeFlightEncoder {
     encoder: IpcDataGenerator,
     tracker: DictionaryTracker,
-    compression_context: CompressionContext,
+    compression_context: IpcWriteContext,
     write_options: writer::IpcWriteOptions,
     schema: Option<SchemaRef>,
 }
@@ -118,7 +118,7 @@ impl Default for ChangeFlightEncoder {
         Self {
             encoder: IpcDataGenerator::default(),
             tracker: DictionaryTracker::new(false),
-            compression_context: CompressionContext::default(),
+            compression_context: IpcWriteContext::default(),
             write_options: writer::IpcWriteOptions::default(),
             schema: None,
         }
@@ -163,7 +163,7 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoExchangeStream>, Status> {
-    let _start = metrics::track_flight_request("do_exchange", None);
+    let _start = metrics::track_flight_request("do_exchange", None).await;
     let mut streaming_request = request.into_inner();
     let req = streaming_request.next().await;
     let Some(subscription_request) = req else {

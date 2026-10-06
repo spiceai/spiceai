@@ -26,6 +26,7 @@ use std::{
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
+    catalog::Session,
     common::{
         DFSchemaRef, Statistics,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
@@ -33,11 +34,16 @@ use datafusion::{
     config::ConfigOptions,
     datasource::DefaultTableSource,
     error::{DataFusionError, Result},
-    execution::{SendableRecordBatchStream, SessionState, TaskContext},
-    logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
+    execution::{SendableRecordBatchStream, TaskContext},
+    logical_expr::{
+        Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+        physical_planning_context::PhysicalPlanningContext,
+    },
     optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr,
+        ChildStats, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+        InputDistributionRequirements, PhysicalExpr, ReplaceChildrenOptions, StatisticsArgs,
+        StatisticsContext,
         execution_plan::{CardinalityEffect, InvariantLevel, check_default_invariants},
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
@@ -52,9 +58,9 @@ use datafusion::{
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 
-use crate::{Index, IndexedTableProvider};
+use spice_table::{Index, SpiceTable};
 
-/// [`OptimizerRule`] that looks for [`IndexedTableProvider`] nodes and adds an [`IndexTableScanNode`].
+/// [`OptimizerRule`] that looks for indexed tables and adds an [`IndexTableScanNode`].
 #[derive(Debug, Default)]
 pub struct IndexTableScanOptimizerRule {}
 
@@ -100,16 +106,17 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
                     return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
                 };
                 let underlying = Arc::clone(&default_source.table_provider);
-                let Some(indexed_table_provider) =
-                    underlying.downcast_ref::<IndexedTableProvider>()
+                let Some(indexes) = underlying
+                    .downcast_ref::<SpiceTable>()
+                    .map(spice_table::SpiceTable::indexes)
+                    .filter(|indexes| !indexes.is_empty())
                 else {
                     return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
                 };
                 let projected_schema = Arc::clone(&table_scan.projected_schema);
 
                 // Filter to just the indexes that can be served by the projected schema
-                let available_indexes: Vec<_> = indexed_table_provider
-                    .indexes
+                let available_indexes: Vec<_> = indexes
                     .iter()
                     .filter(|index| {
                         // Check if all required columns for this index are in the projected schema
@@ -123,7 +130,7 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
 
                 if available_indexes.is_empty() {
                     // No indexes can be served by the projected schema
-                    let required_columns = indexed_table_provider.indexes.iter().flat_map(|i| i.required_columns()).collect::<HashSet<_>>().into_iter().join(",");
+                    let required_columns = indexes.iter().flat_map(|i| i.required_columns()).collect::<HashSet<_>>().into_iter().join(",");
                     let projected_schema_columns = projected_schema.fields().iter().map(|c| c.name()).join(",");
                     tracing::warn!(
                         "Could not index table {}, did not find expected columns [{required_columns}] in the projected schema [{projected_schema_columns}]",
@@ -299,7 +306,8 @@ impl ExtensionPlanner for IndexTableScanExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        _session_state: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(index_table_scan_node) = node.as_any().downcast_ref::<IndexTableScanNode>() else {
             return Ok(None);
@@ -346,6 +354,28 @@ impl IndexerExec {
     }
 }
 
+impl IndexerExec {
+    fn with_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(datafusion::error::DataFusionError::Internal(
+                "IndexerExec requires exactly one input".to_string(),
+            ));
+        }
+        let input = children.into_iter().next().ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "IndexerExec requires exactly one input".to_string(),
+            )
+        })?;
+        Ok(Arc::new(Self {
+            input_exec: input,
+            indexes: self.indexes.clone(),
+        }))
+    }
+}
+
 impl DisplayAs for IndexerExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "IndexerExec")?;
@@ -363,6 +393,15 @@ impl DisplayAs for IndexerExec {
 }
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for IndexerExec {
+    /// Not serializable. Forwarding to the input would ship a plan without the
+    /// indexing this node adds, so a remote executor would silently skip it.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> datafusion::common::Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -411,6 +450,22 @@ impl ExecutionPlan for IndexerExec {
         vec![Distribution::SinglePartition]
     }
 
+    /// See [`Self::required_input_distribution`]: the input must be a single partition.
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![Distribution::SinglePartition])
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true; self.children().len()]
     }
@@ -430,27 +485,30 @@ impl ExecutionPlan for IndexerExec {
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.with_children(children)
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // `properties()` is always read from the input, so there is nothing to keep or recompute.
+        self.with_children(children)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(datafusion::error::DataFusionError::Internal(
-                "IndexerExec requires exactly one input".to_string(),
-            ));
-        }
-        let input = children.into_iter().next().ok_or_else(|| {
-            datafusion::error::DataFusionError::Internal(
-                "IndexerExec requires exactly one input".to_string(),
-            )
-        })?;
-        Ok(Arc::new(Self {
-            input_exec: input,
-            indexes: self.indexes.clone(),
-        }))
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_children(children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_children(children)
     }
 
     // Allow optimizer to push limits through to inputs
@@ -563,8 +621,27 @@ impl ExecutionPlan for IndexerExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input_exec.partition_statistics(partition)
+        StatisticsContext::new().compute(
+            self.input_exec.as_ref(),
+            &StatisticsArgs::new().with_partition(partition),
+        )
     }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    /// Indexing neither adds nor removes rows, so the input's statistics hold unchanged.
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        input_stats.first().map(Arc::clone).ok_or_else(|| {
+            DataFusionError::Internal("IndexerExec requires exactly one input".to_string())
+        })
+    }
+
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         // Propagate the fetch limit to the child input if it supports it
         if let Some(child_with_fetch) = self.input_exec.with_fetch(limit) {
@@ -646,19 +723,18 @@ mod test {
             array::{ArrayRef, Int64Array, RecordBatch, StringArray},
             datatypes::{DataType, Field, Schema},
         },
+        catalog::Session,
         catalog::{MemTable, TableProvider},
         error::DataFusionError,
-        execution::{SessionState, SessionStateBuilder, context::QueryPlanner},
+        execution::{SessionStateBuilder, context::QueryPlanner},
         logical_expr::LogicalPlan,
         physical_plan::ExecutionPlan,
         physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
         prelude::SessionContext,
     };
 
-    use crate::{
-        Index, IndexedTableProvider,
-        analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule},
-    };
+    use crate::analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule};
+    use spice_table::{Index, IndexLayer, SpiceTable};
 
     #[derive(Debug, Default)]
     pub struct TestQueryPlanner {}
@@ -675,7 +751,7 @@ mod test {
         async fn create_physical_plan(
             &self,
             logical_plan: &LogicalPlan,
-            session_state: &SessionState,
+            session_state: &dyn Session,
         ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
             let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
                 IndexTableScanExtensionPlanner::new(),
@@ -787,7 +863,8 @@ mod test {
         index: Arc<dyn Index + Send + Sync>,
         table: Arc<dyn TableProvider>,
     ) -> Arc<dyn TableProvider> {
-        Arc::new(IndexedTableProvider::new(table).add_index(index)) as Arc<dyn TableProvider>
+        (SpiceTable::over(Arc::new(IndexLayer::new().add_index(index)), table))
+            as Arc<dyn TableProvider>
     }
 
     fn test_one_row_batch() -> RecordBatch {
@@ -911,15 +988,17 @@ mod test {
         let table = mem_table_from_batches(vec![test_one_row_batch()]);
 
         // build an IndexedTableProvider with *two* indexes, in order
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&idx1) as Arc<dyn Index + Send + Sync>)
-            .add_index(Arc::clone(&idx2) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(
+            Arc::new(
+                IndexLayer::new()
+                    .add_index(Arc::clone(&idx1) as Arc<dyn Index + Send + Sync>)
+                    .add_index(Arc::clone(&idx2) as Arc<dyn Index + Send + Sync>),
+            ),
+            table,
+        );
 
-        ctx.register_table(
-            "pipeline_idx_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
-        )
-        .expect("valid table");
+        ctx.register_table("pipeline_idx_table", provider as Arc<dyn TableProvider>)
+            .expect("valid table");
 
         let df = ctx.table("pipeline_idx_table").await.expect("valid");
         let results = df.collect().await.expect("should complete");
@@ -948,14 +1027,15 @@ mod test {
         let bad_idx = Arc::new(TestIndex::new(vec!["id".to_string()], Some(|_| Ok(vec![]))));
 
         let table = mem_table(); // empty batch is fine; the error is from the index
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(
+            Arc::new(
+                IndexLayer::new().add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>),
+            ),
+            table,
+        );
 
-        ctx.register_table(
-            "zero_batches_idx_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
-        )
-        .expect("valid table");
+        ctx.register_table("zero_batches_idx_table", provider as Arc<dyn TableProvider>)
+            .expect("valid table");
 
         let df = ctx.table("zero_batches_idx_table").await.expect("valid");
         let err = df
@@ -983,12 +1063,16 @@ mod test {
         ));
 
         let table = mem_table(); // any input works
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(
+            Arc::new(
+                IndexLayer::new().add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>),
+            ),
+            table,
+        );
 
         ctx.register_table(
             "multi_batches_idx_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
         )
         .expect("valid table");
 
@@ -1015,15 +1099,17 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![test_one_row_batch()]);
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&pass_through) as Arc<dyn Index + Send + Sync>)
-            .add_index(Arc::clone(&failing) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(
+            Arc::new(
+                IndexLayer::new()
+                    .add_index(Arc::clone(&pass_through) as Arc<dyn Index + Send + Sync>)
+                    .add_index(Arc::clone(&failing) as Arc<dyn Index + Send + Sync>),
+            ),
+            table,
+        );
 
-        ctx.register_table(
-            "late_fail_idx_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
-        )
-        .expect("valid table");
+        ctx.register_table("late_fail_idx_table", provider as Arc<dyn TableProvider>)
+            .expect("valid table");
 
         let df = ctx.table("late_fail_idx_table").await.expect("valid");
         let err = df
@@ -1062,13 +1148,12 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
-        ctx.register_table(
-            "schema_change_type",
-            Arc::new(provider) as Arc<dyn TableProvider>,
-        )
-        .expect("valid");
+        let provider = SpiceTable::over(
+            Arc::new(IndexLayer::new().add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)),
+            table,
+        );
+        ctx.register_table("schema_change_type", provider as Arc<dyn TableProvider>)
+            .expect("valid");
 
         let df = ctx.table("schema_change_type").await.expect("valid");
         let err = df
@@ -1112,14 +1197,15 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&idx_add) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(
+            Arc::new(
+                IndexLayer::new().add_index(Arc::clone(&idx_add) as Arc<dyn Index + Send + Sync>),
+            ),
+            table,
+        );
 
-        ctx.register_table(
-            "schema_change_add",
-            Arc::new(provider) as Arc<dyn TableProvider>,
-        )
-        .expect("valid");
+        ctx.register_table("schema_change_add", provider as Arc<dyn TableProvider>)
+            .expect("valid");
 
         let df = ctx.table("schema_change_add").await.expect("valid");
         let err = df
@@ -1178,14 +1264,13 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(
+            Arc::new(IndexLayer::new().add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)),
+            table,
+        );
 
-        ctx.register_table(
-            "field_meta_diff_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
-        )
-        .expect("valid");
+        ctx.register_table("field_meta_diff_table", provider as Arc<dyn TableProvider>)
+            .expect("valid");
 
         let df = ctx.table("field_meta_diff_table").await.expect("valid");
         // Must succeed — field-level metadata differences are benign.
@@ -1225,14 +1310,13 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(
+            Arc::new(IndexLayer::new().add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)),
+            table,
+        );
 
-        ctx.register_table(
-            "metadata_diff_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
-        )
-        .expect("valid");
+        ctx.register_table("metadata_diff_table", provider as Arc<dyn TableProvider>)
+            .expect("valid");
 
         let df = ctx.table("metadata_diff_table").await.expect("valid");
         // Must succeed — metadata-only differences are benign.

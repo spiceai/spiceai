@@ -54,10 +54,13 @@ limitations under the License.
 #![cfg(feature = "hashicorp_vault")]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use runtime_parameters_typed::{NoSecretResolver, TypedParams as _};
 use runtime_secrets::SecretStore;
-use runtime_secrets::stores::hashicorp_vault::{HashicorpVault, HashicorpVaultConfig};
-use secrecy::ExposeSecret;
+use runtime_secrets::stores::hashicorp_vault::{HashicorpVault, HashicorpVaultParams};
+use secrecy::{ExposeSecret, SecretString};
+use tokio::sync::RwLock;
 
 fn require_env(key: &str) -> Option<String> {
     std::env::var(key).ok()
@@ -106,10 +109,17 @@ async fn vault_token_auth_reads_kv_value() {
     let mount = require_env("SPICE_TEST_VAULT_MOUNT").unwrap_or_else(|| "secret".to_string());
     let kv_version = require_env("SPICE_TEST_VAULT_KV_VERSION").unwrap_or_else(|| "v2".to_string());
 
-    let params = build_params(&address, &token, &mount, &kv_version);
-    let cfg = HashicorpVaultConfig::from_params(path, &params)
-        .map_err(|e| e.to_string())
-        .expect("from_params");
+    let params = build_params(&address, &token, &mount, &kv_version)
+        .into_iter()
+        .map(|(k, v)| (k, SecretString::from(v)))
+        .collect();
+    let no_resolver = Arc::new(RwLock::new(NoSecretResolver));
+    let cfg =
+        HashicorpVaultParams::try_from_params("secret store hashicorp_vault", params, &no_resolver)
+            .await
+            .map_err(|e| e.to_string())
+            .expect("params parse")
+            .into_config(path);
     let vault = HashicorpVault::from_config(cfg)
         .map_err(|e| e.to_string())
         .expect("from_config");

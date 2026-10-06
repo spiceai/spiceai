@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use data_components::cdc::{ChangeEnvelope, StreamError, replace_change_batch_data};
-use runtime_datafusion_index::{Index, IndexedTableProvider};
+use spice_table::{Index, LayerWalk, SpiceTable};
 
 /// A newtype wrapper around a vector of indexes to prevent cloning the vector for each item in a stream.
 pub struct Indexes(Vec<Arc<dyn Index + Send + Sync>>);
@@ -28,9 +28,21 @@ impl Indexes {
     }
 }
 
-impl From<Arc<IndexedTableProvider>> for Indexes {
-    fn from(indexed_table: Arc<IndexedTableProvider>) -> Self {
-        Self(indexed_table.get_all_indexes())
+impl From<Arc<SpiceTable>> for Indexes {
+    /// Collects the indexes carried anywhere in the table's stack, so a change
+    /// stream maintains every one of them and not just the outermost layer's.
+    ///
+    /// Deduplicates by pointer identity: the walk reaches both sides of a router,
+    /// and maintaining one index twice would apply every change to it twice.
+    fn from(table: Arc<SpiceTable>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        Self(
+            spice_table::nodes(table.as_ref(), LayerWalk::Index)
+                .flat_map(SpiceTable::indexes)
+                .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
+                .map(Arc::clone)
+                .collect(),
+        )
     }
 }
 
@@ -43,7 +55,11 @@ pub async fn index_change_envelope(
         e
     })?;
 
-    let (change_committer, batch, is_dataset_ready) = envelope.into_parts();
+    // Materialize a deferred batch here (this index wrapper transforms the
+    // stream before the accelerator consumes it). Offload the synchronous build
+    // so a large deferred burst can't stall this async worker.
+    let (change_committer, batch, is_dataset_ready, history_unavailable) =
+        envelope.into_parts_offloaded().await?;
     let mut batches = vec![batch.data_batch()];
 
     for index in &indexes.0 {
@@ -56,10 +72,15 @@ pub async fn index_change_envelope(
     let new_change_batch = replace_change_batch_data(&batches[0], &batch)
         .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
-    Ok(ChangeEnvelope::new(
+    // `from_parts` rather than `new`: this wrapper transforms the batch and must
+    // carry every envelope flag through untouched. A rebuild request dropped here
+    // would let the accelerator keep applying changes after the source lost the
+    // history that explains them.
+    Ok(ChangeEnvelope::from_parts(
         change_committer,
         new_change_batch,
         is_dataset_ready,
+        history_unavailable,
     ))
 }
 
@@ -76,7 +97,7 @@ mod tests {
     };
     use datafusion::catalog::TableProvider;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
-    use runtime_datafusion_index::{Index, IndexedTableProvider};
+    use spice_table::{Index, IndexLayer};
     use std::any::Any;
     use std::sync::Arc;
 
@@ -213,14 +234,28 @@ mod tests {
     async fn test_index_change_envelope_success_no_indexes() {
         let envelope = create_test_change_envelope();
         let table_provider = Arc::new(MockTableProvider);
-        let embedding_table = Arc::new(IndexedTableProvider::new(table_provider));
+        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::new()), table_provider);
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
-        assert_eq!(result_envelope.change_batch.record.num_rows(), 3);
-        assert_eq!(result_envelope.change_batch.record.num_columns(), 3); // op, primary_keys, data
+        assert_eq!(
+            result_envelope
+                .change_batch()
+                .expect("built change batch")
+                .record
+                .num_rows(),
+            3
+        );
+        assert_eq!(
+            result_envelope
+                .change_batch()
+                .expect("built change batch")
+                .record
+                .num_columns(),
+            3
+        ); // op, primary_keys, data
     }
 
     #[tokio::test]
@@ -228,18 +263,28 @@ mod tests {
         let envelope = create_test_change_envelope();
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index").with_added_column());
-        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(
+        let embedding_table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![index])),
             table_provider,
-            vec![index],
-        ));
+        );
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
-        assert_eq!(result_envelope.change_batch.record.num_rows(), 3);
+        assert_eq!(
+            result_envelope
+                .change_batch()
+                .expect("built change batch")
+                .record
+                .num_rows(),
+            3
+        );
 
-        let data_batch = result_envelope.change_batch.data_batch();
+        let data_batch = result_envelope
+            .change_batch()
+            .expect("built change batch")
+            .data_batch();
         assert_eq!(data_batch.num_columns(), 3); // id, name, embedding
         assert!(data_batch.schema().column_with_name("embedding").is_some());
     }
@@ -250,22 +295,29 @@ mod tests {
         let table_provider = Arc::new(MockTableProvider);
         let index1 = Arc::new(MockIndex::new("index1"));
         let index2 = Arc::new(MockIndex::new("index2"));
-        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(
+        let embedding_table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![index1, index2])),
             table_provider,
-            vec![index1, index2],
-        ));
+        );
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
-        assert_eq!(result_envelope.change_batch.record.num_rows(), 3);
+        assert_eq!(
+            result_envelope
+                .change_batch()
+                .expect("built change batch")
+                .record
+                .num_rows(),
+            3
+        );
     }
 
     #[tokio::test]
     async fn test_index_change_envelope_input_stream_error() {
         let table_provider = Arc::new(MockTableProvider);
-        let embedding_table = Arc::new(IndexedTableProvider::new(table_provider));
+        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::new()), table_provider);
         let input_error = StreamError::External("Input stream error".to_string());
 
         let result =
@@ -284,10 +336,10 @@ mod tests {
         let envelope = create_test_change_envelope();
         let table_provider = Arc::new(MockTableProvider);
         let failing_index = Arc::new(MockIndex::new("failing_index").with_failure());
-        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(
+        let embedding_table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![failing_index])),
             table_provider,
-            vec![failing_index],
-        ));
+        );
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -309,10 +361,10 @@ mod tests {
 
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index"));
-        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(
+        let embedding_table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![index])),
             table_provider,
-            vec![index],
-        ));
+        );
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -320,8 +372,16 @@ mod tests {
         let result_envelope = result.expect("Expected successful result");
 
         // Verify that all rows still have the "c" (create) operation
-        for i in 0..result_envelope.change_batch.record.num_rows() {
-            let op = result_envelope.change_batch.op(i);
+        for i in 0..result_envelope
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows()
+        {
+            let op = result_envelope
+                .change_batch()
+                .expect("built change batch")
+                .op(i);
             assert!(matches!(op, data_components::cdc::ChangeOperation::Create));
         }
     }
@@ -329,21 +389,29 @@ mod tests {
     #[tokio::test]
     async fn test_index_change_envelope_maintains_row_count() {
         let envelope = create_test_change_envelope();
-        let original_row_count = envelope.change_batch.record.num_rows();
+        let original_row_count = envelope
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows();
 
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index").with_added_column());
-        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(
+        let embedding_table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![index])),
             table_provider,
-            vec![index],
-        ));
+        );
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
         assert_eq!(
-            result_envelope.change_batch.record.num_rows(),
+            result_envelope
+                .change_batch()
+                .expect("built change batch")
+                .record
+                .num_rows(),
             original_row_count
         );
     }

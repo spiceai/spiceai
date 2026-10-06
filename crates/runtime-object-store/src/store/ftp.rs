@@ -45,6 +45,70 @@ const STORE_NAME: &str = "FTP";
 const MAX_CONCURRENT_LISTINGS: usize = 4;
 /// Default connection pool size.
 const DEFAULT_POOL_SIZE: u32 = 4;
+/// Wall-clock bound for one connection attempt — name resolution, TCP connect, greeting
+/// and login together — when `client_timeout` is not configured.
+///
+/// `bb8` consults its own `connection_timeout` (30s by default) only *after*
+/// `ManageConnection::connect` returns, so an attempt that never returns is never
+/// abandoned: its pending pool slot stays taken, which suppresses later `Pool::get`
+/// calls even once the server recovers. 20s leaves the attempt failing inside the
+/// window the pool is already willing to wait.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Apply a connection deadline to `attempt`, reporting expiry against `addr`.
+async fn with_connect_deadline<T>(
+    addr: &str,
+    bound: Duration,
+    attempt: impl Future<Output = object_store::Result<T>>,
+) -> object_store::Result<T> {
+    match tokio::time::timeout(bound, attempt).await {
+        Ok(result) => result,
+        Err(_) => Err(generic_error(
+            STORE_NAME,
+            format!("connecting to {addr} timed out after {bound:?}"),
+        )),
+    }
+}
+
+/// Open a session to `host:port` and log in, under a single deadline.
+///
+/// The deadline covers the whole sequence rather than each stage, so a peer that
+/// accepts TCP and then stalls cannot spend the budget once on the greeting and again
+/// on the login.
+///
+/// The address is passed to `AsyncFtpStream::connect` as text so that it resolves the
+/// name itself. Handing a pre-parsed `SocketAddr` to `connect_timeout` instead cannot
+/// work for a named host: `"host:port".parse::<SocketAddr>()` accepts only a literal
+/// IP, so configuring `client_timeout` failed the connection rather than bounding it.
+///
+/// Resolving inside `attempt` is also what puts the lookup under the deadline, which the
+/// SFTP store has to arrange for itself because its resolver is the blocking one.
+async fn connect_and_login(
+    host: &str,
+    port: &str,
+    user: &str,
+    password: &str,
+    timeout: Option<Duration>,
+) -> object_store::Result<AsyncFtpStream> {
+    let addr = format!("{host}:{port}");
+    let bound = timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+    let connect_addr = addr.clone();
+
+    let attempt = async move {
+        let mut client = AsyncFtpStream::connect(connect_addr)
+            .await
+            .map_err(|e| generic_error(STORE_NAME, e))?;
+
+        client
+            .login(user, password)
+            .await
+            .map_err(|e| generic_error(STORE_NAME, e))?;
+
+        Ok::<_, object_store::Error>(client)
+    };
+
+    with_connect_deadline(&addr, bound, attempt).await
+}
 
 /// Connection manager for bb8 connection pool.
 #[derive(Clone)]
@@ -79,37 +143,7 @@ impl bb8::ManageConnection for FTPConnectionManager {
         let port = self.port.clone();
         let timeout = self.timeout;
 
-        Box::pin(async move {
-            let mut client = match timeout {
-                Some(timeout) => {
-                    AsyncFtpStream::connect_timeout(
-                        format!("{host}:{port}").parse().map_err(
-                            |e: std::net::AddrParseError| object_store::Error::Generic {
-                                store: STORE_NAME,
-                                source: e.into(),
-                            },
-                        )?,
-                        timeout,
-                    )
-                    .await
-                }
-                None => AsyncFtpStream::connect(format!("{host}:{port}")).await,
-            }
-            .map_err(|e| object_store::Error::Generic {
-                store: STORE_NAME,
-                source: e.into(),
-            })?;
-
-            client
-                .login(&user, &password)
-                .await
-                .map_err(|e| object_store::Error::Generic {
-                    store: STORE_NAME,
-                    source: e.into(),
-                })?;
-
-            Ok(client)
-        })
+        Box::pin(async move { connect_and_login(&host, &port, &user, &password, timeout).await })
     }
 
     fn is_valid(
@@ -178,29 +212,14 @@ impl FTPClientConfig {
 
     /// Create a fresh non-pooled connection for operations that modify connection state.
     async fn get_fresh_client(&self) -> object_store::Result<AsyncFtpStream> {
-        let mut client = match self.timeout {
-            Some(timeout) => {
-                AsyncFtpStream::connect_timeout(
-                    format!("{}:{}", self.host, self.port).parse().map_err(
-                        |e: std::net::AddrParseError| object_store::Error::Generic {
-                            store: STORE_NAME,
-                            source: e.into(),
-                        },
-                    )?,
-                    timeout,
-                )
-                .await
-            }
-            None => AsyncFtpStream::connect(format!("{}:{}", self.host, self.port)).await,
-        }
-        .map_err(|e| generic_error(STORE_NAME, e))?;
-
-        client
-            .login(&self.user, &self.password)
-            .await
-            .map_err(|e| generic_error(STORE_NAME, e))?;
-
-        Ok(client)
+        connect_and_login(
+            &self.host,
+            &self.port,
+            &self.user,
+            &self.password,
+            self.timeout,
+        )
+        .await
     }
 }
 
@@ -626,6 +645,34 @@ mod tests {
         let cloned = config;
         assert_eq!(cloned.host, "localhost");
         assert_eq!(cloned.port, "21");
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_expires_and_names_the_address() {
+        // Stands in for a peer that accepts TCP and then never answers: the attempt
+        // never resolves, so only the deadline can end it.
+        let stalled = std::future::pending::<object_store::Result<()>>();
+
+        let err = with_connect_deadline("ftp.example.com:21", Duration::from_millis(50), stalled)
+            .await
+            .expect_err("a connection attempt that never completes must not be waited on forever");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("ftp.example.com:21"),
+            "the error should name the address that stalled, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_passes_a_completed_attempt_through() {
+        let value = with_connect_deadline("ftp.example.com:21", Duration::from_secs(30), async {
+            Ok(7u8)
+        })
+        .await
+        .expect("an attempt that completes inside the bound should be returned as-is");
+
+        assert_eq!(value, 7);
     }
 
     #[test]

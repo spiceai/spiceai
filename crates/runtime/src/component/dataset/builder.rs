@@ -14,18 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use super::{
     CheckAvailability, Dataset, Error, InvalidColumnTypeSnafu, InvalidConfigurationSnafu,
-    OnSchemaChange, ReadyState, Result, SchemaInference, TimeFormat, UnsupportedTypeAction,
-    acceleration, declared_schema, replication, validate_identifier,
+    OnSchemaChange, ReadyState, Result, TimeFormat, UnsupportedTypeAction, acceleration,
+    declared_schema, replication, snapshot_source::SnapshotSource, validate_identifier,
 };
 use crate::Runtime;
 use crate::component::access::AccessMode;
 use app::App;
-use datafusion::sql::TableReference;
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use datafusion::common::TableReference;
+use runtime_acceleration::snapshot::{
+    SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior, snapshots_enabled,
+};
 use snafu::prelude::*;
 use spicepod::{
     acceleration as spicepod_acceleration,
@@ -65,23 +67,24 @@ pub struct DatasetBuilder {
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
     pub full_text_search: Option<FtsStore>,
+    pub drasi: Option<spicepod::drasi::Drasi>,
     pub check_availability: CheckAvailability,
-    pub schema_inference: SchemaInference,
+    pub check_availability_interval: Option<Duration>,
+    /// Set when the dataset reads acceleration snapshots (`file_format: snapshot`). Its
+    /// acceleration is built from this once the snapshots' engine is known.
+    pub(crate) snapshot_source: Option<SnapshotSource>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
     fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
+        // Honoured here; the deprecation is reported by the load path
+        // (`init::dataset::warn_about_acceleration_block`), not from this conversion, which
+        // read-only callers run too.
         #[expect(deprecated)]
         let ready_state = match dataset.acceleration.as_ref().map(|a| a.ready_state) {
-            Some(Some(ready_state)) => {
-                tracing::warn!(
-                    "{}: `dataset.acceleration.ready_state` is deprecated, use `dataset.ready_state` instead.",
-                    dataset.name
-                );
-                ReadyState::from(ready_state)
-            }
+            Some(Some(ready_state)) => ReadyState::from(ready_state),
             _ => ReadyState::from(dataset.ready_state),
         };
 
@@ -101,14 +104,52 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
 
         let metadata = dataset.metadata();
 
-        let acceleration = dataset
-            .acceleration
-            .map(acceleration::Acceleration::try_from)
-            .transpose()?;
+        let snapshot_source =
+            SnapshotSource::from_spicepod(&dataset).context(crate::InvalidSpicepodDatasetSnafu)?;
+
+        // A snapshot dataset's acceleration block is completed only once the engine that
+        // created its snapshots is known; see `build`.
+        let acceleration = if snapshot_source.is_some() {
+            None
+        } else {
+            dataset
+                .acceleration
+                .map(acceleration::Acceleration::try_from)
+                .transpose()?
+        };
 
         validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
 
         let table_reference = Dataset::parse_table_reference(&dataset.name)?;
+
+        // Parse the duration string once here (raw string stays in the Spicepod
+        // representation; the runtime component holds the typed value). An
+        // invalid value fails dataset construction rather than silently
+        // disabling the check.
+        let check_availability_interval = dataset
+            .check_availability_interval
+            .as_deref()
+            .map(|raw| {
+                fundu::parse_duration(raw).map_err(|source| {
+                    crate::component::dataset::Error::UnableToParseFieldAsDuration {
+                        field: "check_availability_interval".to_string(),
+                        source,
+                    }
+                })
+            })
+            .transpose()
+            .context(crate::InvalidSpicepodDatasetSnafu)?;
+
+        // Availability monitoring only applies to non-accelerated datasets, so
+        // warn (rather than silently ignore) when it is configured on an
+        // accelerated one.
+        if check_availability_interval.is_some() && acceleration.as_ref().is_some_and(|a| a.enabled)
+        {
+            tracing::warn!(
+                "Dataset {} sets `check_availability_interval` but is accelerated; availability monitoring applies only to non-accelerated datasets and will be ignored. An accelerated dataset keeps serving from the accelerator even when its source is unavailable.",
+                dataset.name
+            );
+        }
 
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors {
@@ -154,14 +195,15 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             runtime: None,
             vectors: dataset.vectors,
             full_text_search: dataset.full_text_search,
+            drasi: dataset.drasi,
             check_availability: CheckAvailability::from(dataset.check_availability),
-            schema_inference: SchemaInference::from(dataset.schema_inference),
+            check_availability_interval,
+            snapshot_source,
         })
     }
 }
 
 impl DatasetBuilder {
-    #[expect(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         Ok(DatasetBuilder {
             from,
@@ -188,12 +230,13 @@ impl DatasetBuilder {
             runtime: None,
             vectors: None,
             full_text_search: None,
+            drasi: None,
             check_availability: CheckAvailability::default(),
-            schema_inference: SchemaInference::default(),
+            check_availability_interval: None,
+            snapshot_source: None,
         })
     }
 
-    #[expect(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {
@@ -255,7 +298,33 @@ impl DatasetBuilder {
             missing_component: "runtime".to_string(),
         })?;
 
-        if let Some(acceleration) = self.acceleration.as_mut() {
+        if let Some(source) = self.snapshot_source.take() {
+            ensure!(
+                snapshots_enabled(),
+                InvalidConfigurationSnafu {
+                    config_key: "params.file_format",
+                    message: format!(
+                        "Dataset '{}' reads acceleration snapshots (`file_format: snapshot`), which this build of Spice does not include. {SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}",
+                        self.name
+                    ),
+                }
+            );
+            // Until its snapshots have been described the dataset has no acceleration: it
+            // is pending, and loading it resolves the engine (`resolve_snapshot_source`).
+            if let Some(engine) = runtime
+                .snapshot_sources()
+                .engine(&self.name, source.location())
+            {
+                let mut acceleration =
+                    acceleration::Acceleration::try_from(source.acceleration(&self.name, engine)?)?;
+                acceleration.snapshot_behavior = SnapshotBehavior::bootstrap_only(
+                    Arc::new(source.snapshots(&self.params)),
+                    runtime.secrets_weak(),
+                    runtime.tokio_io_runtime(),
+                );
+                self.acceleration = Some(acceleration);
+            }
+        } else if let Some(acceleration) = self.acceleration.as_mut() {
             acceleration.snapshot_behavior = SnapshotBehavior::from(
                 app.snapshots.clone(),
                 self.acceleration_snapshot_behavior,
@@ -275,31 +344,34 @@ impl DatasetBuilder {
             })?;
 
         let dataset = Dataset {
-            from: self.from,
-            name: self.name,
-            access: self.access,
-            params: self.params,
-            metadata: self.metadata,
-            columns: self.columns,
-            schema,
-            has_metadata_table: self.has_metadata_table,
-            replication: self.replication,
-            time_column: self.time_column,
-            time_format: self.time_format,
-            time_partition_column: self.time_partition_column,
-            time_partition_format: self.time_partition_format,
-            acceleration: self.acceleration,
-            embeddings: self.embeddings,
+            spec: super::DatasetSpec {
+                from: self.from,
+                name: self.name,
+                access: self.access,
+                params: self.params,
+                metadata: self.metadata,
+                columns: self.columns,
+                schema,
+                has_metadata_table: self.has_metadata_table,
+                replication: self.replication,
+                time_column: self.time_column,
+                time_format: self.time_format,
+                time_partition_column: self.time_partition_column,
+                time_partition_format: self.time_partition_format,
+                acceleration: self.acceleration,
+                embeddings: self.embeddings,
+                unsupported_type_action: self.unsupported_type_action,
+                on_schema_change: self.on_schema_change,
+                ready_state: self.ready_state,
+                metrics: self.metrics,
+                vectors: self.vectors,
+                full_text_search: self.full_text_search,
+                drasi: self.drasi,
+                check_availability: self.check_availability,
+                check_availability_interval: self.check_availability_interval,
+            },
             app,
-            unsupported_type_action: self.unsupported_type_action,
-            on_schema_change: self.on_schema_change,
-            ready_state: self.ready_state,
-            metrics: self.metrics,
             runtime,
-            vectors: self.vectors,
-            full_text_search: self.full_text_search,
-            check_availability: self.check_availability,
-            schema_inference: self.schema_inference,
         };
 
         Ok(dataset)

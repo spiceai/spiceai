@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
 use test_framework::{
@@ -25,15 +26,32 @@ use test_framework::{
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Represents a single metric sample with its name, labels, and value
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MetricSample {
     pub name: String,
     pub labels: HashMap<String, String>,
     pub value: f64,
     pub metric_type: MetricType,
+    /// Unix-ms wall clock when this scrape was taken. Lets the offline analysis
+    /// compute windowed deltas (`Δ_sum`/`Δ_count` over `Δt`) instead of lifetime totals.
+    #[serde(default)]
+    pub ts_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Unix epoch milliseconds now. Canonical scrape-timestamp helper, shared by the
+/// `pg_stats` sampler. The `0` fallback is intentional and effectively unreachable:
+/// `duration_since(UNIX_EPOCH)` only errors if the system clock is set before 1970,
+/// which cannot happen on a benchmark runner — so threading a `Result` through every
+/// scrape-timestamp call site would be needless plumbing for a can't-happen case.
+pub(crate) fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum MetricType {
     Counter,
     Gauge,
@@ -43,7 +61,7 @@ pub enum MetricType {
 }
 
 /// Aggregated metrics collected during a test run
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct SpicedMetrics {
     /// All samples collected, keyed by metric name
     pub samples: HashMap<String, Vec<MetricSample>>,
@@ -219,7 +237,12 @@ impl MetricsScraper {
             .text()
             .await
             .context("Failed to read metrics response")?;
-        Ok(Self::parse_prometheus_text(&text))
+        let ts_ms = now_unix_ms();
+        let mut samples = Self::parse_prometheus_text(&text);
+        for s in &mut samples {
+            s.ts_ms = ts_ms;
+        }
+        Ok(samples)
     }
 
     /// Parse Prometheus text format into metric samples
@@ -276,6 +299,7 @@ impl MetricsScraper {
                     labels,
                     value,
                     metric_type,
+                    ts_ms: 0,
                 });
             }
         }

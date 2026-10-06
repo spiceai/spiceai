@@ -31,6 +31,10 @@ pub const HEALTH_ENDPOINT: &str = "/health";
 /// Ready check endpoint path (relative to `HTTP_BASE_URL`)
 pub const READY_ENDPOINT: &str = "/v1/ready";
 
+/// Datasets endpoint path (relative to `HTTP_BASE_URL`). With `?status=true` each
+/// entry carries its component status and, when in error, the connector's message.
+pub const DATASETS_ENDPOINT: &str = "/v1/datasets";
+
 /// SQL query endpoint path (relative to `HTTP_BASE_URL`)
 pub const SQL_ENDPOINT: &str = "/v1/sql";
 

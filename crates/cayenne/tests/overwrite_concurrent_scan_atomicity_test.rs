@@ -58,8 +58,21 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Stable key set every overwrite reinserts — a correct scan always sees this count.
 const KEY_COUNT: i64 = 256;
+
 /// Bounded concurrent iterations (enough to interleave; fast enough for CI).
-const ITERATIONS: usize = 200;
+/// Scalable via `CAYENNE_PROPTEST_OPS_SCALE` (see `common::env_scale`) for a
+/// lighter per-PR pass or a deeper nightly run; floored at 1 so the race is
+/// still exercised at least once.
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "common::env_scale() is always positive and the result is floored at 1.0 before casting"
+)]
+fn iterations() -> usize {
+    (200.0 * common::env_scale("CAYENNE_PROPTEST_OPS_SCALE"))
+        .round()
+        .max(1.0) as usize
+}
 
 async fn setup() -> TestResult<(SessionContext, TempDir, TempDir)> {
     let data_dir = TempDir::new()?;
@@ -134,13 +147,14 @@ async fn overwrite_finish_never_exposes_a_torn_snapshot_to_a_concurrent_scan() -
     // is narrow, and a shared barrier maximizes interleaving (cf.
     // shared_metastore_concurrency_test.rs).
     let start = Arc::new(Barrier::new(2));
+    let iterations = iterations();
 
     // Writer: repeatedly OVERWRITE with the same KEY_COUNT keys (count-invariant).
     let writer_ctx = ctx.clone();
     let writer_start = Arc::clone(&start);
     let writer = tokio::spawn(async move {
         writer_start.wait().await;
-        for iteration in 0..ITERATIONS {
+        for iteration in 0..iterations {
             let salt = i64::try_from(iteration % 7).expect("salt fits i64");
             writer_ctx
                 .sql(&format!(
@@ -161,7 +175,7 @@ async fn overwrite_finish_never_exposes_a_torn_snapshot_to_a_concurrent_scan() -
     let reader = tokio::spawn(async move {
         reader_start.wait().await;
         let mut torn_observations = 0_usize;
-        for _ in 0..ITERATIONS {
+        for _ in 0..iterations {
             if scan_count(&reader_ctx).await != KEY_COUNT {
                 torn_observations += 1;
             }

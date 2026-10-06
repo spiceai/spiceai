@@ -175,8 +175,13 @@ pub(crate) async fn do_get(
         .map_err(handle_query_error)?;
 
     let ipc_write_options = Service::ipc_write_options_for_context(&context)?;
-    let (output, from_cache) =
-        Service::query_result_to_flight_stream(query_result, ipc_write_options);
+    let (output, from_cache) = Service::query_result_to_flight_stream(
+        query_result,
+        ipc_write_options,
+        datafusion.cpu_runtime().cloned(),
+        &datafusion.ctx.runtime_env().memory_pool,
+        Arc::clone(&context),
+    );
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =
@@ -199,6 +204,71 @@ mod tests {
             plan,
             transaction_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn decode_plan_executes_a_varchar_literal() -> Result<(), anyhow::Error> {
+        use datafusion_substrait::{
+            logical_plan::producer::to_substrait_plan,
+            substrait::proto::{
+                expression::{
+                    RexType,
+                    literal::{LiteralType, VarChar},
+                },
+                plan_rel::RelType as PlanRelType,
+                rel::RelType,
+            },
+        };
+
+        let df = Arc::new(
+            DataFusion::builder(
+                crate::status::RuntimeStatus::new(),
+                Arc::new(crate::dataaccelerator::AcceleratorEngineRegistry::default()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        let plan = df
+            .ctx
+            .sql("SELECT 'EUROPE' AS region")
+            .await?
+            .into_optimized_plan()?;
+        let mut proto = to_substrait_plan(&plan, &df.ctx.state())?;
+        let Some(PlanRelType::Root(root)) = proto.relations[0].rel_type.as_mut() else {
+            panic!("expected a root relation");
+        };
+        let Some(RelType::Project(project)) =
+            root.input.as_mut().and_then(|rel| rel.rel_type.as_mut())
+        else {
+            panic!("expected a projection");
+        };
+        let Some(RexType::Literal(literal)) = project.expressions[0].rex_type.as_mut() else {
+            panic!("expected a string literal");
+        };
+        literal.literal_type = Some(LiteralType::VarChar(VarChar {
+            value: "EUROPE".to_string(),
+            length: 25,
+        }));
+        let (decoded, _) = decode_plan(
+            &cmd(Some(SubstraitPlan {
+                plan: Bytes::from(proto.encode_to_vec()),
+                version: "0.62.0".to_string(),
+            })),
+            &df,
+        )
+        .await?;
+        let batches = df
+            .ctx
+            .execute_logical_plan(decoded)
+            .await?
+            .collect()
+            .await?;
+        let expected = arrow::array::RecordBatch::try_from_iter([(
+            "region",
+            Arc::new(arrow::array::StringArray::from(vec!["EUROPE"])) as arrow::array::ArrayRef,
+        )])?;
+        assert_eq!(batches, vec![expected]);
+        Ok(())
     }
 
     #[test]

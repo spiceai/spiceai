@@ -1,12 +1,13 @@
 name: build_and_release_cuda
 
+# CUDA is not part of pull-request CI: a single compute-cap 90 compile takes
+# hours on the large runners, and the workflow is not a required check. Trunk
+# pushes, tagged releases, and manual dispatches still build every compute
+# capability.
 on:
-  pull_request:
+  push:
     branches:
       - trunk
-    paths:
-      - 'crates/llms/Cargo.toml'
-  push:
     tags:
       - v*
     paths-ignore:
@@ -127,11 +128,6 @@ jobs:
               return filtered;
             }
 
-            // For `on.pull_request`, only build 90 compute capability on Linux.
-            if (context.eventName === 'pull_request') {
-              return matrix.filter(m => m.compute_cap === "90" && m.target_os === "linux");
-            }
-
             return matrix;
 
   build:
@@ -149,7 +145,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -164,8 +160,6 @@ jobs:
       - name: Set up make
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-make
-        with:
-          os: ${{ matrix.target.target_os }}
 
       - name: Set up cc
         if: matrix.target.target_os == 'linux'
@@ -196,7 +190,7 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -214,7 +208,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install wget -y
-          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo wget https://public-data.spiceai.org/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
           mc alias set spice-minio ${{ env.MINIO_ENDPOINT }} ${{ env.MINIO_ACCESS_KEY }} ${{ env.MINIO_SECRET_KEY }}
 
@@ -236,7 +230,7 @@ jobs:
 
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -282,10 +276,13 @@ jobs:
             --tag "v${{ env.REL_VERSION }}" \
             "${RELEASE_ARTIFACTS[@]}"
 
+          # Pass the notes by path, not by value: a release body over 128 KiB
+          # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126)
+          # after every build has already succeeded.
           if [ "$LATEST_RELEASE" = "true" ]; then
-            export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
+            BODY_ARGS=(--body-file "./docs/release_notes/v${{ env.REL_VERSION }}.md")
           else
-            export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
+            BODY_ARGS=(--body "This is the release candidate ${{ env.REL_VERSION }}")
           fi
 
           echo "Uploading Spice.ai CUDA Binaries to GitHub Release"
@@ -293,6 +290,6 @@ jobs:
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}" \
             --release-name "v${{ env.REL_VERSION }}" \
-            --body "${RELEASE_BODY}" \
+            "${BODY_ARGS[@]}" \
             --prerelease "$PRE_RELEASE" \
             "${RELEASE_ARTIFACTS[@]}"

@@ -25,9 +25,17 @@ use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
-/// Get a Command for the spice binary
+/// Get a Command for the spice binary.
+///
+/// `SPICED_PATH` is cleared. The CLI resolves the runtime from it and reports a
+/// pin that names nothing runnable as an error, so a developer or CI runner
+/// with one exported would otherwise make every assertion below a property of
+/// the host rather than of the CLI. A test that wants a pin sets one on the
+/// returned command.
 fn spice_cmd() -> Command {
-    cargo_bin_cmd!("spice")
+    let mut cmd = cargo_bin_cmd!("spice");
+    cmd.env_remove("SPICED_PATH");
+    cmd
 }
 
 // ============================================================================
@@ -44,6 +52,54 @@ mod version {
             .assert()
             .success()
             .stdout(predicate::str::contains("CLI version:"));
+    }
+
+    /// A `SPICED_PATH` naming something no runtime can be run from. Returned
+    /// with its `TempDir`, which has to outlive the command under test.
+    ///
+    /// A directory, not a file missing its execute bit: Windows carries no
+    /// execute bit, so a plain file is runnable there and the CLI would probe
+    /// it, report its version as unavailable and exit successfully — passing
+    /// the pin through the resolver these tests are asserting it is rejected
+    /// by. Being a directory fails `is_runnable_binary` on every platform.
+    fn unrunnable_pin() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().expect("create tempdir");
+        let pin = dir.path().join("spiced");
+        fs::create_dir(&pin).expect("create the pin");
+        (dir, pin)
+    }
+
+    /// The pin survives the fixture's `env_remove`, and a pin that names
+    /// nothing runnable is reported instead of being silently ignored.
+    #[test]
+    fn a_pinned_runtime_that_is_not_runnable_is_reported_by_version() {
+        let (_dir, pin) = unrunnable_pin();
+
+        let mut cmd = spice_cmd();
+        cmd.env("SPICED_PATH", &pin)
+            .arg("version")
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("CLI version:"))
+            .stdout(predicate::str::contains("SPICED_PATH"))
+            .stdout(predicate::str::contains(pin.display().to_string()))
+            .stdout(predicate::str::contains("https://spiceai.org/docs/cli"));
+    }
+
+    /// The machine-readable form stays machine-readable when resolution
+    /// fails: stdout carries the JSON document or nothing at all, never the
+    /// human error, which a caller parsing `-o json` would choke on.
+    #[test]
+    fn a_failed_resolution_does_not_write_prose_into_json_output() {
+        let (_dir, pin) = unrunnable_pin();
+
+        let mut cmd = spice_cmd();
+        cmd.env("SPICED_PATH", &pin)
+            .args(["version", "-o", "json"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("SPICED_PATH"))
+            .stdout(predicate::str::is_empty().trim());
     }
 
     #[test]
@@ -245,6 +301,8 @@ mod dataset {
 mod login {
     use super::*;
 
+    const LOGIN_PATHS: [&[&str]; 2] = [&["login"], &["cloud", "login"]];
+
     #[test]
     fn test_login_help() {
         let mut cmd = spice_cmd();
@@ -268,12 +326,109 @@ mod login {
     }
 
     #[test]
+    fn test_cloud_login_methods_match_on_both_command_paths() {
+        for prefix in LOGIN_PATHS {
+            let mut cmd = spice_cmd();
+            cmd.args(prefix)
+                .arg("--help")
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("subscription"))
+                .stdout(predicate::str::contains("token"))
+                .stdout(predicate::str::contains("api"))
+                .stdout(predicate::str::contains("--output"));
+        }
+    }
+
+    #[test]
+    fn test_access_token_and_device_spellings_are_explicit() {
+        for prefix in LOGIN_PATHS {
+            let mut token = spice_cmd();
+            token
+                .args(prefix)
+                .args(["token", "--help"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("Access token"));
+
+            let mut pat_alias = spice_cmd();
+            pat_alias
+                .args(prefix)
+                .args(["pat", "--help"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("Access token"));
+
+            let mut subscription = spice_cmd();
+            subscription
+                .args(prefix)
+                .args(["subscription", "--help"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("--device"));
+        }
+    }
+
+    #[test]
     fn test_login_unknown_provider() {
         let mut cmd = spice_cmd();
         cmd.arg("login")
             .arg("unknown_provider_xyz")
             .assert()
             .failure();
+    }
+
+    /// Standalone `spice login --key` keeps its credential-store behavior: the
+    /// key lands in the working directory's `.env`, owner-readable only, with
+    /// the same success line as always.
+    #[test]
+    fn test_login_with_key_writes_env_credentials() {
+        let temp_dir = TempDir::new().expect("temp dir should be creatable");
+
+        let mut cmd = spice_cmd();
+        cmd.current_dir(temp_dir.path())
+            .args(["login", "--key", "sk_test_abc123"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "Successfully logged in to Spice.ai with API key",
+            ));
+
+        let env_path = temp_dir.path().join(".env");
+        let contents = fs::read_to_string(&env_path).expect(".env should be written");
+        assert!(
+            contents.contains("SPICE_SPICEAI_API_KEY=sk_test_abc123"),
+            "the key must be stored under its credential variable: {contents}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&env_path)
+                .expect(".env metadata should be readable")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "the credential file must stay owner-only"
+            );
+        }
+    }
+
+    /// Provider regression guard: the `SharePoint` and ABFS logins keep their
+    /// OAuth device-code flows and vocabulary — their help still asks for the
+    /// Azure AD tenant/client pair rather than anything session-based.
+    #[test]
+    fn test_provider_device_flow_help_unchanged() {
+        for provider in ["sharepoint", "abfs"] {
+            let mut cmd = spice_cmd();
+            cmd.args(["login", provider, "--help"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("--tenant-id"))
+                .stdout(predicate::str::contains("--client-id"));
+        }
     }
 }
 
@@ -728,16 +883,54 @@ mod connect {
     use super::*;
 
     #[test]
-    fn test_connect_help() {
-        let mut cmd = spice_cmd();
-        cmd.arg("connect")
+    fn test_connect_help_describes_only_the_deprecated_pod_add_surface() {
+        spice_cmd()
+            .arg("connect")
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains(
-                "Spicepod hosted on Spice.ai Cloud",
-            ))
-            .stdout(predicate::str::contains("Spice.ai Cloud"));
+            .stdout(predicate::str::contains("deprecated"))
+            .stdout(predicate::str::contains("spice add"))
+            .stdout(predicate::str::contains("spice cloud link"))
+            .stdout(predicate::str::contains("\n      --dir").not())
+            .stdout(predicate::str::contains("\n      --region").not())
+            .stdout(predicate::str::contains("\n      --endpoint").not())
+            .stdout(predicate::str::contains("\n      --force").not())
+            .stdout(predicate::str::contains("\n      --yes").not());
+    }
+
+    #[test]
+    fn test_connect_rejects_removed_automation_flags() {
+        for flag in [
+            "--token",
+            "--org",
+            "--project",
+            "--install",
+            "--dir",
+            "--region",
+            "--endpoint",
+            "--force",
+            "--yes",
+        ] {
+            spice_cmd()
+                .arg("connect")
+                .arg(flag)
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("unexpected argument"));
+        }
+    }
+
+    #[test]
+    fn test_connect_rejects_removed_lifecycle_subcommands() {
+        for command in ["status", "remove", "service"] {
+            spice_cmd()
+                .arg("connect")
+                .arg(command)
+                .assert()
+                .failure()
+                .stdout(predicate::str::contains("only accepts the deprecated"));
+        }
     }
 }
 

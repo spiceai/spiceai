@@ -1,0 +1,41 @@
+version: v1
+kind: Spicepod
+name: model2vec[potion-multilingual-128M]-s3_vectors
+datasets:
+
+  # MTEB SciFact Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
+  # https://huggingface.co/datasets/mteb/scifact
+
+  - from: file:./corpus.parquet
+    name: corpus
+    acceleration:
+      enabled: true
+    vectors:
+      enabled: true
+      engine: s3_vectors
+      params:
+        s3_vectors_bucket: spice-ci-search-benchmarks-variant-001
+        s3_vectors_index: scifact
+        s3_vectors_aws_region: us-east-2
+        s3_vectors_aws_access_key_id: ${env:AWS_S3_VECTORS_KEY}
+        s3_vectors_aws_secret_access_key: ${env:AWS_S3_VECTORS_SECRET}
+    columns:
+      - name: text
+        embeddings:
+          - from: potion
+            row_id:
+              - _id
+
+  - from: file:./queries.parquet
+    name: test_queries
+    acceleration:
+      enabled: true
+
+  - from: file:./data.parquet
+    name: relevance_data
+    acceleration:
+      enabled: true
+
+embeddings:
+  - from: model2vec:minishlab/potion-multilingual-128M
+    name: potion

@@ -40,6 +40,7 @@ use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::error::Error as StdError;
+use std::time::Duration;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 use tonic::transport::{Channel, Endpoint};
@@ -53,12 +54,29 @@ pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 pub const HTTP2_INITIAL_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 pub const HTTP2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
 
-/// Applies shared HTTP/2 flow-control settings for high-throughput Flight streams.
+/// How often to send an HTTP/2 PING on a pooled Flight channel.
+pub const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long to wait for a PING ack before treating the channel as dead.
+pub const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Applies shared HTTP/2 flow-control and keepalive settings for Flight channels.
+///
+/// The keepalive pings matter because these channels are pooled and long-lived. A load
+/// balancer between the client and a Flight endpoint resets connections that go idle,
+/// and the client is not told: the reset only surfaces when the next request is written,
+/// which then fails while the replacement connection is established for the request
+/// after it. Pinging while idle keeps the connection from being reaped in the first
+/// place, so a query or availability probe arriving after a quiet period still lands on
+/// a live channel.
 #[must_use]
 pub fn configure_endpoint_for_high_throughput(endpoint: Endpoint) -> Endpoint {
     endpoint
         .initial_stream_window_size(HTTP2_INITIAL_STREAM_WINDOW_SIZE)
         .initial_connection_window_size(HTTP2_INITIAL_CONNECTION_WINDOW_SIZE)
+        .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
 }
 
 #[derive(Debug)]
@@ -451,7 +469,9 @@ impl FlightClient {
                 .into_parts();
 
             return Ok(FlightRecordBatchStream::new_from_flight_data(
-                response_stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+                response_stream
+                    .map_ok(conforming_map_entries)
+                    .map_err(|status| FlightError::Tonic(Box::new(status))),
             )
             .with_headers(md));
         }
@@ -487,7 +507,9 @@ impl FlightClient {
             .into_parts();
 
         Ok(FlightDataDecoder::new(
-            response_stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+            response_stream
+                .map_ok(conforming_map_entries)
+                .map_err(|status| FlightError::Tonic(Box::new(status))),
         ))
     }
 
@@ -666,4 +688,20 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
         }
         _ => false,
     }
+}
+
+/// Returns `message` with a schema message that declares a `Map` whose `entries` field is
+/// nullable replaced by the conforming declaration; any other message passes through untouched.
+///
+/// The Arrow IPC decoder validates the map layout, so a server that declares nullable `entries`
+/// would otherwise fail every batch it sends with an error that names no column. The decoder
+/// hands its batches straight to the caller, so they have to come out of the decode already
+/// conforming (see `arrow_tools::map_entries::conforming_schema_message`); entries that do hold
+/// nulls are still refused by the decode.
+fn conforming_map_entries(mut message: FlightData) -> FlightData {
+    if let Some(header) = arrow_tools::map_entries::conforming_schema_message(&message.data_header)
+    {
+        message.data_header = header.into();
+    }
+    message
 }

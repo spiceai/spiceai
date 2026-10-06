@@ -20,3 +20,6 @@ tonic = { workspace = true, features = [
     "tls-ring",
     "tls-native-roots",
 ] }
+
+[lints]
+workspace = true

@@ -21,6 +21,13 @@ Cayenne provides a lakehouse format that enables efficient CRUD operations on co
 - **Snapshot engine** (`CayenneSnapshotEngine` in the runtime) that exports a per-dataset metastore "slice" (versioned JSON) so snapshots are portable across nodes with different data directories and never archive raw `cayenne.db*` files.
 - **Logical and physical optimizer rules** that surface Cayenne-friendly join shapes for HTAP workloads (predicate transitive closure for non-key dim filters, dynamic-filter sharing across same-source scans, anti/semi-join sort-merge rewrite above a 10M-row build side, in-list-to-range rewrite).
 
+## Storage modes: `mode: file` vs `mode: memory`
+
+Cayenne runs in one of two storage modes, selected by the acceleration `mode:` field:
+
+- **`mode: file`** (durable): metadata in a local `SQLite`/Turso metastore, immutable data in Vortex data files (local FS or S3 Express One Zone), an LSM level-0 inline tier, and background compaction. Survives restarts. This is Cayenne's original behavior.
+- **`mode: memory`** (fully in-RAM, ephemeral): all data lives in the RAM mem-tier, backed by an in-memory `memdb` `SQLite` metastore — **nothing is written to disk**. Checkpointing, sealing, compaction, and the cold tier are disabled. The dataset is ephemeral and reloads from its source on restart (like the in-memory Arrow accelerator); because there is no durable checkpoint, a CDC (`changes`) source's replication slot is committed immediately after each in-RAM write (not deferred), so source-side retention is not pinned. It works for all refresh modes (`full`/`append`/`changes`) and for both keyed and no-PK datasets, and a full refresh atomically replaces the in-RAM tier. **Partitioning is not supported** — if `partition_by` is set the accelerator returns a configuration error (use `mode: file` for a partitioned table). Since nothing spills to disk, a per-table hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`; default unbounded) returns a structured error on breach rather than growing without limit.
+
 ## Architecture
 
 ```text
@@ -165,7 +172,7 @@ pub trait MetastoreTransaction: Send + Sync {
 }
 ```
 
-Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Null`) to and from native column types. The starting BEGIN statement is sent by the backend itself: `BEGIN IMMEDIATE` for SQLite (takes the reserved write lock up front so a subsequent `UPDATE`/`INSERT` cannot upgrade-deadlock against a concurrent writer), and `BEGIN CONCURRENT` for Turso (MVCC writers serialize at commit time on actual conflicts).
+Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Null`) to and from native column types. The starting BEGIN statement is sent by the backend itself: `BEGIN IMMEDIATE` for SQLite (takes the reserved write lock up front so a subsequent `UPDATE`/`INSERT` cannot upgrade-deadlock against a concurrent writer), and `BEGIN CONCURRENT` for Turso (MVCC writers proceed optimistically and conflict on the statement that writes a row another transaction has changed, or on `COMMIT`).
 
 **Schema validation.** `metastore::EXPECTED_TABLES` is the canonical list of expected metadata tables and their ordered column names; `validate_existing_schema` is invoked after `init_schema` and returns `CatalogError::SchemaMismatch` (with an actionable "clear your acceleration data" message) when the on-disk schema does not match. Types and constraints are not compared — SQLite/libSQL type affinity makes exact type matching unreliable — but column names and ordering are.
 
@@ -173,7 +180,7 @@ Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Nu
 
 - **`SqliteMetastore`** (`metastore/sqlite.rs`): default; `tokio-rusqlite` with WAL mode, `synchronous=NORMAL`, `cache_size=-262144` (~256 MB, sized by `cayenne_metastore_cache_mb`), `temp_store=memory`, foreign keys on, and a 30-second `busy_timeout` (`cayenne_metastore_busy_timeout_ms`). PRAGMA configuration retries up to 5 times with exponential-ish backoff (10/25/50/100/200 ms) when the database is briefly locked at open.
 
-  A round-robin connection **pool** of K independent connections is created lazily on first use (`K = min(available_parallelism, 32)`, falling back to 4 when `available_parallelism()` errors, with a floor of 2). Pool acquisition tries each slot starting at the round-robin index and returns the first one with a free `tokio::sync::Mutex`, falling back to an awaited lock on the starting slot. SQLite WAL mode allows concurrent readers and serializes writers at the engine level; the pool primarily lifts read-side concurrency for metadata-heavy workloads where every scan pays multiple metastore reads. `begin_transaction` holds an `OwnedMutexGuard` on one pool slot for the full transaction lifetime.
+  A round-robin connection **pool** of K independent connections is created lazily on first use (`K = min(cpu_budget().cores(), 32)`, with a floor of 2). Pool acquisition tries each slot starting at the round-robin index and returns the first one with a free `tokio::sync::Mutex`, falling back to an awaited lock on the starting slot. SQLite WAL mode allows concurrent readers and serializes writers at the engine level; the pool primarily lifts read-side concurrency for metadata-heavy workloads where every scan pays multiple metastore reads. `begin_transaction` holds an `OwnedMutexGuard` on one pool slot for the full transaction lifetime.
 
 - **`TursoMetastore`** (`metastore/turso.rs`): optional, gated on the `turso` feature. libSQL/Turso backend with a fixed `K = 16` pool. Uses `BEGIN CONCURRENT` for MVCC-backed concurrent writers; the journal mode is set to the libSQL MVCC literal at connection open. Same 30-second `busy_timeout`.
 
@@ -211,8 +218,11 @@ pub trait MetadataCatalog: Send + Sync {
     async fn get_all_snapshot_sequences(&self, table_id: &str) -> CatalogResult<HashMap<String, i64>>;
     async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
 
-    // Atomic snapshot pointer flips (compaction and overwrite share retry-on-conflict logic)
-    async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    // Atomic snapshot pointer flips (compaction and overwrite share retry-on-conflict logic).
+    // A compaction commits only while the table still points at the snapshot it
+    // was built from (`SnapshotReplaced` otherwise).
+    async fn commit_compaction(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    async fn set_current_snapshot(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
     async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
 
     // Partitions
@@ -269,7 +279,7 @@ pub struct VortexConfig {
     pub compression_strategy: CompressionStrategy,  // default Btrblocks
 
     // Writer concurrency
-    pub upload_concurrency: usize,            // default available_parallelism()
+    pub upload_concurrency: usize,            // default cpu_budget().cores()
     pub write_concurrency: Option<usize>,     // None = session target_partitions; the sort-and-rewrite compaction path pins to 1 regardless of this setting
 
     // Compaction
@@ -297,7 +307,7 @@ pub struct VortexConfig {
 
 The block above is a representative subset. Newer per-dataset fields not shown include `deletion_mode`, `cdc_durability` plus the `cdc_mem_tier_*` group, `delta_encoding`, `shard_key_columns`, `bake_deletion_index_trigger`, `dynamic_tuning` + `pinned_tuning_actuators`, the `goal_*` SLO setpoints, `schema_evolution`, and `data_storage_class` / `metastore_storage_class` — all surfaced as `cayenne_*` parameters (see *Configuration parameters*).
 
-The runtime classifies a dataset as the "small-write profile" when its refresh mode is `caching`, `changes`, or `append` with `refresh_check_interval <= 5m`. All other refresh modes (`full`, `snapshot`, `disabled`, manual/cron append, unspecified) get the larger-write defaults. The two threshold groups have different baselines: `VortexConfig::default()` ships the small-write values for the `inline_max_*` admission gate (1024 / 1 MiB / 4 MiB), and the runtime layer zeroes those out for the large-write profile (disabling inlining for big batch loads). For everything else (compaction triggers and `inline_flush_max_*`), `VortexConfig::default()` ships the larger-write values, and the runtime layer overrides them when the small-write profile applies (`runtime/src/dataaccelerator/cayenne/mod.rs::apply_refresh_mode_defaults`).
+The runtime classifies a dataset as the "small-write profile" when its refresh mode is `caching`, `changes`, or `append` with `refresh_check_interval <= 5m`. All other refresh modes (`full`, `snapshot`, `disabled`, manual/cron append, unspecified) get the larger-write defaults. The two threshold groups have different baselines: `VortexConfig::default()` ships the small-write values for the `inline_max_*` admission gate (1024 / 1 MiB / 4 MiB), and the runtime layer zeroes those out for the large-write profile (disabling inlining for big batch loads). For everything else (compaction triggers and `inline_flush_max_*`), `VortexConfig::default()` ships the larger-write values, and the runtime layer overrides them when the small-write profile applies (`accelerator-cayenne`'s `apply_refresh_mode_defaults`).
 
 Two distinct threshold groups for inline data — `inline_max_*` is the *per-write admission* gate ("is this single write small enough to absorb into the memtable?"); `inline_flush_max_*` is the *cumulative flush* gate ("has the accumulated memtable grown enough that we should checkpoint it to Vortex?"). Under `auto`/`adaptive` tuning the `inline_flush_max_*` caps are derived from available memory (`HardwareProfile::inline_flush_caps`); the table values below are the small-write-profile baseline.
 
@@ -368,7 +378,8 @@ pub struct CayenneTableProvider {
 
     // Per-table locks
     write_lock: Arc<tokio::sync::Mutex<()>>,
-    compaction_lock: Arc<tokio::sync::Mutex<()>>,
+    compaction_lock: Arc<tokio::sync::RwLock<()>>,
+    protected_merge_claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
 
     // Object store
     object_store_config: Option<ObjectStoreConfig>,
@@ -385,13 +396,13 @@ pub struct CayenneTableProvider {
     new_files_since_last_compaction: Arc<AtomicUsize>,
     staging_wal_present: Arc<AtomicBool>,
     staging_may_have_files: Arc<AtomicBool>,
-    post_write_compaction_scheduled: Arc<AtomicBool>,
+    post_write_compaction_state: Arc<AtomicU8>,
     post_write_maintenance: Arc<PostWriteMaintenance>,
     background_compactor: Arc<OnceLock<BackgroundCompactor>>,
 }
 ```
 
-Selected fields only — the full struct (~55 fields) also carries the in-memory CDC mem-tier (`mem_tier`, `mem_checkpoint_lock`, `mem_tier_publish_lock`, `slot_advancer`, `background_mem_tier_checkpointer`), the sequence allocator (`seq_allocator`), schema evolution (`table_schema: Arc<ArcSwap<Schema>>`), sorted-scan attestation (`current_sorted_snapshot`), maintained aggregates (`maintained_aggregates`, `maintained_aggregate_epoch`), in-flight-scan GC guards (`snapshot_scan_refs`, `retired_snapshot_dirs`), and the per-table memory account (`table_memory: Arc<CayenneMemoryAccount>`).
+Selected fields only — the full struct (~55 fields) also carries the in-memory CDC mem-tier (`mem_tier`, `mem_checkpoint_lock`, `mem_tier_publish_lock`, `slot_advancer`, `background_mem_tier_checkpointer`), the sequence allocator (`seq_allocator`), schema evolution (`table_schema: Arc<ArcSwap<Schema>>`), sorted-scan attestation (`current_sorted_snapshot`), maintained aggregates (`maintained_aggregates`, `maintained_aggregate_epoch`, `maintained_aggregate_visibility_sequence`), in-flight-scan GC guards (`snapshot_scan_refs`, `retired_snapshot_dirs`), and the per-table memory account (`table_memory: Arc<CayenneMemoryAccount>`).
 
 Use `CayenneTableProviderBuilder` to construct instances:
 
@@ -447,18 +458,18 @@ Tiered small-files compaction picks the smallest eligible file tier whose total 
 Triggered by:
 
 - **Inline post-write trigger** (`schedule_post_write_compaction`): `tokio::spawn` with an `AcqRel` dedup flag so at most one inline pass is queued per table.
-- **Background compactor** (`BackgroundCompactor`): per-table periodic task gated by a shared per-accelerator semaphore (`Semaphore::new(available_parallelism())`).
+- **Background compactor** (`BackgroundCompactor`): per-table periodic task gated by a shared per-accelerator semaphore (`Semaphore::new(cpu_budget().cores())`).
 - **Inline memtable flush** (`checkpoint_inlined_data_if_memtable_pressure_exceeded`): drains `cayenne_inlined_data` into a Vortex file when cumulative rows / segments / IPC bytes exceed `inline_flush_max_*`.
 
 All compaction triggers `try_lock` the table write lock and skip if a writer is active. The compaction lock itself serializes concurrent compaction passes so write-driven and background-driven runs cannot overlap.
 
-### 8. Snapshot engine (`metastore::snapshot`, `runtime::dataaccelerator::cayenne::snapshot_engine`)
+### 8. Snapshot engine (`metastore::snapshot`, `accelerator_cayenne::snapshot_engine`)
 
 Snapshots of a Cayenne dataset are taken using a **per-dataset metastore slice** rather than archiving the raw `cayenne.db*` file. The slice is a versioned (`format_version: 1`) JSON document that contains every metastore row belonging to one `cayenne_table` (the table row plus all dependent rows via `table_id`). Path columns are rewritten relative to a writer-side anchor on export, and re-anchored to a reader-side directory on import — so snapshots are portable across nodes whose data directories don't match.
 
 `import_dataset` runs inside a single `BEGIN IMMEDIATE` transaction; FK `ON DELETE CASCADE` clears any prior dependent rows when the existing `cayenne_table` row is deleted.
 
-The runtime engine (`CayenneSnapshotEngine`) excludes `cayenne.db`, `cayenne.db-wal`, and `cayenne.db-shm` from the tar; it inserts the slice at the well-known archive path `metadata/<dataset_name>.slice.json`. This avoids the path-portability, multi-dataset clobbering, and init-race / sidecar problems that motivated the design.
+The runtime engine (`CayenneSnapshotEngine`) excludes `cayenne.db`, `cayenne.db-wal`, and `cayenne.db-shm` from the tar; it inserts the slice at the well-known archive path `metadata/<dataset_name>.slice.json`. This avoids the path-portability, multi-dataset clobbering, and init-race / sidecar problems that motivated the design. Of the data directory it archives only what the slice references — the current and protected snapshot directories and the `deletions/` directories they use. Retired snapshot directories, staging state, and the `deletions/` directories of unreferenced snapshots are skipped: maintenance removes them while the archive is being written, and the reader never needs them.
 
 ### 9. Catalog provider (`catalog_provider.rs`)
 
@@ -483,14 +494,14 @@ Cayenne ships several optimizer rules that work together to keep multi-way HTAP 
 - **`CayennePushDownSemiJoin`** (logical) — pushes a `LeftSemi`/`RightSemi` join down through inner joins (and identity-preserving `Projection`/`Filter` wrappers) so it prunes the base Cayenne scan sourcing its key *before* the multi-way joins build their non-spillable hash tables. TPC-H q18 is the motivating shape; soundness rests on the reordering law `(R ⋈ T) ⋉ₖ S ≡ (R ⋉ₖ S) ⋈ T`, valid when every semi-join key is sourced solely from one side. Skips scans it can *prove* are below `MIN_SEMI_JOIN_PUSHDOWN_SCAN_ROWS` (100K) rows.
 - **Inner-join probe filtering** is normally handled by DataFusion's *native* hash-join dynamic-filter pushdown (no Cayenne rule). For inner joins (the only shape DataFusion pushes join-derived dynamic filters through), `HashJoinExec` plants an `Arc<DynamicFilterPhysicalExpr>` into the right-side scan during the filter-pushdown phase, and the build side populates it at execute-time with a combined predicate: min/max **bounds** (for statistics-based file/row-group/segment pruning) plus a **membership** check — an `InList` for build sides within `datafusion.optimizer.hash_join_inlist_pushdown_max_size` (sized from `runtime.query.memory_limit` per partition by the Spice session builder) or a hash-table lookup for larger ones. This natively supersedes the forked `ExactLeftAccumulator` seam. The optional **`CayenneJoinRewriter`** (physical) re-introduces the `ExactLeftAccumulator` probe for Cayenne probe sides, but is *off by default* — registered only when `cayenne_optimizer_rules.exact_join_filter` is enabled.
 - **`CayenneDynamicFilterSharing`** (physical) — when a dynamic filter has been pushed into one `CayenneAccelerationExec`, installs the same `Arc<DynamicFilterPhysicalExpr>` on sibling `CayenneAccelerationExec`s backed by the same underlying table and equi-joined column set. Applies to `Inner`, `LeftSemi`, and `RightSemi` parent joins (anti joins excluded — sharing would drop rows they're meant to preserve).
-- **`CayenneAntiJoinSortMergeRewriter`** (physical) — DataFusion's `HashJoinExec` build side is non-spillable. For same-source Cayenne semi/anti joins, the rule rewrites the hash join into a `SortMergeJoinExec` with explicit spillable `SortExec` inputs when the build side is too large to materialize. The **memory-pool-fraction gate is primary**: when a memory pool is wired through config, the rule fires once the estimated build-side bytes exceed `cayenne.sort_merge_memory_pool_fraction` of `runtime.query.memory_limit` (default 0.125) — catching wide-row builds whose row count is modest but whose hash table would still exhaust the pool. When no memory pool is wired (e.g. direct DataFusion users), it **falls back** to the `cayenne.sort_merge_min_rows` exact build-side row count (default 10M). Inner/outer joins keep `HashJoinExec`.
-- **`CayenneMaintainedAggregateRewriter`** (physical, default-on) — when a query matches a Cayenne-maintained aggregate view (`group_by` + `Count`/`Sum`/`Avg`), serves the incrementally-maintained aggregate state in place of re-scanning and re-aggregating — but only when the maintained state's freshness epoch matches the scan's snapshot epoch (a DBSP-style incremental-view-maintenance fast path for append-heavy CDC streams; see *Maintained aggregates and NDV sketches* below).
+- **`CayenneAntiJoinSortMergeRewriter`** (physical) — DataFusion's `HashJoinExec` build side is non-spillable, so a build side too big for the pool fails the query outright; the rule rewrites such a join into a `SortMergeJoinExec` with explicit spillable `SortExec` inputs. The **memory gate is primary**: the gate is active when a memory pool is wired through config (the runtime always wires one) *and* `cayenne.sort_merge_memory_pool_fraction` resolves to a positive number — setting it to `0` turns the gate off outright even though a pool is still wired. While the gate is active, any join type sort-merge supports — inner, left/right/full outer, and semi/anti — with a Cayenne scan on either side is eligible, and the rule fires once the estimated build-side bytes exceed that join's share of the pool. The share is the smaller of `cayenne.sort_merge_memory_pool_fraction` of `runtime.query.memory_limit` (default 0.125, clamped to at most the whole pool) and an even split of the pool across every hash join in the plan. Exceeding the *fraction* rewrites whatever the row count — catching wide-row builds whose row count is modest but whose hash table would still exhaust the pool — whereas exceeding only the *even split* additionally requires `cayenne.sort_merge_min_rows` (default 10M), so a query holding many joins open does not push mid-size ones onto the slower plan. With no active gate — no memory pool wired (e.g. direct DataFusion users), or the fraction set to zero, negative, or `NaN` — the rule narrows to same-source semi/anti joins gated on that same row count, which there must be `Precision::Exact`.
+- **`CayenneMaintainedAggregateRewriter`** (physical, default-on) — when a query matches a Cayenne-maintained aggregate view (`group_by` + `Count`/`Sum`/`Avg`/`Min`/`Max`), serves the incrementally-maintained aggregate state in place of re-scanning and re-aggregating — but only when the maintained state's freshness epoch matches the scan's snapshot epoch (a DBSP-style incremental-view-maintenance fast path for append-heavy CDC streams; see *Maintained aggregates and NDV sketches* below).
 
 Together these rules turn q18/q21-style multi-way joins from OOM-prone hash-join chains into spillable shapes whose probe sides see propagated filters and shared dynamic filters from the start. The `cayenne` config extension surfaces the row-count and memory thresholds (`CayenneOptimizerConfig`).
 
 ### 12. Maintained aggregates and NDV sketches (`maintained_aggregate.rs`, `hll.rs`)
 
-- **Maintained aggregates** (`MaintainedAggregateSpec`) — a Cayenne-maintained aggregate view (`group_by` columns + `Count`/`Sum`/`Avg` expressions) whose state is updated incrementally on the CDC write path under a DBSP-style delta contract: rows apply as positive deltas while the view is known fresh; any operation that would need a retraction it lacks the old row values for marks the view stale. `CayenneMaintainedAggregateRewriter` (§11) serves the state only when its freshness epoch matches the scan's snapshot epoch, so a query never reads a stale view.
+- **Maintained aggregates** (`MaintainedAggregateSpec`) — a Cayenne-maintained aggregate view (`group_by` columns + `Count`/`Sum`/`Avg`/`Min`/`Max` expressions) whose state is updated incrementally on the CDC write path under a DBSP-style delta contract. `MIN`/`MAX` use a bounded per-group ordered multiset and require a primary key in runtime configuration so UPDATE/DELETE can retract the previous contribution. Each view's retained-entry count is updated in O(1), and the cap counts both per-PK contribution records and distinct ordered-multiset nodes; a stale registry detaches all group/index state immediately. At `cayenne_cdc_mem_tier_shards > 1`, one table-level IVM epoch covers the whole apply: an even/odd scan generation attaches that epoch only to a stable shard capture, while a racing scan keeps its base aggregate plan. The ordered background applier advances the registry after the shard fan-out. `CayenneMaintainedAggregateRewriter` (§11) serves state only when its freshness epoch matches that captured scan epoch; otherwise the query falls back to the base scan.
 - **Incremental HyperLogLog NDV sketches** (`NdvSketches`, `hll.rs`) — per-integer-column distinct-value sketches maintained on the write path and persisted in the `ndv_sketches` column of `cayenne_table_statistics`. Mergeable across writes (register-wise max), so the metastore folds each write's sketch the way it folds min/max. Used mainly to size distributed joins on sparse integer keys (e.g. a CDC `o_custkey` spanning ~1e9 with ~1M distinct).
 
 ### 13. Query-path scan optimizations (`provider/table.rs`)
@@ -551,7 +562,7 @@ Deletion vectors, protected snapshots, inlined data union, and time-retention fi
 
 ## Configuration parameters
 
-The runtime accelerator (`runtime/src/dataaccelerator/cayenne/mod.rs`) recognizes the following core `cayenne_*` spicepod parameters that configure dataset-level behavior. S3 Express One Zone storage parameters are listed in a separate table below. Defaults marked "small-write profile" apply when `refresh_mode` is `caching`, `changes`, or `append` with `refresh_check_interval <= 5m`; otherwise the larger defaults apply.
+The Cayenne accelerator (`crates/accelerators/accelerator-cayenne/src/lib.rs`) recognizes the following core `cayenne_*` spicepod parameters that configure dataset-level behavior. S3 Express One Zone storage parameters are listed in a separate table below. Defaults marked "small-write profile" apply when `refresh_mode` is `caching`, `changes`, or `append` with `refresh_check_interval <= 5m`; otherwise the larger defaults apply.
 
 | Parameter                                        | Description                                                                                                                 | Default                                                                   |
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
@@ -566,7 +577,7 @@ The runtime accelerator (`runtime/src/dataaccelerator/cayenne/mod.rs`) recognize
 | `cayenne_compression_strategy`                   | `btrblocks` or `zstd`.                                                                                                      | `btrblocks`                                                               |
 | `cayenne_delta_encoding`                         | Delta-write encoding level: `auto` (default), `none`, or an explicit level `0`–`10` (`7`+ is full). Tunes per-write delta encoding. | `auto`                                                            |
 | `cayenne_pk_conflict_detection`                  | `auto` or `none`.                                                                                                           | `auto`                                                                    |
-| `cayenne_upload_concurrency`                     | Concurrent multipart upload fan-out.                                                                                        | `available_parallelism()`                                                 |
+| `cayenne_upload_concurrency`                     | Concurrent multipart upload fan-out.                                                                                        | `cpu_budget().cores()`                                                    |
 | `cayenne_write_concurrency`                      | Writer partition override for unsorted ingests. The sort-and-rewrite compaction path always writes serially.                | `target_partitions`                                                       |
 | `cayenne_compaction_trigger_files`               | Small-tier file count trigger.                                                                                              | small = 4, otherwise = 8                                                  |
 | `cayenne_compaction_trigger_protected_snapshots` | Protected-snapshot count trigger.                                                                                           | small = 4, otherwise = 8                                                  |
@@ -587,11 +598,11 @@ The runtime accelerator (`runtime/src/dataaccelerator/cayenne/mod.rs`) recognize
 | `cayenne_cdc_mem_tier_min_flush_bytes`           | Minimum resident RAM-tier bytes before the periodic background tick checkpoints (`memory` mode only); below this a tick is skipped unless the age cap is reached. `0` flushes every tick. | memory-derived (~1/8 of the derived max-bytes, clamped `[32, 128]` MiB) |
 | `cayenne_cdc_mem_tier_checkpoint_interval_ms`    | Periodic background mem-tier checkpoint interval (`memory` mode only); advances the deferred slot ack on idle / pure-upsert streams. `0` disables the periodic task.                 | `1_000`                                                                   |
 | `cayenne_shard_key_columns`                      | Comma-separated columns to hash-cluster rows by during intra-write encode sharding. Empty derives the shard key from the primary key.                                                | (derive from PK)                                                          |
-| `cayenne_tuning`                                 | Auto-tuning mode: `auto` (static config from environment + inferred schema) or `adaptive` (additionally runs a per-table closed-feedback controller within environment-derived bounds; preview). An explicit per-parameter value overrides the derived value and *pins* that actuator under `adaptive`. | `auto`                          |
+| `cayenne_tuning`                                 | Auto-tuning mode: `auto` (static config from environment + inferred schema) or `adaptive` (additionally runs a per-table closed-feedback controller within environment-derived bounds; preview). `adaptive` is reached only by setting it here — no other signal turns the loop on. An explicit per-parameter value overrides the derived value and *pins* that actuator under `adaptive`. | `auto`                          |
 
-**CDC apply-loop coalescing** (runtime-level, per-dataset overrides; tune how the CDC source-reader batches envelopes before each accelerator write): `cdc_prefetch_buffer` (source-reader prefetch channel depth), `cdc_max_coalesced_envelopes` / `cdc_max_coalesced_bytes` (caps on one coalesced burst), `cdc_max_coalesce_age_ms` (linger window before flushing a partial burst), and `cdc_commit_timeout_ms` (source-side commit timeout). Parsed in `runtime/src/dataaccelerator/cayenne/mod.rs`.
+**CDC apply-loop coalescing** (runtime-level, per-dataset overrides; tune how the CDC source-reader batches envelopes before each accelerator write): `cdc_prefetch_buffer` (source-reader prefetch channel depth), `cdc_max_coalesced_envelopes` / `cdc_max_coalesced_bytes` (caps on one coalesced burst), `cdc_max_coalesce_age_ms` (linger window before flushing a partial burst), and `cdc_commit_timeout_ms` (source-side commit timeout). Parsed in `crates/accelerators/accelerator-cayenne/src/lib.rs`.
 
-**Goal-driven tuning** (`cayenne_tuning: adaptive`): `cayenne_goal_replication_lag`, `cayenne_goal_freshness`, and `cayenne_goal_query_latency` declare SLO setpoints the adaptive controller steers toward, within the static `auto` bounds. Set them **globally** under `runtime.params` (they apply to every Cayenne dataset) and override per-dataset via the same `acceleration.params` key. `cayenne_goal_qph` (target query throughput) is **global-only**: QPH is measured across all datasets — a query, e.g. a join, is counted once system-wide — so set it under `runtime.params`; a per-dataset value is ignored. `cayenne_goal_convergence_window` paces *how fast* the loop chases these SLOs (a control-cadence knob, default 60s) rather than declaring an outcome, so it stays a per-dataset advanced override and is not part of the global SLO surface. `cayenne_bake_deletion_index_trigger` sets the deletion-index seq-prefix-bake threshold (a derived value under `auto`; a movable actuator under `adaptive`).
+**Goal-driven tuning** (requires `cayenne_tuning: adaptive` — a goal never enables the loop by itself; set on a table left at the `auto` default it is ignored, with a warning): `cayenne_goal_replication_lag`, `cayenne_goal_freshness`, and `cayenne_goal_query_latency` declare SLO setpoints the adaptive controller steers toward, within the static `auto` bounds. Set them **globally** under `runtime.params` (they apply to every Cayenne dataset) and override per-dataset via the same `acceleration.params` key. `cayenne_goal_qph` (target query throughput) is **global-only**: QPH is measured across all datasets — a query, e.g. a join, is counted once system-wide — so set it under `runtime.params`; a per-dataset value is ignored. `cayenne_goal_convergence_window` paces *how fast* the loop chases these SLOs (a control-cadence knob, default 60s) rather than declaring an outcome, so it stays a per-dataset advanced override and is not part of the global SLO surface. `cayenne_bake_deletion_index_trigger` sets the deletion-index seq-prefix-bake threshold (a fixed engine default of 50 000 under `auto` — it is not environment-derived; a movable actuator under `adaptive`).
 
 ### In-memory CDC durability tier (`cdc_durability: memory`)
 
@@ -635,7 +646,7 @@ These are runtime-global `runtime.params` (not per-dataset). They tune the SQLit
 | `cayenne_metastore_busy_timeout_ms`           | `busy_timeout` — how long a writer waits for the lock before erroring.                                                                          | `30000`          |
 | `cayenne_metastore_wal_autocheckpoint_pages`  | Inline WAL auto-checkpoint threshold in pages; `0` disables the inline checkpoint so it never fires inside a hot commit (the background maintenance tick drains the WAL instead). | `0`              |
 | `cayenne_metastore_wal_truncate_threshold_mb` | WAL size above which the background-tick checkpoint escalates PASSIVE→TRUNCATE to reclaim the `-wal` file (never on the hot write path).         | `160`            |
-| `cayenne_metastore_auto_vacuum`               | `none`, `incremental`, or `full`. Takes effect only on a fresh DB.                                                                              | `none`           |
+| `cayenne_metastore_auto_vacuum`               | `none`, `incremental`, or `full`. Takes effect only on a fresh DB.                                                                              | `incremental`    |
 
 The metastore always runs in WAL journal mode with `synchronous = NORMAL`.
 
@@ -868,13 +879,25 @@ Only **S3 Express One Zone** is supported for data storage; standard S3 buckets 
 
 #### Data types
 
-Some Arrow data types are not natively supported by the Vortex format:
+Some Arrow data types cannot be stored in the Vortex format, and are rejected at table creation:
 
 - `Interval`
 - `Duration`
 - `FixedSizeBinary`
-- `Float16` (auto-converted to `Float32`)
-- Non-microsecond `Timestamp` units (auto-normalized to microseconds, timezone preserved)
+- `Union`
+- `RunEndEncoded` (Vortex can store it, but Cayenne does not accept it yet)
+
+`Map` is storable and restored on read from the table's schema: Vortex stores a map under a type
+of its own that carries no Arrow field names (and an older file stores it as
+`List<Struct<keys, values>>`).
+
+One type is rewritten rather than rejected:
+
+- `Float16` (stored as `Float32`)
+
+`Timestamp` columns keep the unit and timezone their source reports; all four Arrow units are
+stored as-is. A table created before that behaviour changed still stores microseconds, and
+keeps doing so for its lifetime.
 
 The `cayenne_unsupported_type_action` parameter controls handling:
 
@@ -885,7 +908,9 @@ The `cayenne_unsupported_type_action` parameter controls handling:
 
 #### Indexes
 
-Secondary indexes are not supported. Primary keys drive efficient upserts and deletions.
+Cayenne honors dataset `indexes` as in-memory point-lookup accelerators in both file and memory modes. A planned lookup uses an index when equality predicates on bare columns pin every column in one index entry. File mode can also batch-probe a published index from a completed collect-left hash join's exact scalar or correlated composite key set. Partitioned or oversized runtime key sets scan normally. Every predicate and join still runs on the candidate rows. `unique` builds the same lookup index and emits a warning because it does not constrain writes—use `primary_key` plus `on_conflict` for write-time uniqueness.
+
+Floating-point columns (`Float16`, `Float32`, and `Float64`) can be index columns: `-0.0` and `0.0` share an index entry, as does every NaN, so a lookup never misses a row the predicate would select. `EXPLAIN` names the index that served a lookup on `CayenneAccelerationExec` (`lookup_index`), with candidate counts and `uncovered_files` (candidate files read in full because the index does not cover them yet; `uncovered_batches` in memory mode); unsupported predicate shapes and runtime-only lookups report `lookup_index=none`, with `lookup_index_reason` saying why an indexed table's lookup scanned. `cayenne_lookup_index_files` reports how many data files each index covers. Actual runtime index probes are reported by the lookup-index probe metrics. See [Secondary indexes](../../docs/cayenne/cayenne.md#secondary-indexes-indexes) for the design and lifecycle details.
 
 #### Concurrency / MVCC
 
@@ -999,7 +1024,7 @@ Cayenne synthesizes several established database/storage techniques. The list be
 - **SQLite WAL mode** for the metastore. Allows concurrent readers and a single writer at the engine level; combined with Cayenne's connection pool this lifts the read-side concurrency ceiling.
   - SQLite WAL documentation: <https://www.sqlite.org/wal.html>
 
-- **libSQL `BEGIN CONCURRENT`** (MVCC writers) on Turso. Lets multiple writers run in parallel and serialize at commit time on actual conflicts, rather than at BEGIN time.
+- **libSQL `BEGIN CONCURRENT`** (MVCC writers) on Turso. Lets multiple writers run in parallel and conflict on the statement that writes a row another transaction has changed, or on `COMMIT`, rather than at `BEGIN` time.
   - Turso `BEGIN CONCURRENT`: <https://github.com/tursodatabase/libsql/blob/main/docs/BEGIN_CONCURRENT.md>
 
 - **UUIDv7** for `table_id`, `delete_file_id`, snapshot ids, and other catalog IDs. Time-ordered UUIDs keep newly-created rows clustered in B-tree-ordered SQLite primary indexes, reducing page splits on insert-heavy workloads.

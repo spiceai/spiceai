@@ -14,30 +14,32 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::chat::message_to_mistral;
+use crate::chat::{LocalModelOptions, PagedAttentionMode, message_to_mistral};
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::chat::{
-        ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionToolChoiceOption, ChatCompletionTools,
-        CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
-        FunctionCallStream, FunctionType, Role, StopConfiguration, ToolChoiceOptions,
+        ChatChoiceStream, ChatCompletionAllowedToolsChoice, ChatCompletionMessageToolCallChunk,
+        ChatCompletionNamedToolChoice, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
+        ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionUsage,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType, Role,
+        StopConfiguration, ToolChoiceAllowedMode, ToolChoiceOptions,
     },
 };
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
 use mistralrs::core::{
-    AdapterPaths, AutoDeviceMapParams, DeviceMapSetting, GGMLLoaderBuilder, GGMLSpecificConfig,
-    GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
-    ModelPaths, MultimodalLoaderBuilder, MultimodalLoaderType, MultimodalSpecificConfig,
-    NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, Pipeline, RequestMessage,
-    TokenSource,
+    AdapterPaths, AllowedToolChoice, AllowedToolsMode, AllowedToolsToolChoice,
+    AllowedToolsToolChoiceType, AutoDeviceMapParams, DeviceMapSetting, GGMLLoaderBuilder,
+    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs,
+    MistralRsBuilder, ModelPaths, MultimodalLoaderBuilder, MultimodalLoaderType,
+    MultimodalSpecificConfig, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig,
+    Pipeline, RequestMessage, TokenSource,
 };
 use mistralrs::{
     ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device, Function,
@@ -46,6 +48,7 @@ use mistralrs::{
 };
 
 use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
@@ -90,9 +93,14 @@ impl MistralLlama {
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
-        chat_template_literal: Option<&str>,
+        options: LocalModelOptions<'_>,
         ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
+        let LocalModelOptions {
+            chat_template_literal,
+            context_length,
+            paged_attention,
+        } = options;
         for weight in model_weights {
             if !weight.exists() {
                 return Err(ChatError::LocalModelNotFound {
@@ -143,7 +151,16 @@ impl MistralLlama {
             .and_then(|p| p.as_path().extension())
             .and_then(|e| e.to_str());
 
-        let paged_attn_config = Self::paged_attention_config(&device);
+        let paged_attn_config = match paged_attention {
+            PagedAttentionMode::Disabled => {
+                tracing::info!(
+                    "Serving model {model_id} with dense attention (paged_attention: disabled)"
+                );
+                None
+            }
+            PagedAttentionMode::Auto => Self::paged_attention_config(&device),
+        };
+        let device_map = DeviceMapSetting::Auto(Self::text_device_map_params(context_length));
         let paged_attn_requested = paged_attn_config.is_some();
         let pipeline = match extension {
             Some("ggml") => Self::load_ggml_pipeline(
@@ -151,6 +168,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
+                device_map,
                 paged_attn_config,
             )?,
             Some("gguf") => Self::load_gguf_pipeline(
@@ -158,6 +176,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
+                device_map,
                 paged_attn_config,
             )?,
             _ => Self::load_default_pipeline(
@@ -165,6 +184,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
+                device_map,
                 paged_attn_config,
             )?,
         };
@@ -186,17 +206,24 @@ impl MistralLlama {
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
     ) -> Box<dyn ModelPaths> {
-        Box::new(LocalModelPaths::new(
-            tokenizer.map(PathBuf::from).unwrap_or_default(),
-            config.map(PathBuf::from).unwrap_or_default(),
-            tokenizer_config.map(PathBuf::from).unwrap_or_default(),
-            model_weights.to_vec(),
-            AdapterPaths::None,
-            generation_config.map(PathBuf::from),
-            None,
-            None,
-            None,
-        ))
+        // NOTE: `LocalModelPaths::new` wraps its 3rd arg (`template_filename`) in `Some`,
+        // so passing an empty `PathBuf` (GGUF models carry no `tokenizer_config`) yields
+        // `Some("")`, which panics in mistral.rs `get_chat_template` (`.extension()` on an
+        // empty path -> "Template filename must be a file"). Construct the struct directly
+        // so `template_filename` is `None` when absent: GGUF models then fall back to the
+        // chat template embedded in the GGUF metadata. A present `tokenizer_config`
+        // (safetensors) is still used as the template source, preserving prior behavior.
+        Box::new(LocalModelPaths {
+            tokenizer_filename: tokenizer.map(PathBuf::from).unwrap_or_default(),
+            config_filename: config.map(PathBuf::from).unwrap_or_default(),
+            template_filename: tokenizer_config.map(PathBuf::from),
+            filenames: model_weights.to_vec(),
+            adapter_paths: AdapterPaths::None,
+            gen_conf: generation_config.map(PathBuf::from),
+            preprocessor_config: None,
+            processor_config: None,
+            chat_template_json_filename: None,
+        })
     }
 
     fn load_default_pipeline(
@@ -204,6 +231,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        device_map: DeviceMapSetting,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
@@ -222,7 +250,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            device_map,
             None,
             paged_attn_config,
         )
@@ -234,6 +262,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        device_map: DeviceMapSetting,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         // Note: GGUF supports chat templates in the file, but since GGML/llama.cpp does
@@ -282,7 +311,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            device_map,
             None,
             paged_attn_config,
         )
@@ -294,6 +323,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        device_map: DeviceMapSetting,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let tokenizer = paths.get_tokenizer_filename().to_string_lossy().to_string();
@@ -313,13 +343,19 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            device_map,
             None,
             paged_attn_config,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
+    /// Build the mistral.rs `PagedAttention` config for a locally served model, or `None`
+    /// where this build cannot use it.
+    ///
+    /// Requesting it is all a caller can do: the engine downgrades to dense attention for
+    /// architectures with no paged kernel (the Multi-head Latent Attention GGUFs), which
+    /// is knowledge that belongs with its loaders rather than here.
     fn paged_attention_config(device: &Device) -> Option<mistralrs::PagedAttentionConfig> {
         if matches!(device, Device::Cpu) || !Self::paged_attention_supported() {
             return None;
@@ -336,6 +372,20 @@ impl MistralLlama {
 
     fn paged_attention_supported() -> bool {
         cfg!(all(feature = "cuda", target_family = "unix"))
+    }
+
+    /// Auto device-map params for text models, honoring an optional operator-set context
+    /// length (the `context_length` model param); the engine's own default applies when
+    /// unset. This is the sequence-length budget used to plan cross-device layer placement
+    /// and size the KV reservation — it does not raise the context the weights were
+    /// trained for, which the model's own metadata still caps.
+    fn text_device_map_params(context_length: Option<usize>) -> AutoDeviceMapParams {
+        context_length.map_or_else(AutoDeviceMapParams::default_text, |max_seq_len| {
+            AutoDeviceMapParams::Text {
+                max_seq_len,
+                max_batch_size: AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE,
+            }
+        })
     }
 
     fn default_scheduler_config() -> mistralrs::SchedulerConfig {
@@ -527,13 +577,30 @@ impl MistralLlama {
             truncate_sequence: false,
             max_tool_rounds: None,
             tool_dispatch_url: None,
+            // mistral.rs v0.9.0 agentic / code-execution / shell / files features:
+            // Spice does not use them, so opt out with defaults.
+            enable_code_execution: false,
+            enable_shell: false,
+            shell_options: None,
+            code_execution_permission: None,
+            code_execution_approval_notifier: None,
+            agent_permission: None,
+            agent_approval_handler: None,
+            agent_approval_notifier: None,
+            session_id: None,
+            files: None,
+            input_files: Vec::new(),
         }))
     }
 
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
+    ///
+    /// `tool_choice` is converted by the caller ([`convert_tool_choice`]) so a choice this
+    /// pipeline cannot enforce is refused as an invalid argument before anything is sent.
     async fn send_message(
         &self,
         req: CreateChatCompletionRequest,
+        tool_choice: Option<ToolChoice>,
     ) -> Result<Receiver<MistralResponse>> {
         let message = RequestMessage::Chat {
             messages: req
@@ -546,7 +613,6 @@ impl MistralLlama {
         };
 
         let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
-        let tool_choice: Option<ToolChoice> = req.tool_choice.map(|s| convert_tool_choice(&s));
 
         let sampling = SamplingParams {
             temperature: req.temperature.map(f64::from),
@@ -705,7 +771,8 @@ impl Chat for MistralLlama {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let recver = self.send_message(req).await.map_err(|e| {
+        let tool_choice = request_tool_choice(&req)?;
+        let recver = self.send_message(req, tool_choice).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
                 r#type: None,
@@ -720,7 +787,8 @@ impl Chat for MistralLlama {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let mut recver = self.send_message(req).await.map_err(|e| {
+        let tool_choice = request_tool_choice(&req)?;
+        let mut recver = self.send_message(req, tool_choice).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
                 r#type: None,
@@ -802,6 +870,21 @@ fn stream_from_response(
                         code: None,
                     }));
                 }
+                // mistral.rs v0.9.0 agentic / diffusion / file responses: Spice does
+                // not enable those features on the chat path (agent_permission/files
+                // are None), so they should not occur here. Surface an error rather
+                // than panic if the engine ever emits one.
+                MistralResponse::AgenticToolCallProgress { .. }
+                | MistralResponse::BlockDenoisingProgress(_)
+                | MistralResponse::AgenticToolApprovalRequired { .. }
+                | MistralResponse::File(_) => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: "Unsupported response type for chat completions".to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
+                }
              }
         }
     })
@@ -870,16 +953,106 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
     })
 }
 
-fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> ToolChoice {
-    match x {
-        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => ToolChoice::Auto,
-        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => {
-            unimplemented!("`mistral_rs::core` does not yet have `ToolChoice::Required`")
-        }
-        ChatCompletionToolChoiceOption::Function(t) => ToolChoice::Tool(convert_named_tool(t)),
-        // None, AllowedTools, or Custom not supported
-        _ => ToolChoice::None,
+/// Where a refused `tool_choice` points the caller.
+const TOOL_CHOICE_DOCS: &str = "https://spiceai.org/docs/components/models/huggingface";
+
+/// The `tool_choice` to hand `mistral.rs` for `req`, or an invalid-argument error when the
+/// request asks for a constraint that cannot be enforced — including a tool call required of a
+/// request that offers no tools, which `mistral.rs` would otherwise answer in prose.
+fn request_tool_choice(
+    req: &CreateChatCompletionRequest,
+) -> Result<Option<ToolChoice>, OpenAIError> {
+    let Some(choice) = req
+        .tool_choice
+        .as_ref()
+        .map(convert_tool_choice)
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let requires_call = matches!(
+        &choice,
+        ToolChoice::Required
+            | ToolChoice::AllowedTools(AllowedToolsToolChoice {
+                mode: AllowedToolsMode::Required,
+                ..
+            })
+    );
+    if requires_call && req.tools.as_ref().is_none_or(Vec::is_empty) {
+        return Err(OpenAIError::InvalidArgument(format!(
+            "tool_choice requires a tool call, but the request lists no tools. Add the tools the model may call to 'tools', or use tool_choice 'auto'. See: {TOOL_CHOICE_DOCS}"
+        )));
     }
+    Ok(Some(choice))
+}
+
+/// Maps a request's `tool_choice` onto the one `mistral.rs` enforces.
+///
+/// Every choice either maps to the constraint it asks for or is refused: a choice mapped to a
+/// weaker one (`required` answered as `auto`, `allowed_tools` as `none`) returns a normal
+/// completion that silently ignores what the caller asked for.
+fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> Result<ToolChoice, OpenAIError> {
+    match x {
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None) => Ok(ToolChoice::None),
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => Ok(ToolChoice::Auto),
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => {
+            Ok(ToolChoice::Required)
+        }
+        ChatCompletionToolChoiceOption::Function(t) => Ok(ToolChoice::Tool(convert_named_tool(t))),
+        ChatCompletionToolChoiceOption::AllowedTools(choice) => convert_allowed_tools(choice),
+        ChatCompletionToolChoiceOption::Custom(_) => Err(OpenAIError::InvalidArgument(format!(
+            "tool_choice of type 'custom' is not supported by locally hosted models. Use 'none', 'auto', 'required', 'allowed_tools', or a named 'function' tool. See: {TOOL_CHOICE_DOCS}"
+        ))),
+    }
+}
+
+/// Maps an `allowed_tools` choice onto `mistral.rs`'s single-mode equivalent. `mistral.rs` takes
+/// one mode over one tool list, so a choice carrying several entries is refused unless they
+/// agree on the mode.
+fn convert_allowed_tools(
+    choice: &ChatCompletionAllowedToolsChoice,
+) -> Result<ToolChoice, OpenAIError> {
+    let invalid = |reason: &str| {
+        OpenAIError::InvalidArgument(format!(
+            "tool_choice 'allowed_tools' {reason}. See: {TOOL_CHOICE_DOCS}"
+        ))
+    };
+
+    let mut mode = None;
+    let mut tools = Vec::new();
+    for entry in &choice.allowed_tools {
+        let entry_mode = match entry.mode {
+            ToolChoiceAllowedMode::Auto => AllowedToolsMode::Auto,
+            ToolChoiceAllowedMode::Required => AllowedToolsMode::Required,
+        };
+        if mode.is_some_and(|m| m != entry_mode) {
+            return Err(invalid(
+                "mixes 'auto' and 'required' modes, which locally hosted models cannot combine",
+            ));
+        }
+        mode = Some(entry_mode);
+
+        for tool in &entry.tools {
+            let Ok(ChatCompletionTools::Function(tool)) = ChatCompletionTools::deserialize(tool)
+            else {
+                return Err(invalid(
+                    "lists a tool that is not a named 'function' tool, the only kind locally hosted models can be restricted to",
+                ));
+            };
+            tools.push(AllowedToolChoice::Function {
+                name: tool.function.name,
+            });
+        }
+    }
+
+    let Some(mode) = mode else {
+        return Err(invalid("lists no tools"));
+    };
+    Ok(ToolChoice::AllowedTools(AllowedToolsToolChoice {
+        tp: AllowedToolsToolChoiceType::AllowedTools,
+        mode,
+        tools,
+    }))
 }
 
 /// [`MistralRs`] uses `Tool` for both choosing a tool, and defining a tool.
@@ -935,5 +1108,153 @@ fn parse_tool_call_response(
             name: Some(r.function.name.clone()),
             arguments: Some(r.function.arguments.clone()),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn choice(json: serde_json::Value) -> ChatCompletionToolChoiceOption {
+        serde_json::from_value(json).expect("tool_choice should deserialize")
+    }
+
+    fn invalid_argument<T: std::fmt::Debug>(result: Result<T, OpenAIError>) -> String {
+        match result {
+            Err(OpenAIError::InvalidArgument(message)) => message,
+            other => panic!("expected an invalid-argument error, got {other:?}"),
+        }
+    }
+
+    // regression test for #14230: `required` reached an `unimplemented!` and aborted the request.
+    #[test]
+    fn required_maps_to_required() {
+        let converted = convert_tool_choice(&choice(serde_json::json!("required")))
+            .expect("required is supported");
+        assert!(matches!(converted, ToolChoice::Required), "{converted:?}");
+    }
+
+    #[test]
+    fn modes_map_to_the_same_mode() {
+        let none = convert_tool_choice(&choice(serde_json::json!("none"))).expect("none");
+        assert!(matches!(none, ToolChoice::None), "{none:?}");
+        let auto = convert_tool_choice(&choice(serde_json::json!("auto"))).expect("auto");
+        assert!(matches!(auto, ToolChoice::Auto), "{auto:?}");
+    }
+
+    #[test]
+    fn named_function_maps_to_that_tool() {
+        let converted = convert_tool_choice(&choice(serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather" }
+        })))
+        .expect("a named function is supported");
+        let ToolChoice::Tool(tool) = converted else {
+            panic!("expected a forced tool, got {converted:?}");
+        };
+        assert_eq!(tool.function.name, "get_weather");
+    }
+
+    /// `allowed_tools` was mapped to `none`, so a request restricting the model to — or requiring
+    /// — a subset of its tools was answered with tools disabled altogether.
+    #[test]
+    fn allowed_tools_keeps_its_mode_and_tools() {
+        let converted = convert_tool_choice(&choice(serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": [{
+                "mode": "required",
+                "tools": [
+                    { "type": "function", "function": { "name": "get_weather" } },
+                    { "type": "function", "function": { "name": "get_time" } }
+                ]
+            }]
+        })))
+        .expect("function tools with one mode are supported");
+        let ToolChoice::AllowedTools(allowed) = converted else {
+            panic!("expected allowed tools, got {converted:?}");
+        };
+        assert_eq!(allowed.mode, AllowedToolsMode::Required);
+        let names: Vec<_> = allowed
+            .tools
+            .iter()
+            .map(|tool| match tool {
+                AllowedToolChoice::Function { name } => name.as_str(),
+                other => panic!("expected a function tool, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["get_weather", "get_time"]);
+    }
+
+    #[test]
+    fn allowed_tools_that_cannot_be_enforced_are_refused() {
+        let mixed = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": [
+                { "mode": "auto", "tools": [{ "type": "function", "function": { "name": "a" } }] },
+                { "mode": "required", "tools": [{ "type": "function", "function": { "name": "b" } }] }
+            ]
+        }))));
+        assert!(mixed.contains("mixes 'auto' and 'required'"), "{mixed}");
+
+        let hosted = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": [{ "mode": "auto", "tools": [{ "type": "web_search" }] }]
+        }))));
+        assert!(hosted.contains("not a named 'function' tool"), "{hosted}");
+
+        let empty = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": []
+        }))));
+        assert!(empty.contains("lists no tools"), "{empty}");
+    }
+
+    fn request(json: serde_json::Value) -> CreateChatCompletionRequest {
+        serde_json::from_value(json).expect("request should deserialize")
+    }
+
+    /// With no tools to call, `mistral.rs` cannot enforce `required` and answers in prose.
+    #[test]
+    fn a_required_call_needs_tools() {
+        let messages = serde_json::json!([{ "role": "user", "content": "hi" }]);
+        for tool_choice in [
+            serde_json::json!("required"),
+            serde_json::json!({
+                "type": "allowed_tools",
+                "allowed_tools": [{ "mode": "required", "tools": [{ "type": "function", "function": { "name": "a" } }] }]
+            }),
+        ] {
+            let message = invalid_argument(request_tool_choice(&request(serde_json::json!({
+                "model": "m", "messages": messages, "tool_choice": tool_choice
+            }))));
+            assert!(message.contains("lists no tools"), "{message}");
+        }
+
+        let with_tools = request_tool_choice(&request(serde_json::json!({
+            "model": "m",
+            "messages": messages,
+            "tools": [{ "type": "function", "function": { "name": "a" } }],
+            "tool_choice": "required"
+        })))
+        .expect("required with tools is supported");
+        assert!(
+            matches!(with_tools, Some(ToolChoice::Required)),
+            "{with_tools:?}"
+        );
+
+        let auto = request_tool_choice(&request(serde_json::json!({
+            "model": "m", "messages": messages, "tool_choice": "auto"
+        })))
+        .expect("auto needs no tools");
+        assert!(matches!(auto, Some(ToolChoice::Auto)), "{auto:?}");
+    }
+
+    #[test]
+    fn custom_is_refused() {
+        let message = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
+            "type": "custom",
+            "custom": { "name": "grammar_tool" }
+        }))));
+        assert!(message.contains("'custom' is not supported"), "{message}");
     }
 }

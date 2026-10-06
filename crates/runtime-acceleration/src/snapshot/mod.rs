@@ -14,15 +14,16 @@ limitations under the License.
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
 use arrow_schema::{Schema, SchemaRef};
+use arrow_tools::map_entries::conforming_schema;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use aws_sdk_credential_bridge::object_store_builder::{
     S3ObjectStoreBuilder, S3ObjectStoreBuilderError,
 };
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, stream::BoxStream};
 use object_store::{
-    GetResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
+    GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
     path::Path as ObjectPath,
 };
 use opentelemetry::KeyValue;
@@ -37,10 +38,13 @@ use std::{
     collections::HashMap,
     fmt::Write,
     ops::Not,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, LazyLock},
-    time::Instant,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use tokio::sync::OwnedMutexGuard;
 use tokio::{
@@ -61,9 +65,19 @@ mod behavior;
 pub mod directory_archive;
 pub mod engine;
 pub mod metrics;
+pub mod notifications;
+mod writer_lease;
 pub use crate::layout::AccelerationLayout;
-pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior};
+pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior, snapshots_enabled};
 use engine::{SnapshotEngine, create_snapshot_engine};
+use writer_lease::{WriterLease, WriterPermit, claim_publication, superseded_message};
+
+/// Size of each ranged GET used to download a snapshot.
+const SNAPSHOT_DOWNLOAD_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+/// Ranged GETs in flight per snapshot download (up to 32 MiB buffered).
+const SNAPSHOT_DOWNLOAD_CONCURRENCY: usize = 4;
+
+type SnapshotChunks<'a> = BoxStream<'a, object_store::Result<bytes::Bytes>>;
 
 /// Public API types for snapshot information exposed via HTTP endpoints.
 pub mod api {
@@ -113,6 +127,7 @@ const SNAPSHOT_METADATA_FORMAT_VERSION: u32 = 1;
 const METADATA_FILE_NAME: &str = "metadata.json";
 const SNAPSHOT_CHECKSUM_ALGORITHM: &str = "SHA256";
 const NETWORK_RETRY_MAX: usize = 3;
+const SNAPSHOTS_DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/snapshots";
 
 // Shared with the other schema-evolution emit sites. `runtime-acceleration` cannot
 // import the `runtime` crate's counters (it is a dependency of `runtime`), so the
@@ -152,12 +167,24 @@ fn widening_plan_kind(plan: &WideningPlan) -> &'static str {
     }
 }
 
+/// Renders a duration in whole minutes, or in seconds when under a minute, for
+/// log messages.
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// Returns `true` if the given object store error is likely transient and worth retrying.
 fn is_retriable_object_store_error(err: &object_store::Error) -> bool {
     !matches!(
         err,
         object_store::Error::NotFound { .. }
             | object_store::Error::NotSupported { .. }
+            | object_store::Error::NotImplemented { .. }
             | object_store::Error::AlreadyExists { .. }
             | object_store::Error::Precondition { .. }
     )
@@ -275,6 +302,145 @@ struct MetadataHandle {
     version: Option<UpdateVersion>,
 }
 
+impl MetadataHandle {
+    fn e_tag(&self) -> Option<String> {
+        self.version
+            .as_ref()
+            .and_then(|version| version.e_tag.clone())
+    }
+}
+
+/// The outcome of reading `metadata.json`.
+enum MetadataRead {
+    /// A conditional read found the file unchanged since the given `ETag`.
+    Unchanged,
+    /// The file as it is now, or `None` when it does not exist.
+    Current(Option<MetadataHandle>),
+}
+
+/// The outcome of one [`SnapshotManager::download_if_newer`] poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPoll {
+    /// The snapshot that was downloaded, or `None` when nothing newer was available.
+    pub download: Option<SnapshotDownloadInfo>,
+    /// The `ETag` of the metadata this poll acted on, when the store reports one. Passing
+    /// it to the next poll lets that poll skip entirely if the metadata has not changed.
+    pub metadata_e_tag: Option<String>,
+}
+
+/// A dataset's current snapshot as its `metadata.json` records it: what a dataset that
+/// reads snapshots needs to know before it can create the acceleration the snapshot
+/// loads into.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentSnapshot {
+    /// The id `current-snapshot-id` names.
+    pub snapshot_id: u64,
+    /// The acceleration engine that created the snapshot, lowercase as recorded
+    /// (`cayenne`, `duckdb`, `sqlite`, `turso`).
+    pub engine: String,
+    /// The dataset schema recorded for the snapshot.
+    pub schema: SchemaRef,
+}
+
+/// Why [`SnapshotManager::current_snapshot`] found no snapshot to load. Each message is
+/// worded as the cause clause of a message that names the dataset.
+#[derive(Debug, Snafu)]
+#[snafu(module(current_snapshot_error))]
+pub enum CurrentSnapshotError {
+    #[snafu(display("'{metadata}' does not exist"))]
+    MetadataNotFound { metadata: String },
+
+    #[snafu(display(
+        "'{metadata}' has no dataset named '{dataset}' ({})",
+        describe_datasets(available)
+    ))]
+    DatasetNotFound {
+        metadata: String,
+        dataset: String,
+        available: Vec<String>,
+    },
+
+    #[snafu(display("'{metadata}' names no current snapshot for dataset '{dataset}'"))]
+    NoCurrentSnapshot { metadata: String, dataset: String },
+
+    #[snafu(display(
+        "'{metadata}' does not record which acceleration engine created the current snapshot of dataset '{dataset}'"
+    ))]
+    EngineNotRecorded { metadata: String, dataset: String },
+
+    #[snafu(display("'{metadata}' records no schema for dataset '{dataset}'"))]
+    SchemaMissing { metadata: String, dataset: String },
+
+    #[snafu(display(
+        "'{metadata}' records an unreadable schema for dataset '{dataset}': {source}"
+    ))]
+    SchemaInvalid {
+        metadata: String,
+        dataset: String,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("reading '{metadata}' failed: {source}"))]
+    ReadMetadata {
+        metadata: String,
+        source: object_store::Error,
+    },
+
+    #[snafu(display("'{metadata}' is not valid snapshot metadata: {source}"))]
+    ParseMetadata {
+        metadata: String,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display(
+        "'{metadata}' has format version {version}, which this version of Spice cannot read. Upgrade Spice to the version that created the snapshots"
+    ))]
+    UnsupportedMetadataVersion { metadata: String, version: u32 },
+}
+
+impl CurrentSnapshotError {
+    /// Whether the snapshot can still become loadable without a configuration change:
+    /// the metadata, or the dataset's entry in it, may be published later, and a read
+    /// that failed may succeed on a retry. Only metadata written in a format this build
+    /// cannot read needs a different build of Spice.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        !matches!(self, Self::UnsupportedMetadataVersion { .. })
+    }
+}
+
+/// `'a', 'b'` for the datasets a `metadata.json` lists, for [`CurrentSnapshotError`].
+fn describe_datasets(datasets: &[String]) -> String {
+    if datasets.is_empty() {
+        return "it lists no datasets".to_string();
+    }
+    let names = datasets
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("it lists {names}")
+}
+
+/// The engine that created `entry`: the engine recorded on the entry, then the one
+/// recorded for its dataset, then the engine the snapshot file's extension names —
+/// each writer names its snapshots `<dataset>_<timestamp>.<engine>`.
+fn recorded_snapshot_engine(entry: &SnapshotEntry, dataset: &DatasetMetadata) -> Option<String> {
+    entry
+        .snapshot_engine
+        .clone()
+        .or_else(|| dataset.engine.clone())
+        .or_else(|| {
+            let file_name = entry.snapshot.rsplit('/').next()?;
+            let (_, extension) = file_name.rsplit_once('.')?;
+            ["cayenne", "duckdb", "sqlite", "turso"]
+                .into_iter()
+                .find(|engine| extension.eq_ignore_ascii_case(engine))
+                .map(str::to_string)
+        })
+        .map(|engine| engine.to_ascii_lowercase())
+}
+
 #[derive(Debug)]
 enum MetadataLoadError {
     Read {
@@ -292,13 +458,32 @@ enum MetadataLoadError {
 }
 
 impl SchemaMetadata {
+    /// The recorded schema, in the Arrow-conforming form.
+    ///
+    /// A recorded schema is a foreign declaration — JSON written by whichever build produced
+    /// the snapshot — and everything downstream takes it at face value: it bootstraps the
+    /// checkpoint, it is one side of the `classify` comparison, and `download_if_newer` hands
+    /// it to a validator that compares it field by field against the live accelerator schema.
+    /// A `Map` declaring its `entries` field nullable is not a difference the other side of
+    /// that comparison can ever hold — `MapArray::try_new` refuses the declaration — so left
+    /// in, it reads as a schema mismatch no snapshot can satisfy. Conformed on the way out for
+    /// the same reason every other decode point conforms one; see
+    /// [`arrow_tools::type_rewrite::MapEntriesNonNullable`].
     fn to_schema_ref(&self) -> Result<SchemaRef, serde_json::Error> {
         let schema: Schema = serde_json::from_value(self.schema.clone())?;
-        Ok(Arc::new(schema))
+        Ok(conforming_schema(Arc::new(schema)))
     }
 
+    /// Records `schema` in the Arrow-conforming form, so a snapshot written from here on
+    /// carries a declaration an accelerator can hold. Paired with [`Self::to_schema_ref`],
+    /// which repairs the ones already written.
+    ///
+    /// Only the layout-conformance rule is applied, not `normalize_for_comparison`: that
+    /// helper also unwraps `Dictionary` encoding, which is transparent when *comparing* two
+    /// schemas but is real information in one that is persisted and later compared against a
+    /// live accelerator schema that still carries it.
     fn from_schema(schema_id: u64, schema: &SchemaRef) -> Result<Self, serde_json::Error> {
-        let schema_json = serde_json::to_value(schema)?;
+        let schema_json = serde_json::to_value(conforming_schema(Arc::clone(schema)))?;
         Ok(Self {
             schema_id,
             schema: schema_json,
@@ -347,6 +532,11 @@ pub enum SnapshotDownloadError {
     CreateLocalDir {
         path: PathBuf,
         source: std::io::Error,
+    },
+    #[snafu(display("Failed to prepare the snapshot restored to {}: {source}", path.display()))]
+    FinalizeFile {
+        path: PathBuf,
+        source: Box<engine::SnapshotEngineError>,
     },
     #[snafu(display("Failed to write snapshot to {}: {source}", path.display()))]
     WriteLocal {
@@ -509,21 +699,63 @@ pub enum SnapshotUploadError {
         "Schema mismatch for dataset {dataset}: existing snapshots are incompatible with the current schema, and the change is not a lossless widening that snapshot schema versioning can record. Delete the existing snapshots and restart the Spice runtime to rebuild them with the updated schema. {details}"
     ))]
     UploadSchemaMismatch { dataset: String, details: String },
-    #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}"))]
+    #[snafu(display(
+        "Failed to snapshot dataset '{dataset}': there is no acceleration file at {path:?} to snapshot, so no snapshot was created and the dataset's newest snapshot is unchanged. Check the acceleration is loaded and that its file has not been removed. See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    MissingAccelerationFile { dataset: String, path: PathBuf },
+    #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}: {source}"))]
     CopyLocal {
         source_path: PathBuf,
         dest_path: PathBuf,
         source: std::io::Error,
     },
     #[snafu(display("Failed to prepare snapshot for upload: {source}"))]
-    PrepareUpload { source: engine::SnapshotEngineError },
+    PrepareUpload {
+        #[snafu(source(from(engine::SnapshotEngineError, Box::new)))]
+        source: Box<engine::SnapshotEngineError>,
+    },
     #[snafu(display("Snapshots are disabled for dataset {dataset}"))]
     AdapterDisabled { dataset: String },
+    #[snafu(display(
+        "Failed to take the snapshot writer lease of dataset {dataset} at {path}, so no snapshot was created: {source}"
+    ))]
+    WriterLease {
+        dataset: String,
+        path: String,
+        source: object_store::Error,
+    },
     #[snafu(display("Failed to create snapshot archive at {}: {source}", path.display()))]
     ArchiveCreate {
         path: PathBuf,
-        source: std::io::Error,
+        source: directory_archive::ArchiveError,
     },
+}
+
+impl SnapshotUploadError {
+    /// Whether a fresh attempt may succeed. Schema and format errors need a change
+    /// outside the runtime; everything else (network, local I/O, an archive walk that
+    /// raced engine maintenance) may pass on retry.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            Self::StartUpload { source, .. }
+            | Self::UploadPart { source, .. }
+            | Self::CompleteUpload { source, .. }
+            | Self::AbortUpload { source, .. }
+            | Self::UploadReadMetadata { source, .. }
+            | Self::UploadWriteMetadata { source, .. } => is_retriable_object_store_error(source),
+            Self::UploadSchemaSerialize { .. }
+            | Self::UploadParseMetadata { .. }
+            | Self::UploadUnsupportedMetadataVersion { .. }
+            | Self::UploadSerializeMetadata { .. }
+            | Self::UploadMetadataSchemaDeserialize { .. }
+            | Self::UploadMetadataSchemaMissing { .. }
+            | Self::UploadSchemaMismatch { .. }
+            | Self::MissingAccelerationFile { .. }
+            | Self::AdapterDisabled { .. } => false,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -631,6 +863,7 @@ pub struct SnapshotManager {
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
     snapshots_creation_policy: SnapshotsCreationPolicy,
     network_retry_strategy: RetryBackoff,
+    writer_lease: WriterLease,
 }
 
 impl std::fmt::Debug for SnapshotManager {
@@ -651,7 +884,17 @@ impl std::fmt::Debug for SnapshotManager {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct ForceCreate(pub bool);
+
+/// Whether an uploaded snapshot was made current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Publication {
+    Published,
+    /// A later generation of the dataset's writer lease published a snapshot
+    /// first, so this one was left unpublished.
+    Superseded,
+}
 
 impl Not for ForceCreate {
     type Output = bool;
@@ -669,6 +912,111 @@ impl Not for &ForceCreate {
     }
 }
 
+/// Renames a downloaded snapshot file over the accelerator's file.
+///
+/// [`SnapshotEngine::prepare_file_restore`] runs first. If the rename does not
+/// replace the live file, [`SnapshotEngine::abort_file_restore`] puts back
+/// whatever that call moved aside before this returns the rename error.
+pub(crate) async fn replace_downloaded_file(
+    engine: &dyn SnapshotEngine,
+    temp_path: &Path,
+    local_path: &Path,
+    dataset_name: &str,
+) -> Result<(), SnapshotDownloadError> {
+    // Finish a previous process's interrupted restore before this attempt
+    // takes the journal. The guard then keeps a pool open in this process
+    // from putting the parked WAL back while the rename is still in progress.
+    #[cfg(feature = "sqlite")]
+    {
+        engine::recover_interrupted_sqlite_restore(local_path, dataset_name)
+            .await
+            .map_err(|source| SnapshotDownloadError::FinalizeFile {
+                path: local_path.to_path_buf(),
+                source: Box::new(source),
+            })?;
+    }
+    #[cfg(feature = "sqlite")]
+    let _active_sqlite_restore = engine::begin_sqlite_restore(local_path);
+
+    if let Err(source) = engine.prepare_file_restore(local_path, dataset_name).await {
+        let _ = fs::remove_file(temp_path).await;
+        return Err(SnapshotDownloadError::FinalizeFile {
+            path: local_path.to_path_buf(),
+            source: Box::new(source),
+        });
+    }
+
+    if let Err(source) = fs::rename(temp_path, local_path).await {
+        if source.kind() == std::io::ErrorKind::AlreadyExists {
+            let aside = local_path.with_extension(format!("old.{}", std::process::id()));
+            // Name the aside file in the journal before moving the live
+            // database, so a crash in between can rename it back.
+            #[cfg(feature = "sqlite")]
+            if let Err(source) =
+                engine::record_sqlite_restore_aside(local_path, &aside, dataset_name).await
+            {
+                let _ = fs::remove_file(temp_path).await;
+                let _ = engine.abort_file_restore(local_path, dataset_name).await;
+                return Err(SnapshotDownloadError::FinalizeFile {
+                    path: local_path.to_path_buf(),
+                    source: Box::new(source),
+                });
+            }
+            if let Err(swap_err) = fs::rename(local_path, &aside).await {
+                let _ = fs::remove_file(temp_path).await;
+                return Err(
+                    rollback_failed_rename(engine, local_path, dataset_name, swap_err).await,
+                );
+            }
+            if let Err(retry_err) = fs::rename(temp_path, local_path).await {
+                // The original file was moved aside. Put it back before restoring
+                // the state `prepare_file_restore` parked beside it.
+                let _ = fs::rename(&aside, local_path).await;
+                let _ = fs::remove_file(temp_path).await;
+                return Err(
+                    rollback_failed_rename(engine, local_path, dataset_name, retry_err).await,
+                );
+            }
+            // Best-effort cleanup; the aside file is reaped on next restart if
+            // this fails (another process may still have it open on Windows).
+            let _ = fs::remove_file(&aside).await;
+        } else {
+            let _ = fs::remove_file(temp_path).await;
+            return Err(rollback_failed_rename(engine, local_path, dataset_name, source).await);
+        }
+    }
+
+    engine
+        .finalize_file_snapshot(local_path, dataset_name)
+        .await
+        .map_err(|source| SnapshotDownloadError::FinalizeFile {
+            path: local_path.to_path_buf(),
+            source: Box::new(source),
+        })?;
+    Ok(())
+}
+
+/// Puts back sidecars parked by `prepare_file_restore` after the rename left
+/// the original database file in place. When putting them back fails, that
+/// error is what the caller sees: the live database is then missing its log.
+async fn rollback_failed_rename(
+    engine: &dyn SnapshotEngine,
+    local_path: &Path,
+    dataset_name: &str,
+    source: std::io::Error,
+) -> SnapshotDownloadError {
+    if let Err(abort) = engine.abort_file_restore(local_path, dataset_name).await {
+        return SnapshotDownloadError::FinalizeFile {
+            path: local_path.to_path_buf(),
+            source: Box::new(abort),
+        };
+    }
+    SnapshotDownloadError::WriteLocal {
+        path: local_path.to_path_buf(),
+        source,
+    }
+}
+
 impl SnapshotManager {
     fn metadata_path(&self) -> ObjectPath {
         self.snapshots_location.clone().join(METADATA_FILE_NAME)
@@ -676,6 +1024,15 @@ impl SnapshotManager {
 
     fn metadata_path_display(&self) -> String {
         self.metadata_path().to_string()
+    }
+
+    /// `metadata.json` as a URI under this manager's snapshot location, for messages a
+    /// user reads: the object path alone drops the scheme and bucket.
+    fn metadata_uri(&self) -> String {
+        format!(
+            "{}/{METADATA_FILE_NAME}",
+            self.snapshot_location_uri.trim_end_matches('/')
+        )
     }
 
     fn snapshot_uri_for_location(&self, location: &ObjectPath) -> String {
@@ -699,13 +1056,30 @@ impl SnapshotManager {
     }
 
     async fn load_metadata(&self) -> Result<Option<MetadataHandle>, MetadataLoadError> {
+        Ok(match self.read_metadata(None).await? {
+            MetadataRead::Current(handle) => handle,
+            // Only a conditional read reports the file unchanged.
+            MetadataRead::Unchanged => None,
+        })
+    }
+
+    /// Reads `metadata.json`. With `if_none_match` set, the GET is conditional on that
+    /// `ETag` and an unchanged file returns [`MetadataRead::Unchanged`] without a body.
+    async fn read_metadata(
+        &self,
+        if_none_match: Option<&str>,
+    ) -> Result<MetadataRead, MetadataLoadError> {
         let metadata_path = self.metadata_path();
         let metadata_path_display = metadata_path.to_string();
 
         retry(self.network_retry_strategy.clone(), || async {
-            let get_result = match self.object_store.get(&metadata_path).await {
+            let options = GetOptions::new().with_if_none_match(if_none_match);
+            let get_result = match self.object_store.get_opts(&metadata_path, options).await {
                 Ok(result) => result,
-                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(object_store::Error::NotModified { .. }) if if_none_match.is_some() => {
+                    return Ok(MetadataRead::Unchanged);
+                }
+                Err(object_store::Error::NotFound { .. }) => return Ok(MetadataRead::Current(None)),
                 Err(source) => {
                     tracing::warn!(
                         "Transient error reading snapshot metadata, retrying. path={metadata_path_display} error={source}"
@@ -754,7 +1128,7 @@ impl SnapshotManager {
                 None
             };
 
-            Ok(Some(MetadataHandle { metadata, version }))
+            Ok(MetadataRead::Current(Some(MetadataHandle { metadata, version })))
         })
         .await
     }
@@ -884,6 +1258,7 @@ impl SnapshotManager {
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
             network_retry_strategy,
+            writer_lease: WriterLease::default(),
         })
     }
 
@@ -960,6 +1335,7 @@ impl SnapshotManager {
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
             network_retry_strategy,
+            writer_lease: WriterLease::default(),
         })
     }
 
@@ -986,6 +1362,15 @@ impl SnapshotManager {
         snapshots_creation_policy: SnapshotsCreationPolicy,
     ) -> Self {
         self.snapshots_creation_policy = snapshots_creation_policy;
+        self
+    }
+
+    /// Sets how often this dataset creates snapshots. An instance holding the
+    /// dataset's snapshot writer lease is presumed gone once it has not renewed
+    /// the lease for twice this interval.
+    #[must_use]
+    pub fn with_snapshot_interval(mut self, snapshot_interval: Duration) -> Self {
+        self.writer_lease = self.writer_lease.with_snapshot_interval(snapshot_interval);
         self
     }
 
@@ -1030,25 +1415,119 @@ impl SnapshotManager {
         Ok(dataset_entry.current_snapshot_id)
     }
 
+    /// The current snapshot id of every dataset in this manager's snapshot
+    /// location, read from its metadata in one request. A dataset without a
+    /// current snapshot is left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or parsing the snapshot metadata fails.
+    pub async fn current_snapshot_ids(
+        &self,
+    ) -> Result<HashMap<String, u64>, SnapshotDownloadError> {
+        let Some(handle) = self.load_metadata().await? else {
+            return Ok(HashMap::new());
+        };
+        Ok(handle
+            .metadata
+            .datasets
+            .into_iter()
+            .filter_map(|(name, dataset)| Some((name, dataset.current_snapshot_id?)))
+            .collect())
+    }
+
+    /// Describes this dataset's current snapshot from `metadata.json`: its id, the
+    /// engine that created it, and the schema recorded for it. Reads only the metadata,
+    /// never the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CurrentSnapshotError`] when there is no current snapshot to describe
+    /// (no metadata, no entry for this dataset, no current snapshot in the entry), when
+    /// the metadata cannot be read or parsed, or when it lacks the engine or schema.
+    pub async fn current_snapshot(&self) -> Result<CurrentSnapshot, CurrentSnapshotError> {
+        let metadata_uri = self.metadata_uri();
+        let handle = self.load_metadata().await.map_err(|err| match err {
+            MetadataLoadError::Read { source, .. } => CurrentSnapshotError::ReadMetadata {
+                metadata: metadata_uri.clone(),
+                source,
+            },
+            MetadataLoadError::Parse { source, .. } => CurrentSnapshotError::ParseMetadata {
+                metadata: metadata_uri.clone(),
+                source,
+            },
+            MetadataLoadError::UnsupportedVersion { version, .. } => {
+                CurrentSnapshotError::UnsupportedMetadataVersion {
+                    metadata: metadata_uri.clone(),
+                    version,
+                }
+            }
+        })?;
+        let Some(handle) = handle else {
+            return current_snapshot_error::MetadataNotFoundSnafu {
+                metadata: metadata_uri,
+            }
+            .fail();
+        };
+
+        let Some(dataset) = handle.metadata.datasets.get(&self.dataset_name) else {
+            let mut available: Vec<String> = handle.metadata.datasets.keys().cloned().collect();
+            available.sort_unstable();
+            return current_snapshot_error::DatasetNotFoundSnafu {
+                metadata: metadata_uri,
+                dataset: self.dataset_name.clone(),
+                available,
+            }
+            .fail();
+        };
+        let entry = dataset.current_snapshot().with_context(|| {
+            current_snapshot_error::NoCurrentSnapshotSnafu {
+                metadata: metadata_uri.clone(),
+                dataset: self.dataset_name.clone(),
+            }
+        })?;
+        let engine = recorded_snapshot_engine(entry, dataset).with_context(|| {
+            current_snapshot_error::EngineNotRecordedSnafu {
+                metadata: metadata_uri.clone(),
+                dataset: self.dataset_name.clone(),
+            }
+        })?;
+        let schema = dataset
+            .current_schema()
+            .with_context(|| current_snapshot_error::SchemaMissingSnafu {
+                metadata: metadata_uri.clone(),
+                dataset: self.dataset_name.clone(),
+            })?
+            .to_schema_ref()
+            .with_context(|_| current_snapshot_error::SchemaInvalidSnafu {
+                metadata: metadata_uri.clone(),
+                dataset: self.dataset_name.clone(),
+            })?;
+
+        Ok(CurrentSnapshot {
+            snapshot_id: entry.snapshot_id,
+            engine,
+            schema,
+        })
+    }
+
     /// Downloads the latest snapshot only if its `snapshot_id` is strictly
     /// greater than `current_local_id`. When the remote `current_snapshot_id`
     /// is less than or equal to `current_local_id` (matching id, or remote
-    /// metadata rolled back), returns `Ok(None)` without touching local files.
+    /// metadata rolled back), nothing is downloaded and local files are untouched.
     ///
     /// This is the primary entry point for `refresh_mode: snapshot`, which polls
     /// the snapshot store on a fixed cadence and only reloads the accelerator
     /// when a strictly newer snapshot is available. Snapshot mode never
     /// regresses the accelerator to an older snapshot id.
     ///
-    /// # Errors
+    /// `known_metadata_e_tag` is the [`SnapshotPoll::metadata_e_tag`] of the last poll the
+    /// caller completed. The metadata read is conditional on it, so when the metadata has
+    /// not changed the poll returns without downloading it.
     ///
-    /// Same errors as [`SnapshotManager::download_latest_snapshot`].
-    /// Download the latest snapshot if it is strictly newer than
-    /// `current_local_id`. The optional `validate_schema` callback is given
-    /// the snapshot metadata's recorded schema **before** any bytes are
-    /// downloaded or written to disk; if it returns false a schema
-    /// mismatch is reported and the accelerator's primary file is left
-    /// untouched.
+    /// The optional `validate_schema` callback is given the snapshot metadata's recorded
+    /// schema **before** any bytes are downloaded or written to disk; if it returns false a
+    /// schema mismatch is reported and the accelerator's primary file is left untouched.
     ///
     /// # Errors
     ///
@@ -1058,76 +1537,160 @@ impl SnapshotManager {
     pub async fn download_if_newer(
         &self,
         current_local_id: Option<u64>,
+        known_metadata_e_tag: Option<&str>,
         validate_schema: Option<&(dyn Fn(&SchemaRef) -> bool + Send + Sync)>,
-    ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
-        let Some(remote_id) = self.remote_current_snapshot_id().await? else {
-            return Ok(None);
-        };
-        match current_local_id {
-            Some(local_id) if remote_id <= local_id => {
-                if remote_id < local_id {
-                    tracing::warn!(
-                        dataset = %self.dataset_name,
-                        remote_snapshot_id = remote_id,
-                        local_snapshot_id = local_id,
-                        "snapshot metadata current id is older than the locally loaded snapshot; \
-                         skipping reload to avoid regression"
-                    );
-                }
-                Ok(None)
-            }
-            _ => {
-                // Inspect the metadata-recorded schema first, before
-                // touching the file: an incompatible snapshot must never
-                // overwrite the accelerator's current primary file. If a
-                // validator is provided we require the remote metadata to
-                // expose a parseable schema for this dataset — missing or
-                // malformed schema metadata is treated as a validation
-                // failure rather than silently skipped.
-                if let Some(validate) = validate_schema {
-                    let handle = self.load_metadata().await.map_err(|e| match e {
-                        MetadataLoadError::Read { path, source } => {
-                            SnapshotDownloadError::ReadMetadata { path, source }
-                        }
-                        MetadataLoadError::Parse { path, source } => {
-                            SnapshotDownloadError::ParseMetadata { path, source }
-                        }
-                        MetadataLoadError::UnsupportedVersion { path, version } => {
-                            SnapshotDownloadError::UnsupportedMetadataVersion { path, version }
-                        }
-                    })?;
-                    let handle = handle.ok_or_else(|| SnapshotDownloadError::SchemaMismatch {
-                        dataset: self.dataset_name.clone(),
-                    })?;
-                    let dataset_metadata = handle
-                        .metadata
-                        .datasets
-                        .get(&self.dataset_name)
-                        .ok_or_else(|| SnapshotDownloadError::SchemaMismatch {
-                            dataset: self.dataset_name.clone(),
-                        })?;
-                    let metadata_schema = dataset_metadata.current_schema().ok_or_else(|| {
-                        SnapshotDownloadError::SchemaMismatch {
-                            dataset: self.dataset_name.clone(),
-                        }
-                    })?;
-                    let metadata_schema_ref =
-                        metadata_schema.to_schema_ref().map_err(|source| {
-                            SnapshotDownloadError::MetadataSchemaDeserialize {
-                                dataset: self.dataset_name.clone(),
-                                source,
-                            }
-                        })?;
-                    if !validate(&metadata_schema_ref) {
-                        return Err(SnapshotDownloadError::SchemaMismatch {
-                            dataset: self.dataset_name.clone(),
-                        });
-                    }
-                }
+    ) -> Result<SnapshotPoll, SnapshotDownloadError> {
+        if !matches!(
+            self.bootstrap_failure_behavior,
+            BootstrapOnFailureBehavior::Retry
+        ) {
+            return self
+                .poll_once(current_local_id, known_metadata_e_tag, validate_schema)
+                .await
+                .map_err(|err| match err {
+                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
+                });
+        }
 
-                self.download_latest_snapshot().await
+        // Each retry is a whole poll: it reads the metadata again, unconditionally, and
+        // validates the snapshot it then downloads, so a snapshot published to replace a
+        // failed one is picked up.
+        let first_attempt = AtomicBool::new(true);
+        retry(RetryBackoffBuilder::new().build(), || async {
+            let known_metadata_e_tag = if first_attempt.swap(false, Ordering::Relaxed) {
+                known_metadata_e_tag
+            } else {
+                None
+            };
+            self.poll_once(current_local_id, known_metadata_e_tag, validate_schema)
+                .await
+        })
+        .await
+    }
+
+    /// One attempt of [`Self::download_if_newer`]. A failed download is a transient error
+    /// under `bootstrap_on_failure_behavior: retry`; every other error is permanent.
+    async fn poll_once(
+        &self,
+        current_local_id: Option<u64>,
+        known_metadata_e_tag: Option<&str>,
+        validate_schema: Option<&(dyn Fn(&SchemaRef) -> bool + Send + Sync)>,
+    ) -> Result<SnapshotPoll, RetryError<SnapshotDownloadError>> {
+        // One metadata read drives the whole attempt: the id comparison, the schema check and
+        // the download all use it, so the snapshot that is downloaded is the one whose schema
+        // was validated even if a writer publishes a newer one meanwhile.
+        let read = self
+            .read_metadata(known_metadata_e_tag)
+            .await
+            .map_err(|err| RetryError::permanent(err.into()))?;
+        let handle = match read {
+            MetadataRead::Unchanged => {
+                return Ok(SnapshotPoll {
+                    download: None,
+                    metadata_e_tag: known_metadata_e_tag.map(str::to_string),
+                });
+            }
+            MetadataRead::Current(None) => {
+                return Ok(SnapshotPoll {
+                    download: None,
+                    metadata_e_tag: None,
+                });
+            }
+            MetadataRead::Current(Some(handle)) => Arc::new(handle),
+        };
+        let nothing_newer = SnapshotPoll {
+            download: None,
+            metadata_e_tag: handle.e_tag(),
+        };
+        let Some(dataset_metadata) = handle.metadata.datasets.get(&self.dataset_name) else {
+            return Ok(nothing_newer);
+        };
+        let Some(remote_id) = dataset_metadata.current_snapshot_id else {
+            return Ok(nothing_newer);
+        };
+        if let Some(local_id) = current_local_id
+            && remote_id <= local_id
+        {
+            if remote_id < local_id {
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    remote_snapshot_id = remote_id,
+                    local_snapshot_id = local_id,
+                    "snapshot metadata current id is older than the locally loaded snapshot; \
+                     skipping reload to avoid regression"
+                );
+                // Withheld so the next poll reads the metadata again and repeats this warning
+                // for as long as the rollback lasts.
+                return Ok(SnapshotPoll {
+                    download: None,
+                    metadata_e_tag: None,
+                });
+            }
+            return Ok(nothing_newer);
+        }
+
+        // Inspect the metadata-recorded schema first, before touching the file: an
+        // incompatible snapshot must never overwrite the accelerator's current primary
+        // file. If a validator is provided we require the remote metadata to expose a
+        // parseable schema for this dataset — missing or malformed schema metadata is
+        // treated as a validation failure rather than silently skipped.
+        if let Some(validate) = validate_schema {
+            let metadata_schema = dataset_metadata.current_schema().ok_or_else(|| {
+                RetryError::permanent(SnapshotDownloadError::SchemaMismatch {
+                    dataset: self.dataset_name.clone(),
+                })
+            })?;
+            let metadata_schema_ref = metadata_schema.to_schema_ref().map_err(|source| {
+                RetryError::permanent(SnapshotDownloadError::MetadataSchemaDeserialize {
+                    dataset: self.dataset_name.clone(),
+                    source,
+                })
+            })?;
+            if !validate(&metadata_schema_ref) {
+                return Err(RetryError::permanent(
+                    SnapshotDownloadError::SchemaMismatch {
+                        dataset: self.dataset_name.clone(),
+                    },
+                ));
             }
         }
+
+        let e_tag = handle.e_tag();
+        let download = if matches!(
+            self.bootstrap_failure_behavior,
+            BootstrapOnFailureBehavior::Retry
+        ) {
+            let checkpointer_factory = Arc::clone(
+                self.checkpointer_factory
+                    .as_ref()
+                    .context(CheckpointerFactoryNotSetSnafu)
+                    .map_err(RetryError::permanent)?,
+            );
+            self.download_latest_once(checkpointer_factory, Some(handle))
+                .await
+                .map_err(|err| {
+                    tracing::error!(
+                        "Failed to bootstrap snapshot; retrying. dataset={} location={} error={err}",
+                        self.dataset_name,
+                        self.snapshots_location
+                    );
+                    RetryError::transient(err)
+                })?
+        } else {
+            self.download_latest(Some(handle))
+                .await
+                .map_err(RetryError::permanent)?
+        };
+        // The bootstrap failure behavior can turn a failed download into no download, or fall
+        // back to an older snapshot. Neither loaded the current snapshot, so the `ETag` is
+        // withheld and the next poll reads the metadata again instead of skipping.
+        let loaded_current = download
+            .as_ref()
+            .is_some_and(|info| info.snapshot_id == remote_id);
+        Ok(SnapshotPoll {
+            download,
+            metadata_e_tag: e_tag.filter(|_| loaded_current),
+        })
     }
 
     /// Creates a new snapshot by streaming the local acceleration file to object storage.
@@ -1144,7 +1707,8 @@ impl SnapshotManager {
     ///
     /// # Returns
     /// * `Ok(Some(path))` - Snapshot was created at the given path.
-    /// * `Ok(None)` - Snapshot was skipped (no updates since last snapshot).
+    /// * `Ok(None)` - Snapshot was skipped: no updates since the last snapshot,
+    ///   or another instance holds the dataset's snapshot writer lease.
     ///
     /// # Errors
     ///
@@ -1157,6 +1721,41 @@ impl SnapshotManager {
         last_updated_at: Option<i64>,
         row_count: Option<u64>,
         force_create: ForceCreate,
+    ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
+        // Of the instances creating this dataset's snapshots in this location,
+        // only the holder of its writer lease creates them.
+        let writer_generation = match self.hold_writer_lease().await? {
+            WriterPermit::Standby => return Ok(None),
+            WriterPermit::Holder { generation } => Some(generation),
+            WriterPermit::Unleased => None,
+        };
+        let created = self
+            .create_snapshot_as_writer(
+                schema,
+                lock_guard,
+                last_updated_at,
+                row_count,
+                force_create,
+                writer_generation,
+            )
+            .await;
+        if created.is_err() && writer_generation.is_some() {
+            // A holder that cannot create snapshots lets another instance take over.
+            self.release_writer_lease().await;
+        }
+        created
+    }
+
+    /// Creates the snapshot once this instance may write it; `writer_generation`
+    /// is the generation of the writer lease it holds, if the store supports one.
+    async fn create_snapshot_as_writer(
+        &self,
+        schema: &SchemaRef,
+        lock_guard: OwnedMutexGuard<()>,
+        last_updated_at: Option<i64>,
+        row_count: Option<u64>,
+        force_create: ForceCreate,
+        writer_generation: Option<u64>,
     ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
         // If no existing snapshots (in metadata or as actual files), treat as force_create.
         // This ensures at least one snapshot exists at all times.
@@ -1227,16 +1826,25 @@ impl SnapshotManager {
             }
         };
 
-        self.update_metadata_after_upload(
-            &destination_location,
-            checksum.clone(),
-            total_bytes,
-            timestamp_ms,
-            schema,
-            last_updated_at,
-            row_count,
-        )
-        .await?;
+        let publication = self
+            .update_metadata_after_upload(
+                &destination_location,
+                checksum.clone(),
+                total_bytes,
+                timestamp_ms,
+                schema,
+                last_updated_at,
+                row_count,
+                writer_generation,
+            )
+            .await?;
+        if publication == Publication::Superseded {
+            tracing::warn!(
+                "{}",
+                superseded_message(&self.dataset_name, &destination_location)
+            );
+            return Ok(None);
+        }
 
         let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         metrics::record_write_metrics(
@@ -1266,10 +1874,24 @@ impl SnapshotManager {
         destination_location: &ObjectPath,
         lock_guard: OwnedMutexGuard<()>,
     ) -> Result<(u64, String), SnapshotUploadError> {
+        // Every engine hook below opens the accelerator file as a database, and each
+        // driver's open CREATES one at a path that has none — so an absent file would be
+        // materialized as an empty database and published by the copy below as this
+        // dataset's snapshot. Refuse it here, where the answer is the same for every
+        // engine and the message can name the dataset. The caller holds the accelerator
+        // write lock, so nothing removes the file between this check and the copy.
+        ensure!(
+            source_local_path.is_file(),
+            MissingAccelerationFileSnafu {
+                dataset: self.dataset_name.clone(),
+                path: source_local_path.clone(),
+            }
+        );
+
         // Step 0: Engine-specific live checkpoint while the lock is held.
-        // For SQLite/Turso this drains the WAL into the main file so that
-        // the subsequent `fs::copy` produces a self-contained snapshot.
-        // Default (no-op) for engines without WAL.
+        // For DuckDB/SQLite/Turso this drains the write-ahead log into the main
+        // file so that the subsequent `fs::copy` produces a self-contained
+        // snapshot. Engines with nothing to flush return `Ok(())`.
         self.snapshot_engine
             .checkpoint_live(source_local_path, &self.dataset_name)
             .await
@@ -1336,14 +1958,16 @@ impl SnapshotManager {
         destination_location: &ObjectPath,
         lock_guard: OwnedMutexGuard<()>,
     ) -> Result<(u64, String), SnapshotUploadError> {
-        use crate::snapshot::directory_archive::archive_directories_with_plan;
+        use crate::snapshot::directory_archive::archive_directories_to_file_with_plan;
 
         // Step 0: Ask the engine for any per-directory skip list / extras.
         let plan = self
             .snapshot_engine
             .prepare_directory_snapshot(dirs, &self.dataset_name)
             .await
-            .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
+            .map_err(|source| SnapshotUploadError::PrepareUpload {
+                source: Box::new(source),
+            })?;
         let skip_paths: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
         let extras: Vec<(String, Vec<u8>)> = plan
             .extra_entries
@@ -1359,20 +1983,24 @@ impl SnapshotManager {
             uuid::Uuid::now_v7()
         ));
 
-        let archive_file = fs::File::create(&temp_archive_path)
-            .await
-            .map_err(|source| SnapshotUploadError::ArchiveCreate {
-                path: temp_archive_path.clone(),
-                source,
-            })?;
-
-        let total_archived =
-            archive_directories_with_plan(dirs, archive_file, &skip_paths, &extras)
-                .await
-                .map_err(|source| SnapshotUploadError::ArchiveCreate {
-                    path: temp_archive_path.clone(),
-                    source: std::io::Error::other(source.to_string()),
-                })?;
+        let total_archived = match archive_directories_to_file_with_plan(
+            dirs,
+            &temp_archive_path,
+            &skip_paths,
+            &extras,
+        )
+        .await
+        {
+            Ok(total) => total,
+            Err(source) => {
+                // A retry writes a new path, so remove the partial archive now.
+                let _ = fs::remove_file(&temp_archive_path).await;
+                return Err(SnapshotUploadError::ArchiveCreate {
+                    path: temp_archive_path,
+                    source,
+                });
+            }
+        };
 
         tracing::debug!(
             "Created tar archive for snapshot. dataset={} archive_size={}",
@@ -1557,6 +2185,15 @@ impl SnapshotManager {
     pub async fn download_latest_snapshot(
         &self,
     ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
+        self.download_latest(None).await
+    }
+
+    /// Downloads the current snapshot described by `pinned`, or by a fresh metadata read
+    /// on each attempt when `pinned` is `None`.
+    async fn download_latest(
+        &self,
+        pinned: Option<Arc<MetadataHandle>>,
+    ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
         let checkpointer_factory = Arc::clone(
             self.checkpointer_factory
                 .as_ref()
@@ -1564,7 +2201,10 @@ impl SnapshotManager {
         );
         match self.bootstrap_failure_behavior {
             BootstrapOnFailureBehavior::Warn => {
-                match self.download_latest_once(checkpointer_factory).await {
+                match self
+                    .download_latest_once(checkpointer_factory, pinned.clone())
+                    .await
+                {
                     Ok(result) => Ok(result),
                     Err(err) => {
                         let location = self.snapshots_location.to_string();
@@ -1584,7 +2224,7 @@ impl SnapshotManager {
 
                 retry(retry_strategy, || async {
                     match self
-                        .download_latest_once(Arc::clone(&checkpointer_factory))
+                        .download_latest_once(Arc::clone(&checkpointer_factory), pinned.clone())
                         .await
                     {
                         Ok(result) => Ok(result),
@@ -1601,7 +2241,10 @@ impl SnapshotManager {
                 .await
             }
             BootstrapOnFailureBehavior::Fallback => {
-                match self.download_with_fallback(checkpointer_factory).await {
+                match self
+                    .download_with_fallback(checkpointer_factory, pinned)
+                    .await
+                {
                     Ok(result) => Ok(result),
                     Err(err) => {
                         let location = self.snapshots_location.to_string();
@@ -1616,11 +2259,23 @@ impl SnapshotManager {
         }
     }
 
+    /// Returns `pinned` when set, otherwise reads the metadata.
+    async fn pinned_or_load_metadata(
+        &self,
+        pinned: Option<Arc<MetadataHandle>>,
+    ) -> Result<Option<Arc<MetadataHandle>>, MetadataLoadError> {
+        match pinned {
+            Some(handle) => Ok(Some(handle)),
+            None => Ok(self.load_metadata().await?.map(Arc::new)),
+        }
+    }
+
     async fn download_latest_once(
         &self,
         checkpointer_factory: DatasetCheckpointerFactory,
+        pinned: Option<Arc<MetadataHandle>>,
     ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
-        let metadata_handle = match self.load_metadata().await {
+        let metadata_handle = match self.pinned_or_load_metadata(pinned).await {
             Ok(Some(handle)) => handle,
             Ok(None) => {
                 let location_display = self.snapshots_location.to_string();
@@ -1655,16 +2310,22 @@ impl SnapshotManager {
             return Ok(None);
         };
 
-        self.download_snapshot_entry(&current_entry, &dataset_metadata, checkpointer_factory)
-            .await
-            .map(Some)
+        self.download_snapshot_entry(
+            &current_entry,
+            &dataset_metadata,
+            &metadata_handle.metadata.location,
+            checkpointer_factory,
+        )
+        .await
+        .map(Some)
     }
 
     async fn download_with_fallback(
         &self,
         checkpointer_factory: DatasetCheckpointerFactory,
+        pinned: Option<Arc<MetadataHandle>>,
     ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
-        let metadata_handle = match self.load_metadata().await {
+        let metadata_handle = match self.pinned_or_load_metadata(pinned).await {
             Ok(Some(handle)) => handle,
             Ok(None) => return Ok(None),
             Err(err) => return Err(err.into()),
@@ -1698,6 +2359,8 @@ impl SnapshotManager {
 
         let current_engine = self.engine.to_string();
         for snapshot in ordered_snapshots {
+            let snapshot_uri = self
+                .snapshot_read_uri(&snapshot.snapshot, Some(&metadata_handle.metadata.location));
             // Early engine filtering: skip snapshots created by a different engine before
             // attempting any download. This avoids wasting bandwidth on incompatible files
             // (e.g. DuckDB snapshots when the current engine is Cayenne).
@@ -1707,7 +2370,7 @@ impl SnapshotManager {
                 tracing::debug!(
                     "Skipping snapshot with incompatible engine; attempting next available snapshot. dataset={} snapshot={} snapshot_engine={snap_engine} current_engine={current_engine}",
                     self.dataset_name,
-                    snapshot.snapshot,
+                    snapshot_uri,
                 );
                 continue;
             }
@@ -1716,6 +2379,7 @@ impl SnapshotManager {
                 .download_snapshot_entry(
                     &snapshot,
                     &dataset_metadata,
+                    &metadata_handle.metadata.location,
                     Arc::clone(&checkpointer_factory),
                 )
                 .await
@@ -1736,7 +2400,7 @@ impl SnapshotManager {
                         tracing::warn!(
                             "Snapshot schema mismatch; attempting next available snapshot. dataset={} snapshot={} sha={sha}",
                             self.dataset_name,
-                            snapshot.snapshot,
+                            snapshot_uri,
                             sha = snapshot.snapshot_checksum.as_str(),
                         );
                     }
@@ -1748,7 +2412,7 @@ impl SnapshotManager {
                         tracing::warn!(
                             "Snapshot engine mismatch; attempting next available snapshot. dataset={} snapshot={} snapshot_engine={snapshot_engine} current_engine={current_engine}",
                             self.dataset_name,
-                            snapshot.snapshot,
+                            snapshot_uri,
                         );
                     }
                     SnapshotDownloadError::InvalidSnapshotUri { ref uri, .. } => {
@@ -1762,7 +2426,7 @@ impl SnapshotManager {
                         tracing::warn!(
                             "Failed to download snapshot while attempting fallback. dataset={} snapshot={} sha={sha} error={other}",
                             self.dataset_name,
-                            snapshot.snapshot,
+                            snapshot_uri,
                             sha = snapshot.snapshot_checksum.as_str(),
                         );
                         return Err(other);
@@ -1779,9 +2443,31 @@ impl SnapshotManager {
         Ok(None)
     }
 
-    fn snapshot_uri_to_object_path(&self, uri: &str) -> Result<ObjectPath, SnapshotDownloadError> {
-        let base_uri = self.snapshot_location_uri.trim_end_matches('/');
-        if let Some(relative) = uri.strip_prefix(base_uri) {
+    /// Resolves a snapshot entry URI to an object path under this manager's snapshot location.
+    ///
+    /// The URI is matched, in order, against this manager's own snapshot location and the
+    /// `location` recorded in the metadata the entry came from; the part after the matching
+    /// base is joined onto the snapshot location. Matching the recorded location lets a
+    /// reader resolve entries from a copy of the writer's prefix in another bucket (e.g. one
+    /// filled by S3 replication), where every entry still names the writer's bucket.
+    fn snapshot_uri_to_object_path(
+        &self,
+        uri: &str,
+        metadata_location: Option<&str>,
+    ) -> Result<ObjectPath, SnapshotDownloadError> {
+        let bases = std::iter::once(self.snapshot_location_uri.as_str())
+            .chain(metadata_location)
+            .map(|base| base.trim_end_matches('/'))
+            .filter(|base| !base.is_empty());
+        for base in bases {
+            let Some(relative) = uri.strip_prefix(base) else {
+                continue;
+            };
+            // Only match on a path boundary: `s3://bucket/snap` is not a base of
+            // `s3://bucket/snapshots/...`.
+            if !relative.is_empty() && !relative.starts_with('/') {
+                continue;
+            }
             let relative = relative.trim_start_matches('/');
             let combined = if relative.is_empty() {
                 self.snapshots_location.to_string()
@@ -1817,10 +2503,78 @@ impl SnapshotManager {
         }
     }
 
+    /// Streams the snapshot at `object_path` as ranged GETs, yielding bytes in order.
+    ///
+    /// A single GET shares one retry budget (180s by default) across all body resumes, so
+    /// on a slow link a large snapshot fails at the same point on every attempt. Each range
+    /// is a separate request with its own budget.
+    fn snapshot_chunks<'a>(&'a self, object_path: &'a ObjectPath, size: u64) -> SnapshotChunks<'a> {
+        let ranges = (0..size.div_ceil(SNAPSHOT_DOWNLOAD_CHUNK_BYTES)).map(move |i| {
+            let start = i * SNAPSHOT_DOWNLOAD_CHUNK_BYTES;
+            start
+                ..start
+                    .saturating_add(SNAPSHOT_DOWNLOAD_CHUNK_BYTES)
+                    .min(size)
+        });
+        futures::stream::iter(ranges)
+            .map(move |range| async move {
+                retry(self.network_retry_strategy.clone(), || async {
+                    self.object_store
+                        .get_range(object_path, range.clone())
+                        .await
+                        .map_err(|err| {
+                            if !is_retriable_object_store_error(&err) {
+                                return RetryError::permanent(err);
+                            }
+                            tracing::warn!(
+                                "Transient error downloading snapshot, retrying. dataset={} path={object_path} range={}..{} error={err}",
+                                self.dataset_name,
+                                range.start,
+                                range.end,
+                            );
+                            RetryError::transient(err)
+                        })
+                })
+                .await
+            })
+            .buffered(SNAPSHOT_DOWNLOAD_CONCURRENCY)
+            .boxed()
+    }
+
+    /// Returns the URI a snapshot entry is read from, for logs.
+    ///
+    /// An entry's recorded URI can name another bucket than the one read, e.g. the writer's
+    /// when this manager reads a replica, so logs name the resolved location under this
+    /// manager's snapshot location instead. Falls back to the recorded URI when it does
+    /// not resolve.
+    fn snapshot_read_uri(&self, uri: &str, metadata_location: Option<&str>) -> String {
+        self.snapshot_uri_to_object_path(uri, metadata_location)
+            .map_or_else(|_| uri.to_string(), |path| self.object_path_uri(&path))
+    }
+
+    /// Returns `object_path` as a URI under this manager's snapshot location, or the bare
+    /// object path when it lies outside that location.
+    fn object_path_uri(&self, object_path: &ObjectPath) -> String {
+        let Some(parts) = object_path.prefix_match(&self.snapshots_location) else {
+            return object_path.to_string();
+        };
+        let relative = parts
+            .map(|part| part.as_ref().to_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let base = self.snapshot_location_uri.trim_end_matches('/');
+        if relative.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}/{relative}")
+        }
+    }
+
     async fn download_snapshot_entry(
         &self,
         entry: &SnapshotEntry,
         dataset_metadata: &DatasetMetadata,
+        metadata_location: &str,
         checkpointer_factory: DatasetCheckpointerFactory,
     ) -> Result<SnapshotDownloadInfo, SnapshotDownloadError> {
         // Validate engine matches before downloading - fail fast if engines are incompatible
@@ -1842,21 +2596,28 @@ impl SnapshotManager {
             );
         }
 
-        let object_path = self.snapshot_uri_to_object_path(&entry.snapshot)?;
+        let object_path =
+            self.snapshot_uri_to_object_path(&entry.snapshot, Some(metadata_location))?;
         let path_display = object_path.to_string();
+        let snapshot_uri = self.object_path_uri(&object_path);
+        // The recorded URI, when it differs from what is read (e.g. a replica of the writer's
+        // bucket), so a log still ties the restore back to the writer's metadata entry.
+        let recorded_as = (snapshot_uri != entry.snapshot).then_some(entry.snapshot.as_str());
 
-        let get_result = self
+        let object_size = self
             .object_store
-            .get(&object_path)
+            .head(&object_path)
             .await
             .map_err(|source| SnapshotDownloadError::Download {
                 path: path_display.clone(),
                 source,
-            })?;
+            })?
+            .size;
+        let chunks = self.snapshot_chunks(&object_path, object_size);
 
         tracing::debug!(
             dataset = %self.dataset_name,
-            snapshot = %entry.snapshot,
+            snapshot = %snapshot_uri,
             snapshot_id = entry.snapshot_id,
             sha = %entry.snapshot_checksum,
             "Downloading snapshot"
@@ -1869,11 +2630,11 @@ impl SnapshotManager {
                 });
             }
             AccelerationLayout::File { path } => {
-                self.download_to_file(path, get_result, entry, &path_display)
+                self.download_to_file(path, chunks, entry, &path_display)
                     .await?
             }
             AccelerationLayout::Directories { dirs } => {
-                self.download_to_directories(dirs, get_result, entry, &path_display)
+                self.download_to_directories(dirs, chunks, entry, &path_display)
                     .await?
             }
         };
@@ -1893,10 +2654,14 @@ impl SnapshotManager {
                 source,
             })?;
 
+        // The checkpoint is a third store of a schema, written by whichever build last
+        // checkpointed this dataset, and `final_schema` below is returned from it. Conformed
+        // for the same reason the recorded schema is.
         let local_schema = checkpointer
             .get_schema()
             .await
-            .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?;
+            .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?
+            .map(conforming_schema);
         let final_schema = if let Some(schema) = local_schema {
             if schema.as_ref() != metadata_schema.as_ref() {
                 let ctx = EvolutionContext {
@@ -1906,7 +2671,7 @@ impl SnapshotManager {
                     SchemaEvolution::Identical => {
                         tracing::debug!(
                             dataset = %self.dataset_name,
-                            snapshot = %entry.snapshot,
+                            snapshot = %snapshot_uri,
                             "restored snapshot checkpoint schema differs from the metadata-recorded schema in field order, metadata, or nullability only; keeping the restored schema"
                         );
                     }
@@ -1917,7 +2682,7 @@ impl SnapshotManager {
                     SchemaEvolution::Widening(plan) => {
                         tracing::warn!(
                             dataset = %self.dataset_name,
-                            snapshot = %entry.snapshot,
+                            snapshot = %snapshot_uri,
                             snapshot_id = entry.snapshot_id,
                             "restored a snapshot that predates a widening schema change ({}); the acceleration is re-evolved to the current schema when the dataset registers",
                             plan.describe()
@@ -1934,7 +2699,7 @@ impl SnapshotManager {
                     SchemaEvolution::Incompatible { reason } => {
                         tracing::warn!(
                             dataset = %self.dataset_name,
-                            snapshot = %entry.snapshot,
+                            snapshot = %snapshot_uri,
                             snapshot_id = entry.snapshot_id,
                             "restored snapshot checkpoint schema is incompatible with the metadata-recorded schema: {reason}"
                         );
@@ -1966,7 +2731,7 @@ impl SnapshotManager {
             // Closes spiceai/spiceai#10658.
             tracing::debug!(
                 dataset = %self.dataset_name,
-                snapshot = %entry.snapshot,
+                snapshot = %snapshot_uri,
                 sha = %entry.snapshot_checksum,
                 "Bootstrapping dataset checkpoint from snapshot metadata"
             );
@@ -1983,7 +2748,8 @@ impl SnapshotManager {
             .map_or_else(|| "<directories>".to_string(), |p| p.display().to_string());
         tracing::info!(
             dataset = %self.dataset_name,
-            snapshot = %entry.snapshot,
+            snapshot = %snapshot_uri,
+            recorded_as,
             size_bytes = actual_size,
             sha = %actual_checksum,
             "Snapshot restored to {local_path_display}"
@@ -2000,8 +2766,8 @@ impl SnapshotManager {
     /// Downloads a snapshot directly to a single file (for file-based accelerators).
     async fn download_to_file(
         &self,
-        local_path: &PathBuf,
-        get_result: GetResult,
+        local_path: &Path,
+        mut stream: SnapshotChunks<'_>,
         entry: &SnapshotEntry,
         path_display: &str,
     ) -> Result<(u64, String), SnapshotDownloadError> {
@@ -2013,8 +2779,6 @@ impl SnapshotManager {
                 }
             })?;
         }
-
-        let mut stream = get_result.into_stream();
 
         // Write to a sibling temp file then atomically rename into the primary
         // path. This guarantees concurrent readers (e.g. an active accelerator
@@ -2121,38 +2885,16 @@ impl SnapshotManager {
         // because the accelerator's pool may still be holding readers open
         // against `local_path` in the gap before `reload_from_snapshot`
         // evicts them.
-        if let Err(source) = fs::rename(&temp_path, local_path).await {
-            if source.kind() == std::io::ErrorKind::AlreadyExists {
-                let sidecar_path = local_path.with_extension(format!("old.{}", std::process::id()));
-                if let Err(swap_err) = fs::rename(local_path, &sidecar_path).await {
-                    let _ = fs::remove_file(&temp_path).await;
-                    return Err(SnapshotDownloadError::WriteLocal {
-                        path: local_path.clone(),
-                        source: swap_err,
-                    });
-                }
-                if let Err(retry_err) = fs::rename(&temp_path, local_path).await {
-                    // Restore the original to avoid leaving the dataset
-                    // pointing at a missing file.
-                    let _ = fs::rename(&sidecar_path, local_path).await;
-                    let _ = fs::remove_file(&temp_path).await;
-                    return Err(SnapshotDownloadError::WriteLocal {
-                        path: local_path.clone(),
-                        source: retry_err,
-                    });
-                }
-                // Best-effort cleanup; the sidecar will be reaped on next
-                // restart if this fails (e.g. another process still has it
-                // open on Windows).
-                let _ = fs::remove_file(&sidecar_path).await;
-            } else {
-                let _ = fs::remove_file(&temp_path).await;
-                return Err(SnapshotDownloadError::WriteLocal {
-                    path: local_path.clone(),
-                    source,
-                });
-            }
-        }
+        // Moves aside what the live file keeps beside it, renames the download
+        // into place, and puts that state back when the rename does not replace
+        // the file. See `replace_downloaded_file`.
+        replace_downloaded_file(
+            self.snapshot_engine.as_ref(),
+            &temp_path,
+            local_path,
+            &self.dataset_name,
+        )
+        .await?;
 
         // Best-effort fsync of the parent directory so the rename's directory
         // entry update is durable across a crash. POSIX requires this in
@@ -2176,11 +2918,13 @@ impl SnapshotManager {
     async fn download_to_directories(
         &self,
         dirs: &[(PathBuf, String)],
-        get_result: GetResult,
+        mut stream: SnapshotChunks<'_>,
         entry: &SnapshotEntry,
         path_display: &str,
     ) -> Result<(u64, String), SnapshotDownloadError> {
-        use crate::snapshot::directory_archive::{ExtractOptions, extract_archive_with_options};
+        use crate::snapshot::directory_archive::{
+            ExtractOptions, extract_archive_file_with_options,
+        };
 
         // Download to a temporary file first
         let temp_archive_path = std::env::temp_dir().join(format!(
@@ -2200,7 +2944,6 @@ impl SnapshotManager {
             })?;
         }
 
-        let mut stream = get_result.into_stream();
         let mut file = fs::File::create(&temp_archive_path)
             .await
             .map_err(|source| SnapshotDownloadError::WriteLocal {
@@ -2269,13 +3012,6 @@ impl SnapshotManager {
         // Use skip_if_exists to handle shared metadata directories across multiple
         // Cayenne datasets. The first dataset's snapshot extracts the metadata,
         // and subsequent datasets skip those files since they already exist.
-        let archive_file = fs::File::open(&temp_archive_path).await.map_err(|source| {
-            SnapshotDownloadError::WriteLocal {
-                path: temp_archive_path.clone(),
-                source,
-            }
-        })?;
-
         // Build prefix mappings from dirs: map archive prefixes to target directories.
         // This ensures files archived with prefix "data/" are extracted to the actual
         // data directory (e.g., /spice/data/my_table/) rather than a literal "data/" subdirectory.
@@ -2287,7 +3023,7 @@ impl SnapshotManager {
         let mut extract_options = ExtractOptions::skip_existing();
         extract_options.prefix_mappings = Some(prefix_mappings);
 
-        extract_archive_with_options(archive_file, extract_target, extract_options)
+        extract_archive_file_with_options(&temp_archive_path, extract_target, extract_options)
             .await
             .map_err(|source| SnapshotDownloadError::ArchiveExtract {
                 path: temp_archive_path.clone(),
@@ -2373,7 +3109,8 @@ impl SnapshotManager {
         schema: &SchemaRef,
         last_updated_at: Option<i64>,
         row_count: Option<u64>,
-    ) -> Result<(), SnapshotUploadError> {
+        writer_generation: Option<u64>,
+    ) -> Result<Publication, SnapshotUploadError> {
         let metadata_path = self.metadata_path();
         let metadata_path_display = metadata_path.to_string();
         let dataset_name = self.dataset_name.clone();
@@ -2410,6 +3147,51 @@ impl SnapshotManager {
             dataset_entry.name.clone_from(&dataset_name);
             // Always update engine to match the current engine
             dataset_entry.engine = Some(engine_str);
+
+            // A holder that lost the writer lease during its upload does not
+            // publish over the newer snapshot of the instance that took it over.
+            if let Some(generation) = writer_generation
+                && !claim_publication(dataset_entry, generation)
+            {
+                return Ok(Publication::Superseded);
+            }
+
+            // Metadata written before recorded schemas were conformed keeps the invalid
+            // declaration in the *published* JSON. `to_schema_ref` repairs what this process
+            // reads, but the repaired form then compares equal to the live accelerator schema,
+            // so the evolution arm below writes no new version and nothing ever rewrites what
+            // the next reader downloads. Repaired in place, under the same schema id: a
+            // declaration the Arrow layout forbids was never a different schema, so correcting
+            // it is not a schema change and must not mint a version.
+            for recorded in &mut dataset_entry.schemas {
+                let raw = match serde_json::from_value::<Schema>(recorded.schema.clone()) {
+                    Ok(raw) => Arc::new(raw),
+                    // A recorded version this build cannot parse is left as it is; the paths
+                    // that actually read one report the failure with the dataset named.
+                    Err(source) => {
+                        tracing::debug!(
+                            dataset = %dataset_name,
+                            schema_id = recorded.schema_id,
+                            "snapshot upload: could not read a recorded schema of dataset '{dataset_name}', so it was left as written. Cause: {source}"
+                        );
+                        continue;
+                    }
+                };
+                let conformed = conforming_schema(Arc::clone(&raw));
+                if !Arc::ptr_eq(&raw, &conformed) {
+                    recorded.schema = serde_json::to_value(&conformed).map_err(|source| {
+                        SnapshotUploadError::UploadSchemaSerialize {
+                            dataset: dataset_name.clone(),
+                            source,
+                        }
+                    })?;
+                    tracing::info!(
+                        dataset = %dataset_name,
+                        schema_id = recorded.schema_id,
+                        "snapshot upload: a recorded schema of dataset '{dataset_name}' declared a MAP's `entries` field nullable, which the Arrow layout forbids; rewrote it so restoring this snapshot no longer reports a schema mismatch"
+                    );
+                }
+            }
 
             if dataset_entry.schemas.is_empty() {
                 let schema_metadata = SchemaMetadata::from_schema(0, schema).map_err(|source| {
@@ -2528,7 +3310,7 @@ impl SnapshotManager {
                 .put_opts_with_retry(&metadata_path, payload.clone(), put_mode.clone())
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(Publication::Published),
                 Err(object_store::Error::AlreadyExists { .. })
                     if matches!(put_mode, PutMode::Create) => {}
                 Err(object_store::Error::Precondition { .. }) => {}
@@ -2539,7 +3321,7 @@ impl SnapshotManager {
                         .put_opts_with_retry(&metadata_path, payload, PutMode::Overwrite)
                         .await
                     {
-                        Ok(_) => return Ok(()),
+                        Ok(_) => return Ok(Publication::Published),
                         Err(err) => {
                             return Err(SnapshotUploadError::UploadWriteMetadata {
                                 path: metadata_path_display.clone(),
@@ -2619,6 +3401,7 @@ impl SnapshotManager {
         // Check which snapshots actually exist in the object store (with bounded concurrency).
         // Eagerly collect futures into a Vec so the closure doesn't capture `&self` lazily,
         // which would cause higher-ranked lifetime issues with axum handlers.
+        let metadata_location = location.as_str();
         let existence_futures: Vec<_> = windowed_entries
             .iter()
             .map(|entry| {
@@ -2626,7 +3409,9 @@ impl SnapshotManager {
                 let snapshot_id = entry.snapshot_id;
                 let snapshot_size = entry.snapshot_size;
                 async move {
-                    let exists = self.snapshot_exists(&snapshot_uri, snapshot_size).await;
+                    let exists = self
+                        .snapshot_exists(&snapshot_uri, metadata_location, snapshot_size)
+                        .await;
                     (snapshot_id, exists)
                 }
             })
@@ -2702,8 +3487,15 @@ impl SnapshotManager {
 
     /// Checks if a snapshot exists in the object store and whether its size matches,
     /// with retry for transient errors.
-    async fn snapshot_exists(&self, snapshot_uri: &str, expected_size: u64) -> SnapshotFileStatus {
-        let Ok(object_path) = self.snapshot_uri_to_object_path(snapshot_uri) else {
+    async fn snapshot_exists(
+        &self,
+        snapshot_uri: &str,
+        metadata_location: &str,
+        expected_size: u64,
+    ) -> SnapshotFileStatus {
+        let Ok(object_path) =
+            self.snapshot_uri_to_object_path(snapshot_uri, Some(metadata_location))
+        else {
             return SnapshotFileStatus::NotFound;
         };
 
@@ -2785,7 +3577,7 @@ impl SnapshotManager {
         };
 
         let status = match self
-            .snapshot_exists(&entry.snapshot, entry.snapshot_size)
+            .snapshot_exists(&entry.snapshot, &h.metadata.location, entry.snapshot_size)
             .await
         {
             SnapshotFileStatus::Verified => "verified".to_string(),
@@ -2966,7 +3758,10 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("client_timeout")
             .description("The timeout setting for S3 client."),
         ParameterSpec::runtime("allow_http")
-            .description("Allow HTTP protocol for S3 endpoint.")
+            .description("Allow HTTP protocol for S3 endpoint."),
+        ParameterSpec::component(notifications::QUEUE_URL_PARAM)
+            .description("The URL of an SQS queue that receives the snapshot location's S3 event notifications. Datasets with `refresh_mode: snapshot` reload as soon as a new snapshot is published instead of waiting for `refresh_check_interval`.")
+            .secret(),
     ]
 });
 
@@ -2974,6 +3769,13 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
 enum S3ObjectStoreError {
     #[snafu(display("Failed to build S3 object store: {source}"))]
     BuilderError { source: S3ObjectStoreBuilderError },
+}
+
+/// The object path of an `s3://` snapshot location inside its bucket. The
+/// notification consumer matches S3 event keys against the same path, so both
+/// derive it here.
+fn s3_location_path(url: &Url) -> ObjectPath {
+    ObjectPath::from(url.path())
 }
 
 /// Build the object store backing a snapshot location, dispatching on the
@@ -3007,8 +3809,7 @@ async fn build_snapshot_object_store(
                 );
             })
             .ok()?;
-            let path = ObjectPath::from(snapshots_location_url.path());
-            Some((store, path))
+            Some((store, s3_location_path(snapshots_location_url)))
         }
         "abfss" | "abfs" => {
             let params = snapshot_config
@@ -3120,11 +3921,11 @@ async fn build_s3_parameters(
 mod tests {
     use super::*;
     use crate::dataset_checkpoint::{DatasetCheckpointer, Result as DatasetCheckpointResult};
-    use crate::snapshot::engine::create_snapshot_engine;
+    use crate::snapshot::engine::{DefaultSnapshotEngine, create_snapshot_engine};
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
     use object_store::{memory::InMemory, path::Path};
     use std::{io::Write, path::PathBuf, sync::Arc, time::SystemTime};
     use tempfile::{NamedTempFile, TempDir};
@@ -3158,12 +3959,20 @@ mod tests {
             Ok(Some(Arc::clone(&self.schema)))
         }
 
+        async fn set_schema(&self, _schema: &SchemaRef) -> DatasetCheckpointResult<()> {
+            Ok(())
+        }
+
         async fn last_checkpoint_time(&self) -> DatasetCheckpointResult<Option<SystemTime>> {
             Ok(None)
         }
 
         async fn get_refresh_sql(&self) -> DatasetCheckpointResult<Option<String>> {
             Ok(None)
+        }
+
+        async fn delete(&self) -> DatasetCheckpointResult<()> {
+            Ok(())
         }
     }
 
@@ -3176,14 +3985,20 @@ mod tests {
     }
 
     /// Writes a sample local accelerator file appropriate for the engine.
-    /// For `SQLite`/`Turso`, creates a real (empty) `SQLite` WAL-mode database
-    /// so that the engine's `checkpoint_live` hook can open it. For other
-    /// engines, writes opaque test bytes since no engine-side validation
-    /// runs against the file pre-snapshot.
+    /// For `DuckDB`/`SQLite`/`Turso`, creates a real (empty) database so that the
+    /// engine's `checkpoint_live` hook can open it. For other engines, writes opaque
+    /// test bytes since no engine-side validation runs against the file pre-snapshot.
     fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
         match engine {
+            #[cfg(feature = "duckdb")]
+            AccelerationEngine::DuckDB => {
+                let conn = duckdb::Connection::open(path).expect("open sample duckdb db");
+                conn.execute_batch("CREATE TABLE sample(id INTEGER)")
+                    .expect("create sample table");
+                drop(conn);
+            }
             #[cfg(any(feature = "sqlite", feature = "turso"))]
-            AccelerationEngine::Sqlite | AccelerationEngine::Turso => {
+            engine if matches!(engine.snapshot_extension(), ".sqlite" | ".turso") => {
                 let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
                 conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
                     .expect("set wal");
@@ -3232,9 +4047,17 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            writer_lease: WriterLease::default(),
         }
     }
 
+    /// A `DuckDB` manager whose engine hook does nothing, for the tests about the
+    /// manager's own file path. Those hand it a local file of arbitrary bytes and assert
+    /// the uploaded object matches, which `DuckDBSnapshotEngine` cannot do because it
+    /// opens that file as a database. Only the hook is swapped: the manager keeps the
+    /// `DuckDB` identity that names the snapshot file, is published in the metadata, and
+    /// is matched at restore. Tests about engine *behaviour* use
+    /// [`build_manager_for_engine`].
     #[cfg(feature = "duckdb")]
     fn build_manager(
         store: Arc<InMemory>,
@@ -3243,14 +4066,16 @@ mod tests {
         schema: &SchemaRef,
         compaction_enabled: bool,
     ) -> SnapshotManager {
-        build_manager_for_engine(
+        let mut manager = build_manager_for_engine(
             store,
             local_path,
             behavior,
             schema,
             &AccelerationEngine::DuckDB,
             compaction_enabled,
-        )
+        );
+        manager.snapshot_engine = Arc::new(DefaultSnapshotEngine);
+        manager
     }
 
     async fn write_metadata(store: &InMemory, metadata_path: &Path, metadata: &SnapshotMetadata) {
@@ -3387,6 +4212,215 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reader_bootstrap_waits_for_publication_and_hands_off_notifications() {
+        use super::notifications::TestAnnouncer;
+        use crate::BootstrapStatus;
+
+        for behavior in [
+            BootstrapOnFailureBehavior::Warn,
+            BootstrapOnFailureBehavior::Retry,
+            BootstrapOnFailureBehavior::Fallback,
+        ] {
+            for notify in [false, true] {
+                let store = Arc::new(InMemory::new());
+                let temp_dir = TempDir::new().expect("create temp dir");
+                let local_path = temp_dir.path().join("reader.db");
+                let schema = sample_schema();
+                let manager = Arc::new(build_manager(
+                    Arc::clone(&store),
+                    local_path.clone(),
+                    behavior,
+                    &schema,
+                    false,
+                ));
+                let (announcer, subscription) = TestAnnouncer::subscribe(DATASET_NAME);
+                let pending = BootstrapStatus::Pending {
+                    manager,
+                    subscription: notify.then_some(subscription),
+                    poll_interval: if notify {
+                        Duration::from_hours(1)
+                    } else {
+                        Duration::ZERO
+                    },
+                };
+                let bootstrap = pending.complete();
+                tokio::pin!(bootstrap);
+                // Start the real download against an empty store. No table may be
+                // constructed before the first snapshot supplies its schema and data.
+                assert!(futures::poll!(&mut bootstrap).is_pending());
+                assert!(!local_path.exists());
+
+                let base = Path::from(SNAPSHOT_BASE_PATH);
+                let location = base.clone().join("orders.duckdb");
+                let contents = b"snapshot published after reader startup";
+                store
+                    .put(&location, contents.to_vec().into())
+                    .await
+                    .expect("publish snapshot");
+                let entry = SnapshotEntry {
+                    snapshot_id: 7,
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                    snapshot: snapshot_uri(&location),
+                    snapshot_checksum: compute_sha256_hex(contents),
+                    snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+                    snapshot_size: contents.len() as u64,
+                    snapshot_engine: None,
+                    snapshot_row_count: None,
+                    snapshot_last_updated_at_ms: None,
+                };
+                let metadata = SnapshotMetadata {
+                    format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+                    location: SNAPSHOT_URI_PREFIX.to_string(),
+                    last_updated_ms: Utc::now().timestamp_millis(),
+                    datasets: HashMap::from([(
+                        DATASET_NAME.to_string(),
+                        dataset_metadata(&schema, vec![entry], Some(7)),
+                    )]),
+                };
+                write_metadata(&store, &base.join(METADATA_FILE_NAME), &metadata).await;
+                if notify {
+                    announcer.announce(DATASET_NAME, 7);
+                } else {
+                    // Time is the contract here: 0s must not retry an empty store in
+                    // a tight loop. The first Fibonacci delay is at least 700ms.
+                    tokio::time::timeout(Duration::from_millis(200), &mut bootstrap)
+                        .await
+                        .expect_err("zero polling interval must back off before checking again");
+                }
+                let status = tokio::time::timeout(Duration::from_secs(5), &mut bootstrap)
+                    .await
+                    .expect("bootstrap completes on a notification or bounded backoff");
+                assert_eq!(status.loaded_snapshot_id(), Some(7));
+                assert_eq!(
+                    fs::read(&local_path).await.expect("restored file"),
+                    contents
+                );
+
+                if !notify {
+                    assert!(status.clone().take_snapshot_subscription().is_none());
+                    continue;
+                }
+                // A publication between download and table registration must reach
+                // the refresh subscription, including when registration retries.
+                announcer.announce(DATASET_NAME, 8);
+                let mut retry_status = status.clone();
+                drop(status);
+                let mut refresh = retry_status
+                    .take_snapshot_subscription()
+                    .expect("bootstrap hands off the live subscription");
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(5), refresh.next_snapshot())
+                        .await
+                        .expect("publication survives the handoff"),
+                    Some(8)
+                );
+            }
+        }
+    }
+
+    /// Regression test for the first reload of a `refresh_mode: snapshot`
+    /// `SQLite` reader: the restore replaces a live WAL-mode database whose
+    /// connection is still open, and the replaced database's `-wal` must not be
+    /// applied to the restored rows.
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn a_sqlite_restore_over_a_live_wal_database_serves_the_snapshot_rows() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("orders.sqlite");
+        let live = rusqlite::Connection::open(&local_path).expect("open live");
+        live.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        live.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE t(id INTEGER PRIMARY KEY);")
+            .expect("create live table");
+
+        let snapshot_file = temp_dir.path().join("published.sqlite");
+        let published = rusqlite::Connection::open(&snapshot_file).expect("open published");
+        published
+            .execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1), (2), (3);",
+            )
+            .expect("write published snapshot");
+        drop(published);
+        let contents = Bytes::from(std::fs::read(&snapshot_file).expect("read published"));
+
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Sqlite);
+        let instant = Utc
+            .with_ymd_and_hms(2026, 9, 24, 5, 37, 3)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+        let schema = sample_schema();
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(
+                    &schema,
+                    vec![SnapshotEntry {
+                        snapshot_id: 0,
+                        timestamp_ms: instant.timestamp_millis(),
+                        snapshot: snapshot_uri(&location),
+                        snapshot_checksum: compute_sha256_hex(contents.as_ref()),
+                        snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+                        snapshot_size: contents.len() as u64,
+                        snapshot_engine: None,
+                        snapshot_row_count: None,
+                        snapshot_last_updated_at_ms: None,
+                    }],
+                    Some(0),
+                ),
+            )]),
+        };
+        write_metadata(&store, &base.join(METADATA_FILE_NAME), &metadata).await;
+
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::Sqlite,
+            false,
+        );
+        manager
+            .download_latest_snapshot()
+            .await
+            .expect("download should succeed")
+            .expect("expected snapshot");
+
+        let fresh = rusqlite::Connection::open(&local_path).expect("open restored");
+        fresh
+            .query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        let rows: i64 = fresh
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            rows, 3,
+            "the restored snapshot's rows must survive the replaced WAL"
+        );
+        drop(live);
+    }
+
+    /// A snapshot spanning several ranged GETs is reassembled byte-for-byte.
+    #[tokio::test]
+    async fn download_latest_snapshot_reassembles_a_multi_range_snapshot() {
+        // 2.5 ranges; the byte pattern varies so a reordered range changes the checksum.
+        let len = usize::try_from(SNAPSHOT_DOWNLOAD_CHUNK_BYTES * 5 / 2).expect("fits usize");
+        let contents: Vec<u8> = (0..len)
+            .map(|i| u8::try_from((i / 4096) % 251).expect("< 251"))
+            .collect();
+        download_and_verify_snapshot(&AccelerationEngine::Cayenne, contents.into()).await;
+    }
+
+    #[tokio::test]
     #[cfg(feature = "duckdb")]
     async fn download_if_newer_returns_none_when_local_id_matches() {
         let store = Arc::new(InMemory::new());
@@ -3437,10 +4471,14 @@ mod tests {
         );
 
         let result = manager
-            .download_if_newer(Some(7), None)
+            .download_if_newer(Some(7), None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert!(result.is_none(), "matching ids must not download");
+        assert!(result.download.is_none(), "matching ids must not download");
+        assert!(
+            result.metadata_e_tag.is_some(),
+            "an up-to-date poll reports the ETag so the next poll can skip"
+        );
         assert!(
             !local_path.exists(),
             "local file must not be written when nothing is newer"
@@ -3451,12 +4489,16 @@ mod tests {
         // newer remote snapshot causes a reload. Here the remote current id
         // is 7 and the local id we claim is 8, so this must be a no-op.
         let result = manager
-            .download_if_newer(Some(8), None)
+            .download_if_newer(Some(8), None, None)
             .await
             .expect("download_if_newer should succeed");
         assert!(
-            result.is_none(),
+            result.download.is_none(),
             "local id ahead of remote must not regress"
+        );
+        assert_eq!(
+            result.metadata_e_tag, None,
+            "a rollback withholds the ETag so every poll re-checks and warns again"
         );
         assert!(
             !local_path.exists(),
@@ -3465,11 +4507,316 @@ mod tests {
 
         // A strictly older local id (6) than the remote (7) should download.
         let info = manager
-            .download_if_newer(Some(6), None)
+            .download_if_newer(Some(6), None, None)
             .await
             .expect("download_if_newer should succeed")
+            .download
             .expect("expected newer snapshot to be downloaded");
         assert_eq!(info.snapshot_id, 7);
+    }
+
+    /// A Cayenne manager over `root/metadata` and `root/data`, the directories a Cayenne
+    /// snapshot archives.
+    fn build_cayenne_manager(
+        store: Arc<InMemory>,
+        root: &std::path::Path,
+        schema: &SchemaRef,
+    ) -> SnapshotManager {
+        let mut manager = build_manager_for_engine(
+            store,
+            root.join("unused"),
+            BootstrapOnFailureBehavior::Warn,
+            schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+        manager.layout = AccelerationLayout::cayenne(root.join("metadata"), root.join("data"));
+        manager
+    }
+
+    /// Archives a Cayenne `metadata/` + `data/` layout whose data file `part-{snapshot_id}.vortex`
+    /// holds `marker`, stores it as the snapshot taken at `second` past a fixed minute, and
+    /// returns its entry. Cayenne never rewrites a data file in place, so each snapshot's
+    /// file has its own name.
+    async fn put_cayenne_snapshot_entry(
+        store: &InMemory,
+        snapshot_id: u64,
+        second: u32,
+        marker: &[u8],
+    ) -> SnapshotEntry {
+        let source = TempDir::new().expect("create source dir");
+        let metadata_dir = source.path().join("metadata");
+        let data_dir = source.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::write(metadata_dir.join("metastore.db"), b"metastore").expect("write metastore");
+        std::fs::write(data_dir.join(format!("part-{snapshot_id}.vortex")), marker)
+            .expect("write data file");
+        let archive = source.path().join("snapshot.tar");
+        crate::snapshot::directory_archive::archive_directories_to_file_with_plan(
+            &[
+                (metadata_dir, "metadata/".to_string()),
+                (data_dir, "data/".to_string()),
+            ],
+            &archive,
+            &[],
+            &[],
+        )
+        .await
+        .expect("archive cayenne directories");
+        let contents = Bytes::from(std::fs::read(&archive).expect("read archive"));
+
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, second)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&Path::from(SNAPSHOT_BASE_PATH), instant);
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+        SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: compute_sha256_hex(&contents),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: Some(AccelerationEngine::Cayenne.to_string()),
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        }
+    }
+
+    fn metadata_with(
+        schema: &SchemaRef,
+        entries: Vec<SnapshotEntry>,
+        current: u64,
+    ) -> SnapshotMetadata {
+        SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(schema, entries, Some(current)),
+            )]),
+        }
+    }
+
+    /// A poll given the `ETag` of unchanged metadata skips without acting on it; a poll whose
+    /// `ETag` is stale reads the metadata again.
+    #[tokio::test]
+    async fn download_if_newer_skips_when_metadata_e_tag_is_unchanged() {
+        let store = Arc::new(InMemory::new());
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let schema = sample_schema();
+        let first = put_cayenne_snapshot_entry(&store, 0, 1, b"first").await;
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![first.clone()], 0),
+        )
+        .await;
+
+        let root = TempDir::new().expect("create temp dir");
+        let manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+
+        let loaded = manager
+            .download_if_newer(None, None, None)
+            .await
+            .expect("download_if_newer should succeed");
+        assert_eq!(
+            loaded.download.as_ref().map(|info| info.snapshot_id),
+            Some(0)
+        );
+        let e_tag = loaded
+            .metadata_e_tag
+            .expect("the in-memory store reports an ETag");
+
+        // Claiming no snapshot is loaded would download snapshot 0 again, so returning
+        // nothing shows the poll skipped on the unchanged ETag alone.
+        let unchanged = manager
+            .download_if_newer(None, Some(&e_tag), None)
+            .await
+            .expect("download_if_newer should succeed");
+        assert_eq!(
+            unchanged,
+            SnapshotPoll {
+                download: None,
+                metadata_e_tag: Some(e_tag.clone()),
+            }
+        );
+
+        let second = put_cayenne_snapshot_entry(&store, 1, 2, b"second").await;
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![first, second], 1),
+        )
+        .await;
+        let changed = manager
+            .download_if_newer(Some(0), Some(&e_tag), None)
+            .await
+            .expect("download_if_newer should succeed");
+        assert_eq!(
+            changed.download.as_ref().map(|info| info.snapshot_id),
+            Some(1),
+            "changed metadata must be read again"
+        );
+        assert_ne!(changed.metadata_e_tag, Some(e_tag));
+        let restored = fs::read(root.path().join("data").join("part-1.vortex"))
+            .await
+            .expect("read restored data file");
+        assert_eq!(restored.as_slice(), b"second");
+    }
+
+    /// A poll that did not load the current snapshot, because the bootstrap failure behavior
+    /// tolerated a failed download or fell back to an older snapshot, must not report an
+    /// `ETag`: recording it would make every later poll skip instead of retrying.
+    #[tokio::test]
+    async fn download_if_newer_withholds_e_tag_when_current_snapshot_is_not_loaded() {
+        let store = Arc::new(InMemory::new());
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let schema = sample_schema();
+        let older = put_cayenne_snapshot_entry(&store, 0, 1, b"older").await;
+        let mut corrupt = put_cayenne_snapshot_entry(&store, 1, 2, b"current").await;
+        corrupt.snapshot_checksum = "0".repeat(64);
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![older, corrupt], 1),
+        )
+        .await;
+
+        for (behavior, expected_snapshot) in [
+            (BootstrapOnFailureBehavior::Warn, None),
+            (BootstrapOnFailureBehavior::Fallback, Some(0)),
+        ] {
+            let root = TempDir::new().expect("create temp dir");
+            let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+            manager.bootstrap_failure_behavior = behavior;
+
+            let poll = manager
+                .download_if_newer(None, None, None)
+                .await
+                .expect("download_if_newer should succeed");
+            assert_eq!(
+                poll.download.as_ref().map(|info| info.snapshot_id),
+                expected_snapshot,
+                "{behavior:?}"
+            );
+            assert_eq!(poll.metadata_e_tag, None, "{behavior:?}");
+        }
+    }
+
+    /// Under `bootstrap_on_failure_behavior: retry`, a poll whose current snapshot is broken
+    /// keeps retrying, and each retry reads the metadata again: a snapshot published to
+    /// replace the broken one is validated and downloaded instead of retrying forever.
+    #[tokio::test]
+    async fn download_if_newer_retry_picks_up_a_replacement_snapshot() {
+        let store = Arc::new(InMemory::new());
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let schema = sample_schema();
+        let mut broken = put_cayenne_snapshot_entry(&store, 7, 1, b"broken").await;
+        broken.snapshot_checksum = "0".repeat(64);
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![broken.clone()], 7),
+        )
+        .await;
+
+        let root = TempDir::new().expect("create temp dir");
+        let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+        manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Retry;
+
+        let writer_store = Arc::clone(&store);
+        let writer_path = metadata_path.clone();
+        let writer_schema = Arc::clone(&schema);
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let replacement = put_cayenne_snapshot_entry(&writer_store, 8, 2, b"replacement").await;
+            write_metadata(
+                &writer_store,
+                &writer_path,
+                &metadata_with(&writer_schema, vec![broken, replacement], 8),
+            )
+            .await;
+        });
+
+        let validated = std::sync::atomic::AtomicUsize::new(0);
+        let validator = |_: &SchemaRef| {
+            validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        };
+        let poll = tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            manager.download_if_newer(Some(6), None, Some(&validator)),
+        )
+        .await
+        .expect("retry must observe the replacement snapshot instead of retrying forever")
+        .expect("download_if_newer should succeed");
+        writer.await.expect("writer task");
+
+        assert_eq!(poll.download.as_ref().map(|info| info.snapshot_id), Some(8));
+        assert!(poll.metadata_e_tag.is_some());
+        assert!(
+            validated.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "each retry validates the snapshot it downloads"
+        );
+        let restored = fs::read(root.path().join("data").join("part-8.vortex"))
+            .await
+            .expect("read restored data file");
+        assert_eq!(restored.as_slice(), b"replacement");
+    }
+
+    /// A writer that publishes between the schema check and the download must not change
+    /// which snapshot is downloaded: the one validated is the one loaded.
+    #[tokio::test]
+    async fn download_if_newer_downloads_the_snapshot_it_validated() {
+        let store = Arc::new(InMemory::new());
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let schema = sample_schema();
+        let validated = put_cayenne_snapshot_entry(&store, 7, 1, b"validated").await;
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![validated.clone()], 7),
+        )
+        .await;
+        let published = put_cayenne_snapshot_entry(&store, 8, 2, b"published-later").await;
+        let republished = metadata_with(&schema, vec![validated, published], 8);
+
+        let root = TempDir::new().expect("create temp dir");
+        let manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+
+        let writer_store = Arc::clone(&store);
+        let writer_path = metadata_path.clone();
+        let validator = move |_: &SchemaRef| {
+            let payload = serde_json::to_vec_pretty(&republished).expect("serialize metadata");
+            futures::executor::block_on(writer_store.put(&writer_path, payload.into()))
+                .expect("publish newer metadata");
+            true
+        };
+
+        let info = manager
+            .download_if_newer(Some(6), None, Some(&validator))
+            .await
+            .expect("download_if_newer should succeed")
+            .download
+            .expect("expected a newer snapshot");
+        assert_eq!(info.snapshot_id, 7);
+        let data_dir = root.path().join("data");
+        let restored = fs::read(data_dir.join("part-7.vortex"))
+            .await
+            .expect("read restored data file");
+        assert_eq!(restored.as_slice(), b"validated");
+        assert!(
+            !data_dir.join("part-8.vortex").exists(),
+            "the snapshot published after validation must not be restored"
+        );
     }
 
     #[tokio::test]
@@ -3487,13 +4834,159 @@ mod tests {
             false,
         );
         let result = manager
-            .download_if_newer(None, None)
+            .download_if_newer(None, None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert!(result.is_none());
+        assert!(result.download.is_none());
         assert!(!local_path.exists());
     }
 
+    const WRITER_LOCATION: &str = "s3://bucket-a/snapshots/";
+
+    /// Returns `location` as an entry URI under `WRITER_LOCATION`, the way a writer whose
+    /// `snapshots.location` differs from the reader's records it.
+    fn writer_snapshot_uri(location: &ObjectPath) -> String {
+        let relative = snapshot_uri(location)
+            .strip_prefix(SNAPSHOT_URI_PREFIX)
+            .expect("snapshot uri starts with the reader prefix")
+            .trim_start_matches('/')
+            .to_string();
+        format!("{WRITER_LOCATION}{relative}")
+    }
+
+    /// Writes a snapshot under the reader's `snapshots/` path and a `metadata.json` whose
+    /// `location` and entry URIs name the writer's bucket, as a replicated copy of the
+    /// writer's prefix looks to a reader in another bucket. Returns the snapshot bytes.
+    async fn write_replicated_snapshot(
+        store: &InMemory,
+        schema: &SchemaRef,
+        snapshot_id: u64,
+    ) -> Bytes {
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+        let contents = Bytes::from_static(b"replicated-snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let entry = SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: writer_snapshot_uri(&location),
+            snapshot_checksum: compute_sha256_hex(contents.as_ref()),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: WRITER_LOCATION.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(schema, vec![entry], Some(snapshot_id)),
+            )]),
+        };
+        write_metadata(store, &base.join(METADATA_FILE_NAME), &metadata).await;
+        contents
+    }
+
+    // regression test for #14425
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn download_latest_snapshot_resolves_entries_against_metadata_location() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let contents = write_replicated_snapshot(&store, &schema, 0).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let info = manager
+            .download_latest_snapshot()
+            .await
+            .expect("bootstrap from a replicated prefix should succeed")
+            .expect("expected snapshot");
+        assert_eq!(info.snapshot_id, 0);
+        assert_eq!(info.bytes_downloaded, contents.len() as u64);
+        let downloaded = fs::read(&local_path)
+            .await
+            .expect("read downloaded snapshot");
+        assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    // regression test for #14425
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn download_if_newer_resolves_entries_against_metadata_location() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let contents = write_replicated_snapshot(&store, &schema, 7).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let info = manager
+            .download_if_newer(Some(6), None, None)
+            .await
+            .expect("refresh from a replicated prefix should succeed")
+            .download
+            .expect("expected newer snapshot to be downloaded");
+        assert_eq!(info.snapshot_id, 7);
+        let downloaded = fs::read(&local_path)
+            .await
+            .expect("read downloaded snapshot");
+        assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    // regression test for #14425
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn snapshot_api_reports_entries_under_metadata_location() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        write_replicated_snapshot(&store, &schema, 3).await;
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let summary = manager
+            .get_snapshot_summary(10)
+            .await
+            .expect("snapshot summary");
+        assert_eq!(summary.snapshots.len(), 1);
+        assert_eq!(summary.snapshots[0].status, "verified");
+
+        let info = manager.get_snapshot(3).await.expect("get snapshot");
+        assert_eq!(info.status, "verified");
+    }
     #[tokio::test]
     async fn download_with_fallback_uses_next_snapshot_on_integrity_failure() {
         let store = Arc::new(InMemory::new());
@@ -3660,7 +5153,6 @@ mod tests {
         assert_eq!(metadata_schema.as_ref(), schema.as_ref());
     }
 
-    #[cfg(feature = "duckdb")]
     async fn read_dataset_metadata(store: &InMemory) -> DatasetMetadata {
         let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
@@ -3981,7 +5473,7 @@ mod tests {
         );
 
         let result = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await;
 
         assert!(matches!(
@@ -4049,7 +5541,7 @@ mod tests {
         );
 
         let result = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await;
 
         assert!(matches!(
@@ -4117,7 +5609,7 @@ mod tests {
         );
 
         let result = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await;
 
         assert!(matches!(
@@ -4192,7 +5684,7 @@ mod tests {
         );
 
         let result = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await;
 
         assert!(matches!(
@@ -4272,7 +5764,7 @@ mod tests {
         );
 
         let info = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await
             .expect("pre-evolution snapshot should be accepted");
 
@@ -4346,7 +5838,7 @@ mod tests {
         );
 
         let result = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await;
 
         assert!(
@@ -4641,6 +6133,101 @@ mod tests {
         assert_eq!(downloaded.as_slice(), good_contents.as_ref());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_archive_removes_the_partial_archive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().expect("temp dir");
+        let unreadable = root.path().join("data/unreadable");
+        std::fs::create_dir_all(&unreadable).expect("create data dir");
+        std::fs::create_dir_all(root.path().join("metadata")).expect("create metadata dir");
+        std::fs::write(root.path().join("data/a.vortex"), b"data").expect("write data file");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("make dir unreadable");
+
+        let schema = sample_schema();
+        let mut manager = build_cayenne_manager(Arc::new(InMemory::new()), root.path(), &schema);
+        manager.dataset_name = format!("archive_cleanup_{}", uuid::Uuid::now_v7().simple());
+        let prefix = format!("snapshot_{}_", manager.dataset_name);
+
+        let guard = Arc::new(Mutex::new(())).lock_owned().await;
+        let result = manager
+            .create_snapshot(&schema, guard, None, None, ForceCreate(true))
+            .await;
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+
+        assert!(
+            matches!(result, Err(SnapshotUploadError::ArchiveCreate { .. })),
+            "expected an archive error, got {result:?}"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "partial archive left behind: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn upload_error_retriability() {
+        let store_err = |source| SnapshotUploadError::UploadWriteMetadata {
+            path: "metadata.json".to_string(),
+            source,
+        };
+        let transient = store_err(object_store::Error::Generic {
+            store: "S3",
+            source: "connection reset".into(),
+        });
+        let precondition = store_err(object_store::Error::Precondition {
+            path: "metadata.json".to_string(),
+            source: "etag changed".into(),
+        });
+        let missing_bucket = SnapshotUploadError::StartUpload {
+            path: "t.cayenne".to_string(),
+            source: object_store::Error::NotFound {
+                path: "t.cayenne".to_string(),
+                source: "no such bucket".into(),
+            },
+        };
+        let archive = SnapshotUploadError::ArchiveCreate {
+            path: PathBuf::from("/tmp/snapshot.tar"),
+            source: directory_archive::ArchiveError::CreateArchive {
+                path: PathBuf::from("/data/t"),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+        };
+        let mismatch = SnapshotUploadError::UploadSchemaMismatch {
+            dataset: "t".to_string(),
+            details: "column dropped".to_string(),
+        };
+
+        assert!(
+            transient.is_retriable(),
+            "a network error may pass on retry"
+        );
+        assert!(
+            archive.is_retriable(),
+            "an archive walk may race maintenance"
+        );
+        assert!(
+            !precondition.is_retriable(),
+            "a precondition failure is handled by the metadata update loop"
+        );
+        assert!(
+            !missing_bucket.is_retriable(),
+            "a missing bucket needs user action"
+        );
+        assert!(
+            !mismatch.is_retriable(),
+            "a schema mismatch needs user action"
+        );
+    }
+
     #[test]
     fn snapshot_uri_to_object_path_handles_relative_uris() {
         let store = Arc::new(InMemory::new());
@@ -4655,7 +6242,7 @@ mod tests {
 
         let uri = format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/day=01/dataset=dataset/file.db");
         let path = manager
-            .snapshot_uri_to_object_path(&uri)
+            .snapshot_uri_to_object_path(&uri, None)
             .expect("convert uri to path");
 
         assert_eq!(
@@ -4678,10 +6265,117 @@ mod tests {
 
         let uri = "memory://other-prefix/path/to/file.db";
         let path = manager
-            .snapshot_uri_to_object_path(uri)
+            .snapshot_uri_to_object_path(uri, None)
             .expect("convert uri to path");
 
         assert_eq!(path.to_string(), "snapshots/other-prefix/path/to/file.db");
+    }
+
+    // regression test for #14425
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn snapshot_uri_to_object_path_resolves_against_metadata_location() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+        let uri = "s3://bucket-a/snapshots/month=2025-01/day=01/dataset=dataset/file.db";
+        let expected = "snapshots/month=2025-01/day=01/dataset=dataset/file.db";
+
+        for metadata_location in ["s3://bucket-a/snapshots/", "s3://bucket-a/snapshots"] {
+            let path = manager
+                .snapshot_uri_to_object_path(uri, Some(metadata_location))
+                .expect("convert uri to path");
+            assert_eq!(path.to_string(), expected, "location={metadata_location}");
+        }
+
+        // The reader's own location still takes precedence over the recorded one.
+        let own = format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/day=01/dataset=dataset/file.db");
+        let path = manager
+            .snapshot_uri_to_object_path(&own, Some("s3://bucket-a/snapshots/"))
+            .expect("convert uri to path");
+        assert_eq!(path.to_string(), expected);
+
+        // An empty recorded location falls through to the host-join fallback.
+        let path = manager
+            .snapshot_uri_to_object_path(uri, Some(""))
+            .expect("convert uri to path");
+        assert_eq!(
+            path.to_string(),
+            "snapshots/bucket-a/snapshots/month=2025-01/day=01/dataset=dataset/file.db"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn snapshot_uri_to_object_path_matches_metadata_location_on_path_boundary() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        // `s3://bucket-a/snap` is a string prefix of the URI but not a path prefix, so it
+        // must not match; the URI falls through to the host-join fallback.
+        let path = manager
+            .snapshot_uri_to_object_path(
+                "s3://bucket-a/snapshots/month=2025-01/file.db",
+                Some("s3://bucket-a/snap"),
+            )
+            .expect("convert uri to path");
+        assert_eq!(
+            path.to_string(),
+            "snapshots/bucket-a/snapshots/month=2025-01/file.db"
+        );
+
+        // The same boundary applies to the reader's own location.
+        let path = manager
+            .snapshot_uri_to_object_path(&format!("{SNAPSHOT_URI_PREFIX}-old/file.db"), None)
+            .expect("convert uri to path");
+        assert_eq!(path.to_string(), "snapshots/snapshots-old/file.db");
+    }
+
+    // regression test for #14425: logs name the location read, not the writer's bucket
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn snapshot_read_uri_names_the_location_read() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        // An entry recorded under the writer's bucket reads from this manager's location.
+        assert_eq!(
+            manager.snapshot_read_uri(
+                "s3://bucket-a/snapshots/month=2025-01/file.db",
+                Some("s3://bucket-a/snapshots/"),
+            ),
+            format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/file.db")
+        );
+
+        // An entry under this manager's own location is logged unchanged.
+        let own = format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/file.db");
+        assert_eq!(manager.snapshot_read_uri(&own, None), own);
+
+        // A URI that does not resolve is logged as recorded.
+        assert_eq!(
+            manager.snapshot_read_uri("s3://[bad/file.db", None),
+            "s3://[bad/file.db"
+        );
     }
 
     #[cfg(feature = "duckdb")]
@@ -4721,11 +6415,12 @@ mod tests {
             .len();
 
         let schema = sample_schema();
-        let manager = build_manager(
+        let manager = build_manager_for_engine(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            &AccelerationEngine::DuckDB,
             true,
         );
 
@@ -4888,6 +6583,15 @@ mod tests {
 
     /// Generic test: Download snapshot succeeds with valid metadata (for any engine).
     async fn generic_download_snapshot_with_valid_metadata(engine: &AccelerationEngine) {
+        download_and_verify_snapshot(
+            engine,
+            Bytes::from_static(b"engine-agnostic-snapshot-bytes"),
+        )
+        .await;
+    }
+
+    /// Publishes `contents` as the current snapshot, downloads it, and checks the result.
+    async fn download_and_verify_snapshot(engine: &AccelerationEngine, contents: Bytes) {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
@@ -4897,7 +6601,6 @@ mod tests {
             .expect("valid time");
         let location = layout.build_location(&base, instant);
 
-        let contents = Bytes::from_static(b"engine-agnostic-snapshot-bytes");
         store
             .put(&location, contents.clone().into())
             .await
@@ -4954,7 +6657,10 @@ mod tests {
         let downloaded = fs::read(&local_path)
             .await
             .expect("read downloaded snapshot");
-        assert_eq!(downloaded.as_slice(), contents.as_ref());
+        assert!(
+            downloaded.as_slice() == contents.as_ref(),
+            "downloaded bytes differ"
+        );
     }
 
     /// Generic test: `SnapshotEngine` reports correct compaction support.
@@ -4983,6 +6689,181 @@ mod tests {
     #[tokio::test]
     async fn cayenne_create_snapshot_updates_metadata() {
         generic_create_snapshot_updates_metadata(&AccelerationEngine::Cayenne).await;
+    }
+
+    #[tokio::test]
+    async fn only_the_writer_lease_holder_uploads_snapshots() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let schema = sample_schema();
+        let instance = |identity: &str, file: &str| {
+            let local_path = temp_dir.path().join(file);
+            write_sample_local_db(&local_path, &AccelerationEngine::Cayenne);
+            let mut manager = build_manager_for_engine(
+                Arc::clone(&store),
+                local_path,
+                BootstrapOnFailureBehavior::Warn,
+                &schema,
+                &AccelerationEngine::Cayenne,
+                false,
+            );
+            manager.writer_lease = WriterLease::for_instance(identity, Duration::from_mins(1));
+            manager
+        };
+        let first = instance("host-a/1", "a.db");
+        let second = instance("host-b/2", "b.db");
+        let mutex = Arc::new(Mutex::new(()));
+
+        let created = first
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("first instance creates a snapshot");
+        assert!(created.is_some());
+
+        // Even a forced snapshot is left to the lease holder.
+        let skipped = second
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("second instance skips its snapshot");
+        assert_eq!(skipped, None);
+
+        let renewed = first
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(false),
+            )
+            .await
+            .expect("first instance creates another snapshot");
+        assert!(renewed.is_some());
+
+        let dataset = read_dataset_metadata(&store).await;
+        assert_eq!(
+            dataset.snapshots.len(),
+            2,
+            "only the lease holder's snapshots are recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_uploaded_under_an_older_lease_generation_is_not_published() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        write_sample_local_db(&local_path, &AccelerationEngine::Cayenne);
+        let schema = sample_schema();
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path,
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+        let mutex = Arc::new(Mutex::new(()));
+
+        // The instance that took the lease over publishes under generation 2...
+        let newer = manager
+            .create_snapshot_as_writer(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+                Some(2),
+            )
+            .await
+            .expect("generation 2 publishes");
+        assert!(newer.is_some());
+
+        // ...so the previous holder's upload, finishing later under generation 1,
+        // is left unpublished.
+        let older = manager
+            .create_snapshot_as_writer(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+                Some(1),
+            )
+            .await
+            .expect("generation 1 finishes its upload");
+        assert_eq!(older, None);
+
+        let dataset = read_dataset_metadata(&store).await;
+        assert_eq!(dataset.snapshots.len(), 1);
+        assert_eq!(dataset.current_snapshot_id, Some(0));
+        assert_eq!(
+            dataset
+                .properties
+                .get("writer-generation")
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_holder_whose_snapshot_fails_releases_the_writer_lease() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let schema = sample_schema();
+        let instance = |identity: &str, local_path: PathBuf| {
+            let mut manager = build_manager_for_engine(
+                Arc::clone(&store),
+                local_path,
+                BootstrapOnFailureBehavior::Warn,
+                &schema,
+                &AccelerationEngine::Cayenne,
+                false,
+            );
+            manager.writer_lease = WriterLease::for_instance(identity, Duration::from_mins(1));
+            manager
+        };
+        // No local acceleration file, so this holder's upload fails.
+        let failing = instance("host-a", temp_dir.path().join("missing.db"));
+        let healthy_path = temp_dir.path().join("b.db");
+        write_sample_local_db(&healthy_path, &AccelerationEngine::Cayenne);
+        let healthy = instance("host-b", healthy_path);
+        let mutex = Arc::new(Mutex::new(()));
+
+        failing
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect_err("there is no local file to upload");
+
+        // The released lease passes to the other instance at its next snapshot.
+        let created = healthy
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("the other instance creates the snapshot");
+        assert!(created.is_some());
     }
 
     #[tokio::test]
@@ -5033,6 +6914,143 @@ mod tests {
     #[tokio::test]
     async fn duckdb_create_snapshot_updates_metadata() {
         generic_create_snapshot_updates_metadata(&AccelerationEngine::DuckDB).await;
+    }
+
+    /// The whole upload path, not just the engine hook: a `DuckDB` write that is still
+    /// in the write-ahead log when the snapshot is taken must reach the uploaded object.
+    /// Before the `checkpoint_live` override, `create_file_snapshot` copied the database
+    /// file while the write sat in `<db>.wal`, and the snapshot was published without it
+    /// (#13912). The accelerator's connection stays open throughout, as it does in
+    /// production.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_snapshot_carries_a_write_still_in_the_write_ahead_log() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let live = duckdb::Connection::open(&local_path).expect("open live database");
+        live.execute_batch("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1); CHECKPOINT;")
+            .expect("seed a checkpointed baseline");
+        live.execute_batch("INSERT INTO t VALUES (2);")
+            .expect("write without checkpointing");
+
+        let wal = PathBuf::from(format!("{}.wal", local_path.display()));
+        assert!(
+            std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0),
+            "the second write must still be in the write-ahead log for this test to mean anything"
+        );
+
+        let schema = sample_schema();
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::DuckDB,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        let uploaded_path = manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot should be created");
+
+        let uploaded = store
+            .get(&uploaded_path)
+            .await
+            .expect("snapshot stored")
+            .bytes()
+            .await
+            .expect("read stored snapshot");
+
+        let restored = temp_dir.path().join("restored.db");
+        std::fs::write(&restored, &uploaded).expect("materialize the uploaded snapshot");
+        let verify = duckdb::Connection::open(&restored).expect("open the uploaded snapshot");
+        let rows: i64 = verify
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .expect("count rows in the uploaded snapshot");
+        assert_eq!(
+            rows, 2,
+            "the uploaded snapshot must carry the write that was still in the log"
+        );
+    }
+
+    /// An absent accelerator file must fail the snapshot, not become one. Every engine
+    /// hook opens that file as a database, and each driver's open creates one at a path
+    /// that has none — so without the guard in `create_file_snapshot` the hook would
+    /// materialize an empty database and the copy would publish it as this dataset's
+    /// snapshot, leaving `current_snapshot_id` pointing at an empty database for the next
+    /// restore to bootstrap from. Generic because the contract is the caller's, not any
+    /// one engine's (#13912).
+    async fn generic_an_absent_accelerator_file_fails_the_snapshot(engine: &AccelerationEngine) {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("absent.db");
+        assert!(
+            !local_path.exists(),
+            "the accelerator file must be absent for this test to mean anything"
+        );
+
+        let schema = sample_schema();
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            engine,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        let err = manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect_err("an absent accelerator file must fail the snapshot");
+
+        assert!(
+            matches!(err, SnapshotUploadError::MissingAccelerationFile { .. }),
+            "the missing file must be named, not reached as a copy failure: {err}"
+        );
+        assert!(
+            !local_path.exists(),
+            "no engine hook may bring the accelerator file into existence"
+        );
+        // The writer lease this attempt took, then released, is not a snapshot.
+        let published: Vec<_> = store
+            .list(None)
+            .map(|meta| meta.expect("list the store").location)
+            .filter(|location| {
+                std::future::ready(!location.as_ref().starts_with("snapshots/leases/"))
+            })
+            .collect()
+            .await;
+        assert!(
+            published.is_empty(),
+            "nothing may be published when there is no accelerator file to snapshot: {published:?}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_an_absent_accelerator_file_fails_the_snapshot() {
+        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::DuckDB).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_an_absent_accelerator_file_fails_the_snapshot() {
+        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Sqlite).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_an_absent_accelerator_file_fails_the_snapshot() {
+        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Turso).await;
     }
 
     #[cfg(feature = "duckdb")]
@@ -5466,7 +7484,7 @@ mod tests {
 
     /// Builds a `SnapshotManager` for metadata-only API tests.
     /// Uses `AccelerationLayout::None` since API tests only read/write metadata.
-    fn build_manager_for_api_tests(store: Arc<InMemory>) -> SnapshotManager {
+    pub(super) fn build_manager_for_api_tests(store: Arc<InMemory>) -> SnapshotManager {
         let object_store: Arc<dyn ObjectStore> = store;
         let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne, false);
 
@@ -5484,6 +7502,7 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            writer_lease: WriterLease::default(),
         }
     }
 
@@ -6129,6 +8148,7 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            writer_lease: WriterLease::default(),
         }
     }
 
@@ -6554,6 +8574,590 @@ mod tests {
             snapshot_json["snapshot-row-count"],
             serde_json::json!(100),
             "snapshot-row-count should be serialized"
+        );
+    }
+
+    /// A schema whose `Map` column declares its `entries` field nullable — the declaration the
+    /// Arrow layout forbids and `MapArray::try_new` refuses, so no accelerator can hold a
+    /// column declared that way.
+    fn nullable_map_entries_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("keys", DataType::Utf8, false),
+                        Field::new("values", DataType::Int32, true),
+                    ])),
+                    true,
+                )),
+                false,
+            ),
+            true,
+        )]))
+    }
+
+    /// Whether the schema's single `Map` column declares its `entries` field nullable.
+    fn declares_nullable_entries(schema: &Schema) -> bool {
+        match schema.field(0).data_type() {
+            DataType::Map(entries, _) => entries.is_nullable(),
+            other => panic!("expected a Map column, got {other}"),
+        }
+    }
+
+    /// A `SchemaMetadata` holding exactly the JSON an older build wrote, before recorded
+    /// schemas were conformed — built by hand rather than through `from_schema`, which now
+    /// conforms on the way in.
+    fn legacy_recorded_schema(schema_id: u64, schema: &SchemaRef) -> SchemaMetadata {
+        SchemaMetadata {
+            schema_id,
+            schema: serde_json::to_value(schema).expect("serialize schema"),
+        }
+    }
+
+    #[test]
+    fn recording_a_snapshot_schema_conforms_a_map_declaration_arrow_refuses() {
+        let recorded = SchemaMetadata::from_schema(0, &nullable_map_entries_schema())
+            .expect("serialize schema");
+        let round_tripped = recorded.to_schema_ref().expect("deserialize schema");
+
+        assert!(
+            !declares_nullable_entries(&round_tripped),
+            "a recorded snapshot schema must not carry a Map declaration MapArray::try_new refuses"
+        );
+    }
+
+    /// The half that reaches snapshots already written: the JSON on the wire still carries the
+    /// forbidden declaration, and reading it is what has to repair it.
+    #[test]
+    fn reading_a_legacy_recorded_schema_conforms_its_map_declaration() {
+        let forbidden = nullable_map_entries_schema();
+        let legacy = legacy_recorded_schema(0, &forbidden);
+
+        assert!(
+            declares_nullable_entries(
+                &serde_json::from_value::<Schema>(legacy.schema.clone()).expect("raw schema")
+            ),
+            "the fixture must hold the declaration an older build recorded"
+        );
+        assert!(
+            !declares_nullable_entries(&legacy.to_schema_ref().expect("deserialize schema")),
+            "reading a snapshot written before recorded schemas were conformed must repair it"
+        );
+    }
+
+    /// Only the layout-conformance rule is applied, not `normalize_for_comparison`: unwrapping
+    /// `Dictionary` encoding is transparent when *comparing* two schemas, but a recorded schema
+    /// is later compared against a live accelerator schema that still carries it.
+    #[test]
+    fn recording_a_snapshot_schema_preserves_dictionary_encoding() {
+        let dictionary_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+
+        let round_tripped = SchemaMetadata::from_schema(0, &dictionary_schema)
+            .expect("serialize schema")
+            .to_schema_ref()
+            .expect("deserialize schema");
+
+        assert_eq!(
+            round_tripped.field(0).data_type(),
+            dictionary_schema.field(0).data_type(),
+            "recording a snapshot schema must not unwrap dictionary encoding"
+        );
+    }
+
+    /// A checkpointer that records what `checkpoint` was handed, so a test can assert what the
+    /// checkpoint holds after a restore rather than what the restore acknowledged.
+    #[derive(Clone)]
+    struct RecordingCheckpointer {
+        /// `None` drives the restore path's bootstrap branch — the steady state for engines
+        /// whose archive ships no `_dataset_checkpoint` row, Cayenne most notably.
+        schema: Option<SchemaRef>,
+        checkpointed: Arc<Mutex<Option<SchemaRef>>>,
+    }
+
+    #[async_trait]
+    impl DatasetCheckpointer for RecordingCheckpointer {
+        async fn exists(&self) -> bool {
+            true
+        }
+
+        async fn checkpoint(
+            &self,
+            schema: &SchemaRef,
+            _refresh_sql: Option<&str>,
+        ) -> DatasetCheckpointResult<()> {
+            *self.checkpointed.lock().await = Some(Arc::clone(schema));
+            Ok(())
+        }
+
+        async fn get_schema(&self) -> DatasetCheckpointResult<Option<SchemaRef>> {
+            Ok(self.schema.clone())
+        }
+
+        async fn last_checkpoint_time(&self) -> DatasetCheckpointResult<Option<SystemTime>> {
+            Ok(None)
+        }
+
+        /// The restore path this recorder serves reaches the checkpoint through
+        /// `checkpoint`, never through `set_schema`, so there is nothing for a schema
+        /// rewrite to record here and `checkpointed` stays the sink for what
+        /// `checkpoint` was handed.
+        async fn set_schema(&self, _schema: &SchemaRef) -> DatasetCheckpointResult<()> {
+            Ok(())
+        }
+
+        async fn get_refresh_sql(&self) -> DatasetCheckpointResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn delete(&self) -> DatasetCheckpointResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Restores a snapshot whose recorded schema is `recorded` against a checkpoint holding
+    /// `checkpoint_schema`, and returns `(what checkpoint() was handed, the restore's schema)`.
+    #[cfg(feature = "duckdb")]
+    async fn restore_snapshot_recording_schema(
+        snapshot_schema: SchemaMetadata,
+        checkpoint_schema: Option<SchemaRef>,
+    ) -> (Option<SchemaRef>, SchemaRef) {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 6, 1, 12, 0, 0)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+        let contents = Bytes::from_static(b"snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let entry = SnapshotEntry {
+            snapshot_id: 3,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: compute_sha256_hex(contents.as_ref()),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+        let metadata = DatasetMetadata {
+            name: DATASET_NAME.to_string(),
+            engine: None,
+            schemas: vec![snapshot_schema],
+            current_schema_id: 0,
+            snapshots: vec![entry.clone()],
+            current_snapshot_id: Some(3),
+            ..Default::default()
+        };
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let handed_to_checkpoint = Arc::new(Mutex::new(None));
+        let recorder = RecordingCheckpointer {
+            schema: checkpoint_schema,
+            checkpointed: Arc::clone(&handed_to_checkpoint),
+        };
+        let factory: DatasetCheckpointerFactory = Arc::new(move || {
+            let recorder = recorder.clone();
+            Box::pin(async move { Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(recorder)) })
+        });
+
+        let mut manager = build_manager(
+            Arc::clone(&store),
+            temp_dir.path().join("snapshot.db"),
+            BootstrapOnFailureBehavior::Warn,
+            &sample_schema(),
+            false,
+        );
+        manager.checkpointer_factory = Some(Arc::clone(&factory));
+
+        let info = manager
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
+            .await
+            .expect("restore snapshot");
+
+        let handed = handed_to_checkpoint.lock().await.clone();
+        (handed, info.schema)
+    }
+
+    /// The acceptance case: a snapshot written before recorded schemas were conformed
+    /// bootstraps the checkpoint, and what the checkpoint ends up holding must be a
+    /// declaration an accelerator can hold.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restoring_a_legacy_snapshot_bootstraps_a_conforming_checkpoint() {
+        let forbidden = nullable_map_entries_schema();
+        let (checkpointed, restored) =
+            restore_snapshot_recording_schema(legacy_recorded_schema(0, &forbidden), None).await;
+
+        let checkpointed = checkpointed.expect("the bootstrap branch checkpoints the schema");
+        assert!(
+            !declares_nullable_entries(&checkpointed),
+            "the bootstrapped checkpoint must not be given a Map declaration MapArray::try_new refuses"
+        );
+        assert!(
+            !declares_nullable_entries(&restored),
+            "the restore must not hand back a Map declaration MapArray::try_new refuses"
+        );
+    }
+
+    /// The checkpoint is a third store of a schema. One written by an older build carries the
+    /// same declaration, and it is what the restore returns on this branch.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restoring_over_a_legacy_checkpoint_conforms_the_schema_it_returns() {
+        let forbidden = nullable_map_entries_schema();
+        let (_, restored) = restore_snapshot_recording_schema(
+            legacy_recorded_schema(0, &forbidden),
+            Some(Arc::clone(&forbidden)),
+        )
+        .await;
+
+        assert!(
+            !declares_nullable_entries(&restored),
+            "a checkpoint written before schemas were conformed must not be handed back as-is"
+        );
+    }
+
+    /// A snapshot written before recorded schemas were conformed keeps the invalid declaration
+    /// in its *published* JSON. Reading repairs what this process sees, but the next upload
+    /// finds the conformed form equal to the live schema and writes no new schema version — so
+    /// nothing ever rewrites what the next reader downloads.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn uploading_over_legacy_metadata_repairs_the_published_schema() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        write_sample_local_db(&local_path, &AccelerationEngine::DuckDB);
+
+        // The accelerator's own schema conforms — it is the only form it can hold.
+        let forbidden = nullable_map_entries_schema();
+        let live_schema = conforming_schema(Arc::clone(&forbidden));
+
+        // Metadata written by an older build, carrying the declaration verbatim.
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
+        metadata.datasets.insert(
+            DATASET_NAME.to_string(),
+            DatasetMetadata {
+                name: DATASET_NAME.to_string(),
+                engine: Some(AccelerationEngine::DuckDB.to_string()),
+                schemas: vec![legacy_recorded_schema(0, &forbidden)],
+                current_schema_id: 0,
+                ..Default::default()
+            },
+        );
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path,
+            BootstrapOnFailureBehavior::Warn,
+            &live_schema,
+            false,
+        );
+        let mutex = Arc::new(Mutex::new(()));
+        manager
+            .create_snapshot(
+                &live_schema,
+                mutex.lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("create snapshot");
+
+        let published: SnapshotMetadata = serde_json::from_slice(
+            &store
+                .get(&metadata_path)
+                .await
+                .expect("metadata stored")
+                .bytes()
+                .await
+                .expect("read metadata"),
+        )
+        .expect("parse metadata");
+        let dataset = published
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset metadata present");
+
+        assert_eq!(
+            dataset.schemas.len(),
+            1,
+            "repairing the declaration is not a schema change and must not mint a new version"
+        );
+        let raw: Schema = serde_json::from_value(
+            dataset
+                .current_schema()
+                .expect("current schema")
+                .schema
+                .clone(),
+        )
+        .expect("published schema");
+        assert!(
+            !declares_nullable_entries(&raw),
+            "the published snapshot metadata must not keep a Map declaration MapArray::try_new refuses"
+        );
+    }
+
+    fn reader_snapshot_entry(
+        snapshot_id: u64,
+        file_name: &str,
+        engine: Option<&str>,
+    ) -> SnapshotEntry {
+        SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: 0,
+            snapshot: format!(
+                "{SNAPSHOT_URI_PREFIX}/month=2026-09/day=2026-09-26/dataset={DATASET_NAME}/{file_name}"
+            ),
+            snapshot_checksum: String::new(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 0,
+            snapshot_engine: engine.map(str::to_string),
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        }
+    }
+
+    fn reader_metadata(datasets: HashMap<String, DatasetMetadata>) -> SnapshotMetadata {
+        SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: 0,
+            datasets,
+        }
+    }
+
+    fn build_reader(store: Arc<InMemory>) -> SnapshotManager {
+        build_manager_for_engine(
+            store,
+            PathBuf::from("unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &sample_schema(),
+            &AccelerationEngine::Cayenne,
+            false,
+        )
+    }
+
+    async fn current_snapshot_of(
+        metadata: &SnapshotMetadata,
+    ) -> Result<CurrentSnapshot, CurrentSnapshotError> {
+        let store = Arc::new(InMemory::new());
+        write_metadata(
+            &store,
+            &Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME),
+            metadata,
+        )
+        .await;
+        build_reader(store).current_snapshot().await
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_describes_the_entry_current_snapshot_id_names() {
+        let schema = sample_schema();
+        let dataset = dataset_metadata(
+            &schema,
+            vec![
+                reader_snapshot_entry(0, "dataset_20260925T000000Z.duckdb", Some("duckdb")),
+                reader_snapshot_entry(1, "dataset_20260926T000000Z.cayenne", Some("cayenne")),
+            ],
+            Some(1),
+        );
+        let metadata = reader_metadata(HashMap::from([(DATASET_NAME.to_string(), dataset)]));
+
+        let current = current_snapshot_of(&metadata)
+            .await
+            .expect("the current snapshot is described");
+
+        assert_eq!(
+            current,
+            CurrentSnapshot {
+                snapshot_id: 1,
+                engine: "cayenne".to_string(),
+                schema,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_falls_back_to_the_dataset_engine_then_the_file_extension() {
+        let schema = sample_schema();
+
+        let mut recorded_on_dataset = dataset_metadata(
+            &schema,
+            vec![reader_snapshot_entry(
+                0,
+                "dataset_20260926T000000Z.snapshot",
+                None,
+            )],
+            Some(0),
+        );
+        recorded_on_dataset.engine = Some("DuckDB".to_string());
+        let current = current_snapshot_of(&reader_metadata(HashMap::from([(
+            DATASET_NAME.to_string(),
+            recorded_on_dataset,
+        )])))
+        .await
+        .expect("the dataset-level engine is used");
+        assert_eq!(current.engine, "duckdb");
+
+        let named_by_extension = dataset_metadata(
+            &schema,
+            vec![reader_snapshot_entry(
+                0,
+                "dataset_20260926T000000Z.sqlite",
+                None,
+            )],
+            Some(0),
+        );
+        let current = current_snapshot_of(&reader_metadata(HashMap::from([(
+            DATASET_NAME.to_string(),
+            named_by_extension,
+        )])))
+        .await
+        .expect("the file extension names the engine");
+        assert_eq!(current.engine, "sqlite");
+
+        let unrecorded = dataset_metadata(
+            &schema,
+            vec![reader_snapshot_entry(
+                0,
+                "dataset_20260926T000000Z.bin",
+                None,
+            )],
+            Some(0),
+        );
+        let err = current_snapshot_of(&reader_metadata(HashMap::from([(
+            DATASET_NAME.to_string(),
+            unrecorded,
+        )])))
+        .await
+        .expect_err("no engine is recorded anywhere");
+        assert!(
+            matches!(err, CurrentSnapshotError::EngineNotRecorded { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_names_the_metadata_it_could_not_find() {
+        let err = build_reader(Arc::new(InMemory::new()))
+            .current_snapshot()
+            .await
+            .expect_err("there is no metadata");
+
+        assert!(
+            matches!(err, CurrentSnapshotError::MetadataNotFound { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.is_retriable(),
+            "a writer may still publish the metadata"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("'{SNAPSHOT_URI_PREFIX}/metadata.json' does not exist")
+        );
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_lists_the_datasets_the_metadata_has() {
+        let schema = sample_schema();
+        let other = |name: &str| {
+            let mut dataset = dataset_metadata(
+                &schema,
+                vec![reader_snapshot_entry(
+                    0,
+                    "x_20260926T000000Z.cayenne",
+                    Some("cayenne"),
+                )],
+                Some(0),
+            );
+            dataset.name = name.to_string();
+            dataset
+        };
+        let metadata = reader_metadata(HashMap::from([
+            ("orders".to_string(), other("orders")),
+            ("customers".to_string(), other("customers")),
+        ]));
+
+        let err = current_snapshot_of(&metadata)
+            .await
+            .expect_err("the dataset is not in the metadata");
+
+        assert!(err.is_retriable(), "a writer may still publish the dataset");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "'{SNAPSHOT_URI_PREFIX}/metadata.json' has no dataset named '{DATASET_NAME}' (it lists 'customers', 'orders')"
+            )
+        );
+
+        let empty = current_snapshot_of(&reader_metadata(HashMap::new()))
+            .await
+            .expect_err("the metadata lists no datasets");
+        assert!(
+            empty.to_string().ends_with("(it lists no datasets)"),
+            "unexpected message: {empty}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_needs_a_current_snapshot_pointer() {
+        let dataset = dataset_metadata(
+            &sample_schema(),
+            vec![reader_snapshot_entry(
+                0,
+                "dataset_20260926T000000Z.cayenne",
+                Some("cayenne"),
+            )],
+            None,
+        );
+        let err = current_snapshot_of(&reader_metadata(HashMap::from([(
+            DATASET_NAME.to_string(),
+            dataset,
+        )])))
+        .await
+        .expect_err("no snapshot is current");
+
+        assert!(
+            matches!(err, CurrentSnapshotError::NoCurrentSnapshot { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(err.is_retriable());
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_of_a_newer_metadata_format_is_not_retriable() {
+        let mut metadata = reader_metadata(HashMap::new());
+        metadata.format_version = SNAPSHOT_METADATA_FORMAT_VERSION + 1;
+
+        let err = current_snapshot_of(&metadata)
+            .await
+            .expect_err("the format version is unsupported");
+
+        assert!(
+            matches!(err, CurrentSnapshotError::UnsupportedMetadataVersion { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.is_retriable(),
+            "only a different build of Spice can read this metadata"
         );
     }
 }

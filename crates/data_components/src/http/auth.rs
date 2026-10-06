@@ -18,10 +18,20 @@ limitations under the License.
 //!
 //! The module exposes an [`HttpAuthenticator`] trait that [`crate::http::provider::HttpTableProvider`]
 //! uses to decorate outgoing requests. The main implementation is
-//! [`RefreshTokenAuth`], which implements the `OAuth2` refresh-token grant
-//! (RFC 6749 §6): it exchanges a long-lived refresh token for short-lived
-//! access tokens against a configured token endpoint and refreshes them in
-//! the background before they expire.
+//! [`OAuth2Auth`], which acquires short-lived access tokens from a configured
+//! token endpoint and refreshes them in the background before they expire. Two
+//! `OAuth2` grants are supported (see [`OAuthGrant`]):
+//!
+//! - the refresh-token grant (RFC 6749 §6): exchange a long-lived refresh token
+//!   for access tokens; the endpoint may rotate the refresh token;
+//! - the client-credentials grant (RFC 6749 §4.4): authenticate as the client
+//!   with `client_id`/`client_secret`; no refresh token is issued, so each
+//!   refresh simply re-runs the same exchange (e.g. Shopify Admin API).
+//!
+//! By default the access token is attached as `Authorization: Bearer <token>`,
+//! but the header name is configurable via [`TokenHeader`]; a non-`Authorization`
+//! header carries the bare token, so non-standard schemes work too (e.g.
+//! Shopify's `X-Shopify-Access-Token: <token>`).
 
 use std::fmt;
 use std::sync::Arc;
@@ -29,7 +39,7 @@ use std::time::Duration;
 
 use reqwest::{
     Client, ClientBuilder, RequestBuilder,
-    header::{AUTHORIZATION, HeaderValue},
+    header::{AUTHORIZATION, HeaderName, HeaderValue},
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -100,6 +110,12 @@ pub enum Error {
     InvalidAccessToken {
         source: reqwest::header::InvalidHeaderValue,
     },
+
+    #[snafu(display("Invalid OAuth2 auth header name '{name}': {source}"))]
+    InvalidHeaderName {
+        name: String,
+        source: reqwest::header::InvalidHeaderName,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -110,7 +126,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// (e.g. token refresh) should happen on a background task so callers do not
 /// pay latency on every request.
 pub trait HttpAuthenticator: Send + Sync + fmt::Debug {
+    /// Attach the authentication header to an outgoing request.
     fn apply(&self, builder: RequestBuilder) -> RequestBuilder;
+
+    /// The HTTP header name this authenticator writes. Callers use it to guard
+    /// against a conflicting static (`http_headers`) or dynamic
+    /// (`request_headers`) header of the same name, which would otherwise be
+    /// sent alongside the authenticator's value.
+    fn header_name(&self) -> &HeaderName;
 }
 
 /// How client credentials are conveyed to the `OAuth2` token endpoint
@@ -138,96 +161,183 @@ impl ClientAuthMethod {
     }
 }
 
-/// Static configuration for the `OAuth2` refresh-token grant.
+/// The `OAuth2` grant used to obtain (and periodically refresh) access tokens.
 #[derive(Clone, Debug)]
-pub struct RefreshTokenConfig {
+pub enum OAuthGrant {
+    /// RFC 6749 §6 refresh-token grant. The connector trades a long-lived
+    /// refresh token for short-lived access tokens; the token endpoint may
+    /// rotate the refresh token on each exchange.
+    RefreshToken(SecretString),
+    /// RFC 6749 §4.4 client-credentials grant. The connector authenticates as
+    /// itself with `client_id`/`client_secret`; no refresh token is issued, so
+    /// each refresh re-runs the same exchange.
+    ClientCredentials,
+}
+
+impl OAuthGrant {
+    /// The `grant_type` form field value sent to the token endpoint.
+    fn grant_type(&self) -> &'static str {
+        match self {
+            Self::RefreshToken(_) => "refresh_token",
+            Self::ClientCredentials => "client_credentials",
+        }
+    }
+}
+
+/// Where the obtained access token is attached to outgoing data requests.
+///
+/// Only the header *name* is user-configurable; the value scheme is derived
+/// from it. The `Authorization` header (the default) carries `Bearer <token>`
+/// per RFC 6750; any other header carries the bare `<token>` — matching APIs
+/// with non-standard schemes, e.g. the Shopify Admin API's
+/// `X-Shopify-Access-Token: <token>`.
+#[derive(Clone, Debug)]
+pub struct TokenHeader {
+    name: HeaderName,
+}
+
+impl Default for TokenHeader {
+    fn default() -> Self {
+        Self {
+            name: AUTHORIZATION,
+        }
+    }
+}
+
+impl TokenHeader {
+    /// Build a token header from the user-facing header name.
+    ///
+    /// `name` is the HTTP header name (e.g. `Authorization`,
+    /// `X-Shopify-Access-Token`). The value scheme is derived: `Authorization`
+    /// yields `Bearer <token>`, any other header yields the bare `<token>`.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidHeaderName`] if `name` is not a valid HTTP header
+    /// name.
+    pub fn new(name: &str) -> Result<Self> {
+        let trimmed = name.trim();
+        let header_name = HeaderName::from_bytes(trimmed.as_bytes()).map_err(|source| {
+            Error::InvalidHeaderName {
+                name: trimmed.to_string(),
+                source,
+            }
+        })?;
+        Ok(Self { name: header_name })
+    }
+
+    /// The configured header name.
+    #[must_use]
+    pub fn name(&self) -> &HeaderName {
+        &self.name
+    }
+
+    /// Render the sensitive header value for `access_token`. The scheme depends
+    /// on the header name: `Bearer <token>` for `Authorization`, bare `<token>`
+    /// otherwise.
+    fn header_value(&self, access_token: &SecretString) -> Result<HeaderValue> {
+        let raw = if self.name == AUTHORIZATION {
+            format!("Bearer {}", access_token.expose_secret())
+        } else {
+            access_token.expose_secret().to_string()
+        };
+        let mut header = HeaderValue::from_str(&raw).context(InvalidAccessTokenSnafu)?;
+        header.set_sensitive(true);
+        Ok(header)
+    }
+}
+
+/// Static configuration for `OAuth2` token acquisition.
+#[derive(Clone, Debug)]
+pub struct OAuth2Config {
     pub token_url: String,
     pub client_id: Option<String>,
     pub client_secret: Option<SecretString>,
     pub scopes: Option<String>,
     pub client_auth: ClientAuthMethod,
+    pub header: TokenHeader,
 }
 
-/// Authenticator that applies `Authorization: Bearer <access_token>` to every
-/// outgoing request, refreshing the access token in the background before it
-/// expires.
-pub struct RefreshTokenAuth {
+/// Authenticator that applies an `OAuth2` access token to every outgoing
+/// request, refreshing the token in the background before it expires.
+pub struct OAuth2Auth {
     token_url: String,
+    header_name: HeaderName,
     rx: watch::Receiver<HeaderValue>,
     _handle: Arc<JoinHandle<()>>,
 }
 
-impl fmt::Debug for RefreshTokenAuth {
+impl fmt::Debug for OAuth2Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RefreshTokenAuth")
+        f.debug_struct("OAuth2Auth")
             .field("token_url", &self.token_url)
+            .field("header_name", &self.header_name)
             .field("access_token", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
 
-impl RefreshTokenAuth {
-    /// Perform the initial refresh-token exchange and spawn a background task
-    /// that refreshes the access token before it expires.
+impl OAuth2Auth {
+    /// Perform the initial token exchange and spawn a background task that
+    /// refreshes the access token before it expires.
     ///
     /// # Errors
     /// Returns an error if `config.token_url` is invalid, if the HTTP client
     /// cannot be constructed, or if the initial token exchange fails.
-    pub async fn try_new(config: RefreshTokenConfig, refresh_token: SecretString) -> Result<Self> {
+    pub async fn try_new(config: OAuth2Config, grant: OAuthGrant) -> Result<Self> {
         validate_token_url(&config.token_url)?;
 
         let client = build_token_client()?;
 
-        let initial = exchange_refresh_token(&client, &config, &refresh_token).await?;
+        let initial = exchange_token(&client, &config, &grant).await?;
 
-        let header = bearer_header_value(&initial.access_token)?;
+        let header = config.header.header_value(&initial.access_token)?;
         let (tx, rx) = watch::channel(header);
         let expires_in = initial.expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
-        let current_refresh = initial.refresh_token.unwrap_or(refresh_token);
 
-        let handle = tokio::spawn(refresh_loop(
-            client,
-            config.clone(),
-            current_refresh,
-            expires_in,
-            tx,
-        ));
+        // For the refresh-token grant, honor a rotated refresh token from the
+        // initial response; the client-credentials grant carries no refresh
+        // token to rotate.
+        let grant = match (grant, initial.refresh_token) {
+            (OAuthGrant::RefreshToken(_), Some(rotated)) => OAuthGrant::RefreshToken(rotated),
+            (grant, _) => grant,
+        };
+
+        let header_name = config.header.name().clone();
+        let token_url = config.token_url.clone();
+
+        let handle = tokio::spawn(refresh_loop(client, config, grant, expires_in, tx));
 
         Ok(Self {
-            token_url: config.token_url,
+            token_url,
+            header_name,
             rx,
             _handle: Arc::new(handle),
         })
     }
 
-    /// Current `Authorization: Bearer …` header value. Test-only helper so
-    /// downstream callers can't accidentally log or otherwise exfiltrate the
-    /// bearer token via this API.
+    /// Current auth header value. Test-only helper so downstream callers can't
+    /// accidentally log or otherwise exfiltrate the access token via this API.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn current_bearer_value(&self) -> HeaderValue {
+    pub(crate) fn current_header_value(&self) -> HeaderValue {
         self.rx.borrow().clone()
     }
 }
 
-impl HttpAuthenticator for RefreshTokenAuth {
+impl HttpAuthenticator for OAuth2Auth {
     fn apply(&self, builder: RequestBuilder) -> RequestBuilder {
-        builder.header(AUTHORIZATION, self.rx.borrow().clone())
+        builder.header(self.header_name.clone(), self.rx.borrow().clone())
     }
-}
 
-/// Build a sensitive `Authorization: Bearer <token>` header value.
-fn bearer_header_value(access_token: &SecretString) -> Result<HeaderValue> {
-    let raw = format!("Bearer {}", access_token.expose_secret());
-    let mut header = HeaderValue::from_str(&raw).context(InvalidAccessTokenSnafu)?;
-    header.set_sensitive(true);
-    Ok(header)
+    fn header_name(&self) -> &HeaderName {
+        &self.header_name
+    }
 }
 
 async fn refresh_loop(
     client: Client,
-    config: RefreshTokenConfig,
-    mut current_refresh: SecretString,
+    config: OAuth2Config,
+    mut grant: OAuthGrant,
     initial_expires_in: u64,
     tx: watch::Sender<HeaderValue>,
 ) {
@@ -242,11 +352,11 @@ async fn refresh_loop(
             () = tx.closed() => break,
         }
 
-        match exchange_refresh_token(&client, &config, &current_refresh).await {
+        match exchange_token(&client, &config, &grant).await {
             Ok(resp) => {
                 backoff.reset();
                 let expires_in = resp.expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
-                let header = match bearer_header_value(&resp.access_token) {
+                let header = match config.header.header_value(&resp.access_token) {
                     Ok(h) => h,
                     Err(e) => {
                         tracing::error!(
@@ -266,8 +376,12 @@ async fn refresh_loop(
                 if tx.send(header).is_err() {
                     break;
                 }
-                if let Some(new_refresh) = resp.refresh_token {
-                    current_refresh = new_refresh;
+                // Rotate the refresh token if the endpoint issued a new one.
+                // Only meaningful for the refresh-token grant.
+                if let (OAuthGrant::RefreshToken(current), Some(new_refresh)) =
+                    (&mut grant, resp.refresh_token)
+                {
+                    *current = new_refresh;
                 }
                 next_wait = next_refresh_wait(expires_in);
             }
@@ -340,13 +454,13 @@ struct RawTokenResponse {
     token_type: Option<String>,
 }
 
-async fn exchange_refresh_token(
+async fn exchange_token(
     client: &Client,
-    config: &RefreshTokenConfig,
-    refresh_token: &SecretString,
+    config: &OAuth2Config,
+    grant: &OAuthGrant,
 ) -> Result<TokenResponse> {
-    let response = send_request_with_retry("HTTP connector OAuth2", "refresh access token", || {
-        build_token_request(client, config, refresh_token)
+    let response = send_request_with_retry("HTTP connector OAuth2", "acquire access token", || {
+        build_token_request(client, config, grant)
     })
     .await
     .map_err(|e| Error::TokenRequest {
@@ -383,16 +497,18 @@ async fn exchange_refresh_token(
 
 fn build_token_request(
     client: &Client,
-    config: &RefreshTokenConfig,
-    refresh_token: &SecretString,
+    config: &OAuth2Config,
+    grant: &OAuthGrant,
 ) -> RequestBuilder {
-    let mut form: Vec<(String, String)> = vec![
-        ("grant_type".to_string(), "refresh_token".to_string()),
-        (
+    let mut form: Vec<(String, String)> =
+        vec![("grant_type".to_string(), grant.grant_type().to_string())];
+
+    if let OAuthGrant::RefreshToken(refresh_token) = grant {
+        form.push((
             "refresh_token".to_string(),
             refresh_token.expose_secret().to_string(),
-        ),
-    ];
+        ));
+    }
 
     if let Some(scopes) = &config.scopes {
         let trimmed = scopes.trim();
@@ -554,6 +670,18 @@ mod tests {
         (format!("http://{addr}"), request_count, captured)
     }
 
+    /// Convenience config with the default `Authorization: Bearer` header.
+    fn test_config(token_url: String, client_auth: ClientAuthMethod) -> OAuth2Config {
+        OAuth2Config {
+            token_url,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
+            client_auth,
+            header: TokenHeader::default(),
+        }
+    }
+
     #[test]
     fn parse_client_auth_method() {
         assert_eq!(
@@ -562,6 +690,47 @@ mod tests {
         );
         assert_eq!(ClientAuthMethod::parse("BODY"), Ok(ClientAuthMethod::Body));
         ClientAuthMethod::parse("none").expect_err("expected unsupported auth method to fail");
+    }
+
+    #[test]
+    fn token_header_validation() {
+        // Default: Authorization -> Bearer scheme.
+        let default = TokenHeader::default();
+        assert_eq!(default.name(), &AUTHORIZATION);
+        assert_eq!(
+            default
+                .header_value(&SecretString::from("abc"))
+                .expect("value")
+                .to_str()
+                .unwrap_or(""),
+            "Bearer abc"
+        );
+
+        // Explicit Authorization (any case) also gets the Bearer scheme.
+        let explicit = TokenHeader::new("authorization").expect("valid header");
+        assert_eq!(
+            explicit
+                .header_value(&SecretString::from("abc"))
+                .expect("value")
+                .to_str()
+                .unwrap_or(""),
+            "Bearer abc"
+        );
+
+        // Any other header carries the bare token.
+        let shopify =
+            TokenHeader::new("X-Shopify-Access-Token").expect("valid custom header should parse");
+        assert_eq!(shopify.name().as_str(), "x-shopify-access-token");
+        let value = shopify
+            .header_value(&SecretString::from("shpat_abc"))
+            .expect("header value should build");
+        assert_eq!(value.to_str().unwrap_or(""), "shpat_abc");
+        assert!(value.is_sensitive(), "token header must be sensitive");
+
+        assert!(matches!(
+            TokenHeader::new("Bad Header Name"),
+            Err(Error::InvalidHeaderName { .. })
+        ));
     }
 
     #[test]
@@ -606,17 +775,22 @@ mod tests {
         .await;
 
         let client = build_token_client().expect("build token client");
-        let config = RefreshTokenConfig {
+        let config = OAuth2Config {
             token_url: format!("{url}/oauth/token"),
             client_id: Some("my-client".to_string()),
             client_secret: Some(SecretString::from("super-secret")),
             scopes: Some("read:data".to_string()),
             client_auth: ClientAuthMethod::Basic,
+            header: TokenHeader::default(),
         };
 
-        let resp = exchange_refresh_token(&client, &config, &SecretString::from("rt-original"))
-            .await
-            .expect("token exchange should succeed");
+        let resp = exchange_token(
+            &client,
+            &config,
+            &OAuthGrant::RefreshToken(SecretString::from("rt-original")),
+        )
+        .await
+        .expect("token exchange should succeed");
 
         assert_eq!(resp.expires_in, Some(600));
         assert_eq!(resp.access_token.expose_secret(), "new-access");
@@ -660,17 +834,22 @@ mod tests {
         .await;
 
         let client = build_token_client().expect("build token client");
-        let config = RefreshTokenConfig {
+        let config = OAuth2Config {
             token_url: format!("{url}/oauth/token"),
             client_id: Some("cid".to_string()),
             client_secret: Some(SecretString::from("csec")),
             scopes: None,
             client_auth: ClientAuthMethod::Body,
+            header: TokenHeader::default(),
         };
 
-        exchange_refresh_token(&client, &config, &SecretString::from("rt"))
-            .await
-            .expect("token exchange should succeed");
+        exchange_token(
+            &client,
+            &config,
+            &OAuthGrant::RefreshToken(SecretString::from("rt")),
+        )
+        .await
+        .expect("token exchange should succeed");
 
         let request = captured.lock().await.remove(0);
         let lower = request.to_ascii_lowercase();
@@ -689,6 +868,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn exchange_client_credentials_grant_omits_refresh_token() {
+        let (url, _count, captured) = start_mock_server(vec![MockResponse::ok(&json!({
+            "access_token": "shpat_generated",
+            "expires_in": 86399
+        }))])
+        .await;
+
+        let client = build_token_client().expect("build token client");
+        let config = OAuth2Config {
+            token_url: format!("{url}/admin/oauth/access_token"),
+            client_id: Some("shopify-client".to_string()),
+            client_secret: Some(SecretString::from("shopify-secret")),
+            scopes: None,
+            client_auth: ClientAuthMethod::Body,
+            header: TokenHeader::new("X-Shopify-Access-Token").expect("valid header config"),
+        };
+
+        let resp = exchange_token(&client, &config, &OAuthGrant::ClientCredentials)
+            .await
+            .expect("client-credentials exchange should succeed");
+        assert_eq!(resp.access_token.expose_secret(), "shpat_generated");
+        assert_eq!(resp.expires_in, Some(86399));
+
+        let request = captured.lock().await.remove(0);
+        assert!(
+            request.contains("grant_type=client_credentials"),
+            "missing client_credentials grant_type: {request}"
+        );
+        assert!(
+            !request.contains("refresh_token="),
+            "client-credentials grant must not send a refresh_token: {request}"
+        );
+        assert!(
+            request.contains("client_id=shopify-client")
+                && request.contains("client_secret=shopify-secret"),
+            "client credentials should be in the body: {request}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn exchange_refresh_token_surfaces_non_success_body() {
         let (url, _count, _captured) = start_mock_server(vec![MockResponse::status(
             "400 Bad Request",
@@ -697,17 +916,15 @@ mod tests {
         .await;
 
         let client = build_token_client().expect("build token client");
-        let config = RefreshTokenConfig {
-            token_url: format!("{url}/oauth/token"),
-            client_id: None,
-            client_secret: None,
-            scopes: None,
-            client_auth: ClientAuthMethod::Basic,
-        };
+        let config = test_config(format!("{url}/oauth/token"), ClientAuthMethod::Basic);
 
-        let err = exchange_refresh_token(&client, &config, &SecretString::from("rt"))
-            .await
-            .expect_err("400 should propagate as TokenEndpointStatus");
+        let err = exchange_token(
+            &client,
+            &config,
+            &OAuthGrant::RefreshToken(SecretString::from("rt")),
+        )
+        .await
+        .expect_err("400 should propagate as TokenEndpointStatus");
 
         match err {
             Error::TokenEndpointStatus { status, body, .. } => {
@@ -719,27 +936,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn refresh_token_auth_applies_bearer_header() {
+    async fn oauth2_auth_applies_bearer_header() {
         let (url, _count, _captured) = start_mock_server(vec![MockResponse::ok(&json!({
             "access_token": "initial-access",
             "expires_in": 3600
         }))])
         .await;
 
-        let auth = RefreshTokenAuth::try_new(
-            RefreshTokenConfig {
-                token_url: format!("{url}/oauth/token"),
-                client_id: None,
-                client_secret: None,
-                scopes: None,
-                client_auth: ClientAuthMethod::Basic,
-            },
-            SecretString::from("rt-seed"),
+        let auth = OAuth2Auth::try_new(
+            test_config(format!("{url}/oauth/token"), ClientAuthMethod::Basic),
+            OAuthGrant::RefreshToken(SecretString::from("rt-seed")),
         )
         .await
-        .expect("RefreshTokenAuth::try_new should succeed");
+        .expect("OAuth2Auth::try_new should succeed");
 
-        let current = auth.current_bearer_value();
+        assert_eq!(auth.header_name(), &AUTHORIZATION);
+        let current = auth.current_header_value();
         assert_eq!(current.to_str().unwrap_or(""), "Bearer initial-access");
         assert!(
             current.is_sensitive(),
@@ -759,6 +971,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn oauth2_auth_applies_custom_header_for_client_credentials() {
+        let (url, _count, _captured) = start_mock_server(vec![MockResponse::ok(&json!({
+            "access_token": "shpat_live",
+            "expires_in": 86399
+        }))])
+        .await;
+
+        let config = OAuth2Config {
+            token_url: format!("{url}/admin/oauth/access_token"),
+            client_id: Some("cid".to_string()),
+            client_secret: Some(SecretString::from("csec")),
+            scopes: None,
+            client_auth: ClientAuthMethod::Body,
+            header: TokenHeader::new("X-Shopify-Access-Token").expect("valid header config"),
+        };
+
+        let auth = OAuth2Auth::try_new(config, OAuthGrant::ClientCredentials)
+            .await
+            .expect("client-credentials auth should initialise");
+
+        assert_eq!(auth.header_name().as_str(), "x-shopify-access-token");
+
+        let client = Client::new();
+        let builder = client.get("https://example.invalid/admin/api/shop.json");
+        let built = auth.apply(builder).build().expect("request should build");
+        assert_eq!(
+            built
+                .headers()
+                .get("X-Shopify-Access-Token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            "shpat_live"
+        );
+        assert!(
+            built.headers().get("Authorization").is_none(),
+            "custom-header auth must not also set Authorization"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn exchange_rejects_non_bearer_token_type() {
         let (url, _count, _captured) = start_mock_server(vec![MockResponse::ok(&json!({
             "access_token": "at",
@@ -768,17 +1020,15 @@ mod tests {
         .await;
 
         let client = build_token_client().expect("build token client");
-        let config = RefreshTokenConfig {
-            token_url: format!("{url}/oauth/token"),
-            client_id: None,
-            client_secret: None,
-            scopes: None,
-            client_auth: ClientAuthMethod::Basic,
-        };
+        let config = test_config(format!("{url}/oauth/token"), ClientAuthMethod::Basic);
 
-        let err = exchange_refresh_token(&client, &config, &SecretString::from("rt"))
-            .await
-            .expect_err("non-Bearer token_type should be rejected");
+        let err = exchange_token(
+            &client,
+            &config,
+            &OAuthGrant::RefreshToken(SecretString::from("rt")),
+        )
+        .await
+        .expect_err("non-Bearer token_type should be rejected");
 
         match err {
             Error::UnsupportedTokenType { token_type } => {
@@ -794,11 +1044,11 @@ mod tests {
     /// the seed token.
     ///
     /// Note: we deliberately do not use `#[tokio::test(start_paused = true)]`
-    /// here. The test depends on real TCP I/O against a local axum mock
-    /// server, and reqwest's `connect_timeout` is driven by the tokio timer —
-    /// paused time races with the (real) TCP connect and fires the connect
-    /// timeout before the three-way handshake completes. Instead we use a
-    /// small `expires_in` so the refresh loop sleeps just ~1s.
+    /// here. The test depends on real TCP I/O against a local mock server, and
+    /// reqwest's `connect_timeout` is driven by the tokio timer — paused time
+    /// races with the (real) TCP connect and fires the connect timeout before
+    /// the three-way handshake completes. Instead we use a small `expires_in`
+    /// so the refresh loop sleeps just ~1s.
     #[tokio::test(flavor = "current_thread")]
     async fn refresh_loop_uses_rotated_refresh_token() {
         // Server responses: first exchange rotates seed->refresh-v1, second
@@ -822,21 +1072,15 @@ mod tests {
         ])
         .await;
 
-        let auth = RefreshTokenAuth::try_new(
-            RefreshTokenConfig {
-                token_url: format!("{url}/oauth/token"),
-                client_id: None,
-                client_secret: None,
-                scopes: None,
-                client_auth: ClientAuthMethod::Basic,
-            },
-            SecretString::from("seed-refresh"),
+        let auth = OAuth2Auth::try_new(
+            test_config(format!("{url}/oauth/token"), ClientAuthMethod::Basic),
+            OAuthGrant::RefreshToken(SecretString::from("seed-refresh")),
         )
         .await
         .expect("initial exchange should succeed");
 
         assert_eq!(
-            auth.current_bearer_value().to_str().unwrap_or(""),
+            auth.current_header_value().to_str().unwrap_or(""),
             "Bearer access-v1"
         );
 
@@ -846,7 +1090,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             if count.load(Ordering::SeqCst) >= 2
-                && auth.current_bearer_value().to_str().unwrap_or("") == "Bearer access-v2"
+                && auth.current_header_value().to_str().unwrap_or("") == "Bearer access-v2"
             {
                 break;
             }
@@ -859,7 +1103,7 @@ mod tests {
             "background refresh did not fire a second exchange within 5s",
         );
         assert_eq!(
-            auth.current_bearer_value().to_str().unwrap_or(""),
+            auth.current_header_value().to_str().unwrap_or(""),
             "Bearer access-v2",
             "watch channel did not propagate the rotated access token",
         );

@@ -6,7 +6,7 @@
     "license": {
       "name": ""
     },
-    "version": "2.1.0-unstable"
+    "version": "2.4.0-unstable"
   },
   "servers": [
     {
@@ -148,6 +148,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "The specified model is an evaluation model; use POST /v1/evaluate"
           },
           "404": {
             "description": "The specified model was not found"
@@ -427,6 +430,89 @@
         }
       }
     },
+    "/v1/datasets/{name}/cdc": {
+      "post": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "Ingest Debezium CDC changes",
+        "description": "Push Debezium change events (JSON or Avro) directly into an accelerated\ndataset configured with `from: cdc:…` and `refresh_mode: changes`. No Kafka\nis required — use this as a Debezium Server / Embedded Engine sink.",
+        "operationId": "post_dataset_cdc",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Dataset name (must match a `from: cdc:…` dataset)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Debezium change event(s) as JSON or Avro",
+          "content": {
+            "application/avro": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            },
+            "application/json": {
+              "schema": {}
+            },
+            "application/vnd.debezium+avro": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            },
+            "application/vnd.debezium+json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Changes applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CdcIngestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body or format"
+          },
+          "403": {
+            "description": "Write access required"
+          },
+          "404": {
+            "description": "Dataset not registered for CDC ingest"
+          },
+          "501": {
+            "description": "CDC ingest requires the debezium feature in this build"
+          },
+          "503": {
+            "description": "Change stream stopped (dataset unloaded or reloading)"
+          },
+          "504": {
+            "description": "Timed out waiting for capacity or apply"
+          }
+        }
+      }
+    },
     "/v1/embeddings": {
       "post": {
         "tags": [
@@ -506,6 +592,62 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/evaluate": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Evaluate",
+        "description": "Evaluate unstructured `state` against a map of typed System One questions\n(noul / choice / score). Returns structured answers with probabilities and\nconfidence. `model` names either a System One model (`TypeSafe` Jev), whose\nprobabilities are calibrated, or any chat model, whose probabilities are the\nmodel's own estimates. System One models do not support chat completions.",
+        "operationId": "post_evaluate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvaluateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Evaluation succeeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvaluateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Upstream authentication failed"
+          },
+          "403": {
+            "description": "Upstream permission denied"
+          },
+          "404": {
+            "description": "No System One or chat model with this name"
+          },
+          "422": {
+            "description": "Malformed JSON request body (Axum Json extractor)"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "500": {
+            "description": "Evaluation failed"
+          },
+          "503": {
+            "description": "Upstream provider unavailable"
           }
         }
       }
@@ -829,13 +971,13 @@
           "mcp"
         ],
         "summary": "Open an MCP server-to-client SSE stream",
-        "description": "Open a long-lived server-to-client SSE stream for the current MCP session as defined by the Streamable HTTP transport. The `Mcp-Session-Id` header must identify an existing session created via `POST /v1/mcp`.",
+        "description": "Legacy-era only (`2025-11-25` and earlier). Open a long-lived server-to-client SSE stream for an MCP session created via `POST /v1/mcp`. `2026-07-28` clients do not use GET; they POST `subscriptions/listen` instead. The `Mcp-Session-Id` header must identify an existing legacy session.",
         "operationId": "mcp_stream",
         "parameters": [
           {
             "name": "Mcp-Session-Id",
             "in": "header",
-            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "description": "Legacy-era only (`2025-11-25` and earlier). Session identifier returned on `initialize` and required on subsequent requests in that session. Ignored for `2026-07-28` requests, which are sessionless.",
             "required": false
           }
         ],
@@ -847,7 +989,7 @@
             "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
           },
           "403": {
-            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list."
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, or the `Origin` header is not in `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin."
           },
           "404": {
             "description": "Unknown or expired `Mcp-Session-Id`."
@@ -859,13 +1001,37 @@
           "mcp"
         ],
         "summary": "Send a Model Context Protocol message",
-        "description": "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), selected via the `Accept` header. Session continuity is carried via the `Mcp-Session-Id` header.",
+        "description": "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. Spice is dual-era: `2026-07-28` clients call `server/discover` and tools without a session; legacy clients may still `initialize` and use `Mcp-Session-Id`. The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), selected via the `Accept` header.",
         "operationId": "mcp_message",
         "parameters": [
           {
+            "name": "MCP-Protocol-Version",
+            "in": "header",
+            "description": "Required for `2026-07-28` requests. Must match `_meta['io.modelcontextprotocol/protocolVersion']` in the JSON-RPC body. Spice serves `2026-07-28` and remains dual-era for legacy `initialize` clients.",
+            "required": false
+          },
+          {
+            "name": "Mcp-Method",
+            "in": "header",
+            "description": "Required for `2026-07-28` requests. Must match the JSON-RPC `method` (e.g. `server/discover`, `tools/list`, `tools/call`). Header/body mismatches are rejected with HTTP 400 and JSON-RPC `-32020`.",
+            "required": false
+          },
+          {
+            "name": "Mcp-Name",
+            "in": "header",
+            "description": "Required for `2026-07-28` `tools/call` (and `resources/read` / `prompts/get`) requests. Must match `params.name` or `params.uri`.",
+            "required": false
+          },
+          {
+            "name": "Mcp-Param-*",
+            "in": "header",
+            "description": "For `2026-07-28` `tools/call` requests, one header per tool argument annotated with `x-mcp-header`. The header name is `Mcp-Param-` plus the annotation value (for example `Mcp-Param-Region`). The value must match the corresponding argument in the JSON-RPC body; mismatches are rejected with HTTP 400 and JSON-RPC `-32020`.",
+            "required": false
+          },
+          {
             "name": "Mcp-Session-Id",
             "in": "header",
-            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "description": "Legacy-era only (`2025-11-25` and earlier). Session identifier returned on `initialize` and required on subsequent requests in that session. Ignored for `2026-07-28` requests, which are sessionless.",
             "required": false
           }
         ],
@@ -877,16 +1043,16 @@
             "description": "Message accepted (for JSON-RPC notifications / responses that do not require a reply)."
           },
           "400": {
-            "description": "Malformed JSON-RPC payload."
+            "description": "Malformed JSON-RPC payload, unsupported protocol version (`-32022` lists supported versions), or Streamable HTTP header/body mismatch (`-32020`)."
           },
           "401": {
             "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
           },
           "403": {
-            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list. Configure `runtime.mcp.allowed_hosts` or set it to `[\"*\"]` to allow all hosts."
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, or the `Origin` header is not in `runtime.cors.allowed_origins`. Configure `runtime.mcp.allowed_hosts` or `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin. A concrete Origin list 403s a mismatched `Origin`."
           },
           "404": {
-            "description": "Unknown or expired `Mcp-Session-Id`."
+            "description": "Unknown method, or unknown/expired `Mcp-Session-Id` on a legacy-era request."
           },
           "413": {
             "description": "Payload too large. Maximum allowed size is 32 MiB."
@@ -898,13 +1064,13 @@
           "mcp"
         ],
         "summary": "Terminate an MCP Streamable HTTP session",
-        "description": "Terminate the MCP session identified by the `Mcp-Session-Id` header. Subsequent requests bearing the same session id will receive `404 Not Found`.",
+        "description": "Legacy-era only (`2025-11-25` and earlier). Terminate the MCP session identified by the `Mcp-Session-Id` header. `2026-07-28` requests are sessionless and do not use DELETE. Subsequent legacy requests bearing the same session id will receive `404 Not Found`.",
         "operationId": "mcp_terminate_session",
         "parameters": [
           {
             "name": "Mcp-Session-Id",
             "in": "header",
-            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "description": "Legacy-era only (`2025-11-25` and earlier). Session identifier returned on `initialize` and required on subsequent requests in that session. Ignored for `2026-07-28` requests, which are sessionless.",
             "required": false
           }
         ],
@@ -916,7 +1082,7 @@
             "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
           },
           "403": {
-            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list."
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, or the `Origin` header is not in `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin."
           },
           "404": {
             "description": "Unknown or already-terminated `Mcp-Session-Id`."
@@ -1015,82 +1181,6 @@
                 "schema": {},
                 "example": {
                   "error": "App not initialized"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/models/{name}/predict": {
-      "get": {
-        "tags": [
-          "AI"
-        ],
-        "summary": "ML Prediction",
-        "description": "Make a ML prediction using a specific model.",
-        "operationId": "get_model_predict",
-        "parameters": [
-          {
-            "name": "name",
-            "in": "path",
-            "description": "The name of the model to make a prediction with.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Prediction made successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PredictResponse"
-                },
-                "example": {
-                  "status": "Success",
-                  "model_name": "my_model_name",
-                  "model_version": "1.0",
-                  "prediction": [
-                    0.45,
-                    0.5,
-                    0.55
-                  ],
-                  "duration_ms": 123
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid request to the model",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PredictResponse"
-                },
-                "example": {
-                  "status": "BadRequest",
-                  "error_message": "You gave me a bad request :(",
-                  "model_name": "my_model_name",
-                  "duration_ms": 12
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error occurred during prediction",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PredictResponse"
-                },
-                "example": {
-                  "status": "InternalError",
-                  "error_message": "Oops, the server couldn't predict",
-                  "model_name": "my_model_name",
-                  "duration_ms": 12
                 }
               }
             }
@@ -1564,87 +1654,6 @@
                 "example": {
                   "error": "An unexpected error occurred"
                 }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/predict": {
-      "post": {
-        "tags": [
-          "AI"
-        ],
-        "summary": "Batch ML Predictions",
-        "description": "Perform a batch of ML predictions, using multiple models, in one request. This is useful for ensembling or A/B testing different models.",
-        "operationId": "post_batch_predict",
-        "requestBody": {
-          "description": "Batch prediction request containing a list of prediction requests for specific models",
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BatchPredictRequest"
-              },
-              "example": {
-                "predictions": [
-                  {
-                    "model_name": "drive_stats_a"
-                  },
-                  {
-                    "model_name": "drive_stats_b"
-                  }
-                ]
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Batch predictions completed successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BatchPredictResponse"
-                },
-                "example": {
-                  "duration_ms": 81,
-                  "predictions": [
-                    {
-                      "status": "Success",
-                      "model_name": "drive_stats_a",
-                      "model_version": "1.0",
-                      "prediction": [
-                        0.45,
-                        0.5,
-                        0.55
-                      ],
-                      "duration_ms": 42
-                    },
-                    {
-                      "status": "Success",
-                      "model_name": "drive_stats_b",
-                      "model_version": "1.0",
-                      "prediction": [
-                        0.43,
-                        0.51,
-                        0.53
-                      ],
-                      "duration_ms": 42
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error occurred during batch prediction",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                },
-                "example": "An unexpected error occurred while processing batch predictions"
               }
             }
           }
@@ -2696,6 +2705,109 @@
           }
         ]
       },
+      "Answer": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "noul",
+              "type"
+            ],
+            "properties": {
+              "noul": {
+                "type": "number",
+                "format": "double"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "noul"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "choice",
+              "probabilities",
+              "confidence",
+              "type"
+            ],
+            "properties": {
+              "choice": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "number",
+                "format": "double"
+              },
+              "probabilities": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "number",
+                  "format": "double"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "choice"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "score",
+              "legend",
+              "probabilities",
+              "confidence",
+              "type"
+            ],
+            "properties": {
+              "confidence": {
+                "type": "number",
+                "format": "double"
+              },
+              "legend": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/EntryType"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "probabilities": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "number",
+                  "format": "double"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "score": {
+                "type": "number",
+                "format": "double"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "score"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A typed answer returned for one question."
+      },
       "ApplyPatchCallOutputStatus": {
         "type": "string",
         "description": "Outcome values reported for apply_patch tool call outputs.",
@@ -3103,37 +3215,6 @@
           "assistant"
         ]
       },
-      "BatchPredictRequest": {
-        "type": "object",
-        "properties": {
-          "predictions": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PredictRequest"
-            },
-            "description": "The list of prediction requests, each specifying the model to use for the prediction"
-          }
-        }
-      },
-      "BatchPredictResponse": {
-        "type": "object",
-        "required": [
-          "predictions",
-          "duration_ms"
-        ],
-        "properties": {
-          "duration_ms": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "predictions": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PredictResponse"
-            }
-          }
-        }
-      },
       "Billing": {
         "type": "object",
         "required": [
@@ -3160,6 +3241,24 @@
           "name": {
             "type": "string",
             "description": "The name of the catalog"
+          }
+        }
+      },
+      "CdcIngestResponse": {
+        "type": "object",
+        "required": [
+          "applied",
+          "dataset"
+        ],
+        "properties": {
+          "applied": {
+            "type": "integer",
+            "description": "Number of change rows applied.",
+            "minimum": 0
+          },
+          "dataset": {
+            "type": "string",
+            "description": "Dataset that received the changes."
           }
         }
       },
@@ -6675,6 +6774,29 @@
           "base64"
         ]
       },
+      "EntryType": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null",
+            "default": null
+          }
+        ],
+        "description": "`TypeSafe` `EntryType`: string, object, array, or null.\n\nUsed for `instructions` and structured criteria descriptions.\nSee <https://docs.typesafe.ai/primitives/advanced>."
+      },
       "ErrorObject": {
         "type": "object",
         "description": "Error returned by the API when a request fails.",
@@ -6692,6 +6814,82 @@
             "description": "A human-readable description of the error."
           }
         }
+      },
+      "EvaluateRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/evaluate` and provider System One calls.",
+        "required": [
+          "model",
+          "state",
+          "questions"
+        ],
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Spicepod model name (runtime) or provider model id (provider forward)."
+          },
+          "questions": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Question"
+            },
+            "minProperties": 1
+          },
+          "state": {
+            "$ref": "#/components/schemas/EvaluateState",
+            "description": "State for the model to evaluate: string, object, or array."
+          }
+        }
+      },
+      "EvaluateResponse": {
+        "type": "object",
+        "description": "Response body for evaluation: typed answers plus provider metadata.",
+        "required": [
+          "model",
+          "answers"
+        ],
+        "properties": {
+          "answers": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Answer"
+            },
+            "minProperties": 1
+          },
+          "model": {
+            "type": "string",
+            "description": "Versioned model id that answered (e.g. `jev-1.13.0`), when the provider reports it."
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage"
+              }
+            ]
+          }
+        }
+      },
+      "EvaluateState": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Evaluation `state`: string, object, or array (not bool/number/null)."
       },
       "FileCitationBody": {
         "type": "object",
@@ -9478,6 +9676,37 @@
           }
         }
       },
+      "NonNullEntry": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Non-null `EntryType` values: string, object, or array (not JSON null).\n\nUsed for score rubric levels so the `OpenAPI` contract matches `TypeSafe`'s\nnon-empty `list[str | object | array]` criteria shape."
+      },
+      "NoulCriteria": {
+        "type": "object",
+        "description": "Optional yes/no rubric for a noul question.\n\n`true` / `false` use [`NullableEntry`] so explicit JSON `null` is preserved when\nforwarding to `TypeSafe` (unlike `Option<EntryType>`, which drops nulls).",
+        "properties": {
+          "false": {
+            "$ref": "#/components/schemas/NullableEntry"
+          },
+          "true": {
+            "$ref": "#/components/schemas/NullableEntry"
+          }
+        }
+      },
       "NsqlColumnContext": {
         "type": "object",
         "required": [
@@ -10010,6 +10239,29 @@
             "minimum": 0
           }
         }
+      },
+      "NullableEntry": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null",
+            "default": null
+          }
+        ],
+        "description": "`TypeSafe` `EntryType`: string, object, array, or null.\n\nUsed for `instructions` and structured criteria descriptions.\nSee <https://docs.typesafe.ai/primitives/advanced>."
       },
       "OutputItem": {
         "oneOf": [
@@ -10564,73 +10816,6 @@
           }
         }
       },
-      "PredictRequest": {
-        "type": "object",
-        "required": [
-          "model_name"
-        ],
-        "properties": {
-          "model_name": {
-            "type": "string"
-          }
-        }
-      },
-      "PredictResponse": {
-        "type": "object",
-        "required": [
-          "status",
-          "model_name",
-          "duration_ms"
-        ],
-        "properties": {
-          "duration_ms": {
-            "type": "integer",
-            "description": "The time taken to complete the prediction (in milliseconds)",
-            "minimum": 0
-          },
-          "error_message": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The error message if the request failed"
-          },
-          "model_name": {
-            "type": "string",
-            "description": "The name of the model used for the prediction"
-          },
-          "model_version": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The version of the model used"
-          },
-          "prediction": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "number",
-              "format": "float"
-            },
-            "description": "The prediction result, typically an array of floats"
-          },
-          "status": {
-            "$ref": "#/components/schemas/PredictStatus",
-            "description": "The status of the prediction"
-          }
-        }
-      },
-      "PredictStatus": {
-        "type": "string",
-        "enum": [
-          "Success",
-          "BadRequest",
-          "InternalError"
-        ]
-      },
       "PredictionContent": {
         "oneOf": [
           {
@@ -10733,6 +10918,96 @@
             "minimum": 0
           }
         }
+      },
+      "Question": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Yes/no probability question. Answer is `noul` in \\[0, 1\\] (P(yes)).",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "criteria": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/NoulCriteria"
+                  }
+                ]
+              },
+              "instructions": {
+                "$ref": "#/components/schemas/NullableEntry"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "noul"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Closed-set selection. Answer is the highest-probability option plus the full distribution.",
+            "required": [
+              "criteria",
+              "type"
+            ],
+            "properties": {
+              "criteria": {
+                "type": "object",
+                "description": "Option id → description (`EntryType`, or JSON null).",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/EntryType"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "instructions": {
+                "$ref": "#/components/schemas/NullableEntry"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "choice"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Ordered rubric score. Answer is a probability-weighted value across levels.",
+            "required": [
+              "criteria",
+              "type"
+            ],
+            "properties": {
+              "criteria": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/NonNullEntry"
+                },
+                "description": "Two to ten non-null rubric levels: `TypeSafe` documents score criteria as\n\"at least two levels and takes up to 10\"\n(<https://docs.typesafe.ai/primitives/score>).",
+                "maxItems": 10,
+                "minItems": 2
+              },
+              "instructions": {
+                "$ref": "#/components/schemas/NullableEntry"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "score"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A typed question sent to a System One evaluation model.\n\n`instructions` uses [`NullableEntry`] so an explicit JSON `null` survives the round\ntrip to `TypeSafe` instead of collapsing into an omitted field."
       },
       "RankVersionType": {
         "type": "string",
@@ -11806,8 +12081,7 @@
           },
           "last-column-id": {
             "type": "integer",
-            "format": "int32",
-            "minimum": 0
+            "format": "int32"
           },
           "last-partition-id": {
             "type": "integer",
@@ -12658,6 +12932,23 @@
           "url": {
             "type": "string",
             "description": "The URL of the web resource."
+          }
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "description": "Token usage reported by the provider.",
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Defaulted: the provider may report one count without the other, and a partial\n`usage` block must not fail an otherwise successful evaluation.",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
@@ -21,7 +22,7 @@ use snafu::ResultExt;
 
 use std::{any::Any, pin::Pin, sync::Arc};
 
-use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
 use datafusion::datasource::TableProvider;
 use futures::Future;
 use runtime_tools::memory::MEMORY_TABLE_SCHEMA;
@@ -65,10 +66,11 @@ impl DataConnectorFactory for MemoryConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         _params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move { Ok(Arc::new(MemoryConnector::default()) as Arc<dyn DataConnector>) })
     }
 
@@ -89,7 +91,8 @@ impl DataConnector for MemoryConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let Some(schema) = Self::schema_from_path(path) else {
@@ -114,7 +117,8 @@ impl DataConnector for MemoryConnector {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let path = dataset.path();
         let Some(schema) = Self::schema_from_path(path) else {
@@ -138,4 +142,4 @@ impl DataConnector for MemoryConnector {
     }
 }
 
-register_data_connector!("memory", MemoryConnectorFactory);
+data_connector_api::register_data_connector!("memory", MemoryConnectorFactory);

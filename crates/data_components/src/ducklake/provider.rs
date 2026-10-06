@@ -22,14 +22,16 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
+use datafusion::common::TableReference;
 use datafusion::error::Result as DFResult;
-use datafusion::sql::TableReference;
+use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use globset::GlobSet;
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snafu::prelude::*;
 use tokio::sync::Mutex;
 
@@ -81,7 +83,7 @@ pub struct DuckLakeCatalogProvider {
     /// Whether DDL operations are allowed
     ddl_enabled: bool,
     /// Optional glob filter for table inclusion (`schema.table` format)
-    include: Option<Arc<GlobSet>>,
+    selector: TableSelector,
     /// Shared write lock to serialize concurrent writes across all schemas.
     /// All schemas share one `DuckDB` instance which enforces single-writer semantics;
     /// serializing here avoids wasting blocking threads that would just wait on `DuckDB`'s
@@ -97,6 +99,23 @@ impl std::fmt::Debug for DuckLakeCatalogProvider {
     }
 }
 
+/// The dialect a `DuckLake` catalog unparses with, and the functions federation
+/// may push down to it.
+///
+/// One value because they are one decision. What a deny-list may safely allow
+/// depends on what the dialect beside it can translate: a name the deny-list lets
+/// through is emitted by that dialect, verbatim if it has no handler for it. So a
+/// caller supplying one without the other has not made half the decision -- it has
+/// made a different one, and the result shows up as remote SQL rather than as a
+/// type error. Taking them together is what stops that.
+pub struct DuckLakeFederation {
+    /// The unparser dialect. Every name `function_support` allows through is
+    /// emitted by this dialect, so it has to be one that can spell them.
+    pub dialect: Arc<dyn Dialect + Send + Sync>,
+    /// Which functions may be pushed into the SQL sent to `DuckDB`.
+    pub function_support: FunctionSupport,
+}
+
 impl DuckLakeCatalogProvider {
     /// Creates a new `DuckLakeCatalogProvider` with the given `DuckDB` pool.
     ///
@@ -107,17 +126,28 @@ impl DuckLakeCatalogProvider {
     /// * `catalog_name` - The catalog name as attached in `DuckDB`
     /// * `writable` - Whether write operations (INSERT, UPDATE, DELETE) are allowed
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
-    /// * `include` - Optional glob filter for table inclusion (`schema.table` format)
+    /// * `selector` - Which discovered tables the catalog registers
+    /// * `federation` - How this catalog unparses and what it may push down.
+    ///   Required rather than defaulted: the factory's own defaults federate
+    ///   everything with no deny-list, so every Spice-only UDF (`json_get_str`
+    ///   and the rest of the JSON set, the embedding/distance UDFs, every
+    ///   user-registered function) is unparsed verbatim into the statement sent
+    ///   to `DuckDB`, where it does not exist. See issues #10703 and #13664.
     #[must_use]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
         catalog_name: String,
         writable: bool,
         ddl_enabled: bool,
-        include: Option<GlobSet>,
+        selector: TableSelector,
+        federation: DuckLakeFederation,
     ) -> Self {
         // Create a table factory that uses the same pool (with ducklake already attached)
-        let duckdb_factory = Arc::new(DuckDBTableFactory::new(Arc::clone(&pool)));
+        let duckdb_factory = Arc::new(
+            DuckDBTableFactory::new(Arc::clone(&pool))
+                .with_dialect(federation.dialect)
+                .with_function_support(federation.function_support),
+        );
         Self {
             pool,
             duckdb_factory,
@@ -125,7 +155,7 @@ impl DuckLakeCatalogProvider {
             schemas: RwLock::new(HashMap::new()),
             writable,
             ddl_enabled,
-            include: include.map(Arc::new),
+            selector,
             write_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -200,7 +230,7 @@ impl DuckLakeCatalogProvider {
                 schema_name.clone(),
                 self.writable,
                 self.ddl_enabled,
-                self.include.clone(),
+                self.selector.clone(),
                 Arc::clone(&self.write_lock),
             );
             schema_provider.refresh().await?;
@@ -288,7 +318,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                     schema_name,
                     ducklake_schema.writable,
                     ducklake_schema.ddl_enabled,
-                    ducklake_schema.include.clone(),
+                    ducklake_schema.selector.clone(),
                     Arc::clone(&ducklake_schema.write_lock),
                 ))
             } else {
@@ -299,7 +329,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                     schema_name,
                     self.writable,
                     self.ddl_enabled,
-                    self.include.clone(),
+                    self.selector.clone(),
                     Arc::clone(&self.write_lock),
                 ))
             };
@@ -414,7 +444,7 @@ pub struct DuckLakeSchemaProvider {
     /// Whether DDL operations are allowed
     ddl_enabled: bool,
     /// Optional glob filter for table inclusion (`schema.table` format)
-    include: Option<Arc<GlobSet>>,
+    selector: TableSelector,
     /// Shared write lock to serialize concurrent writes across all schemas.
     /// All schemas share one `DuckDB` instance which enforces single-writer semantics;
     /// serializing here avoids wasting blocking threads that would just wait on `DuckDB`'s
@@ -443,7 +473,7 @@ impl DuckLakeSchemaProvider {
     /// * `schema_name` - The schema name
     /// * `writable` - Whether write operations (INSERT, UPDATE, DELETE) are allowed
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
-    /// * `include` - Optional glob filter for table inclusion (`schema.table` format)
+    /// * `selector` - Which discovered tables the catalog registers
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
@@ -456,7 +486,7 @@ impl DuckLakeSchemaProvider {
         schema_name: String,
         writable: bool,
         ddl_enabled: bool,
-        include: Option<Arc<GlobSet>>,
+        selector: TableSelector,
         write_lock: Arc<Mutex<()>>,
     ) -> Self {
         Self {
@@ -467,7 +497,7 @@ impl DuckLakeSchemaProvider {
             tables: RwLock::new(HashMap::new()),
             writable,
             ddl_enabled,
-            include,
+            selector,
             write_lock,
         }
     }
@@ -523,11 +553,11 @@ impl DuckLakeSchemaProvider {
 
         let mut tables = HashMap::new();
         for table_name in table_names {
-            let schema_with_table = format!("{}.{}", self.schema_name, table_name);
-            if let Some(include) = &self.include
-                && !include.is_match(&schema_with_table)
-            {
-                tracing::debug!("Table {schema_with_table} is not included, skipping");
+            if !self.selector.selects_table(&self.schema_name, &table_name) {
+                tracing::debug!(
+                    "Table {}.{table_name} is not selected by the catalog's include/exclude patterns, skipping",
+                    self.schema_name
+                );
                 continue;
             }
 

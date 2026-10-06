@@ -30,14 +30,15 @@ use crate::datafusion::query::QueryTracker;
 use crate::datafusion::query::error_code::ErrorCode;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use ballista_core::JobId;
 use ballista_core::extension::BallistaConfigGrpcEndpoint;
 use ballista_core::serde::protobuf::job_status;
 use ballista_core::serde::scheduler::PartitionLocation;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use ballista_scheduler::scheduler_server::job_state_event::JobState as BallistaJobState;
 use cache::key::RawCacheKey;
+use datafusion::common::TableReference;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::sql::TableReference;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
@@ -142,6 +143,15 @@ enum QueryHandleState {
 pub struct QueryHandle {
     /// The Ballista scheduler job ID (or a synthetic ID for cached results).
     ballista_job_id: String,
+    /// Original SQL text (or `"<logical plan>"`) for the emitted
+    /// `EXPLAIN ANALYZE …` input label on plan-capture rows.
+    sql: Arc<str>,
+    /// Wall-clock start of this distributed submission, used for plan-capture
+    /// duration thresholds at finalize time.
+    query_start: std::time::Instant,
+    /// Set from the submitted [`LogicalPlan`] so finalize can skip capture for
+    /// `EXPLAIN` / `EXPLAIN ANALYZE` without re-inspecting SQL text.
+    plan_is_explain: bool,
     /// Internal state (running or cached).
     state: QueryHandleState,
     /// Result schema from the logical plan.
@@ -177,6 +187,17 @@ pub struct QueryHandle {
     /// Mutex + `Option::take` also gives us idempotent finalization: only
     /// the first call gets the span; later attempts see `None` and skip.
     task_history_span: Arc<Mutex<Option<Span>>>,
+    /// Span carrying this job's trace id onto every log record it produces.
+    ///
+    /// Resolved **once**, at submission, and held here for the handle's whole
+    /// life. Re-resolving it later would mint a *different* id whenever the
+    /// caller pinned none and task history is off — `resolve_trace_id` has no
+    /// span trace id to borrow in that case and generates a fresh one — so
+    /// submission and completion would be logged under ids that never meet.
+    ///
+    /// A plain field, unlike `task_history_span`: this is not an `OTel` span,
+    /// so surviving clones delay nothing and skew no duration.
+    trace_span: Span,
 }
 
 impl std::fmt::Debug for QueryHandle {
@@ -209,9 +230,16 @@ impl QueryHandle {
         tracker: Option<QueryTracker>,
         request_context: Arc<RequestContext>,
         task_history_span: Span,
+        trace_span: Span,
+        sql: Arc<str>,
+        query_start: std::time::Instant,
+        plan_is_explain: bool,
     ) -> Self {
         Self {
             ballista_job_id,
+            sql,
+            query_start,
+            plan_is_explain,
             state: QueryHandleState::Running { scheduler },
             schema,
             datasets: Some(datasets),
@@ -221,6 +249,7 @@ impl QueryHandle {
             tracker: Arc::new(Mutex::new(tracker)),
             request_context,
             task_history_span: Arc::new(Mutex::new(Some(task_history_span))),
+            trace_span,
         }
     }
 
@@ -229,6 +258,7 @@ impl QueryHandle {
     /// This is used when the query results are retrieved from the cache
     /// and no Ballista job needs to be executed.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new_with_cached_result(
         job_id: String,
         schema: SchemaRef,
@@ -236,9 +266,14 @@ impl QueryHandle {
         cache_key: Option<RawCacheKey>,
         cached_stream: SendableRecordBatchStream,
         request_context: Arc<RequestContext>,
+        trace_span: Span,
+        sql: Arc<str>,
     ) -> Self {
         Self {
             ballista_job_id: job_id,
+            sql,
+            query_start: std::time::Instant::now(),
+            plan_is_explain: false,
             state: QueryHandleState::Cached {
                 cached_stream: Arc::new(Mutex::new(Some(cached_stream))),
             },
@@ -250,6 +285,7 @@ impl QueryHandle {
             tracker: Arc::new(Mutex::new(None)),
             request_context,
             task_history_span: Arc::new(Mutex::new(None)),
+            trace_span,
         }
     }
 
@@ -283,6 +319,11 @@ impl QueryHandle {
         self.cancel_token.clone()
     }
 
+    /// Ballista job id as the typed [`JobId`] expected by scheduler APIs.
+    fn ballista_job_id_typed(&self) -> JobId {
+        JobId::from(self.ballista_job_id.as_str())
+    }
+
     /// Polls the current status of the job.
     ///
     /// Returns the job status or an error if the status cannot be retrieved.
@@ -296,7 +337,7 @@ impl QueryHandle {
         let status = scheduler
             .state
             .task_manager
-            .get_job_status(&self.ballista_job_id)
+            .get_job_status(&self.ballista_job_id_typed())
             .await
             .map_err(|e| QueryHandleError::StatusError {
                 message: e.to_string(),
@@ -333,7 +374,7 @@ impl QueryHandle {
 
         if let QueryHandleState::Running { scheduler } = &self.state {
             scheduler
-                .cancel_job(self.ballista_job_id.clone())
+                .cancel_job(JobId::from(self.ballista_job_id.as_str()))
                 .await
                 .map_err(|e| QueryHandleError::StatusError {
                     message: format!("Failed to cancel job: {e}"),
@@ -388,7 +429,7 @@ impl QueryHandle {
                     match event_result {
                         Ok(event) => {
                             // Only process events for our job
-                            if event.job_id != self.ballista_job_id {
+                            if event.job_id.as_str() != self.ballista_job_id {
                                 continue;
                             }
 
@@ -440,7 +481,7 @@ impl QueryHandle {
                 }
                 // Check for cancellation
                 () = cancel.cancelled() => {
-                    let _ = scheduler.cancel_job(self.ballista_job_id.clone()).await;
+                    let _ = scheduler.cancel_job(JobId::from(self.ballista_job_id.as_str())).await;
                     let err = QueryHandleError::JobCancelled;
                     self.finish_tracker_with_error(&err);
                     return Err(err);
@@ -460,7 +501,7 @@ impl QueryHandle {
         let status = scheduler
             .state
             .task_manager
-            .get_job_status(&self.ballista_job_id)
+            .get_job_status(&self.ballista_job_id_typed())
             .await
             .map_err(|e| {
                 let err = QueryHandleError::StatusError {
@@ -504,7 +545,7 @@ impl QueryHandle {
             let status = scheduler
                 .state
                 .task_manager
-                .get_job_status(&self.ballista_job_id)
+                .get_job_status(&self.ballista_job_id_typed())
                 .await
                 .map_err(|e| {
                     let err = QueryHandleError::StatusError {
@@ -667,7 +708,23 @@ impl QueryHandle {
             return;
         };
 
+        // Submission's span, not a freshly resolved one: re-resolving would
+        // mint a new id for an unpinned job with task history off, and the
+        // failure recorded below would name an id nothing else does.
+        let trace_span = self.trace_span.clone();
+
         let request_context = Arc::clone(&self.request_context);
+
+        // The two paths below that finalize without walking the execution graph
+        // (a cached job, and a `Drop` off any tokio runtime) record the row the
+        // same way: inside both spans, so the record names its trace id.
+        let finalize_now = |tracker: QueryTracker, error: Option<(String, ErrorCode)>| {
+            let _trace = trace_span.enter();
+            parent_span.in_scope(|| match error {
+                Some((msg, code)) => tracker.finish_with_error(&request_context, msg, code),
+                None => tracker.finish(&request_context, ""),
+            });
+        };
         let scheduler = match &self.state {
             QueryHandleState::Running { scheduler } => Some(Arc::clone(scheduler)),
             QueryHandleState::Cached { .. } => None,
@@ -678,23 +735,21 @@ impl QueryHandle {
             // Cached path — nothing to walk. Synchronous finalize is fine
             // because there's no async fetch to do. The span drops at
             // end-of-scope here, closing the OTel span immediately.
-            parent_span.in_scope(|| match error {
-                Some((msg, code)) => tracker.finish_with_error(&request_context, msg, code),
-                None => tracker.finish(&request_context, &Arc::from("")),
-            });
+            finalize_now(tracker, error);
             return;
         };
 
         let job_id = self.ballista_job_id.clone();
+        let sql = Arc::clone(&self.sql);
+        let query_start = self.query_start;
+        let plan_is_explain = self.plan_is_explain;
+        let df = Arc::clone(&self.df);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // No tokio runtime here (likely Drop on a non-runtime
             // thread). Finalize the parent without stage detail or
             // job cancellation rather than `block_on`'ing into a
             // private API.
-            parent_span.in_scope(|| match error {
-                Some((msg, code)) => tracker.finish_with_error(&request_context, msg, code),
-                None => tracker.finish(&request_context, &Arc::from("")),
-            });
+            finalize_now(tracker, error);
             return;
         };
 
@@ -727,7 +782,7 @@ impl QueryHandle {
                     let already_terminal = match scheduler_for_cancel
                         .state
                         .task_manager
-                        .get_job_status(&cancel_job_id)
+                        .get_job_status(&JobId::from(cancel_job_id.as_str()))
                         .await
                     {
                         Ok(Some(job_status)) => match job_status.status {
@@ -752,7 +807,7 @@ impl QueryHandle {
                         // so a concurrent path (e.g. `wait_for_complete`
                         // reacting to `cancel_token`) cancelling first is OK.
                         if let Err(e) =
-                            scheduler_for_cancel.cancel_job(cancel_job_id.clone()).await
+                            scheduler_for_cancel.cancel_job(JobId::from(cancel_job_id.as_str())).await
                         {
                             tracing::warn!(
                                 target: "task_history",
@@ -764,7 +819,7 @@ impl QueryHandle {
                 let graph = scheduler
                     .state
                     .task_manager
-                    .get_job_execution_graph(&job_id)
+                    .get_job_execution_graph(&JobId::from(job_id.as_str()))
                     .await
                     .ok()
                     .flatten();
@@ -774,15 +829,40 @@ impl QueryHandle {
                         &ballista_job_id,
                         graph.as_ref(),
                     );
+
+                    // Emit plan capture from the real distributed graph
+                    // (including failed jobs with partial metrics) whenever
+                    // ExplainAnalyze is configured and thresholds pass.
+                    // `plan_is_explain` was decided from the LogicalPlan at
+                    // submit time — no SQL re-scan on the finalize path.
+                    let elapsed_ms = query_start.elapsed().as_secs_f64() * 1000.0;
+                    if !plan_is_explain
+                        && let Some(cfg) = df.plan_capture_config()
+                        && cfg.analyze_enabled()
+                        && crate::datafusion::query::plan_capture::plan_capture_eligible(
+                            elapsed_ms, cfg,
+                        )
+                    {
+                        let output = crate::datafusion::query::plan_capture::render_distributed_plan_with_metrics(
+                            graph.as_ref(),
+                        );
+                        span_for_record.in_scope(|| {
+                            crate::datafusion::query::plan_capture::emit_plan_span(
+                                sql.as_ref(),
+                                &output,
+                            );
+                        });
+                    }
                 }
                 match final_error {
                     Some((msg, code)) => {
                         tracker.finish_with_error(&request_context, msg, code);
                     }
-                    None => tracker.finish(&request_context, &Arc::from("")),
+                    None => tracker.finish(&request_context, ""),
                 }
             }
-            .instrument(parent_span),
+            .instrument(parent_span)
+            .instrument(trace_span),
         );
     }
 
@@ -795,27 +875,37 @@ impl QueryHandle {
     /// as they are streamed.
     ///
     /// For cached results, returns the cached stream directly.
+    ///
+    /// Both the wait for completion and the returned stream run inside the
+    /// job's trace span: a distributed query fails while waiting for the
+    /// scheduler, while connecting to an executor, and mid-drain just as
+    /// readily as it fails at submission, and each of those records has to name
+    /// the same id as the submission's.
     pub async fn into_stream(&self) -> Result<SendableRecordBatchStream> {
-        match &self.state {
+        let stream = match &self.state {
             QueryHandleState::Cached { cached_stream } => {
                 // Return the cached stream directly
-                let stream =
-                    cached_stream
-                        .lock()
-                        .take()
-                        .ok_or_else(|| QueryHandleError::JobFailed {
-                            message: "Cached stream already consumed".to_string(),
-                        })?;
-                Ok(stream)
+                cached_stream
+                    .lock()
+                    .take()
+                    .ok_or_else(|| QueryHandleError::JobFailed {
+                        message: "Cached stream already consumed".to_string(),
+                    })?
             }
             QueryHandleState::Running { scheduler } => {
                 // Wait for job completion and fetch results
                 let locations = self
                     .wait_for_complete(scheduler, &self.cancel_token)
+                    .instrument(self.trace_span.clone())
                     .await?;
-                Ok(self.fetch_results_stream(locations))
+                self.fetch_results_stream(locations)
             }
-        }
+        };
+
+        Ok(crate::datafusion::query::instrument_record_batch_stream(
+            stream,
+            self.trace_span.clone(),
+        ))
     }
 
     /// Creates a stream that lazily fetches results from the partition locations.
@@ -850,6 +940,8 @@ impl QueryHandle {
                 Box::pin(stream),
                 cache_key,
                 Arc::clone(datasets),
+                self.query_start,
+                None,
             )
         } else {
             Box::pin(stream)
@@ -957,6 +1049,10 @@ impl PartitionResultStream {
                 MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE,
                 use_tls,
                 customize_endpoint,
+                3,          // io_retries_times
+                3000,       // io_retry_wait_time_ms
+                67_108_864, // initial_connection_window_size (64 MiB)
+                16_777_216, // initial_stream_window_size (16 MiB)
             )
             .await
             .map_err(|e| {
@@ -970,7 +1066,7 @@ impl PartitionResultStream {
             })?;
 
             let stream = client
-                .fetch_partition(
+                .fetch_partition_at_path(
                     &executor_meta.id,
                     &location.partition_id,
                     &location.path,

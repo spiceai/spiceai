@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,20 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use util::concat_arrays;
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN};
-use crate::parameters::ParameterSpec;
-
-pub const PARAMETERS: &[ParameterSpec] =
-    &concat_arrays::<
-        ParameterSpec,
-        GOOGLE_PARAM_LEN,
-        PARAM_WITH_DEPRE_LEN,
-        { GOOGLE_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
-    >(GOOGLE_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
-
-const GOOGLE_PARAM_LEN: usize = 1;
-
-pub(crate) const GOOGLE_PARAMETERS: [ParameterSpec; GOOGLE_PARAM_LEN] =
-    [ParameterSpec::component("api_key").description("The Google Generative AI API key.")];
+/// Parameters for `from: google` chat models. Authenticates via Vertex AI (GCP
+/// project/region-scoped, service-account auth).
+#[derive(TypedParams)]
+#[params(
+    prefix = "google",
+    passthrough = crate::model::params::common::PREFIXED_COMMON,
+    emit_specs
+)]
+pub struct GoogleModelParams {
+    /// The GCP project ID.
+    pub project: Option<String>,
+    /// The GCP region, e.g. `us-central1`, or `global`.
+    pub location: Option<String>,
+    /// Path to a GCP service account JSON key file. One of `google_service_account_path`,
+    /// `google_service_account_key`, or `google_application_default_credentials` is required.
+    pub service_account_path: Option<String>,
+    /// GCP service account JSON key as a string.
+    #[param(autoload_secret)]
+    pub service_account_key: Option<SecretString>,
+    /// Use Google Application Default Credentials for authentication. If the
+    /// `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set, uses that path.
+    pub application_default_credentials: Option<bool>,
+}

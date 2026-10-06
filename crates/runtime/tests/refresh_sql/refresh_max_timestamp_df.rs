@@ -24,7 +24,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_expr::CreateExternalTable;
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
 use runtime::Runtime;
-use runtime::accelerated_table::refresh_task::{accelerator_table_provider, max_timestamp_df};
+use runtime::accelerated::refresh_task::{accelerator_table_provider, max_timestamp_df};
 use runtime::component::dataset::acceleration::Engine;
 use runtime::datafusion::builder::AnalyzerRulesBuilder;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
@@ -80,7 +80,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
             let cmd = CreateExternalTable {
                 schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema))?,
                 name: TableReference::bare("test_table"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -98,9 +98,11 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 .await
                 .expect("Failed to create external table");
 
-            accelerated_table
-                .downcast_ref::<PolyTableProvider>()
-                .expect("Expected PolyTableProvider");
+            spice_table::find_layer::<PolyTableProvider>(
+                accelerated_table.as_ref(),
+                spice_table::LayerWalk::Write,
+            )
+            .expect("Expected PolyTableProvider");
 
             let mut state = SessionStateBuilder::new()
                 .with_runtime_env(default_runtime_env(Handle::current()))
@@ -130,10 +132,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 &df.clone().explain(false, false)?.collect().await?,
             )?;
 
-            insta::assert_snapshot!(
-                format!("refresh_max_timestamp_df_explain_plan"),
-                explain_plan
-            );
+            insta::assert_snapshot!("refresh_max_timestamp_df_explain_plan", explain_plan);
 
             Ok(())
         })
@@ -177,7 +176,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
             let cmd = CreateExternalTable {
                 schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema))?,
                 name: TableReference::bare("test_table"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -195,9 +194,11 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 .await
                 .expect("Failed to create external table");
 
-            accelerated_table
-                .downcast_ref::<PolyTableProvider>()
-                .expect("Expected PolyTableProvider");
+            spice_table::find_layer::<PolyTableProvider>(
+                accelerated_table.as_ref(),
+                spice_table::LayerWalk::Write,
+            )
+            .expect("Expected PolyTableProvider");
 
             let table_provider = accelerator_table_provider(&accelerated_table);
 

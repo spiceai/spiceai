@@ -22,6 +22,7 @@ use crate::error::{
     NoModelsConfiguredSnafu, Result,
 };
 use crate::output::{OutputFormat, write_json};
+use crate::sse::{SseDecoder, SseEvent};
 use clap::Args;
 use futures::StreamExt;
 use repl::util::{Spinner, create_editor_with_history, save_history};
@@ -128,10 +129,54 @@ struct ChatChunk {
     usage: Option<Usage>,
 }
 
+/// The payload of an error the server reports mid-stream.
+///
+/// The runtime sends its own as an `error`-named event carrying `{"type":…,"message":…}`;
+/// an OpenAI-compatible server nests the same information under `error`. Either way the
+/// stream is over, and whatever has been printed is a partial answer rather than a whole one.
+#[derive(Deserialize)]
+struct StreamErrorPayload {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    error: Option<NestedStreamError>,
+}
+
+#[derive(Deserialize)]
+struct NestedStreamError {
+    #[serde(default)]
+    message: Option<String>,
+}
+
+impl StreamErrorPayload {
+    /// The reason `data` gives for the stream failing, if it reads as a failure and gives one.
+    fn reason_in(data: &str) -> Option<String> {
+        let payload = serde_json::from_str::<Self>(data).ok()?;
+        let message = payload
+            .message
+            .as_deref()
+            .or_else(|| payload.error.as_ref()?.message.as_deref())?;
+
+        Some(message.to_string())
+    }
+}
+
 /// A choice in a chat chunk.
 #[derive(Deserialize)]
 struct ChunkChoice {
-    delta: Delta,
+    /// Absent on a choice that carries no content. Azure `OpenAI`'s asynchronous content
+    /// filtering emits annotation choices holding only `content_filter_results`, and those
+    /// arrive on a passing stream too -- so a choice without a delta is an ordinary event
+    /// with nothing to print, not an unreadable one.
+    #[serde(default)]
+    delta: Option<Delta>,
+    /// Why the model stopped producing this choice, on the last chunk that carries it.
+    ///
+    /// Intermediate chunks send `null` here, which reads as `None`: the answer is still being
+    /// produced and nothing has ended it. A value means the generation is over, and only
+    /// `stop` means it is over because the model had said everything it meant to.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Delta content in a streaming response.
@@ -142,7 +187,7 @@ struct Delta {
 }
 
 /// Token usage statistics.
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 #[expect(clippy::struct_field_names)]
 struct Usage {
@@ -152,11 +197,14 @@ struct Usage {
 }
 
 /// Chat response with timing and usage statistics.
+#[derive(Debug)]
 struct ChatResponse {
     content: String,
     total_duration: std::time::Duration,
     first_token_duration: Option<std::time::Duration>,
     usage: Option<Usage>,
+    /// The reason the last chunk gave for the generation ending, when it gave one.
+    finish_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -166,6 +214,9 @@ struct ChatJsonResponse<'a> {
     duration_ms: u128,
     first_token_ms: Option<u128>,
     usage: Option<&'a Usage>,
+    /// Present so a consumer reading `content` can tell a whole answer from a truncated one
+    /// without parsing the notice written to stderr.
+    finish_reason: Option<&'a str>,
 }
 
 impl<'a> ChatJsonResponse<'a> {
@@ -178,11 +229,53 @@ impl<'a> ChatJsonResponse<'a> {
                 .first_token_duration
                 .map(|duration| duration.as_millis()),
             usage: response.usage.as_ref(),
+            finish_reason: response.finish_reason.as_deref(),
         }
     }
 }
 
+/// The longest `finish_reason` repeated back to the user. The reasons the API defines are far
+/// shorter; this only bounds what an arbitrary endpoint can put on the terminal.
+const LONGEST_REPORTED_FINISH_REASON: usize = 40;
+
 impl ChatResponse {
+    /// How the answer ended, when it did not end whole.
+    ///
+    /// `stop` is the only reason meaning the model said everything it meant to, and an absent
+    /// reason means the same: a server that never reports one is not reporting an early stop.
+    /// Every other reason ended the generation before the answer was finished. The tokens
+    /// already printed are genuine, so this is something to tell the user about the answer
+    /// rather than a failure to raise -- nothing else on screen distinguishes a fragment from
+    /// a complete reply.
+    fn incomplete_notice(&self) -> Option<String> {
+        let reason = self.finish_reason.as_deref()?;
+
+        let detail = match reason {
+            "stop" => return None,
+            "length" => "it reached the maximum number of tokens it was allowed to produce",
+            "content_filter" => "a content filter stopped it",
+            "tool_calls" | "function_call" => {
+                "it asked to call a tool, which `spice chat` does not run"
+            }
+            _ => "the reason is not one this version recognises",
+        };
+
+        // The reason is one of a closed set of tokens, so a value outside that shape is
+        // described rather than repeated: an endpoint can put anything in the field,
+        // terminal escapes included, and this line goes straight to the user's terminal.
+        let is_token = !reason.is_empty()
+            && reason.len() <= LONGEST_REPORTED_FINISH_REASON
+            && reason
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+
+        Some(if is_token {
+            format!("The model stopped early ({reason}): {detail}. The answer above is incomplete.")
+        } else {
+            format!("The model stopped early: {detail}. The answer above is incomplete.")
+        })
+    }
+
     /// Format the stats output like the Go CLI:
     /// `Time: 3.36s (first token 0.45s). Tokens: 1652. Prompt: 1475. Completion: 177 (292.25/s).`
     fn format_stats(&self) -> String {
@@ -374,6 +467,11 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
         } else {
             println!();
         }
+        // On stderr so it reaches a user reading the terminal without joining the answer a
+        // caller is capturing on stdout.
+        if let Some(notice) = response.incomplete_notice() {
+            eprintln!("{notice}");
+        }
         return Ok(());
     }
 
@@ -463,6 +561,9 @@ async fn run_repl(ctx: &RuntimeContext, config: &ChatConfig<'_>) -> Result<()> {
             Ok(response) => {
                 // Print stats first before consuming content
                 println!("\n\n{}\n", response.format_stats());
+                if let Some(notice) = response.incomplete_notice() {
+                    eprintln!("{notice}");
+                }
                 // Add assistant response to history
                 if !response.content.is_empty() {
                     messages.push(Message {
@@ -507,8 +608,10 @@ async fn send_chat_streaming(
         }),
     };
 
+    // The streamed answer's duration is the model's, not the network's, so this must not
+    // go out under the control-plane client's whole-request deadline.
     let mut request = ctx
-        .http_client()
+        .inference_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
@@ -551,13 +654,48 @@ async fn send_chat_streaming(
     }
 
     // Stream the response
-    let mut full_response = String::new();
     let mut stream = response.bytes_stream();
-    let mut spinner = spinner;
-    let mut first_token_time: Option<std::time::Duration> = None;
-    let mut usage: Option<Usage> = None;
+    let mut state = StreamState {
+        response: String::new(),
+        usage: None,
+        first_token: None,
+        spinner,
+        finish_reason: None,
+    };
 
-    while let Some(chunk_result) = stream.next().await {
+    // An event can straddle two reads, so the bytes are reassembled into events before
+    // anything is read out of them; a reader that took each read as whole lines would drop
+    // whichever events happened to be split, without saying so.
+    let mut decoder = SseDecoder::new();
+
+    // The client's read deadline counts bytes, and the runtime keeps this stream alive with an
+    // SSE comment every 30 seconds, so it can never fire here however long the model has been
+    // stuck. What has to be bounded is the gap between *events*: a keep-alive says the
+    // connection is up, not that anything is being produced.
+    let progress_deadline = ctx.inference_deadline().duration();
+    let mut last_event = Instant::now();
+
+    'stream: loop {
+        let remaining = progress_deadline.saturating_sub(last_event.elapsed());
+        let Ok(next) = tokio::time::timeout(remaining, stream.next()).await else {
+            state.stop_spinner().await;
+            return Err(InvalidResponseSnafu {
+                message: format!(
+                    "The model at {url} sent nothing for {}s. The connection is still open, so the request is being held rather than refused -- check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models",
+                    progress_deadline.as_secs()
+                ),
+            }
+            .build());
+        };
+        let Some(chunk_result) = next else {
+            // The stream ended. A server that closed without its final blank line still has
+            // one event's worth of bytes buffered here, and dropping it would lose the tail
+            // of the answer.
+            decoder.close();
+            drain_events(&mut decoder, &url, emit_tokens, start_time, &mut state).await?;
+            break 'stream;
+        };
+
         let chunk = chunk_result.map_err(|e| {
             InvalidResponseSnafu {
                 message: format!("Failed to read stream: {e}"),
@@ -565,61 +703,728 @@ async fn send_chat_streaming(
             .build()
         })?;
 
-        let text = String::from_utf8_lossy(&chunk);
+        let data_before = decoder.data_fields_seen();
+        decoder.push(&chunk);
 
-        // Parse SSE events
-        for line in text.lines() {
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    continue;
-                }
+        if drain_events(&mut decoder, &url, emit_tokens, start_time, &mut state).await?
+            == EventOutcome::Stop
+        {
+            break 'stream;
+        }
 
-                // Parse the JSON chunk
-                if let Ok(chat_chunk) = serde_json::from_str::<ChatChunk>(data) {
-                    // Capture usage from the final chunk (if present)
-                    if chat_chunk.usage.is_some() {
-                        usage = chat_chunk.usage;
-                    }
+        // Progress is a `data` line arriving, not an event completing: a large event spread
+        // over several reads is the model producing, even before its terminator lands. A
+        // keep-alive comment carries no data field, so it still cannot hold the stream open.
+        if decoder.data_fields_seen() != data_before {
+            last_event = Instant::now();
+        }
 
-                    for choice in &chat_chunk.choices {
-                        if let Some(content) = &choice.delta.content {
-                            // Record first token time and stop spinner
-                            if first_token_time.is_none() {
-                                first_token_time = Some(start_time.elapsed());
-                                if let Some(s) = spinner.take() {
-                                    s.stop().await;
-                                }
-                            }
-                            if emit_tokens {
-                                print!("{content}");
-                                let _ = io::stdout().flush();
-                            }
-                            full_response.push_str(content);
-                        }
-                    }
-                }
+        // Asked after draining, so the cap bounds one event the stream never ends rather
+        // than however many whole events happened to arrive in a single read.
+        if let Some(buffered) = decoder.oversized_bytes() {
+            state.stop_spinner().await;
+            return Err(InvalidResponseSnafu {
+                message: format!(
+                    "The model at {url} sent {buffered} bytes of a single response event without ending it. Check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models"
+                ),
             }
+            .build());
         }
     }
 
-    // Ensure spinner is stopped
-    if let Some(s) = spinner {
-        s.stop().await;
-    }
-
-    let total_duration = start_time.elapsed();
+    state.stop_spinner().await;
 
     Ok(ChatResponse {
-        content: full_response,
-        total_duration,
-        first_token_duration: first_token_time,
-        usage,
+        content: state.response,
+        total_duration: start_time.elapsed(),
+        first_token_duration: state.first_token,
+        usage: state.usage,
+        finish_reason: state.finish_reason,
     })
+}
+
+/// Read every event the decoder has ready, stopping early if one ends the stream.
+async fn drain_events(
+    decoder: &mut SseDecoder,
+    url: &str,
+    emit_tokens: bool,
+    start_time: Instant,
+    state: &mut StreamState,
+) -> Result<EventOutcome> {
+    while let Some(event) = decoder.next_event() {
+        if apply_event(&event, url, emit_tokens, start_time, state).await? == EventOutcome::Stop {
+            return Ok(EventOutcome::Stop);
+        }
+    }
+
+    Ok(EventOutcome::Continue)
+}
+
+/// What the stream should do once an event has been read.
+#[derive(PartialEq, Eq)]
+enum EventOutcome {
+    /// Keep reading.
+    Continue,
+    /// The stream is over: the server said so.
+    Stop,
+}
+
+/// The answer as it accumulates across the stream's events.
+struct StreamState {
+    response: String,
+    usage: Option<Usage>,
+    first_token: Option<std::time::Duration>,
+    spinner: Option<Spinner>,
+    /// The last reason a choice gave for ending, which is the one that describes the answer
+    /// as it stands when the stream is over.
+    finish_reason: Option<String>,
+}
+
+impl StreamState {
+    async fn stop_spinner(&mut self) {
+        if let Some(spinner) = self.spinner.take() {
+            spinner.stop().await;
+        }
+    }
+}
+
+/// Read one SSE event into the answer.
+///
+/// Every event the server sends is either content, the protocol's terminator, or a report
+/// that the stream has failed. An event that is none of those cannot be read as content, and
+/// discarding it would leave the user a truncated answer presented as a whole one — so it is
+/// an error, not a skip.
+async fn apply_event(
+    event: &SseEvent,
+    url: &str,
+    emit_tokens: bool,
+    start_time: Instant,
+    state: &mut StreamState,
+) -> Result<EventOutcome> {
+    // The runtime reports a mid-stream failure as an `error` event. Read as content it
+    // parses as nothing, which is how it used to disappear.
+    if event.name.as_deref() == Some("error") {
+        state.stop_spinner().await;
+        let detail = StreamErrorPayload::reason_in(&event.data)
+            .unwrap_or_else(|| "the server did not say why".to_string());
+
+        return Err(InvalidResponseSnafu {
+            message: format!(
+                "The model at {url} failed part-way through its answer: {detail}. Any answer printed above is incomplete. Check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models"
+            ),
+        }
+        .build());
+    }
+
+    // An event with no payload — a bare `event:` line, or a keep-alive a proxy reframed —
+    // carries no content and no failure. It is progress, not something to read.
+    if event.data.is_empty() {
+        return Ok(EventOutcome::Continue);
+    }
+
+    if event.data == "[DONE]" {
+        // The protocol's terminator. Reading on would wait for an EOF the server is under no
+        // obligation to send promptly.
+        return Ok(EventOutcome::Stop);
+    }
+
+    let Ok(chunk) = serde_json::from_str::<ChatChunk>(&event.data) else {
+        state.stop_spinner().await;
+
+        // An OpenAI-compatible server reports a failure in an unnamed event instead, so the
+        // payload gets one more reading before this is called unintelligible.
+        let detail = StreamErrorPayload::reason_in(&event.data).map_or_else(
+            || "the response could not be read".to_string(),
+            |message| format!("the model reported: {message}"),
+        );
+
+        return Err(InvalidResponseSnafu {
+            message: format!(
+                "The model at {url} sent a response event that is not a chat completion -- {detail}. Any answer printed above is incomplete. Check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models"
+            ),
+        }
+        .build());
+    };
+
+    // Capture usage from the final chunk (if present)
+    if chunk.usage.is_some() {
+        state.usage = chunk.usage;
+    }
+
+    for choice in &chunk.choices {
+        // Recorded from whichever chunk carries one. A choice that ends the generation
+        // usually carries no delta alongside it, so this cannot hang off the content branch.
+        if let Some(reason) = &choice.finish_reason {
+            state.finish_reason = Some(reason.clone());
+        }
+
+        if let Some(content) = choice
+            .delta
+            .as_ref()
+            .and_then(|delta| delta.content.as_ref())
+        {
+            // Record first token time and stop spinner
+            if state.first_token.is_none() {
+                state.first_token = Some(start_time.elapsed());
+                state.stop_spinner().await;
+            }
+            if emit_tokens {
+                print!("{content}");
+                let _ = io::stdout().flush();
+            }
+            state.response.push_str(content);
+        }
+    }
+
+    Ok(EventOutcome::Continue)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::Deadline;
+    use crate::test_support::SlowServer;
+    use std::time::Duration;
+
+    /// The one-shot prompt every streaming test sends. The content is irrelevant to all of
+    /// them — what is under test is how the response is read.
+    fn one_shot_prompt() -> Vec<Message> {
+        vec![Message {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }]
+    }
+
+    /// A config that leaves the endpoint to the context, so a test's `SlowServer` is what the
+    /// request reaches.
+    const fn test_chat_config() -> ChatConfig<'static> {
+        ChatConfig {
+            model: "test-model",
+            temperature: None,
+            endpoint: None,
+            custom_headers: &[],
+        }
+    }
+
+    /// One SSE event carrying `text` as a content delta — the shape of every chunk a chat
+    /// completion stream sends.
+    fn content_event(text: &str) -> String {
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n")
+    }
+
+    /// One SSE event carrying `payload` verbatim, for the events that are not content.
+    fn raw_event(payload: &str) -> String {
+        format!("data: {payload}\n\n")
+    }
+
+    /// The final event of a generation, carrying why it ended and no content -- the shape a
+    /// server sends once it has stopped producing. `reason` is escaped as JSON rather than
+    /// interpolated, so a test can send one containing characters JSON has to encode.
+    fn finish_event(reason: &str) -> String {
+        let reason = serde_json::to_string(reason).expect("a string always serialises");
+        format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":{reason}}}]}}\n\n"
+        )
+    }
+
+    /// A context whose deadlines are generous enough that only the response itself ends the
+    /// read — most of these tests are about what is read, not about when reading stops.
+    fn unhurried_context(url: &str) -> RuntimeContext {
+        RuntimeContext::with_deadlines_for_test(
+            url,
+            Deadline::Total(Duration::from_secs(30)),
+            Deadline::Silence(Duration::from_secs(30)),
+        )
+    }
+
+    async fn stream_from(server: &SlowServer) -> Result<ChatResponse> {
+        let ctx = unhurried_context(server.url());
+        send_chat_streaming(&ctx, &test_chat_config(), &one_shot_prompt(), false, false).await
+    }
+
+    /// A streamed answer that keeps arriving must not be cut off for taking longer than the
+    /// control-plane deadline — the failure reported in
+    /// <https://github.com/spiceai/spiceai/issues/12583>.
+    ///
+    /// Both deadlines are shrunk from their production values so the difference between them
+    /// is observable in under a second; the production gap is 30 seconds.
+    #[tokio::test]
+    async fn a_streamed_answer_outlives_the_control_plane_deadline() {
+        let control_plane = Duration::from_millis(400);
+        let server = SlowServer::dribbling(
+            std::iter::repeat_n(content_event("token "), 8).collect(),
+            control_plane / 4,
+        );
+
+        let ctx = RuntimeContext::with_deadlines_for_test(
+            server.url(),
+            Deadline::Total(control_plane),
+            Deadline::Silence(control_plane),
+        );
+
+        // Positive control: the same response, over the control-plane client, is the bug.
+        // Without it a green test could mean the server simply answered quickly.
+        let cut_off = ctx
+            .http_client()
+            .get(server.url())
+            .send()
+            .await
+            .expect("the response head arrives promptly")
+            .text()
+            .await
+            .expect_err("the control-plane deadline should cut this response off");
+        assert!(
+            cut_off.is_timeout(),
+            "expected the control-plane client to time out, got: {cut_off}"
+        );
+
+        let config = test_chat_config();
+        let messages = one_shot_prompt();
+
+        let response = send_chat_streaming(&ctx, &config, &messages, false, false)
+            .await
+            .expect("a streamed answer that keeps arriving should be read to the end");
+
+        assert_eq!(response.content, "token ".repeat(8));
+        assert!(
+            response.total_duration > control_plane,
+            "the answer should have outlasted the control-plane deadline, took {:?}",
+            response.total_duration
+        );
+        // The server answers every path alike, so without this the test would pass against any
+        // route and would pin only the client, not the endpoint.
+        assert!(
+            server
+                .targets()
+                .iter()
+                .any(|target| target == "/v1/chat/completions"),
+            "expected a request to /v1/chat/completions, saw {:?}",
+            server.targets()
+        );
+    }
+
+    /// `data: [DONE]` is the protocol's terminator, so the answer is complete when it arrives.
+    /// Reading on for an EOF the server is under no obligation to send promptly leaves the CLI
+    /// looking hung after it already has the whole answer.
+    #[tokio::test]
+    async fn a_completed_answer_does_not_wait_for_the_server_to_hang_up() {
+        let mut chunks: Vec<String> = std::iter::repeat_n(content_event("token "), 3).collect();
+        chunks.push(raw_event("[DONE]"));
+
+        // The connection stays open after `[DONE]`, so only the terminator can end the read.
+        let server = SlowServer::dribbling_then_holding(chunks, Duration::from_millis(20));
+
+        let ctx = unhurried_context(server.url());
+        let config = test_chat_config();
+        let messages = one_shot_prompt();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_chat_streaming(&ctx, &config, &messages, false, false),
+        )
+        .await;
+
+        let Ok(result) = outcome else {
+            panic!("the CLI kept reading after [DONE] instead of returning the finished answer");
+        };
+        let response = result.expect("the answer arrived in full before the terminator");
+        assert_eq!(response.content, "token ".repeat(3));
+    }
+
+    /// The runtime keeps an SSE stream alive with a comment every 30 seconds
+    /// (`KEEP_ALIVE_INTERVAL` in `crates/runtime/src/http/v1/chat.rs`), and each one resets the
+    /// client's read deadline. So a model that stops producing but never closes would hold the
+    /// CLI open forever if the only bound counted bytes; the bound has to count events.
+    #[tokio::test]
+    async fn a_stream_that_only_sends_keep_alives_is_not_waited_on_forever() {
+        // Long enough that a descheduled runner cannot mistake it for a stall, short enough
+        // that many of them arrive inside the progress deadline below.
+        let keep_alive_gap = Duration::from_millis(50);
+        let server = SlowServer::dribbling(
+            std::iter::repeat_n(": keep-alive\n\n".to_string(), 200).collect(),
+            keep_alive_gap,
+        );
+
+        let ctx = RuntimeContext::with_deadlines_for_test(
+            server.url(),
+            Deadline::Total(Duration::from_secs(30)),
+            // The progress bound as well as the client's. A keep-alive resets the client's, so
+            // if that were the only bound this would run until the server ran out of them.
+            Deadline::Silence(Duration::from_millis(300)),
+        );
+
+        let config = test_chat_config();
+        let messages = one_shot_prompt();
+
+        let progress_deadline = Duration::from_millis(600);
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            progress_deadline,
+            send_chat_streaming(&ctx, &config, &messages, false, false),
+        )
+        .await;
+
+        // The CLI must end this itself. Reaching the outer timeout means it did not.
+        let Ok(result) = outcome else {
+            panic!(
+                "the CLI waited out {progress_deadline:?} of keep-alives without giving up; the progress bound is counting bytes, not events"
+            );
+        };
+        let Err(error) = result else {
+            panic!("a stream carrying no events should not report an answer");
+        };
+        assert!(
+            error.to_string().contains("sent nothing"),
+            "expected the no-progress error, got: {error}"
+        );
+        assert!(
+            started.elapsed() < progress_deadline,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An SSE event is not obliged to arrive in one read. Splitting one mid-payload used to
+    /// lose it entirely — the leading fragment is truncated JSON and the trailing one has no
+    /// `data:` prefix, so both were discarded without a word. That is
+    /// <https://github.com/spiceai/spiceai/issues/12588>.
+    #[tokio::test]
+    async fn an_event_split_across_two_reads_is_not_dropped() {
+        let event = content_event("whole");
+        let split = event.len() / 2;
+        let server = SlowServer::dribbling(
+            vec![event[..split].to_string(), event[split..].to_string()],
+            Duration::from_millis(10),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("an event split across two reads is still one event");
+
+        assert_eq!(response.content, "whole");
+    }
+
+    /// The tokens either side of a split must survive too, and in order — a decoder that
+    /// dropped only the split event would still pass the test above if it were the sole event.
+    #[tokio::test]
+    async fn tokens_either_side_of_a_split_event_keep_their_order() {
+        let split_event = content_event("middle ");
+        let split = split_event.len() / 2;
+        let server = SlowServer::dribbling(
+            vec![
+                content_event("first "),
+                split_event[..split].to_string(),
+                split_event[split..].to_string(),
+                content_event("last"),
+            ],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("every event should be read");
+
+        assert_eq!(response.content, "first middle last");
+    }
+
+    /// A multi-byte character split across two reads must be reassembled. Decoding each read
+    /// on its own replaces both halves with U+FFFD, corrupting the answer silently.
+    #[tokio::test]
+    async fn a_character_split_across_two_reads_is_not_corrupted() {
+        let event = content_event("café");
+        // Between the two bytes of `é`, which is the last character before the closing quote.
+        let split = event
+            .find('é')
+            .expect("the payload contains the character being split")
+            + 1;
+        // The halves are carried as bytes: putting them through `String` would replace the
+        // split character here, in the fixture, and the test would pass on any decoder.
+        let server = SlowServer::dribbling_bytes(
+            vec![
+                event.as_bytes()[..split].to_vec(),
+                event.as_bytes()[split..].to_vec(),
+            ],
+            Duration::from_millis(10),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("a character split across two reads is still one character");
+
+        assert_eq!(response.content, "café");
+    }
+
+    /// The runtime reports a mid-stream failure as an `error` event
+    /// (`to_openai_error_event` in `crates/runtime/src/http/v1/chat.rs`). Read as a chat
+    /// completion it parses as nothing, so it used to be discarded — leaving the user a
+    /// truncated answer, printed as though it were whole, with no error and no exit code.
+    #[tokio::test]
+    async fn an_error_event_ends_the_stream_rather_than_truncating_the_answer() {
+        let server = SlowServer::dribbling(
+            vec![
+                content_event("partial"),
+                "event: error\ndata: {\"type\":\"error\",\"message\":\"the model ran out of context\"}\n\n"
+                    .to_string(),
+            ],
+            Duration::from_millis(5),
+        );
+
+        let error = stream_from(&server)
+            .await
+            .expect_err("a stream that failed part-way through has no complete answer");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("the model ran out of context"),
+            "the server's reason should reach the user, got: {message}"
+        );
+        assert!(
+            message.contains("incomplete"),
+            "the user should be told the printed answer is partial, got: {message}"
+        );
+        // The wording the named branch produces, and the generic unreadable-event branch
+        // does not. Without this the test passes with that branch removed: the payload
+        // falls through to the generic path, which happens to quote the same reason.
+        assert!(
+            message.contains("failed part-way through its answer"),
+            "an error event should be reported as a failed answer, not as an unreadable event: {message}"
+        );
+    }
+
+    /// The same failure from an OpenAI-compatible server, which nests it under `error` in an
+    /// unnamed event instead of naming the event.
+    #[tokio::test]
+    async fn an_unnamed_error_payload_is_reported_with_its_reason() {
+        let server = SlowServer::dribbling(
+            vec![raw_event(r#"{"error":{"message":"upstream rate limit"}}"#)],
+            Duration::from_millis(5),
+        );
+
+        let error = stream_from(&server)
+            .await
+            .expect_err("an event that is not a chat completion is not an answer");
+
+        assert!(
+            error.to_string().contains("upstream rate limit"),
+            "the server's reason should reach the user, got: {error}"
+        );
+    }
+
+    /// An event whose data field is empty — the heartbeat some servers send in place of a
+    /// comment — is neither content nor a failure, and must not be mistaken for either.
+    /// (A frame carrying no data field at all is not dispatched at all; `sse` covers that.)
+    #[tokio::test]
+    async fn an_event_with_no_payload_does_not_end_the_stream() {
+        let server = SlowServer::dribbling(
+            vec!["data: \n\n".to_string(), content_event("answer")],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("an empty event is not a failure");
+
+        assert_eq!(response.content, "answer");
+    }
+
+    /// Azure `OpenAI`'s asynchronous content filtering emits annotation choices carrying only
+    /// `content_filter_results` and no `delta`, on passing streams as well as filtered ones.
+    /// Treating every payload that is not a plain content chunk as unreadable would stop the
+    /// stream on a valid event and lose every token after it.
+    #[tokio::test]
+    async fn an_annotation_choice_without_a_delta_does_not_stop_the_stream() {
+        let server = SlowServer::dribbling(
+            vec![
+                content_event("before "),
+                raw_event(
+                    r#"{"choices":[{"index":0,"finish_reason":null,"content_filter_results":{},"content_filter_offsets":{"check_offset":44,"start_offset":44,"end_offset":198}}],"usage":null}"#,
+                ),
+                content_event("after"),
+            ],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("an annotation choice is a valid event with nothing to print");
+
+        assert_eq!(response.content, "before after");
+    }
+
+    /// Azure `OpenAI` ends the stream when its content filter trips. Every token already sent
+    /// stays on screen and the command still succeeds, so unless the reason the generation
+    /// ended is read and reported, a filtered fragment is indistinguishable from a whole
+    /// answer -- the failure reported in
+    /// <https://github.com/spiceai/spiceai/issues/12596>.
+    #[tokio::test]
+    async fn a_content_filtered_answer_is_reported_as_incomplete() {
+        let server = SlowServer::dribbling(
+            vec![
+                content_event("as I was saying"),
+                finish_event("content_filter"),
+            ],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("the tokens that arrived are genuine, so this is not a failure");
+
+        // The tokens are kept: what the model did say is worth showing.
+        assert_eq!(response.content, "as I was saying");
+
+        let notice = response
+            .incomplete_notice()
+            .expect("an answer a filter stopped is not a whole answer");
+        assert!(
+            notice.contains("content_filter") && notice.contains("incomplete"),
+            "the notice should name the reason and say the answer is incomplete, got: {notice}"
+        );
+    }
+
+    /// An answer that hit `max_tokens` is cut off mid-sentence, and the CLI exits `0` either
+    /// way, so the same reporting has to cover it.
+    #[tokio::test]
+    async fn an_answer_cut_off_by_the_token_limit_is_reported_as_incomplete() {
+        let server = SlowServer::dribbling(
+            vec![content_event("counting: one two"), finish_event("length")],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("a truncated answer is still an answer");
+
+        assert_eq!(response.content, "counting: one two");
+
+        let notice = response
+            .incomplete_notice()
+            .expect("an answer stopped at the token limit is not a whole answer");
+        assert!(
+            notice.contains("length"),
+            "the notice should name the reason, got: {notice}"
+        );
+    }
+
+    /// The negative control for the two above. `stop` is the reason a finished answer carries,
+    /// and reporting it would warn on every successful chat.
+    #[tokio::test]
+    async fn a_whole_answer_is_not_reported_as_incomplete() {
+        let server = SlowServer::dribbling(
+            vec![content_event("all of it"), finish_event("stop")],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server).await.expect("a whole answer is read");
+
+        assert_eq!(response.content, "all of it");
+        assert_eq!(
+            response.incomplete_notice(),
+            None,
+            "an answer the model finished must not be called incomplete"
+        );
+    }
+
+    /// A server that reports no reason at all is not reporting an early stop, so the absence
+    /// must stay silent rather than being read as an unrecognised reason.
+    #[tokio::test]
+    async fn an_answer_with_no_finish_reason_is_not_reported_as_incomplete() {
+        let server = SlowServer::dribbling(
+            vec![content_event("plain answer")],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("a stream that never reports a reason is an ordinary stream");
+
+        assert_eq!(response.content, "plain answer");
+        assert_eq!(
+            response.incomplete_notice(),
+            None,
+            "no reported reason is not an early stop"
+        );
+    }
+
+    /// The answer is still reported as incomplete when the endpoint puts something other than
+    /// a reason token in the field -- but the field's contents are described, not written to
+    /// the terminal, since nothing stops an endpoint from filling it with escape sequences.
+    #[tokio::test]
+    async fn an_unreasonable_finish_reason_is_described_and_not_echoed() {
+        let server = SlowServer::dribbling(
+            vec![
+                content_event("partial"),
+                // A terminal title-setting sequence. It reaches the wire as a JSON escape,
+                // and would reach the terminal as a control sequence if it were echoed.
+                finish_event("\u{1b}]0;owned\u{7}"),
+            ],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("an odd reason is not a failure to read the stream");
+
+        assert_eq!(response.content, "partial");
+
+        let notice = response
+            .incomplete_notice()
+            .expect("a reason that is not `stop` still ended the answer early");
+        assert!(
+            notice.contains("incomplete"),
+            "the answer should still be called incomplete, got: {notice}"
+        );
+        assert!(
+            !notice.contains('\u{1b}') && !notice.contains("owned"),
+            "the reason should be described rather than echoed, got: {notice}"
+        );
+    }
+
+    /// A single event spread over several reads is the model producing, even before its
+    /// terminator arrives. Recording progress only at dispatch times such a stream out.
+    #[tokio::test]
+    async fn a_data_line_keeps_the_stream_alive_before_its_event_ends() {
+        let progress_bound = Duration::from_millis(500);
+        // One multiline event, in three reads. Its data lands well inside the bound each
+        // time, but the terminator does not arrive until after the bound has elapsed.
+        let server = SlowServer::dribbling(
+            vec![
+                "data: {\"choices\":[{\"delta\":\n".to_string(),
+                "data:  {\"content\":\"slow\"}}]}\n".to_string(),
+                "\n".to_string(),
+            ],
+            Duration::from_millis(200),
+        );
+
+        let ctx = RuntimeContext::with_deadlines_for_test(
+            server.url(),
+            Deadline::Total(Duration::from_secs(30)),
+            Deadline::Silence(progress_bound),
+        );
+
+        let response =
+            send_chat_streaming(&ctx, &test_chat_config(), &one_shot_prompt(), false, false)
+                .await
+                .expect("an event still arriving is a stream that is producing");
+
+        assert_eq!(response.content, "slow");
+    }
+
+    /// A server that hangs up without the blank line terminating its last event still sent
+    /// that event, and its tokens belong in the answer.
+    #[tokio::test]
+    async fn a_final_event_without_its_terminator_is_still_read() {
+        let server = SlowServer::dribbling(
+            vec![content_event("tail").trim_end().to_string()],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("the last event arrived, only its terminator did not");
+
+        assert_eq!(response.content, "tail");
+    }
 
     #[test]
     fn select_single_available_model_uses_only_model() {

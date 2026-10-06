@@ -97,6 +97,7 @@ use opentelemetry::metrics::{Counter, Meter};
 use serde_json::Value;
 
 pub const FLATTEN_JSON_UDTF_NAME: &str = "flatten_json";
+runtime_udfs_api::register_spice_function!(FLATTEN_JSON_SPICE_FUNCTION, FLATTEN_JSON_UDTF_NAME);
 
 const DEFAULT_MAX_DEPTH: usize = 64;
 const DEFAULT_MAX_ROWS: usize = 1_000_000;
@@ -171,7 +172,7 @@ pub struct JsonRow {
     pub parent_path: String,
     pub key: String,
     pub value: Option<String>,
-    pub type_name: String,
+    pub type_name: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,7 +278,6 @@ impl Walker<'_> {
         }
 
         let type_name = value_type(value);
-        let parent_path = parent_of(path, self.opts.path_style);
         let is_container = matches!(value, Value::Object(_) | Value::Array(_));
 
         // Emit interior rows only when `include_internal` is set.
@@ -291,7 +291,14 @@ impl Walker<'_> {
         };
         let rows_before = self.rows.len();
         if emit_now {
-            self.push_row(path, &parent_path, key, value, &type_name);
+            // `parent_of` returns an owned String; move it into the row.
+            self.push_row(
+                path,
+                parent_of(path, self.opts.path_style),
+                key,
+                value,
+                type_name,
+            );
             if self.row_cap_hit {
                 return;
             }
@@ -347,17 +354,23 @@ impl Walker<'_> {
         // produce no row at all in leaves-only mode. Surface them as a single
         // container row so the field still appears.
         if is_container && !emit_now && self.rows.len() == rows_before {
-            self.push_row(path, &parent_path, key, value, &type_name);
+            self.push_row(
+                path,
+                parent_of(path, self.opts.path_style),
+                key,
+                value,
+                type_name,
+            );
         }
     }
 
     fn push_row(
         &mut self,
         path: &str,
-        parent_path: &str,
+        parent_path: String,
         key: &str,
         value: &Value,
-        type_name: &str,
+        type_name: &'static str,
     ) {
         if self.rows.len() >= self.opts.max_rows {
             if !self.row_cap_hit {
@@ -368,28 +381,28 @@ impl Walker<'_> {
         }
         self.rows.push(JsonRow {
             path: path.to_owned(),
-            parent_path: parent_path.to_owned(),
+            parent_path,
             key: key.to_owned(),
             value: leaf_value_string(value),
-            type_name: type_name.to_owned(),
+            type_name,
         });
     }
 }
 
-fn value_type(v: &Value) -> String {
+fn value_type(v: &Value) -> &'static str {
     match v {
-        Value::Null => "null".to_owned(),
-        Value::Bool(_) => "boolean".to_owned(),
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
         Value::Number(n) => {
             if n.is_i64() || n.is_u64() {
-                "integer".to_owned()
+                "integer"
             } else {
-                "number".to_owned()
+                "number"
             }
         }
-        Value::String(_) => "string".to_owned(),
-        Value::Array(_) => "array".to_owned(),
-        Value::Object(_) => "object".to_owned(),
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -691,7 +704,7 @@ fn build_row_arrays(rows: &[JsonRow]) -> Vec<ArrayRef> {
             Some(v) => value.append_value(v),
             None => value.append_null(),
         }
-        type_name.append_value(&row.type_name);
+        type_name.append_value(row.type_name);
     }
 
     vec![

@@ -1,0 +1,56 @@
+##
+## Copyright 2024-2026 The Spice.ai OSS Authors
+##
+## Licensed under the Apache License, Version 2.0 (the "License");
+## you may not use this file except in compliance with the License.
+## You may obtain a copy of the License at
+##
+##      https://www.apache.org/licenses/LICENSE-2.0
+##
+## Unless required by applicable law or agreed to in writing, software
+## distributed under the License is distributed on an "AS IS" BASIS,
+## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+## See the License for the specific language governing permissions and
+## limitations under the License.
+##
+
+[package]
+name = "accelerator-turso"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "Turso data accelerator: implements data-accelerator-api::DataAccelerator over a Turso table provider."
+
+[dependencies]
+data-accelerator-api = { path = "../../data-accelerator-api" }
+data_components = { path = "../../data_components", features = ["turso"] }
+runtime-acceleration = { path = "../../runtime-acceleration", features = ["turso"] }
+runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
+runtime-checkpoint-turso = { path = "../../runtime-checkpoint-turso" }
+runtime-udfs-api = { path = "../../runtime-udfs-api" }
+runtime-parameters = { path = "../../runtime-parameters" }
+runtime-table-partition = { path = "../../runtime-table-partition" }
+async-trait.workspace = true
+datafusion.workspace = true
+linkme.workspace = true
+paste.workspace = true
+datafusion-table-providers = { workspace = true, features = ["sqlite"] }
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow_tools = { path = "../../arrow_tools" }
+futures.workspace = true
+spicepod = { path = "../../spicepod" }
+tracing.workspace = true
+rusqlite.workspace = true
+turso.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+snafu.workspace = true
+
+[dev-dependencies]
+runtime-acceleration = { path = "../../runtime-acceleration", features = ["turso", "test-support"] }
+datafusion-table-providers = { workspace = true, features = ["sqlite", "duckdb"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

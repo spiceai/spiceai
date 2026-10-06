@@ -24,6 +24,7 @@ limitations under the License.
 //! - **`StockLevel`** (4%): Read-only — count low-stock items in recent orders.
 
 pub mod delivery;
+pub mod mysql;
 pub mod new_order;
 pub mod order_status;
 pub mod payment;

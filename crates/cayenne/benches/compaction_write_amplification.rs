@@ -21,9 +21,9 @@ limitations under the License.
 //! Every row on this path is written to disk TWICE. A delta / mem-tier
 //! checkpoint (`WriteClass::Delta`) writes each protected snapshot with a LIGHT
 //! encoding — it skips the `BtrBlocks` per-column strategy search + FSST
-//! symbol-table training that dominate small-write encode cost (see
+//! symbol-table training that dominates encode cost (see
 //! `provider::delta_encoding`, `effective_level` returns `AUTO_LIGHT_LEVEL` for
-//! a small/unknown-size `auto` delta). Those light files are LESS compressed, so
+//! every `auto` delta, regardless of size). Those light files are LESS compressed, so
 //! they inflate on-disk bytes (read-amp in bytes) until compaction folds them.
 //! Compaction (`WriteClass::Maintenance`) then RE-ENCODES the merged corpus with
 //! the FULL cascade — the expensive strategy search + FSST it skipped — so the

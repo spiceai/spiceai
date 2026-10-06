@@ -19,8 +19,13 @@ runs:
     - name: Install cc (macOS)
       if: runner.os == 'macOS'
       shell: bash
-      run: |
-        brew install cmake pkg-config openssl unixodbc llvm libnfs
+      # The step lives in its own script so test_macos_toolchain.sh can drive it
+      # against a fake Homebrew prefix. It probes the Cellar and PATH before it
+      # touches `brew`: a formula whose keg is absent is installed, a keg that is
+      # present but unlinked or shadowed on PATH is put in front of PATH instead,
+      # so a runner whose `brew` cannot take its global lock only blocks when it
+      # genuinely has something to install (spiceai#13463, spiceai#13479).
+      run: bash "$GITHUB_ACTION_PATH/macos_toolchain.sh"
 
     - name: Install cc (Windows)
       if: runner.os == 'Windows'

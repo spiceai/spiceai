@@ -12,14 +12,14 @@ All criteria must be met for the Catalog to be considered Stable, with exception
 | Cayenne       | ➖             |              |
 | Databricks    | ➖             |              |
 | DuckLake      | ➖             |              |
-| Glue          | ➖             |              |
+| Glue          | ✅             | @lukekim     |
 | Iceberg       | ➖             |              |
 | MS SQL        | ➖             |              |
 | MySQL         | ➖             |              |
 | Oracle        | ➖             |              |
 | PostgreSQL    | ➖             |              |
 | Snowflake     | ➖             |              |
-| Spice.ai      | ➖             |              |
+| Spice.ai      | ✅             | @peasee      |
 | Unity Catalog | ✅             | @Sevenannn   |
 
 ## Stable Release Criteria

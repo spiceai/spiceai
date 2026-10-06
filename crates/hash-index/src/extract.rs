@@ -213,7 +213,8 @@ macro_rules! impl_primitive_key {
 
             #[inline]
             fn value_bytes(array: &Self::ArrayType, row: usize) -> Vec<u8> {
-                array.value(row).to_le_bytes().to_vec()
+                // Fixed-size LE bytes via stack array; single heap alloc for the Vec.
+                Vec::from(array.value(row).to_le_bytes())
             }
         }
     };
@@ -228,9 +229,41 @@ impl_primitive_key!(u16, UInt16Array, DataType::UInt16);
 impl_primitive_key!(u32, UInt32Array, DataType::UInt32);
 impl_primitive_key!(u64, UInt64Array, DataType::UInt64);
 
+/// Holds either `Utf8` or `LargeUtf8` string arrays without re-encoding.
+enum StringKeys {
+    Utf8(StringArray),
+    LargeUtf8(LargeStringArray),
+}
+
+impl StringKeys {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Utf8(a) => a.len(),
+            Self::LargeUtf8(a) => a.len(),
+        }
+    }
+
+    #[inline]
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Utf8(a) => a.is_null(row),
+            Self::LargeUtf8(a) => a.is_null(row),
+        }
+    }
+
+    #[inline]
+    fn value(&self, row: usize) -> &str {
+        match self {
+            Self::Utf8(a) => a.value(row),
+            Self::LargeUtf8(a) => a.value(row),
+        }
+    }
+}
+
 /// Key extractor for UTF-8 string columns.
 pub struct Utf8KeyExtractor {
-    array: StringArray,
+    array: StringKeys,
 }
 
 impl Utf8KeyExtractor {
@@ -257,22 +290,14 @@ impl Utf8KeyExtractor {
     /// Returns an error if the array type is not supported.
     pub fn from_array(array: &ArrayRef) -> Result<Self> {
         if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-            return Ok(Self { array: arr.clone() });
+            return Ok(Self {
+                array: StringKeys::Utf8(arr.clone()),
+            });
         }
         if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
-            // Convert LargeStringArray to StringArray (may fail for large offsets)
-            let values: Vec<Option<&str>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                })
-                .collect();
-            let string_array = StringArray::from(values);
+            // Keep LargeStringArray as-is — no intermediate re-encode.
             return Ok(Self {
-                array: string_array,
+                array: StringKeys::LargeUtf8(arr.clone()),
             });
         }
 
@@ -328,9 +353,41 @@ impl KeyExtractor for Utf8KeyExtractor {
     }
 }
 
+/// Holds either `Binary` or `LargeBinary` arrays without re-encoding.
+enum BinaryKeys {
+    Binary(BinaryArray),
+    LargeBinary(LargeBinaryArray),
+}
+
+impl BinaryKeys {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Binary(a) => a.len(),
+            Self::LargeBinary(a) => a.len(),
+        }
+    }
+
+    #[inline]
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Binary(a) => a.is_null(row),
+            Self::LargeBinary(a) => a.is_null(row),
+        }
+    }
+
+    #[inline]
+    fn value(&self, row: usize) -> &[u8] {
+        match self {
+            Self::Binary(a) => a.value(row),
+            Self::LargeBinary(a) => a.value(row),
+        }
+    }
+}
+
 /// Key extractor for binary columns.
 pub struct BinaryKeyExtractor {
-    array: BinaryArray,
+    array: BinaryKeys,
 }
 
 impl BinaryKeyExtractor {
@@ -349,22 +406,14 @@ impl BinaryKeyExtractor {
     /// Creates from a raw array reference.
     pub fn from_array(array: &ArrayRef) -> Result<Self> {
         if let Some(arr) = array.as_any().downcast_ref::<BinaryArray>() {
-            return Ok(Self { array: arr.clone() });
+            return Ok(Self {
+                array: BinaryKeys::Binary(arr.clone()),
+            });
         }
         if let Some(arr) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-            // Convert LargeBinaryArray to BinaryArray
-            let values: Vec<Option<&[u8]>> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                })
-                .collect();
-            let binary_array = BinaryArray::from(values);
+            // Keep LargeBinaryArray as-is — no intermediate re-encode.
             return Ok(Self {
-                array: binary_array,
+                array: BinaryKeys::LargeBinary(arr.clone()),
             });
         }
 

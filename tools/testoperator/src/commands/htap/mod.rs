@@ -43,12 +43,25 @@ use test_framework::{
 };
 
 use crate::{
-    args::HtapArgs, commands::bench::prepare_chbench_source, health::HealthMonitor,
+    args::{HtapArgs, SourceType},
+    commands::bench::prepare_chbench_source,
+    health::HealthMonitor,
+    probe::{self, Phase},
     spiced_metrics::MetricsScraper,
 };
 
+/// Cap on the *default* terminal count (when `--terminals` is not passed
+/// explicitly) — see the comment at its use site below.
+const DEFAULT_TERMINALS_CAP: usize = 100;
+
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let test_args = &args.test_args;
+    // spiced names replication metrics per source connector; select the prefix
+    // matching the configured source so scraping picks up the right series.
+    let replication_engine = match test_args.source_type {
+        SourceType::Postgres => "postgres",
+        SourceType::Mysql => "mysql",
+    };
     let (app, mut start_request) = super::get_app_and_start_request(&test_args.common).await?;
 
     let query_set = test_args.load_query_set()?;
@@ -58,6 +71,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
              Use '--query-set chbench' or run 'testoperator run bench' for other query sets."
         );
     }
+    super::ensure_shared_client_connections(test_args, "htap")?;
 
     // Always enable the metrics endpoint in HTAP mode for replication metrics.
     if !test_args.common.scrape_spiced_metrics {
@@ -68,22 +82,43 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     // 1. Prepare the source: seed schema + data — or, with --skip-prepare,
     //    connect to an already-prepared source and verify it matches the SF.
     let scale_factor = test_args.scale_factor.unwrap_or(1.0);
+    // Each OLTP terminal opens its own dedicated source-DB connection, and the
+    // benchmark source containers run with max-connections=200 (see
+    // setup-chbench-mysql/postgres). An unbounded default here can exhaust
+    // that well before the scale factor gets large — a manual SF1000 dispatch
+    // that omitted --terminals hit exactly this ("Too many connections"),
+    // since scale_factor * 10 = 10,000 terminals. Scheduled dispatch configs
+    // already avoid it by hardcoding `terminals: 100`; cap the *default* the
+    // same way so an omitted --terminals doesn't reproduce the failure.
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);
+    let terminals = args
+        .terminals
+        .unwrap_or_else(|| ((scale_factor * 10.0) as usize).min(DEFAULT_TERMINALS_CAP));
     let duration = Duration::from_secs(test_args.common.duration);
-    let driver: Arc<dyn chbench_driver::ChBenchDriver> = Arc::new(
-        prepare_chbench_source(scale_factor, terminals, args.rate, args.skip_prepare).await?,
-    );
+    // Seeding an SF1000 source runs for the better part of an hour and prints
+    // little; without this, `/v1/ready` could not tell it apart from a run stuck
+    // on the source connection.
+    probe::set_phase(Phase::PreparingSource);
+    let driver: Arc<dyn chbench_driver::ChBenchDriver> = prepare_chbench_source(
+        scale_factor,
+        terminals,
+        args.rate,
+        args.skip_prepare,
+        test_args.source_type,
+    )
+    .await?;
 
     // --prepare-only: the source is now seeded; exit before starting spiced so
     // an external harness can snapshot the pristine source (e.g. to a Postgres
     // template database) for fast reuse across subsequent runs.
     if args.prepare_only {
         println!("--prepare-only: source prepared, exiting without running the workload");
+        probe::set_phase(Phase::Finished);
         return Ok(());
     }
 
     // 2. Start spiced.
+    probe::set_phase(Phase::WaitingForSpiced);
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let ready_wait_start = Instant::now();
 
@@ -105,6 +140,39 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let testoperator_commit_sha = git::get_commit_sha();
     let branch_name = git::get_branch_name();
 
+    // Source↔local clock-skew estimate for the artifact: lag gauges mix the source's
+    // commit timestamps with spiced's clock, so this offset (local − server) biases
+    // them and the waterfall can subtract it. Best-effort; `null` if the source is
+    // unreachable. Probed once up front (a few ms round trips).
+    let clock_skew_ms_estimate = crate::pg_stats::probe_clock_skew_ms().await;
+    if let Some(skew) = clock_skew_ms_estimate {
+        println!(
+            "source clock-skew estimate: {skew}ms (local − server; subtracted from lag in analysis)"
+        );
+    }
+
+    // Run metadata for the `--metrics-dump` artifact — captured before the values
+    // below are moved into the telemetry `Resource`. Mirrors the resource
+    // attributes so the waterfall analysis has commit + config alongside the
+    // series.
+    let run_metadata = serde_json::json!({
+        "app_name": app.name.clone(),
+        "spiced_version": spiced_version.clone(),
+        "spiced_commit_sha": spiced_commit_sha.clone(),
+        "testoperator_commit_sha": testoperator_commit_sha.clone(),
+        "branch_name": branch_name.clone(),
+        "query_set": query_set.to_string(),
+        "scale_factor": scale_factor,
+        "terminals": terminals,
+        "duration_secs": duration.as_secs(),
+        "concurrency": test_args.common.concurrency,
+        "target_oltp_rate": args.rate
+            .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
+        "spicepod_path": test_args.common.spicepod_path.display().to_string(),
+        "clock_skew_ms_estimate": clock_skew_ms_estimate,
+        "skip_analytic_gate": args.skip_analytic_gate,
+    });
+
     let benchmark_resource = Resource::builder_empty()
         .with_attributes(vec![
             KeyValue::new("service.name", "testoperator"),
@@ -124,6 +192,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 args.rate
                     .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
             ),
+            KeyValue::new("skip_analytic_gate", args.skip_analytic_gate.to_string()),
         ])
         .build();
 
@@ -133,6 +202,22 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     // Always scrape spiced metrics in HTAP mode — replication metrics are essential.
     let metrics_scraper = Some(MetricsScraper::spawn()?);
+
+    // Also sample source-side Postgres stats (walsender waits, OLTP lock
+    // contention, WAL-production/commit rate) — best-effort; never blocks the run.
+    let pg_stats_scraper = match crate::pg_stats::source_conn_from_env() {
+        Ok((conn_str, db)) => match crate::pg_stats::PgStatsScraper::spawn(conn_str, db).await {
+            Ok(scraper) => scraper,
+            Err(e) => {
+                eprintln!("pg_stats: scraper failed to start: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("pg_stats: could not resolve source config: {e}");
+            None
+        }
+    };
 
     // 3. Start the OLTP workload in the background.
     let oltp_stop = CancellationToken::new();
@@ -149,9 +234,17 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         Arc::clone(&driver),
         staleness_spice_client,
         oltp_stop.clone(),
+        // Reject absurd freshness samples (> 2x the run duration): a bootstrap-era /
+        // catch-up probe reading can otherwise poison p99/max (a single ~2-day sample
+        // dominated a 10-sample window in a prior run).
+        duration.saturating_mul(2),
     );
 
     // 4. Run analytical queries through spiced concurrently with the OLTP load.
+    // Load is being applied from here on, so this is where the run becomes
+    // ready: a window that starts earlier would include the seed, and one that
+    // started at the first query would miss the OLTP writes under it.
+    probe::set_phase(Phase::Running);
     println!("Running HTAP analytical queries under OLTP load");
 
     let executor = super::create_query_executor(test_args, &spiced_instance).await?;
@@ -172,7 +265,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
-        .with_results_snapshot(|_| false) // No snapshots for HTAP — results change under OLTP
+        .with_results_snapshot(|_, _| test_framework::snapshot::SnapshotMode::Skip) // No snapshots for HTAP — results change under OLTP
         .with_progress_bars(!test_args.common.disable_progress_bars)
         // Concurrent OLTP mutations make row counts non-deterministic; 0 rows is expected.
         .with_validate_row_count(false)
@@ -193,8 +286,21 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     //    after OLTP stops. Stopping the scraper here gives accurate under-load values.
     let spiced_metrics =
         super::process_spiced_metrics(metrics_scraper, test_args.common.metrics, &[]).await;
+    // Snapshot the probe latencies for the same reason, while OLTP is still running:
+    // the monitor keeps sampling through the post-drain gate below, and that idle
+    // window would dilute the under-load percentiles.
+    let probe_snapshot = health_monitor.snapshot();
+    // Stop the source-PG stats scraper at the same point (under load), so its view
+    // aligns with the spiced-side scrape window.
+    let pg_stats = match pg_stats_scraper {
+        Some(scraper) => scraper.stop().await,
+        None => Vec::new(),
+    };
 
-    // 6. Stop OLTP and collect results.
+    // 6. Stop OLTP and collect results. No load is applied past this point, so
+    //    the run stops reporting itself ready while the gates and reporting
+    //    below (which can take minutes) still run.
+    probe::set_phase(Phase::Finalizing);
     oltp_stop.cancel();
     let oltp_result = oltp_handle.await;
     let staleness_result = staleness_handle.await;
@@ -208,13 +314,16 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         None => None,
     };
 
+    probe_snapshot.print_latency_summary("under load");
+
     // 7. Report analytical query metrics.
     let mut failures: Vec<String> = Vec::new();
+    let mut query_summary_rows: Vec<reporting::QuerySummaryRow> = Vec::new();
     for query in &metrics.metrics {
         let query_name = &query.query_name;
         let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
 
-        let status: u64 = u64::from(match &query.query_status {
+        let passed = match &query.query_status {
             QueryStatus::Passed => true,
             QueryStatus::Failed(reason) => {
                 if let Some(reason) = reason {
@@ -224,6 +333,16 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 }
                 false
             }
+        };
+        let status: u64 = u64::from(passed);
+
+        query_summary_rows.push(reporting::QuerySummaryRow {
+            query_name: query_name.to_string(),
+            passed,
+            iterations: query.iterations,
+            median_ms: query.median_duration_ms,
+            p90_ms: query.percentile_90_duration_ms,
+            p99_ms: query.percentile_99_duration_ms,
         });
 
         crate::metrics::QUERY_STATUS.record(status, &attributes);
@@ -271,10 +390,17 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     // 8. Report OLTP results.
     println!("\n=== TPC-C OLTP ===");
+    let mut oltp_summary: Option<reporting::OltpSummary> = None;
     match oltp_result {
         Ok(Ok(report)) => {
             report.print_summary();
             crate::metrics::OLTP_TPMC.record(report.tpmc, &[]);
+            oltp_summary = Some(reporting::OltpSummary {
+                tpmc: report.tpmc,
+                total_committed: report.total_committed,
+                total_aborted: report.total_aborted,
+                abort_rate: report.abort_rate,
+            });
         }
         Ok(Err(e)) => {
             eprintln!("OLTP workload error: {e}");
@@ -297,14 +423,68 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         }
     }
 
-    if let Some(metrics) = spiced_metrics {
-        reporting::emit_replication_metrics(&metrics, "under load", true);
+    // Apply-phase coverage violations (populated below), gated at the end of the run.
+    let mut coverage_violations: Vec<(String, f64)> = Vec::new();
+    let mut lag_summary: Option<reporting::ReplicationLagSummary> = None;
+    if let Some(metrics) = &spiced_metrics {
+        lag_summary = reporting::emit_replication_metrics(
+            metrics,
+            replication_engine,
+            &pg_stats,
+            "under load",
+            true,
+        );
         // For Cayenne backend report additional metrics
-        reporting::emit_cayenne_read_amp_percentiles(&metrics);
+        reporting::emit_cayenne_read_amp_percentiles(metrics);
+        // Localize CDC backpressure across the pipeline stages (prefetch channel,
+        // encode budget, compaction semaphore, mem-tier budget).
+        reporting::emit_backpressure_summary(metrics);
+        // Instrumentation self-check: flag (and optionally fail on) tables whose apply
+        // time is mostly un-instrumented — a blind spot hides a real bottleneck there.
+        coverage_violations = reporting::emit_phase_coverage(metrics, args.min_phase_coverage);
+    }
+
+    // Persist the full scraped time-series + run metadata for offline waterfall
+    // analysis (scripts/chbench-waterfall.py) and CI artifact upload.
+    if let Some(dump_path) = &args.metrics_dump {
+        match reporting::write_metrics_dump(
+            dump_path,
+            &run_metadata,
+            spiced_metrics.as_ref(),
+            &pg_stats,
+        )
+        .await
+        {
+            Ok(()) => println!("\nWrote metrics dump to {}", dump_path.display()),
+            Err(e) => eprintln!(
+                "Failed to write metrics dump to {}: {e}",
+                dump_path.display()
+            ),
+        }
+    }
+
+    // Emit the headline results (tpmC, QPH, worst lag, per-query latencies) as a
+    // Markdown summary CI appends to the job summary.
+    if let Some(summary_path) = &args.summary_out {
+        let summary = reporting::RunSummary {
+            qph,
+            completed_queries,
+            elapsed_secs,
+            oltp: oltp_summary,
+            lag: lag_summary,
+            queries: query_summary_rows,
+        };
+        match reporting::write_run_summary(summary_path, &summary).await {
+            Ok(()) => println!("\nWrote run summary to {}", summary_path.display()),
+            Err(e) => eprintln!(
+                "Failed to write run summary to {}: {e}",
+                summary_path.display()
+            ),
+        }
     }
 
     // 10. Data-correctness gate: OLTP has stopped, so wait for replication to
-    //     fully drain (bounded by the test duration) and then assert that
+    //     fully drain (bounded by 2x the test duration) and then assert that
     //     source and Spice row counts match for every replicated table.
     let probe_tables: Vec<String> = driver
         .probe_tables()
@@ -323,7 +503,8 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         Arc::clone(&driver),
         &spice_clients,
         &probe_tables,
-        duration,
+        // Allow up to 2x the test duration for replication to converge post-drain.
+        duration.saturating_mul(2),
     )
     .await;
 
@@ -336,11 +517,21 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         Ok(report) => {
             report.emit();
             // If replication failed to converge, re-scrape the live lag one more time for diagnostics
-            if report.converged_at.is_none() {
+            if !report.convergence.converged() {
                 match crate::spiced_metrics::MetricsScraper::scrape_once().await {
                     Ok(metrics) => {
-                        reporting::emit_replication_metrics(
+                        // Re-sample source-side stats fresh: the background scraper
+                        // stopped under load, so its `pg_stats` are stale and would make
+                        // the authoritative slot-retained check report against load-time
+                        // WAL rather than the current (post-drain) state.
+                        let fresh_pg_stats =
+                            crate::pg_stats::PgStatsScraper::sample_once_now().await;
+                        // Diagnostic re-scrape: the lag summary return is unused here
+                        // (the headline was already captured from the under-load scrape).
+                        let _ = reporting::emit_replication_metrics(
                             &metrics,
+                            replication_engine,
+                            &fresh_pg_stats,
                             "post-drain re-scrape",
                             false,
                         );
@@ -357,9 +548,20 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 error_messages.push(message);
             }
 
-            // Analytical-correctness gate runs only when the row-count gate fully passed (replication converged + every table matches).
-            // Otherwise the underlying data is known to diverge, so comparing analytical query results adds no signal.
-            if row_count_message.is_none() {
+            // Analytical-correctness gate runs only when not explicitly skipped AND the
+            // row-count gate fully passed (replication converged + every table matches).
+            // Otherwise the underlying data is known to diverge, so comparing analytical
+            // query results adds no signal.
+            let skip_reason = match (args.skip_analytic_gate, row_count_message.is_some()) {
+                (true, true) => Some("--skip-analytic-gate set (row-count gate also did not pass)"),
+                (true, false) => Some("--skip-analytic-gate set"),
+                (false, true) => Some("row-count gate did not pass"),
+                (false, false) => None,
+            };
+
+            if let Some(reason) = skip_reason {
+                println!("\nSkipping analytical-query gate — {reason}");
+            } else {
                 let query_overrides = test_args
                     .query_overrides
                     .clone()
@@ -368,6 +570,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                     Arc::clone(&driver),
                     &spice_clients,
                     query_overrides,
+                    args.analytic_gate_concurrency,
                 )
                 .await;
 
@@ -382,8 +585,6 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                         error_messages.push(format!("HTAP analytical-query error: {e}"));
                     }
                 }
-            } else {
-                println!("\nSkipping analytical-query gate — row-count gate did not pass");
             }
         }
         Err(e) => {
@@ -416,6 +617,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     spiced_instance.stop()?;
+    // Everything measurable is done; what follows only assembles the verdict.
+    // Set here rather than beside the final `Ok(())` so a run that exits with a
+    // gate failure reports the same phase as one that passes.
+    probe::set_phase(Phase::Finished);
 
     let health_report = health_report?;
 
@@ -428,6 +633,24 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     if let Some(message) = health_report.failure_message() {
         eprintln!("Warning: {message}");
+    }
+
+    if !coverage_violations.is_empty() {
+        let detail = coverage_violations
+            .iter()
+            .map(|(t, c)| {
+                format!(
+                    "{t}: {:.1}% < {:.0}%",
+                    c * 100.0,
+                    args.min_phase_coverage * 100.0
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        error_messages.push(format!(
+            "HTAP apply-phase coverage below --min-phase-coverage: {detail} \
+             (a CDC apply bottleneck is hiding in un-instrumented code)"
+        ));
     }
 
     if !error_messages.is_empty() {

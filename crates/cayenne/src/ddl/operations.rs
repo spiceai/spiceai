@@ -26,12 +26,14 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use datafusion::catalog::SchemaProvider;
+use datafusion::common::TableReference;
 use datafusion::common::ToDFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::prelude::{Expr, SessionContext};
-use datafusion::sql::TableReference;
+use datafusion::sql::planner::IdentNormalizer;
+use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
@@ -78,12 +80,47 @@ pub struct CreateTableParams {
     /// Raw SQL text for the `PARTITION BY` expression.
     /// Parsed and validated at execution time inside [`CayenneCreateTableExec`].
     pub partition_expr_sql: Option<String>,
+    /// Hilbert-clustering columns from `CLUSTER BY`.
+    pub cluster_by: Vec<String>,
     /// If `true`, do not error when the table already exists.
     pub if_not_exists: bool,
     /// Source table for `CREATE TABLE … (LIKE …)`.
     pub like_source_table: Option<TableReference>,
     /// `SessionContext` used to parse the partition expression at execution time.
     pub ctx: Option<Arc<SessionContext>>,
+}
+
+/// Validate a Cayenne `CLUSTER BY` clause and return its column names,
+/// normalized by `normalizer` the way the statement's column definitions were.
+///
+/// A parenthesized column, `CLUSTER BY (id)`, parses as a nested expression and
+/// names that column.
+///
+/// # Errors
+///
+/// Returns a planning error when an expression is not a simple column
+/// identifier. Column existence and data-type support are validated against
+/// the transformed table schema during creation.
+pub fn cluster_by_column_names(
+    table_name: &str,
+    expressions: &[SqlExpr],
+    normalizer: &IdentNormalizer,
+) -> DFResult<Vec<String>> {
+    expressions
+        .iter()
+        .map(|expression| {
+            let mut column = expression;
+            while let SqlExpr::Nested(inner) = column {
+                column = inner;
+            }
+            match column {
+                SqlExpr::Identifier(identifier) => Ok(normalizer.normalize(identifier.clone())),
+                _ => Err(DataFusionError::Plan(format!(
+                    "Failed to create table '{table_name}' (cayenne): unsupported clustering expression '{expression}'. `CLUSTER BY` accepts column names only. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                ))),
+            }
+        })
+        .collect()
 }
 
 // ── Operations ────────────────────────────────────────────────────────────────
@@ -105,7 +142,10 @@ pub async fn create_table(
 ) -> DFResult<CreateTableOutcome> {
     let metadata_catalog = Arc::clone(cayenne_provider.metadata_catalog());
     let data_base_path = cayenne_provider.data_base_path().to_string();
-    let vortex_config = cayenne_provider.vortex_config().clone();
+    let mut vortex_config = cayenne_provider.vortex_config().clone();
+    if !params.cluster_by.is_empty() {
+        vortex_config.cluster_by.clone_from(&params.cluster_by);
+    }
 
     let metadata_table_name = format!("{}/{}", params.schema_name, params.table_name);
 
@@ -344,6 +384,7 @@ pub fn create_schema(
         Arc::clone(cayenne_provider.metadata_catalog()),
         schema_name.to_string(),
         runtime_env,
+        cayenne_provider.table_selector().clone(),
     ));
     cayenne_provider
         .register_schema_provider(
@@ -375,6 +416,7 @@ fn ensure_schema_provider(
         Arc::clone(metadata_catalog),
         schema_name.to_string(),
         Arc::clone(runtime_env),
+        cayenne_provider.table_selector().clone(),
     ));
     cayenne_provider
         .register_schema_provider(
@@ -409,7 +451,7 @@ async fn build_partitioned_provider(
     let partition_expr_for_error =
         partition_expr_sql.map_or_else(|| partition_expr.to_string(), String::clone);
 
-    tracing::info!(
+    tracing::debug!(
         table = %table_name,
         partition_expr = %partition_expr_for_error,
         "CayenneCreateTableExec: validating partition expression"
@@ -427,22 +469,30 @@ async fn build_partitioned_provider(
         expression: partition_expr.clone(),
     }];
 
-    let creator = Arc::new(CayennePartitionCreator::new(
-        metadata_table_name.to_string(),
-        PathBuf::from(table_data_path),
-        partition_by.clone(),
-        Arc::clone(vortex_schema),
-        Arc::clone(metadata_catalog),
-        table_id.to_string(),
-        UnsupportedTypeAction::Error,
-        Vec::new(),
-        None,
-        vortex_config.clone(),
-        None,
-        primary_key.to_vec(),
-        on_conflict,
-        Arc::clone(runtime_env),
-    ));
+    // Draw on the process-wide compaction budget, so a partition that is written
+    // to and then goes quiet still gets consolidated. Post-write compaction only
+    // fires while a partition keeps being appended to; without an interval
+    // compactor an idle partition keeps its small files for the table's lifetime,
+    // and every later scan pays for them.
+    let creator = Arc::new(
+        CayennePartitionCreator::new(
+            metadata_table_name.to_string(),
+            PathBuf::from(table_data_path),
+            partition_by.clone(),
+            Arc::clone(vortex_schema),
+            Arc::clone(metadata_catalog),
+            table_id.to_string(),
+            UnsupportedTypeAction::Error,
+            Vec::new(),
+            None,
+            vortex_config.clone(),
+            None,
+            primary_key.to_vec(),
+            on_conflict,
+            Arc::clone(runtime_env),
+        )
+        .with_background_compaction(crate::provider::compaction_budget()),
+    );
 
     let partition_provider =
         PartitionTableProvider::new(creator, partition_by, Arc::clone(vortex_schema))
@@ -498,10 +548,115 @@ fn parse_label_from_sql(sql: &str) -> Option<String> {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, TimeUnit};
+    use datafusion::prelude::col;
+    use datafusion::scalar::ScalarValue;
     use tempfile::TempDir;
 
-    use crate::CayenneCatalog;
     use crate::metadata::VortexConfig;
+    use crate::{CayenneCatalog, CayenneTableProvider};
+
+    /// A `CREATE TABLE … PARTITIONED BY` table's partitions must run an interval
+    /// background compactor.
+    ///
+    /// Post-write compaction only fires while a partition keeps being appended
+    /// to, so a partition that is written and then goes quiet consolidates
+    /// nothing without one, and every later scan pays the small-file cost for as
+    /// long as the table lives.
+    #[tokio::test]
+    async fn ddl_partitions_run_interval_background_compaction() {
+        let tmp = TempDir::new().expect("tempdir");
+        let table_data_path = format!("{}/events/", tmp.path().to_string_lossy());
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("bucket", DataType::Utf8, false),
+        ]);
+        let vortex_schema = Arc::new(
+            transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+                .expect("schema transforms for vortex"),
+        );
+
+        let metadata_catalog: Arc<dyn MetadataCatalog> = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}", tmp.path().join("meta.db").display()))
+                .expect("catalog opens"),
+        );
+        metadata_catalog
+            .init()
+            .await
+            .expect("catalog schema initializes");
+
+        let table_name = "events".to_string();
+        let table_id = metadata_catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.clone(),
+                schema: Arc::clone(&vortex_schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: table_data_path.clone(),
+                partition_column: Some("bucket".to_string()),
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("catalog create_table");
+
+        let provider = build_partitioned_provider(
+            &table_name,
+            &table_name,
+            &table_data_path,
+            &col("bucket"),
+            Some("bucket"),
+            None,
+            &vortex_schema,
+            &metadata_catalog,
+            &table_id,
+            &[],
+            None,
+            &VortexConfig::default(),
+            &SessionContext::new().runtime_env(),
+        )
+        .await
+        .expect("partitioned provider builds");
+
+        let partitioned = provider
+            .downcast_ref::<PartitionTableProvider>()
+            .expect("the DDL path builds a PartitionTableProvider");
+
+        let partition = partitioned
+            .get_or_create_partition_provider(vec![ScalarValue::Utf8(Some("a".to_string()))])
+            .await
+            .expect("partition is created");
+
+        let cayenne = partition
+            .downcast_ref::<CayenneTableProvider>()
+            .expect("a Cayenne partition is backed by a CayenneTableProvider");
+
+        assert!(
+            cayenne.has_background_compactor(),
+            "a DDL-created partition must run an interval compactor, not rely on post-write \
+             compaction alone"
+        );
+    }
+
+    /// The compaction budget is one process-wide ceiling. Handing every table a
+    /// fresh semaphore would let concurrent compactions fan out without any
+    /// bound as tables are added.
+    #[test]
+    fn the_compaction_budget_is_one_process_wide_ceiling() {
+        assert!(
+            Arc::ptr_eq(
+                &crate::provider::compaction_budget(),
+                &crate::provider::compaction_budget()
+            ),
+            "every caller must draw on the same compaction budget"
+        );
+        // Not an assertion on `available_permits()`: sibling tests in this binary
+        // spawn compactors that draw on this same budget, so only the ceiling is
+        // stable. A zero ceiling would park every compactor forever.
+        assert!(
+            crate::provider::compaction_budget_permits() > 0,
+            "a zero-permit budget would stall every compaction in the process"
+        );
+    }
 
     /// End-to-end on local FS: a Cayenne table partitioned by a user-supplied
     /// `date_trunc` EXPRESSION over a Timestamp column (explicit `partition_by`
@@ -631,9 +786,18 @@ mod tests {
                 && let Some(value) = name.strip_prefix("ts_day_bucket=")
             {
                 bucket_dirs += 1;
+                // The partition key is written through the versioned, path-safe
+                // codec (`runtime_table_partition::creator::filename::encode_key`,
+                // e.g. `v1.ts_us.v<hex>` for a `Timestamp(Microsecond)` bucket), so
+                // the dir name is filesystem-safe without being a bare integer.
+                // Assert filesystem-safety directly — the codec's own unit tests
+                // cover the exact encoding.
                 assert!(
-                    value.chars().all(|c| c.is_ascii_digit()),
-                    "bucket dir must be a filesystem-safe integer, got {name}"
+                    !value.is_empty()
+                        && value
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_'),
+                    "bucket dir must be a filesystem-safe partition key, got {name}"
                 );
             }
         }

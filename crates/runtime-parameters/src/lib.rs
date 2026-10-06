@@ -60,13 +60,27 @@ pub enum Error {
     InvalidConfigurationNoSource { component: String, message: String },
 }
 
+/// Whether building [`Parameters`] warns about the user's parameters it ignores or that
+/// are deprecated.
+///
+/// A component's parameters are reported once, where the component is created; code
+/// that re-resolves the same parameters later (an accelerator's sidecar, say) suppresses
+/// the warnings rather than repeat them each time it resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Diagnostics {
+    Report,
+    Suppress,
+}
+
 impl Parameters {
     fn validate_and_format_key(
         all_params: &[ParameterSpec],
         prefix: &'static str,
         key: &str,
         component_name: &str,
+        diagnostics: Diagnostics,
     ) -> Option<String> {
+        let report = diagnostics == Diagnostics::Report;
         let full_prefix = format!("{prefix}_");
         let mut key_to_use = key;
         let mut prefix_removed = false;
@@ -92,21 +106,27 @@ impl Parameters {
         }
 
         let Some(spec) = spec else {
-            let suggestion = closest_param_suggestion(all_params, prefix, key);
-            if let Some(candidate) = suggestion {
-                tracing::warn!(
-                    "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
-                );
-            } else {
-                tracing::warn!("Ignoring parameter `{key}`: not supported for {component_name}.");
+            if report {
+                let suggestion = closest_param_suggestion(all_params, prefix, key);
+                if let Some(candidate) = suggestion {
+                    tracing::warn!(
+                        "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
+                    );
+                } else {
+                    tracing::warn!(
+                        "Ignoring parameter `{key}`: not supported for {component_name}."
+                    );
+                }
             }
             return None;
         };
 
         if !prefix_removed && spec.r#type.is_prefixed() {
-            tracing::warn!(
-                "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
-            );
+            if report {
+                tracing::warn!(
+                    "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
+                );
+            }
             return None;
         }
 
@@ -115,9 +135,11 @@ impl Parameters {
             if deprecated_spec.is_some() {
                 return Some(key_to_use.to_string());
             }
-            tracing::warn!(
-                "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
-            );
+            if report {
+                tracing::warn!(
+                    "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
+                );
+            }
             return None;
         }
 
@@ -134,16 +156,43 @@ impl Parameters {
         secrets: Arc<RwLock<Secrets>>,
         all_params: &'static [ParameterSpec],
     ) -> AnyErrorResult<Self> {
+        Self::try_new_with_diagnostics(
+            component_name,
+            params,
+            prefix,
+            secrets,
+            all_params,
+            Diagnostics::Report,
+        )
+        .await
+    }
+
+    /// [`Self::try_new`], choosing whether ignored and deprecated parameters are warned
+    /// about.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when supplied parameters do not satisfy the provided `ParameterSpec`.
+    pub async fn try_new_with_diagnostics(
+        component_name: &str,
+        params: Vec<(String, SecretString)>,
+        prefix: &'static str,
+        secrets: Arc<RwLock<Secrets>>,
+        all_params: &'static [ParameterSpec],
+        diagnostics: Diagnostics,
+    ) -> AnyErrorResult<Self> {
         // Check for deprecated parameters using the original user-provided keys
         // before normalization strips prefixes.
-        let original_keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
-        for parameter in all_params {
-            if let Some(deprecation_message) = parameter.deprecation_message {
-                let user_key = parameter.display_name(prefix);
-                if original_keys.contains(&user_key.as_str()) {
-                    tracing::warn!(
-                        "Parameter '{user_key}' is deprecated for {component_name}: {deprecation_message}",
-                    );
+        if diagnostics == Diagnostics::Report {
+            let original_keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+            for parameter in all_params {
+                if let Some(deprecation_message) = parameter.deprecation_message {
+                    let user_key = parameter.display_name(prefix);
+                    if original_keys.contains(&user_key.as_str()) {
+                        tracing::warn!(
+                            "Parameter '{user_key}' is deprecated for {component_name}: {deprecation_message}",
+                        );
+                    }
                 }
             }
         }
@@ -152,12 +201,16 @@ impl Parameters {
         let mut params: Vec<(String, SecretString)> = params
             .into_iter()
             .filter_map(|(key, value)| {
-                Self::validate_and_format_key(all_params, prefix, &key, component_name)
+                Self::validate_and_format_key(all_params, prefix, &key, component_name, diagnostics)
                     .map(|k| (k, value))
             })
             .collect();
 
-        let secret_guard = secrets.read().await;
+        // Resolve against a snapshot rather than under the read guard: the
+        // autoload lookups below are network round trips for the remote
+        // stores, and a guard held across them stalls a registry swap — see
+        // `Secrets::snapshot`.
+        let secrets = Secrets::snapshot(&secrets).await;
 
         // Try to autoload secrets that might be missing from params.
         for secret_key in all_params.iter().filter(|p| p.secret) {
@@ -173,7 +226,7 @@ impl Parameters {
             if params.iter().any(|p| p.0 == secret_key.name) {
                 continue;
             }
-            let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
+            let secret = secrets.get_secret(&secret_key_with_prefix).await;
             if let Ok(Some(secret)) = secret {
                 tracing::debug!(
                     "Autoloading secret for {component_name}: {secret_key_with_prefix}",
@@ -504,6 +557,8 @@ impl<'a> ExposedParamLookup<'a> {
 
 pub use runtime_parameter_spec::{ParameterSpec, ParameterType};
 
+pub use runtime_parameters_derive::TypedParams;
+
 /// Suggest the closest valid parameter name for a user-typo'd key.
 ///
 /// Compares against the user-facing form of every non-deprecated spec
@@ -652,7 +707,8 @@ mod test {
                 &[ParameterSpec::component("endpoint")],
                 "databricks",
                 "databricks_endpoint",
-                "connector databricks"
+                "connector databricks",
+                Diagnostics::Report
             ),
             Some("endpoint".to_string())
         );
@@ -663,7 +719,8 @@ mod test {
                 &[ParameterSpec::component("endpoint")],
                 "not_databricks",
                 "databricks_endpoint",
-                "connector databricks"
+                "connector databricks",
+                Diagnostics::Report
             ),
             None
         );
@@ -674,7 +731,8 @@ mod test {
                 &[ParameterSpec::runtime("endpoint")], // deliberately `runtime` not `component`.
                 "databricks",
                 "databricks_endpoint",
-                "connector databricks"
+                "connector databricks",
+                Diagnostics::Report
             ),
             None
         );
@@ -685,7 +743,8 @@ mod test {
                 &[ParameterSpec::runtime("file_format")],
                 "file",
                 "file_format",
-                "connector file"
+                "connector file",
+                Diagnostics::Report
             ),
             Some("file_format".to_string())
         );
@@ -696,7 +755,8 @@ mod test {
                 &[ParameterSpec::component("file_format")],
                 "file",
                 "file_format",
-                "connector file"
+                "connector file",
+                Diagnostics::Report
             ),
             Some("file_format".to_string())
         );
@@ -707,7 +767,8 @@ mod test {
                 &[ParameterSpec::component("format")],
                 "file",
                 "file_format",
-                "connector file"
+                "connector file",
+                Diagnostics::Report
             ),
             Some("format".to_string())
         );
@@ -717,10 +778,54 @@ mod test {
                 &[ParameterSpec::runtime("file_format")],
                 "not_file",
                 "file_format",
-                "accelerator not_file"
+                "accelerator not_file",
+                Diagnostics::Report
             ),
             Some("file_format".to_string())
         );
+    }
+
+    /// Suppressing diagnostics silences the warnings only: the parameters a component
+    /// resolves are the same either way, so a sidecar that suppresses them still sees
+    /// exactly what the component was created with.
+    #[tokio::test]
+    async fn suppressed_diagnostics_resolve_the_same_parameters() {
+        static SPECS: &[ParameterSpec] = &[
+            ParameterSpec::component("host"),
+            ParameterSpec::runtime("pool_size").default("10"),
+        ];
+        async fn resolve(diagnostics: Diagnostics) -> Vec<(String, String)> {
+            let params = Parameters::try_new_with_diagnostics(
+                "accelerator test",
+                vec![
+                    ("test_host".to_string(), SecretString::from("db.internal")),
+                    ("test_unknown".to_string(), SecretString::from("ignored")),
+                ],
+                "test",
+                Arc::new(RwLock::new(Secrets::new())),
+                SPECS,
+                diagnostics,
+            )
+            .await
+            .expect("parameters resolve");
+            let mut pairs: Vec<(String, String)> = params
+                .to_secret_map()
+                .into_iter()
+                .map(|(k, v)| (k, v.expose_secret().to_string()))
+                .collect();
+            pairs.sort();
+            pairs
+        }
+
+        let reported = resolve(Diagnostics::Report).await;
+        assert_eq!(
+            reported,
+            vec![
+                ("host".to_string(), "db.internal".to_string()),
+                ("pool_size".to_string(), "10".to_string()),
+            ]
+        );
+        assert_eq!(resolve(Diagnostics::Suppress).await, reported);
     }
 
     #[tokio::test]
@@ -909,6 +1014,68 @@ mod test {
         assert_eq!(
             result.get("service_account"),
             Some(&"/path/to/sa.json".to_string())
+        );
+    }
+
+    /// A store whose lookup parks until it is released, standing in for the
+    /// network round trip a remote secret store makes on a miss.
+    struct ParkedStore {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl runtime_secrets::SecretStore for ParkedStore {
+        async fn get_secret(&self, _key: &str) -> AnyErrorResult<Option<SecretString>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Some(SecretString::from("autoloaded")))
+        }
+    }
+
+    /// `try_new`'s autoload pass must not stall a registry swap, and — since
+    /// callers reach it while resolving their own params through the same lock
+    /// — must not take a second read guard that a queued writer would trap
+    /// (tokio's `RwLock` is write-preferring).
+    #[tokio::test]
+    async fn test_try_new_autoload_does_not_block_a_registry_swap() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::component("api_key").secret()];
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let mut registry = Secrets::new();
+        registry.register_store(
+            "env",
+            Arc::new(ParkedStore {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+        );
+        let secrets = Arc::new(RwLock::new(registry));
+
+        let creation = tokio::spawn({
+            let secrets = Arc::clone(&secrets);
+            async move { Parameters::try_new("test component", vec![], "test", secrets, SPECS).await }
+        });
+
+        entered.notified().await;
+
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(5), secrets.write())
+                .await
+                .expect("a registry swap must not wait for an in-flight autoload"),
+        );
+
+        release.notify_one();
+        let params = creation
+            .await
+            .expect("parameter task should not panic")
+            .expect("parameters should build");
+        assert_eq!(
+            Some("autoloaded"),
+            params.get("api_key").expose().ok(),
+            "the parked store should still have served the autoloaded secret"
         );
     }
 }

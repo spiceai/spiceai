@@ -5,7 +5,7 @@ description: "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'seco
 [
   {
     "id": 1015,
-    "_score": 0.283
+    "_score": 0.282
   },
   {
     "id": 821,
@@ -13,10 +13,10 @@ description: "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'seco
   },
   {
     "id": 449,
-    "_score": 0.24
+    "_score": 0.239
   },
   {
     "id": 1193,
-    "_score": 0.204
+    "_score": 0.203
   }
 ]

@@ -1,0 +1,69 @@
+---
+name: Sign-off Resolve Target Tests
+
+# `signoff.yml`'s `resolve` job exists so the `sign-off` job can key its
+# `concurrency` group on the commit being signed off rather than on the raw
+# dispatch input. That key is what stops `-f branch=X` and `-f pr_number=N` for
+# the same branch from occupying two slots of the shared self-hosted pool for
+# 1-4 hours each and then racing to post the `signoff` status on one commit
+# (#12472). Nothing else exercises the step: a change that stops it emitting
+# `head_sha`, or that makes the two input forms disagree, silently restores the
+# duplicate runs — the workflow still passes, it just does the work twice.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.github/workflows/signoff.yml'
+      - 'scripts/test_signoff_resolve_target.sh'
+      - '.github/workflows/signoff_resolve_target_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/workflows/signoff.yml'
+      - 'scripts/test_signoff_resolve_target.sh'
+      - '.github/workflows/signoff_resolve_target_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-signoff-resolve-target:
+    name: Unit tests for the sign-off target resolution
+    # GitHub-hosted on purpose: this is a sub-second check and must not queue
+    # behind the saturated self-hosted pool this fix exists to stop wasting.
+    runs-on: ubuntu-24.04
+    # A checkout plus a local bash script against a stub `gh` — the job reads
+    # the repository and nothing else, so it needs no write scope.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        # The test extracts the step under test from signoff.yml rather than
+        # keeping a copy, so it needs a YAML parser.
+        #
+        # `python -m pip`, not a bare `pip`: it installs into the interpreter
+        # setup-python just put on PATH, rather than whichever `pip` the runner
+        # image happens to resolve first.
+        run: python -m pip install pyyaml
+
+      - name: Run tests
+        # Invoked through `bash` rather than as `./…` so the job does not depend
+        # on the script's executable bit surviving a checkout on every platform.
+        run: bash scripts/test_signoff_resolve_target.sh

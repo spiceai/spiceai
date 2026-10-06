@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::cluster::datafusion::codec::udtf_args::UdtfArgsExt;
 use crate::datafusion::udf::{UserFunctionInfo, user_function_infos};
-use crate::execution_plan::UdtfExec;
+use runtime_execution_plans::UdtfExec;
 
 /// UDTF name constant for `list_udfs`
 pub const LIST_UDFS_UDTF_NAME: &str = "list_udfs";

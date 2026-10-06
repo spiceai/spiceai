@@ -34,15 +34,23 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  # On a pull request both jobs are skipped at the job level, so the required
+  # check is published under its name as `skipped` rather than a `success`
+  # nothing ran for (#13841); the merge-group commit is what runs the tests.
   check_changes:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
+    # cold runner having to clone from scratch, not the ~1 min a warm
+    # self-hosted workspace takes.
+    timeout-minutes: 45
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+          fetch-depth: 0
 
       - name: Check for code changes
         id: check
@@ -51,15 +59,21 @@ jobs:
   test:
     name: ADBC Integration Tests
     needs: check_changes
-    if: needs.check_changes.outputs.relevant_changes == 'true'
+    # Slowest observed success in the 2026-07-25..08-08 window: 50 min.
+    timeout-minutes: 150
+    if: ${{ github.event_name != 'pull_request' }}
+    # Gate each step rather than the job, so docs-only merge groups still
+    # report success.
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           persist-credentials: false
           fetch-depth: 1
 
       - name: Cache Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -71,28 +85,37 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Set up Rust
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
 
       - name: Set up make
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-make
 
       - name: Set up cc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
       - name: Install protoc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/install-protoc
 
       - name: Set up sccache
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Set up ADBC drivers
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: columnar-tech/setup-dbc@4d83cce5bf2aa1e46eedbe44f13b57bbef8f2baf # v1.0.2
         with:
           drivers: 'sqlite'
 
       - name: Run ADBC integration tests
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           CARGO_INCREMENTAL: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}

@@ -14,47 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::stream::{
+    change_events_to_change_batch, default_unnest_parameters, nullable_clone, truncate_change_batch,
+};
 use async_stream::try_stream;
 use async_trait::async_trait;
-use data_components::{
-    cdc::{
-        ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
-        build_heartbeat_envelope, build_ready_signal_envelope, wrap_data_as_change_batch,
-    },
-    mongodb::stream::{
-        change_events_to_change_batch, default_unnest_parameters, nullable_clone,
-        truncate_change_batch,
-    },
+use data_components::cdc::{
+    ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
+    build_ready_signal_envelope, wrap_data_as_change_batch,
 };
+use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::parameters::ConnectorContext;
+use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::{
     arrow::datatypes::SchemaRef, datasource::TableProvider,
-    physical_plan::SendableRecordBatchStream, prelude::SessionContext,
+    physical_plan::SendableRecordBatchStream,
 };
 use datafusion_table_providers::mongodb::connection_pool::MongoDBConnectionPool;
-use futures::{Stream, StreamExt as FuturesStreamExt};
+use futures::StreamExt as FuturesStreamExt;
 use mongodb::{
-    ClientSession, Collection,
+    Collection,
     bson::Document,
-    change_stream::{event::ChangeStreamEvent, event::ResumeToken, session::SessionChangeStream},
+    change_stream::{ChangeStream, event::ChangeStreamEvent, event::ResumeToken},
     options::FullDocumentType,
 };
-use runtime::{
-    component::dataset::{
-        Dataset,
-        acceleration::{Acceleration, Engine, OnConflictBehavior},
-    },
-    dataaccelerator::spice_sys::{
-        OpenOption,
-        mongodb::{MongoCheckpointMetadata, MongoSys},
-    },
-    federated_table::FederatedTable,
-    parameters::{ExposedParamLookup, Parameters},
-};
-use std::{
-    sync::Arc,
-    sync::atomic::{AtomicI64, Ordering},
-    time::Duration,
-};
+use runtime_checkpoint_api::mongodb::{MongoCheckpointMetadata, MongoCheckpointStore};
+use runtime_component::dataset::DatasetSpec;
+use runtime_component::dataset::acceleration::{Acceleration, Engine, OnConflictBehavior};
+use runtime_parameters::{ExposedParamLookup, Parameters};
+use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
 
 const DEFAULT_CHANGE_STREAM_BATCH_MAX_SIZE: usize = 1_000;
@@ -62,11 +50,45 @@ const DEFAULT_CHANGE_STREAM_BATCH_SIZE: u32 = 1_000;
 const DEFAULT_CHANGE_STREAM_BATCH_MAX_DURATION: Duration = Duration::from_secs(1);
 const DEFAULT_CHANGE_STREAM_MAX_AWAIT_TIME: Duration = Duration::from_secs(1);
 
+/// The resume-token store for `dataset`, or `None` when the resume token cannot be
+/// persisted — the dataset is not file-accelerated, or the sidecar cannot be opened.
+/// Either way the stream runs, restarting from the beginning after a restart.
+///
+/// Resolved *before* the stream is built, so the generator holds only the store. A
+/// store holds a connection pool and no runtime, so a long-lived stream that holds
+/// one cannot pin the runtime.
+pub async fn resolve_checkpoint_store(
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
+) -> Option<Arc<dyn MongoCheckpointStore>> {
+    if !dataset.is_file_accelerated() {
+        tracing::info!(
+            dataset = %dataset.name,
+            collection = %dataset.path(),
+            "MongoDB Change Stream dataset is not file-accelerated; resume token will not be persisted across restarts"
+        );
+        return None;
+    }
+
+    match context.mongo_checkpoint_store(dataset).await {
+        Ok(sys) => Some(sys),
+        Err(error) => {
+            tracing::error!(
+                dataset = %dataset.name,
+                error = %error,
+                "Failed to initialize MongoDB resume-token sidecar; resume token will not be persisted across restarts"
+            );
+            None
+        }
+    }
+}
+
 pub fn build_changes_stream(
     pool: Arc<MongoDBConnectionPool>,
     params: Parameters,
-    dataset: Dataset,
-    federated_table: Arc<FederatedTable>,
+    dataset: DatasetSpec,
+    mongo_sys: Option<Arc<dyn MongoCheckpointStore>>,
+    federated_table: Arc<dyn FederatedTableProvider>,
 ) -> ChangesStream {
     // `try_stream!` keeps MongoDB cursor polling, snapshot reads, and commit-aware
     // CDC yields in one backpressured stream; a spawned channel would risk buffering
@@ -75,6 +97,14 @@ pub fn build_changes_stream(
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
         let primary_keys = resolve_primary_keys(&dataset.name, dataset.acceleration.as_ref(), &schema)?;
+        // JSON-nesting projection, matching the scan path. `_id` is MongoDB's
+        // only primary key and must stay a declared column (never folded into
+        // the catch-all). `schema` is already the projected (exposed) schema.
+        let projection = parse_schema_projection(
+            &dataset,
+            &ProjectionPolicy::new("mongodb").with_required_columns(vec!["_id".to_string()]),
+        )
+        .map_err(|e| StreamError::External(e.to_string()))?;
         let config = ChangeStreamConfig::from_params(&params)?;
         let invalid_token_behavior = ResumeTokenInvalidBehavior::from_params(&params)?;
         let collection_name = dataset.path().to_string();
@@ -86,37 +116,10 @@ pub fn build_changes_stream(
                 "Failed to connect to MongoDB Change Stream for dataset `{}` collection `{collection_name}`: {error}",
                 dataset.name
             )))?;
-
         let collection = connection
             .client
             .database(&connection.db_name)
             .collection::<Document>(&collection_name);
-
-        // Run the change stream under an EXPLICIT session so we can read the
-        // server's `operation_time` between getMores — including the empty ones
-        // emitted while idle. That timestamp drives the idle heartbeat's
-        // `source_commit_ts_ms` (see `mongodb_event_stream`): it advances only
-        // when the server actually replied, so a stalled cursor can't make the
-        // replication-lag gauge read falsely fresh the way wall-clock `now()` would.
-        let mut session = collection
-            .client()
-            .start_session()
-            .await
-            .map_err(|error| StreamError::External(format!(
-                "Failed to start MongoDB session for dataset `{}` collection `{collection_name}`: {error}",
-                dataset.name
-            )))?;
-
-        let mongo_sys = if dataset.is_file_accelerated() {
-            initialize_mongo_sys(&dataset).await
-        } else {
-            tracing::info!(
-                dataset = %dataset.name,
-                collection = %collection_name,
-                "MongoDB Change Stream dataset is not file-accelerated; resume token will not be persisted across restarts"
-            );
-            None
-        };
 
         let current_schema_json = serialize_current_schema(&schema, &dataset.name);
         let persisted =
@@ -130,7 +133,7 @@ pub fn build_changes_stream(
                     dataset.name
                 )))?;
 
-            match try_open_change_stream(&collection, &config, Some(resume_token), &mut session).await {
+            match try_open_change_stream(&collection, &config, Some(resume_token)).await {
                 Ok(stream) => {
                     tracing::info!(
                         dataset = %dataset.name,
@@ -178,7 +181,6 @@ pub fn build_changes_stream(
                 &dataset.name,
                 &collection_name,
                 None,
-                &mut session,
             )
             .await?;
             let resume_token = initial_change_stream.resume_token().ok_or_else(|| {
@@ -196,7 +198,7 @@ pub fn build_changes_stream(
             );
 
             let truncate = truncate_change_batch(&schema)
-                .map_err(StreamError::MongoDB)?;
+                .map_err(StreamError::from)?;
             yield ChangeEnvelope::new(Box::new(NoOpCommitter), truncate, false);
 
             // Use the same nullable schema that CDC event batches use (via nullable_clone
@@ -230,7 +232,8 @@ pub fn build_changes_stream(
                 )))?;
             let ready = build_ready_signal_envelope(&schema)
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
-            let (_, batch, is_ready) = ready.into_parts();
+            let (_, batch, is_ready, _) = ready.into_parts()
+                .map_err(|error| StreamError::Arrow(error.to_string()))?;
             let committer: Box<dyn CommitChange + Send + Sync> = match mongo_sys.as_ref() {
                 Some(sys) => Box::new(MongoResumeTokenCommitter::new(
                     Arc::clone(sys),
@@ -240,7 +243,9 @@ pub fn build_changes_stream(
                 )),
                 None => Box::new(NoOpCommitter),
             };
-            yield ChangeEnvelope::from_parts(committer, batch, is_ready);
+            // Not a history-unavailable signal: this is the readiness envelope
+            // re-wrapped with the resume-token committer.
+            yield ChangeEnvelope::from_parts(committer, batch, is_ready, false);
 
             tracing::info!(
                 dataset = %dataset.name,
@@ -254,74 +259,23 @@ pub fn build_changes_stream(
                 &dataset.name,
                 &collection_name,
                 Some(resume_token),
-                &mut session,
             )
             .await?
         };
 
         let unnest_parameters = default_unnest_parameters(config.unnest_depth);
-
-        // Idle heartbeat: while the change stream produces no events, the source is
-        // caught up to the oplog head, so emit a zero-row heartbeat to keep the
-        // replication-lag gauge (`now - source_commit_ts_ms`) reading ~0 instead of
-        // freezing at the last real event's age.
-        //
-        // The heartbeat is stamped with the SERVER's `operation_time` (the cluster
-        // time the cursor has scanned through). Unlike wall-clock `now()`, it advances
-        // only when the server actually replied.
-        let heartbeat_interval = config.batch_max_duration.saturating_mul(2);
-
-        // Latest server operation time (ms since the Unix epoch)
-        let server_commit_ms = Arc::new(AtomicI64::new(0));
-        let event_stream = mongodb_event_stream(
-            live_change_stream,
-            session,
-            Arc::clone(&server_commit_ms),
-            dataset.name.clone(),
-        );
-        let event_batches = event_stream.chunks_timeout(
+        let event_batches = live_change_stream.chunks_timeout(
             config.batch_max_size,
             config.batch_max_duration,
         );
         tokio::pin!(event_batches);
 
-        loop {
-            let batch = match tokio::time::timeout(
-                heartbeat_interval,
-                TokioStreamExt::next(&mut event_batches),
-            )
-            .await
-            {
-                // Change stream ended.
-                Ok(None) => break,
-                Ok(Some(batch)) => batch,
-                // Idle window elapsed: the source is caught up. Emit a heartbeat
-                // stamped with the freshest server time observed, then keep tailing.
-                // Skip while it's still 0 (no getMore has replied yet) so we never
-                // emit a timestamp we can't vouch for.
-                Err(_elapsed) => {
-                    let server_ms = server_commit_ms.load(Ordering::Relaxed);
-                    if server_ms > 0 {
-                        match build_heartbeat_envelope(&schema, server_ms) {
-                            Ok(envelope) => yield envelope,
-                            Err(error) => tracing::warn!(
-                                dataset = %dataset.name,
-                                %error,
-                                "Failed to build MongoDB CDC heartbeat envelope; replication-lag gauge may go stale while the stream is idle"
-                            ),
-                        }
-                    }
-                    continue;
-                }
-            };
-
-            // Surface the first cursor error in the chunk (matches the previous
-            // `collect_change_events` short-circuit); the wrapper already tagged it
-            // with dataset context.
-            let events = batch.into_iter().collect::<Result<Vec<_>, _>>()?;
-            if events.is_empty() {
+        while let Some(batch) = TokioStreamExt::next(&mut event_batches).await {
+            if batch.is_empty() {
                 continue;
             }
+
+            let events = collect_change_events(batch, &dataset)?;
 
             let tail_token = events.last().map(|event| event.id.clone());
             let tail_cluster_time = events
@@ -334,8 +288,9 @@ pub fn build_changes_stream(
                 &schema,
                 &primary_keys,
                 &unnest_parameters,
+                projection.as_ref(),
             )
-            .map_err(StreamError::MongoDB)? {
+            .map_err(StreamError::from)? {
                 // MongoDB change-stream cluster time is whole seconds (BSON
                 // Timestamp), so the replication-lag signal here has ~1s
                 // granularity — fine for a multi-second tuner.
@@ -354,23 +309,9 @@ pub fn build_changes_stream(
     })
 }
 
-async fn initialize_mongo_sys(dataset: &Dataset) -> Option<Arc<MongoSys>> {
-    match MongoSys::try_new(dataset, OpenOption::CreateIfNotExists).await {
-        Ok(sys) => Some(Arc::new(sys)),
-        Err(error) => {
-            tracing::error!(
-                dataset = %dataset.name,
-                error = %error,
-                "Failed to initialize MongoDB resume-token sidecar; resume token will not be persisted across restarts"
-            );
-            None
-        }
-    }
-}
-
 async fn persisted_checkpoint(
-    mongo_sys: Option<&MongoSys>,
-    dataset: &Dataset,
+    mongo_sys: Option<&dyn MongoCheckpointStore>,
+    dataset: &DatasetSpec,
     current_schema_json: Option<&str>,
 ) -> Option<MongoCheckpointMetadata> {
     let sys = mongo_sys?;
@@ -393,7 +334,10 @@ async fn persisted_checkpoint(
     Some(metadata)
 }
 
-async fn clear_persisted_token(mongo_sys: Option<&MongoSys>, dataset: &Dataset) {
+async fn clear_persisted_token(
+    mongo_sys: Option<&dyn MongoCheckpointStore>,
+    dataset: &DatasetSpec,
+) {
     if let Some(sys) = mongo_sys
         && let Err(error) = sys.delete().await
     {
@@ -407,9 +351,9 @@ async fn clear_persisted_token(mongo_sys: Option<&MongoSys>, dataset: &Dataset) 
 
 fn serialize_current_schema(
     schema: &SchemaRef,
-    dataset_name: &datafusion::sql::TableReference,
+    dataset_name: &datafusion::common::TableReference,
 ) -> Option<String> {
-    match MongoSys::serialize_schema(schema) {
+    match arrow_tools::schema::schema_to_json(schema) {
         Ok(json) => Some(json),
         Err(error) => {
             tracing::warn!(
@@ -442,11 +386,11 @@ fn resume_token_error_code(error: &mongodb::error::Error) -> Option<i32> {
 }
 
 fn build_batch_committer(
-    mongo_sys: Option<&Arc<MongoSys>>,
+    mongo_sys: Option<&Arc<dyn MongoCheckpointStore>>,
     tail_token: Option<ResumeToken>,
     tail_cluster_time: Option<i64>,
     schema_json: Option<&str>,
-    dataset_name: &datafusion::sql::TableReference,
+    dataset_name: &datafusion::common::TableReference,
 ) -> Box<dyn CommitChange + Send + Sync> {
     let Some(sys) = mongo_sys else {
         return Box::new(NoOpCommitter);
@@ -505,7 +449,7 @@ impl ResumeTokenInvalidBehavior {
 }
 
 pub(crate) struct MongoResumeTokenCommitter {
-    mongo_sys: Arc<MongoSys>,
+    mongo_sys: Arc<dyn MongoCheckpointStore>,
     resume_token_json: String,
     cluster_time_ts: Option<i64>,
     schema_json: Option<String>,
@@ -513,7 +457,7 @@ pub(crate) struct MongoResumeTokenCommitter {
 
 impl MongoResumeTokenCommitter {
     fn new(
-        mongo_sys: Arc<MongoSys>,
+        mongo_sys: Arc<dyn MongoCheckpointStore>,
         resume_token_json: String,
         cluster_time_ts: Option<i64>,
         schema_json: Option<String>,
@@ -548,8 +492,7 @@ async fn try_open_change_stream(
     collection: &Collection<Document>,
     config: &ChangeStreamConfig,
     resume_token: Option<ResumeToken>,
-    session: &mut ClientSession,
-) -> mongodb::error::Result<SessionChangeStream<ChangeStreamEvent<Document>>> {
+) -> mongodb::error::Result<ChangeStream<ChangeStreamEvent<Document>>> {
     let mut watch = collection
         .watch()
         .full_document(FullDocumentType::UpdateLookup)
@@ -560,21 +503,17 @@ async fn try_open_change_stream(
         watch = watch.resume_after(resume_token);
     }
 
-    // Bind the watch to our explicit session so its getMores run on it and
-    // advance `session.operation_time()` (read by the idle heartbeat). The
-    // returned stream owns its cursor and does not retain the session borrow.
-    watch.session(session).await
+    watch.await
 }
 
 async fn open_change_stream(
     collection: &Collection<Document>,
     config: &ChangeStreamConfig,
-    dataset_name: &datafusion::sql::TableReference,
+    dataset_name: &datafusion::common::TableReference,
     collection_name: &str,
     resume_token: Option<ResumeToken>,
-    session: &mut ClientSession,
-) -> Result<SessionChangeStream<ChangeStreamEvent<Document>>, StreamError> {
-    try_open_change_stream(collection, config, resume_token, session)
+) -> Result<ChangeStream<ChangeStreamEvent<Document>>, StreamError> {
+    try_open_change_stream(collection, config, resume_token)
         .await
         .map_err(|error| {
             StreamError::External(format!(
@@ -596,7 +535,7 @@ fn is_stale_resume_token_error(error: &mongodb::error::Error) -> bool {
 async fn snapshot_stream(
     table_provider: Arc<dyn TableProvider>,
 ) -> Result<SendableRecordBatchStream, data_components::cdc::StreamError> {
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
     let df = ctx
         .read_table(table_provider)
         .map_err(|error| data_components::cdc::StreamError::Arrow(error.to_string()))?;
@@ -605,37 +544,23 @@ async fn snapshot_stream(
         .map_err(|error| data_components::cdc::StreamError::Arrow(error.to_string()))
 }
 
-/// Adapt a session-bound change stream into a plain `Stream` of events so the
-/// caller can reuse `chunks_timeout` (a `SessionChangeStream` is not a `Stream`,
-/// since advancing it needs `&mut ClientSession`).
-fn mongodb_event_stream(
-    mut stream: SessionChangeStream<ChangeStreamEvent<Document>>,
-    mut session: ClientSession,
-    server_commit_ms: Arc<AtomicI64>,
-    dataset_name: datafusion::sql::TableReference,
-) -> impl Stream<Item = Result<ChangeStreamEvent<Document>, StreamError>> {
-    try_stream! {
-        while stream.is_alive() {
-            let maybe_event = stream.next_if_any(&mut session).await.map_err(|error| {
-                StreamError::External(format!(
-                    "Failed to read MongoDB Change Stream event for dataset `{dataset_name}`: {error}"
-                ))
-            })?;
-
-            if let Some(ts) = session.operation_time() {
-                server_commit_ms.store(i64::from(ts.time).saturating_mul(1000), Ordering::Relaxed);
-            }
-
-            if let Some(event) = maybe_event {
-                yield event;
-            }
-            // `None` => empty getMore: nothing to yield; the clock is already updated.
-        }
-    }
+fn collect_change_events(
+    batch: Vec<mongodb::error::Result<ChangeStreamEvent<Document>>>,
+    dataset: &DatasetSpec,
+) -> Result<Vec<ChangeStreamEvent<Document>>, data_components::cdc::StreamError> {
+    batch
+        .into_iter()
+        .collect::<mongodb::error::Result<Vec<_>>>()
+        .map_err(|error| {
+            data_components::cdc::StreamError::External(format!(
+                "Failed to read MongoDB Change Stream event for dataset `{}`: {error}",
+                dataset.name
+            ))
+        })
 }
 
 fn resolve_primary_keys(
-    dataset_name: &datafusion::sql::TableReference,
+    dataset_name: &datafusion::common::TableReference,
     acceleration: Option<&Acceleration>,
     schema: &SchemaRef,
 ) -> Result<Vec<String>, data_components::cdc::StreamError> {
@@ -841,7 +766,7 @@ mod tests {
     use datafusion_table_providers::util::{
         column_reference::ColumnReference, constraints::UpsertOptions,
     };
-    use runtime::component::dataset::acceleration::{Acceleration, RefreshMode};
+    use runtime_component::dataset::acceleration::{Acceleration, RefreshMode};
     use secrecy::SecretString;
     use std::collections::HashMap;
 
@@ -884,7 +809,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let keys = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect("valid CDC config");
         assert_eq!(keys, vec!["_id".to_string()]);
@@ -892,7 +817,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_acceleration() {
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, None, &schema())
             .expect_err("missing acceleration should fail");
 
@@ -916,7 +841,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("arrow acceleration should fail");
 
@@ -932,7 +857,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("missing primary key should fail");
 
@@ -949,7 +874,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("missing upsert should fail");
         assert!(error.to_string().contains("on_conflict"));
@@ -972,7 +897,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("non-_id primary key should fail");
         assert!(error.to_string().contains("primary_key: _id"));
@@ -991,7 +916,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("composite primary key should fail before on_conflict hint");
 
@@ -1015,7 +940,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema_without_id())
             .expect_err("missing _id column should fail");
 

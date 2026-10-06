@@ -22,18 +22,26 @@ limitations under the License.
 //! scan/update plumbing. The provider drives these from its insert/delete path.
 
 use super::delete::CayenneDeletionSink;
-use super::pk_index::{CachedPkIndex, PkExistenceRef, ShardedPkIndex};
+use super::pk_index::{
+    CachedPkIndex, CheckedOutShardedPkIndex, PendingPkExistence, PkCheckoutGuard, PkDigestSet,
+    PkExistenceRef,
+};
+use super::pk_validation::null_primary_key_message;
+use super::table::DeletionRequestSource;
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
-use arrow_row::{OwnedRow, RowConverter};
 use arrow_schema::SchemaRef;
+
+use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
+use datafusion::execution::TaskContext;
 use datafusion_catalog::Session;
 use datafusion_expr::Expr;
 use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use hash_index::PrehashedBuildHasher;
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -48,7 +56,13 @@ use super::table::{
     record_cayenne_write_phase,
 };
 
-pub(crate) struct PreparedOnConflictDeletionPublish {
+/// Prepared deletion metadata and process-local visibility state for a staged upsert.
+pub struct PreparedOnConflictDeletionPublish {
+    pub(crate) durable_payload: Option<PreparedOnConflictDurablePayload>,
+    pub(crate) cleanup_armed: bool,
+    pub(crate) pending_inline_tombstone_owned: bool,
+    pub(crate) table: CayenneTableProvider,
+    pub(crate) publish_as_protected_snapshot: bool,
     pub(crate) target_snapshot_id: String,
     pub(crate) snapshot_sequence: i64,
     pub(crate) delete_sequence: Option<i64>,
@@ -87,6 +101,129 @@ pub(crate) struct PreparedOnConflictDeletionPublish {
     /// SAME `Int64Pk` deletions in two encodings (i64 + committed byte keys), so
     /// summing their lengths double-counts, and neither captures `position_deletions`.
     pub(crate) superseded: usize,
+}
+
+pub(crate) struct PreparedOnConflictDurablePayload {
+    pub(crate) table_id: String,
+    pub(crate) delete_files: Vec<crate::metadata::DeleteFile>,
+    pub(crate) insert_pk_bytes: Vec<Vec<u8>>,
+    pub(crate) inline_tombstone: Option<crate::metadata::InlinedDelete>,
+    pub(crate) pending_durable_flips: Vec<String>,
+}
+
+impl PreparedOnConflictDeletionPublish {
+    /// The commit sequence this staged upsert publishes under. An on-conflict
+    /// append carries no `append_sequence`, so this is the value its validated
+    /// primary keys must be stamped with for per-key optimistic concurrency.
+    #[must_use]
+    pub fn snapshot_sequence(&self) -> i64 {
+        self.snapshot_sequence
+    }
+
+    /// Return the exact deletion-vector paths owned by abort cleanup.
+    pub fn cleanup_paths(&self) -> Vec<std::path::PathBuf> {
+        self.durable_payload
+            .as_ref()
+            .map_or_else(Vec::new, |payload| {
+                payload
+                    .delete_files
+                    .iter()
+                    .map(|file| std::path::PathBuf::from(&file.path))
+                    .collect()
+            })
+    }
+
+    /// Mark the durable metadata committed and disarm destructive abort cleanup.
+    pub fn mark_catalog_committed(&mut self) {
+        self.cleanup_armed = false;
+        self.pending_inline_tombstone_owned = false;
+    }
+
+    /// Relinquish process-local bookkeeping without deleting physical files.
+    ///
+    /// Used when a shared transaction's durable outcome is mixed or cannot be
+    /// read. The top-level WAL remains authoritative for restart recovery, so
+    /// deleting staged vectors would be unsafe, but counters and deferred flips
+    /// owned by this process must still be restored before the value is dropped.
+    pub fn retain_files_for_wal_recovery(&mut self) {
+        if let Some(payload) = self.durable_payload.as_mut() {
+            self.table.restore_aborted_inline_tombstone_bookkeeping(
+                &mut self.pending_inline_tombstone_owned,
+                &mut payload.pending_durable_flips,
+            );
+        } else {
+            let mut no_pending_flips = Vec::new();
+            self.table.restore_aborted_inline_tombstone_bookkeeping(
+                &mut self.pending_inline_tombstone_owned,
+                &mut no_pending_flips,
+            );
+        }
+        self.cleanup_armed = false;
+    }
+
+    /// Disarm abort cleanup when recovery proves that an ambiguously completed
+    /// shared transaction committed this payload. Exact path matching is used:
+    /// an unrelated later catalog row must never retain this batch's files.
+    pub(crate) fn mark_catalog_committed_if_paths_match(
+        &mut self,
+        committed_paths: &std::collections::HashSet<String>,
+    ) -> bool {
+        let Some(payload) = self.durable_payload.as_ref() else {
+            return true;
+        };
+        if payload
+            .delete_files
+            .iter()
+            .all(|file| committed_paths.contains(&file.path))
+        {
+            self.mark_catalog_committed();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for PreparedOnConflictDeletionPublish {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        if let Some(payload) = self.durable_payload.as_mut() {
+            self.table.restore_aborted_inline_tombstone_bookkeeping(
+                &mut self.pending_inline_tombstone_owned,
+                &mut payload.pending_durable_flips,
+            );
+        } else {
+            let mut no_pending_flips = Vec::new();
+            self.table.restore_aborted_inline_tombstone_bookkeeping(
+                &mut self.pending_inline_tombstone_owned,
+                &mut no_pending_flips,
+            );
+        }
+        let paths = self.cleanup_paths();
+        if paths.is_empty() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                super::delete::cleanup_uncommitted_delete_paths(&paths).await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                for path in paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "Failed to clean uncommitted deletion-vector file"
+                        ),
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// One published inline tombstone's removal effect, recorded so the inline-cache
@@ -247,24 +384,156 @@ impl InlinedDataRewrite {
     }
 }
 
+/// Where [`InlineAwareDeletionSink`] gets the deletion-vector sink it publishes
+/// through. Not itself a sink — see [`super::delete::sink::file_based`] for the
+/// file-based delete route, which is a different delete strategy entirely.
+///
+/// A [`CayenneDeletionSink`] captures the tiers it will scan when it is BUILT and
+/// re-reads only the main listing at execution, so every other source — the
+/// protected snapshots a mem-tier checkpoint publishes into, the cold tier — is
+/// frozen at build time. How far that freeze can drift from the delete depends on
+/// who builds the sink and when.
+pub(crate) enum DeletionSinkSource {
+    /// Built by the caller immediately before it drives the sink itself
+    /// (`delete_from_cdc_fast`, the CDC apply loop's own delete path). Its window
+    /// is whatever separates those two statements; this is its pre-existing shape,
+    /// neither widened nor narrowed here.
+    Prebuilt(Box<CayenneDeletionSink>),
+    /// Built inside the execution-time `write_lock` hold, after the in-memory CDC
+    /// tier is checkpointed in that same hold.
+    ///
+    /// `TableProvider::delete_from` builds a plan and executes it as two separate
+    /// steps, so building here left the delete judging the table by a capture taken
+    /// before any apply that landed in between: a row that arrived after it is in no
+    /// scan source, so a predicate naming it deletes nothing, and — worse — an upsert
+    /// that superseded a durable row leaves the scan matching the SUPERSEDED version,
+    /// so the key tombstone hides the KEY and takes the live replacement with it
+    /// (#13828, the lost-update shape #13574 closed one tier over).
+    ///
+    /// This closes that gap, not every drift: a mem-tier checkpoint publishes its
+    /// snapshot under `listing_fence` rather than `write_lock`, so one can still
+    /// appear mid-delete — the residual race `CayenneDeletionSink::live_main_insert_records`
+    /// documents and downgrades for.
+    BuildAtExecution(DeletionRequestSource),
+}
+
 pub(crate) struct InlineAwareDeletionSink {
     pub(crate) table: CayenneTableProvider,
-    pub(crate) file_sink: CayenneDeletionSink,
+    pub(crate) file_sink: DeletionSinkSource,
     pub(crate) filters: Vec<Expr>,
+}
+
+/// `true` when the delete targets every row — an empty filter list, or every
+/// filter being the always-true literal `true` (a TRUNCATE / `DELETE … WHERE
+/// TRUE`, which the CDC truncate path emits as `vec![lit(true)]`).
+pub(crate) fn is_delete_all(filters: &[Expr]) -> bool {
+    filters.iter().all(|filter| {
+        matches!(
+            filter,
+            Expr::Literal(datafusion_common::ScalarValue::Boolean(Some(true)), _)
+        )
+    })
+}
+
+/// Taints the maintained live row count's exactness around a user `DELETE`.
+///
+/// A delete tombstones rows the persisted `num_rows` still counts, and nothing
+/// re-derives that count — `cached_table_statistics_for_optimizer` only *masks*
+/// the drift while `has_pending_deletions()` holds. Any path that folds the
+/// tombstone (compaction, overwrite, datalake promotion, the seq-prefix bake)
+/// drops that mask, and one that does not also re-baseline the count with
+/// [`RowCountUpdate::Set`] leaves it served `Exact` over a stale value — which a
+/// distributed `COUNT(*)` can substitute into its result. Tainting exactness at
+/// delete time makes the mask no longer the only thing standing between a stale
+/// count and an `Exact` answer, for every fold path at once.
+///
+/// The count itself is deliberately left alone rather than decremented: the
+/// deleted total spans tiers the persisted count does not uniformly include (a
+/// delete-all also purges the mem tier), so subtracting it can under-count. An
+/// over-count served `Inexact` is a planner estimate; an under-count that a later
+/// `Set` has not yet corrected would be a wrong answer.
+///
+/// [`RowCountUpdate::Set`]: super::column_stats::RowCountUpdate::Set
+pub(crate) struct RowCountExactnessTaintingDeletionSink {
+    pub(crate) table: CayenneTableProvider,
+    pub(crate) inner: Arc<dyn DeletionSink>,
+}
+
+#[async_trait]
+impl DeletionSink for RowCountExactnessTaintingDeletionSink {
+    async fn delete_from(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Taint BEFORE the inner delete, which publishes durably and cannot be
+        // undone. Taint-then-delete can only leave the count conservative (a
+        // delete that removes nothing, errors, or is cancelled costs the metadata
+        // `COUNT(*)` fast path until the next full rewrite); delete-then-taint
+        // leaves the *unsafe* residue — a cancellation, crash, or failed
+        // statistics write between the two, after which the tombstone is durable
+        // while `num_rows_exact` still claims the stale count is the live one, and
+        // a later fold un-masks it as `Exact`. This mirrors
+        // `PkKeysetInvalidatingDeletionSink`'s unconditional pre-delete
+        // `mark_pk_keyset_occ_degraded`, and for the same reason: on this path the
+        // conservative direction is free and the optimistic one is a wrong answer.
+        self.table.taint_persisted_row_count_exactness().await;
+        self.inner.delete_from(context).await
+    }
 }
 
 pub(crate) struct PkKeysetInvalidatingDeletionSink {
     pub(crate) table: CayenneTableProvider,
     pub(crate) inner: Arc<dyn DeletionSink>,
+    /// The delete request's filters, needed to recognize a delete-all so the
+    /// mem-tier can be purged alongside the inner sink's file-side work.
+    pub(crate) filters: Vec<Expr>,
 }
 
 #[async_trait]
 impl DeletionSink for PkKeysetInvalidatingDeletionSink {
     async fn delete_from(
         &self,
+        context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         self.table.mark_maintained_aggregates_stale();
-        let deleted = self.inner.delete_from().await?;
+        // Degrade per-key OCC BEFORE the inner delete runs. `self.inner.delete_from`
+        // draws the delete sequence and (for an upsert table) leaves the deleted
+        // keys stale-present in the Exact keyset with their pre-delete stamps, and
+        // it acquires + releases the table `write_lock` INTERNALLY. If the flag were
+        // set only afterward, a transaction commit could acquire `write_lock` in the
+        // window between the inner delete releasing it and this flag write, run
+        // `transaction_has_conflict` against a non-degraded keyset, trust a
+        // stale-present stamp, and resurrect a just-deleted key (a missed conflict).
+        // Setting the flag first (a `Release` store) orders it ahead of any commit
+        // that can observe the delete's effects. It is set unconditionally here
+        // (before we know the deleted count): degrading on a zero-row delete only
+        // costs a conservative per-table fallback until the next rebuild, never a
+        // missed conflict. A `DoNothing` table's post-delete `clear_cached_pk_keyset`
+        // below resets the flag and rebuilds exact; an upsert table keeps the
+        // stale-superset keyset and stays degraded until its next rebuild.
+        self.table.mark_pk_keyset_occ_degraded();
+        let mut deleted = self.inner.delete_from(context).await?;
+
+        // The mem-tier is a tier this sink cannot see: it records `(file,
+        // file-local position)` deletes, and rows resident in RAM live in no file.
+        // A table with no primary key reaches this sink for EVERY delete
+        // (`pk_deletion_strategy` is `PositionBased` exactly then), so without this
+        // a `mode: memory` table could neither be emptied nor filtered.
+        //
+        // `apply_mem_tier_delete` needs the table `write_lock`, which the inner
+        // sink takes and releases internally, so acquire it here rather than
+        // nesting. Before the `deleted > 0` bookkeeping below: on a table whose
+        // rows are ONLY in the mem-tier the inner count is 0, and the cached scan
+        // statistics still need invalidating once this changes the visible count.
+        {
+            let _guard = self.table.write_lock.lock().await;
+            deleted = deleted.saturating_add(
+                apply_mem_tier_delete(&self.table, &self.filters)
+                    .await
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?,
+            );
+        }
+
         if deleted > 0 {
             // Keyset clear-on-delete avoidance (cycle-4 incremental lever).
             //
@@ -281,7 +550,7 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
             // at ~6106 and the Bloom arm at ~6159 keep the row and emit at most a
             // no-op delete). So for upsert tables we SKIP the clear entirely and
             // keep the stale-superset index — eliminating the O(live-rows)
-            // `load_existing_keyset` cold rebuild the next CDC insert batch would
+            // `load_existing_pk_index` cold rebuild the next CDC insert batch would
             // otherwise pay (measured 277 ms × 244 = 68 s/600 s on `new_order`).
             //
             // `DoNothing` tables need an EXACT answer (a stale-present entry would
@@ -289,6 +558,10 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
             // ~6105), and their keys are not enumerable on this filter path, so
             // they keep the conservative full clear and rebuild next batch.
             // `upsert_bloom_eligible()` is precisely "is this an `Upsert` table".
+            // Upsert tables keep the stale-superset keyset (already degraded before
+            // the delete above, so its stale stamps are never trusted until the
+            // next rebuild); `DoNothing` tables need exactness, so clear and rebuild
+            // next batch (which also resets the degraded flag).
             if !self.table.upsert_bloom_eligible() {
                 self.table.clear_cached_pk_keyset();
             }
@@ -304,25 +577,135 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
     }
 }
 
+/// The mem-tier arm of a `DELETE`, shared by both deletion sinks.
+///
+/// Neither sink can see the in-memory tier: one addresses `(file, file-local
+/// position)` pairs and the other durable-file plus catalog-inlined rows, and a
+/// RAM-resident row is in none of those. Under `mode: memory` the tier is the
+/// PERMANENT store, so what the sinks miss is the whole table.
+///
+/// The background retention pass deliberately does NOT come through here: it calls
+/// `delete_mem_tier_rows_matching` directly, because the delete-all branch below releases
+/// the discarded bytes against the process-global mem-tier budget, which a
+/// memory-resident write never reserved. See `CayenneTableProvider::apply_retention_filters`.
+///
+/// Delete-all discards the tier wholesale (#11987, #12072). A filtered delete
+/// evaluates the predicate against the tier and rebuilds it without the matching
+/// rows (#12008), for memory-resident tables only — see
+/// `delete_mem_tier_rows_matching` for why the other memory profile is excluded.
+///
+/// The two arms are not symmetric: the delete-all branch applies to every mode
+/// and carries slot-advancer and budget bookkeeping, while the filtered branch
+/// self-gates on memory residency and carries neither.
+///
+/// Rebuilding is the general mechanism rather than landing an in-RAM tombstone per
+/// matched key. A tombstone is keyed by primary key and hides every row at or
+/// below its sequence, so a key whose live version an upsert wrote after this
+/// delete read the tier would be taken with it — the lost-update shape #13574
+/// closed one tier over. Doing it by key WOULD let the predicate pass run off-lock
+/// (the split `SegmentTombstones` already exists for the CDC delete path, and
+/// `transaction_has_conflict` is the footprint check that would make it safe), and
+/// is the optimization to reach for if this hold ever measures as a problem — but
+/// it cannot serve a table with no primary key, which is exactly the table that
+/// reaches the position-based sink.
+///
+/// The caller must hold the table `write_lock`.
+async fn apply_mem_tier_delete(
+    table: &CayenneTableProvider,
+    filters: &[Expr],
+) -> crate::provider::Result<u64> {
+    if is_delete_all(filters) {
+        table.purge_mem_tier_all().await
+    } else {
+        table
+            .delete_mem_tier_rows_matching(filters)
+            .await
+            .map_err(|error| crate::provider::Error::DataFusion { source: error })
+    }
+}
+
 #[async_trait]
 impl DeletionSink for InlineAwareDeletionSink {
     async fn delete_from(
         &self,
+        _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let _write_guard = self.table.write_lock.lock().await;
         self.table.mark_maintained_aggregates_stale();
 
-        let inlined_deleted = self
-            .table
-            .delete_inlined_rows_matching_filters(&self.filters)
-            .await?;
-        let file_deleted = self.file_sink.delete_from().await?;
+        // Make the in-memory CDC tier durable and capture the scan sources inside
+        // THIS hold, so no apply lands between the capture and the delete it is
+        // judged by (#13828). The two are not separable: a checkpoint publishes its
+        // rows as a protected snapshot, and the sink freezes the protected set it
+        // will scan. See [`DeletionSinkSource`].
+        let built_at_execution;
+        let file_sink = match &self.file_sink {
+            DeletionSinkSource::Prebuilt(sink) => sink.as_ref(),
+            DeletionSinkSource::BuildAtExecution(source) => {
+                // A no-op in `mode: memory`, which has no Vortex tier to checkpoint
+                // into — there the tier is reconciled below by
+                // `apply_mem_tier_delete`.
+                self.table.checkpoint_mem_tier_for_delete().await?;
+                built_at_execution = self
+                    .table
+                    .build_deletion_vector_sink(&self.filters, None, *source)
+                    .await?;
+                &built_at_execution
+            }
+        };
 
-        let deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
+        let (inline_rewrite, inlined_deleted) = self
+            .table
+            .prepare_inlined_rows_matching_filters(&self.filters)
+            .await?;
+        let mut prepared_file_delete = file_sink.prepare_delete().await?;
+        let file_deleted = prepared_file_delete
+            .as_ref()
+            .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);
+
+        if !inline_rewrite.is_empty() || prepared_file_delete.is_some() {
+            let delete_files = prepared_file_delete
+                .as_ref()
+                .map_or_else(Vec::new, |prepared| prepared.delete_files().to_vec());
+            if let Err(error) = self
+                .table
+                .metadata_catalog()
+                .commit_delete_files_with_inlined_rewrite(
+                    delete_files,
+                    self.table.table_id(),
+                    inline_rewrite.updated_data.clone(),
+                    inline_rewrite.deleted_inlined_ids.clone(),
+                )
+                .await
+            {
+                return Err(Box::new(error));
+            }
+            if let Some(prepared) = &mut prepared_file_delete {
+                prepared.mark_catalog_committed();
+            }
+            if let Some(prepared) = prepared_file_delete {
+                prepared.publish()?;
+            }
+            if !inline_rewrite.is_empty() {
+                self.table.publish_inlined_rewrite(&inline_rewrite);
+            }
+        }
+
+        let mut deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
             Box::new(datafusion_common::DataFusionError::Execution(
                 "Deleted row count overflowed u64".to_string(),
             )) as Box<dyn std::error::Error + Send + Sync>
         })?;
+
+        // The mem-tier is a tier this sink cannot see: the file/inline sink above
+        // tombstones durable file rows and catalog-inlined data only, so rows
+        // resident in RAM survive it. Runs under the `write_lock` held above, so
+        // no concurrent apply mutates the tier between the decision and the swap.
+        deleted = deleted.saturating_add(
+            apply_mem_tier_delete(&self.table, &self.filters)
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
 
         if deleted > 0 {
             // Keyset clear-on-delete avoidance (cycle-4 incremental lever) — see
@@ -331,10 +714,16 @@ impl DeletionSink for InlineAwareDeletionSink {
             // here. For an `Upsert` table a stale-present existence entry only
             // yields a harmless redundant delete on a later re-insert (the
             // `PkBloom` false-positive invariant, see `provider::pk_index::PkBloom`), so we SKIP
-            // the clear and avoid the O(live-rows) `load_existing_keyset` rebuild
+            // the clear and avoid the O(live-rows) `load_existing_pk_index` rebuild
             // the next insert batch would pay. `DoNothing` tables need exactness
             // (a stale entry would wrongly drop a new row) and keep the full clear.
-            if !self.table.upsert_bloom_eligible() {
+            if self.table.upsert_bloom_eligible() {
+                // Upsert stale-superset keyset: retained deleted keys keep their
+                // pre-delete per-key OCC stamps — degrade to the per-table
+                // fallback until rebuild (see the twin site in
+                // `PkKeysetInvalidatingDeletionSink::delete_from`).
+                self.table.mark_pk_keyset_occ_degraded();
+            } else {
                 self.table.clear_cached_pk_keyset();
             }
             if file_deleted > 0 && self.table.pk_deletion_strategy.is_position_based() {
@@ -351,7 +740,7 @@ pub(crate) struct BatchValidationResult {
     /// Per-file position deletes for located conflict rows: file path -> deleted
     /// file-local row positions. Empty unless `deletion_mode: position`.
     pub(crate) delete_specs: Vec<(Arc<str>, Vec<u64>)>,
-    pub(crate) kept_keys: HashSet<OwnedRow>,
+    pub(crate) kept_keys: PkDigestSet,
     /// File-backed Int64 PK values being deleted (for `Int64Pk` strategy).
     pub(crate) deleted_pk_i64: Vec<i64>,
     /// File-backed row key bytes being deleted (for `RowConverterBased` strategy).
@@ -369,6 +758,66 @@ pub(crate) struct PreparedInsertStream {
     pub(crate) stream: SendableRecordBatchStream,
     post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
     may_have_on_conflict_deletions: bool,
+}
+
+/// Stream wrapper that enforces the non-null primary-key invariant without
+/// performing conflict detection. `pk_conflict_detection: none` disables only
+/// the existence lookup; it must not make invalid rows writable.
+pub(crate) struct PrimaryKeyValidationStream {
+    inner: SendableRecordBatchStream,
+    schema: SchemaRef,
+    pk_indices: Vec<usize>,
+    table_name: String,
+}
+
+impl PrimaryKeyValidationStream {
+    pub(crate) fn new(
+        inner: SendableRecordBatchStream,
+        pk_indices: Vec<usize>,
+        table_name: String,
+    ) -> Self {
+        let schema = inner.schema();
+        Self {
+            inner,
+            schema,
+            pk_indices,
+            table_name,
+        }
+    }
+}
+
+impl futures::Stream for PrimaryKeyValidationStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                if this
+                    .pk_indices
+                    .iter()
+                    .any(|&index| batch.column(index).null_count() > 0)
+                {
+                    Poll::Ready(Some(Err(datafusion_common::DataFusionError::Execution(
+                        format!(
+                            "Data validation failed for table '{}': {}",
+                            this.table_name,
+                            null_primary_key_message(&batch, &this.pk_indices)
+                        ),
+                    ))))
+                } else {
+                    Poll::Ready(Some(Ok(batch)))
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+impl RecordBatchStream for PrimaryKeyValidationStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 }
 
 impl PreparedInsertStream {
@@ -408,8 +857,9 @@ impl PreparedInsertStream {
 /// wrapped in an [`OnConflictValidationStream`] — because the sharded path runs
 /// the on-conflict validation PER SHARD after splitting each batch by
 /// `shard_of_pk`. The pre-apply existence snapshot is carried as a
-/// [`ShardedPkIndex`] (one existence view per shard), so a shard validates only
-/// against its own keys (a key's whole history is confined to one shard, §3.1).
+/// [`CheckedOutShardedPkIndex`] (one existence view per shard, plus the checkout
+/// window opened over the cache gap), so a shard validates only against its own
+/// keys (a key's whole history is confined to one shard, §3.1).
 ///
 /// The single-shard (`n == 1`) path never uses this — it takes the existing
 /// `prepare_stream_for_insert` flow unchanged, keeping N=1 byte-identical.
@@ -418,13 +868,16 @@ pub(crate) struct PreparedShardedInsertStream {
     pub(crate) stream: SendableRecordBatchStream,
     /// PK column indices (in the stream's schema) for the shard split + validate.
     pub(crate) pk_indices: Vec<usize>,
-    /// The PK existence converter, reused across the apply's batches.
-    pub(crate) converter: RowConverter,
-    /// Pre-apply per-shard existence snapshot. `None` when conflict detection is
-    /// off (`pk_conflict_detection: none`) or the source trusts uniqueness — the
-    /// drain then appends every row with no validation, mirroring the immediate
-    /// path.
-    pub(crate) sharded_index: Option<ShardedPkIndex>,
+    /// The PK existence converter, reused across the apply's batches. An `Arc`
+    /// so it can be the table's cached `pk_row_converter` (zero per-apply rebuild)
+    /// for composite PKs, or a freshly built one for `Int64` PKs (no cache).
+    pub(crate) converter: Arc<RowConverter>,
+    /// Pre-apply per-shard existence snapshot, paired with the checkout window it
+    /// was taken under. `None` when conflict detection is off
+    /// (`pk_conflict_detection: none`) or the source trusts uniqueness — the drain
+    /// then appends every row with no validation, mirroring the immediate path, and
+    /// no window was opened.
+    pub(crate) sharded_index: Option<CheckedOutShardedPkIndex>,
     /// The resolved on-conflict behavior for this table.
     pub(crate) on_conflict: OnConflict,
 }
@@ -586,18 +1039,6 @@ pub(crate) enum PkDeletionSnapshot {
     RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
 }
 
-/// One memoized merged (file ∪ mem-tier) deletion snapshot for the scan path.
-/// See the `merged_scan_deletions` field docs for the key's torn-state proof.
-pub(crate) struct MergedScanDeletions {
-    /// `Arc::as_ptr` identity of the FILE-side index the merge was built from.
-    pub(crate) file_index_ptr: usize,
-    /// [`crate::provider::mem_tier::MemTier::version`] of the tier merged in.
-    pub(crate) tier_version: u64,
-    /// Structural epoch observed when the memo was built.
-    pub(crate) structural_epoch: u64,
-    pub(crate) merged: PkDeletionSnapshot,
-}
-
 /// PK membership of a mem-tier checkpoint's flushed corpus (the visible inline +
 /// tier rows being encoded into the new snapshot), keyed by deletion strategy.
 /// Splits the tier's tombstones at durable-commit time: a tombstoned key WITH a
@@ -654,40 +1095,18 @@ impl PkDeletionSnapshot {
         }
     }
 
-    /// Extend this snapshot by ONE append's tombstone delta — O(delta), the
-    /// persistent-index extend. Used by the append path to keep the
-    /// merged-scan-deletions memo CURRENT in lockstep (under sustained CDC the
-    /// version-keyed memo can otherwise never hit: every append bumps the tier
-    /// version, and the O(tier) rebuild per scan was the churn-coupled collapse
-    /// the `mem_tier_join_shapes` live lanes measure at 175-247x).
-    pub(crate) fn extended_by_delta(
-        &self,
-        delta: &crate::provider::mem_tier::SegmentTombstones,
-    ) -> Self {
-        // Every key in `delta` shares one reserved delete sequence (one CDC
-        // apply), so the memo extend applies that single scalar to all of them —
-        // identical to extending by a per-key map whose values are all that seq.
-        let seq = delta.delete_sequence();
+    /// Count of re-insert records in this snapshot — keys whose tombstone is
+    /// superseded by a later insert.
+    ///
+    /// Its ratio to [`Self::delete_len`] is how much of the index is dead
+    /// weight: in an upsert workload most tombstones are immediately superseded,
+    /// so a high ratio means the index's size is carrying history the probe no
+    /// longer needs. `0` for `PositionBased`, matching `delete_len`.
+    pub(crate) fn insert_len(&self) -> usize {
         match self {
-            Self::PositionBased => Self::PositionBased,
-            Self::Int64Pk { tombstones } => {
-                if delta.is_int64_empty() {
-                    return self.clone();
-                }
-                let updated = tombstones.extend_max_deletes(delta.int64_keys().map(|pk| (pk, seq)));
-                Self::Int64Pk {
-                    tombstones: Arc::new(updated),
-                }
-            }
-            Self::RowConverterBased { tombstones } => {
-                if delta.is_row_keys_empty() {
-                    return self.clone();
-                }
-                let updated = tombstones.extend_max_deletes(delta.row_keys().map(|key| (key, seq)));
-                Self::RowConverterBased {
-                    tombstones: Arc::new(updated),
-                }
-            }
+            Self::PositionBased => 0,
+            Self::Int64Pk { tombstones } => tombstones.insert_len(),
+            Self::RowConverterBased { tombstones } => tombstones.insert_len(),
         }
     }
 
@@ -785,6 +1204,10 @@ pub(crate) struct ProtectedSnapshotScan<'a> {
     /// View-typed read schema so protected-snapshot scans match the main file
     /// scan in the union (see `viewify_read_schema`).
     pub(crate) read_schema: SchemaRef,
+    /// The main scan's secondary index selection and pinned view, applied to
+    /// each protected snapshot's files as to the current snapshot's.
+    pub(crate) lookup_selection: Option<super::lookup_index::LookupSelection>,
+    pub(crate) pinned_lookup_index: Option<Arc<super::lookup_index::LookupIndexView>>,
 }
 
 pub(crate) struct PreparedProtectedSnapshotUpdate {
@@ -795,7 +1218,26 @@ pub(crate) struct PreparedProtectedSnapshotUpdate {
 #[derive(Default)]
 pub(crate) struct PostValidationState {
     pub(crate) on_conflict_deletions: OnConflictDeletions,
-    pub(crate) validated_keys: HashSet<OwnedRow>,
+    pub(crate) validated_keys: PkDigestSet,
+}
+
+/// One apply's raw batches split by PK shard
+/// ([`CayenneTableProvider::split_apply_by_pk_shard`]), with the resident bytes
+/// each shard's sub-batches hold.
+pub(crate) struct ShardedApplyBatches {
+    /// Shard s's non-empty sub-batches, in apply order.
+    pub(crate) per_shard_batches: Vec<Vec<RecordBatch>>,
+    /// Shard s's resident bytes, each Arrow allocation counted once.
+    pub(crate) per_shard_bytes: Vec<u64>,
+}
+
+impl ShardedApplyBatches {
+    /// The whole apply's resident bytes: the figure to budget and reserve.
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.per_shard_bytes
+            .iter()
+            .fold(0, |total, bytes| total.saturating_add(*bytes))
+    }
 }
 
 /// Aggregate result of one sharded in-memory CDC apply
@@ -812,7 +1254,7 @@ pub(crate) struct ShardedApplyResult {
     /// Union of every shard's on-conflict deletions (keys disjoint across shards).
     pub(crate) on_conflict_deletions: OnConflictDeletions,
     /// Union of every shard's validated (kept) keys.
-    pub(crate) validated_keys: HashSet<OwnedRow>,
+    pub(crate) validated_keys: PkDigestSet,
 }
 
 pub(crate) struct OnConflictContext<'a> {
@@ -821,7 +1263,14 @@ pub(crate) struct OnConflictContext<'a> {
     pub(crate) on_conflict: &'a OnConflict,
     pub(crate) upsert_options: &'a UpsertOptions,
     pub(crate) existing: PkExistenceRef<'a>,
-    pub(crate) incoming_keys: &'a HashSet<OwnedRow>,
+    /// Keys committed by other writers since `existing` was checked out of its
+    /// cache, which `existing` therefore cannot know about (see
+    /// [`PendingPkKeys`](super::pk_index::PendingPkKeys)).
+    /// Consulted on an `existing` miss so a key committed mid-validation is not
+    /// classified as a new primary key. `None` when nothing was committed during
+    /// this checkout — the common case.
+    pub(crate) pending: Option<&'a PendingPkExistence>,
+    pub(crate) incoming_keys: &'a HashSet<u128, PrehashedBuildHasher>,
 }
 
 pub(crate) struct OnConflictValidationStream {
@@ -833,8 +1282,8 @@ pub(crate) struct OnConflictValidationStream {
     pub(crate) on_conflict: OnConflict,
     pub(crate) upsert_options: UpsertOptions,
     existing_keys: Option<CachedPkIndex>,
-    pub(crate) incoming_keys: HashSet<OwnedRow>,
-    pub(crate) kept_keys: HashSet<OwnedRow>,
+    pub(crate) incoming_keys: HashSet<u128, PrehashedBuildHasher>,
+    pub(crate) kept_keys: PkDigestSet,
     pub(crate) delete_specs: HashMap<Arc<str>, Vec<u64>>,
     pub(crate) deleted_pk_i64: Vec<i64>,
     pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
@@ -842,10 +1291,27 @@ pub(crate) struct OnConflictValidationStream {
     pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
     reinserted_over_tombstone: usize,
     post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+    /// The checkout window `existing_keys` was taken under, held for the whole
+    /// (lazily consumed) stream and closed by the restore that stores the keyset
+    /// back. Holding it here is what closes the window when the stream is dropped
+    /// or cancelled part-way, rather than only when it finishes (see
+    /// [`PkCheckoutGuard`]).
+    ///
+    /// `None` for off-lock conditional-commit staging, which validates against a
+    /// **private** keyset built without holding `write_lock` and so never opened a
+    /// window: storing that keyset back would clobber a concurrent ordinary
+    /// writer's cache update and drop committed keys. The window itself is what
+    /// records that distinction, so there is no separate flag to fall out of step
+    /// with it.
+    pk_checkout: Option<PkCheckoutGuard>,
     finalized: bool,
 }
 
 impl OnConflictValidationStream {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "distinct stream-construction inputs; grouping them into a struct would not aid clarity"
+    )]
     pub(crate) fn new(
         table: CayenneTableProvider,
         inner: SendableRecordBatchStream,
@@ -854,6 +1320,7 @@ impl OnConflictValidationStream {
         existing_keys: CachedPkIndex,
         on_conflict: OnConflict,
         post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+        pk_checkout: Option<PkCheckoutGuard>,
     ) -> Self {
         let schema = inner.schema();
         let upsert_options = on_conflict.get_upsert_options();
@@ -866,8 +1333,8 @@ impl OnConflictValidationStream {
             on_conflict,
             upsert_options,
             existing_keys: Some(existing_keys),
-            incoming_keys: HashSet::with_capacity(1024),
-            kept_keys: HashSet::with_capacity(1024),
+            incoming_keys: HashSet::with_capacity_and_hasher(1024, PrehashedBuildHasher),
+            kept_keys: PkDigestSet::with_capacity(1024),
             delete_specs: HashMap::new(),
             deleted_pk_i64: Vec::new(),
             deleted_row_keys: Vec::new(),
@@ -875,6 +1342,7 @@ impl OnConflictValidationStream {
             deleted_inlined_row_keys: Vec::new(),
             reinserted_over_tombstone: 0,
             post_validation,
+            pk_checkout,
             finalized: false,
         }
     }
@@ -894,8 +1362,19 @@ impl OnConflictValidationStream {
             ))
         })?;
         let existing = match existing_index {
-            CachedPkIndex::Exact(keyset) => PkExistenceRef::Exact(&keyset.keys),
+            CachedPkIndex::Exact(keyset) => PkExistenceRef::Exact(keyset),
             CachedPkIndex::Bloom(bloom) => PkExistenceRef::Bloom(bloom),
+        };
+
+        // Snapshot per batch, not per stream: `existing` was checked out before the
+        // first batch, and this stream is consumed lazily as the encode runs, so a
+        // concurrent writer can commit a key between two batches of it.
+        let pending = if self.pk_checkout.is_some() {
+            self.table.pending_pk_existence()
+        } else {
+            // Off-lock staging validates against a private keyset it just built —
+            // it holds no checkout, so the log is another writer's business.
+            None
         };
 
         let mut ctx = OnConflictContext {
@@ -904,6 +1383,7 @@ impl OnConflictValidationStream {
             on_conflict: &self.on_conflict,
             upsert_options: &self.upsert_options,
             existing,
+            pending: pending.as_ref(),
             incoming_keys: &self.incoming_keys,
         };
 
@@ -937,15 +1417,19 @@ impl OnConflictValidationStream {
             .extend(deleted_inlined_row_keys);
         self.reinserted_over_tombstone += reinserted_over_tombstone;
 
-        self.incoming_keys.extend(kept_keys.iter().cloned());
-        self.kept_keys.extend(kept_keys);
+        self.incoming_keys.extend(kept_keys.digests());
+        self.kept_keys.absorb(kept_keys);
 
         Ok(filtered_batch)
     }
 
     fn store_existing_keyset(&mut self) {
-        if let Some(existing_keys) = self.existing_keys.take() {
-            self.table.store_cached_pk_index(existing_keys);
+        let existing_keys = self.existing_keys.take();
+        // Off-lock staging validates against a private keyset and must never publish
+        // it to the shared cache (see `pk_checkout`). With no window there is nothing
+        // to restore into and nothing to close — drop the keyset instead.
+        if let (Some(existing_keys), Some(checkout)) = (existing_keys, self.pk_checkout.take()) {
+            self.table.store_cached_pk_index(existing_keys, checkout);
         }
     }
 

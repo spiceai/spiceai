@@ -13,6 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+// The runtime's async call graph nests deeply enough that computing the layout of a test's
+// top-level future exceeds rustc's default 128-deep query limit. Matches the `recursion_limit`
+// the `runtime` crate itself and the sibling integration test crates set.
+#![recursion_limit = "256"]
+
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 #[cfg(feature = "mysql")]
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -22,10 +28,49 @@ use std::sync::Arc;
 
 #[cfg(feature = "postgres-accel")]
 use crate::utils::TEST_REQUEST_CONTEXT;
+
 use runtime::Runtime;
 use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
+
+// The force-links these tests depend on live in `utils`, which every binary sharing
+// these helpers includes; the guard below is what proves they are working.
+/// An engine reaches the registry only if its crate is linked into this binary, which a
+/// Cargo dependency does not guarantee — the linker drops the unreferenced slice static.
+/// Asserted here rather than left to the first accelerated test of each engine, which
+/// needs a live database and so cannot tell a missing registration apart from a missing
+/// server. Extend this with each engine that moves into its own crate.
+#[test]
+fn accelerator_crates_register_their_engines() {
+    let engines = data_accelerator_api::registered_engine_names();
+    #[cfg(feature = "postgres-accel")]
+    assert!(
+        engines.iter().any(|engine| engine == "postgres"),
+        "the postgres accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    #[cfg(feature = "sqlite")]
+    assert!(
+        engines.iter().any(|engine| engine == "sqlite"),
+        "the sqlite accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    #[cfg(feature = "turso")]
+    assert!(
+        engines.iter().any(|engine| engine == "turso"),
+        "the turso accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    #[cfg(feature = "duckdb")]
+    assert!(
+        engines.iter().any(|engine| engine == "duckdb"),
+        "the duckdb accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    #[cfg(not(windows))]
+    assert!(
+        engines.iter().any(|engine| engine == "cayenne"),
+        "the cayenne accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    let _ = &engines;
+}
 
 mod abfs;
 mod acceleration;
@@ -33,6 +78,7 @@ mod acceleration;
 mod adbc;
 mod cache;
 mod catalog;
+#[cfg(not(windows))]
 mod cayenne;
 #[cfg(not(windows))]
 mod cayenne_catalog_ddl;
@@ -61,6 +107,8 @@ mod databricks_spark_m2m;
 #[cfg(feature = "databricks")]
 mod databricks_sql_warehouse;
 #[cfg(feature = "databricks")]
+mod databricks_sql_warehouse_m2m;
+#[cfg(feature = "databricks")]
 mod databricks_sql_warehouse_permissions;
 mod dataset_availability;
 mod datasets_api;
@@ -88,6 +136,8 @@ mod iceberg;
 mod iceberg_api;
 mod json;
 
+#[cfg(feature = "debezium")]
+mod cdc_ingest;
 mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
@@ -104,9 +154,16 @@ mod mysql;
 mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
+#[cfg(not(windows))]
+mod otel_ingest_races;
+#[cfg(not(windows))]
+mod otel_restart;
+mod plan_capture;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;
+#[cfg(any(feature = "mongodb", feature = "dynamodb", feature = "cosmosdb"))]
+mod pushdown_roundtrip;
 #[cfg(feature = "rate-control")]
 mod rate_control;
 mod ready_state;
@@ -114,10 +171,12 @@ mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
 mod results_cache;
+mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
 mod s3_location_pruning;
+mod s3_parquet_overwrite;
 #[cfg(any(
     feature = "postgres",
     feature = "duckdb",
@@ -129,10 +188,14 @@ mod schema_evolution;
 mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
+// Cayenne does not build on Windows.
+#[cfg(all(feature = "snapshots", feature = "duckdb", not(windows)))]
+mod snapshot_source;
 #[cfg(feature = "snowflake")]
 mod snowflake;
 #[cfg(feature = "snowflake")]
 mod snowflake_catalog;
+mod source_unavailable;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;
@@ -146,26 +209,50 @@ mod utils;
 mod view;
 
 mod management;
-// MySQL is required for the rehydration tests
+// MySQL is required for the rehydration tests (source container); the
+// local-db verification covers whichever persistent engines are enabled.
 mod podswatcher;
-#[cfg(all(feature = "mysql", feature = "duckdb"))]
+#[cfg(all(feature = "mysql", any(feature = "duckdb", feature = "sqlite")))]
 mod rehydration;
 mod shutdown;
 
+/// The CPU entitlement every test in this binary is pinned to.
+///
+/// Sizing derived from the CPU budget — `target_partitions` above all, but also
+/// worker-thread counts and encode permits — would otherwise follow the host and
+/// make explain-plan snapshots machine-dependent.
+const TEST_CPU_CORES: usize = 3;
+
 /// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
 ///
-/// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
+/// 1) Pins the CPU budget, and with it `target_partitions`, to [`TEST_CPU_CORES`].
 /// 2) Disables coalesce batches and repartition joins for terser plans.
 fn configure_test_datafusion() {
+    pin_test_cpu_budget();
+
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => {
-            config.options_mut().execution.target_partitions = 3;
-
             config.options_mut().execution.coalesce_batches = false;
 
             config.options_mut().optimizer.repartition_joins = false;
         }
         _ => panic!("Must obtain write lock to defaults"),
+    }
+}
+
+/// Pin the process-wide CPU budget to [`TEST_CPU_CORES`].
+///
+/// Every session sizes `target_partitions` from the CPU budget, so pinning the
+/// budget is what makes plans reproducible across machines.
+///
+/// Installing is idempotent by intent — the budget is a process-wide `OnceLock`
+/// and all 300-odd callers ask for the same value, so every call after the first
+/// is an expected no-op rather than an error worth surfacing.
+fn pin_test_cpu_budget() {
+    let config = cpu_budget::CpuConfig::from_sources(None, None, Some(&TEST_CPU_CORES.to_string()));
+    match cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect()) {
+        Ok(budget) => drop(budget.install()),
+        Err(e) => panic!("{TEST_CPU_CORES} must be a valid CPU quantity: {e}"),
     }
 }
 #[cfg(feature = "postgres-accel")]
@@ -244,6 +331,11 @@ where
             filters => vec![
                 // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
                 (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+                // Docker assigns fixture ports independently for each test instance.
+                (r"(compute_context=host=localhost,port=)\d+(,db=)", "$1<PORT>$2"),
+                // Spark Connect plans include Databricks connection details. Those identify
+                // the test fixture, not the plan being asserted.
+                (r"compute_context=sc://[^ ]+", "compute_context=<DATABRICKS_SPARK_CONNECT>"),
             ],
         }, {
             insta::assert_snapshot!(snapshot_name, explain_plan);

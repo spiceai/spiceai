@@ -1,0 +1,6 @@
+---
+source: crates/search/src/generation/text_search/util.rs
+expression: "lines.join(\"\\n\")"
+---
+{"id":"a","seq":1}
+{"id":"b","seq":2}

@@ -20,12 +20,11 @@ limitations under the License.
 //! This module explicitly references all connector modules to ensure they are linked into the
 //! binary and their `linkme` distributed slice registrations are included.
 
-use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
-use runtime::dataconnector::DATA_CONNECTOR_REGISTRATIONS;
-use runtime::model::params::{
-    anthropic, azure, bedrock, databricks, file, google, huggingface, openai, xai,
-};
+use data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS;
+use data_connector_api::DATA_CONNECTOR_REGISTRATIONS;
+use runtime::model::params::get_params_spec;
 use runtime_parameters::ParameterSpec;
+use spicepod::component::model::ModelSource;
 
 // Force linkage of all data connector modules by referencing their factory types.
 // Without these references, the linker may not include the modules and their
@@ -34,6 +33,7 @@ use connector_clickhouse as _;
 use connector_delta_lake as _;
 use connector_dremio as _;
 use connector_duckdb as _;
+use connector_dynamodb as _;
 use connector_flightsql as _;
 use connector_ftp as _;
 use connector_graphql as _;
@@ -45,6 +45,15 @@ use connector_mysql as _;
 use connector_oracle as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
+use connector_abfs as _;
+use connector_cosmosdb as _;
+use connector_databricks as _;
+use connector_ducklake as _;
+use connector_elasticsearch as _;
+use connector_gcs as _;
+use connector_git as _;
+use connector_github as _;
+use connector_glue as _;
 use connector_postgres as _;
 use connector_scylladb as _;
 use connector_sftp as _;
@@ -52,27 +61,21 @@ use connector_sharepoint as _;
 use connector_smb as _;
 use connector_snowflake as _;
 use connector_spark as _;
+use connector_spiceai as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::s3 as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::spiceai as _;
 
 // Force linkage of all data accelerator modules
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+use accelerator_duckdb as _;
+use accelerator_postgres as _;
+use accelerator_sqlite as _;
+use accelerator_turso as _;
 #[expect(unused_imports)]
 use runtime::dataaccelerator::arrow as _;
-#[cfg(not(windows))]
-#[expect(unused_imports)]
-use runtime::dataaccelerator::cayenne as _;
-#[expect(unused_imports)]
-use runtime::dataaccelerator::duckdb as _;
-#[expect(unused_imports)]
-use runtime::dataaccelerator::partitioned_duckdb as _;
-#[expect(unused_imports)]
-use runtime::dataaccelerator::postgres as _;
-#[expect(unused_imports)]
-use runtime::dataaccelerator::sqlite as _;
-#[expect(unused_imports)]
-use runtime::dataaccelerator::turso as _;
 
 /// Schema information for a connector or accelerator.
 #[derive(Debug, Clone)]
@@ -140,8 +143,8 @@ pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
 /// This function iterates over the distributed slice of data accelerator registrations
 /// and extracts the engine name, prefix, and parameters from each accelerator.
 ///
-/// Multiple registrations can share the same engine name (e.g. `duckdb` and
-/// `partitioned_duckdb` both register under `duckdb`), so results are sorted by
+/// Multiple registrations can share the same engine name (e.g. `arrow` and
+/// `partitioned_arrow` both register under `arrow`), so results are sorted by
 /// `(name, prefix)` and de-duplicated by `name`. Sorting by `prefix` as a
 /// secondary key makes the surviving entry deterministic across builds, since
 /// distributed-slice iteration order is not guaranteed.
@@ -149,14 +152,16 @@ pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
 pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
     let mut accelerators: Vec<ConnectorSchema> = DATA_ACCELERATOR_REGISTRATIONS
         .iter()
-        .map(|reg| {
-            let accelerator = (reg.constructor)();
-            ConnectorSchema {
+        .filter_map(|reg| {
+            // An engine that cannot be prepared has already logged why; leaving it out of
+            // the schema is better than emitting an entry with no parameters.
+            let accelerator = reg.build_with_defaults()?;
+            Some(ConnectorSchema {
                 // Use Display trait to get the string representation
                 name: reg.engine.to_string(),
                 prefix: accelerator.prefix(),
                 parameters: accelerator.parameters(),
-            }
+            })
         })
         .collect();
     accelerators.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.prefix.cmp(b.prefix)));
@@ -200,56 +205,92 @@ pub fn collect_catalog_connectors() -> Vec<CatalogConnectorSchema> {
 
 /// Collects schema information from all model sources.
 ///
-/// Model sources define their parameters in `crates/runtime/src/model/params/`.
-/// This function enumerates them directly to avoid adding schema-generation-only
-/// code to the runtime.
+/// Model sources define their parameters as `#[derive(TypedParams)]` structs in
+/// `crates/runtime/src/model/params/`; `get_params_spec` regenerates the
+/// `ParameterSpec` list from each struct, keeping the struct the single source
+/// of truth for both runtime deserialization and schema.
 #[must_use]
 pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
     vec![
         ModelSourceSchema {
             name: "openai",
-            prefix: "openai",
-            parameters: openai::PARAMETERS,
+            prefix: ModelSource::OpenAi.short_name(),
+            parameters: get_params_spec(&ModelSource::OpenAi),
         },
         ModelSourceSchema {
             name: "azure",
-            prefix: "azure",
-            parameters: azure::PARAMETERS,
+            prefix: ModelSource::Azure.short_name(),
+            parameters: get_params_spec(&ModelSource::Azure),
         },
         ModelSourceSchema {
             name: "file",
-            prefix: "file",
-            parameters: file::PARAMETERS,
+            prefix: ModelSource::File.short_name(),
+            parameters: get_params_spec(&ModelSource::File),
         },
         ModelSourceSchema {
             name: "databricks",
-            prefix: "databricks",
-            parameters: databricks::PARAMETERS,
+            prefix: ModelSource::Databricks.short_name(),
+            parameters: get_params_spec(&ModelSource::Databricks),
         },
         ModelSourceSchema {
             name: "huggingface",
-            prefix: "huggingface",
-            parameters: huggingface::PARAMETERS,
+            prefix: ModelSource::HuggingFace.short_name(),
+            parameters: get_params_spec(&ModelSource::HuggingFace),
         },
         ModelSourceSchema {
             name: "anthropic",
-            prefix: "anthropic",
-            parameters: anthropic::PARAMETERS,
+            prefix: ModelSource::Anthropic.short_name(),
+            parameters: get_params_spec(&ModelSource::Anthropic),
         },
         ModelSourceSchema {
             name: "xai",
-            prefix: "xai",
-            parameters: xai::PARAMETERS,
+            prefix: ModelSource::Xai.short_name(),
+            parameters: get_params_spec(&ModelSource::Xai),
         },
         ModelSourceSchema {
             name: "bedrock",
-            prefix: "bedrock",
-            parameters: bedrock::PARAMETERS,
+            prefix: ModelSource::Bedrock.short_name(),
+            parameters: get_params_spec(&ModelSource::Bedrock),
         },
         ModelSourceSchema {
             name: "google",
-            prefix: "google",
-            parameters: google::PARAMETERS,
+            prefix: ModelSource::Google.short_name(),
+            parameters: get_params_spec(&ModelSource::Google),
+        },
+        ModelSourceSchema {
+            name: "spiceai",
+            prefix: ModelSource::SpiceAI.short_name(),
+            parameters: get_params_spec(&ModelSource::SpiceAI),
+        },
+        ModelSourceSchema {
+            name: "typesafe",
+            prefix: ModelSource::TypeSafe.short_name(),
+            parameters: get_params_spec(&ModelSource::TypeSafe),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spot-check drift guard: connectors that self-register into the `linkme` slice must appear
+    /// in the generated schema. This catches a broken force-linkage (`use connector_* as _;` in
+    /// this module) or a connector silently dropping out of `.schema/spicepod.schema.json`. The
+    /// sampled connectors span always-linked and feature-gated `connector-*` crates that register
+    /// via `register_data_connector!`; extend the list as more connectors adopt the pattern.
+    #[test]
+    fn documents_slice_registered_connectors() {
+        let names: Vec<String> = collect_data_connectors()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(!names.is_empty(), "no data connectors were collected");
+        for expected in ["dynamodb", "postgres", "clickhouse", "mysql", "graphql"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "connector '{expected}' missing from the generated schema; collected: {names:?}"
+            );
+        }
+    }
 }

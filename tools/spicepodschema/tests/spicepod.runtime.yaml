@@ -11,12 +11,24 @@ name: runtime-test
 # RUNTIME CONFIGURATION
 # =============================================================================
 runtime:
+  # Shared object store for runtime state (results-cache warmup, source
+  # rate-control, and distributed query when those sections omit state_location).
+  state:
+    location: s3://my-bucket/spice-state
+    params:
+      s3_region: us-east-1
+      s3_auth: iam_role
   caching:
+    # `runtime.caching.*.engine` (`moka` | `pingora`) is accepted for
+    # compatibility and ignored at runtime; LruCache always uses the Spice
+    # sharded-cache backend. `engine: pingora` no longer selects Pingora.
     sql_results:
       enabled: true
       max_size: 1GiB # Default 128 MiB
       item_ttl: 1m # Default 1s
       stale_while_revalidate_ttl: 30s # Default 0s (disabled)
+      # disabled (default) | on_first_refresh
+      warmup: on_first_refresh
     search_results:
       enabled: true
       max_size: 1GiB # Default 128 MiB
@@ -24,3 +36,12 @@ runtime:
   task_history:
     enabled: true
     captured_context: redacted
+  query:
+    # Materialize multi-reference CTEs once on the Cayenne query path.
+    # disabled (default) | auto
+    cte_materialization: auto
+  cpu:
+    # How many CPUs the runtime behaves as though it has. Accepts 4, 3.5, 3500m,
+    # or `auto` (the default) to detect it. Also settable via --cpu-cores or
+    # SPICE_CPU_CORES.
+    cores: 4

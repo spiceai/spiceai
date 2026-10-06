@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/openai.rs
 expression: "format!(\"{:#?}\", response.choices)"
-snapshot_kind: text
 ---
 [
     ChatChoice {
@@ -10,6 +9,7 @@ snapshot_kind: text
             content: Some(
                 "10",
             ),
+            reasoning_content: None,
             refusal: None,
             tool_calls: None,
             annotations: Some(

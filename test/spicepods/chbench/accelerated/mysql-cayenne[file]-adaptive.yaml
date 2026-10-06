@@ -1,0 +1,269 @@
+version: v1
+kind: Spicepod
+name: mysql-cayenne[file]-adaptive
+
+# Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
+# the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
+# table runs `cayenne_tuning: adaptive`: the runtime still warm-starts each knob from the detected
+# host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
+# within the environment-derived [floor, ceiling] as the workload shifts.
+#
+# Schema inference (always on) does double duty here, so nothing else is hand-set:
+#   - It auto-detects the primary key (and rough table sizing) from the MySQL source and seeds
+#     an `upsert` on_conflict on the inferred PK — exactly what `refresh_mode: changes` needs to
+#     apply UPDATE/DELETE events. So PK / on_conflict are intentionally NOT declared below;
+#     inference fills them (it is gap-filling only and never overrides a user-set value, so
+#     declaring them would just suppress the very thing we test).
+#   - It supplies inferred row_count/table_bytes that sharpen the adaptive loop's data-aware
+#     warm-start. Adaptive is set explicitly, so it runs regardless; without inferred metadata
+#     the loop just relearns the row width from observed ingest.
+# Background compaction stays at the auto-derived (non-zero) default — the controller rides its
+# tick. No per-ACTUATOR knob value is set anywhere: an explicit knob would *pin* it under adaptive
+# (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
+# The `cayenne_goal_*` SLOs (set globally under `runtime.params`) are NOT actuator knobs — they
+# are the high-level targets the closed loop converges toward (it still moves the un-pinned
+# actuators freely to hit them).
+#
+# sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
+# comparison isolates the effect of adaptive tuning, not caching/history overhead.
+#
+# order_line carries predicate-aware maintained aggregates for CH-benCH q1 and q6.
+# Past the retained-entry cap the registry detaches and those queries fall back to a
+# base-table scan (expected at SF1000).
+#
+# CLUSTERED LAYOUT: the three high-volume CDC tables CH-benCH filters on pin
+# `cayenne_cluster_by`, so their warm files are laid out along a Hilbert curve over that
+# key instead of the default layout, which ranks columns by how OFTEN a query filters them
+# rather than by how much they prune — at CH-benCH that favours `ol_delivery_d`, the
+# most-filtered order_line column, although the seed writes it as one constant plus NULL,
+# so it separates almost nothing. Each key pairs the leading primary-key column (`*_w_id`,
+# keeping the per-warehouse locality the CDC upsert probes and every join read through)
+# with the one column a query filters selectively — order_line q8 `ol_i_id < 1000` and q19
+# `ol_w_id IN (1,2,3)`, oorder q13 `o_carrier_id > 8`, customer q3 `c_state LIKE 'A%'`.
+# stock, new_order, district and warehouse stay unpinned (no CH-benCH query filters them),
+# so every run still carries a high-volume table on the default layout to compare against.
+# Keys match the postgres adaptive pod, so the two sources stay comparable.
+# What it costs and buys, measured on the 3-node lab (mysql, SF-100, 3 reps per side,
+# arms interleaved, one binary, pods differing only by these keys): worst-table freshness
+# halves — 25.1s unpinned vs 12.5s pinned, every pinned arm below every unpinned one, exact
+# permutation p=0.05 — while QPH (p=0.55), tpmC, spiced CPU and RSS all stay put. The layout
+# does change: an explicit key replaces the inference-derived sort order (the two cannot be
+# combined) and routes whole-snapshot writes through ONE ordered writer instead of the
+# range-routed parallel write, so order_line's durable scan reads 4 files in 4 groups where
+# the unpinned arm reads 31 in 20. Fewer footer opens against less scan fan-out cancel out on
+# a 20-core host, which is why query latency does not move. WHY freshness improves is NOT
+# established: every write-path metric scraped (files on disk, write MiB/s, metastore and
+# mem-tier checkpoints, files reclaimed, encode waits) is flat between the arms.
+#
+# DATALAKE (COLD) TIER: the six high-volume CDC tables (district, customer, new_order, oorder,
+# order_line, stock) also carry the datalake tier, so this config runs all three storage tiers:
+# RAM mem-tier -> warm local-disk Vortex -> cold object store. No datalake knob is an adaptive
+# actuator, and only the tier's location and credentials are set, so warm data moves on the
+# engine default trigger: 16 x the 512 MB cold file size (8 GiB) of warm data. Small scale
+# factors stay below it. warehouse and the full-refresh reference tables stay on the warm tier.
+# The cold store is the shared MinIO (`s3://benchmarks`). Each run writes under its own prefix,
+# the Actions run id, so the HTAP workflow can delete that run's objects afterwards without
+# touching a concurrent run's.
+# spiced does not resolve `${env:…}` in `cayenne_datalake_location` yet (#14711), so the HTAP
+# workflow substitutes the run id into it before spiced starts. A move holds the table's write
+# lock for its whole duration (#12849), so CDC apply on that table pauses while it runs.
+
+# All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
+# (server_id derived from the connection identity - the engine default).
+mysql_connection_params: &mysql_params
+  mysql_host: ${env:CHBENCH_MYSQL_HOST}
+  mysql_tcp_port: 3306
+  mysql_db: chbench
+  mysql_user: bench
+  mysql_pass: bench
+  mysql_sslmode: disabled
+
+runtime:
+  query:
+    cte_materialization: auto
+  flight:
+    ipc_compression: lz4_frame
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+  # Goal-driven adaptive SLOs, set GLOBALLY once here and inherited by every Cayenne
+  # dataset (override per-dataset via the same acceleration.params key). These are the
+  # high-level targets the closed loop converges toward — NOT actuator knobs.
+  # Replication-lag/freshness drive the CDC (changes) tables (inert on the full-refresh
+  # reference tables); query-latency (p99) applies to all. QPH is GLOBAL-ONLY: it is
+  # measured across all datasets (a query/join spans several, counted once), so it
+  # cannot be set per-dataset.
+  params:
+    cayenne_goal_replication_lag: '5s'
+    cayenne_goal_freshness: '30s'
+    cayenne_goal_query_latency: '10s'
+    cayenne_goal_qph: '5000'
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+  # No primary_key / on_conflict: schema inference (always on) detects the PK from the MySQL
+  # source and seeds the upsert on_conflict the CDC (changes) path requires.
+
+  - from: mysql:warehouse
+    name: warehouse
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      params: &cayenne_params
+        cayenne_tuning: adaptive
+        # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in
+        # parallel within one apply on the memory-tier (changes) tables. Inert on the
+        # full-refresh reference tables that share this anchor (not CDC memory mode).
+        cayenne_cdc_mem_tier_shards: '4'
+        cdc_prefetch_buffer: '16384'
+        cdc_max_coalesced_envelopes: '16384'
+        cdc_max_coalesced_bytes: '536870912'
+        # A 500 ms linger is the knee of the freshness/query trade-off once per-shard PK-index rebuilds are
+        # off the apply path (#14555). Measured on MySQL SF-100 at 3 000 txn/s, 600 s, two runs per setting:
+        #   2000 ms: worst-table freshness P99 2 826 ms, query geomean 903 ms
+        #    500 ms: 1 416 ms, 934 ms (+3.4 %, within run spread)
+        #    250 ms: 1 190 ms, 973 ms (+7.7 %)
+        #      0 ms: one apply per transaction, half the query throughput
+        cdc_max_coalesce_age_ms: '500'
+        # Goal-driven SLOs are set globally under `runtime.params` (above) and
+        # inherited by every dataset, so they are intentionally not repeated here.
+        # (A dataset that needed a sharper target would override the relevant
+        # cayenne_goal_* here; QPH is global-only and cannot be overridden.)
+
+  - from: mysql:district
+    name: district
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: &cayenne_accel_cold
+      <<: *cayenne_accel
+      params: &cayenne_params_cold
+        <<: *cayenne_params
+        # Datalake (cold) tier: location and credentials only (see the header).
+        cayenne_datalake_location: s3://benchmarks/cayenne-datalake/${env:GITHUB_RUN_ID}/
+        cayenne_datalake_s3_auth: key
+        cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
+        cayenne_datalake_s3_key: ${secrets:S3_KEY}
+        cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
+        cayenne_datalake_s3_allow_http: 'true'
+
+  - from: mysql:customer
+    name: customer
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration:
+      <<: *cayenne_accel_cold
+      params:
+        <<: *cayenne_params_cold
+        # q3's `c_state LIKE 'A%'` (one state prefix in 26) is the only customer
+        # predicate a zone map can prune — q22 filters on `substr(c_phone, 1, 1)`
+        # and a scalar subquery. c_w_id leads the primary key.
+        cayenne_cluster_by: c_w_id,c_state
+
+  - from: mysql:new_order
+    name: new_order
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel_cold
+
+  - from: mysql:oorder
+    name: oorder
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration:
+      <<: *cayenne_accel_cold
+      params:
+        <<: *cayenne_params_cold
+        # q13 filters `o_carrier_id > 8` (the Delivery txn sets it, NULL until then).
+        # o_w_id leads the primary key and is the join key q3/q5/q10/q12/q18/q21 read
+        # oorder through.
+        cayenne_cluster_by: o_w_id,o_carrier_id
+
+  - from: mysql:order_line
+    name: order_line
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration:
+      <<: *cayenne_accel_cold
+      params:
+        <<: *cayenne_params_cold
+        # The two selective CH-benCH predicates over the heaviest table: q8
+        # `ol_i_id < 1000` (999 of the 100,000 item ids the seed draws from, ~1% of
+        # rows) and q19's `ol_w_id IN (...)` lists (3 warehouses of the scale factor;
+        # degenerate at SF1, where the whole table is one warehouse). ol_w_id also
+        # leads the primary key.
+        cayenne_cluster_by: ol_w_id,ol_i_id
+      # Predicate-aware maintained aggregates for CH-benCH q1 and q6 over
+      # order_line. Same views as the postgres adaptive pod: q1 grouped by
+      # ol_number over delivered lines; q6 a global SUM over a delivery-date
+      # window. Past the retained-entry cap the registry detaches and queries
+      # fall back to a base-table scan (expected at SF1000).
+      maintained_aggregates:
+        - group_by: [ol_number]
+          filter_sql: "ol_delivery_d > '2007-01-02 00:00:00.000000'"
+          aggregates:
+            - function: sum
+              column: ol_quantity
+            - function: sum
+              column: ol_amount
+            - function: avg
+              column: ol_quantity
+            - function: avg
+              column: ol_amount
+            - function: count
+        - group_by: []
+          filter_sql: "ol_delivery_d >= '1997-01-01 00:00:00' AND ol_delivery_d < '2030-01-01 00:00:00' AND ol_quantity BETWEEN 1 AND 100000"
+          aggregates:
+            - function: sum
+              column: ol_amount
+
+  - from: mysql:stock
+    name: stock
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel_cold
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+  # Same: the PK comes from schema inference (always on); on_conflict is seeded only
+  # for CDC (changes) datasets — a full refresh replaces the table and needs no upsert.
+
+  - from: mysql:item
+    name: item
+    params:
+      <<: *mysql_params
+    acceleration: &cayenne_accel_full
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      params: *cayenne_params
+
+  - from: mysql:region
+    name: region
+    params:
+      <<: *mysql_params
+    acceleration: *cayenne_accel_full
+
+  - from: mysql:nation
+    name: nation
+    params:
+      <<: *mysql_params
+    acceleration: *cayenne_accel_full
+
+  - from: mysql:supplier
+    name: supplier
+    params:
+      <<: *mysql_params
+    acceleration: *cayenne_accel_full

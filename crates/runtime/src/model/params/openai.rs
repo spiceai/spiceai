@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,39 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use util::concat_arrays;
+use llms::openai::{ChatBackend, UsageTier};
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-use super::{COMMON_MODEL_PARAMETERS, PARAM_LEN};
-use crate::parameters::ParameterSpec;
-
-pub const PARAMETERS: &[ParameterSpec] =
-    &concat_arrays::<ParameterSpec, OPENAI_PARAM_LEN, PARAM_LEN, { OPENAI_PARAM_LEN + PARAM_LEN }>(
-        OPENAI_PARAMETERS,
-        COMMON_MODEL_PARAMETERS,
-    );
-
-const OPENAI_PARAM_LEN: usize = 7;
-
-pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
-    ParameterSpec::runtime("endpoint")
-        .description("The OpenAI API base endpoint. Can be overridden to use a compatible provider (i.e. Nvidia NIM).")
-        .default("https://api.openai.com/v1"),
-    ParameterSpec::component("api_key")
-        .secret()
-        .description("The OpenAI API key."),
-    ParameterSpec::component("org_id")
-        .description("The OpenAI organization ID."),
-    ParameterSpec::component("project_id")
-        .description("The OpenAI project ID."),
-    ParameterSpec::component("usage_tier")
-        .description("The current usage tier for the OpenAI account associated with the API key: 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'.")
-        .one_of(&["free", "tier1", "tier2", "tier3", "tier4", "tier5"])
-        .default("tier1"),
-    ParameterSpec::runtime("responses_api")
-        .description("Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.")
-        .one_of(&["enabled", "disabled"])
-        .default("disabled"),
-    ParameterSpec::component("responses_tools")
-        .description("The OpenAI Responses tools to use when calling the model from the Responses API")
-        .default("")
-];
+/// Parameters for `from: openai` chat/responses models.
+#[derive(Debug, TypedParams)]
+#[params(
+    prefix = "openai",
+    passthrough = crate::model::params::common::OPENAI_COMMON,
+    emit_specs
+)]
+pub struct OpenAiModelParams {
+    /// The `OpenAI` API base endpoint. Can be overridden to use a compatible provider (i.e. Nvidia NIM).
+    #[param(runtime, default = "https://api.openai.com/v1")]
+    pub endpoint: String,
+    /// The `OpenAI` API key.
+    #[param(autoload_secret)]
+    pub api_key: Option<SecretString>,
+    /// The `OpenAI` organization ID.
+    pub org_id: Option<String>,
+    /// The `OpenAI` project ID.
+    pub project_id: Option<String>,
+    /// The current usage tier for the `OpenAI` account associated with the API key: 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'.
+    #[param(default = "tier1")]
+    pub usage_tier: UsageTier,
+    /// Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.
+    #[param(runtime, default = "disabled")]
+    pub responses_api: ChatBackend,
+    /// The `OpenAI` Responses tools to use when calling the model from the Responses API.
+    #[param(default = "")]
+    pub responses_tools: String,
+}

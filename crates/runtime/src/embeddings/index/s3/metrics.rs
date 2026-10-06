@@ -21,6 +21,35 @@ use opentelemetry::{
     metrics::{Counter, Histogram, Meter},
 };
 
+/// Boundaries for the `s3_vectors_*_latency` histograms, in milliseconds.
+///
+/// Sized for a round trip to the `S3Vectors` API rather than for in-process work: the smallest
+/// positive boundary is 1ms because no network call answers faster, and the 5-75ms boundaries
+/// resolve the band a query against a small index is answered in. The `0` boundary is not a
+/// resolution floor and predates this set; it is kept because dropping it would redefine an
+/// already-published `le` series.
+///
+/// A histogram needs a boundary wherever its observations land. A quantile interpolated inside a
+/// single bucket is a function of the requested percentile alone, so a p50 drawn from one bucket
+/// spanning 0-100ms reports 50ms whatever the real latency is, and a p90 reports 90ms.
+///
+/// The coarser boundaries above 100ms are `le` series that operator dashboards read, so they are
+/// fixed. Adding a boundary only subdivides a bucket and leaves every series meaning what it
+/// means; moving or dropping one silently redefines a published series.
+fn latency_histogram_boundaries() -> Vec<f64> {
+    let sub_hundred = [0.0, 1.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 75.0];
+    let hundreds = (1..10).map(|i| 100.0 * f64::from(i));
+    let half_seconds = (1..20).map(|i| 500.0 + 500.0 * f64::from(i));
+    let seconds = (1..10).map(|i| 10000.0 + 1000.0 * f64::from(i));
+
+    sub_hundred
+        .into_iter()
+        .chain(hundreds)
+        .chain(half_seconds)
+        .chain(seconds)
+        .collect()
+}
+
 /// A macro to standardise the API-level metrics recorded for each `S3Vectors` operation.
 macro_rules! generate_s3vectors_metrics {
     ($prefix:literal, $name:ident) => {
@@ -48,18 +77,7 @@ macro_rules! generate_s3vectors_metrics {
                 METER
                     .f64_histogram(concat!("s3_vectors_", $prefix, "_latency"))
                     .with_description("Total duration of operation, in milliseconds.")
-                    .with_boundaries(
-                        [
-                            (0..10).map(|i| 100.0 * f64::from(i)).collect::<Vec<_>>(),
-                            (1..20)
-                                .map(|i| 500.0 + 500.0 * f64::from(i))
-                                .collect::<Vec<_>>(),
-                            (1..10)
-                                .map(|i| 10000.0 + 1000.0 * f64::from(i))
-                                .collect::<Vec<_>>(),
-                        ]
-                        .concat(),
-                    )
+                    .with_boundaries(latency_histogram_boundaries())
                     .build()
             });
         }
@@ -82,3 +100,80 @@ generate_s3vectors_metrics!("list_vectors", list_vectors);
 generate_s3vectors_metrics!("put_vector_bucket_policy", put_vector_bucket_policy);
 generate_s3vectors_metrics!("put_vectors", put_vectors);
 generate_s3vectors_metrics!("query_vectors", query_vectors);
+
+#[cfg(test)]
+mod tests {
+    use super::latency_histogram_boundaries;
+
+    /// The coarse boundaries operator dashboards read as `le` series on these histograms.
+    fn published_le_boundaries() -> Vec<f64> {
+        let hundreds = (0..10).map(|i| 100.0 * f64::from(i));
+        let half_seconds = (1..20).map(|i| 500.0 + 500.0 * f64::from(i));
+        let seconds = (1..10).map(|i| 10000.0 + 1000.0 * f64::from(i));
+
+        hundreds.chain(half_seconds).chain(seconds).collect()
+    }
+
+    /// Membership by total order, so a boundary is located without comparing floats for equality.
+    fn holds_boundary(bounds: &[f64], value: f64) -> bool {
+        bounds.iter().any(|bound| bound.total_cmp(&value).is_eq())
+    }
+
+    /// A quantile is only as precise as the bucket its observations land in. If nothing separates
+    /// 0 from 100ms, an operation answered in 10-40ms shares a bucket with one answered instantly,
+    /// and interpolating inside that single bucket reports the requested percentile rather than a
+    /// latency.
+    ///
+    /// Regression test for #12698.
+    #[test]
+    fn latency_boundaries_resolve_below_a_hundred_milliseconds() {
+        let bounds = latency_histogram_boundaries();
+        let resolved: Vec<f64> = bounds
+            .iter()
+            .copied()
+            .filter(|&bound| bound > 0.0 && bound < 100.0)
+            .collect();
+
+        assert!(
+            resolved.len() >= 4,
+            "operations faster than 100ms need more than one bucket to draw a quantile from, got \
+             boundaries {resolved:?}"
+        );
+
+        let in_small_index_band = resolved
+            .iter()
+            .filter(|&&bound| (10.0..=40.0).contains(&bound))
+            .count();
+        assert!(
+            in_small_index_band >= 3,
+            "a query against a small index is answered in 10-40ms, which should not collapse into \
+             one bucket, got boundaries {resolved:?}"
+        );
+    }
+
+    /// `with_boundaries` requires an ordered set, and a cumulative `le` series is only monotonic
+    /// if the boundaries it is keyed by increase.
+    #[test]
+    fn latency_boundaries_are_strictly_increasing() {
+        let bounds = latency_histogram_boundaries();
+
+        assert!(
+            bounds.windows(2).all(|pair| pair[0] < pair[1]),
+            "the latency boundaries must be strictly increasing, got {bounds:?}"
+        );
+    }
+
+    /// Subdividing a bucket leaves every `le` series meaning what it means; dropping or moving a
+    /// boundary silently redefines one that operator dashboards read.
+    #[test]
+    fn latency_boundaries_keep_every_published_le_series() {
+        let bounds = latency_histogram_boundaries();
+
+        for published in published_le_boundaries() {
+            assert!(
+                holds_boundary(&bounds, published),
+                "boundary {published} is gone, which redefines the le={published} series"
+            );
+        }
+    }
+}

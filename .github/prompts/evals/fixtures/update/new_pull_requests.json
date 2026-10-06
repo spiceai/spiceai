@@ -1,0 +1,33 @@
+{
+  "_comment": "Frozen `gh pr view <num> --json title,body,author,labels` for the commits in new_commits.txt.",
+  "12070": {
+    "title": "feat(llms): add prompt caching for Anthropic models",
+    "author": { "login": "Jeadie" },
+    "labels": ["kind/enhancement", "area/llms"],
+    "body": "Adds prompt caching for Anthropic models. Spice marks the system prompt and the dataset schema block as cacheable, so a repeated NSQL or chat request reuses them instead of resending them.\n\nOn a 40-dataset spicepod the cached prefix is about 18k tokens. Time to first token on a warm cache dropped from 2.4s to 0.6s in local measurement.\n\n```yaml\nmodels:\n  - name: claude\n    from: anthropic:claude-opus-5\n    params:\n      prompt_cache: enabled # 'enabled' or 'disabled' (default)\n```"
+  },
+  "12073": {
+    "title": "fix(search): stop rrf() from dropping ties at the top-k boundary",
+    "author": { "login": "karifabri" },
+    "labels": ["kind/bug", "area/search"],
+    "body": "When two documents had an identical fused score at the top-k cutoff, `rrf()` kept whichever the hash map yielded first, so the same query returned different results between runs.\n\nThe fused ranking now breaks ties on the document key, which is stable. A query with tied scores returns the same rows every time."
+  },
+  "12074": {
+    "title": "fix(tests): update snapshots after the rrf change",
+    "author": { "login": "github-actions[bot]" },
+    "labels": ["kind/chore"],
+    "body": "Regenerates insta snapshots. Test-only."
+  },
+  "12077": {
+    "title": "fix(mongodb): resume from the stored token after a replica set failover",
+    "author": { "login": "sgrebnov" },
+    "labels": ["kind/bug", "connector/mongodb"],
+    "body": "After a MongoDB replica set failover the change stream reconnected to the new primary and restarted from the current time instead of the stored resume token. Every change written during the failover window was lost from the acceleration.\n\nThe connector now passes the stored resume token on reconnect. Where the token is no longer valid on the new primary, the dataset fails the refresh with a structured error naming the collection instead of silently skipping the gap.\n\nThis was a data-loss bug."
+  },
+  "12079": {
+    "title": "chore(deps): bump tokio from 1.48.0 to 1.48.1",
+    "author": { "login": "dependabot[bot]" },
+    "labels": ["dependencies"],
+    "body": "Routine patch bump. No user-visible change."
+  }
+}

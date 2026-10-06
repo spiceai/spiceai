@@ -16,6 +16,23 @@ limitations under the License.
 
 #![allow(dead_code, clippy::allow_attributes)]
 
+// Accelerator engines are their own crates and self-register through a linkme slice. A
+// dev-dependency alone does not put an entry in a test binary — the linker drops the
+// unreferenced static — and every integration binary links separately, so each one that
+// exercises an engine needs its own reference. `integration.rs`'s
+// `accelerator_crates_register_their_engines` guards the mechanism; this is where the
+// binaries that share these helpers get it.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+#[cfg(feature = "duckdb")]
+use accelerator_duckdb as _;
+#[cfg(feature = "postgres-accel")]
+use accelerator_postgres as _;
+#[cfg(feature = "sqlite")]
+use accelerator_sqlite as _;
+#[cfg(feature = "turso")]
+use accelerator_turso as _;
+
 use std::{
     fmt::Display,
     future::Future,
@@ -56,7 +73,33 @@ pub(crate) async fn runtime_ready_check(rt: &Runtime) {
 }
 
 pub(crate) async fn runtime_ready_check_with_timeout(rt: &Runtime, duration: Duration) {
-    assert!(wait_until_true(duration, || async { rt.status().is_ready() }).await);
+    assert!(
+        wait_until_true(duration, || async { rt.status().is_ready() }).await,
+        "the runtime did not become ready within {duration:?} — {}",
+        describe_component_statuses(rt)
+    );
+}
+
+/// Name every registered component and the state it is in.
+///
+/// The readiness wait elapses identically whether a component failed to load, is
+/// still initializing, or was never registered at all, so on its own it says only
+/// that the runtime is not ready. `ComponentStatus::Error` carries the message that
+/// put the component in that state, so naming the states turns the timeout into the
+/// reason for it.
+fn describe_component_statuses(rt: &Runtime) -> String {
+    let statuses = rt.status().get_all_statuses();
+    if statuses.is_empty() {
+        return "no components were registered".to_string();
+    }
+
+    let mut described: Vec<String> = statuses
+        .iter()
+        .map(|(component, status)| format!("{component}: {status:?}"))
+        .collect();
+    // `get_all_statuses` returns a `HashMap`, so sort for a stable message.
+    described.sort();
+    described.join(", ")
 }
 
 pub(crate) async fn runtime_ready_check_with_timeout_err(
@@ -88,26 +131,96 @@ where
     false
 }
 
-/// Returns the duration until the next occurrence of the nearest second.
-/// Optionally, add an overhead to apply to wait for a bit longer after the nearest second is reached.
+/// Returns how long to sleep to land `wait` seconds after the next wall-clock second that
+/// is a multiple of `nearest_second`.
+///
+/// Most callers change something a cron-scheduled refresh should pick up, sleep here, then
+/// assert the refresh happened. That only holds when the boundary this targets is one whose
+/// tick has not fired yet, so the boundary is always strictly in the future. A reading that
+/// already sits on a boundary second therefore counts as a whole period away: that second's
+/// tick fired before the caller's change existed, so only the following tick can pick it up
+/// (#13759).
+///
+/// The reading is truncated to whole seconds, so the sleep can end up to a second past
+/// the boundary rather than before it. That direction spends none of the caller's grace.
 pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Duration {
-    assert!(
-        nearest_second < 60,
-        "nearest_second must be between 0 and 59"
-    );
-    let now_second = chrono::Utc::now().second();
-    let modulus = now_second % nearest_second;
-    let time_until_nearest = if modulus == 0 {
-        0
-    } else {
-        nearest_second - modulus
-    };
+    time_till_second_at(chrono::Utc::now().second(), nearest_second, wait)
+}
 
-    Duration::from_secs(u64::from(time_until_nearest + wait.unwrap_or(0)))
+/// [`time_till_second`] against a supplied clock reading, so the boundary arithmetic can
+/// be checked without waiting for a boundary to come round.
+fn time_till_second_at(now_second: u32, nearest_second: u32, wait: Option<u32>) -> Duration {
+    // Cron restarts its `*/n` count every minute, so a period that does not divide 60 has
+    // a short final gap this arithmetic does not model: `*/7` runs at :56 and then :00,
+    // which it would place at :63. Every caller uses 10, 15 or 30; refuse the rest here
+    // rather than let a future one sleep through the tick it is waiting for.
+    assert!(
+        nearest_second > 0 && nearest_second < 60 && 60 % nearest_second == 0,
+        "nearest_second must divide 60"
+    );
+
+    // In `1..=nearest_second`.
+    let till_boundary = nearest_second - now_second % nearest_second;
+
+    Duration::from_secs(u64::from(till_boundary) + u64::from(wait.unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod time_till_second_tests {
+    use super::{Duration, time_till_second_at};
+
+    #[test]
+    fn a_reading_between_boundaries_waits_out_the_remainder() {
+        assert_eq!(time_till_second_at(7, 15, None), Duration::from_secs(8));
+        assert_eq!(
+            time_till_second_at(7, 15, Some(5)),
+            Duration::from_secs(13),
+            "the grace is added to the wait for the boundary, not to the boundary"
+        );
+    }
+
+    #[test]
+    fn a_reading_inside_a_boundary_second_waits_for_the_next_boundary() {
+        // The tick at :15 has already run, so a sleep of only the grace ends before the
+        // tick that can see the caller's change (#13759, as seen by
+        // `acceleration::cron::test_append_cron_schedule`).
+        assert_eq!(
+            time_till_second_at(15, 15, Some(5)),
+            Duration::from_secs(20),
+            "a boundary second is behind us, not ahead"
+        );
+        assert_eq!(time_till_second_at(0, 30, None), Duration::from_secs(30));
+        assert_eq!(
+            time_till_second_at(30, 30, Some(20)),
+            Duration::from_secs(50)
+        );
+    }
+
+    #[test]
+    fn no_reading_waits_longer_than_one_period() {
+        // One period is the ceiling the callers' nextest slow-timeout is sized for. 60 is
+        // the second chrono reports during a leap second; every accepted period divides
+        // it, so it needs no case of its own.
+        for nearest in [10_u32, 15, 30] {
+            for second in 0..=60 {
+                let waited = time_till_second_at(second, nearest, None);
+                assert!(
+                    waited > Duration::ZERO && waited <= Duration::from_secs(u64::from(nearest)),
+                    "second {second} with period {nearest} waited {waited:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "nearest_second must divide 60")]
+    fn a_period_that_does_not_divide_60_is_refused() {
+        let _ = time_till_second_at(59, 7, None);
+    }
 }
 
 pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), String> {
-    let mut secrets = runtime::secrets::Secrets::new();
+    let mut secrets = runtime_secrets::Secrets::new();
     // Will automatically load `env` as the default
     secrets
         .load_from(&[])
@@ -141,6 +254,27 @@ pub(crate) async fn run_query(
     Ok(results)
 }
 
+/// The SQL each federated scan in an `EXPLAIN` sends to the remote engine, one
+/// per line, and empty when nothing federated.
+///
+/// `base_sql=` is the only part of a plan that says what the remote engine is
+/// asked to evaluate -- the logical plan above it names the `DataFusion`
+/// function whether or not it was pushed down -- so a test claiming a call did
+/// or did not reach the source reads this rather than the whole plan.
+///
+/// Returns an error rather than an empty string when the plan will not format:
+/// "nothing federated" and "the assertion could not be made" must not look the
+/// same to a caller asserting emptiness.
+pub(crate) fn pushed_down_sql(plan: &[RecordBatch]) -> Result<String, anyhow::Error> {
+    let rendered = to_pretty_display(plan)?.to_string();
+    Ok(rendered
+        .split("base_sql=")
+        .skip(1)
+        .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display, anyhow::Error> {
     let pretty = arrow::util::pretty::pretty_format_batches(batches)
         .map_err(|e| anyhow::Error::msg(e.to_string()))?;
@@ -164,6 +298,27 @@ pub(crate) fn init_tracing_with_task_history_captured_context(
     rt: &Runtime,
     captured_context: TaskHistoryCapturedContext,
 ) -> (DefaultGuard, SdkTracerProvider) {
+    init_tracing_with_task_history_plan_capture(
+        default_level,
+        rt,
+        captured_context,
+        spicepod::component::runtime::TaskHistoryCapturedPlan::None,
+        None,
+        None,
+    )
+}
+
+/// Like [`init_tracing_with_task_history_captured_context`], but also configures
+/// plan capture mode/thresholds on both the exporter and `DataFusion` (for the
+/// execution-time `ExplainAnalyze` path).
+pub(crate) fn init_tracing_with_task_history_plan_capture(
+    default_level: Option<&str>,
+    rt: &Runtime,
+    captured_context: TaskHistoryCapturedContext,
+    captured_plan: spicepod::component::runtime::TaskHistoryCapturedPlan,
+    min_plan_duration_ms: Option<f64>,
+    min_sql_duration_ms: Option<f64>,
+) -> (DefaultGuard, SdkTracerProvider) {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
@@ -171,6 +326,14 @@ pub(crate) fn init_tracing_with_task_history_captured_context(
     };
 
     let fmt_layer = fmt::layer().with_ansi(true).with_filter(filter);
+
+    rt.datafusion().set_plan_capture_config(
+        runtime::datafusion::query::plan_capture::PlanCaptureConfig {
+            captured_plan: captured_plan.clone(),
+            min_plan_duration_ms,
+            min_sql_duration_ms,
+        },
+    );
 
     let (ballista_transform, ballista_retention) =
         runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
@@ -180,9 +343,9 @@ pub(crate) fn init_tracing_with_task_history_captured_context(
         query_engine,
         TaskHistoryCapturedOutput::Truncated,
         captured_context,
-        None, // min_sql_duration_ms
-        spicepod::component::runtime::TaskHistoryCapturedPlan::None,
-        None, // min_plan_duration_ms
+        min_sql_duration_ms,
+        captured_plan,
+        min_plan_duration_ms,
         None, // scheduler_id - not in cluster mode for tests
     )
     .with_transform(ballista_transform)
@@ -399,98 +562,6 @@ pub(crate) async fn verify_anthropic_model_available(model_id: &str) -> Result<(
     }
 }
 
-/// Response structure for Google Gemini models API
-#[derive(Debug, Deserialize)]
-struct GeminiModelResponse {
-    name: String,
-}
-
-/// Verify that a specific model is available from Google Gemini.
-/// This calls the Google Generative AI models API to check if the model exists.
-pub(crate) async fn verify_google_model_available(model_id: &str) -> Result<(), String> {
-    let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
-        .map_err(|_| "SPICE_GOOGLE_API_KEY environment variable not set".to_string())?;
-
-    let client = reqwest::Client::new();
-    // Google Gemini models API uses the format: models/{model_id}
-    let url =
-        format!("https://generativelanguage.googleapis.com/v1beta/models/{model_id}?key={api_key}");
-
-    let response = client
-        .get(&url)
-        .header(CONTENT_TYPE, "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to Google Gemini API: {e}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read Google Gemini API response: {e}"))?;
-
-    if status.is_success() {
-        // Verify the response contains model info
-        if serde_json::from_str::<GeminiModelResponse>(&body).is_ok() {
-            Ok(())
-        } else {
-            Err(format!(
-                "Google Gemini model '{model_id}' response was unexpected: {body}"
-            ))
-        }
-    } else {
-        Err(format!(
-            "Google Gemini model '{model_id}' not available (HTTP {status}): {body}"
-        ))
-    }
-}
-
-/// List available Google Gemini models
-pub(crate) async fn list_google_models() -> Result<Vec<String>, String> {
-    let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
-        .map_err(|_| "SPICE_GOOGLE_API_KEY environment variable not set".to_string())?;
-
-    let client = reqwest::Client::new();
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models?key={api_key}");
-
-    let response = client
-        .get(&url)
-        .header(CONTENT_TYPE, "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to Google Gemini API: {e}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read Google Gemini API response: {e}"))?;
-
-    if status.is_success() {
-        #[derive(Deserialize)]
-        struct ModelsResponse {
-            models: Vec<GeminiModelResponse>,
-        }
-        let models: ModelsResponse = serde_json::from_str(&body)
-            .map_err(|e| format!("Failed to parse Google Gemini models response: {e}"))?;
-        // Extract model names, stripping the "models/" prefix
-        Ok(models
-            .models
-            .into_iter()
-            .map(|m| {
-                m.name
-                    .strip_prefix("models/")
-                    .unwrap_or(&m.name)
-                    .to_string()
-            })
-            .collect())
-    } else {
-        Err(format!(
-            "Failed to list Google Gemini models (HTTP {status}): {body}"
-        ))
-    }
-}
-
 /// Verify that a Bedrock model is accessible.
 /// Since Bedrock uses AWS SDK authentication, we verify by checking if the model ID
 /// matches known Bedrock model patterns.
@@ -539,7 +610,6 @@ pub(crate) async fn verify_models_available(
                 "openai" => verify_openai_model_available(model_id).await,
                 "anthropic" => verify_anthropic_model_available(model_id).await,
                 "xai" => verify_xai_model_available(model_id).await,
-                "google" | "gemini" => verify_google_model_available(model_id).await,
                 "bedrock" => verify_bedrock_model_available(model_id),
                 _ => Err(format!("Unknown provider: {provider}")),
             };
@@ -591,13 +661,6 @@ impl ModelVerificationBuilder {
     #[must_use]
     pub fn xai(mut self, model_id: &str) -> Self {
         self.models.push(("xai".to_string(), model_id.to_string()));
-        self
-    }
-
-    #[must_use]
-    pub fn google(mut self, model_id: &str) -> Self {
-        self.models
-            .push(("google".to_string(), model_id.to_string()));
         self
     }
 
@@ -660,6 +723,11 @@ async fn do_register_test_connectors() {
     register_connector_factory(
         connector_clickhouse::CONNECTOR_NAME,
         connector_clickhouse::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_dynamodb::CONNECTOR_NAME,
+        connector_dynamodb::factory(),
     )
     .await;
     register_connector_factory(
@@ -731,6 +799,44 @@ async fn do_register_test_connectors() {
     )
     .await;
     register_connector_factory(connector_spark::CONNECTOR_NAME, connector_spark::factory()).await;
+
+    // Connectors extracted into dedicated crates (registered the same way as in `bin/spiced`).
+    register_connector_factory(connector_abfs::CONNECTOR_NAME, connector_abfs::factory()).await;
+    // Also register the "abfss" prefix (secure variant uses the same factory)
+    register_connector_factory("abfss", connector_abfs::factory()).await;
+    register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
+    register_connector_factory(
+        connector_cosmosdb::CONNECTOR_NAME,
+        connector_cosmosdb::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_ducklake::CONNECTOR_NAME,
+        connector_ducklake::factory(),
+    )
+    .await;
+    register_connector_factory(connector_gcs::CONNECTOR_NAME, connector_gcs::factory()).await;
+    // Also register the "gs" prefix alias for GCS
+    register_connector_factory("gs", connector_gcs::factory()).await;
+    register_connector_factory(connector_git::CONNECTOR_NAME, connector_git::factory()).await;
+    register_connector_factory(
+        connector_github::CONNECTOR_NAME,
+        connector_github::factory(),
+    )
+    .await;
+    register_connector_factory(connector_glue::CONNECTOR_NAME, connector_glue::factory()).await;
+    register_connector_factory(connector_kafka::CONNECTOR_NAME, connector_kafka::factory()).await;
+    register_connector_factory(
+        connector_spiceai::CONNECTOR_NAME,
+        connector_spiceai::factory(),
+    )
+    .await;
+    // Also register the legacy "spiceai" prefix
+    register_connector_factory(
+        connector_spiceai::LEGACY_CONNECTOR_NAME,
+        connector_spiceai::legacy_factory(),
+    )
+    .await;
 
     tracing::debug!("Completed connector registration for tests");
 }

@@ -36,7 +36,7 @@ use iceberg_datafusion::IcebergTableProvider;
 use spicepod::acceleration::Acceleration;
 
 use super::acceleration_options::DatasetOptions;
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::datafusion::DataFusion;
 use data_components::RefreshableCatalogProvider;
@@ -122,8 +122,14 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         Arc::clone(&self.app)
     }
 
-    fn runtime(&self) -> Arc<crate::Runtime> {
-        unreachable!("DDL-created Iceberg acceleration source does not provide a runtime")
+    fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+        Arc::new(tokio::sync::RwLock::new(crate::secrets::Secrets::new()))
+    }
+
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        None
     }
 
     fn acceleration(&self) -> Option<&RuntimeAcceleration> {
@@ -134,12 +140,47 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         &self.name
     }
 
+    fn connector_name(&self) -> Option<&str> {
+        // A table created by Iceberg DDL has no `from:` — it is reached through the
+        // Iceberg catalog, and no `DataConnector` resolves its refresh mode. So no
+        // connector default applies, and `None` resolves to `full`, matching what
+        // this DDL path itself does with an unset mode (see
+        // `runtime_accel.refresh_mode.unwrap_or(RefreshMode::Full)` in
+        // `create_accelerated_iceberg_table`).
+        None
+    }
+
+    fn on_schema_change(&self) -> Option<runtime_acceleration::OnSchemaChange> {
+        // An Iceberg `CREATE TABLE` declares no `on_schema_change`; the table's schema is
+        // the one the DDL states.
+        None
+    }
+
+    fn allows_write(&self) -> bool {
+        // The point of the table is to be written by DML, so a scan of it must always
+        // read its own writes.
+        true
+    }
+
     fn time_column(&self) -> Option<&str> {
         self.time_column.as_deref()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// This source is synthesised for an Iceberg `CREATE TABLE` and is not backed by a
+    /// runtime-owned accelerator, so there is no checkpoint to open. Reports that rather
+    /// than handing back a no-op checkpointer, which would read as "checkpoint present
+    /// and empty" to the snapshot bootstrap.
+    fn checkpointer_factory(
+        &self,
+        _snapshot_behavior: runtime_acceleration::snapshot::SnapshotBehavior,
+    ) -> runtime_acceleration::dataset_checkpoint::DatasetCheckpointerFactory {
+        runtime_acceleration::dataset_checkpoint::make_checkpointer_factory(|| async {
+            Err("an Iceberg DDL acceleration source has no accelerator to checkpoint".into())
+        })
     }
 }
 
@@ -232,6 +273,17 @@ impl ExecutionPlan for IcebergCreateSchemaExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -409,6 +461,17 @@ impl ExecutionPlan for IcebergCreateTableExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -546,15 +609,18 @@ impl ExecutionPlan for IcebergCreateTableExec {
                             "Table '{table_name}' already exists and acceleration was registered"
                         );
                     } else {
+                        let inner = provider;
                         let deletion_provider =
                             data_components::iceberg::delete::IcebergDeletionProvider::new(
                                 Arc::clone(&catalog),
                                 namespace.clone(),
                                 table_name.clone(),
-                                provider,
+                                Arc::clone(&inner),
                             );
-                        schema_provider
-                            .register_table(table_name.clone(), Arc::new(deletion_provider))?;
+                        schema_provider.register_table(
+                            table_name.clone(),
+                            spice_table::SpiceTable::over(Arc::new(deletion_provider), inner),
+                        )?;
                         message = format!("Table '{table_name}' already exists");
                     }
 
@@ -625,10 +691,10 @@ impl ExecutionPlan for IcebergCreateTableExec {
                             Arc::clone(&catalog),
                             namespace.clone(),
                             table_name.clone(),
-                            raw_provider,
+                            Arc::clone(&raw_provider),
                         );
                     let adapted: Arc<dyn datafusion::datasource::TableProvider> =
-                        Arc::new(deletion_provider);
+                        spice_table::SpiceTable::over(Arc::new(deletion_provider), raw_provider);
                     schema_provider.register_table(table_name.clone(), adapted)?;
                     Ok(())
                 };
@@ -753,10 +819,10 @@ async fn create_accelerated_iceberg_table(
     dataset_name: TableReference,
     partition_expr_sql: Option<&str>,
 ) -> Result<AcceleratedTable, DataFusionError> {
-    use crate::accelerated_table::refresh::Refresh;
+    use crate::accelerated::refresh::Refresh;
     use crate::component::dataset::TimeFormat;
     use crate::component::dataset::acceleration::RefreshMode;
-    use crate::federated_table::FederatedTable;
+    use crate::federated::FederatedTable;
 
     let df = datafusion.upgrade().ok_or_else(|| {
         DataFusionError::Execution(
@@ -910,7 +976,8 @@ async fn build_registered_provider(
     )
     .await?;
 
-    let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(accelerated);
+    let provider: Arc<dyn datafusion::datasource::TableProvider> =
+        Arc::new(accelerated).into_table();
 
     Ok(provider)
 }
@@ -925,7 +992,7 @@ async fn initialize_partition_metadata(
     if let Some(expr_sql) = partition_expr_sql
         && let Some(registry) = executor_registry
     {
-        let table_ref = datafusion::sql::TableReference::full(
+        let table_ref = datafusion::common::TableReference::full(
             catalog_name.to_string(),
             schema_name.to_string(),
             table_name.to_string(),
@@ -1229,6 +1296,17 @@ impl ExecutionPlan for IcebergDropTableExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

@@ -16,6 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use snafu::prelude::*;
 use std::{
@@ -28,6 +29,7 @@ use tokio::sync::Mutex;
 
 mod docx;
 mod pdf;
+mod pdfium;
 mod pptx;
 mod xlsx;
 pub use docx::DocxParser;
@@ -42,6 +44,15 @@ pub enum Error {
         format: DocumentType,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to parse PDF document: the PDFium library could not be loaded ({reason}). \
+        Docker images ship PDFium next to the runtime; for a standalone install, ensure the \
+        host can reach GitHub so it can be downloaded automatically, or set the PDFIUM_LIB_PATH \
+        environment variable to a directory containing the PDFium shared library. \
+        See: https://spiceai.org/docs/features/document-processing"
+    ))]
+    PdfiumUnavailable { reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -50,16 +61,13 @@ static DOCUMENT_PARSER_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DocumentParserFactory>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// [`DocumentParserFactory`] added here should not hold live resources (e.g. cached connection pools).
+// If a factory is ever added that owns a live resource, must reimplement an `unregister_all`.
 pub async fn register_all() {
     register_parser_factory("docx", Arc::new(docx::DocxParserFactory {})).await;
     register_parser_factory("pdf", Arc::new(pdf::PdfParserFactory {})).await;
     register_parser_factory("pptx", Arc::new(pptx::PptxParserFactory {})).await;
     register_parser_factory("xlsx", Arc::new(xlsx::XlsxParserFactory {})).await;
-}
-
-pub async fn unregister_all() {
-    let mut registry = DOCUMENT_PARSER_FACTORY_REGISTRY.lock().await;
-    registry.clear();
 }
 
 pub async fn get_parser_factory(ext: &str) -> Option<Arc<dyn DocumentParserFactory>> {
@@ -86,8 +94,9 @@ pub trait DocumentParserFactory: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+#[async_trait]
 pub trait DocumentParser: Send + Sync {
-    fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>>;
+    async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>>;
 }
 
 pub trait Document {

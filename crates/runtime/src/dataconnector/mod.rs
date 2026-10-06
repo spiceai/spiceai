@@ -14,426 +14,72 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::{self, AcceleratedTable};
-use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
-use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::metrics::MetricsProvider;
-use crate::component::metrics::MetricsProviderComponent;
-use crate::datafusion::error::find_datafusion_root;
-use crate::federated_table::FederatedTable;
-use crate::parameters::ParameterSpec;
-use crate::parameters::Parameters;
-use arrow_schema::SchemaRef;
-use arrow_tools::schema::schema_meta_get_computed_columns;
-use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
-use datafusion::common::Column;
-use datafusion::common::tree_node::Transformed;
-use datafusion::common::tree_node::TreeNode;
-use datafusion::dataframe::DataFrame;
-use datafusion::datasource::{DefaultTableSource, TableProvider};
-use datafusion::error::DataFusionError;
-use datafusion::error::Result as DataFusionResult;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::LogicalPlan;
-use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
-use datafusion::prelude::ident;
-use datafusion::sql::TableReference;
-use datafusion::sql::unparser::Unparser;
-use linkme::distributed_slice;
-pub use parameters::ConnectorParams;
-use snafu::prelude::*;
-use std::any::Any;
+// A second alias for the `runtime-parameters` types, kept crate-visible for the
+// same reason as the `parameters` alias itself: it would otherwise be a way for
+// a connector to name them without depending on the crate that owns them.
+pub(crate) use crate::parameters::ParameterSpec;
+pub(crate) use crate::parameters::Parameters;
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
-use tracing::Level;
 
-use std::future::Future;
-use std::time::Duration;
+pub mod client_identity;
+// Re-exports `data-http-rate-control`; crate-visible so a connector outside the
+// runtime depends on that crate directly instead of routing through here.
+pub(crate) mod http_rate_control;
 
-pub(crate) mod client_identity;
-pub mod http_rate_control;
-pub mod listing;
-
-/// Creates a default reqwest client with standard Spice settings.
-///
-/// # Errors
-///
-/// Returns an error if the client cannot be built.
-pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
-    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
-
-    let mut headers = HeaderMap::new();
-    headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
-
-    reqwest::Client::builder()
-        .user_agent(util::spiceai_user_agent())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .default_headers(headers)
-        .build()
-}
-
-#[derive(Clone, Copy)]
-pub struct DataConnectorRegistration {
-    pub name: &'static str,
-    pub constructor: fn() -> Arc<dyn DataConnectorFactory>,
-}
-
-impl DataConnectorRegistration {
-    pub const fn new(
-        name: &'static str,
-        constructor: fn() -> Arc<dyn DataConnectorFactory>,
-    ) -> Self {
-        Self { name, constructor }
-    }
-}
-
-/// Distributed slice that automatically collects all data connector registrations at link time
-/// via the `linkme` crate. Entries are added using the [`register_data_connector!`] macro.
-#[distributed_slice]
-pub static DATA_CONNECTOR_REGISTRATIONS: [DataConnectorRegistration] = [..];
-
-/// Registers a data connector factory by name.
-///
-/// This macro creates a constructor function for the specified connector factory type and
-/// registers it in the global distributed slice of data connectors. This allows
-/// the runtime to discover and instantiate connectors without updating a central registry.
-///
-/// # Example (simple form)
-///
-/// ```
-/// register_data_connector!("file", FileFactory);
-/// ```
-///
-/// # Example (explicit form)
-///
-/// ```
-/// register_data_connector!(
-///     register_file_connector,
-///     FILE_CONNECTOR_REGISTRATION,
-///     "file",
-///     FileFactory
-/// );
-/// ```
-///
-/// Using this macro automatically adds the connector to the distributed slice,
-/// making it available for discovery by the runtime.
-#[macro_export]
-macro_rules! register_data_connector {
-    ($fn_name:ident, $static_name:ident, $name:expr, $factory:path) => {
-        fn $fn_name() -> ::std::sync::Arc<dyn $crate::dataconnector::DataConnectorFactory> {
-            <$factory>::new_arc()
-        }
-
-        #[linkme::distributed_slice($crate::dataconnector::DATA_CONNECTOR_REGISTRATIONS)]
-        pub static $static_name: $crate::dataconnector::DataConnectorRegistration =
-            $crate::dataconnector::DataConnectorRegistration::new($name, $fn_name);
-    };
-
-    ($name:expr, $factory:ident) => {
-        ::paste::paste! {
-            $crate::register_data_connector!(
-                [<__register_data_connector_fn_ $factory:snake>],
-                [<__REGISTER_DATA_CONNECTOR_ $factory:upper>],
-                $name,
-                $factory
-            );
-        }
-    };
-}
-
-pub mod abfs;
-#[cfg(feature = "adbc")]
-pub mod adbc;
-#[cfg(feature = "cosmosdb")]
-pub mod cosmosdb;
+// abfs: moved to crates/data-connectors/connector-abfs
+// #[deprecated] pub mod abfs;
+// adbc: moved to crates/data-connectors/connector-adbc
+// #[cfg(feature = "adbc")] pub mod adbc;
+// cosmosdb: moved to crates/data-connectors/connector-cosmosdb
+// #[cfg(feature = "cosmosdb")] pub mod cosmosdb;
+#[cfg(feature = "debezium")]
+pub mod cdc_ingest;
 #[cfg(feature = "debezium")]
 pub mod debezium;
-#[cfg(feature = "dynamodb")]
-pub mod dynamodb;
 pub mod file;
 
-pub mod git;
-pub mod github;
+// git: moved to crates/data-connectors/connector-git
+// github: moved to crates/data-connectors/connector-github
 pub mod https;
-#[cfg(feature = "kafka")]
+// kafka connector moved to crates/data-connectors/connector-kafka; module kept for debezium sidecar types
+#[cfg(feature = "debezium")]
 pub mod kafka;
 pub mod localpod;
 pub mod memory;
 
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
+pub const SCYLLADB_DATACONNECTOR: &str = "scylladb"; // const needs to be accessible when ScyllaDB isn't built
+/// The cargo feature that builds the `ScyllaDB` data connector into `spiced`.
+pub const SCYLLADB_FEATURE: &str = "scylladb";
 pub mod deferred;
-#[cfg(feature = "duckdb")]
-pub mod ducklake;
-pub mod gcs;
+// ducklake: moved to crates/data-connectors/connector-ducklake
+// gcs: moved to crates/data-connectors/connector-gcs
+// glue: registration moved to crates/data-connectors/connector-glue; module kept for catalog connector
 pub mod glue;
 pub mod iceberg;
 pub mod iceberg_cluster;
 pub mod parameters;
+pub mod refresh_source;
 pub mod s3;
+// Re-exports `data-connector-api`'s projection parser; crate-visible so a
+// connector outside the runtime depends on that crate directly.
+pub(crate) mod schema_projection;
 pub mod sink;
+pub(crate) mod snapshot_source;
+// spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
 pub mod spiceai;
 
-#[derive(Debug, Snafu)]
-pub enum DataConnectorError {
-    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). {source}"))]
-    UnableToConnectInternal {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}) on {host}:{port}. Ensure that the host and port are correctly configured in the spicepod, and that the host is reachable."
-    ))]
-    UnableToConnectInvalidHostOrPort {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        host: String,
-        port: String,
-    },
-
-    #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}). Authentication failed. Ensure that the username and password are correctly configured in the spicepod."
-    ))]
-    UnableToConnectInvalidUsernameOrPassword {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-    },
-
-    #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}). A TLS error occurred. Ensure that the corresponding TLS/secure option is configured to match the data connector's TLS security requirements."
-    ))]
-    UnableToConnectTlsError {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-    },
-
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}). {source}"))]
-    UnableToGetReadProvider {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}). {source}"))]
-    UnableToGetReadWriteProvider {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Failed to setup the {connector_component} ({dataconnector}). {source}"))]
-    UnableToGetCatalogProvider {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "The {connector_component} ({dataconnector}) has been rate limited. {source}"
-    ))]
-    RateLimited {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
-    ))]
-    InvalidConfiguration {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        message: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {source}"
-    ))]
-    InvalidConfigurationSourceOnly {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
-    ))]
-    InvalidConfigurationNoSource {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        message: String,
-    },
-
-    // Unlike the InvalidConfiguration* variants, this is a transient (retriable)
-    // condition: an object-store source has no data files at the path yet. Object
-    // stores are eventually consistent and data is frequently written after the
-    // runtime starts, so the dataset load must keep retrying until the files
-    // appear rather than failing permanently. See `is_retriable`.
-    #[snafu(display(
-        "No data files are yet available for the {connector_component} ({dataconnector}). {message} The runtime will keep retrying until the source data becomes available."
-    ))]
-    ObjectStoreNoFilesAvailable {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        message: String,
-    },
-
-    #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}). The connector '{dataconnector}' is not a valid connector. For details, visit: https://spiceai.org/docs/components/data-connectors"
-    ))]
-    InvalidConnectorType {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). An invalid glob pattern was provided '{pattern}'. Ensure the glob pattern is valid. {source}"
-    ))]
-    InvalidGlobPattern {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        pattern: String,
-        source: globset::Error,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). The table, '{table_name}', was not found. Verify the source table name in the Spicepod configuration."
-    ))]
-    InvalidTableName {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        table_name: String,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). Failed to detect a table schema. Ensure the table, '{table_name}', exists in the data source."
-    ))]
-    UnableToGetSchema {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        table_name: String,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). An unknown Data Connector Error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
-    InternalWithSource {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). An internal error occurred in the {dataconnector} Data Connector. Report a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the code: {code}"
-    ))]
-    Internal {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        code: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). Failed to infer the table schema. Report a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the error: {source}"
-    ))]
-    UnableToGetSchemaInternal {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). Unsupported type action is not enabled for the {dataconnector} Data Connector. Remove the parameter from your dataset configuration."
-    ))]
-    UnsupportedTypeAction {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). The field '{field_name}' has an unsupported data type: {data_type}. Skip loading this field by setting the `unsupported_type_action` parameter to `ignore` or `warn` in the dataset configuration. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#unsupported_type_action"
-    ))]
-    UnsupportedDataType {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        data_type: String,
-        field_name: String,
-    },
-
-    #[snafu(display(
-        "Failed to initialize the {connector_component} (ODBC). The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
-    ))]
-    OdbcNotInstalled {
-        connector_component: ConnectorComponent,
-    },
-
-    #[snafu(display(
-        "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled. Verify if the remote table schema update is expected and rebuild the acceleration if necessary."
-    ))]
-    SchemaMismatch {
-        dataset_name: String,
-        differences: String,
-    },
-
-    #[snafu(display(
-        "The name '{keyword}' is reserved and cannot be used as a name for a dataset for the {dataconnector} data connector. Change the name in the Spicepod and try again."
-    ))]
-    UseOfProtectedKeyword {
-        dataconnector: String,
-        keyword: String,
-    },
-
-    #[snafu(display(
-        "Insufficient permissions to access the {connector_component} ({dataconnector}). {source}"
-    ))]
-    InsufficientPermissions {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
-
-impl DataConnectorError {
-    /// Returns `true` if this error is transient and the operation may succeed
-    /// on retry. Configuration errors, unsupported type/table errors, and
-    /// permission errors are permanent and should not be retried.
-    #[must_use]
-    pub fn is_retriable(&self) -> bool {
-        !matches!(
-            self,
-            Self::InvalidConfiguration { .. }
-                | Self::InvalidConfigurationSourceOnly { .. }
-                | Self::InvalidConfigurationNoSource { .. }
-                | Self::InvalidConnectorType { .. }
-                | Self::InvalidGlobPattern { .. }
-                | Self::InvalidTableName { .. }
-                | Self::InsufficientPermissions { .. }
-                | Self::UnableToConnectInvalidHostOrPort { .. }
-                | Self::UnableToConnectInvalidUsernameOrPassword { .. }
-                | Self::UnableToConnectTlsError { .. }
-                | Self::UnsupportedTypeAction { .. }
-                | Self::UnsupportedDataType { .. }
-                | Self::OdbcNotInstalled { .. }
-                | Self::UseOfProtectedKeyword { .. }
-        )
-    }
-}
-
-pub type Result<T, E = DataConnectorError> = std::result::Result<T, E>;
-pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
-
-pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
+// The connector contract lives in `data-connector-api`, below `runtime`.
+// Crate-visible, not public: a public re-export would be a second path to every
+// contract item, and anything reached through `runtime` re-acquires the
+// dependency on the orchestrator that the inversion just removed — invisibly to
+// the layering guard, which only sees the `runtime` edge. Everything outside
+// this crate names `data-connector-api` directly.
+pub(crate) use data_connector_api::*;
 
 static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>>,
@@ -462,6 +108,7 @@ pub async fn get_connector_factory(name: &str) -> Option<Arc<dyn DataConnectorFa
 pub async fn create_new_connector(
     name: &str,
     params: ConnectorParams,
+    context: &dyn ConnectorContext,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let factory = {
         let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
@@ -491,10 +138,12 @@ pub async fn create_new_connector(
         .into()));
     }
 
-    let result = factory.create(params).await;
+    let result = factory.create(params, context).await;
     Some(result)
 }
 
+// [`DataConnectorFactory`] added here should not hold live resources (e.g. cached connection pools).
+// If a factory is ever added that owns a live resource, must reimplement an `unregister_all`.
 pub async fn register_all() {
     for registration in DATA_CONNECTOR_REGISTRATIONS {
         register_connector_factory(registration.name, (registration.constructor)()).await;
@@ -518,346 +167,27 @@ pub async fn suggest_connector(name: &str) -> Option<String> {
     util::levenshtein::closest_match(name, &registered_connector_names().await)
 }
 
-pub async fn unregister_all() {
-    let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
-    registry.clear();
-}
-pub trait DataConnectorFactory: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-
-    fn create(
-        &self,
-        params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
-
-    fn supports_unsupported_type_action(&self) -> bool {
-        false
-    }
-
-    /// The prefix to use for parameters and secrets for this `DataConnector`.
-    ///
-    /// This prefix is applied to any `ParameterType::Connector` parameters.
-    ///
-    /// ## Example
-    ///
-    /// If the prefix is `pg` then the following parameters are accepted:
-    ///
-    /// - `pg_host` -> `host`
-    /// - `pg_port` -> `port`
-    ///
-    /// The prefix will be stripped from the parameter name before being passed to the data connector.
-    fn prefix(&self) -> &'static str;
-
-    /// Returns a list of parameters that the data connector requires to be able to connect to the data source.
-    ///
-    /// Any parameter provided by a user that isn't in this list will be filtered out and a warning logged.
-    fn parameters(&self) -> &'static [ParameterSpec];
-
-    /// Returns a list of keywords that are reserved by the data connector.
-    /// Used to ensure that any table name isn't a reserved keyword.
-    fn reserved_keywords(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    /// Returns a static schema for the given dataset if this connector
-    /// **intrinsically** knows the schema from configuration alone
-    /// — i.e. without contacting the source and without relying on a
-    /// user-declared `columns:` block. (User-declared columns are
-    /// handled separately by the runtime's deferral dispatch as a
-    /// fallback when this method returns `None`.)
-    ///
-    /// Called during dataset registration **before** the connector itself
-    /// is built (no `create` call is required first). Implementations may
-    /// consult `params` (e.g. a configured file format) and `dataset`
-    /// (e.g. declared content type, JSON column decomposition) but must
-    /// not perform any I/O.
-    ///
-    /// When `Some(schema)` is returned, the runtime is allowed to register
-    /// the dataset using that schema and defer building the connector and
-    /// calling [`DataConnector::read_provider`] until the dataset is
-    /// actually referenced. The connector is still expected to return a
-    /// `TableProvider` whose schema matches on the first `read_provider`
-    /// call; mismatches surface at first scan as a hard error rather than
-    /// being silently retried (the static schema is configuration, not
-    /// source state).
-    ///
-    /// Default: `None`. Most connectors do not have an intrinsic
-    /// configuration-only schema and instead rely on either source
-    /// inference or the user-declared `columns:` fallback.
-    fn static_schema(&self, _params: &ConnectorParams, _dataset: &Dataset) -> Option<SchemaRef> {
-        None
-    }
-}
-
-/// A `DataConnector` knows how to retrieve and optionally write or stream data.
-#[async_trait]
-pub trait DataConnector: Debug + Send + Sync + 'static {
-    fn as_any(&self) -> &dyn Any;
-
-    /// Resolves the default refresh mode for the data connector.
-    ///
-    /// Most data connectors should keep this as `RefreshMode::Full`.
-    fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
-        refresh_mode.unwrap_or(RefreshMode::Full)
-    }
-
-    async fn read_provider(&self, dataset: &Dataset)
-    -> DataConnectorResult<Arc<dyn TableProvider>>;
-
-    async fn read_write_provider(
-        &self,
-        _dataset: &Dataset,
-    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
-        None
-    }
-
-    fn supports_changes_stream(&self) -> bool {
-        false
-    }
-
-    fn changes_stream(
-        &self,
-        _federated_table: Arc<FederatedTable>,
-        _dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
-    ) -> Option<ChangesStream> {
-        None
-    }
-
-    fn supports_append_stream(&self) -> bool {
-        false
-    }
-
-    fn append_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        None
-    }
-
-    async fn metadata_provider(
-        &self,
-        _dataset: &Dataset,
-    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
-        None
-    }
-
-    /// Pre-register any object stores this connector needs in order to execute
-    /// scans for `dataset` against the supplied `runtime_env`.
-    ///
-    /// Called on cluster executor startup so that physical plans decoded from
-    /// the scheduler can resolve their object stores via
-    /// `runtime_env().object_store(url)` even when the per-scan
-    /// `parquet_file_reader_factory` (or equivalent) is dropped during proto
-    /// round-trip.
-    ///
-    /// The default implementation is a no-op. Connectors backed by per-table
-    /// object stores (object-store-style connectors, Delta on S3/Azure/GCS,
-    /// Iceberg, etc.) should override this to register the appropriate stores
-    /// using the dataset's already secret-expanded params.
-    async fn register_object_stores(
-        &self,
-        _dataset: &Dataset,
-        _runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-    ) -> DataConnectorResult<()> {
-        Ok(())
-    }
-
-    /// A hook called **before** the accelerated table is built, giving the
-    /// connector a chance to wrap or replace the accelerator provider on the
-    /// [`Builder`](crate::accelerated_table::Builder).
-    ///
-    /// Any provider set here will be shared with the [`Refresher`] that is
-    /// created during [`Builder::build`]. Use this hook instead of
-    /// [`on_accelerated_table_registration`](Self::on_accelerated_table_registration)
-    /// when the wrapped provider must be visible to the refresh pipeline
-    /// (e.g. to recreate indexes after a data refresh).
-    async fn on_accelerator_setup(
-        &self,
-        _dataset: &Dataset,
-        _builder: &mut accelerated_table::Builder,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-
-    /// A hook that is called when an accelerated table is registered to the
-    /// `DataFusion` context for this data connector.
-    ///
-    /// Allows running any setup logic specific to the data connector when its
-    /// accelerated table is registered, i.e. setting up a file watcher to refresh
-    /// the table when the file is updated.
-    async fn on_accelerated_table_registration(
-        &self,
-        _dataset: &Dataset,
-        _accelerated_table: &mut AcceleratedTable,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-
-    /// Returns a `MetricsProvider` for the data connector.
-    ///
-    /// If the data connector does not support metrics, return `None`.
-    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
-        None
-    }
-
-    /// Returns whether the data connector should be initialized on startup or on trigger.
-    fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::default()
-    }
-
-    /// Returns whether the data connector should be initialized on startup or on trigger,
-    /// with dataset-specific logic.
-    ///
-    /// This method allows connectors to make initialization decisions based on the specific
-    /// dataset configuration. The default implementation delegates to `initialization()`.
-    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
-        self.initialization()
-    }
-}
-
-impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {
-    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
-        self.metrics_provider()
-    }
-}
-
-// Gets data from a table provider and returns it as a vector of RecordBatches.
-pub async fn get_data(
-    ctx: &mut SessionContext,
-    table_name: TableReference,
-    table_provider: Arc<dyn TableProvider>,
-    sql: Option<String>,
-    filters: Vec<Expr>,
-) -> Result<SendableRecordBatchStream, DataFusionError> {
-    let mut df = match sql {
-        None => {
-            let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
-
-            // Get the columns so we can add projection to the plan. This
-            // converts the plan to federated where the correct dialect is
-            // applied
-            let schema = table_provider.schema();
-            let columns: Vec<Expr> = schema.fields().iter().map(|f| ident(f.name())).collect();
-
-            let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
-                .map_err(find_datafusion_root)?
-                .project(columns)?
-                .build()
-                .map_err(find_datafusion_root)?;
-
-            DataFrame::new(ctx.state(), logical_plan)
-        }
-        Some(sql) => {
-            let session = ctx.state();
-            let mut plan = session
-                .create_logical_plan(&sql)
-                .await
-                .map_err(find_datafusion_root)?;
-
-            // If the refresh SQL defines a subset of columns to fetch, computed columns such as embeddings
-            // are not included automatically, so we verify their presence and add them manually if needed.
-            plan = include_computed_columns(plan, &table_provider.schema())?;
-
-            DataFrame::new(session, plan)
-        }
-    };
-
-    for filter in filters {
-        df = df.filter(filter).map_err(find_datafusion_root)?;
-    }
-
-    if tracing::enabled!(Level::TRACE)
-        && let Ok(explained) = df.clone().explain(false, false)
-        && let Ok(explained) = explained.to_string().await
-    {
-        tracing::trace!("Data refresh plan for {}:\n{}", table_name, explained);
-    }
-
-    let sql = Unparser::default()
-        .plan_to_sql(df.logical_plan())
-        .map_err(find_datafusion_root)?;
-    tracing::info!(target: "task_history", sql = %sql, "labels");
-
-    let record_batch_stream = df.execute_stream().await.map_err(find_datafusion_root)?;
-    Ok(record_batch_stream)
-}
-
-#[derive(Debug, Clone)]
-pub enum ConnectorComponent {
-    Catalog(Arc<Catalog>),
-    Dataset(Arc<Dataset>),
-}
-
 impl From<&Dataset> for ConnectorComponent {
     fn from(dataset: &Dataset) -> Self {
-        ConnectorComponent::Dataset(Arc::new(dataset.clone()))
-    }
-}
-
-impl From<&Arc<Dataset>> for ConnectorComponent {
-    fn from(dataset: &Arc<Dataset>) -> Self {
-        ConnectorComponent::Dataset(Arc::clone(dataset))
+        ConnectorComponent::Dataset(Arc::new(dataset.spec.clone()))
     }
 }
 
 impl From<&Catalog> for ConnectorComponent {
     fn from(catalog: &Catalog) -> Self {
-        ConnectorComponent::Catalog(Arc::new(catalog.clone()))
+        ConnectorComponent::Catalog(Arc::new(catalog.spec.clone()))
     }
-}
-
-impl std::fmt::Display for ConnectorComponent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectorComponent::Catalog(catalog) => write!(f, "catalog {}", catalog.name),
-            ConnectorComponent::Dataset(dataset) => write!(f, "dataset {}", dataset.name),
-        }
-    }
-}
-
-/// Ensures that the associated computed columns (e.g., embeddings) are included
-/// in the `LogicalPlan::Projection` node.
-/// If any required computed columns are missing, they are automatically added to the projection.
-fn include_computed_columns(
-    plan: LogicalPlan,
-    source_table_schema: &SchemaRef,
-) -> DataFusionResult<LogicalPlan> {
-    let plan = plan
-        .transform_down(|plan| {
-            match plan {
-                LogicalPlan::Projection(mut proj) => {
-                    for (idx, col) in proj.schema.columns().iter().enumerate() {
-                        if let Some(computed_columns) = schema_meta_get_computed_columns(
-                            source_table_schema.as_ref(),
-                            col.name(),
-                        ) {
-                            for computed_column in computed_columns {
-                                if !proj
-                                    .schema
-                                    .has_column_with_unqualified_name(computed_column.name())
-                                {
-                                    proj.expr.push(Expr::Column(Column::new(
-                                        proj.schema.qualified_field(idx).0.cloned(),
-                                        computed_column.name().clone(),
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                    // The Transformed flag is not used, so we always specify it as transformed for simplicity.
-                    Ok(Transformed::yes(LogicalPlan::Projection(proj)))
-                }
-                _ => Ok(Transformed::no(plan)),
-            }
-        })?
-        .data;
-
-    Ok(plan)
 }
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use datafusion::datasource::TableProvider;
     use datafusion_table_providers::UnsupportedTypeAction;
+    use runtime_component::dataset::DatasetSpec;
+    use std::any::Any;
+    use std::future::Future;
+    use std::pin::Pin;
     use tokio::runtime::Handle;
     use tokio::sync::{Barrier, RwLock};
     use tokio::time::{Duration, timeout};
@@ -889,13 +219,10 @@ mod tests {
                 .build()
                 .expect("Failed to build dataset");
 
-        ConnectorParamsBuilder::new(
-            connector_name.into(),
-            ConnectorComponent::Dataset(Arc::new(dataset)),
-        )
-        .build(secrets, Handle::current())
-        .await
-        .expect("failed to build connector params")
+        ConnectorParamsBuilder::for_dataset(connector_name.into(), &dataset)
+            .build(secrets, Handle::current())
+            .await
+            .expect("failed to build connector params")
     }
 
     #[tokio::test]
@@ -909,10 +236,11 @@ mod tests {
             fn as_any(&self) -> &dyn Any {
                 self
             }
-            fn create(
-                &self,
+            fn create<'a>(
+                &'a self,
                 _params: ConnectorParams,
-            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                _context: &'a dyn ConnectorContext,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
                 unimplemented!("static_schema must not require create()")
             }
             fn prefix(&self) -> &'static str {
@@ -935,13 +263,10 @@ mod tests {
             .build()
             .expect("Failed to build dataset");
 
-        let params = ConnectorParamsBuilder::new(
-            "default_factory".into(),
-            ConnectorComponent::Dataset(Arc::new(dataset.clone())),
-        )
-        .build(secrets, Handle::current())
-        .await
-        .expect("failed to build connector params");
+        let params = ConnectorParamsBuilder::for_dataset("default_factory".into(), &dataset)
+            .build(secrets, Handle::current())
+            .await
+            .expect("failed to build connector params");
 
         let factory = DefaultFactory;
         assert!(factory.static_schema(&params, &dataset).is_none());
@@ -956,10 +281,11 @@ mod tests {
                 self
             }
 
-            fn create(
-                &self,
+            fn create<'a>(
+                &'a self,
                 _params: ConnectorParams,
-            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                _context: &'a dyn ConnectorContext,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
                 Box::pin(async {
                     let connector: Arc<dyn DataConnector> = Arc::new(TestConnector);
                     Ok(connector)
@@ -990,7 +316,8 @@ mod tests {
 
             async fn read_provider(
                 &self,
-                _dataset: &Dataset,
+                _context: &dyn ConnectorContext,
+                _dataset: &DatasetSpec,
             ) -> DataConnectorResult<Arc<dyn TableProvider>> {
                 unimplemented!()
             }
@@ -1011,10 +338,7 @@ mod tests {
         dataset.unsupported_type_action = Some(DatasetUnsupportedTypeAction::Ignore);
 
         let secrets = Arc::new(RwLock::new(Secrets::default()));
-        let builder = ConnectorParamsBuilder::new(
-            "test".into(),
-            ConnectorComponent::Dataset(Arc::new(dataset)),
-        );
+        let builder = ConnectorParamsBuilder::for_dataset("test".into(), &dataset);
 
         let result = builder.build(secrets, Handle::current()).await;
         assert!(result.is_ok());
@@ -1038,10 +362,11 @@ mod tests {
                 self
             }
 
-            fn create(
-                &self,
+            fn create<'a>(
+                &'a self,
                 _params: ConnectorParams,
-            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                _context: &'a dyn ConnectorContext,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
                 let barrier = Arc::clone(&self.barrier);
 
                 Box::pin(async move {
@@ -1072,7 +397,8 @@ mod tests {
 
             async fn read_provider(
                 &self,
-                _dataset: &Dataset,
+                _context: &dyn ConnectorContext,
+                _dataset: &DatasetSpec,
             ) -> DataConnectorResult<Arc<dyn TableProvider>> {
                 unimplemented!()
             }
@@ -1098,13 +424,20 @@ mod tests {
             Arc::clone(&secrets),
         )
         .await;
-        let params_two =
-            build_test_connector_params("test_concurrent", "second", app, runtime, secrets).await;
+        let params_two = build_test_connector_params(
+            "test_concurrent",
+            "second",
+            Arc::clone(&app),
+            Arc::clone(&runtime),
+            secrets,
+        )
+        .await;
+        let context = parameters::RuntimeConnectorContext::new(app, runtime);
 
-        let (result_one, result_two) = timeout(Duration::from_secs(5), async move {
+        let (result_one, result_two) = timeout(Duration::from_secs(5), async {
             tokio::join!(
-                create_new_connector("test_concurrent", params_one),
-                create_new_connector("test_concurrent", params_two),
+                create_new_connector("test_concurrent", params_one, &context),
+                create_new_connector("test_concurrent", params_two, &context),
             )
         })
         .await
@@ -1120,5 +453,119 @@ mod tests {
             result_two.expect("second factory should exist").is_ok(),
             "second connector should initialize successfully"
         );
+    }
+
+    /// A source that advertises safe durable write-back delivery, so a wrapper
+    /// that silently inherits the trait default is visible as `false`.
+    #[derive(Debug)]
+    struct SafeDeliveryConnector;
+
+    #[async_trait]
+    impl DataConnector for SafeDeliveryConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _context: &dyn ConnectorContext,
+            _dataset: &DatasetSpec,
+        ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+            unimplemented!("capability-forwarding test never reads")
+        }
+
+        fn supports_durable_write_back_delivery(&self) -> bool {
+            true
+        }
+    }
+
+    /// `supports_durable_write_back_delivery` has a `false` default, so any
+    /// wrapper that forgets to forward it silently reports a safe source as
+    /// unsafe and the registration gate rejects a valid dataset. That is the
+    /// defaulted-no-op wrapper bug (#10460) applied to this capability, and it
+    /// compiles cleanly — only a test catches it.
+    ///
+    /// `ElasticsearchFullTextConnector` forwards the same one-liner but is
+    /// behind the `elasticsearch` feature and needs a params-bearing dataset to
+    /// construct, so it is not exercised here.
+    #[test]
+    fn every_wrapper_forwards_durable_write_back_delivery_support() {
+        let inner: Arc<dyn DataConnector> = Arc::new(SafeDeliveryConnector);
+        assert!(
+            inner.supports_durable_write_back_delivery(),
+            "precondition: the wrapped source advertises safe delivery"
+        );
+
+        let deferred = crate::dataconnector::deferred::DeferredConnector::new(Arc::clone(&inner));
+        assert!(
+            deferred.supports_durable_write_back_delivery(),
+            "DeferredConnector must forward the source's delivery capability"
+        );
+
+        let full_text =
+            crate::search::full_text::connector::FullTextConnector::new(Arc::clone(&inner));
+        assert!(
+            full_text.supports_durable_write_back_delivery(),
+            "FullTextConnector must forward the source's delivery capability"
+        );
+
+        let embedding = crate::embeddings::connector::EmbeddingConnector::new(
+            Arc::clone(&inner),
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            Arc::new(RwLock::new(Secrets::default())),
+        );
+        assert!(
+            embedding.supports_durable_write_back_delivery(),
+            "EmbeddingConnector must forward the source's delivery capability"
+        );
+
+        let drasi = crate::drasi::connector::DrasiConnector::new(
+            Arc::clone(&inner),
+            crate::drasi::DeliveryMode::Acknowledged(Arc::new(
+                runtime_drasi::DrasiSink::try_new(runtime_drasi::DrasiSinkConfig {
+                    dataset: "test".to_string(),
+                    source_id: "test".to_string(),
+                    mapping: runtime_drasi::ElementMapping::new(
+                        "test".to_string(),
+                        vec!["test".to_string()],
+                    ),
+                    // Never connected to: building the sink only builds a client.
+                    transport: runtime_drasi::TransportConfig::Http {
+                        endpoint: url::Url::parse("http://127.0.0.1:1").expect("valid url"),
+                        request_timeout: Duration::from_secs(1),
+                    },
+                    on_delivery_error: runtime_drasi::OnDeliveryError::Block,
+                })
+                .expect("builds a sink"),
+            )),
+        );
+        assert!(
+            drasi.supports_durable_write_back_delivery(),
+            "DrasiConnector must forward the source's delivery capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutting_down_one_runtime_does_not_deregister_connectors_for_another() {
+        // Regression test for the `s3` connector race that flaked
+        // `search::test_megascience_permutations` in CI: shutting one
+        // `Runtime` down must not deregister connectors a sibling `Runtime`
+        // still relies on.
+        let rt_a = crate::Runtime::builder().build().await;
+        let rt_b = crate::Runtime::builder().build().await;
+
+        assert!(
+            get_connector_factory("s3").await.is_some(),
+            "s3 connector should be registered before any shutdown"
+        );
+
+        rt_a.shutdown().await;
+
+        assert!(
+            get_connector_factory("s3").await.is_some(),
+            "shutting down one Runtime must not deregister connectors a sibling Runtime still needs"
+        );
+
+        rt_b.shutdown().await;
     }
 }

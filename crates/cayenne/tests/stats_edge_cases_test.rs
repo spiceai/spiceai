@@ -318,14 +318,44 @@ async fn test_overwrite_clears_inlined_data(fixture: common::TestFixture) -> Tes
         .collect()
         .await?;
 
-    // Inlined data should be cleared
+    // The overwrite clears the previous inline corpus and — being small enough
+    // to be admitted — writes its own rows back as ONE entry in the same
+    // transaction, so the tier now holds exactly the overwritten rows and none
+    // of the pre-overwrite ones. Note `get_inlined_data_count` sums
+    // `record_count`: it counts inlined ROWS, not entries.
+    let inlined_rows = fixture.catalog.get_inlined_data_count(&table_id).await?;
     assert_eq!(
-        fixture.catalog.get_inlined_data_count(&table_id).await?,
-        0,
-        "Overwrite should clear inlined data"
+        inlined_rows, 2,
+        "an admitted overwrite replaces the inlined corpus with exactly its own rows"
+    );
+    assert_eq!(
+        fixture.catalog.get_inlined_data(&table_id).await?.len(),
+        1,
+        "the replacement is a single entry"
     );
 
-    // Only the overwrite data should be visible
+    // Only the overwrite data is visible, whichever tier the rows landed in.
+    assert_eq!(query_count(&ctx, "inline_overwrite").await, 2);
+
+    // The load-bearing property for a table refreshed on a schedule: repeated
+    // overwrites must REPLACE, never accumulate. Without the clear in
+    // `commit_overwrite_in_txn` this grows one entry per refresh forever.
+    for _ in 0..4 {
+        ctx.sql("INSERT OVERWRITE inline_overwrite VALUES (99,990),(100,1000)")
+            .await?
+            .collect()
+            .await?;
+    }
+    assert_eq!(
+        fixture.catalog.get_inlined_data(&table_id).await?.len(),
+        1,
+        "five overwrites must still leave exactly one inline entry"
+    );
+    assert_eq!(
+        fixture.catalog.get_inlined_data_count(&table_id).await?,
+        2,
+        "and exactly the last overwrite's rows"
+    );
     assert_eq!(query_count(&ctx, "inline_overwrite").await, 2);
 
     Ok(())

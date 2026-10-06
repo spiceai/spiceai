@@ -33,6 +33,7 @@ use crate::vector_simd::{
 };
 
 pub static INNER_PRODUCT_UDF_NAME: &str = "inner_product";
+runtime_udfs_api::register_spice_function!(INNER_PRODUCT_SPICE_FUNCTION, INNER_PRODUCT_UDF_NAME);
 
 /// Alias so `dot_product(a, b)` resolves to this UDF.
 ///

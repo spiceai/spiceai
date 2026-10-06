@@ -1,0 +1,10 @@
+---
+source: crates/vortex/src/persistent/mod.rs
+expression: else_fmt
+---
++----+
+| id |
++----+
+| 1  |
+| 5  |
++----+

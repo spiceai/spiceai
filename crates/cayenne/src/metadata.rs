@@ -16,11 +16,13 @@ limitations under the License.
 
 //! Data structures for Cayenne metadata.
 
-use std::num::NonZeroUsize;
-
 use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
+// Re-exported so callers configuring a `VortexConfig` (the runtime's Cayenne
+// accelerator) name the mode through this module alongside the other config
+// enums, rather than reaching into `vortex-datafusion` for one type.
+pub use vortex_datafusion::ScanConcurrency;
 
 /// Default maximum number of rows to inline in the metastore instead of writing a Vortex file.
 pub const DEFAULT_INLINE_MAX_ROWS: usize = 1024;
@@ -34,6 +36,10 @@ pub const DEFAULT_INLINE_FLUSH_MAX_ROWS: i64 = 10_000;
 pub const DEFAULT_INLINE_FLUSH_MAX_SEGMENTS: i64 = 64;
 /// Default maximum serialized IPC bytes to keep inline before flushing to Vortex.
 pub const DEFAULT_INLINE_FLUSH_MAX_BYTES: i64 = 8 * 1_048_576;
+/// Default maximum age of buffered streaming-append data before the sink cuts
+/// the segment and publishes it (bounds ingest-to-queryable latency for
+/// long-lived insert streams).
+pub const DEFAULT_STREAM_PUBLISH_INTERVAL_MS: u64 = 10_000;
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -70,6 +76,69 @@ pub struct TableMetadata {
     /// the new insert has a higher sequence than the delete, so the delete
     /// doesn't apply to the new data.
     pub current_sequence_number: i64,
+}
+
+impl TableMetadata {
+    /// Physical directory segment for the **datalake (cold) tier**:
+    /// `{sanitized_table_name}-{table_id}`.
+    ///
+    /// The datalake tier groups a table's objects under this segment
+    /// (`{cayenne_datalake_location}/{segment}/data/{promotion_id}/…`). Prepending
+    /// a human-readable slug of the table name makes a shared datalake bucket
+    /// navigable, while the trailing `UUIDv7` `table_id` preserves the collision-free
+    /// namespacing that lets multiple tables/instances safely share one location.
+    ///
+    /// Because the `table_id` suffix already guarantees uniqueness, the name slug
+    /// may be **lossy**: any character outside `[A-Za-z0-9_-]` becomes `_`, leading
+    /// and trailing `_`/`-` are trimmed, and the slug is capped at
+    /// [`Self::DATALAKE_SLUG_MAX_LEN`] characters. A name that slugs to nothing
+    /// (e.g. all symbols) falls back to the bare `table_id`.
+    ///
+    /// The segment is a pure function of two immutable fields (`table_name` never
+    /// changes for a given `table_id` — a rename is a drop + recreate that mints a
+    /// new id), so it is derived on demand and never persisted. The warm tier is
+    /// intentionally left keyed by the bare `table_id`.
+    #[must_use]
+    pub fn datalake_dir_segment(&self) -> String {
+        let slug = Self::sanitize_name_slug(&self.table_name);
+        if slug.is_empty() {
+            self.table_id.clone()
+        } else {
+            format!("{slug}-{}", self.table_id)
+        }
+    }
+
+    /// Lossy, path-safe slug of a table name for [`Self::datalake_dir_segment`]:
+    /// non-`[A-Za-z0-9_-]` characters become `_`, leading/trailing `_`/`-` are
+    /// trimmed, and the result is capped at [`Self::DATALAKE_SLUG_MAX_LEN`]. May
+    /// return an empty string (e.g. an all-symbol name); callers fall back to the
+    /// bare `table_id`, which alone keeps segments unique.
+    fn sanitize_name_slug(name: &str) -> String {
+        let mapped: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        mapped
+            .trim_matches(['_', '-'])
+            .chars()
+            .take(Self::DATALAKE_SLUG_MAX_LEN)
+            .collect::<String>()
+            // Re-trim: truncation can re-expose a trailing separator.
+            .trim_end_matches(['_', '-'])
+            .to_string()
+    }
+
+    /// Maximum length (in characters) of the sanitized table-name slug used in
+    /// [`Self::datalake_dir_segment`]. Keeps the full segment well under the
+    /// 255-byte path-component limit on common filesystems even with a 36-char
+    /// UUID and a separator appended.
+    pub const DATALAKE_SLUG_MAX_LEN: usize = 64;
 }
 
 /// Represents a data file containing table rows.
@@ -197,14 +266,17 @@ pub struct PartitionMetadata {
 impl PartitionMetadata {
     /// Returns a composite key string for this partition.
     ///
-    /// For single partitions: returns the single value (e.g., `"us-east-1"`).
-    /// For composite partitions: returns a slash-separated path (e.g., `"2025/10/15"`).
-    ///
-    /// This key uniquely identifies the partition within a table and is used
-    /// for `HashMap` lookups and Hive-style directory naming.
+    /// Components are length-prefixed so tuple boundaries are unambiguous even
+    /// for legacy values containing separators.
     #[must_use]
     pub fn composite_key(&self) -> String {
-        self.partition_values.join("/")
+        let mut composite = String::from("v1:");
+        for value in &self.partition_values {
+            composite.push_str(&value.len().to_string());
+            composite.push(':');
+            composite.push_str(value);
+        }
+        composite
     }
 
     /// Creates a new `PartitionMetadata` for a single partition column (legacy compatibility).
@@ -250,6 +322,28 @@ impl PartitionMetadata {
     }
 }
 
+/// Provenance of [`VortexConfig::sort_columns`] — whether the operator asked
+/// for that sort order or schema inference guessed it.
+///
+/// This exists because the two carry different authority. An explicit
+/// `cayenne_sort_columns` is a statement of intent and wins outright. An
+/// inference-derived value is a *fallback guess* — for `PostgreSQL` CDC tables it
+/// resolves to the primary key when the source has no `CLUSTER` or natural
+/// order, which is close to the worst clustering for range/date predicates. It
+/// must therefore rank below the hot filter columns actually observed on scans,
+/// or the guess permanently shadows the measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortColumnsOrigin {
+    /// Explicitly configured by the operator (or absent, in which case
+    /// `sort_columns` is empty and the distinction is moot). Authoritative.
+    #[default]
+    User,
+    /// Filled in by schema inference from the source's declared sort order.
+    /// A guess — outranked by observed filter columns.
+    Inferred,
+}
+
 /// Which compression strategy the table's FULL encoding tier uses — i.e.
 /// maintenance writes (compaction outputs, rewrites, overwrites) and delta
 /// writes that resolve to a full level (`7..=10`, or `auto` on large /
@@ -274,10 +368,9 @@ pub enum CompressionStrategy {
 ///
 /// zstd-style level scale (`cayenne_delta_encoding` param):
 ///
-/// - `auto` (default) — size-gated: a write smaller than a quarter of the
-///   target file size encodes at a light level (the file is transient by
-///   definition — compaction exists to fold it); larger or unknown-size
-///   writes use the full default encoding.
+/// - `auto` (default) — every delta write encodes at a light level: a delta
+///   is transient by definition (the tiered compactor folds it into a
+///   properly-encoded file), so it skips the full cascade regardless of size.
 /// - `0` — no compression (canonical arrays; cheapest encode).
 /// - `1`–`6` — progressively richer scheme sets. The cheap levels skip the
 ///   per-file encoder-strategy search and FSST symbol-table training.
@@ -295,14 +388,15 @@ pub enum CompressionStrategy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum DeltaEncoding {
-    /// Size-gated: light for small deltas, full for large writes.
-    /// Local micro A/B (2026-06-06) was neutral on the
-    /// upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
-    /// production-scale CDC and is to be validated there. Set the
-    /// param to `7` to opt out (pre-feature behavior).
+    /// `Auto` — light encoding for every delta write. Deltas are transient
+    /// (compaction re-encodes them at the full cascade), so the CDC hot path
+    /// skips the per-file encoder-strategy search + FSST symbol-table training
+    /// regardless of delta size. The SF1000 CH-benCHmark HTAP sweep validated
+    /// this at production scale: shedding checkpoint encode CPU lets the apply
+    /// loop keep up (it enables replication convergence where full-encode does
+    /// not, and gives the best analytic QPH on top of coalescing).
     ///
-    /// `Auto` — size-gated light encoding for small deltas. This is also what
-    /// pre-feature stored table configs deserialize to via
+    /// This is also what pre-feature stored table configs deserialize to via
     /// `#[serde(default)]`, so existing tables pick up the policy on upgrade
     /// (write-time only; existing data files are unaffected and a level
     /// change never forces a table re-create). Set the
@@ -616,7 +710,9 @@ pub struct PinnedTuningActuators {
 pub enum StorageClass {
     /// Local NVMe/SSD — fast random I/O; the tuner applies no write-amortization bias.
     LocalSsd,
-    /// Network block store (e.g. EBS) — higher, variable latency: the slow tier.
+    /// Network-attached storage — EBS / Azure managed block disks, or an NFS/SMB
+    /// network filesystem. Higher, variable latency: the slow/networked tier.
+    /// (The variant name is historical — EBS was the first case.)
     Ebs,
     /// tmpfs / RAM-backed — fastest; no bias.
     Tmpfs,
@@ -649,9 +745,39 @@ impl StorageClass {
     }
 }
 
+/// Serializes [`ScanConcurrency`] through its own `Display`/`FromStr` pair.
+///
+/// The type is owned by `vortex-datafusion`, which carries no serde dependency, so
+/// the string form is produced here rather than derived there. Going through the
+/// enum's own parser keeps one definition of what `auto`/`off`/`<n>` mean — a
+/// second mapping here would be free to drift from the one the scan honors.
+mod scan_concurrency_serde {
+    use super::ScanConcurrency;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &ScanConcurrency,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ScanConcurrency, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "VortexConfig is a flat aggregate of many independent, unrelated runtime toggles \
+              mapped 1:1 from spicepod params; grouping them into sub-structs would obscure that mapping"
+)]
 pub struct VortexConfig {
     /// Runtime-global footer metadata cache size in MB, when explicitly configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -660,6 +786,16 @@ pub struct VortexConfig {
     ///
     /// Passed through to `vortex-datafusion` as the per-format segment cache size.
     pub segment_cache_mb: usize,
+    /// How many splits a single Vortex file scan decodes concurrently.
+    ///
+    /// `auto` (the default) derives it from `DataFusion` target partitions and the
+    /// planned file count; `off` forces serial decoding; an explicit count pins it.
+    /// Raising it trades resident decode memory for scan throughput — the scan
+    /// memory accounting charges the query pool for every concurrent split, so a
+    /// wide fan-out over a small pool surfaces as a refused query rather than an
+    /// over-committed host.
+    #[serde(default, with = "scan_concurrency_serde")]
+    pub scan_concurrency: ScanConcurrency,
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
     /// for better parallelism and more granular statistics for query optimization.
@@ -667,6 +803,19 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Where [`Self::sort_columns`] came from. `user` (an explicit
+    /// `cayenne_sort_columns`) is authoritative and outranks everything.
+    /// `inferred` means schema inference filled it from the source's declared
+    /// order — for a `PostgreSQL` CDC table that is usually just the primary key,
+    /// a *guess* about what queries will filter on. An inferred value therefore
+    /// ranks BELOW the hot filter columns actually observed on scans, so the
+    /// default-on adaptive layout can override a guess with evidence.
+    ///
+    /// Deliberately NOT compared by `configuration_matches`: it is provenance
+    /// about a value, not a data-affecting field. Comparing it would make every
+    /// existing table look config-changed on upgrade and trip the recreate path.
+    #[serde(default)]
+    pub sort_columns_origin: SortColumnsOrigin,
     /// Columns to hash-cluster rows by during intra-write sharding (the parallel
     /// encode fan-out). Empty = derive from the primary key (PK-hash clustering,
     /// the historical behavior); PK-less tables shard round-robin. Ignored for
@@ -677,11 +826,11 @@ pub struct VortexConfig {
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
     /// Encoding effort for delta writes (fresh CDC/append snapshot files).
-    /// `auto` (default) size-gates: small deltas encode light and are folded
-    /// into properly-encoded files by compaction; explicit `0..=10` pins the
-    /// level (`7` = the full default cascade, the pre-feature behavior).
-    /// Maintenance writes (compaction, rewrites) always use the full default
-    /// encoding. See [`DeltaEncoding`].
+    /// `auto` (default) encodes every delta light (deltas are transient and
+    /// folded into properly-encoded files by compaction); explicit `0..=10`
+    /// pins the level (`7` = the full default cascade, the pre-feature
+    /// behavior). Maintenance writes (compaction, rewrites) always use the full
+    /// default encoding. See [`DeltaEncoding`].
     #[serde(default)]
     pub delta_encoding: DeltaEncoding,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.
@@ -715,34 +864,6 @@ pub struct VortexConfig {
     /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
     #[serde(default = "default_bake_deletion_index_trigger")]
     pub bake_deletion_index_trigger: usize,
-    /// Per-table threshold: number of orphan-eligible key-based deletion vectors
-    /// (count of `cayenne_delete_file` rows, NOT masked rows) that must accumulate
-    /// on a single table before its cleanup sweep runs. A key DV becomes
-    /// orphan-eligible only once **time-based retention** empties the protected
-    /// snapshot(s) it shadowed, raising the surviving-sequence floor above its
-    /// delete sequence so it shadows nothing (issue #9388). Without a retention
-    /// policy no DVs are ever orphaned and the sweep is a no-op.
-    ///
-    /// This governs ONLY the orphaned tail. The live (not-yet-orphaned) DV set —
-    /// DVs still shadowing rows in un-emptied snapshots — is bounded separately by
-    /// compaction's seq-prefix bake (see [`crate::provider::memory_account`]: "the
-    /// real bound on deletions is compaction"), not by this knob.
-    ///
-    /// `Some(20)` is the default. `None` disables cleanup entirely — no
-    /// background sweep is spawned, so the file-based DELETE path acquires no
-    /// extra locks and runs no catalog scan (the pre-feature behavior). The
-    /// `NonZeroUsize` type makes a misconfigured `0` unrepresentable; the spicepod
-    /// param (`cayenne_orphaned_dv_cleanup_min_files`) maps `0` to `None`
-    /// (disabled) and, when left unset, falls back to this default (`20`). A
-    /// larger value sweeps less often
-    /// (cheaper, but orphaned `.arrow` files linger on disk longer); a smaller
-    /// value reclaims disk sooner. Each orphaned `.arrow` file's size scales with
-    /// the number of deletions it records, so lingering disk ≈
-    /// `n_tables × threshold × avg_dv_size` (`avg_dv_size` was ~63 KiB, up to
-    /// ~870 KiB, in an SF-100 CH-benCHmark sample). The sweep is lock-free and
-    /// runs off the write path on the dedicated compaction runtime, so this only
-    /// trades sweep frequency against lingering disk — never ingest latency.
-    pub orphaned_dv_cleanup_min_files: Option<NonZeroUsize>,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
     /// so small-file compaction tuning does not silently change scan amplification
@@ -813,6 +934,13 @@ pub struct VortexConfig {
         alias = "inline_memtable_max_bytes"
     )]
     pub inline_flush_max_bytes: i64,
+    /// Maximum age (ms) of buffered data in a streaming append before the sink
+    /// cuts the segment and publishes it, bounding ingest-to-queryable latency
+    /// for long-lived insert streams (e.g. ADBC bulk ingest). Each segment is a
+    /// complete prepare→stage→publish write. Set to 0 to disable and publish
+    /// only when the stream ends (pre-feature behavior).
+    #[serde(default = "default_stream_publish_interval_ms")]
+    pub stream_publish_interval_ms: u64,
     /// Whether inserts should scan existing data for primary-key conflicts. Set to `none` only
     /// when the source enforces PK uniqueness and ingestion cannot replay existing rows.
     #[serde(default)]
@@ -836,6 +964,22 @@ pub struct VortexConfig {
     /// above-scan key-based filter.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
+    /// Whether this table is a pure in-memory (`mode: memory`) accelerator: all
+    /// data lives in the RAM mem-tier (the in-memory metastore holds only metadata), no Vortex
+    /// data files are ever written (checkpoint + compaction disabled), it is
+    /// ephemeral (reload from the source on restart — for CDC `changes` the source
+    /// slot is committed immediately after each in-RAM write, since there is no
+    /// durable checkpoint to defer behind), and a hard RAM bound returns an error
+    /// on breach instead of spilling.
+    ///
+    /// Not a user param — `VortexConfig` is only serde-deserialized from the metastore
+    /// (never from user input; the accelerator builds it field-by-field), so this is
+    /// set programmatically by the accelerator from the acceleration `mode: memory`.
+    /// It IS serialized with the table config so it survives the create-time
+    /// metastore round-trip (`create` re-reads the table via `get_table`). For a
+    /// memory table the metastore is itself in-RAM; a file-mode table stores `false`.
+    #[serde(default)]
+    pub memory_mode: bool,
     /// Durability mode for the inline CDC write path. [`CdcDurability::Memory`]
     /// (default) appends to an in-RAM tier and defers the slot ack to a
     /// periodic/cap-triggered checkpoint — A/B-validated faster than `file`
@@ -893,6 +1037,24 @@ pub struct VortexConfig {
     /// to 1 s.
     #[serde(default = "default_cdc_mem_tier_checkpoint_interval_ms")]
     pub cdc_mem_tier_checkpoint_interval_ms: u64,
+    /// Max wall-clock milliseconds the ACTIVE ingestion piece may age before a
+    /// **seal** durably shadows it and advances the source replication slot, in
+    /// `cdc_durability: memory` mode only. This is the fresh-durability cadence
+    /// that DECOUPLES the slot ack (and thus replication/freshness lag) from the
+    /// heavy protected-snapshot checkpoint: a seal writes the un-sealed RAM delta
+    /// to the durable-but-unpublished inline corpus (one metastore commit, no
+    /// Vortex encode, no listing-fence publish, no read-amp) and fires the slot
+    /// advancer, so the slot advances every ~`seal_age_ms` instead of every
+    /// `max_age_ms`/`min_flush_bytes` checkpoint. Reads are unaffected — they
+    /// already union the RAM tier; the shadow is invisible in-process and is only
+    /// replayed on crash recovery. Bounds replication lag WITHOUT the read-amp of a
+    /// faster full checkpoint. `0` disables sealing (slot ack reverts to the
+    /// checkpoint cadence — the pre-seal behavior). Defaults to 2 s so replication
+    /// freshness stays under ~3 s. Should be `<= cdc_mem_tier_max_age_ms` to have
+    /// any effect (a seal older than the checkpoint window is superseded by the
+    /// checkpoint's own slot advance).
+    #[serde(default = "default_cdc_mem_tier_seal_age_ms")]
+    pub cdc_mem_tier_seal_age_ms: u64,
     /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
     /// the `cayenne_tuning` mode: `auto` (default) → `false` (static derivation
     /// only); `adaptive` → `true` (static warm-start + the closed loop). When on,
@@ -943,8 +1105,9 @@ pub struct VortexConfig {
     /// signal-driven controller for that metric). When any is set, the closed loop
     /// drives that high-level SLO toward target with small incremental steps,
     /// converging within `goal_convergence_window_secs`. Set from the
-    /// `cayenne_goal_*` params; setting any goal implies `dynamic_tuning` (a goal
-    /// with the loop off is inert). Runtime-only — never compared by
+    /// `cayenne_goal_*` params. A goal declares a target, not a controller, so it
+    /// never turns `dynamic_tuning` on — set without it, the goal is inert (the
+    /// accelerator warns). Runtime-only — never compared by
     /// `configuration_matches` (does not affect data layout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_replication_lag_secs: Option<f64>,
@@ -995,36 +1158,74 @@ pub struct VortexConfig {
     #[serde(skip)]
     pub force_view_read_schema: bool,
 
+    /// End-to-end integrity checksums for durability surfaces (staging-WAL
+    /// records and Vortex data files). When enabled:
+    ///
+    /// * Each staging-WAL record is written with a checksum envelope, and a
+    ///   record that fails its checksum on recovery is *detected and discarded*
+    ///   (converging to the last committed snapshot) rather than parsed as
+    ///   garbage or replayed with corrupted move instructions.
+    /// * A digest is computed for each published Vortex data file and stored in
+    ///   the manifest, then verified before the file is first scanned; a
+    ///   mismatch fails the read as a *detected fault* instead of returning
+    ///   silently-wrong rows.
+    ///
+    /// Runtime-configurable: the accelerator factory sets it (default off; opt
+    /// in with `cayenne_integrity_checksums: true`). Off is byte-identical to
+    /// the pre-feature on-disk format and adds no read/write overhead. Reads
+    /// always accept both framed and legacy pre-feature WAL records regardless
+    /// of this flag, so toggling it (or downgrading) never orphans a WAL.
+    #[serde(skip)]
+    pub integrity_checksums: bool,
+
     // ---- Cold object-store tier (storage-cascade bottom tier; cascade model) ----
     /// Absolute object-store URL prefix for the cold tier (e.g.
     /// `s3://bucket/prefix`). `None`/empty (the default) disables the cold tier.
-    /// Set from the `cayenne_cold_tier_location` spicepod param. Persisted so a
+    /// Set from the `cayenne_datalake_location` spicepod param. Persisted so a
     /// reopened table knows where its cold files live; NOT compared by
     /// `configuration_matches`, so toggling it never recreates the table (the
     /// cold tier is a strict superset of behavior over an unchanged warm tier).
     pub cold_tier_location: Option<String>,
-    /// Liquid-clustering key columns for cold files (multi-column Z-order).
-    /// Empty = fall back to `sort_columns`, then the primary key. Set from
-    /// `cayenne_cold_clustering_columns`.
-    pub cold_clustering_columns: Vec<String>,
+    /// Hilbert-clustering key columns for warm and datalake files.
+    /// Empty leaves layout selection to the existing automatic policy. Set from
+    /// `cayenne_cluster_by` or a Cayenne DDL `CLUSTER BY` clause.
+    ///
+    /// The alias preserves metadata written by preview builds that stored the
+    /// cold-tier-only field name. New metadata is always written as `cluster_by`.
+    #[serde(alias = "cold_clustering_columns")]
+    pub cluster_by: Vec<String>,
     /// Target size for cold Vortex files in MB. Larger than the warm
     /// `target_vortex_file_size_mb` because object stores favor fewer, larger
     /// objects and cold scans are range reads. Set from
-    /// `cayenne_cold_target_file_size_mb`. Defaults to 512.
+    /// `cayenne_datalake_target_file_size_mb`. Defaults to 512.
     pub cold_target_file_size_mb: usize,
-    /// Promotion fires only once the warm tier exceeds this many bytes
+    /// Max input bytes (in MB) fed to one bounded clustering sort run during a
+    /// warm-to-datalake move. `None` (the default) derives
+    /// [`Self::cold_clustering_run_size_bytes`] as `cold_target_file_size_mb *
+    /// 16` — 16 target files' worth of input gives enough locality for good
+    /// clustering (8 GiB with the default 512 MB target).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_clustering_run_size_mb: Option<usize>,
+    /// The warm tier moves to the datalake only once it exceeds this many bytes
     /// (`<= 0` disables the byte trigger). Set from
-    /// `cayenne_cold_tier_warm_max_bytes`.
+    /// `cayenne_datalake_warm_max_bytes`.
     pub cold_tier_warm_max_bytes: i64,
-    /// Promotion fires only once the warm tier exceeds this many files
+    /// The warm tier moves to the datalake only once it exceeds this many files
     /// (`0` disables the file-count trigger). Set from
-    /// `cayenne_cold_tier_warm_max_files`.
+    /// `cayenne_datalake_warm_max_files`.
     pub cold_tier_warm_max_files: usize,
-    /// How often (ms) the background loop evaluates the cold-promotion trigger.
-    /// Cold tiering is not latency-critical, so this is much coarser than the
-    /// compaction interval. Set from `cayenne_cold_tier_background_interval_ms`.
-    /// Defaults to 60s.
+    /// How often (ms) the background loop checks whether to move warm-tier data
+    /// to the datalake. Datalake tiering is not latency-critical, so this is much coarser than the
+    /// compaction interval. Set from the user-facing
+    /// `cayenne_datalake_tiering_check_interval_ms`. Defaults to 60s.
     pub cold_tier_background_interval_ms: u64,
+    /// Physical-GC cadence AND orphan grace (ms) for superseded cold objects:
+    /// the sweep runs about this often, and an orphan (on the store, not in the
+    /// manifest) is deleted only after being observed orphaned this long — mark
+    /// on one sweep, delete on the next, so an in-flight scan gets a full
+    /// interval to finish. From `cayenne_datalake_gc_interval_ms`; defaults to
+    /// 5min, lowered in tests.
+    pub cold_tier_gc_interval_ms: u64,
 }
 
 impl VortexConfig {
@@ -1034,6 +1235,18 @@ impl VortexConfig {
         self.cold_tier_location
             .as_ref()
             .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Effective byte cap for one bounded clustering sort run during cold
+    /// promotion: an explicit [`Self::cold_clustering_run_size_mb`], else
+    /// derived as `cold_target_file_size_mb * 16`. The single derivation rule
+    /// for standalone and runtime paths — never returns 0.
+    #[must_use]
+    pub fn cold_clustering_run_size_bytes(&self) -> usize {
+        self.cold_clustering_run_size_mb
+            .unwrap_or_else(|| self.cold_target_file_size_mb.saturating_mul(16))
+            .max(1)
+            .saturating_mul(1024 * 1024)
     }
 }
 
@@ -1075,7 +1288,7 @@ impl SchemaEvolutionMode {
 }
 
 fn default_concurrency() -> usize {
-    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    cpu_budget::cpu_budget().cayenne_upload_concurrency()
 }
 
 fn default_upload_concurrency() -> usize {
@@ -1132,6 +1345,10 @@ fn default_inline_flush_max_segments() -> i64 {
 
 fn default_inline_flush_max_bytes() -> i64 {
     DEFAULT_INLINE_FLUSH_MAX_BYTES
+}
+
+fn default_stream_publish_interval_ms() -> u64 {
+    DEFAULT_STREAM_PUBLISH_INTERVAL_MS
 }
 
 /// Default per-table RAM-tier byte cap for `cdc_durability: memory` (256 MiB —
@@ -1207,6 +1424,18 @@ fn default_cdc_mem_tier_checkpoint_interval_ms() -> u64 {
     1_000
 }
 
+/// Default seal cadence for `cdc_durability: memory` (2 s). A seal durably
+/// shadows the un-sealed RAM delta into the unpublished inline corpus and
+/// advances the source slot WITHOUT a full protected-snapshot checkpoint, so
+/// replication/freshness lag is bounded by this (not by `max_age_ms` /
+/// `min_flush_bytes`). 2 s keeps freshness under ~3 s while amortizing the
+/// per-seal metastore commit. Set to 0 to disable sealing (slot ack reverts to
+/// the checkpoint cadence). Like the age cap, this is a time-domain durability
+/// policy bound and is deliberately NOT hardware-derived.
+fn default_cdc_mem_tier_seal_age_ms() -> u64 {
+    2_000
+}
+
 impl VortexConfig {
     /// Surface parameter values that *parse* but won't behave as a user likely
     /// intends — out-of-range values that get silently clamped at their use site,
@@ -1215,8 +1444,8 @@ impl VortexConfig {
     ///
     /// Pure and side-effect-free so the rules stay unit-testable. The actual
     /// clamping still happens at the use sites — this only makes it visible
-    /// instead of silent. `available_cores` is the host's logical core count (the
-    /// encode-shard ceiling); pass `std::thread::available_parallelism()`.
+    /// instead of silent. `available_cores` is the encode-shard ceiling; pass
+    /// `cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling()`.
     #[must_use]
     pub fn config_warnings(&self, available_cores: usize) -> Vec<String> {
         let cores = available_cores.max(1);
@@ -1229,7 +1458,7 @@ impl VortexConfig {
             && write_concurrency > cores
         {
             warnings.push(format!(
-                "cayenne_write_concurrency ({write_concurrency}) exceeds the host core count ({cores}); encode is CPU-bound so it is capped at {cores} — the surplus only inflates the per-snapshot file count without speeding the write. Set it to {cores} or below."
+                "cayenne_write_concurrency ({write_concurrency}) exceeds the runtime's CPU budget ({cores} cores); encode is CPU-bound so it is capped at {cores} — the surplus only inflates the per-snapshot file count without speeding the write. Set it to {cores} or below."
             ));
         }
 
@@ -1279,29 +1508,26 @@ impl Default for VortexConfig {
         Self {
             footer_cache_mb: None,
             segment_cache_mb: 256,
+            // Derive intra-file decode concurrency from target partitions and the
+            // planned file count.
+            scan_concurrency: ScanConcurrency::default(),
             // Balanced file size for scan throughput and write amplification
             target_vortex_file_size_mb: 256,
             // No sort columns by default
             sort_columns: Vec::new(),
+            sort_columns_origin: SortColumnsOrigin::default(),
             // Shard key derives from the primary key unless overridden
             shard_key_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
-            // `auto`: size-gated light encoding for small deltas (re-encoded
-            // by compaction). Local micro A/B (2026-06-06) was neutral on the
-            // upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
-            // production-scale CDC and is to be validated there. Set the
-            // param to `7` to opt out (pre-feature behavior).
+            // `auto`: light encoding for every delta (re-encoded by
+            // compaction). Validated at production scale by the SF1000
+            // CH-benCHmark HTAP sweep (frees apply CPU → convergence + QPH).
+            // Set the param to `7` to opt out (pre-feature behavior).
             delta_encoding: DeltaEncoding::default(),
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
             bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
-            // Orphaned-DV cleanup enabled by default at a per-table threshold of 20
-            // (retention-only: a no-op until time-based retention orphans DVs; the
-            // sweep is lock-free/off-path, so enabling it does not affect ingest —
-            // validated no-regression on CH-benCHmark SF-1000). Set the spicepod
-            // param `cayenne_orphaned_dv_cleanup_min_files` to `0` to disable.
-            orphaned_dv_cleanup_min_files: NonZeroUsize::new(20),
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
@@ -1314,15 +1540,18 @@ impl Default for VortexConfig {
             inline_flush_max_rows: default_inline_flush_max_rows(),
             inline_flush_max_segments: default_inline_flush_max_segments(),
             inline_flush_max_bytes: default_inline_flush_max_bytes(),
+            stream_publish_interval_ms: default_stream_publish_interval_ms(),
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
+            memory_mode: false,
             cdc_durability: CdcDurability::default(),
             cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
             cdc_mem_tier_shards: default_cdc_mem_tier_shards(),
             cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
             cdc_mem_tier_min_flush_bytes: default_cdc_mem_tier_min_flush_bytes(),
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
+            cdc_mem_tier_seal_age_ms: default_cdc_mem_tier_seal_age_ms(),
             dynamic_tuning: false,
             pinned_tuning_actuators: PinnedTuningActuators::default(),
             // Directory listing stays the scan's file source by default; the
@@ -1339,19 +1568,56 @@ impl Default for VortexConfig {
             data_storage_write_mbps: None,
             metastore_storage_write_mbps: None,
             force_view_read_schema: false,
+            integrity_checksums: false,
             cold_tier_location: None,
-            cold_clustering_columns: Vec::new(),
+            cluster_by: Vec::new(),
             cold_target_file_size_mb: 512,
+            cold_clustering_run_size_mb: None,
             cold_tier_warm_max_bytes: 0,
             cold_tier_warm_max_files: 0,
             cold_tier_background_interval_ms: 60_000,
+            cold_tier_gc_interval_ms: 300_000,
         }
     }
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "these tests assert the defaults against the host the test process sees, which is the value the budget resolves to when nothing is configured"
+)]
 mod tests {
-    use super::{PkConflictDetection, VortexConfig};
+    use super::{PkConflictDetection, ScanConcurrency, VortexConfig};
+
+    /// `scan_concurrency` must survive a metastore round trip, and a config
+    /// written before the field existed must still load.
+    ///
+    /// The mode is serialized through the enum's own string form because
+    /// `vortex-datafusion` carries no serde derive. A stored table's config is
+    /// deserialized on every open, so a format that only round-trips one way
+    /// would fail the table, not just the setting.
+    #[test]
+    fn scan_concurrency_round_trips_and_tolerates_configs_written_without_it() {
+        for mode in [
+            ScanConcurrency::Auto,
+            ScanConcurrency::Off,
+            ScanConcurrency::Explicit(4),
+        ] {
+            let config = VortexConfig {
+                scan_concurrency: mode,
+                ..Default::default()
+            };
+            let encoded = serde_json::to_string(&config).expect("config should serialize");
+            let decoded: VortexConfig =
+                serde_json::from_str(&encoded).expect("config should deserialize");
+            assert_eq!(decoded.scan_concurrency, mode);
+        }
+
+        // A config persisted before this field existed carries no key for it.
+        let legacy: VortexConfig =
+            serde_json::from_str("{}").expect("a config without the field should deserialize");
+        assert_eq!(legacy.scan_concurrency, ScanConcurrency::Auto);
+    }
 
     #[test]
     fn test_concurrency_defaults_use_available_parallelism_where_global() {
@@ -1414,6 +1680,16 @@ mod tests {
         assert!(
             config.cdc_mem_tier_checkpoint_interval_ms > 0,
             "cdc_mem_tier_checkpoint_interval_ms must default non-zero so the periodic task runs"
+        );
+        assert!(
+            config.cdc_mem_tier_seal_age_ms > 0,
+            "cdc_mem_tier_seal_age_ms must default non-zero so sealing (fast durable slot \
+             advance) is ON by default — the feature must not be gated behind an opt-in flag"
+        );
+        assert!(
+            config.cdc_mem_tier_seal_age_ms <= config.cdc_mem_tier_max_age_ms,
+            "the seal cadence must default at or below the checkpoint age cap, or seals never \
+             fire before the checkpoint supersedes them"
         );
 
         let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
@@ -1531,6 +1807,107 @@ mod tests {
         );
         assert_eq!(PkConflictDetection::parse("invalid"), None);
     }
+
+    /// The datalake name slug is lossy but always path/S3-safe: only
+    /// `[A-Za-z0-9_-]` survives, edges are trimmed, and length is capped. These
+    /// cases pin the exact contract the datalake directory segment depends on.
+    #[test]
+    fn test_sanitize_name_slug() {
+        use super::TableMetadata;
+
+        // Plain names pass through unchanged.
+        assert_eq!(TableMetadata::sanitize_name_slug("orders"), "orders");
+        assert_eq!(
+            TableMetadata::sanitize_name_slug("taxi_trips-1"),
+            "taxi_trips-1"
+        );
+
+        // Unsafe characters (dots, spaces, slashes, schema qualifiers) become `_`.
+        assert_eq!(
+            TableMetadata::sanitize_name_slug("public.orders"),
+            "public_orders"
+        );
+        assert_eq!(TableMetadata::sanitize_name_slug("my table"), "my_table");
+        assert_eq!(TableMetadata::sanitize_name_slug("a/b\\c"), "a_b_c");
+
+        // Non-ASCII is replaced (lossy is fine — the UUID suffix disambiguates).
+        assert_eq!(TableMetadata::sanitize_name_slug("naïve"), "na_ve");
+
+        // Leading/trailing separators are trimmed.
+        assert_eq!(TableMetadata::sanitize_name_slug("__orders__"), "orders");
+        assert_eq!(TableMetadata::sanitize_name_slug(".orders."), "orders");
+
+        // An all-symbol name slugs to empty (caller falls back to the id).
+        assert_eq!(TableMetadata::sanitize_name_slug("***"), "");
+        assert_eq!(TableMetadata::sanitize_name_slug(""), "");
+    }
+
+    /// Truncation to `DATALAKE_SLUG_MAX_LEN` must not leave a dangling separator.
+    #[test]
+    fn test_sanitize_name_slug_caps_length_and_retrims() {
+        use super::TableMetadata;
+
+        let long = "a".repeat(200);
+        let slug = TableMetadata::sanitize_name_slug(&long);
+        assert_eq!(slug.chars().count(), TableMetadata::DATALAKE_SLUG_MAX_LEN);
+
+        // A separator sitting exactly at the truncation boundary is re-trimmed.
+        let boundary = format!(
+            "{}_tail",
+            "a".repeat(TableMetadata::DATALAKE_SLUG_MAX_LEN - 1)
+        );
+        let slug = TableMetadata::sanitize_name_slug(&boundary);
+        assert!(
+            !slug.ends_with('_') && !slug.ends_with('-'),
+            "truncated slug must not end in a separator, got {slug:?}"
+        );
+    }
+
+    /// The full datalake segment is `{slug}-{table_id}`, and falls back to the
+    /// bare `table_id` when the name slugs to nothing. The `table_id` suffix is
+    /// what keeps two distinct tables that slug identically from colliding.
+    #[test]
+    fn test_datalake_dir_segment() {
+        use super::TableMetadata;
+        use arrow_schema::Schema;
+        use std::sync::Arc;
+
+        let md = |name: &str, id: &str| TableMetadata {
+            table_id: id.to_string(),
+            table_name: name.to_string(),
+            path: String::new(),
+            path_is_relative: false,
+            schema: Arc::new(Schema::empty()),
+            primary_key: Vec::new(),
+            on_conflict: None,
+            current_snapshot_id: String::new(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+            current_sequence_number: 0,
+        };
+
+        let id = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        assert_eq!(
+            md("orders", id).datalake_dir_segment(),
+            format!("orders-{id}")
+        );
+        assert_eq!(
+            md("public.orders", id).datalake_dir_segment(),
+            format!("public_orders-{id}")
+        );
+
+        // All-symbol name → bare id (still unique).
+        assert_eq!(md("***", id).datalake_dir_segment(), id);
+
+        // Two tables that slug identically stay distinct via their ids.
+        let a = "0190a1b2-c3d4-7e5f-8a9b-000000000001";
+        let b = "0190a1b2-c3d4-7e5f-8a9b-000000000002";
+        assert_ne!(
+            md("my table", a).datalake_dir_segment(),
+            md("my.table", b).datalake_dir_segment(),
+            "identical slugs must remain distinct segments via the table_id suffix"
+        );
+    }
 }
 
 /// Options for creating a new Cayenne table.
@@ -1601,20 +1978,29 @@ pub struct SnapshotFile {
     pub min_sequence: i64,
     /// Inclusive maximum commit sequence of the rows in this file.
     pub max_sequence: i64,
+    /// Optional end-to-end integrity digest of the file's bytes, self-describing
+    /// as `"<algorithm>:<lowercase-hex>"` (e.g. `"xxh3-128:1a2b…"`). `None` when
+    /// integrity checksums were disabled at flush (or for rows written before
+    /// the feature). Computed once at publish and verified before first read
+    /// when `integrity_checksums` is enabled. See
+    /// [`crate::provider::file_digest`].
+    pub digest: Option<String>,
 }
 
 /// One row of the cold-tier object-store manifest (`cayenne_cold_tier_file`).
 ///
 /// The cold tier is the bottom of the storage cascade (RAM mem-tier →
 /// local-disk warm Vortex snapshot → object-store cold). A background promotion
-/// stage rewrites settled/aged warm files as read-optimized (Z-order clustered)
+/// stage rewrites settled/aged warm files as read-optimized (curve-clustered)
 /// Vortex files on the cold object store and records one row here per file.
 ///
 /// Unlike [`SnapshotFile`], cold files are **table-scoped** (not a member of any
 /// snapshot directory) and append-only: a promoted file is referenced only from
 /// this table, never from `cayenne_snapshot_file`. `file_url` is the *absolute*
-/// object-store URL (e.g. `s3://bucket/prefix/{table_id}/cold/<id>.vortex`),
-/// because the cold location may differ from the table's warm path. The embedded
+/// object-store URL (e.g.
+/// `s3://bucket/prefix/<table_name>-<table_id>/data/<promotion_id>/<id>.vortex`;
+/// see [`TableMetadata::datalake_dir_segment`]), because the cold location may
+/// differ from the table's warm path. The embedded
 /// `statistics_blob` (serialized Vortex [`FileStatistics`]: per-column min/max/
 /// null/sum) lets the scan prune cold files at listing time with no object-store
 /// round-trip. `min_sequence`/`max_sequence` carry the file's commit-seq range
@@ -1638,6 +2024,13 @@ pub struct ColdTierFile {
     /// sum). Always populated at promotion (copied from the written footer) so
     /// listing-time pruning never falls back to a full scan.
     pub statistics_blob: Vec<u8>,
+    /// Serialized PK existence bloom (`provider::pk_index::PkBloom`) over this
+    /// file's live PK values, built at promotion for upsert-eligible tables so the keyset
+    /// rebuild can fold cold-resident keys without scanning the cold store.
+    /// `None` (non-upsert table, over the per-file cap, or a legacy row) makes
+    /// the rebuild fall back to the exact cold scan. Never consulted for
+    /// `DoNothing` (a false positive would wrongly drop a new row).
+    pub pk_bloom: Option<Vec<u8>>,
 }
 
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
@@ -1666,6 +2059,17 @@ pub struct TableStatistics {
     /// the sum of every insert ever made. Compaction and overwrite reset it to
     /// the authoritative rewritten count.
     pub num_rows: i64,
+    /// Whether [`Self::num_rows`] is a provably-exact live count (`true`) or a
+    /// best-effort estimate that may over-count (`false`).
+    ///
+    /// The mem-tier checkpoint applies a `Delta` whose durable-supersede netting
+    /// is best-effort, so it taints this to `false`; a full-rewrite compaction /
+    /// overwrite `Set`s an authoritative count and restores `true`. Consumers that
+    /// answer `COUNT(*)` from statistics (the `stats_aggregate` fold and the
+    /// distributed executor-statistics reporter) must treat a `false` count as
+    /// `Precision::Inexact`, so the fold declines and a real scan answers instead
+    /// — preventing a drifted count from producing a wrong `COUNT(*)`.
+    pub num_rows_exact: bool,
     /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
     /// ([`crate::hll::NdvSketches`]), `None` when no NDV-tracked column has a
     /// sketch. Merged across writes register-wise; used to size distributed
@@ -1698,7 +2102,98 @@ pub struct InlinedData {
     pub created_at: String,
 }
 
-/// Aggregate size information for inline data entries in the metastore.
+/// One Cayenne table's disk and metastore footprint, read from the metastore's
+/// own accounting rather than by walking the table directory.
+///
+/// The manifest (`cayenne_snapshot_file`), the deletion-vector catalog, and the
+/// cold-tier manifest already record every file's size and row count, so a
+/// handful of aggregate queries answer "how big is this dataset, and which
+/// layer is growing" without a LIST per snapshot. That matters because the
+/// tables this is sampled on are exactly the ones with thousands of files.
+///
+/// Every field is `i64` because that is what the metastore returns; the callers
+/// that publish these as gauges saturate to `u64` at the boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableStorageStats {
+    /// Data-file paths the current snapshot references.
+    ///
+    /// PATHS, not inodes: a manifest `file_path` is resolved against its own
+    /// snapshot's directory, so a filename appearing under two snapshots is two
+    /// files as far as every reader is concerned, and subset compaction gets a
+    /// live snapshot its own path by hard-linking. Two paths sharing one inode
+    /// are therefore counted twice — which is also how a `du`-style walk
+    /// (`cayenne_data_dir_bytes`) reads the same directory.
+    pub current_files: i64,
+    /// On-disk bytes of the current snapshot's data files.
+    pub current_bytes: i64,
+    /// Rows in the current snapshot's data files, before deletions apply.
+    pub current_rows: i64,
+    /// Data-file paths referenced by a live protected snapshot — one whose
+    /// sequence is registered and which is not the current snapshot (see
+    /// [`Self::current_files`] for the path-versus-inode rule).
+    pub protected_files: i64,
+    /// On-disk bytes of the protected snapshots' data files.
+    pub protected_bytes: i64,
+    /// Rows in the protected snapshots' data files, before deletions apply.
+    pub protected_rows: i64,
+    /// Manifest rows naming a snapshot that is no longer live — dead weight in
+    /// the metastore until a compaction or overwrite prunes them.
+    pub unreachable_manifest_rows: i64,
+    /// Manifest rows naming a snapshot that is still live.
+    ///
+    /// A row is a `(snapshot, file)` pair, and each pair is one path on disk, so
+    /// this equals [`Self::current_files`] + [`Self::protected_files`]. It is
+    /// published beside the unreachable count because the remainder only means
+    /// something taken against the live rows.
+    pub reachable_manifest_rows: i64,
+    /// Files promoted to the cold object-store tier.
+    pub cold_files: i64,
+    /// Bytes of the cold-tier files.
+    pub cold_bytes: i64,
+    /// Rows in the cold-tier files.
+    pub cold_rows: i64,
+    /// Live deletion-vector files.
+    pub delete_files: i64,
+    /// On-disk bytes of the deletion-vector files.
+    pub delete_file_bytes: i64,
+    /// Tombstones recorded across those deletion-vector files.
+    pub delete_file_tombstones: i64,
+    /// Registered snapshot sequences (the durable protected-snapshot set).
+    pub snapshot_sequences: i64,
+    /// Per-file pruning-statistics rows.
+    pub file_statistics_rows: i64,
+    /// Re-insert records held in the metastore.
+    pub insert_records: i64,
+    /// Inline (level-0) data entries not yet checkpointed to Vortex files.
+    pub inlined_entries: i64,
+    /// Rows held in those inline entries.
+    pub inlined_rows: i64,
+    /// Serialized Arrow IPC bytes held inline.
+    pub inlined_bytes: i64,
+    /// Inline tombstone entries not yet flushed to deletion vectors.
+    pub inlined_delete_entries: i64,
+    /// Tombstones held in those inline entries.
+    pub inlined_delete_rows: i64,
+}
+
+impl TableStorageStats {
+    /// Bytes the live data-file paths describe across the warm tiers.
+    ///
+    /// Safe to add because the tiers partition the live manifest rows. Not a
+    /// physical figure where hard links are in play — see
+    /// [`Self::current_files`].
+    #[must_use]
+    pub const fn live_data_bytes(&self) -> i64 {
+        self.current_bytes + self.protected_bytes
+    }
+}
+
+/// Aggregate size information for the metastore's two inline tables.
+///
+/// Both are reported together because the inline checkpoint clears both together
+/// and they do not fill together — see `CayenneTableProvider`'s
+/// `inlined_tombstone_bytes` for why `cayenne_inlined_delete` grows on a table
+/// whose `cayenne_inlined_data` stays empty.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InlinedDataStats {
     /// Total number of visible rows represented by inline entries.
@@ -1707,6 +2202,33 @@ pub struct InlinedDataStats {
     pub entry_count: i64,
     /// Total serialized Arrow IPC bytes stored inline.
     pub ipc_bytes: i64,
+    /// Number of inline tombstone rows (`cayenne_inlined_delete`).
+    pub tombstone_entry_count: i64,
+    /// Total serialized tombstone-key bytes stored inline.
+    pub tombstone_ipc_bytes: i64,
+}
+
+/// Metastore bytes a `cayenne_inlined_delete` row costs beyond its `delete_ipc`
+/// payload: the `inlined_id` and `table_id` UUID text, the sequence number, the
+/// timestamp, the activation flag, the row header, and the
+/// `(table_id, sequence_number)` index entry.
+///
+/// Charged so a budget spent against tombstone size bounds their ROW count too.
+/// A single-key `Int64` tombstone's payload is 9 bytes — one format tag plus one
+/// big-endian key — so a payload-only budget would admit on the order of ten
+/// times the metastore it accounts for.
+pub const INLINED_DELETE_ROW_OVERHEAD_BYTES: i64 = 128;
+
+impl InlinedDataStats {
+    /// Metastore bytes the inline tombstones occupy: payload plus per-row
+    /// overhead. What the reclamation budget is spent against.
+    #[must_use]
+    pub fn tombstone_metastore_bytes(&self) -> i64 {
+        self.tombstone_ipc_bytes.saturating_add(
+            self.tombstone_entry_count
+                .saturating_mul(INLINED_DELETE_ROW_OVERHEAD_BYTES),
+        )
+    }
 }
 
 impl InlinedData {

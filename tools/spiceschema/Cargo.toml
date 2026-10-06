@@ -17,3 +17,6 @@ runtime = { path = "../../crates/runtime", features = [
 ] }
 serde_json.workspace = true
 yaml = { path = "../../crates/yaml" }
+
+[lints]
+workspace = true

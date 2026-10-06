@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 pub mod arrow;
+pub mod avro;
 pub mod change_event;
+pub mod decode;
 
 #[cfg(test)]
 mod tests;

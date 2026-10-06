@@ -16,16 +16,18 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::model::{is_evaluate_only, try_to_evaluate_model};
 use crate::{
-    Runtime, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE,
+    Runtime, model::ENABLE_MODEL_SUPPORT_MESSAGE,
     model::provider_models::get_available_models_hint, status,
 };
 use app::App;
-use model_components::model::Model;
+use llms::evaluate::Evaluate;
 use opentelemetry::KeyValue;
+use runtime_metrics as metrics;
 use runtime_secrets::get_params_with_secrets;
 use snafu::prelude::*;
-use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
+use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 use telemetry::timing::TimeMeasurement;
 
 #[derive(Debug, Snafu)]
@@ -35,17 +37,6 @@ pub enum Error {
         name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-
-    #[snafu(display("Failed to load runnable model: {name}. {source}"))]
-    FailedToLoadRunnableModel {
-        name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to load model {name} from spicepod. Unable to determine model type. Verify the model source and try again. For details, visit https://spiceai.org/docs/components/models",
-    ))]
-    UnableToDetermineModelType { name: String },
 
     #[snafu(display(
         "Model {name} includes a non-existent path: {path}. Verify the model configuration and ensure all paths are correct. For details, visit https://spiceai.org/docs/components/models",
@@ -121,18 +112,58 @@ impl Runtime {
             }
         }
 
-        let model_type = m.model_type();
-        tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
-        let result: Result<(), Error> = match model_type {
-            Some(ModelType::Llm) => match self.load_llm(m.clone(), params.clone()).await {
+        let result: Result<(), Error> = if is_evaluate_only(m) {
+            match try_to_evaluate_model(m, &params, &self.secrets()).await {
+                Ok((evaluate_model, rate_controller)) => {
+                    if let Err(e) = Evaluate::health(evaluate_model.as_ref()).await {
+                        Err(Error::FailedToLoadLLM {
+                            name: m.name.clone(),
+                            source: Box::new(e),
+                        })
+                    } else {
+                        let store = self.llm_runtime_stores.evaluate_models();
+                        let mut map = store.write().await;
+                        map.insert(m.name.clone(), evaluate_model);
+                        drop(map);
+                        let responses_api_support_store =
+                            self.llm_runtime_stores.responses_api_support();
+                        let mut responses_support_map = responses_api_support_store.write().await;
+                        responses_support_map.insert(
+                            m.name.clone(),
+                            crate::model::ResponsesApiSupport::EvaluateOnly {
+                                provider: ModelSource::TypeSafe.to_string(),
+                            },
+                        );
+                        drop(responses_support_map);
+                        let model_rate_controllers = self.model_rate_controllers();
+                        let mut rc_map = model_rate_controllers.write().await;
+                        rc_map.insert(m.name.clone(), rate_controller);
+                        Ok(())
+                    }
+                }
+                Err(e) => Err(Error::FailedToLoadLLM {
+                    name: m.name.clone(),
+                    source: Box::new(e),
+                }),
+            }
+        } else {
+            match self.load_llm(m.clone(), params.clone()).await {
                 Ok((completions_model, responses_model, responses_api_support)) => {
                     let rate_controller =
                         crate::model::rate_limit::build_model_rate_controller(m, &params);
 
+                    // Every chat model also answers `/v1/evaluate`.
+                    let evaluator = completions_model.evaluator(&m.name);
+
                     let completion_llms = self.completion_llms();
                     let mut llm_map = completion_llms.write().await;
-                    llm_map.insert(m.name.clone(), completions_model);
+                    llm_map.insert(m.name.clone(), completions_model.chat);
                     drop(llm_map);
+
+                    let evaluate_models = self.llm_runtime_stores.evaluate_models();
+                    let mut evaluate_map = evaluate_models.write().await;
+                    evaluate_map.insert(m.name.clone(), evaluator);
+                    drop(evaluate_map);
 
                     if let Some(responses_model) = responses_model {
                         let responses_llms = self.responses_llms();
@@ -155,21 +186,7 @@ impl Runtime {
                     name: m.name.clone(),
                     source: Box::new(e),
                 }),
-            },
-            Some(ModelType::Ml) => match Model::load(m.clone(), params.clone()).await {
-                Ok(in_m) => {
-                    let mut model_map = self.models.write().await;
-                    model_map.insert(m.name.clone(), Arc::new(in_m));
-                    Ok(())
-                }
-                Err(e) => Err(Error::FailedToLoadRunnableModel {
-                    name: m.name.clone(),
-                    source: Box::new(e),
-                }),
-            },
-            None => Err(Error::UnableToDetermineModelType {
-                name: m.name.clone(),
-            }),
+            }
         };
         match result {
             Ok(()) => {
@@ -211,33 +228,29 @@ impl Runtime {
     }
 
     async fn remove_model(&self, m: &SpicepodModel) {
-        match m.model_type() {
-            Some(ModelType::Ml) => {
-                let mut ml_map = self.models.write().await;
-                ml_map.remove(&m.name);
-            }
-            Some(ModelType::Llm) => {
-                let completion_llms = self.completion_llms();
-                let mut llm_map = completion_llms.write().await;
-                llm_map.remove(&m.name);
-                drop(llm_map);
+        let completion_llms = self.completion_llms();
+        let mut llm_map = completion_llms.write().await;
+        llm_map.remove(&m.name);
+        drop(llm_map);
 
-                let responses_llms = self.responses_llms();
-                let mut responses_map = responses_llms.write().await;
-                responses_map.remove(&m.name);
-                drop(responses_map);
+        let responses_llms = self.responses_llms();
+        let mut responses_map = responses_llms.write().await;
+        responses_map.remove(&m.name);
+        drop(responses_map);
 
-                let responses_api_support = self.llm_runtime_stores.responses_api_support();
-                let mut responses_support_map = responses_api_support.write().await;
-                responses_support_map.remove(&m.name);
-                drop(responses_support_map);
+        let evaluate_models = self.llm_runtime_stores.evaluate_models();
+        let mut evaluate_map = evaluate_models.write().await;
+        evaluate_map.remove(&m.name);
+        drop(evaluate_map);
 
-                let model_rate_controllers = self.model_rate_controllers();
-                let mut rc_map = model_rate_controllers.write().await;
-                rc_map.remove(&m.name);
-            }
-            None => return,
-        }
+        let responses_api_support = self.llm_runtime_stores.responses_api_support();
+        let mut responses_support_map = responses_api_support.write().await;
+        responses_support_map.remove(&m.name);
+        drop(responses_support_map);
+
+        let model_rate_controllers = self.model_rate_controllers();
+        let mut rc_map = model_rate_controllers.write().await;
+        rc_map.remove(&m.name);
 
         tracing::info!("Model [{}] has been unloaded", m.name);
         let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();

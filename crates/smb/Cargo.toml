@@ -33,3 +33,6 @@ rand.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "sync", "time"] }
 tracing.workspace = true
+
+[lints]
+workspace = true

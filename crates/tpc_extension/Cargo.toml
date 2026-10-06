@@ -14,3 +14,6 @@ duckdb.workspace = true
 runtime = { path = "../runtime" }
 snafu.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

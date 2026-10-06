@@ -354,28 +354,99 @@ mod tests {
                     weight: 4,
                 },
             ];
-            let mut count_1 = 0;
-            let mut count_2 = 0;
-            let mut count_4 = 0;
+            // Every expectation below is derived from `cfg` rather than
+            // restating its weights, so editing the fixture above cannot leave
+            // the assertions silently describing the old weighting.
+            let mut arms: Vec<(String, f64, u32)> = cfg
+                .iter()
+                .filter_map(|c| {
+                    if let worker::RouterConfig::Weighted { from, weight } = c {
+                        Some((from.clone(), f64::from(*weight), 0))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                arms.len(),
+                cfg.len(),
+                "every arm of the fixture must be Weighted for these bounds to hold"
+            );
+            let total_weight: f64 = arms.iter().map(|(_, weight, _)| weight).sum();
+
             let n = 1000;
-            for _ in 1..n {
+            // Every draw must land on a known arm. Skipping the ones that don't
+            // would let a draw vanish from the tally, and the bounds below are
+            // noise margins wide enough to absorb a fair number of vanished
+            // draws without noticing — so a `select_from_weighted` that started
+            // returning `None`, or a name outside the fixture, would leave every
+            // count uniformly low and the test still passing. Neither is
+            // reachable for this fixture (`WeightedIndex` accepts these weights,
+            // and it only ever samples an index into them), which is exactly why
+            // a draw that isn't one of them should fail loudly rather than be
+            // dropped.
+            for draw in 1..n {
                 let Some(v) = select_from_weighted(&cfg) else {
-                    continue;
+                    panic!("draw {draw} selected nothing from the fixture");
                 };
-                match v.as_str() {
-                    "example1.com" => count_1 += 1,
-                    "example2.com" => count_2 += 1,
-                    "example3.com" => count_4 += 1,
-                    _ => {}
-                }
+                let Some((_, _, count)) = arms.iter_mut().find(|(from, _, _)| *from == v) else {
+                    panic!("draw {draw} selected '{v}', not an arm of the fixture");
+                };
+                *count += 1;
             }
 
-            assert!(count_2 > count_1);
-            assert!(count_4 > count_2);
+            // A heavier arm must be selected more often than a lighter one. The
+            // fixture ascends by weight, so comparing consecutive pairs covers
+            // every arm; the weight assertion is what keeps that true if the
+            // fixture is reordered.
+            for pair in arms.windows(2) {
+                let [lighter, heavier] = pair else {
+                    continue;
+                };
+                let (lighter, light_weight, light_count) = lighter;
+                let (heavier, heavy_weight, heavy_count) = heavier;
+                assert!(
+                    heavy_weight > light_weight,
+                    "the fixture's arms must ascend by weight, but '{heavier}' \
+                     ({heavy_weight}) does not outweigh '{lighter}' ({light_weight})"
+                );
+                assert!(
+                    heavy_count > light_count,
+                    "'{heavier}' (weight {heavy_weight}) was selected {heavy_count} times, \
+                     no more often than the lighter '{lighter}' (weight {light_weight}, \
+                     {light_count} times)"
+                );
+            }
 
-            // An integer approximation to check that weights are approximately correct.
-            assert!(count_2 - 2 * count_1 < n / 10);
-            assert!(count_4 - 2 * count_2 < n / 10);
+            // Regression test for #12537. The draw is random and unseeded, so
+            // these bounds are noise margins rather than accuracy targets, and a
+            // margin sized by eye is a flaky test: this suite runs on every
+            // sign-off, so a bound only a couple of standard deviations wide reds
+            // out PRs that touch nothing in this crate.
+            //
+            // Each count is binomial over `draws` trials, so the tolerance is
+            // derived from the weights rather than hardcoded — five standard
+            // deviations, two-sided, which fails by chance about once in 580,000
+            // runs. That is still tight enough to catch a real mis-weighting: the
+            // band is ±14% of the mean on the heaviest arm, widening to ±39% on
+            // the lightest, whose count is smallest and so proportionally
+            // noisiest. Two-sided matters as much as the width — an arm selected
+            // far too *rarely* is as much a weighting bug as one selected too
+            // often.
+            let draws = f64::from(n - 1);
+
+            for (from, weight, count) in &arms {
+                let share = weight / total_weight;
+                let expected = draws * share;
+                let deviation = (f64::from(*count) - expected).abs();
+                let tolerance = 5.0 * (draws * share * (1.0 - share)).sqrt();
+
+                assert!(
+                    deviation < tolerance,
+                    "'{from}' (weight {weight}) selected {count} times, {deviation:.1} away \
+                     from the expected {expected:.1} (tolerance {tolerance:.1})"
+                );
+            }
         }
     }
 

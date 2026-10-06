@@ -1,0 +1,537 @@
+version: v1
+kind: Spicepod
+name: mongo-sf100-tuned
+# Hand-tuned MongoDB CDC pod (mongo-sf100-tuned). Cayenne tuning=auto (static hardware-seeded
+# warm-start, no closed loop): the actuator values below are PINNED starting points
+# seeded from the CH-benCHmark postgres-cayenne[file]-cdc-tuned-memory-* pods —
+# tune per-table for best performance. Benchmark against mongo-adaptive.yaml.
+runtime:
+  flight:
+    ipc_compression: lz4_frame
+  params:
+    cdc_prefetch_buffer: "16384"
+    cdc_max_coalesced_envelopes: "16384"
+    cdc_max_coalesced_bytes: "134217728"
+    cdc_max_coalesce_age_ms: "250"
+    cdc_commit_timeout_ms: "60000"
+    cayenne_sort_merge_min_rows: "50000000"
+    cayenne_footer_cache_mb: "1024"
+    cayenne_metastore_cache_mb: "1024"
+    cayenne_metastore_mmap_mb: "4096"
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+datasets:
+  - from: "mongodb:lineitem"
+    name: lineitem
+    params:
+      mongodb_connection_string: "${secrets:MONGO_CONNECTION_STRING}"
+      change_stream_batch_size: "10000"
+      change_stream_batch_max_size: "10000"
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      refresh_on_startup: auto
+      primary_key: _id
+      on_conflict:
+        _id: upsert
+      params:
+        cayenne_tuning: auto
+        cayenne_metastore: sqlite
+        cayenne_force_view_types: "false"
+        cayenne_deletion_mode: key
+        cayenne_cdc_durability: memory
+        cayenne_cdc_mem_tier_max_age_ms: "30000"
+        cayenne_cdc_mem_tier_shards: "4"
+        cayenne_compaction_background_interval_ms: "3000"
+        cayenne_compaction_trigger_snapshot_age_ms: "15000"
+        cayenne_compaction_max_files_per_pick: "64"
+        cdc_max_coalesce_age_ms: "3000"
+        cdc_max_coalesced_bytes: "536870912"
+        cayenne_pk_keyset_cache_mb: "256"
+        cayenne_write_concurrency: "8"
+        cayenne_segment_cache_mb: "1024"
+        cayenne_target_file_size_mb: "512"
+        cayenne_cdc_mem_tier_max_bytes: "1073741824"
+        cayenne_cdc_mem_tier_min_flush_bytes: "134217728"
+    columns:
+      - name: _id
+        type: Utf8
+        nullable: true
+      - name: l_orderkey
+        type: Int64
+        nullable: true
+      - name: l_partkey
+        type: Int64
+        nullable: true
+      - name: l_suppkey
+        type: Int64
+        nullable: true
+      - name: l_linenumber
+        type: Int32
+        nullable: true
+      - name: l_quantity
+        type: Float64
+        nullable: true
+      - name: l_extendedprice
+        type: Float64
+        nullable: true
+      - name: l_discount
+        type: Float64
+        nullable: true
+      - name: l_tax
+        type: Float64
+        nullable: true
+      - name: l_returnflag
+        type: Utf8
+        nullable: true
+      - name: l_linestatus
+        type: Utf8
+        nullable: true
+      - name: l_shipdate
+        type: Date32
+        nullable: true
+      - name: l_commitdate
+        type: Date32
+        nullable: true
+      - name: l_receiptdate
+        type: Date32
+        nullable: true
+      - name: l_shipinstruct
+        type: Utf8
+        nullable: true
+      - name: l_shipmode
+        type: Utf8
+        nullable: true
+      - name: l_comment
+        type: Utf8
+        nullable: true
+      - name: __created_at
+        type: "Timestamp(Microsecond, None)"
+        nullable: true
+  - from: "mongodb:orders"
+    name: orders
+    params:
+      mongodb_connection_string: "${secrets:MONGO_CONNECTION_STRING}"
+      change_stream_batch_size: "10000"
+      change_stream_batch_max_size: "10000"
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      refresh_on_startup: auto
+      primary_key: _id
+      on_conflict:
+        _id: upsert
+      params:
+        cayenne_tuning: auto
+        cayenne_metastore: sqlite
+        cayenne_force_view_types: "false"
+        cayenne_deletion_mode: key
+        cayenne_cdc_durability: memory
+        cayenne_cdc_mem_tier_max_age_ms: "30000"
+        cayenne_cdc_mem_tier_shards: "4"
+        cayenne_compaction_background_interval_ms: "3000"
+        cayenne_compaction_trigger_snapshot_age_ms: "15000"
+        cayenne_compaction_max_files_per_pick: "64"
+        cdc_max_coalesce_age_ms: "3000"
+        cdc_max_coalesced_bytes: "536870912"
+        cayenne_pk_keyset_cache_mb: "256"
+        cayenne_write_concurrency: "8"
+        cayenne_segment_cache_mb: "1024"
+        cayenne_target_file_size_mb: "512"
+        cayenne_cdc_mem_tier_max_bytes: "1073741824"
+        cayenne_cdc_mem_tier_min_flush_bytes: "134217728"
+    columns:
+      - name: _id
+        type: Utf8
+        nullable: true
+      - name: o_orderkey
+        type: Int64
+        nullable: true
+      - name: o_custkey
+        type: Int64
+        nullable: true
+      - name: o_orderstatus
+        type: Utf8
+        nullable: true
+      - name: o_totalprice
+        type: Float64
+        nullable: true
+      - name: o_orderdate
+        type: Date32
+        nullable: true
+      - name: o_orderpriority
+        type: Utf8
+        nullable: true
+      - name: o_clerk
+        type: Utf8
+        nullable: true
+      - name: o_shippriority
+        type: Int32
+        nullable: true
+      - name: o_comment
+        type: Utf8
+        nullable: true
+      - name: __created_at
+        type: "Timestamp(Microsecond, None)"
+        nullable: true
+  - from: "mongodb:partsupp"
+    name: partsupp
+    params:
+      mongodb_connection_string: "${secrets:MONGO_CONNECTION_STRING}"
+      change_stream_batch_size: "10000"
+      change_stream_batch_max_size: "10000"
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      refresh_on_startup: auto
+      primary_key: _id
+      on_conflict:
+        _id: upsert
+      params:
+        cayenne_tuning: auto
+        cayenne_metastore: sqlite
+        cayenne_force_view_types: "false"
+        cayenne_deletion_mode: key
+        cayenne_cdc_durability: memory
+        cayenne_cdc_mem_tier_max_age_ms: "30000"
+        cayenne_cdc_mem_tier_shards: "4"
+        cayenne_compaction_background_interval_ms: "3000"
+        cayenne_compaction_trigger_snapshot_age_ms: "15000"
+        cayenne_compaction_max_files_per_pick: "64"
+        cdc_max_coalesce_age_ms: "3000"
+        cdc_max_coalesced_bytes: "536870912"
+        cayenne_pk_keyset_cache_mb: "256"
+        cayenne_write_concurrency: "8"
+        cayenne_segment_cache_mb: "1024"
+        cayenne_target_file_size_mb: "512"
+        cayenne_cdc_mem_tier_max_bytes: "1073741824"
+        cayenne_cdc_mem_tier_min_flush_bytes: "134217728"
+    columns:
+      - name: _id
+        type: Utf8
+        nullable: true
+      - name: ps_partkey
+        type: Int64
+        nullable: true
+      - name: ps_suppkey
+        type: Int64
+        nullable: true
+      - name: ps_availqty
+        type: Int32
+        nullable: true
+      - name: ps_supplycost
+        type: Float64
+        nullable: true
+      - name: ps_comment
+        type: Utf8
+        nullable: true
+      - name: __created_at
+        type: "Timestamp(Microsecond, None)"
+        nullable: true
+  - from: "mongodb:customer"
+    name: customer
+    params:
+      mongodb_connection_string: "${secrets:MONGO_CONNECTION_STRING}"
+      change_stream_batch_size: "10000"
+      change_stream_batch_max_size: "10000"
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      refresh_on_startup: auto
+      primary_key: _id
+      on_conflict:
+        _id: upsert
+      params:
+        cayenne_tuning: auto
+        cayenne_metastore: sqlite
+        cayenne_force_view_types: "false"
+        cayenne_deletion_mode: key
+        cayenne_cdc_durability: memory
+        cayenne_cdc_mem_tier_max_age_ms: "30000"
+        cayenne_cdc_mem_tier_shards: "4"
+        cayenne_compaction_background_interval_ms: "3000"
+        cayenne_compaction_trigger_snapshot_age_ms: "15000"
+        cayenne_compaction_max_files_per_pick: "64"
+        cdc_max_coalesce_age_ms: "3000"
+        cdc_max_coalesced_bytes: "536870912"
+        cayenne_pk_keyset_cache_mb: "256"
+        cayenne_write_concurrency: "8"
+        cayenne_segment_cache_mb: "1024"
+        cayenne_target_file_size_mb: "512"
+        cayenne_cdc_mem_tier_max_bytes: "1073741824"
+        cayenne_cdc_mem_tier_min_flush_bytes: "134217728"
+    columns:
+      - name: _id
+        type: Utf8
+        nullable: true
+      - name: c_custkey
+        type: Int64
+        nullable: true
+      - name: c_name
+        type: Utf8
+        nullable: true
+      - name: c_address
+        type: Utf8
+        nullable: true
+      - name: c_nationkey
+        type: Int64
+        nullable: true
+      - name: c_phone
+        type: Utf8
+        nullable: true
+      - name: c_acctbal
+        type: Float64
+        nullable: true
+      - name: c_mktsegment
+        type: Utf8
+        nullable: true
+      - name: c_comment
+        type: Utf8
+        nullable: true
+      - name: __created_at
+        type: "Timestamp(Microsecond, None)"
+        nullable: true
+  - from: "mongodb:part"
+    name: part
+    params:
+      mongodb_connection_string: "${secrets:MONGO_CONNECTION_STRING}"
+      change_stream_batch_size: "10000"
+      change_stream_batch_max_size: "10000"
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      refresh_on_startup: auto
+      primary_key: _id
+      on_conflict:
+        _id: upsert
+      params:
+        cayenne_tuning: auto
+        cayenne_metastore: sqlite
+        cayenne_force_view_types: "false"
+        cayenne_deletion_mode: key
+        cayenne_cdc_durability: memory
+        cayenne_cdc_mem_tier_max_age_ms: "30000"
+        cayenne_cdc_mem_tier_shards: "4"
+        cayenne_compaction_background_interval_ms: "3000"
+        cayenne_compaction_trigger_snapshot_age_ms: "15000"
+        cayenne_compaction_max_files_per_pick: "64"
+        cdc_max_coalesce_age_ms: "3000"
+        cdc_max_coalesced_bytes: "536870912"
+        cayenne_pk_keyset_cache_mb: "256"
+        cayenne_write_concurrency: "8"
+        cayenne_segment_cache_mb: "1024"
+        cayenne_target_file_size_mb: "512"
+        cayenne_cdc_mem_tier_max_bytes: "1073741824"
+        cayenne_cdc_mem_tier_min_flush_bytes: "134217728"
+    columns:
+      - name: _id
+        type: Utf8
+        nullable: true
+      - name: p_partkey
+        type: Int64
+        nullable: true
+      - name: p_name
+        type: Utf8
+        nullable: true
+      - name: p_mfgr
+        type: Utf8
+        nullable: true
+      - name: p_brand
+        type: Utf8
+        nullable: true
+      - name: p_type
+        type: Utf8
+        nullable: true
+      - name: p_size
+        type: Int32
+        nullable: true
+      - name: p_container
+        type: Utf8
+        nullable: true
+      - name: p_retailprice
+        type: Float64
+        nullable: true
+      - name: p_comment
+        type: Utf8
+        nullable: true
+      - name: __created_at
+        type: "Timestamp(Microsecond, None)"
+        nullable: true
+  - from: "mongodb:supplier"
+    name: supplier
+    params:
+      mongodb_connection_string: "${secrets:MONGO_CONNECTION_STRING}"
+      change_stream_batch_size: "10000"
+      change_stream_batch_max_size: "10000"
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      refresh_on_startup: auto
+      primary_key: _id
+      on_conflict:
+        _id: upsert
+      params:
+        cayenne_tuning: auto
+        cayenne_metastore: sqlite
+        cayenne_force_view_types: "false"
+        cayenne_deletion_mode: key
+        cayenne_cdc_durability: memory
+        cayenne_cdc_mem_tier_max_age_ms: "30000"
+        cayenne_cdc_mem_tier_shards: "4"
+        cayenne_compaction_background_interval_ms: "3000"
+        cayenne_compaction_trigger_snapshot_age_ms: "15000"
+        cayenne_compaction_max_files_per_pick: "64"
+        cdc_max_coalesce_age_ms: "3000"
+        cdc_max_coalesced_bytes: "536870912"
+        cayenne_pk_keyset_cache_mb: "256"
+        cayenne_write_concurrency: "2"
+        cayenne_segment_cache_mb: "64"
+        cayenne_target_file_size_mb: "512"
+        cayenne_cdc_mem_tier_max_bytes: "268435456"
+        cayenne_cdc_mem_tier_min_flush_bytes: "33554432"
+    columns:
+      - name: _id
+        type: Utf8
+        nullable: true
+      - name: s_suppkey
+        type: Int64
+        nullable: true
+      - name: s_name
+        type: Utf8
+        nullable: true
+      - name: s_address
+        type: Utf8
+        nullable: true
+      - name: s_nationkey
+        type: Int64
+        nullable: true
+      - name: s_phone
+        type: Utf8
+        nullable: true
+      - name: s_acctbal
+        type: Float64
+        nullable: true
+      - name: s_comment
+        type: Utf8
+        nullable: true
+      - name: __created_at
+        type: "Timestamp(Microsecond, None)"
+        nullable: true
+  - from: "mongodb:nation"
+    name: nation
+    params:
+      mongodb_connection_string: "${secrets:MONGO_CONNECTION_STRING}"
+      change_stream_batch_size: "10000"
+      change_stream_batch_max_size: "10000"
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      refresh_on_startup: auto
+      primary_key: _id
+      on_conflict:
+        _id: upsert
+      params:
+        cayenne_tuning: auto
+        cayenne_metastore: sqlite
+        cayenne_force_view_types: "false"
+        cayenne_deletion_mode: key
+        cayenne_cdc_durability: memory
+        cayenne_cdc_mem_tier_max_age_ms: "30000"
+        cayenne_cdc_mem_tier_shards: "4"
+        cayenne_compaction_background_interval_ms: "3000"
+        cayenne_compaction_trigger_snapshot_age_ms: "15000"
+        cayenne_compaction_max_files_per_pick: "64"
+        cdc_max_coalesce_age_ms: "3000"
+        cdc_max_coalesced_bytes: "536870912"
+        cayenne_pk_keyset_cache_mb: "256"
+        cayenne_write_concurrency: "2"
+        cayenne_segment_cache_mb: "64"
+        cayenne_target_file_size_mb: "512"
+        cayenne_cdc_mem_tier_max_bytes: "268435456"
+        cayenne_cdc_mem_tier_min_flush_bytes: "33554432"
+    columns:
+      - name: _id
+        type: Utf8
+        nullable: true
+      - name: n_nationkey
+        type: Int64
+        nullable: true
+      - name: n_name
+        type: Utf8
+        nullable: true
+      - name: n_regionkey
+        type: Int64
+        nullable: true
+      - name: n_comment
+        type: Utf8
+        nullable: true
+      - name: __created_at
+        type: "Timestamp(Microsecond, None)"
+        nullable: true
+  - from: "mongodb:region"
+    name: region
+    params:
+      mongodb_connection_string: "${secrets:MONGO_CONNECTION_STRING}"
+      change_stream_batch_size: "10000"
+      change_stream_batch_max_size: "10000"
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      refresh_on_startup: auto
+      primary_key: _id
+      on_conflict:
+        _id: upsert
+      params:
+        cayenne_tuning: auto
+        cayenne_metastore: sqlite
+        cayenne_force_view_types: "false"
+        cayenne_deletion_mode: key
+        cayenne_cdc_durability: memory
+        cayenne_cdc_mem_tier_max_age_ms: "30000"
+        cayenne_cdc_mem_tier_shards: "4"
+        cayenne_compaction_background_interval_ms: "3000"
+        cayenne_compaction_trigger_snapshot_age_ms: "15000"
+        cayenne_compaction_max_files_per_pick: "64"
+        cdc_max_coalesce_age_ms: "3000"
+        cdc_max_coalesced_bytes: "536870912"
+        cayenne_pk_keyset_cache_mb: "256"
+        cayenne_write_concurrency: "2"
+        cayenne_segment_cache_mb: "64"
+        cayenne_target_file_size_mb: "512"
+        cayenne_cdc_mem_tier_max_bytes: "268435456"
+        cayenne_cdc_mem_tier_min_flush_bytes: "33554432"
+    columns:
+      - name: _id
+        type: Utf8
+        nullable: true
+      - name: r_regionkey
+        type: Int64
+        nullable: true
+      - name: r_name
+        type: Utf8
+        nullable: true
+      - name: r_comment
+        type: Utf8
+        nullable: true
+      - name: __created_at
+        type: "Timestamp(Microsecond, None)"
+        nullable: true

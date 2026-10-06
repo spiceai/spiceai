@@ -45,9 +45,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
 use futures::future::join_all;
 use runtime::Runtime;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -91,6 +91,13 @@ impl DatasetCheckpointer for DelayedMockCheckpointer {
         Ok(None)
     }
 
+    async fn set_schema(
+        &self,
+        _schema: &arrow::datatypes::SchemaRef,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        Ok(())
+    }
+
     async fn last_checkpoint_time(
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<SystemTime>> {
@@ -101,6 +108,10 @@ impl DatasetCheckpointer for DelayedMockCheckpointer {
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         Ok(None)
+    }
+
+    async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
     }
 }
 
@@ -697,9 +708,9 @@ impl EngineType {
 
 /// Run contention test for a specific engine type
 async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<()> {
+    use data_accelerator_api::DataAccelerator;
     use datafusion::common::{Constraints, ToDFSchema};
     use datafusion_expr::CreateExternalTable;
-    use runtime::dataaccelerator::DataAccelerator;
     use std::collections::HashMap;
 
     let temp_root = unique_temp_dir(&format!("lock_contention_{engine_type}"));
@@ -721,7 +732,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     let accelerator: Arc<dyn TableProvider> = match engine_type {
         #[cfg(feature = "duckdb")]
         EngineType::DuckDB => {
-            use runtime::dataaccelerator::duckdb::DuckDBAccelerator;
+            use accelerator_duckdb::DuckDBAccelerator;
 
             let mut options = HashMap::new();
             options.insert("open".to_string(), db_file.display().to_string());
@@ -729,7 +740,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
             let cmd = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_table"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -751,7 +762,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
         }
         #[cfg(feature = "sqlite")]
         EngineType::Sqlite => {
-            use runtime::dataaccelerator::sqlite::SqliteAccelerator;
+            use accelerator_sqlite::SqliteAccelerator;
 
             let mut options = HashMap::new();
             options.insert("file".to_string(), db_file.display().to_string());
@@ -759,7 +770,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
             let cmd = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_table"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,

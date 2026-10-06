@@ -163,8 +163,7 @@ pub(crate) async fn do_action(
 ) -> Result<Response<<Service as FlightService>::DoActionStream>, Status> {
     let action_type = ActionType::from_str(request.get_ref().r#type.as_str());
 
-    let action_type_str = action_type.as_str().to_string();
-    let start = metrics::track_flight_request("do_action", Some(&action_type_str)).await;
+    let start = metrics::track_flight_request("do_action", Some(action_type.as_str())).await;
 
     let stream = match action_type {
         ActionType::CreatePreparedStatement => {
@@ -251,7 +250,9 @@ async fn handle_cancel_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     }
 
     let df = get_current_datafusion(&context);
-    let cancelled = df.query_cancel_registry().cancel(parsed);
+    let cancelled = df
+        .query_cancel_registry()
+        .cancel_owned(parsed, &crate::jobs::current_job_owner().await);
 
     let resp = CancelQueryResponse {
         query_id: req.query_id,

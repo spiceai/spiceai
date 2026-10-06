@@ -232,7 +232,7 @@ async fn run_post_filter_scenario(
     zero_results_action: ZeroResultsAction,
 ) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,runtime::accelerated_table=debug",
+        "integration=debug,runtime=debug,runtime_table::accelerated=debug",
     ));
     register_test_connectors().await;
 

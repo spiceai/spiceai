@@ -8,15 +8,14 @@ repository = "https://github.com/spiceai/spiceai"
 version.workspace = true
 
 [dependencies]
+cpu-budget = { path = "../cpu-budget" }
 arc-swap = { workspace = true }
 arrow = { workspace = true }
 arrow_tools = { path = "../arrow_tools" }
 datafusion-ddl = { path = "../datafusion-ddl" }
 datafusion-dml = { path = "../datafusion-dml" }
-regex = "1.12.3"
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
-arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -30,17 +29,26 @@ datafusion-common = { workspace = true }
 datafusion-datasource = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
+# `DecimalAverager`: the maintained decimal AVG serves DataFusion's own
+# sum/count -> decimal quotient, so parity with a base-table re-scan is
+# structural rather than a re-implementation kept in sync by hand.
+datafusion-functions-aggregate-common = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
+# `ExecutionPlan::try_to_proto` exists only with datafusion-physical-plan's `proto`
+# feature, which datafusion-proto enables.
+datafusion-proto = { workspace = true }
 datafusion-pruning = { workspace = true }
 datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
 hash-index = { path = "../hash-index" }
+key-index = { path = "../key-index" }
 im = "15.1"
 object_store = { workspace = true }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-request-context = { path = "../runtime-request-context" }
 runtime-table-partition = { path = "../runtime-table-partition", optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
@@ -99,22 +107,42 @@ libc = "0.2"
 default = []
 turso = ["dep:turso"]
 partition-table-provider = ["dep:runtime-table-partition"]
+# Criterion *performance* comparison benches (`benches/vs_duckdb_*`, `vs_chdb_*`).
 duckdb-bench = ["dep:duckdb"]
 chdb-bench = ["dep:chdb-rust"]
+# *Result correctness* gates (`tests/result_correctness_*`). Same optional
+# engines, separate feature names so CI/docs never conflate correctness with
+# the perf matrix in docs/dev/cayenne_vs_duckdb_benchmarks.md.
+result-correctness-duckdb = ["dep:duckdb"]
+result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
+tpcdsgen = { workspace = true }
+tpchgen = { workspace = true }
+vortex-io = { workspace = true }
+# Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
+# longer depends on arrow-row's (unstable) row format.
+arrow-row = { workspace = true }
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion-federation.workspace = true
 datafusion-functions-aggregate = { workspace = true }
 datafusion-functions = { workspace = true }
+# Compiles the `include`/`exclude` patterns the catalog-selector tests feed to
+# `data_components::catalog_filter::TableSelector`.
+globset = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
 rstest = "0.26.1"
+# For the `pk_key_hashing` bench (FxHash for native integer PK keys) and the
+# `hll_ndv_hashing` bench (FxHash vs XXH3 for NDV sketch value hashing).
+rustc-hash = "2.1.2"
 tempfile = { workspace = true }
 test-framework = { path = "../test-framework" }
 test-log = { version = "0.2", features = ["trace"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 tokio-stream = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 # The `compaction_io_hygiene` bench reproduces the Linux-only fadvise/fsync
 # primitives (`sync_file_range`, `posix_fadvise`, `mincore`) directly. cayenne
@@ -123,9 +151,30 @@ tokio-stream = { workspace = true }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"
 
+# `loom` model-checks the `StructuralVersion` seqlock's memory orderings
+# (`provider/structural_version.rs`). Gated on `cfg(cayenne_loom)` so it is
+# compiled ONLY under `RUSTFLAGS="--cfg cayenne_loom"` and never enters normal
+# test/CI builds. Run with:
+#   RUSTFLAGS="--cfg cayenne_loom" cargo test -p cayenne --lib \
+#     provider::structural_version --release
+[target.'cfg(cayenne_loom)'.dev-dependencies]
+loom = { workspace = true }
+
 [[bench]]
 harness = false
-name = "zorder_clustering"
+name = "in_list_query_e2e"
+
+[[bench]]
+harness = false
+name = "lookup_index_freshness"
+
+[[bench]]
+harness = false
+name = "cold_clustering"
+
+[[bench]]
+harness = false
+name = "layout_amp_default_on"
 
 [[bench]]
 harness = false
@@ -134,6 +183,18 @@ name = "metastore_operations"
 [[bench]]
 harness = false
 name = "ivm_retraction_anchor"
+
+[[bench]]
+harness = false
+name = "mem_tier_shard_split_converter"
+
+[[bench]]
+harness = false
+name = "sharded_validation_inline"
+
+[[bench]]
+harness = false
+name = "maintained_minmax_anchor"
 
 [[bench]]
 harness = false
@@ -341,6 +402,10 @@ name = "int64_pk_filter_keep_mask_alloc"
 
 [[bench]]
 harness = false
+name = "key_based_filter_scratch_reuse_alloc"
+
+[[bench]]
+harness = false
 name = "position_delete_redundant_walks"
 
 [[bench]]
@@ -350,6 +415,11 @@ name = "apply_partial_filter_empty_alloc"
 [[bench]]
 harness = false
 name = "pk_lookup_file_group_fanout"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "selective_join_pk_probe"
 required-features = ["duckdb-bench"]
 
 [[bench]]
@@ -377,6 +447,10 @@ name = "delta_encoding_sweep"
 [[bench]]
 harness = false
 name = "compaction_write_amplification"
+
+[[bench]]
+harness = false
+name = "p1_audit_coverage"
 
 [[bench]]
 harness = false
@@ -416,6 +490,14 @@ name = "mem_tier_join_shapes"
 
 [[bench]]
 harness = false
+name = "mem_tier_seal_cadence"
+
+[[bench]]
+harness = false
+name = "metastore_manifest_rewrite"
+
+[[bench]]
+harness = false
 name = "publish_metadata_wall"
 
 [[bench]]
@@ -425,3 +507,68 @@ name = "cdc_apply_simd"
 [[bench]]
 harness = false
 name = "compaction_io_hygiene"
+
+[[bench]]
+harness = false
+name = "pk_key_hashing"
+
+[[bench]]
+harness = false
+name = "hll_ndv_hashing"
+
+[[bench]]
+harness = false
+name = "pk_keyset_present_path"
+
+[[bench]]
+harness = false
+name = "scan_view_reuse_qps"
+
+# Turso 0.7.2 → 0.8.1 on-disk open. The fixtures were written by
+# `tools/turso-072-fixture-gen` (excluded from the workspace so cargo does not
+# unify `turso` to 0.8.1). Required feature: the test talks to the Turso crate.
+[[test]]
+name = "turso_0_7_2_open_compat_test"
+path = "tests/turso_0_7_2_open_compat_test.rs"
+required-features = ["turso"]
+
+# Result *correctness* (not perf): inventory completeness + pure compare path.
+[[test]]
+name = "result_correctness_inventory_test"
+path = "tests/result_correctness_inventory_test.rs"
+
+# Static comparison-cell census over the inventory. Links no engines; prints the
+# planned-coverage ceiling as markdown. Not a gate — it asserts nothing.
+[[test]]
+name = "result_correctness_census_test"
+path = "tests/result_correctness_census_test.rs"
+
+# Result correctness vs DuckDB on SF1 suites + SQLLancer. Not a Criterion bench.
+[[test]]
+name = "result_correctness_vs_duckdb_test"
+path = "tests/result_correctness_vs_duckdb_test.rs"
+required-features = ["result-correctness-duckdb"]
+
+# Result correctness vs chDB (SQLLancer + micro). Separate process from DuckDB
+# — the engines cannot co-link. Not a Criterion bench.
+[[test]]
+name = "result_correctness_vs_chdb_test"
+path = "tests/result_correctness_vs_chdb_test.rs"
+required-features = ["result-correctness-chdb"]
+
+# Result correctness vs SQLite (SSB + SQLLancer + micro). Always linked
+# (rusqlite is a cayenne dependency). Not a Criterion bench.
+[[test]]
+name = "result_correctness_vs_sqlite_test"
+path = "tests/result_correctness_vs_sqlite_test.rs"
+
+# Out-of-Spice oracle baseline: standalone DuckDB ↔ standalone SQLite (no
+# Cayenne / no Spice accelerators). Validates external engines agree before
+# accelerator-vs-oracle gates. Requires DuckDB feature for one side.
+[[test]]
+name = "result_correctness_standalone_engines_test"
+path = "tests/result_correctness_standalone_engines_test.rs"
+required-features = ["result-correctness-duckdb"]
+
+[lints]
+workspace = true

@@ -48,7 +48,6 @@ pub struct EndpointAuth {
 impl EndpointAuth {
     #[must_use]
     pub async fn new(secrets: Arc<RwLock<Secrets>>, app: &App) -> Self {
-        let secrets = &*secrets.read().await;
         let Some(auth) = app.runtime.auth.as_ref() else {
             return Self::no_auth();
         };
@@ -58,7 +57,8 @@ impl EndpointAuth {
                 return Self::no_auth();
             }
 
-            let api_key_auth = api_key_auth(secrets, api_key_auth_config).await;
+            let secrets = Secrets::snapshot(&secrets).await;
+            let api_key_auth = api_key_auth(&secrets, api_key_auth_config).await;
             let http_auth = Arc::clone(&api_key_auth) as Arc<dyn HttpAuth + Send + Sync>;
             let flight_basic_auth =
                 Arc::clone(&api_key_auth) as Arc<dyn FlightBasicAuth + Send + Sync>;

@@ -25,7 +25,7 @@ use datafusion::{
     error::DataFusionError,
     execution::runtime_env::RuntimeEnv,
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
-    prelude::{Expr, SessionContext},
+    prelude::Expr,
     scalar::ScalarValue,
 };
 use runtime_table_partition::{
@@ -39,10 +39,11 @@ use snafu::prelude::*;
 use crate::{
     component::dataset::acceleration::{Engine, RefreshMode},
     parameters::ParameterSpec,
-    register_data_accelerator,
 };
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator};
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption, unsupported_sidecar};
+use runtime_checkpoint_api::CheckpointError;
 
 #[derive(Debug)]
 pub(crate) struct ArrowPartitionCreator {
@@ -84,7 +85,7 @@ impl PartitionCreator for ArrowPartitionCreator {
             });
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let table_provider =
             TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &self.cmd)
                 .await
@@ -186,6 +187,17 @@ impl DataAccelerator for PartitionedArrowAccelerator {
         Ok(table_provider as Arc<dyn TableProvider>)
     }
 
+    async fn sidecar(
+        &self,
+        _source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        _open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        // In-memory: there is no database to keep sidecar tables in, and nothing would
+        // survive a restart if there were.
+        Err(unsupported_sidecar("partitioned_arrow", "sidecar"))
+    }
+
     fn prefix(&self) -> &'static str {
         "arrow"
     }
@@ -195,4 +207,7 @@ impl DataAccelerator for PartitionedArrowAccelerator {
     }
 }
 
-register_data_accelerator!(Engine::PartitionedArrow, PartitionedArrowAccelerator);
+data_accelerator_api::register_data_accelerator!(
+    Engine::PartitionedArrow,
+    PartitionedArrowAccelerator
+);

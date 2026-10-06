@@ -12,6 +12,9 @@ version = { workspace = true }
 [dependencies]
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
+# Sole source of the CPU entitlement, which caps the derived intra-file scan
+# concurrency (see `VortexSource::resolved_scan_concurrency`).
+cpu-budget = { workspace = true }
 datafusion-catalog = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-common-runtime = { workspace = true }
@@ -19,6 +22,7 @@ datafusion-datasource = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-functions = { workspace = true }
+datafusion-functions-nested = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-expr-adapter = { workspace = true }
 datafusion-physical-expr-common = { workspace = true }
@@ -29,7 +33,8 @@ itertools = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 object_store = { workspace = true }
 opentelemetry = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
+parking_lot = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "time"] }
 tokio-stream = { workspace = true }
 tracing = { workspace = true, features = ["std", "attributes"] }
 twox-hash = { workspace = true }
@@ -39,9 +44,40 @@ vortex-utils = { workspace = true, features = ["dashmap"] }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion = { workspace = true }
 insta = { workspace = true }
+opentelemetry-prometheus = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+prometheus = { workspace = true }
 rstest = "0.26.1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 url = { workspace = true }
+
+[[bench]]
+harness = false
+name = "filter_pushdown_cast_case"
+
+[[bench]]
+harness = false
+name = "schema_field_lookup"
+
+[[bench]]
+harness = false
+name = "filter_pushdown_not"
+
+[[bench]]
+harness = false
+name = "in_list_kernel"
+
+[[bench]]
+harness = false
+name = "in_list_pruning"
+
+[[bench]]
+harness = false
+name = "in_list_pruning_power"
+
+[lints]
+workspace = true

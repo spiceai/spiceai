@@ -17,8 +17,6 @@
 [![GitHub Actions Workflow Status - docker build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_dev.yml?branch=trunk&label=docker%20build)](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_dev.yml?query=branch%3Atrunk)
 [![GitHub Actions Workflow Status - unit tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk&label=unit%20tests)](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml?query=branch%3Atrunk)
 [![GitHub Actions Workflow Status - integration tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?branch=trunk&label=integration%20tests)](https://github.com/spiceai/spiceai/actions/workflows/integration.yml?query=branch%3Atrunk)
-[![GitHub Actions Workflow Status - integration tests (models)](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&label=integration%20tests%20%28models%29)](https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml?query=branch%3Atrunk)
-[![GitHub Actions Workflow Status - benchmark tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/testoperator_run_bench.yml?branch=trunk&label=benchmark%20tests)](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_bench.yml?query=branch%3Atrunk)
 
 </div>
 
@@ -26,26 +24,36 @@
   <a href="https://spiceai.org/docs">📄 Docs</a> | <a href="#%EF%B8%8F-quickstart-local-machine">⚡️ Quickstart</a> | <a href="https://github.com/spiceai/cookbook">🧑‍🍳 Cookbook</a> | <a href="https://github.com/spiceai/skills">🤖 AI Skills</a> | <a href="https://spice.ai/blog">📰 Blog</a>
 </p>
 
-**Spice** is a portable, accelerated SQL query, search, and LLM-inference engine, written in Rust, for data-grounded AI apps and agents. Run it as a sidecar next to your application — or scale to a multi-node distributed cluster — to get **millisecond data and AI on localhost**, backed by your existing data sources.
+**Spice** (Spice.ai Open Source) is a data and AI engine that brings your data to your application. Connect it to the databases, data warehouses, data lakes, and APIs you already use, and it serves that data to your applications and AI agents through standard APIs — with SQL query, search, and LLM inference built in. Queries on an accelerated dataset return in **milliseconds** because Spice keeps a local, continuously refreshed copy of it, so your production systems don't take the load. Other datasets are queried in place at the source, with query push-down.
+
+**How it works:**
+
+1. **Connect** — Declare datasets from 30+ sources (PostgreSQL, MySQL, Snowflake, Databricks, S3, Iceberg, and more) in one YAML file, `spicepod.yaml`.
+2. **Accelerate (optional, per dataset)** — Spice materializes the datasets you choose in memory or on local disk, and keeps them fresh with scheduled refreshes or real-time change data capture (CDC).
+3. **Query, search, and infer** — Your application queries with SQL over HTTP, Arrow Flight SQL, JDBC, ODBC, or ADBC; searches with vector, full-text, or hybrid search; and calls LLMs through OpenAI-compatible APIs and MCP — all over the same data.
+
+Spice is a single binary written in Rust on Apache DataFusion, Apache Arrow, and Vortex. Run it next to your application as a sidecar, as a standalone service, or as a multi-node distributed cluster. This repository contains the Apache-2.0 runtime (`spiced`) and CLI (`spice`); [Spice.ai Cloud](https://spice.ai) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise) are optional managed and enterprise distributions built on it.
 
 <img width="740" alt="Spice.ai Open Source accelerated data query and LLM-inference engine" src="https://github.com/user-attachments/assets/9db94f9c-10a1-47b0-ab45-05aa964590ff" />
 
 🎯 **Goal**: Build data-grounded AI apps and agents in minutes, not months. No pipelines. No glue. Just SQL, search, and inference — federated across your data, accelerated locally, served on localhost.
 
+> 🆕 **New in Spice 2.0 — add a real-time analytics node to your operational database.** Point Spice at **PostgreSQL, MySQL, or MongoDB** and it maintains a sandboxed, analytics-ready replica with high-throughput **CDC replication** — **sub-second queries, ~2-second freshness, and zero analytical load on production**. No ETL, no Debezium, no Kafka required. [Read the Spice 2.0 launch →](https://spice.ai/blog/spice-2-0-is-now-available)
+
 ## Why Spice?
 
-- 🚀 **Localhost latency at any scale** — Millisecond queries against a sandboxed working set on each pod, transparently delegated to a distributed cluster for the long tail.
+- ⚡ **Real-time analytics node for your operational database** — Add a sandboxed analytics replica to **PostgreSQL, MySQL, and MongoDB** via native CDC (WAL, binlog, change streams) plus DynamoDB Streams — **~2-second freshness, zero load on production, no ETL, no Debezium or Kafka required**.
+- 🚀 **Localhost latency at any scale** — Millisecond queries against a sandboxed working set on each pod, microsecond repeat queries from the results cache, and transparent delegation to a distributed cluster for the long tail.
 - 🦀 **Built in Rust** on industry-leading open foundations: [Apache DataFusion](https://datafusion.apache.org), [Apache Ballista](https://datafusion.apache.org/ballista/), [Apache Arrow](https://arrow.apache.org), [Apache Iceberg](https://iceberg.apache.org), [Vortex](https://github.com/vortex-data/vortex), [DuckDB](https://duckdb.org), and [SQLite](https://www.sqlite.org).
 - ⚡ **Distributed query without the operational tax** — Apache Ballista with multi-active schedulers coordinated through object storage. **2.9x faster than single-node DataFusion** on TPC-H SF100, **8x less RAM than Spark**.
-- 💎 **Spice Cayenne** data accelerator on Vortex — **1.4x faster than DuckDB with 3x less memory** on TPC-H SF100. **100x faster random access vs. Parquet**.
+- 💎 **Spice Cayenne**, the acceleration engine that powers Spice (GA) — high-rate CDC ingestion and low-latency queries on the same table, built on Vortex. It runs in memory or on disk, with secondary indexes and, on disk, multi-column clustering. **1.5x faster than DuckDB with 3x less memory** on TPC-H SF100, **26x faster than Spice 1.x on TPC-DS SF100**, **100x faster random access vs. Parquet**.
 - 🔍 **Petabyte-scale hybrid search** — Native Amazon S3 Vectors, Tantivy BM25, DuckDB HNSW, and Elasticsearch kNN, with reciprocal rank fusion (RRF) and reranker UDTFs — all in a single SQL query.
 - 🤖 **AI-native runtime** — OpenAI-compatible APIs, MCP server + gateway, LLM memory, NSQL text-to-SQL, multi-vector ColBERT-style embeddings, provider-aware prompt caching.
 - 🔗 **30+ data connectors** with advanced query push-down — federate Postgres, MySQL, Snowflake, Databricks, Iceberg, Delta Lake, S3, Spark, MSSQL, DynamoDB, MongoDB, GitHub, SharePoint, Kafka, and more.
-- ⏱️ **Real-time CDC** — Native PostgreSQL WAL streaming and DynamoDB Streams (no Debezium or Kafka required), plus Debezium when you need it.
 - 📝 **Open table formats, first-class** — Query, **accelerate, and write** to Apache Iceberg with ACID guarantees via standard SQL `INSERT INTO`. No Spark required.
 - 🛡️ **Enterprise-ready** — HashiCorp Vault and Azure Key Vault secret stores, mTLS, read-only API keys, observability via OpenTelemetry, and an extensibility model used in production at companies like Twilio and Barracuda.
 
-📣 **Latest:** Read [Localhost Latency at Scale: The Spice Cluster-Sidecar Architecture](https://spice.ai/blog/cluster-sidecar-architecture) and [Apache Ballista at Spice AI: Distributed Query Execution Without the Operational Tax](https://spice.ai/blog/apache-ballista-at-spice-ai). | [📊 2025 Year in Review](https://spice.ai/blog/2025-spice-ai-year-in-review)
+📣 **Latest:** [**Spice v2.3**](https://spiceai.org/releases/v2.3.2) — indexed point lookups and multi-column data clustering in Spice Cayenne, results-cache hits answered before query planning, BigQuery federation, Google models on Vertex AI, and MCP specification `2026-07-28`. | Read the [Spice 2.0 launch](https://spice.ai/blog/spice-2-0-is-now-available), and the [Analytics Replica Pattern](https://spice.ai/blog/the-analytics-replica-pattern-shortening-the-path-to-data-based-ai), [Cluster-Sidecar Architecture](https://spice.ai/blog/cluster-sidecar-architecture), and [Apache Ballista](https://spice.ai/blog/apache-ballista-at-spice-ai) deep dives.
 
 <div align="center">
   <picture>
@@ -59,9 +67,9 @@ Spice provides five APIs and interfaces in a lightweight, portable runtime (sing
 
 1. **SQL Query & Search**: HTTP, Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC APIs; `vector_search`, `text_search`, `rrf`, and `rerank` UDTFs.
 2. **Text-to-SQL (NSQL)**: Natural-language SQL generation grounded in your federated schema with built-in sampling tools — usable from the HTTP API, the SQL REPL, or directly inside agent tool calls.
-3. **OpenAI-Compatible APIs**: Hosted LLM gateway (OpenAI, Anthropic, xAI, Bedrock) and local model serving (CUDA/Metal accelerated). Includes the OpenAI Responses API, web search, and tool calls.
+3. **OpenAI-Compatible APIs**: Hosted LLM gateway (OpenAI, Anthropic, xAI, Bedrock, Google Vertex AI, Databricks) and local model serving (CUDA/Metal accelerated). Includes the OpenAI Responses API, web search, and tool calls.
 4. **Iceberg Catalog REST APIs**: A unified Iceberg REST Catalog API for query and write.
-5. **MCP HTTP+SSE APIs**: Model Context Protocol server *and* gateway with Streamable HTTP transport.
+5. **MCP HTTP+SSE APIs**: Model Context Protocol server *and* gateway with Streamable HTTP transport. Dual-era: serves [`2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28/) (`server/discover`, sessionless) and still answers legacy `initialize`.
 
 ## 🎥 Watch & Learn
 
@@ -77,17 +85,37 @@ Spice provides five APIs and interfaces in a lightweight, portable runtime (sing
 
 ## What's New
 
+### Analytics node for operational databases — real-time CDC, no ETL
+
+Add a sandboxed, analytics-ready replica alongside **PostgreSQL, MySQL, and MongoDB** in minutes — **~2-second end-to-end freshness, zero analytical load on production, and no ETL**. Spice replicates committed inserts, updates, and deletes directly from the native change log at up to **~170x the ingest throughput of Spice 1.x**, so production never runs a single analytical query. It's incrementally adoptable: start with **1 table** and be querying operational data in minutes, then join across replicated sources in a single SQL query. In the CH-BenCHmark HTAP benchmark, **1 Spice node served 1,046 analytical queries/hour at SF1000 (1,000 warehouses, 300M+ rows) while the source sustained a 266,000+ tpmC live transactional load**. [Read the Spice 2.0 launch →](https://spice.ai/blog/spice-2-0-is-now-available)
+
+- **PostgreSQL (WAL), MySQL (binlog), and MongoDB (change streams)** — native replication with auto-managed replication state (slots, binlog positions, resume tokens) and bootstrapped initial snapshots. Many PostgreSQL datasets can share one replication slot. **No Debezium or Kafka required.**
+- **Whole-database CDC** — a PostgreSQL catalog with `refresh_mode: changes` replicates every table its `include` patterns match that has a primary key or a replica-identity index, with no per-table configuration (Alpha). Views, and tables without a usable key, are skipped with a warning. [Catalog docs →](https://spiceai.org/docs/components/catalogs/postgres)
+- **DynamoDB Streams** — two-tier acceleration that fans out from a central Spice layer to thousands of edge sidecars with sub-second propagation. Used in production for global control-plane sync. [Read the pattern →](https://spice.ai/blog/real-time-acceleration-with-dynamodb-streams)
+- **Debezium** — Kafka consumer (`from: debezium:…`) or **push ingest without Kafka** (`from: cdc:…` + `POST /v1/datasets/{name}/cdc`, JSON/Avro).
+
 ### Cluster-Sidecar Architecture: localhost latency, cluster scale
 
 Each application gets a complete data plane on `localhost`. A lightweight Spice sidecar runs in the application pod, serves SQL/search/LLM-inference from a scoped working set, and transparently delegates the long tail to a central Spice cluster (Ballista distributed query, Cayenne acceleration, hybrid search indexing) over Arrow Flight. Three latency tiers: results cache (microseconds) → local working set (single-digit milliseconds) → cluster delegation. The application **never holds credentials** to Postgres, S3, Snowflake, or Iceberg — only a token to its sidecar. [Read the architecture deep dive →](https://spice.ai/blog/cluster-sidecar-architecture)
 
 ### Apache Ballista distributed query
 
-Spice extends Apache Ballista with **multi-active scheduler HA coordinated through object storage** (no etcd, ZooKeeper, or Redis required), bidirectional gRPC control streams, mandatory mTLS, multiple shuffle backends (local, in-memory, S3/Azure/GCS), Vortex-encoded shuffle data, and distributed embeddings inside SQL. **TPC-H SF100: 2.9x faster than single-node DataFusion. 8x less RAM than Apache Spark with 2–8x better query performance** in early preview. [Read the engineering deep dive →](https://spice.ai/blog/apache-ballista-at-spice-ai)
+Spice extends Apache Ballista with **multi-active scheduler HA coordinated through object storage** (no etcd, ZooKeeper, or Redis required), bidirectional gRPC control streams, mandatory mTLS, multiple shuffle backends (local, in-memory, S3/Azure/GCS), Vortex-encoded shuffle data, and distributed embeddings inside SQL. Iceberg catalog tables scan across executors, small dimension tables are broadcast for distributed joins, and scheduler job state is shared so a scheduler can fail over without losing in-flight work. **TPC-H SF100: 2.9x faster on 3 executors than 1 node. 8x less RAM than Apache Spark with 2–8x better query performance** — now generally available. [Read the engineering deep dive →](https://spice.ai/blog/apache-ballista-at-spice-ai)
 
-### Spice Cayenne — next-gen data acceleration on Vortex
+### Spice Cayenne — the acceleration engine that powers Spice
 
-Cayenne pairs the [Vortex columnar format](https://github.com/vortex-data/vortex) with SQLite metadata to deliver multi-file acceleration without DuckDB's single-file ceiling or memory overhead. **TPC-H SF-100: 1.4x faster than DuckDB-file with 3x less memory. ClickBench: 14% faster, 3.4x less memory.** Vortex itself is **100x faster on random access**, **10–20x faster on full scans**, and **5x faster writes** than Parquet — compute kernels run directly on encoded data, skipping decompression entirely for many operations. [Read the Vortex deep dive →](https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads)
+Cayenne is built on the [Vortex columnar format](https://github.com/vortex-data/vortex) and a transactional SQLite (or Turso) metastore, and is tuned end to end for high-rate CDC ingestion and low-latency queries on the same table — multi-file acceleration without DuckDB's single-file ceiling. **Generally available** since v2.0, it runs fully in RAM (`mode: memory`) or durably on local disk or S3 Express One Zone (`mode: file`), with an optional cold tier on object storage.
+
+- **Point lookups and selective joins** — `indexes` builds secondary indexes, so a lookup that pins every indexed column to a value reads the matching rows instead of scanning, and in `mode: file` a selective hash join probes the index with its join keys instead of scanning the table.
+- **A data layout that prunes** — In `mode: file`, `cayenne_cluster_by` (or `CREATE TABLE … CLUSTER BY`) clusters the rows in every tier's data files on one or more columns, and full refreshes write key-range files, so filtered queries open only the files that can match.
+- **HTAP writes** — atomic WAL-staged writes, an in-memory CDC tier, and a dedicated compaction runtime keep replication lag low under sustained upserts, alongside serializable multi-statement transactions, `MERGE INTO`, and SQL-defined partitioning.
+- **A faster query path** — multi-reference CTEs computed once (`runtime.query.cte_materialization: auto`), zone-map skipping and set-probe `IN` lists inside Vortex scans, and prepared scan views reused until the data changes.
+
+**TPC-H SF100: 1.5x faster than DuckDB with 3x less memory. TPC-DS SF100: 26x faster than Spice 1.x. ClickBench: 14% faster, 3.4x less memory.** Vortex itself is **100x faster on random access**, **10–20x faster on full scans**, and **5x faster writes** than Parquet — compute kernels run directly on encoded data, skipping decompression entirely for many operations. [Cayenne docs →](https://spiceai.org/docs/components/data-accelerators/cayenne) | [Read the Vortex deep dive →](https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads)
+
+### Results caching — repeat queries in microseconds
+
+Spice keeps a results cache in front of every data source and accelerator. A repeated query is answered from memory without being planned or scanned, and an entry is retired as soon as a refresh, CDC burst, or write changes a table it read. With `stale_while_revalidate_ttl` set, a refresh marks dependent entries stale instead of evicting them, so high-QPS dashboards keep hitting while one background query per key revalidates. Responses report `Results-Cache-Status`, clients steer freshness with `Cache-Control`, and `Spice-Cache-Key` lets an application name its own entries. For slow HTTP APIs, `refresh_mode: caching` stores each response as rows in the accelerator — bounded by `caching_max_size` and `caching_max_items`, serving the last good response when the origin fails (`caching_stale_if_error`), and coalescing concurrent misses for the same request into one origin call. [Caching docs →](https://spiceai.org/docs/features/caching)
 
 ### Apache Iceberg: query, accelerate, and write
 
@@ -95,7 +123,7 @@ Connect to any Iceberg catalog (REST, AWS Glue, Hadoop), query tables with full 
 
 ### Petabyte-scale hybrid search
 
-Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus DuckDB HNSW and Elasticsearch kNN as `.vectors.engine` backends. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
+Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus DuckDB HNSW and Elasticsearch kNN as `.vectors.engine` backends. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, Google Vertex AI, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. Vector and full-text indexes serve from a warm in-memory tier by default, and full-text search pushes SQL filters down into the Tantivy index. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
 
 ```sql
 SELECT * FROM rerank(
@@ -109,13 +137,7 @@ SELECT * FROM rerank(
 
 ### Multi-tenancy for AI agents — without per-tenant pipelines
 
-Spin up one Spice runtime per tenant or agent — each with its own sandboxed datasets, accelerators, secrets, and policies. Or share a runtime with config-level tenant isolation. Or do both with a hybrid model. The lightweight runtime makes "one Spicepod per tenant" actually viable — even at high tenant counts. [Read the patterns →](https://spice.ai/blog/multi-tenancy-for-ai-agents-without-pipelines)
-
-### Real-time CDC, the simple way
-
-- **PostgreSQL Native CDC via WAL** — Stream INSERT/UPDATE/DELETE events directly from `pgoutput` logical replication into any local accelerator. **No Debezium or Kafka required.** Auto-managed replication slots and LSN acknowledgement.
-- **DynamoDB Streams** — Two-tier acceleration pattern that fans out from a central Spice layer to thousands of edge sidecars with sub-second propagation. Used in production for global control-plane sync. [Read the pattern →](https://spice.ai/blog/real-time-acceleration-with-dynamodb-streams)
-- **Debezium + Kafka** — Available when you want it.
+Spin up one Spice runtime per tenant or agent — each with its own sandboxed datasets, accelerators, secrets, and policies. Or share a runtime with config-level tenant isolation. Or do both with a hybrid model. A runtime that idles at **~140MB** of memory makes "one Spicepod per tenant" actually viable — even at **thousands of tenants**. [Read the patterns →](https://spice.ai/blog/multi-tenancy-for-ai-agents-without-pipelines)
 
 ### Spice Skills for AI coding agents
 
@@ -137,9 +159,11 @@ Bootstrap accelerated datasets from S3 in **seconds, not minutes**. Cold-start e
 
 - **HashiCorp Vault** and **Azure Key Vault** secret stores
 - **Read-only API keys** enforced on Flight DoGet and async query paths
+- **[Cloud Connect](https://spiceai.org/docs/deployment/cloud/cloud-connect)** links self-hosted (BYOC) runtimes to Spice.ai Cloud for management and observability
 - **Provider-aware LLM prompt caching** for cost reduction
 - **mTLS** for all internal cluster communication; OpenTelemetry metric export with delta temporality
-- **Streamable HTTP MCP transport**, MCP gateway, MCP server
+- **Streamable HTTP MCP transport** (`2026-07-28` + legacy `initialize`) with browser `Origin` checks, MCP gateway, MCP server
+- **CPU sizing for Kubernetes pods** — a pod that declares its CPU request (`SPICE_CPU_REQUEST_MILLICORES`, from the downward API) and sets no limit is sized at twice that request (at least two cores) instead of the whole node; `runtime.cpu.cores` sets an exact core count, or `all` for the whole node
 - **30+ data connectors** with shared HTTP rate control, dynamic headers, schema decomposition
 
 ## How is Spice different?
@@ -148,59 +172,29 @@ Bootstrap accelerated datasets from S3 in **seconds, not minutes**. Cold-start e
 2. **Structural data sandboxing** — Datasets a sidecar doesn't declare in its `spicepod.yaml` are *physically absent from the catalog*, not filtered at query time. The application never holds credentials to Postgres, S3, Snowflake, or Iceberg — only a token to its sidecar. A compromised pod gets a loopback scoped to that tenant's working set, not database credentials.
 3. **Ingest once, serve everywhere** — The cluster ingests each source dataset once and produces one authoritative materialization that every sidecar pulls. Source systems see one stable connection pool, not one per pod. Pull-based refresh + acceleration snapshots in S3 mean cold starts in seconds and graceful degradation when the cluster is unreachable.
 4. **AI-Native Runtime** — Data query and AI inference live in one engine, so retrieval, ranking, and generation happen in one query plan, in one process — `vector_search`, `text_search`, `rrf`, `rerank`, NSQL, and tool calls are all SQL primitives.
-5. **Dual-engine acceleration** — Per-dataset choice of OLAP (Cayenne/Vortex, Arrow, DuckDB) and OLTP (SQLite, PostgreSQL) engines, so you can match workload to engine instead of forcing everything into one shape.
+5. **Dual-engine acceleration** — Per-dataset choice of OLAP (Cayenne/Vortex, Arrow, DuckDB) and OLTP (SQLite, or PostgreSQL in Spice.ai Enterprise) engines, so you can match workload to engine instead of forcing everything into one shape.
 6. **Edge to cloud, single binary** — Runs on a laptop, as a Kubernetes sidecar, as a microservice, or as a multi-node Ballista cluster across edge, on-prem, and public clouds. Self-hosted OSS, Spice Cloud (managed cluster), and Spice.ai Enterprise (on-prem full stack) all use identical `spicepod.yaml` manifests — no app changes to migrate.
 
 If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ballista**, Spice gives you a flexible, production-ready engine you can just use — instead of stitching them together yourself.
 
-## How does Spice compare?
-
-### Data Query and Analytics
-
-| Feature                          | **Spice**                                           | Trino / Presto       | Dremio                | ClickHouse          | Materialize         |
-| -------------------------------- | --------------------------------------------------- | -------------------- | --------------------- | ------------------- | ------------------- |
-| **Primary Use-Case**             | Data & AI apps/agents                               | Big data analytics   | Interactive analytics | Real-time analytics | Real-time analytics |
-| **Primary deployment model**     | Sidecar + Cluster                                   | Cluster              | Cluster               | Cluster             | Cluster             |
-| **Federated Query Support**      | ✅                                                   | ✅                    | ✅                     | ❌                   | ❌                   |
-| **Distributed Query Execution**  | ✅ (Apache Ballista, multi-active HA)                | ✅                    | ✅                     | ✅                   | Limited             |
-| **Acceleration/Materialization** | ✅ (Cayenne/Vortex, Arrow, SQLite, DuckDB, Postgres) | Intermediate storage | Reflections (Iceberg) | Materialized views  | ✅ (Real-time views) |
-| **Catalog Support**              | ✅ (Iceberg, Unity Catalog, AWS Glue, Databricks)    | ✅                    | ✅                     | ❌                   | ❌                   |
-| **Iceberg Write (SQL INSERT)**   | ✅                                                   | ✅                    | Limited               | ❌                   | ❌                   |
-| **Query Result Caching**         | ✅                                                   | ✅                    | ✅                     | ✅                   | Limited             |
-| **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP per dataset)                         | ❌                    | ❌                     | ❌                   | ❌                   |
-| **Native CDC**                   | ✅ (Postgres WAL, DynamoDB Streams, Debezium)        | ❌                    | ❌                     | ❌                   | ✅ (Debezium)        |
-| **Built-in AI / LLM inference**  | ✅                                                   | ❌                    | ❌                     | ❌                   | ❌                   |
-
-### AI Apps and Agents
-
-| Feature                       | **Spice**                                                   | LangChain          | LlamaIndex | AgentOps.ai      | Ollama                        |
-| ----------------------------- | ----------------------------------------------------------- | ------------------ | ---------- | ---------------- | ----------------------------- |
-| **Primary Use-Case**          | Data & AI apps                                              | Agentic workflows  | RAG apps   | Agent operations | LLM apps                      |
-| **Programming Language**      | Any (HTTP / Flight / ODBC / JDBC)                           | JavaScript, Python | Python     | Python           | Any language (HTTP interface) |
-| **Unified Data + AI Runtime** | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
-| **Federated Data Query**      | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
-| **Distributed Query**         | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
-| **Accelerated Data Access**   | ✅                                                           | ❌                  | ❌          | ❌                | ❌                             |
-| **Tools/Functions**           | ✅ (MCP server + gateway, Streamable HTTP)                   | ✅                  | ✅          | Limited          | Limited                       |
-| **LLM Memory**                | ✅                                                           | ✅                  | ❌          | ✅                | ❌                             |
-| **Hybrid Search**             | ✅ (BM25 + vector + RRF + rerank UDTFs)                      | ✅                  | ✅          | Limited          | Limited                       |
-| **Caching**                   | ✅ (query, results, and provider-aware LLM prompt caching)   | Limited            | ❌          | ❌                | ❌                             |
-| **Embeddings**                | ✅ (Built-in & pluggable; multi-vector ColBERT-style MaxSim) | ✅                  | ✅          | Limited          | ❌                             |
-
-✅ = Fully supported · ❌ = Not supported · Limited = Partial or restricted support
-
 ## Example Use-Cases
+
+### Real-time Analytics on Operational Data (no ETL)
+
+- **Analytics node for PostgreSQL, MySQL, and MongoDB**: Point Spice at a live operational database and it maintains a continuously updated, sandboxed analytics replica via native CDC — **sub-second queries, ~2-second freshness, and zero analytical queries against production**. Start with one table, then join across replicated sources in one SQL query. [CDC Docs](https://spiceai.org/docs/features/cdc)
+- **HTAP at scale**: Sustain analytics and transactions on the same data — **1,046 analytical QPH at SF1000 under a 266,000+ tpmC transactional load** in CH-BenCHmark, all served from the replica. [Spice 2.0 launch →](https://spice.ai/blog/spice-2-0-is-now-available)
+- **Bring your own BI tools**: Query the replica from Power BI, Tableau, Looker, and Apache Superset over Arrow Flight SQL, ODBC, and JDBC — or from Python and the Go, Rust, Java, and JavaScript SDKs.
 
 ### Data-grounded Agentic AI Applications
 
-- **OpenAI-compatible AI Gateway**: Hosted (OpenAI, Anthropic, xAI, Bedrock) or local models (Llama, NVIDIA NIM) with Responses API, streaming tool calls, web search, and provider-aware prompt caching. [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
+- **OpenAI-compatible AI Gateway**: Hosted (OpenAI, Anthropic, xAI, Bedrock, Google Vertex AI, Databricks) or local models (Llama, NVIDIA NIM) with Responses API, streaming tool calls, web search, and provider-aware prompt caching. [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
 - **Federated Data Access**: SQL and NSQL (text-to-SQL) across 30+ sources with advanced push-down, scaling to multi-node Ballista. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
 - **Search and RAG**: Petabyte-scale vector search via Amazon S3 Vectors, BM25 full-text via Tantivy, ColBERT-style multi-vector embeddings with MaxSim, hybrid search with RRF, rerank UDTF. [Amazon S3 Vectors Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
 - **LLM Memory and Observability**: Persistent agent memory + deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Observability Docs](https://spiceai.org/docs/features/observability)
 
 ### Database CDN and Query Mesh
 
-- **Co-located acceleration**: Materialize working sets as Cayenne (Vortex), Arrow, SQLite, DuckDB, or Postgres alongside your app for sub-second query. Bootstrap from S3 snapshots. [DuckDB Accelerator Recipe](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md)
+- **Co-located acceleration**: Materialize working sets as Cayenne (Vortex), Arrow, DuckDB, or SQLite alongside your app for sub-second query, with secondary indexes for point lookups. Bootstrap from S3 snapshots. [DuckDB Accelerator Recipe](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md)
 - **Resiliency**: Maintain availability with local replicas of critical datasets; recover from source outages from snapshots. [Local Dataset Replication Recipe](https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md)
 - **Responsive dashboards**: Sub-second BI with configurable refresh and CDC. [Sales BI Demo](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
 - **Legacy modernization**: One endpoint that federates legacy systems with modern infrastructure. [Federation Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
@@ -233,46 +227,50 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name                               | Description                           | Status            | Protocol/Format              |
 | ---------------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
+| `adbc`                             | ADBC (incl. BigQuery)                 | Stable            | Arrow                        |
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Stable            | S3/Delta Lake                |
+| `databricks (mode: spark_connect)` | [Databricks][databricks]              | Stable            | [Spark Connect][spark]       |
+| `databricks (mode: sql_warehouse)` | [Databricks][databricks]              | Stable            | SQL Statement Execution API  |
 | `delta_lake`                       | Delta Lake                            | Stable            | Delta Lake                   |
 | `dremio`                           | [Dremio][dremio]                      | Stable            | Arrow Flight                 |
 | `duckdb`                           | DuckDB                                | Stable            | Embedded                     |
 | `file`                             | File                                  | Stable            | Parquet, CSV                 |
 | `github`                           | GitHub                                | Stable            | GitHub API                   |
+| `http`, `https`                    | HTTP(s) (dynamic headers, pagination) | Stable            | Parquet, CSV, JSON           |
+| `localpod`                         | [Local dataset replication][localpod] | Stable            |                              |
 | `postgres`                         | PostgreSQL (with native WAL CDC)      | Stable            |                              |
 | `s3`                               | [S3][s3]                              | Stable            | Parquet, CSV                 |
-| `mysql`                            | MySQL                                 | Stable            |                              |
+| `mysql`                            | MySQL (with native binlog CDC)        | Stable            |                              |
 | `spice.ai`                         | [Spice.ai][spiceai]                   | Stable            | Arrow Flight                 |
 | `dynamodb`                         | Amazon DynamoDB (with Streams)        | Stable            |                              |
+| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Stable            | Parquet                      |
+| `flightsql`                        | FlightSQL                             | Stable            | Arrow Flight SQL             |
+| `glue`                             | [AWS Glue][glue]                      | Stable            | Iceberg, Parquet, CSV        |
+| `mongodb`                          | MongoDB (with change-stream CDC)      | Stable            |                              |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
 | `cosmosdb`                         | Azure Cosmos DB (NoSQL)               | Release Candidate |                              |
 | `git`                              | Git repositories                      | Release Candidate |                              |
 | `snowflake`                        | Snowflake                             | Release Candidate | Arrow                        |
-| `adbc`                             | ADBC                                  | Release Candidate | Arrow                        |
-| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Release Candidate | Parquet                      |
-| `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
+| `oracle`                           | Oracle                                | Release Candidate | [Oracle ODPI-C][ODPIC]       |
 | `ducklake`                         | [DuckLake][ducklake]                  | Beta              | Parquet                      |
-| `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
-| `odbc`                             | ODBC                                  | Beta              | ODBC                         |
+| `odbc`<sup>†</sup>                 | ODBC                                  | Beta              | ODBC                         |
 | `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
 | `sharepoint`                       | Microsoft SharePoint                  | Beta              | Object-store listing         |
-| `oracle`                           | Oracle                                | Alpha             | [Oracle ODPI-C][ODPIC]       |
+| `kafka`                            | Kafka                                 | Beta              | Kafka + JSON                 |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | ClickHouse                            | Alpha             |                              |
-| `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
-| `elasticsearch`                    | Elasticsearch (BM25 + kNN + RRF)      | Alpha             |                              |
+| `debezium`                         | Debezium CDC (Kafka consumer)         | Alpha             | Kafka + JSON                 |
+| `cdc`                              | Debezium push ingest (no Kafka)       | Alpha             | JSON + Avro HTTP             |
+| `elasticsearch`<sup>†</sup>        | Elasticsearch (BM25 + kNN + RRF)      | Alpha             |                              |
 | `gcs`, `gs`                        | [Google Cloud Storage][gcs]           | Alpha             | Parquet, CSV, JSON           |
-| `kafka`                            | Kafka                                 | Alpha             | Kafka + JSON                 |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
-| `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
-| `http`, `https`                    | HTTP(s) (dynamic headers, pagination) | Alpha             | Parquet, CSV, JSON           |
 | `imap`                             | IMAP                                  | Alpha             | IMAP Emails                  |
-| `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
-| `mongodb`                          | MongoDB                               | Alpha             |                              |
-| `scylladb`                         | ScyllaDB                              | Alpha             |                              |
+| `scylladb`<sup>†</sup>             | ScyllaDB                              | Alpha             |                              |
 | `smb`                              | SMB 3.1.1                             | Alpha             | SMB                          |
-| `nfs`                              | NFS                                   | Alpha             | Parquet, CSV, JSON           |
+| `nfs`<sup>†</sup>                  | NFS                                   | Alpha             | Parquet, CSV, JSON           |
+
+<sup>†</sup> Available in Spice.ai Enterprise; not included in the open-source release binaries or Docker images. To use one with the open-source runtime, build `spiced` from source with the connector's feature: `make install-odbc`, `make install-scylladb`, `make install-nfs` (requires the system `libnfs` library), or `make install SPICED_NON_DEFAULT_FEATURES=elasticsearch`.
 
 [databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
 [ducklake]: https://ducklake.select/
@@ -290,10 +288,10 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name       | Description                       | Status            | Engine Modes     |
 | ---------- | --------------------------------- | ----------------- | ---------------- |
-| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Release Candidate | `file`           |
+| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable            | `memory`, `file` |
 | `arrow`    | [In-Memory Arrow Records][arrow]  | Stable            | `memory`         |
 | `duckdb`   | Embedded [DuckDB][duckdb]         | Stable            | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL][postgres]   | Release Candidate | N/A              |
+| `postgres` | Attached [PostgreSQL][postgres] (Spice.ai Enterprise) | Release Candidate | N/A |
 | `sqlite`   | Embedded [SQLite][sqlite]         | Release Candidate | `memory`, `file` |
 
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
@@ -309,11 +307,13 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `openai`      | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
 | `file`        | Local filesystem                             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
 | `huggingface` | Models hosted on HuggingFace                 | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
-| `spice.ai`    | Models hosted on the Spice.ai Cloud Platform |                   | ONNX         | OpenAI-compatible HTTP endpoint |
+| `spice.ai`    | Models hosted on the Spice.ai Cloud Platform, or served by another Spice runtime |                   | -            | OpenAI-compatible HTTP endpoint |
 | `azure`       | Azure OpenAI                                 |                   | -            | OpenAI-compatible HTTP endpoint |
 | `bedrock`     | Amazon Bedrock (Nova models)                 | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 | `anthropic`   | Models hosted on Anthropic                   | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 | `xai`         | Models hosted on xAI                         | Alpha             | -            | OpenAI-compatible HTTP endpoint |
+| `google`      | Google Vertex AI (Gemini)                    |                   | -            | Vertex AI HTTP endpoint         |
+| `databricks`  | Models deployed to Databricks Mosaic AI      |                   | -            | OpenAI-compatible HTTP endpoint |
 
 ## Supported Embeddings Providers
 
@@ -325,6 +325,8 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `model2vec`   | Static embeddings (500x faster)              | Release Candidate | Model2Vec    | -                                      |
 | `azure`       | Azure OpenAI                                 | Alpha             | -            | OpenAI-compatible HTTP endpoint        |
 | `bedrock`     | AWS Bedrock (Titan, Cohere, Nova, Nova 2)    | Alpha             | -            | OpenAI-compatible HTTP endpoint        |
+| `google`      | Google Vertex AI embedding models            |                   | -            | Vertex AI HTTP endpoint                |
+| `databricks`  | Models deployed to Databricks Mosaic AI      |                   | -            | OpenAI-compatible HTTP endpoint        |
 
 ## Supported Vector Engines
 
@@ -334,7 +336,64 @@ Configured as `.vectors.engine` on a column-level embedding.
 | --------------- | -------------------------------------------------------------------- | ------ |
 | `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying     | Alpha  |
 | `duckdb`        | DuckDB with HNSW vector index                                        | Alpha  |
-| `elasticsearch` | Elasticsearch with kNN                                               | Alpha  |
+| `elasticsearch`<sup>†</sup> | Elasticsearch with kNN                                  | Alpha  |
+
+<sup>†</sup> Available in Spice.ai Enterprise; not included in the open-source release binaries. To use it with the open-source runtime, build with `make install SPICED_NON_DEFAULT_FEATURES=elasticsearch`.
+
+## Change Forwarding to Drasi (Alpha)
+
+> **Alpha** — Drasi support is in preview and should not be used in production.
+
+Configured as `.drasi` on a dataset accelerated with `refresh_mode: changes`. Publishes the dataset's change-data-capture stream to a [Drasi](https://drasi.io) source, so Drasi continuous queries react to the same changes Spice applies to the local accelerator. One row becomes one graph node: the primary key derives the element id, the source table name becomes the node label, and the row's columns become node properties.
+
+Forwarding runs before the change is acknowledged to the source, so delivery is at-least-once — a change is replayed rather than lost if Drasi is unreachable.
+
+```yaml
+datasets:
+  - from: postgres:public.orders
+    name: orders
+    acceleration:
+      enabled: true
+      engine: cayenne
+      refresh_mode: changes
+    drasi:
+      source_id: spice-cdc
+      delivery: queued          # or `acknowledged` (default)
+      params:
+        drasi_http_endpoint: http://localhost:9000
+```
+
+| Transport | Description                                                                    | Status |
+| --------- | ------------------------------------------------------------------------------ | ------ |
+| `http`    | Batched POST to a Drasi Server HTTP source                                     | Alpha  |
+| `redis`   | CloudEvents envelopes on the Redis stream a Drasi platform source consumes      | Alpha  |
+
+`delivery` selects when a change counts as handed off, which is the throughput/durability trade:
+
+| `delivery` | Replication | On failure |
+| ---------- | ----------- | ---------- |
+| `acknowledged` (default) | Advances only once Drasi has the change, so nothing is lost — a stall or crash replays it. A slow or unreachable Drasi slows or stops replication. | `on_delivery_error`: `block` (default) retries indefinitely; `skip` gives up after a bounded budget and continues; `fail` stops the stream. |
+| `queued` | Never waits for Drasi — the change is queued locally and the replication position acknowledged immediately, with delivery retried in the background. `on_delivery_error` does not apply. | A failure that could clear is written to a durable dead-letter store under `.spice/data/drasi` and retried until it lands, surviving a restart. One that never clears is counted and discarded, so it cannot block later changes. |
+
+Use `queued` when Drasi is a downstream consumer whose availability should not pace replication; keep `acknowledged` when no change may be missed.
+
+Under `queued`, the replication log is no longer what replays a failure — the dead-letter store is. Because an insert or update is a full-state replace keyed by element id, redelivery must not be overtaken by newer changes for the same row, so the store is stop-the-line: once anything is pending, later changes queue behind it and delivery resumes only once it drains. Drasi's view of a dataset advances in order or not at all. The store is capped (1024 batches per component); past that the oldest is discarded and counted, since the newest state for a row is the state worth keeping.
+
+`forwarding: disabled` keeps a whole block in place without publishing anything, so it can be switched off and back on without reconstructing the endpoint, labels and keys.
+
+Spice's own operational tables can be forwarded the same way, so continuous queries can react to events like a query exceeding its budget or a refresh failing. These are configured under `runtime` because they are not CDC-fed from an external source, and they default to `on_delivery_error: skip` — blocking the runtime's telemetry writer on a downstream outage buys nothing:
+
+```yaml
+runtime:
+  drasi:
+    source_id: spice-runtime
+    params:
+      drasi_http_endpoint: http://localhost:9000
+    tables:
+      - name: task_history
+```
+
+Runtime tables are always queued — they have no replication position to hold, so there is nothing for blocking to protect. Only the tables named are forwarded. A table's element id comes from its declared primary key (`task_history` uses `span_id`); a table that declares none — such as `runtime.metrics` — must name its identifying columns with `key:`, since a synthesized id would publish a duplicate node on every delivery retry.
 
 ## Supported Catalogs
 
@@ -344,10 +403,11 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | --------------- | ----------------------- | ------ | ---------------------------- |
 | `spice.ai`      | Spice.ai Cloud Platform | Stable | Arrow Flight                 |
 | `unity_catalog` | Unity Catalog           | Stable | Delta Lake                   |
+| `glue`          | AWS Glue                | Stable | CSV, Parquet, Iceberg        |
 | `databricks`    | Databricks              | Beta   | Spark Connect, S3/Delta Lake |
 | `iceberg`       | Apache Iceberg          | Beta   | Parquet                      |
 | `ducklake`      | DuckLake                | Beta   | Parquet                      |
-| `glue`          | AWS Glue                | Alpha  | CSV, Parquet, Iceberg        |
+| `pg`            | PostgreSQL (with native WAL CDC catalog acceleration) | Beta | PostgreSQL Wire Protocol |
 
 ## Supported Secret Stores
 
@@ -408,15 +468,16 @@ cd spice_qs
 spice run
 ```
 
-Example output will be shown as follows:
+Example output (abridged):
 
 ```bash
-2025/01/20 11:26:10 INFO Spice.ai runtime starting...
-2025-01-20T19:26:10.679068Z  INFO runtime::init::dataset: No datasets were configured. If this is unexpected, check the Spicepod configuration.
-2025-01-20T19:26:10.679716Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
-2025-01-20T19:26:10.679786Z  INFO runtime::metrics_server: Spice Runtime Metrics listening on 127.0.0.1:9090
-2025-01-20T19:26:10.680140Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:8090
-2025-01-20T19:26:10.879126Z  INFO runtime::init::results_cache: Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s
+ INFO Spice.ai runtime starting...
+2026-09-25T22:41:29.701252Z  INFO spiced: Starting runtime v2.3.2+models
+2026-09-25T22:41:29.712500Z  INFO runtime::init::caching: Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s, hashing algorithm: XXH3, encoding: none
+2026-09-25T22:41:29.823292Z  INFO runtime: No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration.
+2026-09-25T22:41:29.823342Z  INFO runtime: All components are loaded. Spice runtime is ready!
+2026-09-25T22:41:29.917854Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
+2026-09-25T22:41:29.918583Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:8090
 ```
 
 The runtime is now started and ready for queries.
@@ -430,7 +491,7 @@ spice add spiceai/quickstart
 The `spicepod.yaml` file will be updated with the `spiceai/quickstart` dependency.
 
 ```yaml
-version: v1
+version: v2
 kind: Spicepod
 name: spice_qs
 dependencies:
@@ -440,9 +501,9 @@ dependencies:
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
-2025-01-20T19:26:30.011633Z  INFO runtime::init::dataset: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (arrow), results cache enabled.
-2025-01-20T19:26:30.013002Z  INFO runtime::accelerated_table::refresh_task: Loading data for dataset taxi_trips
-2025-01-20T19:26:40.312839Z  INFO runtime::accelerated_table::refresh_task: Loaded 2,964,624 rows (399.41 MiB) for dataset taxi_trips in 10s 299ms
+2026-09-25T22:41:46.090331Z  INFO runtime::init::dataset: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (arrow), results cache enabled. duration_ms=0
+2026-09-25T22:41:46.091619Z  INFO runtime_table::accelerated::refresh_task: Loading data for dataset taxi_trips
+2026-09-25T22:41:57.252645Z  INFO runtime_table::accelerated::refresh_task: Loaded 2,964,624 rows (399.38 MiB) for dataset taxi_trips in 11s 161ms.
 ```
 
 **Step 4.** Start the Spice SQL REPL:
@@ -454,9 +515,13 @@ spice sql
 The SQL REPL interface will be shown:
 
 ```bash
-Welcome to the Spice.ai SQL REPL! Type 'help' for help.
+Welcome to the Spice.ai SQL REPL! Type `help` or `?` for commands.
 
-show tables; -- list available tables
+Examples:
+  show tables;              -- list available tables
+  describe <table_name>;    -- show column types
+  nql <question>            -- natural language to SQL (requires a model)
+
 sql>
 ```
 
@@ -464,15 +529,15 @@ Enter `show tables;` to display the available tables for query:
 
 ```bash
 sql> show tables;
-+---------------+--------------+---------------+------------+
-| table_catalog | table_schema | table_name    | table_type |
-+---------------+--------------+---------------+------------+
-| spice         | public       | taxi_trips    | BASE TABLE |
-| spice         | runtime      | query_history | BASE TABLE |
-| spice         | runtime      | metrics       | BASE TABLE |
-+---------------+--------------+---------------+------------+
++---------------+--------------+--------------+------------+
+| table_catalog | table_schema |  table_name  | table_type |
+|    varchar    |    varchar   |    varchar   |   varchar  |
++---------------+--------------+--------------+------------+
+| spice         | public       | taxi_trips   | BASE TABLE |
+| spice         | runtime      | task_history | BASE TABLE |
++---------------+--------------+--------------+------------+
 
-Time: 0.022671708 seconds. 3 rows.
+Time: 0.001421875 seconds. 2 rows.
 ```
 
 Enter a query to display the longest taxi trips:
@@ -486,6 +551,7 @@ Output:
 ```bash
 +---------------+--------------+
 | trip_distance | total_amount |
+|    float64    |    float64   |
 +---------------+--------------+
 | 312722.3      | 22.15        |
 | 97793.92      | 36.31        |
@@ -499,7 +565,7 @@ Output:
 | 44018.64      | 52.43        |
 +---------------+--------------+
 
-Time: 0.045150667 seconds. 10 rows.
+Time: 0.00242825 seconds. 10 rows.
 ```
 
 ## ⚙️ Container & Cluster Deployment
@@ -527,7 +593,7 @@ Spice is available in the [AWS Marketplace](https://aws.amazon.com/marketplace/p
 
 ### Distributed cluster (Apache Ballista)
 
-Run Spice as a multi-node cluster: start scheduler nodes with `--role scheduler` and start executor nodes with `--scheduler-address <scheduler-url>` to join them. Multi-active schedulers coordinate through your object store (configured via `runtime.scheduler.state_location`) — no etcd, ZooKeeper, or Redis. mTLS certificates are managed via the Spice CLI. See the [Ballista architecture deep dive](https://spice.ai/blog/apache-ballista-at-spice-ai) and the [distributed query docs](https://spiceai.org/docs/features/query-federation).
+Run Spice as a multi-node cluster: start scheduler nodes with `--role scheduler` and start executor nodes with `--scheduler-address <scheduler-url>` to join them. Multi-active schedulers coordinate through your object store (configured via `runtime.scheduler.state_location`) — no etcd, ZooKeeper, or Redis. mTLS certificates are managed via the Spice CLI. See the [Ballista architecture deep dive](https://spice.ai/blog/apache-ballista-at-spice-ai) and the [distributed query docs](https://spiceai.org/docs/features/distributed-query).
 
 ## 🏎️ Next Steps
 
@@ -549,7 +615,7 @@ npx skills add spiceai/skills
 
 ### Explore the Spice.ai Cookbook
 
-86+ recipes and end-to-end examples — federation, acceleration, search, RAG, agents, CDC, and more — at [github.com/spiceai/cookbook](https://github.com/spiceai/cookbook#readme).
+100+ recipes and end-to-end examples — federation, acceleration, search, RAG, agents, CDC, and more — at [github.com/spiceai/cookbook](https://github.com/spiceai/cookbook#readme).
 
 ### Use the Spice.ai Cloud Platform (optional)
 
@@ -557,8 +623,8 @@ Access ready-to-use Spicepods and datasets hosted on the Spice.ai Cloud Platform
 
 To use public datasets, create a free account on Spice.ai:
 
-1. Visit [spice.ai](https://spice.ai/) and click **Try for Free**.
-2. After creating an account, create an app to generate an API key.
+1. Visit [spice.ai](https://spice.ai/) and click **Start for free**.
+2. After creating an account, create a project to generate an API key.
 
 Once set up, you can access ready-to-use Spicepods including datasets. For this demonstration, use the `taxi_trips` dataset from the [Spice.ai Quickstart](https://spice.ai/spiceai/quickstart).
 
@@ -593,7 +659,8 @@ spice dataset configure
 dataset name: (spice_app) taxi_trips
 description: Taxi trips dataset
 from: spice.ai/spiceai/quickstart/datasets/taxi_trips
-Locally accelerate (y/n)? y
+locally accelerate (y/n)?: (y) y
+Saved datasets/taxi_trips/dataset.yaml
 ```
 
 **Step 5.** Query from the SQL REPL:
@@ -614,13 +681,15 @@ Comprehensive documentation at [spiceai.org/docs](https://spiceai.org/docs/).
 
 Spice.ai is designed to be extensible. See [EXTENSIBILITY.md](./docs/EXTENSIBILITY.md) to build custom [Data Connectors](https://spiceai.org/docs/components/data-connectors), [Data Accelerators](https://spiceai.org/docs/components/data-accelerators), [Catalog Connectors](https://spiceai.org/docs/components/catalogs), [Secret Stores](https://spiceai.org/docs/components/secret-stores), [Models](https://spiceai.org/docs/components/models), or [Embeddings](https://spiceai.org/docs/components/embeddings).
 
-### 🔨 Roadmap
+### 🔨 Releases & Roadmap
 
-🚀 See the [Roadmap](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md). Highlights:
+🚀 See the full [Roadmap](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md). Recent releases and what's next:
 
-- **[v2.0](https://github.com/spiceai/spiceai/milestone/58) (June 2026)** — Cayenne GA, multi-active HA GA, distributed query GA, mTLS, Cedar policy engine (Beta)
-- **[v2.1](https://github.com/spiceai/spiceai/milestone/95) (July 2026)** — Distributed search, schema registry, schema evolution
-- **[v2.2](https://github.com/spiceai/spiceai/milestone/99) (September 2026)** — Webhooks, reactive event-driven actions (Drasi-based)
+- **[v2.0](https://spiceai.org/releases/v2.0-stable)** (shipped, June 2026) — Spice Cayenne GA, multi-active HA distributed query GA, native CDC (PostgreSQL WAL, MongoDB change streams, Debezium), DML/DDL write-back, mTLS + OIDC, HashiCorp Vault & Azure Key Vault, and SQL/HTTP UDFs. [Read the launch →](https://spice.ai/blog/spice-2-0-is-now-available)
+- **[v2.1](https://spiceai.org/releases/v2.1.0)** (shipped, July 2026) — High-throughput Cayenne CDC (in-memory tier + dedicated compaction runtime), PostgreSQL replication at scale (shared replication slot), distributed Iceberg scans and broadcast joins, DataFusion v54, tensor-parallel GLM inference (Spice.ai Enterprise), and adaptive self-tuning (experimental).
+- **[v2.2](https://spiceai.org/releases/v2.2.0)** (shipped, August 2026) — Cloud Connect for BYOC runtimes, MySQL binlog CDC, PostgreSQL Catalog CDC, warm in-memory search indexes, Cayenne serializable transactions with durable write-back, and reactive event-driven actions (Drasi, alpha).
+- **[v2.3](https://spiceai.org/releases/v2.3.0)** (shipped, September 2026) — Cayenne secondary indexes for point lookups, multi-column clustering across storage tiers, key-range full refreshes, CTE materialization, and DML on `mode: memory` tables; results-cache hits answered before query planning, with stale-while-revalidate kept across acceleration refreshes; size- and count-bounded caching accelerators; BigQuery federation; Google models on Vertex AI; and MCP specification `2026-07-28`.
+- **[v2.4](https://github.com/spiceai/spiceai/milestone/101)** (upcoming, targeting October 2026) — Schema Registry (initial), full UPDATE/DELETE DML on write-through accelerated tables, distributed search (alpha), distributed Cayenne catalog, audit logging, resource quotas, and DataFusion v56.
 
 ### 🤝 Connect with us
 

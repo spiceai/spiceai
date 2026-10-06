@@ -42,7 +42,6 @@ on:
           - 'odbc-databricks'
           - 'duckdb'
           - 'duckdb-zero-results'
-          - 'duckdb-partitioned'
           - 'snowflake'
           - 'spark'
           - 'iceberg-sf1'
@@ -54,6 +53,16 @@ on:
           - 'postgres-catalog'
           - 'mysql-catalog'
           - 'mssql-catalog'
+          - 'arrow'
+          - 'bigquery'
+          - 'dynamodb'
+          - 'scylladb'
+          - 'turso'
+      scale_factor:
+        description: 'Scale factor for the data and queries'
+        required: false
+        type: string
+        default: '1'
       runner_type:
         description: 'Runner type'
         required: true
@@ -88,17 +97,40 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set spicepod path
         id: set_spicepod_path
+        env:
+          QUERY_SET: ${{ github.event.inputs.query_set }}
+          SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+          SPICEPOD_FILE: ${{ github.event.inputs.spicepod_path }}
         run: |
-          query_set="${{ github.event.inputs.query_set }}"
+          if [[ ! "$SCALE_FACTOR" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ -z "${SCALE_FACTOR//[0.]/}" ]]; then
+            echo "Error: scale_factor must be a positive number"
+            exit 1
+          fi
+          query_set="$QUERY_SET"
           query_set="${query_set%%\[*\]*}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/${{ github.event.inputs.spicepod_path }}"
-          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+          scale_factor="$SCALE_FACTOR"
+          while [[ "$scale_factor" == 0[0-9]* ]]; do
+            scale_factor="${scale_factor#0}"
+          done
+          if [[ "$scale_factor" == *.* ]]; then
+            while [[ "$scale_factor" == *0 ]]; do
+              scale_factor="${scale_factor%0}"
+            done
+            scale_factor="${scale_factor%.}"
+          fi
+          fixture_scale="${scale_factor//./_}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${fixture_scale}/${SPICEPOD_FILE}"
+          {
+            echo "SPICEPOD_PATH=${SPICEPOD_PATH}"
+            echo "query_set=${query_set}"
+            echo "fixture_scale=${fixture_scale}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Validate spicepod file exists
         run: |
@@ -142,13 +174,15 @@ jobs:
         uses: ./.github/actions/setup-testoperator-data
         with:
           query_set: ${{ github.event.inputs.query_set }}
+          scale_factor: ${{ github.event.inputs.scale_factor }}
 
       - name: Setup MySQL
+        env:
+          QUERY_SET: ${{ steps.set_spicepod_path.outputs.query_set }}
+          FIXTURE_SCALE: ${{ steps.set_spicepod_path.outputs.fixture_scale }}
         run: |
-          if [[ ${{ github.event.inputs.query_set }} == "tpcds" ]]; then
-            echo "MYSQL_DB=tpcds_sf1" >> $GITHUB_ENV
-          elif [[ ${{ github.event.inputs.query_set }} == "tpch" ]]; then
-            echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
+          if [[ "$QUERY_SET" == "tpcds" || "$QUERY_SET" == "tpch" ]]; then
+            echo "MYSQL_DB=${QUERY_SET}_sf${FIXTURE_SCALE}" >> "$GITHUB_ENV"
           fi
 
       - name: Install OpenMP runtime library
@@ -156,59 +190,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgomp1
 
-      - name: Run the load test - ${{ github.event.inputs.spicepod_path }}
-        if: ${{ github.event.inputs.query_overrides == '' }}
-        run: |
-          rm -rf .spice/data
-          testoperator run load \
-            -s /usr/local/bin/spiced \
-            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
-            -d /opt/spiced/data \
-            --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait 900 \
-            --disable-progress-bars \
-            --duration ${{ github.event.inputs.duration }} \
-            --concurrency ${{ github.event.inputs.concurrency }} \
-            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
-            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
-            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
-            --metrics
-        env:
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
-          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
-          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
-          DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
-          MYSQL_HOST: ${{ vars.TEST_MYSQL_HOST }}
-          MYSQL_TCP_PORT: 3306
-          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
-          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
-          POSTGRES_HOST: ${{ vars.POSTGRES_HOST }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
-          SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
-          SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
-          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
-          SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
-          SQL_WAREHOUSE_DATABRICKS_HOST: ${{ vars.SQL_WAREHOUSE_DATABRICKS_HOST }}
-          SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ vars.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
-          MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
-          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+      - name: Install ADBC BigQuery Driver
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/setup-adbc-bigquery
 
-      - name: Run the load test (with overrides) - ${{ github.event.inputs.spicepod_path }}
-        if: ${{ github.event.inputs.query_overrides != '' }}
+      - name: Run the load test - ${{ github.event.inputs.spicepod_path }}
         run: |
           rm -rf .spice/data
           testoperator run load \
@@ -216,21 +202,24 @@ jobs:
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
+            --scale-factor "$TEST_SCALE_FACTOR" \
             --ready-wait 900 \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --query-overrides ${{ github.event.inputs.query_overrides }} \
+            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
             ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
             ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
             --metrics
         env:
+          TEST_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
           DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
           DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}

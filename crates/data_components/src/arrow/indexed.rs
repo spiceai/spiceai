@@ -620,34 +620,26 @@ impl TableProvider for IndexedMemTable {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         let owned_filters: Vec<Expr> = filters.iter().map(|&e| e.clone()).collect();
 
-        // If we have a primary key index and the filter includes a PK equality,
-        // mark only the PK filter as Exact. Non-PK filters must be Inexact so
-        // DataFusion still applies them after the indexed lookup. Returning Exact
-        // for all filters would silently drop non-PK predicates (e.g.
-        // `WHERE id=10 AND version=101` would ignore `version=101` and return
-        // the row for id=10 regardless of its version).
+        // A primary-key equality lets `scan` serve the query from the hash index,
+        // but the pushdown is reported `Inexact` — never `Exact`.
+        //
+        // `Exact` is a promise that the scan applied the predicate, and this
+        // provider cannot keep it. Whether the index is usable is decided from the
+        // `dirty` flag, which is read here during logical optimization and read
+        // AGAIN in `scan` during physical planning. A write landing between those
+        // two reads (DML, retention eviction, or a refresh sink — all call
+        // `mark_dirty`) makes `scan` bypass the index and fall through to an
+        // unfiltered `MemTable` scan while the predicate has already been deleted
+        // from the plan, so the point lookup returns the whole table (#12070).
+        //
+        // `Inexact` still hands the filter to `scan`, so the `IndexedLookupExec`
+        // fast path is unchanged; DataFusion additionally keeps a `FilterExec`,
+        // which over a point-lookup result costs nothing and makes every path
+        // through `scan` correct — index hit, index miss, hash-collision miss, and
+        // the full-scan fallback alike. It also keeps non-PK predicates applied
+        // (`WHERE id=10 AND version=101` must not ignore `version=101`).
         if self.index.is_some() && self.extract_pk_equality_value(&owned_filters).is_some() {
-            // When the index is dirty (a DML/retention/synchronized write happened
-            // without a subsequent rebuild), it can no longer be trusted: report the
-            // PK filter as Inexact instead of Exact so DataFusion keeps a FilterExec
-            // and re-applies the predicate over the full-scan fallback in `scan`,
-            // rather than dropping the filter and trusting a stale index (#11262).
-            let pk_dirty = self.is_dirty();
-            let pk_column = &self.primary_key_columns[0];
-            return Ok(filters
-                .iter()
-                .map(|f| {
-                    if Self::extract_equality_value(f, pk_column).is_some() {
-                        if pk_dirty {
-                            TableProviderFilterPushDown::Inexact
-                        } else {
-                            TableProviderFilterPushDown::Exact
-                        }
-                    } else {
-                        TableProviderFilterPushDown::Inexact
-                    }
-                })
-                .collect());
+            return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
         }
 
         // Check if a secondary index can handle this filter
@@ -905,6 +897,20 @@ impl TableProvider for IndexedMemTable {
         self.mark_dirty();
         self.inner.truncate(state).await
     }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: datafusion::prelude::Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.mark_dirty();
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
+    }
 }
 
 #[async_trait]
@@ -1023,6 +1029,17 @@ impl ExecutionPlan for IndexedLookupExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -1071,6 +1088,35 @@ impl ExecutionPlan for IndexedLookupExec {
     fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
         Some(self.metrics.clone_inner())
     }
+
+    /// An exact row count: a primary-key probe returns the one row it matched or
+    /// nothing at all, and `output_rows` is set from that outcome at
+    /// construction, so `Precision::Exact` is provable here rather than an
+    /// estimate.
+    ///
+    /// It has to be reported for the optimizer to act on it. `EnforceDistribution`
+    /// decides whether round-robin repartitioning is worthwhile from
+    /// `partition_statistics().num_rows`, and reads `Precision::Absent` as
+    /// "worthwhile" — so a plan that does not answer fans a single-row scan
+    /// across every partition, paying task spawns at execution and extra
+    /// planning time in each pass that walks the larger tree.
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<Arc<datafusion::common::Statistics>> {
+        if let Some(idx) = partition {
+            let partition_count = self.properties().partitioning.partition_count();
+            if idx >= partition_count {
+                return Err(DataFusionError::Internal(format!(
+                    "Invalid partition index {idx}, the partition count is {partition_count}"
+                )));
+            }
+        }
+
+        let mut statistics = datafusion::common::Statistics::new_unknown(&self.schema);
+        statistics.num_rows = datafusion::common::stats::Precision::Exact(self.output_rows);
+        Ok(Arc::new(statistics))
+    }
 }
 
 #[cfg(test)]
@@ -1078,6 +1124,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
     use datafusion::prelude::*;
 
     fn create_test_batch(ids: Vec<i64>, names: Vec<&str>) -> RecordBatch {
@@ -1296,12 +1343,14 @@ mod tests {
         )
         .expect("failed to create table");
 
-        // Equality on primary key should get Exact pushdown
+        // Equality on primary key gets Inexact pushdown: the index serves the
+        // lookup, but `scan` may bypass it, so DataFusion must re-apply the
+        // predicate (#12070).
         let filter_eq = col("id").eq(lit(1_i64));
         let pushdown = table
             .supports_filters_pushdown(&[&filter_eq])
             .expect("pushdown check failed");
-        assert_eq!(pushdown, vec![TableProviderFilterPushDown::Exact]);
+        assert_eq!(pushdown, vec![TableProviderFilterPushDown::Inexact]);
 
         // Non-equality should get Unsupported (MemTable doesn't support filter pushdown)
         let filter_gt = col("id").gt(lit(1_i64));
@@ -1733,6 +1782,74 @@ mod tests {
     }
 
     /// Helper to get the physical plan as a string for EXPLAIN output.
+    /// A `SessionContext` with `target_partitions` pinned, for EXPLAIN snapshot
+    /// tests. The default is the host's core count, which `RepartitionExec`
+    /// prints into the plan (`RoundRobinBatch(N)`) — a snapshot recorded that way
+    /// only matches machines with the same core count.
+    fn snapshot_session_context() -> SessionContext {
+        SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_target_partitions(4),
+        )
+    }
+
+    /// A primary-key probe knows its own cardinality, and the optimizer relies
+    /// on it: see `partition_statistics` on `IndexedLookupExec`.
+    #[tokio::test]
+    async fn test_indexed_lookup_reports_exact_row_count() {
+        let batch = create_large_test_batch(300);
+        let table = create_test_indexed_table_force_index(
+            batch.schema(),
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
+
+        for (id, expected) in [(7_i64, 1_usize), (30_000_i64, 0_usize)] {
+            let filter = col("id").eq(lit(id));
+            let plan = table
+                .scan(&session_state, None, std::slice::from_ref(&filter), None)
+                .await
+                .expect("scan");
+            let stats = StatisticsContext::new()
+                .compute(plan.as_ref(), &StatisticsArgs::new())
+                .expect("statistics");
+            assert_eq!(
+                stats.num_rows,
+                datafusion::common::stats::Precision::Exact(expected),
+                "id = {id} should report exactly {expected} row(s)"
+            );
+        }
+    }
+
+    /// The reason the row count above is worth reporting: without it
+    /// `EnforceDistribution` repartitions a single-row scan across every
+    /// partition.
+    #[tokio::test]
+    async fn test_point_lookup_plan_has_no_repartition() {
+        let batch = create_large_test_batch(300);
+        let table = create_test_indexed_table_force_index(
+            batch.schema(),
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
+        ctx.register_table("test_table", Arc::new(table))
+            .expect("failed to register");
+
+        let plan = explain_plan(&ctx, "SELECT * FROM test_table WHERE id = 7").await;
+        assert!(
+            plan.contains("IndexedLookupExec"),
+            "expected the primary-key probe to survive planning. Got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("RepartitionExec"),
+            "a single-row probe should not be repartitioned across partitions. Got:\n{plan}"
+        );
+    }
+
     async fn explain_plan(ctx: &SessionContext, sql: &str) -> String {
         let df = ctx.sql(sql).await.expect("failed to create dataframe");
         let plan = df
@@ -1757,7 +1874,7 @@ mod tests {
         )
         .expect("failed to create table");
 
-        let ctx = SessionContext::new();
+        let ctx = snapshot_session_context();
         ctx.register_table("test_table", Arc::new(table))
             .expect("failed to register table");
 
@@ -1861,7 +1978,7 @@ mod tests {
         )
         .expect("failed to create non-indexed table");
 
-        let ctx = SessionContext::new();
+        let ctx = snapshot_session_context();
         ctx.register_table("indexed_table", Arc::new(indexed_table))
             .expect("failed to register table");
         ctx.register_table("non_indexed_table", Arc::new(non_indexed_table))
@@ -2739,14 +2856,14 @@ mod tests {
 
         let table_with_secondary = table.with_secondary_index(secondary);
 
-        // PK query should return Exact
+        // PK query should return Inexact (#12070)
         let pk_filter = datafusion::prelude::col("id").eq(datafusion::prelude::lit(1_i64));
         let result = table_with_secondary
             .supports_filters_pushdown(&[&pk_filter])
             .expect("pushdown check");
         assert_eq!(
             result,
-            vec![datafusion::logical_expr::TableProviderFilterPushDown::Exact]
+            vec![datafusion::logical_expr::TableProviderFilterPushDown::Inexact]
         );
 
         // Secondary index query should return Inexact (for unique secondary indexes)
@@ -3353,8 +3470,9 @@ mod tests {
         assert_eq!(name_col.value(0), "name_42");
     }
 
-    /// Test that `supports_filters_pushdown` returns per-filter pushdown types
-    /// when a PK equality is combined with other predicates.
+    /// Test that `supports_filters_pushdown` reports every filter `Inexact` when a
+    /// PK equality is combined with other predicates, so `DataFusion` re-applies
+    /// both the PK and the non-PK predicate over whatever `scan` returns.
     #[test]
     fn test_filter_pushdown_pk_and_non_pk_filters() {
         let batch = create_large_test_batch(300);
@@ -3377,10 +3495,12 @@ mod tests {
         assert_eq!(
             pushdown,
             vec![
-                TableProviderFilterPushDown::Exact,   // PK filter handled by index
+                // The index serves the lookup, but `scan` may still bypass it, so
+                // the PK predicate must be re-applied too (#12070).
+                TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Inexact, // non-PK filter must still be applied
             ],
-            "PK filter should be Exact, non-PK filter should be Inexact"
+            "both filters should be Inexact so DataFusion re-applies them"
         );
     }
 
@@ -3388,11 +3508,16 @@ mod tests {
     // Stale-index ("dirty") correctness tests (issue #11262)
     // =========================================================================
 
-    /// A dirty index must downgrade PK equality pushdown from Exact to Inexact so
-    /// `DataFusion` keeps a `FilterExec` and re-applies the predicate, instead of
-    /// trusting a stale index that could silently drop existing rows.
+    /// PK equality pushdown is `Inexact` whether or not the index is dirty, so
+    /// `DataFusion` always keeps a `FilterExec` and re-applies the predicate
+    /// instead of trusting a scan that may bypass the index.
+    ///
+    /// Regression test for #12070: reporting `Exact` while clean was unsound,
+    /// because `scan` re-reads the dirty flag during physical planning and a write
+    /// landing in between makes it serve an unfiltered full scan for a predicate
+    /// `DataFusion` has already deleted from the plan.
     #[test]
-    fn test_dirty_index_downgrades_pushdown_to_inexact() {
+    fn test_pk_pushdown_is_always_inexact() {
         let batch = create_large_test_batch(300);
         let schema = batch.schema();
         let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
@@ -3400,12 +3525,13 @@ mod tests {
 
         let pk_filter = col("id").eq(lit(42_i64));
 
-        // Clean index: Exact.
+        // Clean index: still Inexact — `Exact` is a promise `scan` cannot keep.
         assert_eq!(
             table
                 .supports_filters_pushdown(&[&pk_filter])
                 .expect("pushdown check failed"),
-            vec![TableProviderFilterPushDown::Exact]
+            vec![TableProviderFilterPushDown::Inexact],
+            "a clean index must not report Exact (#12070)"
         );
 
         // After a DML marks the table dirty: Inexact.
@@ -3418,6 +3544,66 @@ mod tests {
             vec![TableProviderFilterPushDown::Inexact],
             "dirty index must report Inexact so the predicate is re-applied"
         );
+    }
+
+    /// A write that lands between logical optimization and physical planning must
+    /// not change the answer. Regression test for #12070: while PK equality was
+    /// reported `Exact`, `DataFusion` deleted the predicate during logical
+    /// optimization, then `scan` saw the now-dirty index, bypassed it, and served
+    /// an unfiltered `MemTable` scan — so the point lookup returned every row.
+    ///
+    /// The two planning stages are driven explicitly, with the write interleaved at
+    /// exactly the boundary the race straddles.
+    #[tokio::test]
+    async fn test_write_between_pushdown_and_scan_keeps_point_lookup_correct() {
+        let batch = create_test_batch(vec![1, 2, 3], vec!["alice", "bob", "charlie"]);
+        let schema = batch.schema();
+        let table = Arc::new(
+            create_test_indexed_table_force_index(
+                Arc::clone(&schema),
+                vec![vec![batch]],
+                vec!["id".to_string()],
+            )
+            .expect("failed to create table"),
+        );
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::clone(&table) as Arc<dyn TableProvider>)
+            .expect("failed to register");
+
+        // Stage 1 — logical optimization decides the pushdown (index is clean).
+        let optimized = ctx
+            .sql("SELECT id, name FROM test WHERE id = 1")
+            .await
+            .expect("failed to plan query")
+            .into_optimized_plan()
+            .expect("failed to optimize plan");
+
+        // A concurrent DML / retention eviction / refresh sink marks the index dirty.
+        table.mark_dirty();
+
+        // Stage 2 — physical planning now sees the dirty index and falls back to a
+        // full scan. The predicate must survive in the plan for that to be correct.
+        let physical = ctx
+            .state()
+            .create_physical_plan(&optimized)
+            .await
+            .expect("failed to create physical plan");
+        let batches = datafusion::physical_plan::collect(physical, ctx.task_ctx())
+            .await
+            .expect("failed to collect");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 1,
+            "point lookup must return 1 row, not the whole table (#12070)"
+        );
+        let id_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("expected int64");
+        assert_eq!(id_col.value(0), 1);
     }
 
     /// A dirty index must not be used in `scan` — the plan must NOT contain an
@@ -3521,8 +3707,8 @@ mod tests {
             table
                 .supports_filters_pushdown(&[&pk_filter])
                 .expect("pushdown check failed"),
-            vec![TableProviderFilterPushDown::Exact],
-            "clean index must restore Exact pushdown"
+            vec![TableProviderFilterPushDown::Inexact],
+            "pushdown stays Inexact even once the index is clean (#12070)"
         );
         assert_eq!(find_5000().await, 1, "row still found after maintenance");
     }

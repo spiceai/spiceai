@@ -14,23 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// odbcpool/odbcconn are exported (as they were in db_connection_pool) so clippy's
+// avoid-breaking-exported-api treats their public API items as exported; the
+// missing_errors_doc relaxation mirrors data_components/connector-git for moved code.
+#![allow(clippy::missing_errors_doc)]
+
+pub mod odbc;
+pub mod odbcconn;
+pub mod odbcpool;
+
+use crate::odbc::ODBCTableFactory;
+use crate::odbcconn::ODBCDbConnectionPool;
+use crate::odbcpool::ODBCPool;
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::odbc::ODBCTableFactory;
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    NewDataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{
     CustomDialect, CustomDialectBuilder, DateFieldExtractStyle, DefaultDialect, Dialect,
     IntervalStyle, MySqlDialect, PostgreSqlDialect, SqliteDialect,
 };
-use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
-use db_connection_pool::odbcpool::ODBCPool;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
-    NewDataConnectorResult,
-};
-use runtime::datafusion::udf::deny_spice_specific_functions;
-use runtime::parameters::{ParameterSpec, Parameters};
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
+use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::function_support::expression_support_for_engine;
+use runtime_parameters::{ParameterSpec, Parameters};
+use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -42,9 +54,7 @@ pub enum Error {
     #[snafu(display(
         "Failed to setup the ODBC connection pool. Verify the ODBC connection details are valid, and try again. {source}"
     ))]
-    UnableToCreateODBCConnectionPool {
-        source: db_connection_pool::odbcpool::Error,
-    },
+    UnableToCreateODBCConnectionPool { source: crate::odbcpool::Error },
     #[snafu(display(
         "Missing required parameter: {param}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
@@ -127,6 +137,35 @@ impl From<&str> for ODBCProfile {
                 ODBCProfile::Unknown
             }
         }
+    }
+}
+
+impl ODBCProfile {
+    /// The engine behind the profile, by the name
+    /// [`expression_support_for_engine`] keys on; `None` where the profile
+    /// names no engine Spice has a per-expression gate for.
+    fn engine(&self) -> Option<&'static str> {
+        match self {
+            ODBCProfile::MySql => Some("mysql"),
+            ODBCProfile::PostgreSql => Some("postgresql"),
+            ODBCProfile::Sqlite => Some("sqlite"),
+            ODBCProfile::Athena => Some("athena"),
+            ODBCProfile::Databricks | ODBCProfile::Unknown => None,
+        }
+    }
+}
+
+/// The federation function-support policy for an ODBC connection to `engine`:
+/// the Spice function deny-list, so Spice-only UDFs are evaluated locally
+/// instead of pushed into SQL the driver rejects (#10703), plus the engine's
+/// per-expression gate where one exists, so a cast the engine evaluates
+/// differently from `DataFusion` stays local on this route as on the engine's
+/// own connector (issue #14482).
+fn function_support_for_engine(engine: Option<&str>) -> FunctionSupport {
+    let support = deny_spice_specific_functions().as_ref().clone();
+    match engine.and_then(expression_support_for_engine) {
+        Some(gate) => support.with_expression_support(gate),
+        None => support,
     }
 }
 
@@ -226,51 +265,55 @@ impl DataConnectorFactory for ODBCFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             parameter_is_integer(&params.parameters, "max_binary_size")?;
             parameter_is_integer(&params.parameters, "max_text_size")?;
             parameter_is_integer(&params.parameters, "max_bytes_per_batch")?;
             parameter_is_integer(&params.parameters, "max_num_rows_per_batch")?;
 
-            let dialect =
-                if let Some(sql_dialect) = params.parameters.get("sql_dialect").expose().ok() {
-                    let sql_dialect = SQLDialectParam::new(sql_dialect);
-                    sql_dialect.try_into()
-                } else {
-                    let driver = params
-                        .parameters
-                        .get("connection_string")
-                        .expose()
-                        .ok_or_else(|p| MissingParameterSnafu { param: p.0 }.build())?
-                        .to_lowercase();
+            let (dialect, engine): (
+                Result<Option<Arc<dyn Dialect + Send + Sync>>>,
+                Option<String>,
+            ) = if let Some(sql_dialect) = params.parameters.get("sql_dialect").expose().ok() {
+                let engine = sql_dialect.to_string();
+                let sql_dialect = SQLDialectParam::new(sql_dialect);
+                (sql_dialect.try_into(), Some(engine))
+            } else {
+                let driver = params
+                    .parameters
+                    .get("connection_string")
+                    .expose()
+                    .ok_or_else(|p| MissingParameterSnafu { param: p.0 }.build())?
+                    .to_lowercase();
 
-                    let driver = driver
-                        .split(';')
-                        .find(|s| s.starts_with("driver="))
-                        .context(NoDriverSpecifiedSnafu)?;
+                let driver = driver
+                    .split(';')
+                    .find(|s| s.starts_with("driver="))
+                    .context(NoDriverSpecifiedSnafu)?;
 
-                    // explicitly check if the user has tried to specify a file path
-                    if driver_is_file(driver) {
-                        return Err(Error::DirectDriverNotPermitted {}.into());
-                    }
+                // explicitly check if the user has tried to specify a file path
+                if driver_is_file(driver) {
+                    return Err(Error::DirectDriverNotPermitted {}.into());
+                }
 
-                    Ok(ODBCProfile::from(driver).into())
-                }?;
+                let profile = ODBCProfile::from(driver);
+                let engine = profile.engine().map(str::to_string);
+                (Ok(profile.into()), engine)
+            };
+            let dialect = dialect?;
 
             let pool: Arc<ODBCDbConnectionPool> = Arc::new(
                 ODBCPool::new(params.parameters.to_secret_map())
                     .context(UnableToCreateODBCConnectionPoolSnafu)?,
             );
 
-            // Install the Spice function deny-list so Spice-only UDFs
-            // (json_get_str, etc.) are evaluated locally instead of pushed into
-            // the SQL sent through ODBC, which would reject them (#10703).
             let odbc_factory = ODBCTableFactory::new(pool, dialect)
-                .with_function_support(deny_spice_specific_functions().as_ref().clone());
+                .with_function_support(function_support_for_engine(engine.as_deref()));
 
             Ok(Arc::new(ODBC { odbc_factory }) as Arc<dyn DataConnector>)
         })
@@ -305,13 +348,14 @@ where
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.odbc_factory, dataset.path().into())
                 .await
                 .map_err(|source| {
-                    runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                    data_connector_api::DataConnectorError::UnableToGetReadProvider {
                         dataconnector: "odbc".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         source,
@@ -348,6 +392,57 @@ mod test {
         Ok(())
     }
 
+    /// Regression test for #14482 on the ODBC route: the MySQL, PostgreSQL and
+    /// Athena profiles reach engines that round a fractional-to-integer cast
+    /// `DataFusion` truncates, so their policy must keep the cast local, where
+    /// the SQLite profile, which truncates too, and a profile with no engine
+    /// keep the plain policy and the pushdown.
+    #[test]
+    fn a_fractional_to_integer_cast_stays_local_on_the_odbc_profiles_that_round() {
+        use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+        use datafusion::prelude::lit;
+        use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
+
+        fn plan_projecting(expr: datafusion::prelude::Expr) -> LogicalPlan {
+            LogicalPlanBuilder::values(vec![vec![lit(1_i64)]])
+                .expect("values")
+                .project(vec![expr])
+                .expect("project")
+                .build()
+                .expect("build plan")
+        }
+        let rounding = cast(lit(1.5_f64), DataType::Int64);
+        for profile in [
+            ODBCProfile::MySql,
+            ODBCProfile::PostgreSql,
+            ODBCProfile::Athena,
+        ] {
+            let support = function_support_for_engine(profile.engine());
+            assert!(
+                contains_unsupported_functions(&plan_projecting(rounding.clone()), &support)
+                    .expect("the support check must not error"),
+                "the {profile:?} profile rounds {rounding}, so its policy must keep it local"
+            );
+        }
+        for profile in [
+            ODBCProfile::Sqlite,
+            ODBCProfile::Databricks,
+            ODBCProfile::Unknown,
+        ] {
+            let support = function_support_for_engine(profile.engine());
+            assert!(
+                !contains_unsupported_functions(&plan_projecting(rounding.clone()), &support)
+                    .expect("the support check must not error"),
+                "the {profile:?} profile evaluates {rounding} as DataFusion does, so the pushdown is kept"
+            );
+        }
+        assert_eq!(
+            SQLDialectParam::new("postgresql").0,
+            "postgresql",
+            "the sql_dialect parameter is the engine name the gate keys on"
+        );
+    }
+
     #[test]
     fn test_odbc_driver_is_file() {
         std::fs::File::create("something.so").expect("file should be created");
@@ -365,3 +460,13 @@ mod test {
         std::fs::remove_file("noextfile").expect("file should be deleted");
     }
 }
+
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_odbc as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+data_connector_api::register_data_connector!(
+    register_odbc_connector,
+    ODBC_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    ODBCFactory
+);

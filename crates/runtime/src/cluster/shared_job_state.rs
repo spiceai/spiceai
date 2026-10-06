@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
+use ballista_core::JobId;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{JobStatus, job_status::Status};
@@ -226,7 +227,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T,
 
 #[async_trait]
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for SharedJobState<T, U> {
-    fn accept_job(&self, job_id: &str, job_name: &str, queued_at: u64) -> Result<()> {
+    fn accept_job(&self, job_id: &JobId, job_name: &str, queued_at: u64) -> Result<()> {
         self.queued_jobs
             .insert(job_id.to_string(), (job_name.to_string(), queued_at));
         Ok(())
@@ -238,11 +239,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
 
     async fn submit_job(
         &self,
-        job_id: String,
+        job_id: JobId,
         graph: &ExecutionGraphBox,
         subscriber: Option<JobStatusSubscriber>,
     ) -> Result<()> {
-        let Some((_, (_, queued_at))) = self.queued_jobs.remove(&job_id) else {
+        let Some((_, (_, queued_at))) = self.queued_jobs.remove(job_id.as_str()) else {
             return Err(BallistaError::Internal(format!(
                 "failed to submit job {job_id}, not found in queued jobs"
             )));
@@ -253,11 +254,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         // Claim ownership via OCC *before* writing the graph blob. Writing the
         // graph first would overwrite an existing owner's graph for the same
         // job_id on a metadata conflict, corrupting their recovery state.
-        let mut meta = Self::metadata(&job_id, &status, Some(self.owner_instance_id), 0, queued_at);
+        let mut meta = Self::metadata(
+            job_id.as_str(),
+            &status,
+            Some(self.owner_instance_id),
+            0,
+            queued_at,
+        );
         meta.session_id = graph.session_id().to_string();
         if let object_store_occ::WriteResult::Conflict { .. } = self
             .meta
-            .insert_or_update(&job_id, &meta)
+            .insert_or_update(job_id.as_str(), &meta)
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to persist job meta: {e}")))?
         {
@@ -268,8 +275,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         // With the claim in place, persist the graph. If that fails, best-effort
         // roll back the metadata so other schedulers never observe meta pointing
         // at a missing graph.
-        if let Err(e) = self.put_graph(&job_id, graph).await {
-            if let Err(cleanup) = self.meta.delete(&job_id).await {
+        if let Err(e) = self.put_graph(job_id.as_str(), graph).await {
+            if let Err(cleanup) = self.meta.delete(job_id.as_str()).await {
                 tracing::warn!(
                     "failed to roll back job meta for {job_id} after graph write failed: {cleanup}"
                 );
@@ -278,7 +285,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         }
 
         self.local_jobs
-            .insert(job_id.clone(), LocalJob { status, subscriber });
+            .insert(job_id.to_string(), LocalJob { status, subscriber });
         self.event_sender.send(&JobStateEvent::JobAcquired {
             job_id,
             owner: self.scheduler.clone(),
@@ -286,8 +293,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         Ok(())
     }
 
-    async fn get_job_status(&self, job_id: &str) -> Result<Option<JobStatus>> {
-        if let Some((job_name, queued_at)) = self.queued_jobs.get(job_id).as_deref() {
+    async fn get_job_status(&self, job_id: &JobId) -> Result<Option<JobStatus>> {
+        if let Some((job_name, queued_at)) = self.queued_jobs.get(job_id.as_str()).as_deref() {
             return Ok(Some(JobStatus {
                 job_id: job_id.to_string(),
                 job_name: job_name.clone(),
@@ -296,12 +303,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
                 })),
             }));
         }
-        if let Some(local) = self.local_jobs.get(job_id) {
+        if let Some(local) = self.local_jobs.get(job_id.as_str()) {
             return Ok(Some(local.status.clone()));
         }
         match self
             .meta
-            .get(job_id)
+            .get(job_id.as_str())
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?
         {
@@ -310,24 +317,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         }
     }
 
-    async fn get_execution_graph(&self, job_id: &str) -> Result<Option<ExecutionGraphBox>> {
+    async fn get_execution_graph(&self, job_id: &JobId) -> Result<Option<ExecutionGraphBox>> {
         let Some(meta) = self
             .meta
-            .get(job_id)
+            .get(job_id.as_str())
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?
         else {
             return Ok(None);
         };
-        Ok(Some(self.load_graph(job_id, &meta).await?))
+        Ok(Some(self.load_graph(job_id.as_str(), &meta).await?))
     }
 
-    async fn save_job(&self, job_id: &str, graph: &ExecutionGraphBox) -> Result<()> {
+    async fn save_job(&self, job_id: &JobId, graph: &ExecutionGraphBox) -> Result<()> {
         let status = graph.status().clone();
 
         let current = self
             .meta
-            .get(job_id)
+            .get(job_id.as_str())
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?;
         // A scheduler that has lost ownership must not touch shared state. Drop
@@ -339,7 +346,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
                 "job {job_id} owned by another scheduler (epoch {}); yielding",
                 m.epoch
             );
-            self.local_jobs.remove(job_id);
+            self.local_jobs.remove(job_id.as_str());
             return Ok(());
         }
         let (epoch, queued_at, session_id) = current
@@ -348,7 +355,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
             .unwrap_or((0, 0, graph.session_id().to_string()));
 
         let mut meta = Self::metadata(
-            job_id,
+            job_id.as_str(),
             &status,
             Some(self.owner_instance_id),
             epoch,
@@ -359,7 +366,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         // scheduler racing a takeover cannot clobber the shared graph blob.
         match self
             .meta
-            .update(job_id, &meta)
+            .update(job_id.as_str(), &meta)
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to persist job meta: {e}")))?
         {
@@ -370,42 +377,42 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
                     epoch,
                     current.epoch
                 );
-                self.local_jobs.remove(job_id);
+                self.local_jobs.remove(job_id.as_str());
                 return Ok(());
             }
             object_store_occ::UpdateResult::NotFound => {
-                self.local_jobs.remove(job_id);
+                self.local_jobs.remove(job_id.as_str());
                 return Err(BallistaError::Internal(format!(
                     "job {job_id} metadata no longer exists; cannot persist state"
                 )));
             }
         }
-        self.put_graph(job_id, graph).await?;
+        self.put_graph(job_id.as_str(), graph).await?;
 
         let terminal = matches!(
             status.status,
             Some(Status::Successful(_) | Status::Failed(_))
         );
         if terminal {
-            if let Some((_, local)) = self.local_jobs.remove(job_id) {
+            if let Some((_, local)) = self.local_jobs.remove(job_id.as_str()) {
                 local.notify(status.clone());
             }
-        } else if let Some(mut local) = self.local_jobs.get_mut(job_id) {
+        } else if let Some(mut local) = self.local_jobs.get_mut(job_id.as_str()) {
             local.status = status.clone();
             local.notify(status.clone());
         }
 
         self.event_sender.send(&JobStateEvent::JobUpdated {
-            job_id: job_id.to_string(),
+            job_id: job_id.clone(),
             status,
         });
         Ok(())
     }
 
-    async fn try_acquire_job(&self, job_id: &str) -> Result<Option<ExecutionGraphBox>> {
+    async fn try_acquire_job(&self, job_id: &JobId) -> Result<Option<ExecutionGraphBox>> {
         let Some(meta) = self
             .meta
-            .get(job_id)
+            .get(job_id.as_str())
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?
         else {
@@ -426,7 +433,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         // removed under us (NotFound) — either way we don't own it.
         if !matches!(
             self.meta
-                .update(job_id, &claimed)
+                .update(job_id.as_str(), &claimed)
                 .await
                 .map_err(|e| BallistaError::Internal(format!("failed to acquire job: {e}")))?,
             object_store_occ::UpdateResult::Ok
@@ -434,7 +441,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
             return Ok(None);
         }
 
-        let graph = self.load_graph(job_id, &claimed).await?;
+        let graph = self.load_graph(job_id.as_str(), &claimed).await?;
         self.local_jobs.insert(
             job_id.to_string(),
             LocalJob {
@@ -443,7 +450,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
             },
         );
         self.event_sender.send(&JobStateEvent::JobAcquired {
-            job_id: job_id.to_string(),
+            job_id: job_id.clone(),
             owner: self.scheduler.clone(),
         });
         Ok(Some(graph))
@@ -453,19 +460,19 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         Ok(Box::pin(self.event_sender.subscribe()))
     }
 
-    async fn remove_job(&self, job_id: &str) -> Result<()> {
-        self.local_jobs.remove(job_id);
-        self.queued_jobs.remove(job_id);
+    async fn remove_job(&self, job_id: &JobId) -> Result<()> {
+        self.local_jobs.remove(job_id.as_str());
+        self.queued_jobs.remove(job_id.as_str());
         // Delete metadata first, and only delete the graph if that succeeds.
         // `ObjectState::delete` treats NotFound as success, so an error here is a
         // real object-store failure: keep the graph so meta still points at a
         // valid blob rather than dangling to a missing graph. (A graph-delete
         // failure afterwards is then only a storage leak, not a correctness bug.)
-        if let Err(e) = self.meta.delete(job_id).await {
+        if let Err(e) = self.meta.delete(job_id.as_str()).await {
             tracing::warn!("failed to delete job meta for {job_id}; keeping graph: {e}");
             return Ok(());
         }
-        if let Err(e) = self.store.delete(&self.graph_path(job_id)).await
+        if let Err(e) = self.store.delete(&self.graph_path(job_id.as_str())).await
             && !matches!(e, object_store::Error::NotFound { .. })
         {
             tracing::warn!("failed to delete job graph for {job_id}: {e}");
@@ -473,17 +480,37 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         Ok(())
     }
 
-    async fn get_jobs(&self) -> Result<HashSet<String>> {
+    async fn get_jobs(&self) -> Result<HashSet<JobId>> {
         let keys = self
             .meta
             .list_keys()
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to list jobs: {e}")))?;
-        Ok(keys.into_iter().collect())
+        Ok(keys.into_iter().map(JobId::from).collect())
     }
 
-    async fn fail_unscheduled_job(&self, job_id: &str, reason: String) -> Result<()> {
-        let Some((_, (job_name, queued_at))) = self.queued_jobs.remove(job_id) else {
+    async fn get_all_jobs(&self) -> Result<HashSet<JobId>> {
+        let mut all_jobs: HashSet<JobId> = self
+            .queued_jobs
+            .iter()
+            .map(|pair| JobId::from(pair.key().as_str()))
+            .collect();
+        all_jobs.extend(
+            self.local_jobs
+                .iter()
+                .map(|pair| JobId::from(pair.key().as_str())),
+        );
+        let keys = self
+            .meta
+            .list_keys()
+            .await
+            .map_err(|e| BallistaError::Internal(format!("failed to list jobs: {e}")))?;
+        all_jobs.extend(keys.into_iter().map(JobId::from));
+        Ok(all_jobs)
+    }
+
+    async fn fail_unscheduled_job(&self, job_id: &JobId, reason: String) -> Result<()> {
+        let Some((_, (job_name, queued_at))) = self.queued_jobs.remove(job_id.as_str()) else {
             return Err(BallistaError::Internal(format!(
                 "could not fail unscheduled job {job_id}, not found in queued jobs"
             )));
@@ -498,9 +525,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
                 ended_at: now_ms(),
             })),
         };
-        let mut meta = Self::metadata(job_id, &status, Some(self.owner_instance_id), 0, queued_at);
+        let mut meta = Self::metadata(
+            job_id.as_str(),
+            &status,
+            Some(self.owner_instance_id),
+            0,
+            queued_at,
+        );
         meta.session_id = String::new();
-        if let Err(e) = self.meta.insert_or_update(job_id, &meta).await {
+        if let Err(e) = self.meta.insert_or_update(job_id.as_str(), &meta).await {
             tracing::warn!("failed to persist failed status for unscheduled job {job_id}: {e}");
         }
         Ok(())
@@ -607,7 +640,7 @@ mod tests {
         // Unknown job: nothing to acquire.
         assert!(
             state
-                .try_acquire_job("missing")
+                .try_acquire_job(&JobId::new("missing"))
                 .await
                 .expect("acquire")
                 .is_none(),
@@ -628,7 +661,7 @@ mod tests {
             .expect("persist self-owned meta");
         assert!(
             state
-                .try_acquire_job("self")
+                .try_acquire_job(&JobId::new("self"))
                 .await
                 .expect("acquire")
                 .is_none(),
@@ -651,7 +684,7 @@ mod tests {
             .expect("persist corrupt meta");
         assert!(
             state
-                .try_acquire_job("corrupt")
+                .try_acquire_job(&JobId::new("corrupt"))
                 .await
                 .expect("acquire")
                 .is_none(),
@@ -681,19 +714,189 @@ mod tests {
             .expect("persist graph blob");
 
         assert!(
-            state.get_job_status("j1").await.expect("status").is_some(),
+            state
+                .get_job_status(&JobId::new("j1"))
+                .await
+                .expect("status")
+                .is_some(),
             "job should be visible before removal"
         );
 
-        state.remove_job("j1").await.expect("remove");
+        state.remove_job(&JobId::new("j1")).await.expect("remove");
 
         assert!(
-            state.get_job_status("j1").await.expect("status").is_none(),
+            state
+                .get_job_status(&JobId::new("j1"))
+                .await
+                .expect("status")
+                .is_none(),
             "metadata should be gone after removal"
         );
         assert!(
             state.store.get(&state.graph_path("j1")).await.is_err(),
             "graph blob should be gone after removal"
+        );
+    }
+
+    /// The graph a scheduler persists for a job whose map stage has succeeded: one
+    /// multi-partition task that covered input partitions `0`, `1` and `2` of the
+    /// stage's four and consumed two vcores — deliberately not one per partition, so
+    /// the decoder's fallback of one vcore per partition cannot produce it.
+    fn graph_with_a_multi_partition_task(
+        codec: &BallistaCodec<
+            datafusion_proto::protobuf::LogicalPlanNode,
+            datafusion_proto::protobuf::PhysicalPlanNode,
+        >,
+    ) -> Vec<u8> {
+        use ballista_core::serde::protobuf::{
+            ExecutionGraph, ExecutionGraphStage, ShuffleWritePartition, SuccessfulStage,
+            SuccessfulTask, TaskInfo, execution_graph_stage::StageType, task_info,
+        };
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+        let mut plan_bytes = Vec::new();
+        datafusion_proto::protobuf::PhysicalPlanNode::try_from_physical_plan(
+            plan,
+            codec.physical_extension_codec(),
+        )
+        .and_then(|node| node.try_encode(&mut plan_bytes))
+        .expect("encode the stage plan");
+
+        let task = TaskInfo {
+            task_id: 0,
+            partition_id: 0,
+            status: Some(task_info::Status::Successful(SuccessfulTask {
+                executor_id: "executor-1".to_string(),
+                partitions: vec![ShuffleWritePartition {
+                    partition_id: 0,
+                    path: "/job/1/0".to_string(),
+                    num_batches: 1,
+                    num_rows: 1,
+                    num_bytes: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            global_input_partition_ids: vec![0, 1, 2],
+            vcores_consumed: 2,
+            ..Default::default()
+        };
+        ExecutionGraph {
+            job_id: "j".to_string(),
+            session_id: "session".to_string(),
+            status: Some(job_status("j", Status::Running(RunningJob::default()))),
+            stages: vec![ExecutionGraphStage {
+                stage_type: Some(StageType::SuccessfulStage(SuccessfulStage {
+                    stage_id: 1,
+                    partitions: 4,
+                    plan: plan_bytes,
+                    task_infos: vec![task],
+                    ..Default::default()
+                })),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// The task info of stage 1's only task in an encoded graph.
+    fn persisted_task(bytes: &[u8]) -> ballista_core::serde::protobuf::TaskInfo {
+        use ballista_core::serde::protobuf::ExecutionGraph;
+        use ballista_core::serde::protobuf::execution_graph_stage::StageType;
+
+        let graph = ExecutionGraph::decode(bytes).expect("decode the persisted graph");
+        let Some(StageType::SuccessfulStage(stage)) =
+            graph.stages.into_iter().find_map(|stage| stage.stage_type)
+        else {
+            panic!("the persisted graph lost its successful stage");
+        };
+        let [task] = <[_; 1]>::try_from(stage.task_infos).unwrap_or_else(|infos: Vec<_>| {
+            panic!("expected one persisted task, found {}", infos.len())
+        });
+        task
+    }
+
+    /// Regression test for `TaskInfo` proto fields 11 and 12 —
+    /// `global_input_partition_ids` and `vcores_consumed` — which the
+    /// `spiceai/datafusion-ballista` fork adds so its execution-graph serialization
+    /// can persist them. Upstream's tasks cover several input partitions, but
+    /// upstream persists no task info, so its proto has neither field; a merge that
+    /// takes upstream's proto still builds, because the decoder falls back to
+    /// `[partition_id]` and one vcore per partition.
+    ///
+    /// Without them a scheduler that takes over a job keeps only the first partition
+    /// of each recovered multi-partition task, so after an executor loss the others
+    /// are never rescheduled, and it refunds the wrong number of vcores, so the
+    /// executor's budget drifts. The graph goes through the same `load_graph` and
+    /// `put_graph` a takeover and a save use: decoded, the task has to cover all
+    /// three partitions and two vcores, and saved again, the bytes have to carry
+    /// both fields.
+    #[tokio::test]
+    async fn a_persisted_multi_partition_task_keeps_its_partitions_and_vcores() {
+        use ballista_scheduler::state::execution_stage::ExecutionStage;
+
+        let state = test_state();
+        let meta = meta_with(
+            "j",
+            Status::Running(RunningJob::default()),
+            state.owner_instance_id,
+            0,
+        );
+        state
+            .store
+            .put(
+                &state.graph_path("j"),
+                graph_with_a_multi_partition_task(&state.codec).into(),
+            )
+            .await
+            .expect("persist the graph");
+
+        let graph = state.load_graph("j", &meta).await.expect("load the graph");
+        let Some(ExecutionStage::Successful(map_stage)) = graph.stages().get(&1) else {
+            panic!("the loaded graph lost its successful stage");
+        };
+        let [task] = map_stage.task_infos.as_slice() else {
+            panic!(
+                "expected one loaded task, found {}",
+                map_stage.task_infos.len()
+            );
+        };
+        assert_eq!(
+            task.global_input_partition_ids,
+            vec![0, 1, 2],
+            "a recovered multi-partition task has to keep every partition it covered, or \
+             the ones after the first are never rescheduled after an executor loss"
+        );
+        assert_eq!(
+            task.vcores_consumed, 2,
+            "a recovered task has to keep the vcores it consumed, or the executor's budget \
+             is refunded the wrong amount"
+        );
+
+        state
+            .put_graph("j", &graph)
+            .await
+            .expect("save the graph again");
+        let saved = state
+            .store
+            .get(&state.graph_path("j"))
+            .await
+            .expect("read the saved graph")
+            .bytes()
+            .await
+            .expect("read the saved graph's bytes");
+        let task = persisted_task(&saved);
+        assert_eq!(
+            task.global_input_partition_ids,
+            vec![0, 1, 2],
+            "a saved graph has to carry `global_input_partition_ids`"
+        );
+        assert_eq!(
+            task.vcores_consumed, 2,
+            "a saved graph has to carry `vcores_consumed`"
         );
     }
 }

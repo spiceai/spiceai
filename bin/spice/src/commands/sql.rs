@@ -53,9 +53,12 @@ pub struct SqlArgs {
     #[arg(long, value_name = "SQL")]
     pub query: Option<String>,
 
-    /// Specifies the remote Spice instance endpoint.
-    /// Supports http://, https://, grpc://, or grpc+tls:// schemes.
+    /// Specifies the remote Spice instance's Arrow Flight (gRPC) endpoint — the runtime's
+    /// flight port, 50051 by default, not its HTTP API.
+    /// Supports http://, https://, grpc://, or grpc+tls:// schemes (http:// being plaintext
+    /// gRPC); behind a proxy or ingress it needs a gRPC-capable route.
     /// If not provided, uses local spiced runtime.
+    /// `nql` additionally needs --http-endpoint pointed at the same runtime.
     #[arg(long)]
     endpoint: Option<String>,
 
@@ -159,9 +162,13 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         _ => repl::cache_control::CacheControl::Cache,
     };
 
+    let flight_chosen = flight_endpoint_chosen(args);
+    let another_runtime = repl::http_endpoint_unpaired(flight_chosen, ctx.http_endpoint_chosen());
+
     repl::ReplConfig {
         repl_flight_endpoint: flight_endpoint,
         http_endpoint,
+        http_endpoint_may_be_another_runtime: another_runtime,
         tls_root_certificate_file: args.tls_root_certificate_file.clone(),
         client_tls_certificate_file: args.client_tls_certificate_file.clone(),
         client_tls_key_file: args.client_tls_key_file.clone(),
@@ -170,5 +177,57 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         cache_control,
         custom_headers: args.custom_headers.clone(),
         expanded: args.expanded,
+    }
+}
+
+/// Whether this session's Flight endpoint was chosen on the command line.
+///
+/// `--flight-endpoint` is the deprecated spelling of `--endpoint`; either one moves the SQL
+/// target away from the default.
+fn flight_endpoint_chosen(args: &SqlArgs) -> bool {
+    args.endpoint.is_some() || args.flight_endpoint.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        sql: SqlArgs,
+    }
+
+    fn sql_args(argv: &[&str]) -> SqlArgs {
+        TestCli::parse_from(argv.iter().copied()).sql
+    }
+
+    /// #11005: `spice sql --endpoint <remote>` moves only the Flight endpoint, so the REPL's
+    /// HTTP-backed `nql` kept asking the local runtime - silently answering from a different
+    /// instance than the one every SQL query in the same session went to. Reporting that starts
+    /// with knowing the SQL target was moved.
+    #[test]
+    fn the_endpoint_flag_counts_as_a_chosen_flight_endpoint() {
+        let args = sql_args(&["sql", "--endpoint", "grpc://spiced.internal:50051"]);
+
+        assert!(flight_endpoint_chosen(&args));
+    }
+
+    /// The deprecated spelling moves the SQL target just as far.
+    #[test]
+    fn the_deprecated_flight_endpoint_flag_counts_as_chosen() {
+        let args = sql_args(&["sql", "--flight-endpoint", "grpc://spiced.internal:50051"]);
+
+        assert!(flight_endpoint_chosen(&args));
+    }
+
+    /// A local session chose neither endpoint, and cloud mode derives both from the region, so
+    /// `nql` keeps working untouched in each.
+    #[test]
+    fn endpoints_nobody_moved_are_the_same_runtime() {
+        let args = sql_args(&["sql"]);
+
+        assert!(!flight_endpoint_chosen(&args));
     }
 }

@@ -16,6 +16,10 @@ limitations under the License.
 
 //! Tests for the `/v1/datasets` HTTP API endpoint.
 
+use data_connector_api::{
+    ConnectorComponent, ConnectorContext, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
+};
 use std::{
     any::Any,
     future::Future,
@@ -32,15 +36,8 @@ use datafusion::{
 };
 use rand::RngExt;
 use runtime::{
-    Runtime,
-    auth::EndpointAuth,
-    component::dataset::Dataset as RuntimeDataset,
-    config::Config,
-    dataconnector::{
-        self, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-        DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
-    },
-    status::ComponentStatus,
+    Runtime, auth::EndpointAuth, component::dataset::DatasetSpec as RuntimeDataset, config::Config,
+    dataconnector, status::ComponentStatus,
 };
 use runtime_api_types::v1::{ComponentError, ComponentErrorCategory, ComponentErrorType};
 use runtime_parameters::ParameterSpec;
@@ -90,6 +87,7 @@ impl DataConnector for PermissionStatusConnector {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &RuntimeDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if dataset.name.table() == "permission_denied" {
@@ -124,10 +122,11 @@ impl DataConnectorFactory for PermissionStatusConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         _params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move { Ok(Arc::new(PermissionStatusConnector) as Arc<dyn DataConnector>) })
     }
 
@@ -214,7 +213,7 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
             // Verify the dataset is Ready in RuntimeStatus
             let status = rt.status();
             let dataset_statuses = status.get_dataset_statuses();
-            let dataset_ref = datafusion::sql::TableReference::bare("test_dataset");
+            let dataset_ref = datafusion::common::TableReference::bare("test_dataset");
             let runtime_status = dataset_statuses
                 .get(&dataset_ref)
                 .expect("test_dataset should have a status");
@@ -237,7 +236,18 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
                 "API should return success status"
             );
 
-            let datasets: Vec<DatasetResponse> = response.json().await?;
+            let datasets_json: Value = response.json().await?;
+
+            // The Cloud Connect `GetDatasets` command answers this same
+            // document through `dataset_infos_with_status`, so the two are
+            // compared here, against a real runtime, on every status this test
+            // drives the dataset through.
+            assert_eq!(
+                serde_json::to_value(runtime::dataset_infos_with_status(&rt).await)?,
+                datasets_json,
+                "GetDatasets must answer the /v1/datasets?status=true document (Ready)"
+            );
+            let datasets: Vec<DatasetResponse> = serde_json::from_value(datasets_json)?;
 
             // Find our test dataset
             let test_dataset = datasets
@@ -267,7 +277,13 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
                 "API should return success status"
             );
 
-            let datasets: Vec<DatasetResponse> = response.json().await?;
+            let datasets_json: Value = response.json().await?;
+            assert_eq!(
+                serde_json::to_value(runtime::dataset_infos_with_status(&rt).await)?,
+                datasets_json,
+                "GetDatasets must answer the /v1/datasets?status=true document (Error)"
+            );
+            let datasets: Vec<DatasetResponse> = serde_json::from_value(datasets_json)?;
 
             let test_dataset = datasets
                 .iter()

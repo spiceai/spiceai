@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use rmcp::{
-    model::{CallToolRequestParams, CallToolResult, JsonObject, Tool, object},
+    model::{CallToolRequestParams, CallToolResponse, CallToolResult, JsonObject, Tool, object},
     service::ServiceError,
 };
 use serde_json::Value;
@@ -29,8 +29,9 @@ use tracing_futures::Instrument;
 use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 
 use tools::SpiceModelTool;
+use tools::naming::encode_tool_name;
 
-use super::{Result, catalog::McpClient};
+use super::{Result, catalog::McpClient, task_name_for_exposed_tool};
 
 pub struct McpToolWrapper {
     client: Arc<RwLock<McpClient>>,
@@ -52,6 +53,28 @@ impl McpToolWrapper {
     #[must_use]
     pub fn internal_name(&self) -> Cow<'static, str> {
         self.spec.name.clone()
+    }
+
+    /// The `task_history` identifiers for a call on `spec` proxied from
+    /// `server_name`: the `task` value and the `tool` label, as
+    /// `(task, exposed_name)`.
+    ///
+    /// Both are the name the tool is exposed under. That qualification is
+    /// applied *outside* this wrapper — `with_name` in `tooling.rs` /
+    /// `runtime::tools::utils` — so [`Self::name`] is still the bare upstream
+    /// name and the exposed name has to be recomputed from its parts. It cannot
+    /// be read off the caller either: a `POST /v1/tools/{name}` request resolves
+    /// through `Runtime::get_tool`, which hands back the tool un-renamed.
+    ///
+    /// The qualification is recomputed *unconditionally*, which matches the
+    /// exposure layer only because a tool catalog is exempted from it when it is
+    /// a default catalog, and the default catalogs are `memory` and `builtin` —
+    /// never an MCP server. Were an MCP-backed catalog ever made default, this
+    /// would go back to labelling a tool differently from the name it is listed
+    /// under.
+    fn task_history_labels(server_name: &str, spec: &Tool) -> (String, String) {
+        let exposed_name = encode_tool_name(server_name, &spec.name);
+        (task_name_for_exposed_tool(&exposed_name), exposed_name)
     }
 }
 
@@ -90,8 +113,8 @@ impl SpiceModelTool for McpToolWrapper {
             .into());
         }
 
-        let task_name = format!("tool_use::{}/{}", self.server_name, self.spec.name);
-        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = self.name().to_string(), input = arg);
+        let (task_name, exposed_name) = Self::task_history_labels(&self.server_name, &self.spec);
+        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %exposed_name, input = arg);
         tracing::info!(target: "task_history", parent: &span, task_override = %task_name, mcp_server = %self.server_name, "labels");
 
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
@@ -146,11 +169,146 @@ impl McpProxy for McpToolWrapper {
         &self,
         arguments: Option<JsonObject>,
     ) -> Result<CallToolResult, ServiceError> {
+        let mut params = CallToolRequestParams::new(self.internal_name());
+        if let Some(arguments) = arguments {
+            params = params.with_arguments(arguments);
+        }
         let inner = self.client.read().await;
-        let mut req = CallToolRequestParams::new(self.internal_name());
-        if let Some(args) = arguments {
+        inner.call_tool(params).await
+    }
+
+    async fn call_tool_once(
+        &self,
+        request: CallToolRequestParams,
+    ) -> Result<CallToolResponse, ServiceError> {
+        let inner = self.client.read().await;
+        inner
+            .call_tool_once(rename_proxied_call(request, self.internal_name()))
+            .await
+    }
+}
+
+/// Rewrite the gateway-exposed name to the upstream tool name.
+///
+/// Rebuilding via [`CallToolRequestParams::new`] drops `request.meta`
+/// (`incoming_meta={"com.example/traceId":"trace-42"} forwarded_meta=null`)
+/// while still copying MRTR continuation fields. Rename in place so
+/// `_meta` and any later request fields are relayed.
+fn rename_proxied_call(
+    mut request: CallToolRequestParams,
+    internal_name: impl Into<Cow<'static, str>>,
+) -> CallToolRequestParams {
+    request.name = internal_name.into();
+    request
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::RequestMetaObject;
+    use serde_json::json;
+    use tools::naming::decode_tool_name;
+
+    fn request_with_extension_meta() -> CallToolRequestParams {
+        let meta = serde_json::from_value(json!({"com.example/traceId": "trace-42"}))
+            .expect("request _meta object");
+        let mut request =
+            CallToolRequestParams::new("srv__deploy").with_request_state("opaque-server-state");
+        request.meta = Some(meta);
+        request
+    }
+
+    /// The previous rebuild copied MRTR fields onto `CallToolRequestParams::new`
+    /// and dropped `_meta` (`incoming_meta=… forwarded_meta=null`).
+    #[test]
+    fn rebuild_from_new_drops_caller_meta() {
+        let incoming = request_with_extension_meta();
+        let mut req = CallToolRequestParams::new("deploy");
+        if let Some(args) = incoming.arguments.clone() {
             req = req.with_arguments(args);
         }
-        inner.call_tool(req).await
+        if let Some(responses) = incoming.input_responses.clone() {
+            req = req.with_input_responses(responses);
+        }
+        if let Some(state) = incoming.request_state.clone() {
+            req = req.with_request_state(state);
+        }
+        assert_eq!(
+            req.request_state.as_deref(),
+            Some("opaque-server-state"),
+            "MRTR continuation fields survived the rebuild"
+        );
+        assert!(
+            req.meta.is_none(),
+            "incoming_meta={:?} forwarded_meta=null",
+            incoming
+                .meta
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .expect("request meta should serialize")
+        );
+    }
+
+    #[test]
+    fn rename_proxied_call_keeps_caller_meta() {
+        let incoming = request_with_extension_meta();
+        let forwarded = rename_proxied_call(incoming.clone(), "deploy");
+        assert_eq!(forwarded.name.as_ref(), "deploy");
+        assert_eq!(
+            forwarded.meta, incoming.meta,
+            "incoming_meta must be forwarded, not dropped"
+        );
+        assert_eq!(forwarded.request_state, incoming.request_state);
+        let expected: RequestMetaObject =
+            serde_json::from_value(json!({"com.example/traceId": "trace-42"}))
+                .expect("request _meta object");
+        assert_eq!(forwarded.meta, Some(expected));
+    }
+
+    fn spec(name: &'static str) -> Tool {
+        Tool::new(name, "a proxied tool", Arc::new(serde_json::Map::new()))
+    }
+
+    #[test]
+    fn labels_the_task_with_the_name_the_tool_is_exposed_under() {
+        // Regression for https://github.com/spiceai/spiceai/issues/13338: the
+        // wrapper joined the two components with the pre-#11629 `/` separator,
+        // so the same tool was recorded as `tool_use::github/search_code` here
+        // and `tool_use::github__search_code` through the `/v1/mcp` gateway,
+        // splitting one logical tool across two `task_history` rows.
+        let (task, exposed) = McpToolWrapper::task_history_labels("github", &spec("search_code"));
+        assert_eq!(task, "tool_use::github__search_code");
+        // The gateway labels the task from the exposed name it resolved the
+        // request by, so agreeing on that name is what makes the two match.
+        // (Asserting `task == task_name_for_exposed_tool(&exposed)` here would be
+        // a tautology — the value above is what pins it.)
+        assert_eq!(exposed, "github__search_code");
+    }
+
+    #[test]
+    fn recorded_task_decodes_back_to_its_components() {
+        // The recorded name must be the reversible encoding, so a reader can
+        // recover which server and tool a row belongs to. The `/` join was not
+        // reversible — `decode_tool_name("github/search_code")` is `None` — and
+        // it emitted a component's literal `__` unescaped, which decodes to the
+        // wrong split.
+        for (server, tool) in [
+            ("github", "search_code"),
+            ("my-catalog", "list_files"),
+            ("my__server", "some_tool"),
+            ("server", "tool__name"),
+        ] {
+            let (task, exposed) = McpToolWrapper::task_history_labels(server, &spec(tool));
+            let suffix = task
+                .strip_prefix(super::super::TOOL_USE_PREFIX)
+                .expect("a tool-use task name carries the prefix");
+            assert_eq!(suffix, exposed, "task suffix must be the exposed name");
+            assert_eq!(
+                decode_tool_name(suffix),
+                Some((server.to_string(), tool.to_string())),
+                "recorded task {task} does not decode back to ({server}, {tool})"
+            );
+        }
     }
 }

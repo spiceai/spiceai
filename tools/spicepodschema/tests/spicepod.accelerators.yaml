@@ -33,8 +33,8 @@ datasets:
 
   # ===========================================================================
   # DuckDB Accelerator
-  # Runtime params: file_watcher, partition_mode, connection_pool_size,
-  #                 on_refresh_recompute_statistics, partitioned_write_buffer,
+  # Runtime params: file_watcher, connection_pool_size,
+  #                 on_refresh_recompute_statistics,
   #                 optimizer_duckdb_aggregate_pushdown
   # ===========================================================================
   - name: accel_duckdb
@@ -53,10 +53,8 @@ datasets:
       params:
         duckdb_file: ./data/accel.duckdb
         file_watcher: "true"
-        partition_mode: auto
         connection_pool_size: "5"
         on_refresh_recompute_statistics: "true"
-        partitioned_write_buffer: "1000"
         optimizer_duckdb_aggregate_pushdown: "true"
 
   # DuckDB in memory mode

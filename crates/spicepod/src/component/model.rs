@@ -92,19 +92,31 @@ pub enum ModelSource {
     File,
     Databricks,
     Bedrock,
+    TypeSafe,
 }
+
+/// The prefixes that select [`ModelSource::SpiceAI`]. `spice.ai` matches how the Spice.ai Cloud
+/// Platform is spelled elsewhere in a Spicepod (`from: spice.ai/...` for datasets); `spiceai`
+/// matches the parameter prefix (`spiceai_api_key`). Both are accepted so a `from` reads the same
+/// whether it names a dataset or a model.
+pub const SPICEAI_PREFIXES: [&str; 2] = ["spice.ai", "spiceai"];
 
 impl ModelSource {
     pub fn parse_from(&self, from: &str) -> Option<String> {
         match self {
-            ModelSource::HuggingFace => HUGGINGFACE_PATH_REGEX.captures(from).map(|caps| {
-                let model = format!("{}/{}", &caps["org"], &caps["model"]);
-                if let Some(revision) = caps.name("revision") {
-                    format!("{}:{}", model, revision.as_str())
-                } else {
-                    model
-                }
-            }),
+            ModelSource::HuggingFace => huggingface_model_id(from),
+            // A bare prefix (`spice.ai:`, `spice.ai/`) carries no model id. Report that as absent
+            // rather than as an empty id, so the caller raises "no model provided" instead of
+            // dialing the endpoint with an empty model name.
+            ModelSource::SpiceAI => SPICEAI_PREFIXES
+                .iter()
+                .find_map(|p| {
+                    from.strip_prefix(&format!("{p}:"))
+                        .or_else(|| from.strip_prefix(&format!("{p}/")))
+                })
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(std::string::ToString::to_string),
             p => {
                 if let Some(stripped) = from.strip_prefix(&format!("{p}:")) {
                     Some(stripped.to_string())
@@ -144,6 +156,52 @@ pub static HUGGINGFACE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     }
 });
 
+/// Recovers a `HuggingFace` repo id (and optional pinned `:revision`) from a `from` value via
+/// [`HUGGINGFACE_PATH_REGEX`]. Shared by [`ModelSource::parse_from`], `Embeddings::get_model_id`,
+/// and `Reranker::get_model_id` since all three encode the same
+/// `huggingface:huggingface.co/<org>/<model>[:rev]` convention and must not drift apart.
+#[must_use]
+pub fn huggingface_model_id(from: &str) -> Option<String> {
+    HUGGINGFACE_PATH_REGEX.captures(from).map(|caps| {
+        let model = format!("{}/{}", &caps["org"], &caps["model"]);
+        if let Some(revision) = caps.name("revision") {
+            format!("{}:{}", model, revision.as_str())
+        } else {
+            model
+        }
+    })
+}
+
+/// Splits a `HuggingFace` model id back into its repo id and optional revision.
+///
+/// Both joiners of this convention — [`ModelSource::parse_from`] for `models` and
+/// `Embedding::get_model_id` for `embeddings` — encode a pinned revision by appending it to
+/// the repo id as `org/model:revision`. A loader that forwards that joined string to the Hub
+/// as the repo name therefore asks for a repo that does not exist, and the revision defaults
+/// to `main`. This is the inverse of that join, so a loader can recover both halves.
+///
+/// The first colon is unambiguously the separator: [`HUGGINGFACE_PATH_REGEX`] matches `org`
+/// as `[\w\-]+` and `model` as `[\w\-\.]+`, neither of which admits a `:`.
+///
+/// An empty revision yields `None` rather than `Some("")`, because a caller would otherwise
+/// request the empty revision from the Hub instead of the default branch. The regex already
+/// rejects a trailing `:`, so this only guards a caller that did not build its id from it.
+///
+/// # Example
+/// - `BAAI/bge-base-en-v1.5` -> (`BAAI/bge-base-en-v1.5`, `None`)
+/// - `BAAI/bge-base-en-v1.5:a5beb1e` -> (`BAAI/bge-base-en-v1.5`, `Some("a5beb1e")`)
+#[must_use]
+pub fn split_hf_model_id(model_id: &str) -> (&str, Option<&str>) {
+    match model_id.split_once(':') {
+        Some((repo_id, revision)) if !revision.is_empty() => (repo_id, Some(revision)),
+        // A trailing `:` still separates: the repo id is what precedes it. Folding this
+        // into the `None` arm below would hand the Hub `org/model:` as the repo name —
+        // the same "repo that does not exist" failure this function exists to prevent.
+        Some((repo_id, _)) => (repo_id, None),
+        None => (model_id, None),
+    }
+}
+
 /// Implement the [`TryFrom<&str>`] trait for [`ModelSource`]. Should be the inverse of [`ModelSource`]'s [`Display`].
 impl TryFrom<&str> for ModelSource {
     type Error = &'static str;
@@ -163,12 +221,23 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::Azure)
         } else if value.starts_with("xai") {
             Ok(ModelSource::Xai)
-        } else if value.starts_with("spiceai") {
+        } else if SPICEAI_PREFIXES.iter().any(|p| value.starts_with(p)) {
             Ok(ModelSource::SpiceAI)
         } else if value.starts_with("databricks") {
             Ok(ModelSource::Databricks)
         } else if value.starts_with("bedrock") {
             Ok(ModelSource::Bedrock)
+        } else if value == "typesafe"
+            || value
+                .strip_prefix("typesafe:")
+                .is_some_and(|id| !id.is_empty())
+            || value
+                .strip_prefix("typesafe/")
+                .is_some_and(|id| !id.is_empty())
+        {
+            // Bare `typesafe` is the documented default. A colon or slash must
+            // carry a model id — `typesafe:` / `typesafe/` are not that default.
+            Ok(ModelSource::TypeSafe)
         } else {
             Err("Unknown prefix")
         }
@@ -189,6 +258,7 @@ impl Display for ModelSource {
             ModelSource::SpiceAI => write!(f, "spiceai"),
             ModelSource::Databricks => write!(f, "databricks"),
             ModelSource::Bedrock => write!(f, "bedrock"),
+            ModelSource::TypeSafe => write!(f, "typesafe"),
         }
     }
 }
@@ -207,22 +277,7 @@ impl ModelSource {
             ModelSource::SpiceAI => "spiceai",
             ModelSource::Databricks => "databricks",
             ModelSource::Bedrock => "bedrock",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub enum ModelType {
-    Llm,
-    Ml,
-}
-
-impl Display for ModelType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ModelType::Llm => write!(f, "Llm"),
-            ModelType::Ml => write!(f, "Ml"),
+            ModelSource::TypeSafe => "typesafe",
         }
     }
 }
@@ -333,9 +388,9 @@ impl Model {
     /// - `huggingface:huggingface.co/transformers/gpt-2:latest`
     ///    - Prefix: `huggingface:huggingface.co`
     ///    - Source: `transformers/gpt-2:latest`
-    /// - `file://absolute/path/to/my/model.onnx`
+    /// - `file://absolute/path/to/my/model.gguf`
     ///     - Prefix: `file:`
-    ///     - Source: `/absolute/path/to/my/model.onnx`
+    ///     - Source: `/absolute/path/to/my/model.gguf`
     /// - `openai`
     ///    - Prefix: `openai`
     ///    - Source: None
@@ -345,69 +400,6 @@ impl Model {
     #[must_use]
     pub fn get_model_id(&self) -> Option<String> {
         self.get_source()?.parse_from(self.from.as_str())
-    }
-
-    /// Attempts to determine the model's type based on its `from` field and, `files` and `params`.
-    ///
-    /// ### Current support/checks
-    ///
-    /// | ModelType | OpenAI  |      Hugging Face       | Spice   | Local          |
-    /// | --------- | ------- | ----------------------- | ------- | -------------- |
-    /// | Llm       | Default | `params.model_type` set | N/A     | File Specified |
-    /// | Ml        |  N/A    | ONNX file specified     | Default | File specified |
-    pub fn model_type(&self) -> Option<ModelType> {
-        let Ok(source) = ModelSource::try_from(self.from.as_str()) else {
-            tracing::error!("Unknown model source from model: {}", self.from);
-            return None;
-        };
-
-        // Some providers only support either ML or LLMs.
-        if matches!(
-            source,
-            ModelSource::Azure
-                | ModelSource::OpenAi
-                | ModelSource::Anthropic
-                | ModelSource::Xai
-                | ModelSource::Databricks
-                | ModelSource::Bedrock
-                | ModelSource::Google
-        ) {
-            return Some(ModelType::Llm);
-        }
-
-        if source == ModelSource::SpiceAI {
-            return Some(ModelType::Ml);
-        }
-
-        let files = self.get_all_files();
-
-        // TODO: Need to scan filenames from HF for [`ModelSource::HuggingFace`]. Below is a hack
-        // to determine if it's an LLM from HF by check if an ML files are set manually.
-        let no_ml_files = files.iter().all(|f| !is_ml_file(Path::new(&f.path)));
-        if source == ModelSource::HuggingFace && no_ml_files {
-            return Some(ModelType::Llm);
-        }
-
-        let is_llm = files.iter().any(|f| {
-            match f.file_type() {
-                // Only true since embeddings aren't [`Model`]s.
-                Some(
-                    ModelFileType::Tokenizer
-                    | ModelFileType::Config
-                    | ModelFileType::TokenizerConfig,
-                ) => true,
-                _ => is_llm_file(Path::new(&f.path)),
-            }
-        });
-        if is_llm {
-            return Some(ModelType::Llm);
-        }
-
-        if files.iter().any(|f| is_ml_file(Path::new(&f.path))) {
-            return Some(ModelType::Ml);
-        }
-
-        None
     }
 }
 
@@ -470,7 +462,7 @@ pub enum ModelFileType {
 pub(crate) fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
     let path = Path::new(p);
 
-    if is_ml_file(path) || is_llm_file(path) {
+    if is_llm_file(path) {
         return Some(ModelFileType::Weights);
     }
 
@@ -495,16 +487,6 @@ pub(crate) fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
     None
 }
 
-/// Returns true if the file is an ML model file. Possible false negatives, but attempts to be positively certain (i.e. avoid false positives).
-pub(crate) fn is_ml_file(p: &Path) -> bool {
-    let extension = p
-        .extension()
-        .map(|e| e.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    extension == "onnx"
-}
-
 /// Returns true if the file is an LLM model file. Possible false negatives, but attempts to be positively certain (i.e. avoid false positives).
 pub(crate) fn is_llm_file(p: &Path) -> bool {
     let Some(filename) = p.file_name().map(|f| f.to_string_lossy().to_string()) else {
@@ -524,6 +506,47 @@ pub(crate) fn is_llm_file(p: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn typesafe_from_parses_jev_aliases() {
+        for from in [
+            "typesafe",
+            "typesafe:jev",
+            "typesafe/jev",
+            "typesafe:jev-latest",
+            "typesafe:jev-preview",
+            "typesafe:jev-1.13.0",
+        ] {
+            let model = Model::new(from, "jev");
+            assert_eq!(
+                model.get_source(),
+                Some(ModelSource::TypeSafe),
+                "expected TypeSafe for {from}"
+            );
+        }
+        assert_eq!(
+            Model::new("typesafe:jev", "jev").get_model_id().as_deref(),
+            Some("jev")
+        );
+        assert_eq!(
+            Model::new("typesafe/jev", "jev").get_model_id().as_deref(),
+            Some("jev")
+        );
+        assert_eq!(Model::new("typesafe", "jev").get_model_id(), None);
+
+        // Separator-only forms are not the bare default — they must not parse.
+        for from in ["typesafe:", "typesafe/"] {
+            let model = Model::new(from, "jev");
+            assert_eq!(model.get_source(), None, "expected reject for {from}");
+            assert_eq!(model.get_model_id(), None, "expected no id for {from}");
+        }
+
+        // Require a complete `typesafe` prefix — do not accept lookalikes such as `typesafely:…`.
+        let lookalike = Model::new("typesafely:jev", "jev");
+        assert_eq!(lookalike.get_source(), None);
+        assert_eq!(lookalike.get_model_id(), None);
+    }
+
     use super::*;
 
     #[test]
@@ -650,6 +673,126 @@ mod tests {
             assert!(
                 HUGGINGFACE_PATH_REGEX.captures(path).is_none(),
                 "Should not match invalid path: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn spiceai_source_accepts_both_spellings() {
+        for from in [
+            "spice.ai:openai/gpt-4o",
+            "spice.ai/openai/gpt-4o",
+            "spiceai:openai/gpt-4o",
+            "spiceai/openai/gpt-4o",
+        ] {
+            let model = Model::new(from, "test");
+            assert_eq!(
+                model.get_source(),
+                Some(ModelSource::SpiceAI),
+                "unexpected source for {from}"
+            );
+            assert_eq!(
+                model.get_model_id().as_deref(),
+                Some("openai/gpt-4o"),
+                "unexpected model id for {from}"
+            );
+        }
+    }
+
+    #[test]
+    fn spiceai_source_without_model_id() {
+        for from in ["spice.ai", "spiceai"] {
+            let model = Model::new(from, "test");
+            assert_eq!(model.get_source(), Some(ModelSource::SpiceAI));
+            assert_eq!(model.get_model_id(), None, "unexpected model id for {from}");
+        }
+    }
+
+    #[test]
+    fn spiceai_bare_prefix_reports_no_model_id() {
+        // A blank id would otherwise reach the client as an empty model name, turning a clear
+        // "no model provided" error into an opaque failure against the endpoint.
+        for from in [
+            "spice.ai:",
+            "spice.ai/",
+            "spiceai:",
+            "spiceai/",
+            "spice.ai:   ",
+            "spiceai/ ",
+        ] {
+            let model = Model::new(from, "test");
+            assert_eq!(model.get_source(), Some(ModelSource::SpiceAI));
+            assert_eq!(model.get_model_id(), None, "unexpected model id for {from}");
+        }
+    }
+
+    #[test]
+    fn spiceai_model_id_is_trimmed() {
+        let model = Model::new("spice.ai: openai/gpt-4o ", "test");
+        assert_eq!(model.get_model_id().as_deref(), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn split_hf_model_id_recovers_repo_and_revision() {
+        let repo = "BAAI/bge-base-en-v1.5";
+        let sha = "a5beb1e3e68b9ab74eb54cfd186867f64f240e1a";
+        let pinned = format!("{repo}:{sha}");
+
+        // No revision pinned: the whole id is the repo.
+        assert_eq!(split_hf_model_id(repo), (repo, None));
+
+        // A full commit sha, the form reported in #12430.
+        assert_eq!(split_hf_model_id(&pinned), (repo, Some(sha)));
+
+        // A model name containing dots must not be mistaken for a revision.
+        assert_eq!(
+            split_hf_model_id("org/my-model.v2"),
+            ("org/my-model.v2", None)
+        );
+
+        // A revision carrying the dots, hyphens and digits the regex admits.
+        assert_eq!(
+            split_hf_model_id("org/model-name:v1.2-beta.3"),
+            ("org/model-name", Some("v1.2-beta.3"))
+        );
+
+        // An empty revision is reported absent, so the caller asks for the default branch
+        // rather than for the empty revision. `HUGGINGFACE_PATH_REGEX` rejects a trailing
+        // colon, so only a caller that built its id some other way reaches this.
+        assert_eq!(
+            split_hf_model_id("org/model-name:"),
+            ("org/model-name", None)
+        );
+    }
+
+    /// The join in `ModelSource::parse_from` and the split in [`split_hf_model_id`] have to be
+    /// inverses. If they drift, a revision-pinned model is fetched from a repo id that has the
+    /// revision glued onto it, which is #12430.
+    #[test]
+    fn hf_model_id_round_trips_through_split() {
+        let cases = [
+            (
+                "hf:BAAI/bge-base-en-v1.5:a5beb1e3",
+                "BAAI/bge-base-en-v1.5",
+                Some("a5beb1e3"),
+            ),
+            (
+                "hf:org/model-name:v1.2-beta.3",
+                "org/model-name",
+                Some("v1.2-beta.3"),
+            ),
+            ("huggingface.co/org/model-name", "org/model-name", None),
+        ];
+
+        for (from, expected_repo, expected_revision) in cases {
+            let model = Model::new(from, "test");
+            let Some(model_id) = model.get_model_id() else {
+                panic!("expected a model id for {from}");
+            };
+            assert_eq!(
+                split_hf_model_id(&model_id),
+                (expected_repo, expected_revision),
+                "round trip lost the revision for {from}"
             );
         }
     }

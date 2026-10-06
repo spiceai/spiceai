@@ -625,13 +625,48 @@ pub(crate) fn validate_model_variant(model: &str) -> Result<AnthropicModelVarian
     Ok(model.to_string())
 }
 
-/// Max tokens, limited by the model variant
+/// Output-token ceiling of Claude 3 and the Claude 1/2/instant generations before it.
+const LEGACY_MAX_TOKENS: u32 = 4096;
+
+/// Output tokens every model from Claude 3.5 onward accepts. Deliberately a floor rather than each
+/// model's own maximum, which is far higher and differs per model: Anthropic requires a request
+/// above roughly 21000 output tokens to stream, so a per-model maximum here would make every
+/// non-streaming request fail. Tracking those maxima would also put this constant back in the
+/// business of going stale, which is the defect that brought us here.
+const MODERN_MAX_TOKENS: u32 = 8192;
+
+/// Model families capped at [`LEGACY_MAX_TOKENS`], as the fragment of the model id that identifies
+/// each. Every id Anthropic has published for these carries one of these fragments in all three
+/// formats `ANTHROPIC_REGEX` accepts — the AWS and GCP forms only add a prefix or a suffix
+/// (`anthropic.claude-3-haiku-20240307-v1:0`, `claude-3-haiku@20240307`).
+///
+/// `claude-3-5-*` and `claude-3-7-*` are absent by construction, and none of these fragments is a
+/// substring of a later id: `claude-3-haiku` does not occur in `claude-3-5-haiku`.
+const LEGACY_MODEL_FRAGMENTS: &[&str] = &[
+    "claude-instant",
+    "claude-1",
+    "claude-v1",
+    "claude-2",
+    "claude-v2",
+    "claude-3-opus",
+    "claude-3-sonnet",
+    "claude-3-haiku",
+];
+
+/// Max tokens to request when the caller sets no limit of its own, limited by the model variant.
 /// Based on: `<https://docs.anthropic.com/en/docs/about-claude/models#model-comparison-table>`
+///
+/// Keyed on the legacy families rather than on an allowlist of current ones so that a model
+/// Anthropic releases after this code was written gets the higher budget. An allowlist silently
+/// truncates every response from a new model at [`LEGACY_MAX_TOKENS`] instead.
 pub fn default_max_tokens(model: &AnthropicModelVariant) -> u32 {
-    if model.as_str().contains("claude-3-5-sonnet") {
-        8192
+    if LEGACY_MODEL_FRAGMENTS
+        .iter()
+        .any(|fragment| model.as_str().contains(fragment))
+    {
+        LEGACY_MAX_TOKENS
     } else {
-        4096
+        MODERN_MAX_TOKENS
     }
 }
 
@@ -735,7 +770,10 @@ pub enum ServiceTier {
 
 #[cfg(test)]
 mod tests {
-    use super::{Usage, validate_model_variant};
+    use super::{
+        LEGACY_MAX_TOKENS, MODERN_MAX_TOKENS, Usage, default_max_tokens, validate_model_variant,
+    };
+    use crate::anthropic::DEFAULT_ANTHROPIC_MODEL;
     use async_openai::types::chat::CompletionUsage;
 
     #[test]
@@ -804,5 +842,76 @@ mod tests {
             let res = validate_model_variant(m);
             assert!(res.is_err(), "model {m} should be invalid");
         }
+    }
+
+    /// Every id Anthropic has published for a family that caps generation at
+    /// [`LEGACY_MAX_TOKENS`], across the three formats `ANTHROPIC_REGEX` accepts. Requesting more
+    /// output tokens than the model allows is rejected outright, so this direction must not
+    /// regress.
+    const LEGACY_MODELS: &[&str] = &[
+        "claude-instant-1.2",
+        "claude-2.0",
+        "claude-2.1",
+        "claude-3-opus-latest",
+        "claude-3-opus-20240229",
+        "claude-3-sonnet-20240229",
+        "claude-3-haiku-20240307",
+        "anthropic.claude-instant-v1",
+        "anthropic.claude-v2",
+        "anthropic.claude-v2:1",
+        "anthropic.claude-3-opus-20240229-v1:0",
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        "claude-3-opus@20240229",
+        "claude-3-haiku@20240307",
+    ];
+
+    #[test]
+    fn legacy_models_keep_their_lower_ceiling() {
+        for model in LEGACY_MODELS {
+            assert_eq!(
+                default_max_tokens(&(*model).to_string()),
+                LEGACY_MAX_TOKENS,
+                "{model} caps generation at {LEGACY_MAX_TOKENS} output tokens, so asking for more \
+                 would be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn models_from_claude_35_onward_get_the_larger_budget() {
+        // `VALID_MODELS` is the list this file already keeps of ids the runtime accepts; the
+        // Claude 3 entries in it are the only ones that belong to a legacy family.
+        let modern = VALID_MODELS
+            .iter()
+            .filter(|model| !LEGACY_MODELS.contains(model))
+            .chain(
+                [
+                    "claude-3-5-sonnet-latest",
+                    "claude-sonnet-5",
+                    "claude-opus-5",
+                ]
+                .iter(),
+            );
+
+        for model in modern {
+            assert_eq!(
+                default_max_tokens(&(*model).to_string()),
+                MODERN_MAX_TOKENS,
+                "{model} accepts at least {MODERN_MAX_TOKENS} output tokens, so a response must \
+                 not be truncated below that"
+            );
+        }
+    }
+
+    /// Regression test for #13557. The ceiling used to be keyed on the single id
+    /// `claude-3-5-sonnet`, which was also the default model — so moving the default off a retired
+    /// id silently halved the output budget of every request that names no model.
+    #[test]
+    fn the_default_model_is_not_truncated_at_the_legacy_ceiling() {
+        assert_eq!(
+            default_max_tokens(&DEFAULT_ANTHROPIC_MODEL.to_string()),
+            MODERN_MAX_TOKENS
+        );
     }
 }

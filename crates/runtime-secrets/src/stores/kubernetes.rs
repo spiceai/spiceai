@@ -25,35 +25,37 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 /// while preserving safe characters like `-`, `_`, and `.` that are valid in secret names.
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'/').add(b'\\');
 use reqwest;
-use runtime_parameter_spec::ParameterSpec;
+use runtime_parameters_derive::TypedParams;
 use secrecy::{ExposeSecret, SecretString, zeroize::Zeroizing};
 use snafu::{ResultExt, Snafu};
 
-/// Parameters accepted by the `kubernetes` secret store.
-pub const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("namespace")
-    .description(
-        "Kubernetes namespace containing the secret. Defaults to the namespace of the \
-         current pod (read from the service-account mount).",
-    )
-    .examples(&["spice", "my-team"])];
+/// Typed `params:` for the `kubernetes` secret store.
+#[derive(Debug, TypedParams)]
+#[params(prefix = "kubernetes", deny_unknown)]
+pub struct KubernetesParams {
+    /// Kubernetes namespace containing the secret. Defaults to the namespace of the
+    /// current pod (read from the service-account mount).
+    #[param(runtime)]
+    pub namespace: Option<String>,
+}
+
+impl KubernetesParams {
+    /// Builds the resolved [`KubernetesConfig`] from the `from:` selector
+    /// (the secret name) and the typed params.
+    #[must_use]
+    pub fn into_config(self, secret_name: String) -> KubernetesConfig {
+        KubernetesConfig {
+            secret_name,
+            namespace: self.namespace,
+        }
+    }
+}
 
 /// Resolved configuration for the `kubernetes` secret store.
 #[derive(Debug, Clone)]
 pub struct KubernetesConfig {
     pub secret_name: String,
     pub namespace: Option<String>,
-}
-
-impl KubernetesConfig {
-    /// Builds a [`KubernetesConfig`] from the parsed selector and a
-    /// validated parameter map.
-    #[must_use]
-    pub fn from_params(secret_name: String, params: &HashMap<String, String>) -> Self {
-        Self {
-            secret_name,
-            namespace: params.get("namespace").cloned(),
-        }
-    }
 }
 
 use crate::SecretStore;

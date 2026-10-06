@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "elasticsearch")]
-pub mod elasticsearch_text;
 pub mod text;
+#[cfg(feature = "elasticsearch")]
+pub mod udtf_text;
 pub mod vector;
 pub mod vector_udtf;

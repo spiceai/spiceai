@@ -1,0 +1,31 @@
+---
+source: tools/testoperator/src/commands/schema/mod.rs
+description: "Schema tables for mssql[catalog]"
+---
++---------------+--------------------+--------------+------------+
+| table_catalog | table_schema       | table_name   | table_type |
++---------------+--------------------+--------------+------------+
+| mssql         | dbo                | customer     | BASE TABLE |
+| mssql         | dbo                | lineitem     | BASE TABLE |
+| mssql         | dbo                | nation       | BASE TABLE |
+| mssql         | dbo                | orders       | BASE TABLE |
+| mssql         | dbo                | part         | BASE TABLE |
+| mssql         | dbo                | partsupp     | BASE TABLE |
+| mssql         | dbo                | region       | BASE TABLE |
+| mssql         | dbo                | supplier     | BASE TABLE |
+| mssql         | information_schema | columns      | VIEW       |
+| mssql         | information_schema | df_settings  | VIEW       |
+| mssql         | information_schema | parameters   | VIEW       |
+| mssql         | information_schema | routines     | VIEW       |
+| mssql         | information_schema | schemata     | VIEW       |
+| mssql         | information_schema | tables       | VIEW       |
+| mssql         | information_schema | views        | VIEW       |
+| spice         | information_schema | columns      | VIEW       |
+| spice         | information_schema | df_settings  | VIEW       |
+| spice         | information_schema | parameters   | VIEW       |
+| spice         | information_schema | routines     | VIEW       |
+| spice         | information_schema | schemata     | VIEW       |
+| spice         | information_schema | tables       | VIEW       |
+| spice         | information_schema | views        | VIEW       |
+| spice         | runtime            | task_history | BASE TABLE |
++---------------+--------------------+--------------+------------+

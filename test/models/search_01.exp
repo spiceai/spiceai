@@ -1,14 +1,16 @@
 #!/usr/bin/expect -f
 
+source [file join [file dirname [info script]] repl_helpers.exp]
+
 # spiced runtime response timeout
 set timeout 5
 
-spawn spice search
+spawn spice search {*}[repl_endpoint_args]
 
 proc perform_search {search_term expected_term} {
     global timeout
 
-    send "$search_term\r"
+    repl_send "$search_term\r"
 
     expect {
         -re $expected_term {
@@ -23,19 +25,44 @@ proc perform_search {search_term expected_term} {
             send_user "Error detected\n"
             exit 1
         }
+        eof {
+            repl_died "Searching for \"$search_term\""
+        }
         timeout {
             send_user "Timeout waiting for expected response\n"
             exit 1
         }
     }
 }
-expect "search>"
+
+proc expect_search_prompt {} {
+    global timeout
+
+    expect {
+        "search>" {
+            # runtime is ready for input
+        }
+        eof {
+            repl_died "Waiting for the search prompt"
+        }
+        timeout {
+            send_user "Timeout waiting for search prompt\n"
+            exit 1
+        }
+    }
+}
+
+expect_search_prompt
 perform_search "Spice runtime error" {1 +\S+ +.* +[0-9]+\.[0-9]+ +spice\.public\.issues}
 
-expect "search>"
+expect_search_prompt
 perform_search "friends" {1 +\S+ +.* +[0-9]+\.[0-9]+ +spice\.public\.catalog_page}
 
+# Every search returned its expected result, so the REPL must still be sitting at
+# its prompt.
+repl_assert_running "Checking the search REPL is still running"
+
 # Signal to exit (Ctrl+C)
-send \x03
+repl_send \x03
 
 exit 0

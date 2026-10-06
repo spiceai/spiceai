@@ -23,6 +23,7 @@ pub mod request;
 pub mod rerank;
 pub mod rrf;
 pub mod search_engine;
+pub mod store_params;
 pub mod table_provider_explorer;
 pub mod types;
 pub mod udtf;

@@ -1,0 +1,22 @@
+[package]
+description = "Filesystem watcher that emits reload events when a Spicepod manifest changes"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "podswatcher"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+notify = "8.2.0"
+parking_lot.workspace = true
+spicepod = { path = "../spicepod" }
+tokio = { workspace = true, features = ["rt", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{borrow::Cow, sync::Arc};
-use tools::{SpiceModelTool, rename::with_name};
+use tools::{SpiceModelTool, naming::encode_tool_name, rename::with_name};
 
 use crate::catalog::SpiceToolCatalog;
 
@@ -59,7 +59,7 @@ impl Tooling {
                     .all()
                     .await
                     .iter()
-                    .map(|t| with_name(t, format!("{catalog_name}/{}", t.name()).as_str()))
+                    .map(|t| with_name(t, encode_tool_name(catalog_name, &t.name()).as_str()))
                     .collect()
             }
         }

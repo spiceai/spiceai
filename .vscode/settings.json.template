@@ -1,6 +1,28 @@
-// Copy the below to `settings.json` and tweak the `features` array to enable optional features in VSCode.
+// Copy this file to `settings.json` and tweak the `features` array to enable optional features in VSCode.
+// Clippy args mirror the CI deny-set in `make lint-rust`, minus `expect_used` (allowed in tests by CI).
 {
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  },
   "rust-analyzer.cargo.features": [],
-  "rust-analyzer.check.extraArgs": ["--", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr", "-Aclippy::module_name_repetitions"],
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.extraArgs": [
+    "--",
+    "-Dwarnings",
+    "-Dclippy::pedantic",
+    "-Dclippy::unwrap_used",
+    "-Dclippy::clone_on_ref_ptr",
+    "-Aclippy::module_name_repetitions",
+    "-Aclippy::large_futures",
+    "-Aclippy::too_many_lines",
+    "-Dclippy::equatable_if_let",
+    "-Dclippy::needless_collect",
+    "-Dclippy::redundant_clone",
+    "-Dclippy::todo",
+    "-Dclippy::assertions_on_result_states",
+    "-Dclippy::allow_attributes",
+    "-Aunfulfilled_lint_expectations"
+  ],
   "yaml.format.singleQuote": true
 }

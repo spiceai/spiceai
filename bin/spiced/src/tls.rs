@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use app::spicepod::component::runtime::TlsConfig as SpicepodTlsConfig;
-use runtime::secrets::{ExposeSecret, ParamStr, Secrets};
-use runtime::tls::{TlsConfig, TlsControl};
-use tokio::sync::{RwLock, RwLockReadGuard};
+use runtime_secrets::{ExposeSecret, ParamStr, Secrets};
+use runtime_tls::{TlsConfig, TlsControl};
+use tokio::sync::RwLock;
 
 use crate::{Args, ClientAuthMode};
 
@@ -78,7 +78,7 @@ pub(crate) async fn load_tls_config(
         return Ok((None, ClientAuthMode::None));
     }
 
-    let secrets = secrets.read().await;
+    let secrets = Secrets::snapshot(&secrets).await;
 
     let app_cert_material = load_spicepod_tls_param(
         &secrets,
@@ -241,15 +241,15 @@ pub(crate) struct ResolvedClientAuth {
 }
 
 /// Translate the binary-level [`ClientAuthMode`] into the runtime's
-/// [`runtime::tls::ClientAuthEnforcement`]. The two enums live in
+/// [`runtime_tls::ClientAuthEnforcement`]. The two enums live in
 /// different crates because the binary mirrors the spicepod surface
 /// (clap-derivable) while the runtime carries the per-listener
 /// behavior bit.
-fn client_auth_enforcement(mode: ClientAuthMode) -> runtime::tls::ClientAuthEnforcement {
+fn client_auth_enforcement(mode: ClientAuthMode) -> runtime_tls::ClientAuthEnforcement {
     match mode {
-        ClientAuthMode::None => runtime::tls::ClientAuthEnforcement::Disabled,
-        ClientAuthMode::Request => runtime::tls::ClientAuthEnforcement::Requested,
-        ClientAuthMode::Required => runtime::tls::ClientAuthEnforcement::Required,
+        ClientAuthMode::None => runtime_tls::ClientAuthEnforcement::Disabled,
+        ClientAuthMode::Request => runtime_tls::ClientAuthEnforcement::Requested,
+        ClientAuthMode::Required => runtime_tls::ClientAuthEnforcement::Required,
     }
 }
 
@@ -270,7 +270,7 @@ fn client_auth_enforcement(mode: ClientAuthMode) -> runtime::tls::ClientAuthEnfo
 async fn resolve_client_auth(
     args: &Args,
     spicepod_tls_config: Option<&SpicepodTlsConfig>,
-    secrets: &RwLockReadGuard<'_, Secrets>,
+    secrets: &Secrets,
 ) -> std::result::Result<ResolvedClientAuth, Box<dyn std::error::Error>> {
     // Mode precedence: CLI > spicepod > default.
     let mode = match args.tls_client_auth_mode {
@@ -336,7 +336,7 @@ fn validate_client_auth(
 }
 
 async fn load_spicepod_tls_param(
-    secrets: &RwLockReadGuard<'_, Secrets>,
+    secrets: &Secrets,
     spicepod_tls_config: Option<&SpicepodTlsConfig>,
     file_field: impl Fn(&SpicepodTlsConfig) -> &Option<String>,
     secret_field: impl Fn(&SpicepodTlsConfig) -> &Option<String>,

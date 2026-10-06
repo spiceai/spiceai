@@ -1,0 +1,155 @@
+name: Build Cayenne doc PDF
+
+# Renders the Cayenne technical reference (docs/cayenne/cayenne.md) to
+# Cayenne.pdf via docs/cayenne/build_pdf.py.
+#
+# Runs on push to trunk or a release branch that touches docs/cayenne/** (or
+# this workflow file), and on manual dispatch — it builds and uploads
+# Cayenne.pdf as a downloadable, linkable artifact of that branch.
+#
+# Diagrams render locally through mermaid-cli, pinned in docs/cayenne/package.json
+# and installed with `npm ci`, so the build depends on nothing but the checkout.
+# The same commit therefore renders the same diagrams every time, and no external
+# service can fail the job — which is why every failure here is a real one and
+# fails the build outright.
+#
+# That determinism is also what lets this run on pull requests: it renders the
+# PDF to prove the document still builds (every mermaid block parses, WeasyPrint
+# succeeds) and uploads the result so a reviewer can read the rendered change.
+
+on:
+  pull_request:
+    paths:
+      - 'docs/cayenne/**'
+      - '.github/workflows/cayenne_doc.yml'
+  push:
+    branches:
+      - trunk
+      - release/**
+    paths:
+      - 'docs/cayenne/**'
+      - '.github/workflows/cayenne_doc.yml'
+  workflow_dispatch:
+
+# Cancel a superseded run for the same ref — a newer push to trunk, a release
+# branch, or a pull request branch, or a re-dispatch of this workflow.
+concurrency:
+  group: cayenne-doc-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build_pdf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: docs/cayenne/package-lock.json
+
+      # WeasyPrint renders via Pango/HarfBuzz; DejaVu supplies the monospace
+      # font the stylesheet requests. Without these the PDF step fails to load
+      # libpango at runtime.
+      - name: Install WeasyPrint native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 \
+            libpangoft2-1.0-0 \
+            libharfbuzz0b \
+            libffi8 \
+            fonts-dejavu-core
+
+      - name: Install Python dependencies
+        # Pin the direct dependencies so an upstream major release can't break
+        # the doc build on an otherwise-unrelated push. Bump deliberately when
+        # updating the doc.
+        run: python3 -m pip install 'markdown==3.9' 'weasyprint==66.0'
+
+      # `--ignore-scripts` keeps the dependency install from running arbitrary
+      # package lifecycle scripts; the one script that matters (puppeteer
+      # fetching its browser) is then run explicitly below, which also means the
+      # browser download does not depend on how a given npm version treats
+      # install scripts.
+      - name: Install mermaid-cli
+        working-directory: docs/cayenne
+        run: npm ci --ignore-scripts
+
+      # Cache the browser mermaid-cli renders in, keyed by the lockfile — the
+      # pinned mermaid-cli and puppeteer versions pin the browser build, so the
+      # lockfile is exactly the key that changes when a different browser is
+      # needed.
+      - name: Cache the headless browser
+        id: browser_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/puppeteer
+          key: puppeteer-${{ runner.os }}-${{ hashFiles('docs/cayenne/package-lock.json') }}
+
+      # Always run, cache hit or not: `browsers install` is idempotent — with the
+      # cache restored it resolves the browser already there instead of
+      # downloading again — and it reports the executable path either way.
+      #
+      # That path is what the render actually launches. Puppeteer's own
+      # resolution fails with "Could not find Chrome (ver. ...)" even when that
+      # exact version sits in the cache directory it names, so build_pdf.py
+      # passes this straight through to mermaid-cli rather than letting
+      # puppeteer look it up.
+      - name: Resolve the headless browser
+        working-directory: docs/cayenne
+        run: |
+          installed=$(npx puppeteer browsers install chrome)
+          echo "$installed"
+          # Output is `<browser>@<version> <path>`; the path may contain spaces,
+          # so strip only through the FIRST space.
+          echo "PUPPETEER_EXECUTABLE_PATH=${installed#* }" >> "$GITHUB_ENV"
+
+      - name: Report the renderer version
+        working-directory: docs/cayenne
+        run: |
+          {
+            echo "mermaid-cli $(./node_modules/.bin/mmdc --version)"
+            echo "browser: $("$PUPPETEER_EXECUTABLE_PATH" --version)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Guard against a stale or uncommitted figure: regenerating waterfall.svg
+      # from gen_waterfall.py must leave the working tree clean. --porcelain
+      # catches a modified, untracked, or missing SVG — any of which means the
+      # generator was edited without committing the regenerated figure, so both
+      # the GitHub view and the PDF would show a stale image.
+      - name: Verify waterfall.svg is up to date
+        working-directory: docs/cayenne
+        run: |
+          python3 gen_waterfall.py
+          if [ -n "$(git status --porcelain -- waterfall.svg)" ]; then
+            echo "waterfall.svg is out of date — run 'python3 gen_waterfall.py' and commit the result." >&2
+            git --no-pager diff -- waterfall.svg
+            exit 1
+          fi
+
+      - name: Build Cayenne PDF
+        working-directory: docs/cayenne
+        run: python3 build_pdf.py
+
+      # Uploaded for every trigger: off trunk or a release branch it is that
+      # branch's linkable build, and on a pull request it is the rendered
+      # document under review.
+      - name: Upload Cayenne PDF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: Cayenne.pdf
+          path: docs/cayenne/Cayenne.pdf
+          if-no-files-found: error

@@ -42,12 +42,13 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{
     Session, TableFunctionImpl, TableProvider, default_table_source::provider_as_source,
 };
+use datafusion::common::TableReference;
 use datafusion::common::{Column, DFSchema, DataFusionError, Result as DataFusionResult, Spans};
 use datafusion::datasource::{MemTable, TableType};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{
     ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Subquery,
-    TableScan, Volatility as DfVolatility,
+    Volatility as DfVolatility,
     simplify::{ExprSimplifyResult, SimplifyContext},
 };
 use datafusion::physical_plan::ExecutionPlan;
@@ -55,9 +56,11 @@ use datafusion::physical_plan::{PhysicalExpr, expressions::CastExpr};
 use datafusion::prelude::{DataFrame, Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::{
-    TableReference,
     parser::DFParser,
-    sqlparser::{ast, dialect::PostgreSqlDialect},
+    sqlparser::{
+        ast,
+        dialect::{Dialect, GenericDialect, PostgreSqlDialect, dialect_from_str},
+    },
 };
 use snafu::{ResultExt, Snafu};
 use spicepod::component::function::{
@@ -66,6 +69,7 @@ use spicepod::component::function::{
 use util::session_state::builder_from_existing;
 
 use crate::user_functions::args_inliner::inline_args_into_plan;
+use crate::user_functions::search_query_rewrite::inline_search_query_args;
 
 pub(crate) const SQL_TABLE_ARGS_TABLE_NAME: &str = "args";
 
@@ -193,7 +197,7 @@ pub fn build_scalar_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
     let arrow_schema = Arc::new(Schema::new(fields));
     let df_schema = DFSchema::try_from(arrow_schema.as_ref().clone()).context(BuildSchemaSnafu)?;
 
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
 
     let logical_expr = ctx
         .parse_sql_expr(body, &df_schema)
@@ -327,13 +331,11 @@ impl ScalarUDFImpl for SqlScalarTableArgUdf {
         #[expect(deprecated)]
         let provider = self.table_func.call(&args)?;
         let table_source = provider_as_source(provider);
-        let table_scan = TableScan::try_new(
+        let table_scan = datafusion::logical_expr::TableScanBuilder::new(
             TableReference::bare(format!("{}_result", self.name)),
             table_source,
-            None,
-            vec![],
-            None,
-        )?;
+        )
+        .build()?;
         Ok(ExprSimplifyResult::Simplified(Expr::ScalarSubquery(
             Subquery {
                 subquery: Arc::new(LogicalPlan::TableScan(table_scan)),
@@ -515,7 +517,26 @@ impl TableProvider for SqlTableProvider {
         )
         .await?;
 
-        let (session_state, plan) = ctx.sql(&self.body).await?.into_parts();
+        // Search UDTFs require their query argument to be a literal while the
+        // SQL planner is constructing the logical plan. The regular args
+        // table cannot satisfy that requirement: its values are only made
+        // literal by `inline_args_into_plan`, after this planning step.
+        // Rewrite search-query argument positions before planning, preserving
+        // the args table for all other references in the body. Parse with
+        // the session's configured SQL dialect so this pre-parse agrees with
+        // the `ctx.sql` planning parse just below.
+        let body = {
+            let dialect: Box<dyn Dialect> =
+                dialect_from_str(state.config_options().sql_parser.dialect.as_ref())
+                    .unwrap_or_else(|| Box::new(GenericDialect {}));
+            inline_search_query_args(
+                &self.body,
+                dialect.as_ref(),
+                self.arg_schema.as_ref(),
+                &self.args,
+            )?
+        };
+        let (session_state, plan) = ctx.sql(&body).await?.into_parts();
         let inlined_plan = inline_args_into_plan(plan, self.arg_schema.as_ref(), &self.args)?;
         let mut df = DataFrame::new(session_state, inlined_plan);
         validate_output_schema(&self.name, df.schema().as_arrow(), self.schema.as_ref())
@@ -820,7 +841,7 @@ fn context_with_args(
             })?;
         SessionContext::new_with_state(builder_from_existing(state).build())
     } else {
-        SessionContext::new()
+        util::session_state::session_context()
     };
     let batch = args_record_batch(Arc::clone(&schema), values)?;
     let table = MemTable::try_new(schema, vec![vec![batch]])?;

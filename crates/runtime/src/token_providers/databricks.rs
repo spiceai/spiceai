@@ -35,7 +35,7 @@ const MIN_TOKEN_REFRESH_WAIT_SECS: u64 = 1;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to obtain Databricks service principal token for machine-to-machine authentication. {source}"
+        "Failed to obtain Databricks service principal token for machine-to-machine authentication: {source}. Machine-to-machine is used whenever `databricks_client_secret` is set, including when it is auto-loaded from the secret stores or the environment (`DATABRICKS_CLIENT_SECRET`, `SPICE_DATABRICKS_CLIENT_SECRET`); set `databricks_auth_mode: u2m` for user-to-machine OAuth instead."
     ))]
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -372,6 +372,70 @@ use token_provider::StaticTokenProvider;
 #[cfg(feature = "databricks")]
 use token_provider::registry::TokenProviderRegistry;
 
+/// The accepted values of the `databricks_auth_mode` parameter, in the order they are documented.
+///
+/// The connector and catalog connector parameter specs share this list so that every accepted value
+/// is also a value [`build_auth_credentials`] dispatches on.
+#[cfg(feature = "databricks")]
+pub const AUTH_MODES: &[&str] = &["auto", "token", "m2m", "u2m"];
+
+/// The description both parameter specs use for `databricks_auth_mode`.
+#[cfg(feature = "databricks")]
+pub const AUTH_MODE_DESCRIPTION: &str = "The authentication mode to use: 'token' for a personal access token, 'm2m' for machine-to-machine service principal credentials, 'u2m' for user-to-machine OAuth, or 'auto' (default) to select from the credentials that are set. Set this explicitly to keep a credential auto-loaded from the environment from selecting another mode.";
+
+/// Which Databricks credential flow to use.
+///
+/// Credentials do not only come from the Spicepod: a `secret` parameter is auto-loaded from the
+/// secret stores and the environment when the Spicepod omits it, so [`AuthMode::Auto`] can infer a
+/// flow the Spicepod author did not ask for — an ambient `DATABRICKS_CLIENT_SECRET` on its own is
+/// enough to select machine-to-machine. An explicit mode pins the flow and ignores the credentials
+/// that flow does not use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "databricks")]
+pub enum AuthMode {
+    /// Infer the flow from whichever credentials are set (default).
+    Auto,
+    /// Personal access token: `databricks_token`.
+    Token,
+    /// Machine-to-machine: `databricks_client_id` + `databricks_client_secret`.
+    M2M,
+    /// User-to-machine OAuth: `databricks_client_id`, authorized in the browser.
+    U2M,
+}
+
+#[cfg(feature = "databricks")]
+impl AuthMode {
+    /// Parses the `databricks_auth_mode` parameter, ASCII-case-insensitively so that the `M2M` and
+    /// `U2M` spellings used in the documentation are accepted alongside `m2m` and `u2m`.
+    fn from_params(params: &Parameters) -> Result<Self, AuthConfigError> {
+        let Some(value) = params.get("auth_mode").expose().ok() else {
+            return Ok(Self::Auto);
+        };
+
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "token" => Ok(Self::Token),
+            "m2m" => Ok(Self::M2M),
+            "u2m" => Ok(Self::U2M),
+            _ => Err(AuthConfigError::InvalidConfiguration {
+                message: format!(
+                    "Invalid `databricks_auth_mode` value: '{value}'. Use one of: {}.",
+                    AUTH_MODES.join(", ")
+                ),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "databricks")]
+fn missing_for_mode(mode: &str, parameter: &str) -> AuthConfigError {
+    AuthConfigError::InvalidConfiguration {
+        message: format!(
+            "`databricks_auth_mode: {mode}` requires `{parameter}`. Set `{parameter}`, or remove `databricks_auth_mode` to select the authentication mode from the credentials that are set"
+        ),
+    }
+}
+
 /// Build auth credentials from parameters.
 #[cfg(feature = "databricks")]
 pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>, AuthConfigError> {
@@ -379,26 +443,52 @@ pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>
     let client_id = params.get("client_id").expose().ok();
     let client_secret = params.get("client_secret").ok();
 
-    match (token, client_id, client_secret) {
-        (Some(token), None, None) => Ok(AuthCredentials::Token(token)),
-        (None, Some(client_id), None) => Ok(AuthCredentials::U2M(client_id)),
-        (None, Some(client_id), Some(client_secret)) => {
-            Ok(AuthCredentials::ServicePrincipal(client_id, client_secret))
-        }
-        (None, None, None) => Err(AuthConfigError::InvalidConfiguration {
-            message: "Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters".to_string(),
+    match AuthMode::from_params(params)? {
+        AuthMode::Token => token.map(AuthCredentials::Token).ok_or_else(|| {
+            missing_for_mode("token", "databricks_token")
         }),
-        (None, None, Some(_)) => Err(AuthConfigError::MissingParameter {
-            parameter: "databricks_client_id".to_string(),
-        }),
-        (Some(_), Some(_), Some(_) | None) => Err(AuthConfigError::InvalidConfiguration {
-            message: "Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`".to_string(),
-        }),
-        _ => Err(AuthConfigError::InvalidConfiguration {
-            message: "Invalid authentication configuration. Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`".to_string(),
-        }),
+        AuthMode::M2M => match (client_id, client_secret) {
+            (Some(client_id), Some(client_secret)) => {
+                Ok(AuthCredentials::ServicePrincipal(client_id, client_secret))
+            }
+            (None, _) => Err(missing_for_mode("m2m", "databricks_client_id")),
+            (Some(_), None) => Err(missing_for_mode("m2m", "databricks_client_secret")),
+        },
+        // U2M deliberately ignores `databricks_client_secret` and `databricks_token`: pinning the
+        // mode is how a Spicepod opts out of an ambient service-principal secret or token
+        // redirecting it to another flow.
+        AuthMode::U2M => client_id
+            .map(AuthCredentials::U2M)
+            .ok_or_else(|| missing_for_mode("u2m", "databricks_client_id")),
+        AuthMode::Auto => match (token, client_id, client_secret) {
+            (Some(token), None, None) => Ok(AuthCredentials::Token(token)),
+            (None, Some(client_id), None) => Ok(AuthCredentials::U2M(client_id)),
+            (None, Some(client_id), Some(client_secret)) => {
+                tracing::debug!(
+                    "Databricks authentication: machine-to-machine, because `databricks_client_secret` is set. Set `databricks_auth_mode: u2m` for user-to-machine OAuth."
+                );
+                Ok(AuthCredentials::ServicePrincipal(client_id, client_secret))
+            }
+            (None, None, None) => Err(AuthConfigError::InvalidConfiguration {
+                message: "Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters".to_string(),
+            }),
+            (None, None, Some(_)) => Err(AuthConfigError::MissingParameter {
+                parameter: "databricks_client_id".to_string(),
+            }),
+            (Some(_), Some(_), _) | (Some(_), None, Some(_)) => {
+                Err(AuthConfigError::InvalidConfiguration {
+                    message: AMBIGUOUS_CREDENTIALS_MESSAGE.to_string(),
+                })
+            }
+        },
     }
 }
+
+/// Both a token and service-principal credentials are set. Parameters absent from the Spicepod are
+/// auto-loaded from the secret stores and the environment, so this is reachable without the
+/// Spicepod setting both — say so, and point at the parameter that resolves it.
+#[cfg(feature = "databricks")]
+pub const AMBIGUOUS_CREDENTIALS_MESSAGE: &str = "Both `databricks_token` and service principal credentials (`databricks_client_id`/`databricks_client_secret`) are set, which select different authentication modes. Parameters left out of the Spicepod are auto-loaded from the secret stores and the environment (`DATABRICKS_TOKEN`, `DATABRICKS_CLIENT_SECRET`, `SPICE_DATABRICKS_*`), so one of them may not come from the Spicepod. Unset the credential you do not want, or set `databricks_auth_mode` to `token`, `m2m` or `u2m` to choose the mode explicitly";
 
 /// Error type for auth configuration.
 #[derive(Debug, Snafu)]
@@ -474,6 +564,237 @@ pub async fn get_u2m_token_provider(
         .map_err(|err| Error::UnableToGetToken {
             source: Box::new(err),
         })
+}
+
+#[cfg(all(test, feature = "databricks"))]
+mod auth_mode_tests {
+    use super::*;
+    use crate::catalogconnector::databricks::PARAMETERS;
+
+    fn parameters(params: &[(&str, &str)]) -> Parameters {
+        Parameters::new(
+            params
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), SecretString::from(*value)))
+                .collect(),
+            "databricks",
+            PARAMETERS,
+        )
+    }
+
+    /// Every value the parameter spec accepts must be a value `build_auth_credentials` dispatches
+    /// on, or the runtime would accept a mode it then ignores.
+    #[test]
+    fn every_accepted_auth_mode_is_dispatched() {
+        for mode in AUTH_MODES {
+            let params = parameters(&[("auth_mode", mode)]);
+            assert!(
+                AuthMode::from_params(&params).is_ok(),
+                "`{mode}` is in AUTH_MODES but is not parsed by AuthMode::from_params"
+            );
+        }
+
+        let spec = PARAMETERS
+            .iter()
+            .find(|spec| spec.name == "auth_mode")
+            .expect("the Databricks catalog connector declares an `auth_mode` parameter");
+        assert_eq!(spec.one_of, Some(AUTH_MODES));
+    }
+
+    #[test]
+    fn auth_mode_parses_documented_uppercase_spellings() {
+        for (value, expected) in [
+            ("U2M", AuthMode::U2M),
+            ("M2M", AuthMode::M2M),
+            ("Token", AuthMode::Token),
+            ("AUTO", AuthMode::Auto),
+        ] {
+            let params = parameters(&[("auth_mode", value)]);
+            assert_eq!(
+                AuthMode::from_params(&params).expect("mode should parse"),
+                expected,
+                "`auth_mode: {value}` should parse as {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_mode_rejects_unknown_value() {
+        let params = parameters(&[("auth_mode", "oauth")]);
+        let error = AuthMode::from_params(&params).expect_err("unknown mode should be rejected");
+        assert!(
+            error.to_string().contains("auto, token, m2m, u2m"),
+            "error should list the accepted modes, got: {error}"
+        );
+    }
+
+    #[test]
+    fn missing_auth_mode_defaults_to_auto() {
+        let params = parameters(&[("client_id", "id")]);
+        assert_eq!(
+            AuthMode::from_params(&params).expect("absent mode should default"),
+            AuthMode::Auto
+        );
+    }
+
+    /// Regression test for #11508: a `databricks_client_secret` the Spicepod never set — it is
+    /// auto-loaded from the environment — must not redirect a U2M dataset to machine-to-machine.
+    #[test]
+    fn u2m_mode_ignores_autoloaded_client_secret() {
+        let params = parameters(&[
+            ("auth_mode", "u2m"),
+            ("client_id", "client-id"),
+            ("client_secret", "ambient-secret"),
+        ]);
+
+        match build_auth_credentials(&params).expect("u2m should be selected") {
+            AuthCredentials::U2M(client_id) => assert_eq!(client_id, "client-id"),
+            other => panic!("expected U2M, got {other:?}"),
+        }
+    }
+
+    /// The same shape one step earlier: with an ambient token as well, `auto` cannot decide at all
+    /// (and errors), while an explicit mode still resolves.
+    #[test]
+    fn u2m_mode_ignores_autoloaded_token() {
+        let credentials = [("client_id", "client-id"), ("token", "ambient-token")];
+
+        let auto = build_auth_credentials(&parameters(&credentials))
+            .expect_err("auto cannot choose between a token and a client id");
+        assert!(
+            auto.to_string().contains("databricks_auth_mode"),
+            "the ambiguous-credentials error should point at `databricks_auth_mode`, got: {auto}"
+        );
+
+        let mut with_mode = credentials.to_vec();
+        with_mode.push(("auth_mode", "u2m"));
+        match build_auth_credentials(&parameters(&with_mode)).expect("u2m should be selected") {
+            AuthCredentials::U2M(client_id) => assert_eq!(client_id, "client-id"),
+            other => panic!("expected U2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_mode_ignores_service_principal_credentials() {
+        let params = parameters(&[
+            ("auth_mode", "token"),
+            ("token", "pat"),
+            ("client_id", "client-id"),
+            ("client_secret", "ambient-secret"),
+        ]);
+
+        match build_auth_credentials(&params).expect("token should be selected") {
+            AuthCredentials::Token(token) => assert_eq!(token.expose_secret(), "pat"),
+            other => panic!("expected Token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m2m_mode_ignores_token() {
+        let params = parameters(&[
+            ("auth_mode", "m2m"),
+            ("token", "ambient-token"),
+            ("client_id", "client-id"),
+            ("client_secret", "secret"),
+        ]);
+
+        match build_auth_credentials(&params).expect("m2m should be selected") {
+            AuthCredentials::ServicePrincipal(client_id, secret) => {
+                assert_eq!(client_id, "client-id");
+                assert_eq!(secret.expose_secret(), "secret");
+            }
+            other => panic!("expected ServicePrincipal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_modes_name_the_credential_they_need() {
+        for (mode, credentials, expected_parameter) in [
+            ("token", vec![("client_id", "id")], "databricks_token"),
+            ("m2m", vec![("token", "pat")], "databricks_client_id"),
+            ("m2m", vec![("client_id", "id")], "databricks_client_secret"),
+            (
+                "u2m",
+                vec![("client_secret", "secret")],
+                "databricks_client_id",
+            ),
+        ] {
+            let mut params = credentials;
+            params.push(("auth_mode", mode));
+            let error = build_auth_credentials(&parameters(&params))
+                .expect_err("the credential the mode needs is missing");
+            let message = error.to_string();
+            assert!(
+                message.contains(expected_parameter) && message.contains(mode),
+                "`auth_mode: {mode}` should name `{expected_parameter}`, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_mode_selection_is_unchanged() {
+        match build_auth_credentials(&parameters(&[("token", "pat")]))
+            .expect("a token alone selects token authentication")
+        {
+            AuthCredentials::Token(token) => assert_eq!(token.expose_secret(), "pat"),
+            other => panic!("expected Token, got {other:?}"),
+        }
+
+        match build_auth_credentials(&parameters(&[("client_id", "id")]))
+            .expect("a client id alone selects U2M")
+        {
+            AuthCredentials::U2M(client_id) => assert_eq!(client_id, "id"),
+            other => panic!("expected U2M, got {other:?}"),
+        }
+
+        match build_auth_credentials(&parameters(&[
+            ("client_id", "id"),
+            ("client_secret", "secret"),
+        ]))
+        .expect("a client id and secret select M2M")
+        {
+            AuthCredentials::ServicePrincipal(client_id, secret) => {
+                assert_eq!(client_id, "id");
+                assert_eq!(secret.expose_secret(), "secret");
+            }
+            other => panic!("expected ServicePrincipal, got {other:?}"),
+        }
+
+        let missing = build_auth_credentials(&parameters(&[]))
+            .expect_err("no credentials at all is an error");
+        assert!(
+            missing.to_string().contains(
+                "Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters"
+            ),
+            "got: {missing}"
+        );
+
+        let no_client_id = build_auth_credentials(&parameters(&[("client_secret", "secret")]))
+            .expect_err("a client secret without a client id is an error");
+        assert!(
+            no_client_id.to_string().contains("databricks_client_id"),
+            "got: {no_client_id}"
+        );
+
+        // A token beside a client secret is still ambiguous even though no client id makes M2M
+        // possible, so the mode stays a deliberate choice rather than an inferred one.
+        for ambiguous in [
+            vec![("token", "pat"), ("client_id", "id")],
+            vec![("token", "pat"), ("client_secret", "secret")],
+            vec![
+                ("token", "pat"),
+                ("client_id", "id"),
+                ("client_secret", "secret"),
+            ],
+        ] {
+            let error = build_auth_credentials(&parameters(&ambiguous))
+                .expect_err("a token beside service principal credentials is ambiguous");
+            assert!(
+                error.to_string().contains("databricks_auth_mode"),
+                "got: {error}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

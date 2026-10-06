@@ -11,7 +11,7 @@ description: "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search(q
   {
     "id": 1303,
     "answer": "The metallic bonds become longer and weaker as the atoms get larger, resulting in lower boiling points.",
-    "_score": 0.213
+    "_score": 0.212
   },
   {
     "id": 449,

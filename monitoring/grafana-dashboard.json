@@ -100,7 +100,7 @@
       },
       "id": 100,
       "panels": [],
-      "title": "🏠 System Overview",
+      "title": "\ud83c\udfe0 System Overview",
       "type": "row"
     },
     {
@@ -163,7 +163,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "sum(runtime_flight_server_started{instance=~\"$instances\"})",
+          "expr": "sum(runtime_flight_server_started{instance=~\"($instances)\"})",
           "instant": true,
           "legendFormat": "__auto",
           "range": false,
@@ -229,7 +229,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "sum(dataset_active_count{instance=~\"$instances\"})",
+          "expr": "sum(dataset_active_count{instance=~\"($instances)\"})",
           "instant": true,
           "legendFormat": "__auto",
           "range": false,
@@ -295,7 +295,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "sum(model_active_count{instance=~\"$instances\"})",
+          "expr": "sum(model_active_count{instance=~\"($instances)\"})",
           "instant": true,
           "legendFormat": "__auto",
           "range": false,
@@ -361,7 +361,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "sum(embeddings_active_count{instance=~\"$instances\"})",
+          "expr": "sum(embeddings_active_count{instance=~\"($instances)\"})",
           "instant": true,
           "legendFormat": "__auto",
           "range": false,
@@ -427,7 +427,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "sum(tool_active_count{instance=~\"$instances\"})",
+          "expr": "sum(tool_active_count{instance=~\"($instances)\"})",
           "instant": true,
           "legendFormat": "__auto",
           "range": false,
@@ -532,7 +532,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "(sum by(instance) (count_over_time(runtime_flight_server_started{instance=~\"$instances\"}[$__range])) * 30000) / $__range_ms * 100",
+          "expr": "(sum by(instance) (count_over_time(runtime_flight_server_started{instance=~\"($instances)\"}[$__range])) * 30000) / $__range_ms * 100",
           "instant": true,
           "legendFormat": "__auto",
           "range": false,
@@ -575,7 +575,7 @@
       },
       "id": 200,
       "panels": [],
-      "title": "📊 Query Performance",
+      "title": "\ud83d\udcca Query Performance",
       "type": "row"
     },
     {
@@ -665,7 +665,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile($percentile, sum by (le, protocol) (rate(query_duration_ms_bucket{instance=~\"$instances\"}[$__rate_interval])))\n",
+          "expr": "histogram_quantile($percentile, sum by (le, protocol) (rate(query_duration_ms_bucket{instance=~\"($instances)\"}[$__rate_interval])))\n",
           "legendFormat": "{{protocol}}",
           "range": true,
           "refId": "A"
@@ -760,7 +760,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (protocol) (increase(query_executions{instance=~\"$instances\"}[$__rate_interval]))",
+          "expr": "sum by (protocol) (increase(query_executions{instance=~\"($instances)\"}[$__rate_interval]))",
           "legendFormat": "{{protocol}}",
           "range": true,
           "refId": "A"
@@ -856,7 +856,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (protocol) (query_active_count{instance=~\"$instances\"})",
+          "expr": "sum by (protocol) (query_active_count{instance=~\"($instances)\"})",
           "legendFormat": "{{protocol}}",
           "range": true,
           "refId": "A"
@@ -951,7 +951,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (err_code) (increase(query_failures{instance=~\"$instances\"}[$__rate_interval]) > 0)",
+          "expr": "sum by (err_code) (increase(query_failures{instance=~\"($instances)\"}[$__rate_interval]) > 0)",
           "legendFormat": "{{err_code}}",
           "range": true,
           "refId": "A"
@@ -1046,7 +1046,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile($percentile, sum by (protocol, le) (rate(query_returned_rows_bucket{instance=~\"$instances\"}[$__rate_interval])))\n",
+          "expr": "histogram_quantile($percentile, sum by (protocol, le) (rate(query_returned_rows_bucket{instance=~\"($instances)\"}[$__rate_interval])))\n",
           "legendFormat": "{{protocol}}",
           "range": true,
           "refId": "A"
@@ -1078,7 +1078,7 @@
       },
       "id": 210,
       "panels": [],
-      "title": "📈 Data Throughput",
+      "title": "\ud83d\udcc8 Data Throughput",
       "type": "row"
     },
     {
@@ -1168,7 +1168,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(query_processed_bytes{instance=~\"$instances\"}[$__rate_interval]))",
+          "expr": "sum(rate(query_processed_bytes{instance=~\"($instances)\"}[$__rate_interval]))",
           "legendFormat": "Processed",
           "range": true,
           "refId": "A"
@@ -1179,7 +1179,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(query_returned_bytes{instance=~\"$instances\"}[$__rate_interval]))",
+          "expr": "sum(rate(query_returned_bytes{instance=~\"($instances)\"}[$__rate_interval]))",
           "legendFormat": "Returned",
           "range": true,
           "refId": "B"
@@ -1274,7 +1274,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(query_spilled_bytes{instance=~\"$instances\"}[$__rate_interval]))",
+          "expr": "sum(increase(query_spilled_bytes{instance=~\"($instances)\"}[$__rate_interval]))",
           "legendFormat": "Spilled Bytes",
           "range": true,
           "refId": "A"
@@ -1293,7 +1293,7 @@
       },
       "id": 300,
       "panels": [],
-      "title": "⚡ Accelerated Datasets",
+      "title": "\u26a1 Accelerated Datasets",
       "type": "row"
     },
     {
@@ -1371,7 +1371,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "1000 * time() - dataset_acceleration_last_refresh_unix_time_ms{instance=~\"$instances\", dataset!~\"runtime.*\"}",
+          "expr": "1000 * time() - dataset_acceleration_last_refresh_unix_time_ms{instance=~\"($instances)\", dataset!~\"runtime.*\"}",
           "legendFormat": "{{dataset}}",
           "range": true,
           "refId": "A"
@@ -1467,7 +1467,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile($percentile, sum by (le, dataset) (dataset_acceleration_refresh_duration_ms_bucket{instance=~\"$instances\", dataset!~\"runtime.*\"}))",
+          "expr": "histogram_quantile($percentile, sum by (le, dataset) (dataset_acceleration_refresh_duration_ms_bucket{instance=~\"($instances)\", dataset!~\"runtime.*\"}))",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -1562,7 +1562,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (dataset) (increase(dataset_acceleration_refresh_errors{instance=~\"$instances\"}[$__rate_interval]) > 0)",
+          "expr": "sum by (dataset) (increase(dataset_acceleration_refresh_errors{instance=~\"($instances)\"}[$__rate_interval]) > 0)",
           "legendFormat": "{{dataset}}",
           "range": true,
           "refId": "A"
@@ -1576,7 +1576,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "How far behind the data was at the time of the last refresh. Calculated as: (wall clock time when refresh completed) − (max timestamp in the refreshed data)",
+      "description": "How far behind the data was at the time of the last refresh. Calculated as: (wall clock time when refresh completed) \u2212 (max timestamp in the refreshed data)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1643,7 +1643,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "dataset_acceleration_ingestion_lag_ms{instance=~\"$instances\", dataset!~\"runtime.*\"}",
+          "expr": "dataset_acceleration_ingestion_lag_ms{instance=~\"($instances)\", dataset!~\"runtime.*\"}",
           "legendFormat": "{{dataset}}",
           "range": true,
           "refId": "A"
@@ -1716,7 +1716,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "dataset_acceleration_refresh_lag_ms{instance=~\"$instances\", dataset!~\"runtime.*\"}",
+          "expr": "dataset_acceleration_refresh_lag_ms{instance=~\"($instances)\", dataset!~\"runtime.*\"}",
           "legendFormat": "{{dataset}}",
           "range": true,
           "refId": "A"
@@ -1810,7 +1810,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "1000 * time() - dataset_acceleration_max_timestamp_after_refresh_ms{instance=~\"$instances\", dataset!~\"runtime.*\"}",
+          "expr": "1000 * time() - dataset_acceleration_max_timestamp_after_refresh_ms{instance=~\"($instances)\", dataset!~\"runtime.*\"}",
           "legendFormat": "{{dataset}}",
           "range": true,
           "refId": "A"
@@ -1829,7 +1829,7 @@
       },
       "id": 400,
       "panels": [],
-      "title": "💾 Results Cache",
+      "title": "\ud83d\udcbe Results Cache",
       "type": "row"
     },
     {
@@ -1899,7 +1899,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "avg(results_cache_hit_ratio{instance=~\"$instances\"}) * 100",
+          "expr": "avg(results_cache_hit_ratio{instance=~\"($instances)\"}) * 100",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -2009,7 +2009,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * sum(increase(results_cache_hits{instance=~\"$instances\"}[$__rate_interval])) / sum(increase(results_cache_requests{instance=~\"$instances\"}[$__rate_interval]))",
+          "expr": "100 * sum(increase(results_cache_hits{instance=~\"($instances)\"}[$__rate_interval])) / sum(increase(results_cache_requests{instance=~\"($instances)\"}[$__rate_interval]))",
           "legendFormat": "Hit",
           "range": true,
           "refId": "A"
@@ -2020,7 +2020,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * (1 - sum(increase(results_cache_hits{instance=~\"$instances\"}[$__rate_interval])) / sum(increase(results_cache_requests{instance=~\"$instances\"}[$__rate_interval])))",
+          "expr": "100 * (1 - sum(increase(results_cache_hits{instance=~\"($instances)\"}[$__rate_interval])) / sum(increase(results_cache_requests{instance=~\"($instances)\"}[$__rate_interval])))",
           "legendFormat": "Miss",
           "range": true,
           "refId": "B"
@@ -2138,7 +2138,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(results_cache_size_bytes{instance=~\"$instances\"})",
+          "expr": "sum(results_cache_size_bytes{instance=~\"($instances)\"})",
           "legendFormat": "Used",
           "range": true,
           "refId": "A"
@@ -2149,7 +2149,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(results_cache_max_size_bytes{instance=~\"$instances\"})",
+          "expr": "sum(results_cache_max_size_bytes{instance=~\"($instances)\"})",
           "legendFormat": "Max Capacity",
           "range": true,
           "refId": "B"
@@ -2244,7 +2244,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(results_cache_items_count{instance=~\"$instances\"})",
+          "expr": "sum(results_cache_items_count{instance=~\"($instances)\"})",
           "legendFormat": "Items",
           "range": true,
           "refId": "A"
@@ -2339,7 +2339,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(results_cache_evictions{instance=~\"$instances\"}[$__rate_interval]))",
+          "expr": "sum(increase(results_cache_evictions{instance=~\"($instances)\"}[$__rate_interval]))",
           "legendFormat": "Evictions",
           "range": true,
           "refId": "A"
@@ -2434,7 +2434,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(results_cache_swr_background_query_count{instance=~\"$instances\"}[$__rate_interval]))",
+          "expr": "sum(increase(results_cache_swr_background_query_count{instance=~\"($instances)\"}[$__rate_interval]))",
           "legendFormat": "SWR Background Queries",
           "range": true,
           "refId": "A"
@@ -2540,7 +2540,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile($percentile, sum by (le, method, path) (rate(http_requests_duration_ms_bucket{instance=~\"$instances\"}[$__rate_interval])))\n",
+              "expr": "histogram_quantile($percentile, sum by (le, method, path) (rate(http_requests_duration_ms_bucket{instance=~\"($instances)\"}[$__rate_interval])))\n",
               "legendFormat": "{{method}} {{path}}",
               "range": true,
               "refId": "A"
@@ -2635,7 +2635,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum by (method, path, status) (increase(http_requests{instance=~\"$instances\"}[$__rate_interval]))",
+              "expr": "sum by (method, path, status) (increase(http_requests{instance=~\"($instances)\"}[$__rate_interval]))",
               "legendFormat": "{{method}} {{path}} ({{status}})",
               "range": true,
               "refId": "A"
@@ -2645,7 +2645,7 @@
           "type": "timeseries"
         }
       ],
-      "title": "🌐 HTTP API",
+      "title": "\ud83c\udf10 HTTP API",
       "type": "row"
     },
     {
@@ -2745,7 +2745,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile($percentile, sum by (le, command) (rate(flight_request_duration_ms_bucket{instance=~\"$instances\", method=\"do_get\"}[$__rate_interval])))",
+              "expr": "histogram_quantile($percentile, sum by (le, command) (rate(flight_request_duration_ms_bucket{instance=~\"($instances)\", method=\"do_get\"}[$__rate_interval])))",
               "legendFormat": "{{command}}",
               "range": true,
               "refId": "A"
@@ -2841,7 +2841,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile($percentile, sum by (le, command) (rate(flight_request_duration_ms_bucket{instance=~\"$instances\", method=\"do_put\"}[$__rate_interval])))",
+              "expr": "histogram_quantile($percentile, sum by (le, command) (rate(flight_request_duration_ms_bucket{instance=~\"($instances)\", method=\"do_put\"}[$__rate_interval])))",
               "legendFormat": "{{command}} P{{quantile}}",
               "range": true,
               "refId": "A"
@@ -2937,7 +2937,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile($percentile, sum by (le, command) (rate(flight_request_duration_ms_bucket{instance=~\"$instances\", method=\"get_flight_info\"}[$__rate_interval])))",
+              "expr": "histogram_quantile($percentile, sum by (le, command) (rate(flight_request_duration_ms_bucket{instance=~\"($instances)\", method=\"get_flight_info\"}[$__rate_interval])))",
               "legendFormat": "{{command}} P{{quantile}}",
               "range": true,
               "refId": "A"
@@ -3045,7 +3045,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum by (method) (increase(flight_requests{instance=~\"$instances\"}[$__rate_interval]))",
+              "expr": "sum by (method) (increase(flight_requests{instance=~\"($instances)\"}[$__rate_interval]))",
               "legendFormat": "{{method}}",
               "range": true,
               "refId": "A"
@@ -3140,7 +3140,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum(increase(flight_do_exchange_data_updates_sent{instance=~\"$instances\"}[$__rate_interval]))",
+              "expr": "sum(increase(flight_do_exchange_data_updates_sent{instance=~\"($instances)\"}[$__rate_interval]))",
               "legendFormat": "Data Updates Sent",
               "range": true,
               "refId": "A"
@@ -3150,7 +3150,7 @@
           "type": "timeseries"
         }
       ],
-      "title": "✈️ Arrow Flight Operations",
+      "title": "\u2708\ufe0f Arrow Flight Operations",
       "type": "row"
     },
     {
@@ -3251,7 +3251,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "dataset_kafka_records_lag{instance=~\"$instances\"}",
+              "expr": "dataset_kafka_records_lag{instance=~\"($instances)\"}",
               "legendFormat": "{{name}}",
               "range": true,
               "refId": "A"
@@ -3348,7 +3348,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "rate(dataset_kafka_records_consumed_total{instance=~\"$instances\"}[$__rate_interval])",
+              "expr": "rate(dataset_kafka_records_consumed_total{instance=~\"($instances)\"}[$__rate_interval])",
               "legendFormat": "{{name}}",
               "range": true,
               "refId": "A"
@@ -3358,7 +3358,7 @@
           "type": "timeseries"
         }
       ],
-      "title": "⏩  Debezium Ingestion",
+      "title": "\u23e9  Debezium Ingestion",
       "type": "row"
     },
     {
@@ -3457,7 +3457,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "dataset_dynamodb_lag_ms{instance=~\"$instances\"}",
+              "expr": "dataset_dynamodb_lag_ms{instance=~\"($instances)\"}",
               "legendFormat": "{{name}}",
               "range": true,
               "refId": "A"
@@ -3552,7 +3552,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "rate(dataset_dynamodb_records_consumed_total{instance=~\"$instances\"}[$__rate_interval])",
+              "expr": "rate(dataset_dynamodb_records_consumed_total{instance=~\"($instances)\"}[$__rate_interval])",
               "legendFormat": "{{name}}",
               "range": true,
               "refId": "A"
@@ -3647,7 +3647,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "dataset_dynamodb_shards_active{instance=~\"$instances\"}",
+              "expr": "dataset_dynamodb_shards_active{instance=~\"($instances)\"}",
               "legendFormat": "{{name}}",
               "range": true,
               "refId": "A"
@@ -3742,7 +3742,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "rate(dataset_dynamodb_errors_transient_total{instance=~\"$instances\"}[1m])",
+              "expr": "rate(dataset_dynamodb_errors_transient_total{instance=~\"($instances)\"}[1m])",
               "legendFormat": "{{name}}",
               "range": true,
               "refId": "A"
@@ -3752,7 +3752,7 @@
           "type": "timeseries"
         }
       ],
-      "title": "⏩ DynamoDB Streams Ingestion",
+      "title": "\u23e9 DynamoDB Streams Ingestion",
       "type": "row"
     },
     {
@@ -3853,7 +3853,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile($percentile, sum by (le, dataset) (rate(dataset_acceleration_snapshot_write_duration_ms_bucket{instance=~\"$instances\"}[$__rate_interval])))",
+              "expr": "histogram_quantile($percentile, sum by (le, dataset) (rate(dataset_acceleration_snapshot_write_duration_ms_bucket{instance=~\"($instances)\"}[$__rate_interval])))",
               "legendFormat": "__auto",
               "range": true,
               "refId": "A"
@@ -3950,7 +3950,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "dataset_acceleration_snapshot_write_bytes{instance=~\"$instances\"}",
+              "expr": "dataset_acceleration_snapshot_write_bytes{instance=~\"($instances)\"}",
               "legendFormat": "{{dataset}}",
               "range": true,
               "refId": "A"
@@ -4047,7 +4047,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "dataset_acceleration_snapshot_bootstrap_duration_ms{instance=~\"$instances\"}",
+              "expr": "dataset_acceleration_snapshot_bootstrap_duration_ms{instance=~\"($instances)\"}",
               "legendFormat": "{{dataset}}",
               "range": true,
               "refId": "A"
@@ -4057,7 +4057,7 @@
           "type": "timeseries"
         }
       ],
-      "title": "📦 Acceleration Snapshots",
+      "title": "\ud83d\udce6 Acceleration Snapshots",
       "type": "row"
     },
     {
@@ -4067,6 +4067,829 @@
         "w": 24,
         "x": 0,
         "y": 63
+      },
+      "id": 920,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "none"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 113
+          },
+          "id": 921,
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "11.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "spiced_cpu_budget_cores{instance=~\"($instances)\"}",
+              "legendFormat": "{{instance}} ({{source}})",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "CPU Cores",
+          "type": "timeseries",
+          "description": "How many CPU cores this instance sizes itself for (thread pools, query parallelism, accelerator concurrency). Comes from runtime.cpu.cores, --cpu-cores, SPICE_CPU_CORES, or automatic detection. Legend source shows how the value was chosen (config, container limit, host affinity, \u2026)."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "none"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 113
+          },
+          "id": 922,
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "11.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "spiced_cpu_budget_millicores{instance=~\"($instances)\"}",
+              "legendFormat": "budget {{instance}} ({{source}})",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "spiced_cpu_limit_millicores{instance=~\"($instances)\"}",
+              "legendFormat": "limit {{instance}}",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "spiced_cpu_request_millicores{instance=~\"($instances)\"}",
+              "legendFormat": "request {{instance}}",
+              "range": true,
+              "refId": "C"
+            }
+          ],
+          "title": "CPU Entitlement",
+          "type": "timeseries",
+          "description": "CPU millicores the instance is sized for (budget) compared with the container CPU limit and request when present. A budget much higher than the limit often means the instance sized itself for the whole node \u2014 set runtime.cpu.cores to match the allocation."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "none"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 121
+          },
+          "id": 923,
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "11.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "tokio_runtime_workers{instance=~\"($instances)\"}",
+              "legendFormat": "{{instance}} / {{runtime}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Worker Threads",
+          "type": "timeseries",
+          "description": "Worker threads in each runtime pool (main, cpu, refresh, cdc_apply, compaction). Should roughly match CPU Cores \u2014 a large gap suggests the instance is over- or under-sized for its CPU entitlement."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "none"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 121
+          },
+          "id": 924,
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "11.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "tokio_runtime_alive_tasks{instance=~\"($instances)\"}",
+              "legendFormat": "{{instance}} / {{runtime}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Active Tasks",
+          "type": "timeseries",
+          "description": "In-flight work items per runtime pool. Rising under load is expected; a sustained climb together with Queued Tasks usually means the instance is saturated and needs more CPU or less concurrency."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "none"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 121
+          },
+          "id": 925,
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "11.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "tokio_runtime_global_queue_depth{instance=~\"($instances)\"}",
+              "legendFormat": "{{instance}} / {{runtime}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Queued Tasks",
+          "type": "timeseries",
+          "description": "Work waiting to run in each runtime pool. Near-zero is healthy. Growing or stuck depth means tasks arrive faster than workers can process them \u2014 check CPU Cores, Worker Threads, and concurrent query load."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "decbytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 129
+          },
+          "id": 926,
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "11.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "process_resident_memory_bytes{instance=~\"($instances)\"}",
+              "legendFormat": "{{instance}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Process Memory",
+          "type": "timeseries",
+          "description": "Resident memory of the spiced process (RSS) \u2014 what the OS uses for OOM decisions. Compare with Query Memory and Compaction Memory; a large gap is memory outside those pools (caches, accelerators, native libraries)."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "decbytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 129
+          },
+          "id": 927,
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "11.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "query_memory_pool_used_bytes{instance=~\"($instances)\"}",
+              "legendFormat": "{{instance}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Query Memory",
+          "type": "timeseries",
+          "description": "Memory currently reserved for query execution. Rising toward the configured memory limit, or alongside spill metrics, indicates memory pressure on queries."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "decbytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 129
+          },
+          "id": 928,
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "11.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "cayenne_compaction_memory_pool_used_bytes{instance=~\"($instances)\"}",
+              "legendFormat": "used {{instance}}",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "editorMode": "code",
+              "expr": "cayenne_compaction_memory_pool_bytes{instance=~\"($instances)\"}",
+              "legendFormat": "budget {{instance}}",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "Compaction Memory",
+          "type": "timeseries",
+          "description": "Memory used by background compaction versus the reserved compaction budget. Used near budget (or compaction failures) means the carve is too small for the rewrite working set. Empty when compaction is not enabled for any dataset."
+        }
+      ],
+      "title": "\u2699\ufe0f Runtime Resources",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 64
       },
       "id": 914,
       "panels": [
@@ -4134,7 +4957,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 113
+            "y": 137
           },
           "id": 910,
           "options": {
@@ -4157,14 +4980,15 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "k8s_pod_cpu_usage{k8s_pod_name=~\"$instances\"}",
+              "expr": "k8s_pod_cpu_usage and on(k8s_pod_name) label_replace(runtime_flight_server_started{instance=~\"($instances)\"}, \"k8s_pod_name\", \"$1\", \"instance\", \"^([^:]+)\")",
               "legendFormat": "{{k8s_pod_name}}",
               "range": true,
               "refId": "A"
             }
           ],
           "title": "CPU Usage (by Instance)",
-          "type": "timeseries"
+          "type": "timeseries",
+          "description": "Filtered by the Instances dropdown. Matches Kubernetes pod metrics to the selected Spice scrape targets (pod name = instance host, port stripped when present)."
         },
         {
           "datasource": {
@@ -4231,7 +5055,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 113
+            "y": 137
           },
           "id": 911,
           "options": {
@@ -4254,14 +5078,15 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "k8s_pod_memory_working_set{k8s_pod_name=~\"$instances\"}",
+              "expr": "k8s_pod_memory_working_set and on(k8s_pod_name) label_replace(runtime_flight_server_started{instance=~\"($instances)\"}, \"k8s_pod_name\", \"$1\", \"instance\", \"^([^:]+)\")",
               "legendFormat": "{{k8s_pod_name}}",
               "range": true,
               "refId": "A"
             }
           ],
           "title": "Memory Usage (by Instance)",
-          "type": "timeseries"
+          "type": "timeseries",
+          "description": "Filtered by the Instances dropdown. Matches Kubernetes pod metrics to the selected Spice scrape targets (pod name = instance host, port stripped when present)."
         },
         {
           "datasource": {
@@ -4328,7 +5153,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 121
+            "y": 145
           },
           "id": 912,
           "options": {
@@ -4351,14 +5176,15 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "k8s_volume_capacity{k8s_pod_name=~\"$instances\", k8s_volume_name!~\"kube-api-access-.*|default-token-.*|spiceai-config-volume\"} - k8s_volume_available{k8s_pod_name=~\"$instances\", k8s_volume_name!~\"kube-api-access-.*|default-token-.*|spiceai-config-volume|script\"}",
-              "legendFormat": "{{ k8s_pod_name }} - {{ k8s_volume_name }}",
+              "expr": "(kubelet_volume_stats_used_bytes * on(namespace, persistentvolumeclaim) group_left(pod) kube_pod_spec_volumes_persistentvolumeclaims_info) and on(pod) label_replace(runtime_flight_server_started{instance=~\"($instances)\"}, \"pod\", \"$1\", \"instance\", \"^([^:]+)\")",
+              "legendFormat": "{{pod}} - {{persistentvolumeclaim}}",
               "range": true,
               "refId": "A"
             }
           ],
           "title": "PVC Storage Usage",
-          "type": "timeseries"
+          "type": "timeseries",
+          "description": "Best-effort PVC usage from Prometheus volume stats (kubelet_volume_stats_*), joined to the pod that mounts each claim. Filtered by the Instances dropdown. Empty if volume stats or kube-state-metrics are not scraped in the cluster."
         },
         {
           "datasource": {
@@ -4416,7 +5242,8 @@
                     "value": 80
                   }
                 ]
-              }
+              },
+              "unit": "percent"
             },
             "overrides": []
           },
@@ -4424,7 +5251,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 121
+            "y": 145
           },
           "id": 913,
           "options": {
@@ -4447,17 +5274,18 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "(1 - (k8s_volume_available{k8s_pod_name=~\"$instances\", k8s_volume_name!~\"kube-api-access-.*|default-token-.*|spiceai-config-volume\"} / k8s_volume_capacity{k8s_pod_name=~\"$instances\", k8s_volume_name!~\"kube-api-access-.*|default-token-.*|spiceai-config-volume|script\"})) * 100",
-              "legendFormat": "{{ k8s_pod_name }} - {{ k8s_volume_name }}",
+              "expr": "(((kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * on(namespace, persistentvolumeclaim) group_left(pod) kube_pod_spec_volumes_persistentvolumeclaims_info) and on(pod) label_replace(runtime_flight_server_started{instance=~\"($instances)\"}, \"pod\", \"$1\", \"instance\", \"^([^:]+)\")) * 100",
+              "legendFormat": "{{pod}} - {{persistentvolumeclaim}}",
               "range": true,
               "refId": "A"
             }
           ],
           "title": "PVC Storage Usage %",
-          "type": "timeseries"
+          "type": "timeseries",
+          "description": "Best-effort PVC usage from Prometheus volume stats (kubelet_volume_stats_*), joined to the pod that mounts each claim. Filtered by the Instances dropdown. Empty if volume stats or kube-state-metrics are not scraped in the cluster."
         }
       ],
-      "title": "🔧 Kubernetes Resource Utilization",
+      "title": "\ud83d\udd27 Kubernetes Resource Utilization",
       "type": "row"
     },
     {
@@ -4466,7 +5294,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 64
+        "y": 65
       },
       "id": 900,
       "panels": [
@@ -4556,7 +5384,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile($percentile, sum by (le) (rate(model_load_duration_ms_bucket{instance=~\"$instances\"}[$__rate_interval])))",
+              "expr": "histogram_quantile($percentile, sum by (le) (rate(model_load_duration_ms_bucket{instance=~\"($instances)\"}[$__rate_interval])))",
               "legendFormat": "{{model}} P{{quantile}}",
               "range": true,
               "refId": "A"
@@ -4651,7 +5479,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile($percentile, sum by (le) (rate(secrets_store_load_duration_ms_bucket{instance=~\"$instances\"}[$__rate_interval])))",
+              "expr": "histogram_quantile($percentile, sum by (le) (rate(secrets_store_load_duration_ms_bucket{instance=~\"($instances)\"}[$__rate_interval])))",
               "legendFormat": "Secrets P{{quantile}}",
               "range": true,
               "refId": "A"
@@ -4746,7 +5574,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile($percentile, sum by (le) (rate(workers_load_duration_ms_bucket{instance=~\"$instances\"}[$__rate_interval])))",
+              "expr": "histogram_quantile($percentile, sum by (le) (rate(workers_load_duration_ms_bucket{instance=~\"($instances)\"}[$__rate_interval])))",
               "legendFormat": "Workers P{{quantile}}",
               "range": true,
               "refId": "A"
@@ -4840,7 +5668,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum(increase(model_load_errors{instance=~\"$instances\"}[$__rate_interval]))",
+              "expr": "sum(increase(model_load_errors{instance=~\"($instances)\"}[$__rate_interval]))",
               "legendFormat": "Model Errors",
               "range": true,
               "refId": "A"
@@ -4851,7 +5679,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum(increase(catalog_load_errors{instance=~\"$instances\"}[$__rate_interval]))",
+              "expr": "sum(increase(catalog_load_errors{instance=~\"($instances)\"}[$__rate_interval]))",
               "legendFormat": "Catalog Errors",
               "range": true,
               "refId": "B"
@@ -4862,7 +5690,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum(increase(embeddings_load_errors{instance=~\"$instances\"}[$__rate_interval]))",
+              "expr": "sum(increase(embeddings_load_errors{instance=~\"($instances)\"}[$__rate_interval]))",
               "legendFormat": "Embeddings Errors",
               "range": true,
               "refId": "C"
@@ -4873,7 +5701,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum(increase(tool_load_errors{instance=~\"$instances\"}[$__rate_interval]))",
+              "expr": "sum(increase(tool_load_errors{instance=~\"($instances)\"}[$__rate_interval]))",
               "legendFormat": "Tool Errors",
               "range": true,
               "refId": "D"
@@ -4967,7 +5795,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "sum(increase(dataset_acceleration_refresh_worker_panics{instance=~\"$instances\"}[$__rate_interval]))",
+              "expr": "sum(increase(dataset_acceleration_refresh_worker_panics{instance=~\"($instances)\"}[$__rate_interval]))",
               "legendFormat": "Refresh Worker Panics",
               "range": true,
               "refId": "A"
@@ -4977,7 +5805,7 @@
           "type": "timeseries"
         }
       ],
-      "title": "🔄 Resource Loading",
+      "title": "\ud83d\udd04 Resource Loading",
       "type": "row"
     }
   ],
@@ -5009,7 +5837,8 @@
         "refresh": 1,
         "regex": "",
         "sort": 1,
-        "type": "query"
+        "type": "query",
+        "allValue": ".*"
       },
       {
         "current": {
@@ -5064,6 +5893,6 @@
   "timezone": "browser",
   "title": "Spice.ai Dashboard",
   "uid": "ddgw8xtn75ybkb",
-  "version": 29,
+  "version": 35,
   "weekStart": ""
 }

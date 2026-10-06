@@ -22,20 +22,21 @@ use std::{
 
 #[cfg(feature = "http")]
 pub mod cancel_guard_body;
+pub mod column_reference;
 pub mod fibonacci_backoff;
 pub mod home_dir;
 pub mod levenshtein;
 pub mod retry_strategy;
 #[cfg(feature = "datafusion")]
 pub mod security;
-pub mod time;
 pub mod topological_ordering;
+pub mod tracers;
 pub use backoff::Error as RetryError;
 pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;
 mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
-pub use tracing_util::{in_tracing_context, in_tracing_context_async};
+pub use tracing_util::{in_tracing_context, in_tracing_context_async, single_line};
 pub mod arrow;
 #[cfg(feature = "datafusion")]
 pub mod expr;
@@ -43,9 +44,11 @@ pub mod expr;
 pub mod session_state;
 #[cfg(feature = "datafusion")]
 pub mod stream_utils;
+pub mod time;
 pub mod time_format;
 #[cfg(feature = "datafusion")]
 pub mod timestamp_filter;
+pub mod timezone;
 
 pub const DATAFUSION_BUG_REPORT_MESSAGE: &str = "This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues";
 
@@ -227,7 +230,7 @@ pub fn humantime_elapsed(time: SystemTime) -> Result<String, SystemTimeError> {
         .map(|elapsed| {
             humantime::format_duration(Duration::from_millis(elapsed.as_millis() as u64))
         })
-        .map(|s| format!("{s}"))
+        .map(|s| s.to_string())
 }
 
 /// Create a new array which is `None` at each `null_idxs`. Each element in `data` is in the new

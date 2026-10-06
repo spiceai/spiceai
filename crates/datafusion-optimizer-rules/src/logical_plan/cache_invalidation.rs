@@ -29,6 +29,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use cache::Caching;
 use datafusion::{
+    common::TableReference,
     common::{
         DFSchemaRef,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
@@ -40,7 +41,6 @@ use datafusion::{
     physical_plan::{DisplayFormatType, ExecutionPlan, stream::RecordBatchStreamAdapter},
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
     prelude::Expr,
-    sql::TableReference,
 };
 use futures::StreamExt;
 
@@ -251,7 +251,7 @@ fn create_cache_invalidation_exec(
                 }
             }
             if ok {
-                invalidate_cache_for_table(&table, &caching);
+                invalidate_cache_for_table(&table, &caching).await;
             }
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, s)) as SendableRecordBatchStream)
@@ -274,9 +274,9 @@ fn create_cache_invalidation_exec(
     )
 }
 
-fn invalidate_cache_for_table(table: &TableReference, caching: &Weak<Caching>) {
+async fn invalidate_cache_for_table(table: &TableReference, caching: &Weak<Caching>) {
     if let Some(cache) = caching.upgrade() {
-        if let Err(e) = cache.invalidate_for_table(table.clone()) {
+        if let Err(e) = cache.invalidate_for_table(table.clone()).await {
             tracing::warn!("Failed to invalidate cache for table {table}: {e}");
         } else {
             tracing::trace!("Successfully invalidated cache for table {table}");
@@ -306,7 +306,8 @@ impl ExtensionPlanner for CacheInvalidationExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &datafusion::execution::context::SessionState,
+        _session_state: &dyn datafusion::catalog::Session,
+        _planning_ctx: &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(cache_node) = node.as_any().downcast_ref::<CacheInvalidationNode>() else {
             return Ok(None);

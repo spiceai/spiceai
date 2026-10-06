@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::ClientTlsConfig;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
-use crate::metrics_reader::MetricsReader;
+use telemetry::metrics_reader::MetricsReader;
 
 const CONTROL_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -507,10 +507,9 @@ async fn handle_scheduler_message(
             for task in cmd.tasks {
                 match executor
                     .cancel_task(
-                        task.task_id as usize,
-                        task.job_id.clone(),
+                        task.job_id.clone().into(),
                         task.stage_id as usize,
-                        task.partition_id as usize,
+                        task.task_id as usize,
                     )
                     .await
                 {

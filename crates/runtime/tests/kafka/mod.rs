@@ -34,9 +34,11 @@ use bootstrap::{
 
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check;
-use crate::{init_tracing, utils::test_request_context};
+use crate::{
+    init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
-const KAFKA_PORT: u16 = 19093;
 const KAFKA_MESSAGE_PROCESSING_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test]
@@ -45,11 +47,13 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let (running_container, producer) = start_kafka_docker_container(
-                KAFKA_PORT,
-                &["orders", "schema_infer_test", "flattent_json_test"],
-            )
+            let (running_container, producer) = start_kafka_docker_container(&[
+                "orders",
+                "schema_infer_test",
+                "flattent_json_test",
+            ])
             .await?;
+            let port = running_container.host_port(19092)?;
 
             tracing::debug!("Container started");
 
@@ -69,12 +73,12 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
                 serde_json::from_str(include_str!("./test_data/orders_nested.json"))?;
             send_messages_to_kafka(&producer, "flattent_json_test", &orders_nested).await?;
 
-            let ds = make_kafka_dataset("orders", "kafka_orders", KAFKA_PORT, None);
+            let ds = make_kafka_dataset("orders", "kafka_orders", port, None);
             let options = [("schema_infer_max_records".to_string(), "3".to_string())].into();
             let ds_schema_infer = make_kafka_dataset(
                 "schema_infer_test",
                 "kafka_schema_infer_test",
-                KAFKA_PORT,
+                port,
                 Some(options),
             );
 
@@ -82,7 +86,7 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
             let ds_flatten_json = make_kafka_dataset(
                 "flattent_json_test",
                 "kafka_flattent_json_test",
-                KAFKA_PORT,
+                port,
                 Some(options),
             );
 
@@ -93,6 +97,7 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
@@ -153,9 +158,9 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
 
     test_request_context()
         .scope(async {
-            const TEST_PORT: u16 = 19096;
             let (running_container, producer) =
-                start_kafka_docker_container(TEST_PORT, &["fetch_latest_tombstone_test"]).await?;
+                start_kafka_docker_container(&["fetch_latest_tombstone_test"]).await?;
+            let port = running_container.host_port(19092)?;
             // Send two normal messages followed by a tombstone on the tail.
             let messages: Vec<serde_json::Value> = vec![
                 json!({"id": 1, "schema": "v1"}),
@@ -165,7 +170,7 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
             send_tombstone_to_kafka(&producer, "fetch_latest_tombstone_test", 0, "key3").await?;
 
             let kafka_config = KafkaConfig {
-                brokers: format!("localhost:{TEST_PORT}"),
+                brokers: format!("localhost:{port}"),
                 security_protocol: "SASL_PLAINTEXT".to_string(),
                 sasl_mechanism: bootstrap::KAFKA_SASL_MECHANISM.to_string(),
                 sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),
@@ -217,10 +222,9 @@ async fn kafka_fetch_latest_message_many_tombstones_test() -> anyhow::Result<()>
 
     test_request_context()
         .scope(async {
-            const TEST_PORT: u16 = 19097;
             let (running_container, producer) =
-                start_kafka_docker_container(TEST_PORT, &["fetch_latest_many_tombstones_test"])
-                    .await?;
+                start_kafka_docker_container(&["fetch_latest_many_tombstones_test"]).await?;
+            let port = running_container.host_port(19092)?;
 
             let messages: Vec<serde_json::Value> = vec![
                 json!({"id": 1, "schema": "v1"}),
@@ -240,7 +244,7 @@ async fn kafka_fetch_latest_message_many_tombstones_test() -> anyhow::Result<()>
             }
 
             let kafka_config = KafkaConfig {
-                brokers: format!("localhost:{TEST_PORT}"),
+                brokers: format!("localhost:{port}"),
                 security_protocol: "SASL_PLAINTEXT".to_string(),
                 sasl_mechanism: bootstrap::KAFKA_SASL_MECHANISM.to_string(),
                 sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),
@@ -282,18 +286,18 @@ async fn kafka_fetch_latest_message_many_tombstones_test() -> anyhow::Result<()>
 /// the latest non-tombstone message by timestamp across all partitions.
 #[tokio::test]
 async fn kafka_fetch_latest_message_multi_partition_test() -> anyhow::Result<()> {
-    const TEST_PORT: u16 = 19095;
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
             let (running_container, producer) =
-                start_kafka_docker_container(TEST_PORT, &[]).await?;
+                start_kafka_docker_container(&[]).await?;
+            let port = running_container.host_port(19092)?;
 
             // Create a 2-partition topic explicitly.
             create_kafka_topic_with_partitions(
                 &running_container,
-                TEST_PORT,
+                port,
                 "fetch_latest_multi_partition_test",
                 2,
             )
@@ -329,7 +333,7 @@ async fn kafka_fetch_latest_message_multi_partition_test() -> anyhow::Result<()>
             .await?;
 
             let kafka_config = KafkaConfig {
-                brokers: format!("localhost:{TEST_PORT}"),
+                brokers: format!("localhost:{port}"),
                 security_protocol: "SASL_PLAINTEXT".to_string(),
                 sasl_mechanism: bootstrap::KAFKA_SASL_MECHANISM.to_string(),
                 sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),

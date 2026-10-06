@@ -46,24 +46,18 @@ pub fn from_headers(headers: &HeaderMap) -> BaggageIterator<'_> {
     // its own Context which is unnecessary overhead we don't want to accept on every request.
     // See: <https://github.com/open-telemetry/opentelemetry-rust/blob/e0159ad91f426250eb921b50cc4816002a6c51a7/opentelemetry-sdk/src/propagation/baggage.rs#L99>
     let baggage_iter = baggage_str.split(',').filter_map(|context_value| {
-        if let Some((name_and_value, _)) = context_value
-            .split(';')
-            .collect::<Vec<&str>>()
-            .split_first()
-        {
-            let mut iter = name_and_value.split('=');
-            if let (Some(name), Some(value)) = (iter.next(), iter.next()) {
-                let decode_name = percent_decode_str(name).decode_utf8();
-                let decode_value = percent_decode_str(value).decode_utf8();
+        // Only the name=value segment is used; properties after `;` are ignored.
+        let name_and_value = context_value.split(';').next()?;
+        let mut iter = name_and_value.split('=');
+        if let (Some(name), Some(value)) = (iter.next(), iter.next()) {
+            let decode_name = percent_decode_str(name).decode_utf8();
+            let decode_value = percent_decode_str(value).decode_utf8();
 
-                if let (Ok(name), Ok(value)) = (decode_name, decode_value) {
-                    Some(KeyValue::new(
-                        name.trim().to_owned(),
-                        value.trim().to_string(),
-                    ))
-                } else {
-                    None
-                }
+            if let (Ok(name), Ok(value)) = (decode_name, decode_value) {
+                Some(KeyValue::new(
+                    name.trim().to_owned(),
+                    value.trim().to_string(),
+                ))
             } else {
                 None
             }
@@ -99,8 +93,7 @@ mod tests {
     #[test]
     fn test_from_headers_empty() {
         let headers = HeaderMap::new();
-        let baggage = from_headers(&headers).collect::<Vec<_>>();
-        assert!(baggage.is_empty());
+        assert!(from_headers(&headers).next().is_none());
     }
 
     #[test]
@@ -110,8 +103,7 @@ mod tests {
             BAGGAGE_HEADER,
             HeaderValue::from_bytes(&[0xFF]).expect("Failed to create header value"),
         );
-        let baggage = from_headers(&headers).collect::<Vec<_>>();
-        assert!(baggage.is_empty());
+        assert!(from_headers(&headers).next().is_none());
     }
 
     #[test]
@@ -171,7 +163,6 @@ mod tests {
     fn test_from_headers_invalid_format() {
         let mut headers = HeaderMap::new();
         headers.insert(BAGGAGE_HEADER, HeaderValue::from_static("invalid_format"));
-        let baggage = from_headers(&headers).collect::<Vec<_>>();
-        assert!(baggage.is_empty());
+        assert!(from_headers(&headers).next().is_none());
     }
 }

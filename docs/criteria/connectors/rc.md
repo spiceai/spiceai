@@ -8,13 +8,13 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 
 | Connector                        | RC Quality | DRI Sign-off |
 | -------------------------------- | ---------- | ------------ |
-| ADBC                             | ➖          |              |
+| ADBC                             | ✅          | @lukekim     |
 | Azure BlobFS                     | ➖          |              |
 | Clickhouse                       | ➖          |              |
 | Cosmos DB (NoSQL)                | ✅          | @lukekim     |
 | Databricks (mode: delta_lake)    | ✅          | @Sevenannn   |
-| Databricks (mode: spark_connect) | ➖          |              |
-| Databricks (mode: sql_warehouse) | ➖          |              |
+| Databricks (mode: spark_connect) | ✅          | @lukekim     |
+| Databricks (mode: sql_warehouse) | ✅          | @lukekim     |
 | Debezium                         | ➖          |              |
 | Delta Lake                       | ✅          | @Sevenannn   |
 | Dremio                           | ✅          | @Sevenannn   |
@@ -22,30 +22,30 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | DuckLake                         | ➖          |              |
 | DynamoDB                         | ✅          | @krinart     |
 | File                             | ✅          | @Sevenannn   |
-| FlightSQL                        | ➖          |              |
+| FlightSQL                        | ✅          | @lukekim     |
 | FTP/SFTP                         | ➖          |              |
 | GCS                              | ➖          |              |
 | Git                              | ✅          | @lukekim     |
 | GitHub                           | ✅          | @peasee      |
-| Glue                             | ➖          |              |
+| Glue                             | ✅          | @lukekim     |
 | GraphQL                          | ✅          | @peasee      |
-| HTTP/HTTPS                       | ➖          |              |
-| Iceberg                          | ➖          |              |
+| HTTP/HTTPS                       | ✅          | @lukekim     |
+| Iceberg                          | ✅          | @phillipleblanc |
 | IMAP                             | ➖          |              |
 | Kafka                            | ➖          |              |
-| Localpod                         | ➖          |              |
-| MongoDB                          | ➖          |              |
+| Localpod                         | ✅          | @lukekim     |
+| MongoDB                          | ✅          | @lukekim     |
 | MS SQL                           | ➖          |              |
 | MySQL                            | ✅          | @peasee      |
 | NFS                              | ➖          |              |
 | ODBC                             | ➖          |              |
-| Oracle                           | ➖          |              |
+| Oracle                           | ✅          | @lukekim     |
 | PostgreSQL                       | ✅          | @Sevenannn   |
 | S3                               | ✅          | @Sevenannn   |
 | ScyllaDB                         | ➖          |              |
 | Sharepoint                       | ➖          |              |
 | SMB                              | ➖          |              |
-| Snowflake                        | ➖          |              |
+| Snowflake                        | ✅          | @phillipleblanc |
 | Spark                            | ➖          |              |
 | Spice.ai Cloud Platform          | ✅          | @peasee      |
 

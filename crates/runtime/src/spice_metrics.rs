@@ -20,14 +20,14 @@ use std::time::Duration;
 use crate::datafusion::error::format_datafusion_error;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
-use crate::accelerated_table::Retention;
-use crate::accelerated_table::refresh::Refresh;
+use crate::accelerated::Retention;
+use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::Acceleration;
 use crate::datafusion::Error as DataFusionError;
@@ -45,7 +45,11 @@ pub enum Error {
         "Failed to register the internal metrics table: {}",
         format_datafusion_error(source)
     ))]
-    UnableToRegisterToMetricsTable { source: DataFusionError },
+    UnableToRegisterToMetricsTable {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(DataFusionError, Box::new)))]
+        source: Box<DataFusionError>,
+    },
 }
 
 /// Uses a `Weak` reference to `DataFusion` to prevent blocking its cleanup after runtime termination.
@@ -98,7 +102,7 @@ pub async fn register_metrics_table(
 ) -> Result<(), Error> {
     let metrics_table_reference = get_metrics_table_reference();
 
-    let retention = Retention::builder()
+    let retention = Retention::builder(metrics_table_reference.to_string())
         .time_column(Some("time_unix_nano"))
         .time_format(Some(TimeFormat::Timestamptz))
         .time_period(Some(Duration::from_mins(30))) // delete metrics older than 30 minutes
@@ -121,7 +125,7 @@ pub async fn register_metrics_table(
     .context(UnableToCreateMetricsTableSnafu)?;
 
     datafusion
-        .register_table_as_writable_and_with_schema(metrics_table_reference, table)
+        .register_table_as_writable_and_with_schema(metrics_table_reference, table.into_table())
         .context(UnableToRegisterToMetricsTableSnafu)?;
 
     Ok(())

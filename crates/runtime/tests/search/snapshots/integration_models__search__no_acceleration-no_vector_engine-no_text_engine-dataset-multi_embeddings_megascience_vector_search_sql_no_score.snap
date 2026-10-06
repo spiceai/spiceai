@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/search/mod.rs
-expression: resp?
-snapshot_kind: text
+description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order by _score desc, id LIMIT 4"
 ---
 [
   {

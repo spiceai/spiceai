@@ -17,3 +17,6 @@ util = { path = "../util", features = ["datafusion"] }
 
 [features]
 default = []
+
+[lints]
+workspace = true

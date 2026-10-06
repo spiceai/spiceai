@@ -44,3 +44,21 @@ catalogs:
     from: spice.ai
     params:
       spiceai_api_key: my-api-key
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL catalog, with catalog-level CDC acceleration
+  # ---------------------------------------------------------------------------
+  - name: postgres_catalog
+    from: pg
+    include:
+      - 'public.*'
+    exclude:
+      - 'public.audit_log'
+    params:
+      pg_host: localhost
+      pg_port: 5432
+      pg_user: postgres
+      pg_pass: my-password
+      pg_db: my_database
+    acceleration:
+      refresh_mode: changes

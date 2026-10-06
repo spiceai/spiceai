@@ -14,38 +14,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, num::TryFromIntError, sync::Arc};
-
-use arrow::array::{
-    Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray,
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
+
+use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use arrow_json::{EncoderOptions, writer::make_encoder};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::Field;
 use data_components::s3_vectors::S3VectorsTable;
 use itertools::Itertools;
-use llms::embeddings::{Embed, EmbeddingInput};
-use runtime_datafusion_index::Index;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
-use util::{convert_string_arrow_to_iterator, distribute_nulls};
+use spice_table::Index;
 
+use crate::index::write_util::{
+    self, embed_column, extract_and_format_primary_key, sort_columns_alphabetically,
+    update_embedding_column_in_batch,
+};
 use crate::index::{SearchIndex, embedding_col, s3_vectors::S3Vector};
 
 #[derive(Snafu, Debug)]
 pub enum Error {
-    #[snafu(display("Embedding model '{model_name}' was not found"))]
-    EmbeddingModelNotFound { model_name: String },
-
-    #[snafu(display("{source}"))]
-    FailedToEmbed { source: llms::embeddings::Error },
-
-    #[snafu(display("Cannot write to '{index}' index, data does not have column '{column}'."))]
-    ColumnNotFound { index: String, column: String },
-
-    #[snafu(display("Cannot write to '{index}' index, index has no primary key field(s)."))]
-    NoPrimaryKeyField { index: String },
+    #[snafu(transparent)]
+    WriteUtil { source: write_util::Error },
 
     #[snafu(display(
         "Cannot write to '{index}' index, an issue processing arrow records: {source}."
@@ -56,19 +49,22 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Cannot write to '{index}' index, an issue processing JSON values: {source}."
+        "Cannot write to '{index}' index: failed to encode metadata column '{column}': {source}."
     ))]
-    IssueWithJsonProcessing {
+    MetadataColumnEncoding {
         index: String,
-        source: serde_json::Error,
+        column: String,
+        source: arrow::error::ArrowError,
     },
 
     #[snafu(display(
-        "Cannot write to '{index}' index, primary key could not be serialized: {source}"
+        "Cannot write to '{index}' index: failed to convert metadata column '{column}' at row {row} to JSON: {source}."
     ))]
-    FailedToSerializePrimaryKey {
+    MetadataValueJson {
         index: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        column: String,
+        row: usize,
+        source: serde_json::Error,
     },
 
     #[snafu(display(
@@ -85,27 +81,16 @@ pub enum Error {
     #[snafu(display("Cannot write to '{index}' index: {source}"))]
     CannotWriteIndex {
         index: String,
-        source: data_components::s3_vectors::Error,
+        #[snafu(source(from(data_components::s3_vectors::Error, Box::new)))]
+        source: Box<data_components::s3_vectors::Error>,
     },
 
-    #[snafu(display("Cannot update embedding column in record batch: {source}"))]
-    CannotUpdateEmbeddingColumn { source: arrow::error::ArrowError },
-
     #[snafu(display(
-        "Cannot create embedding array: no valid embeddings found to determine dimension"
+        "Failed to update search index '{index}' (s3_vectors): the vectors stored for the records this write could not embed could not be removed, so a search would return them at their previous value. Check the index's AWS credentials grant s3vectors:DeleteVectors, then write the affected rows again. See: https://spiceai.org/docs/features/search. Cause: {source}"
     ))]
-    CannotDetermineEmbeddingDimension,
-
-    #[snafu(display("Embedding dimension is too large to fit into an i32"))]
-    EmbeddingDimensionTooLarge { source: TryFromIntError },
-
-    #[snafu(display(
-        "Embedding dimension mismatch: expected {expected} but got {actual} at row {row_index}"
-    ))]
-    EmbeddingDimensionMismatch {
-        expected: usize,
-        actual: usize,
-        row_index: usize,
+    CannotEvictRejectedRecords {
+        index: String,
+        source: datafusion::error::DataFusionError,
     },
 }
 
@@ -150,12 +135,12 @@ async fn process_single_batch(
         .schema()
         .column_with_name(index.embedded_column.as_str())
     else {
-        tracing::warn!(
-            "Cannot write to '{}' index, data does not have column '{}'.",
-            index.name(),
-            index.embedded_column
-        );
-        return Ok(record);
+        return write_util::ColumnNotFoundSnafu {
+            index: index.name().to_string(),
+            column: index.embedded_column.clone(),
+        }
+        .fail()
+        .map_err(Error::from);
     };
 
     let embedding_vectors = embed_column(
@@ -173,10 +158,9 @@ async fn process_single_batch(
             .filter(|c| *c != embedding_col(&index.search_column()))
             .collect::<Vec<_>>(),
         &record,
-    )
-    .map_err(|e| *e)?;
+    )?;
     let primary_key = extract_and_format_primary_key(index.name(), &index.primary_key, &record)
-        .map_err(|e| *e)?;
+        .map_err(|e| Error::from(*e))?;
 
     if primary_key.len() != embedding_vectors.len() {
         return LengthMismatchSnafu {
@@ -209,11 +193,28 @@ async fn process_single_batch(
         &embedding_vectors,
         i32::try_from(table.dimension).unwrap_or_default(),
     )
-    .map_err(|e| *e)?;
+    .map_err(|e| Error::from(*e))?;
 
     // Filter out zero vectors to prevent cosine similarity calculation errors
-    let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
+    let (filtered_embeddings, filtered_primary_key, filtered_metadata, evicted) =
         filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
+
+    // Before the put, for two reasons. A key this batch both rejects and stores is excluded
+    // from `evicted`, so deleting first is what lets the two orders agree. And the delete and
+    // the put cannot be made one atomic operation against S3 Vectors, so one of them has to
+    // be able to land without the other: deleting first fails toward the stale vector being
+    // gone, whereas putting first fails toward it still being served — which is the bug.
+    // A retry of the whole batch converges either way.
+    // No rejected row means no extra call at all.
+    if !evicted.is_empty() {
+        index
+            .evict_written_keys(table, evicted)
+            .await
+            .map_err(|source| Error::CannotEvictRejectedRecords {
+                index: index.name().to_string(),
+                source,
+            })?;
+    }
 
     let spill_index = index.spill_index().await.context(CannotWriteIndexSnafu {
         index: index.name().to_string(),
@@ -233,303 +234,84 @@ async fn process_single_batch(
 
     // Because of limitations of `DFSchema::logically_equivalent_names_and_types` and its use in
     // `MemTable`, this must be in the same order as outputted by `VectorScanTableProvider`.
-    let (schema, arr, _) = updated_record.into_parts();
-    let (arrs, fields): (Vec<_>, Vec<_>) = arr
-        .into_iter()
-        .zip(schema.fields())
-        .sorted_by_key(|(_, f)| f.name())
-        .unzip();
-
-    RecordBatch::try_new(
-        Arc::new(Schema::new(fields.into_iter().cloned().collect::<Vec<_>>())),
-        arrs,
-    )
-    .context(IssueWithArrowProcessingSnafu {
-        index: index.name(),
-    })
-}
-
-/// Given a [`RecordBatch`] of data from a [`SearchIndex`]'s associated [`TableProvider`], extract and format the primary key, so as to be ready for indexing into `S3Vectors`.
-///
-/// Formatting is:
-///  - When there is a single [`Field`] in `primary_key`, the relevant [`ArrayRef`] is cast to a [`StringArray`] via [`arrow::compute::cast`].
-///  - Otherwise, consider the [`Field`] as a sub-[`RecordBatch`] and convert to a string via [`arrow_json`].
-pub fn extract_and_format_primary_key(
-    index_name: &str,
-    primary_key: &[Field],
-    record: &RecordBatch,
-) -> Result<Vec<Option<String>>, Box<Error>> {
-    let schema = record.schema();
-    match primary_key {
-        [f] => {
-            let Some((i, _)) = schema.column_with_name(f.name().as_str()) else {
-                return ColumnNotFoundSnafu {
-                    index: index_name.to_string(),
-                    column: f.name().clone(),
-                }
-                .fail()
-                .map_err(Box::from);
-            };
-            let c = record.column(i);
-
-            // If already string like, continue
-            if let Some(data) = convert_string_arrow_to_iterator!(c) {
-                return Ok(to_string_vec(data));
-            }
-
-            // Otherwise cast to UTF8.
-            let string_arr = arrow::compute::cast(&c, &arrow_schema::DataType::Utf8).context(
-                IssueWithArrowProcessingSnafu {
-                    index: index_name.to_string(),
-                },
-            )?;
-            let Some(data) = convert_string_arrow_to_iterator!(string_arr) else {
-                return Err(Box::from(Error::FailedToSerializePrimaryKey {
-                    index: index_name.to_string(),
-                    source: Box::from(format!(
-                        "could not cast a '{}' column (column '{}') into string type",
-                        f.data_type(),
-                        f.name()
-                    )),
-                }));
-            };
-            Ok(to_string_vec(data))
-        }
-        [] => Err(Box::from(Error::NoPrimaryKeyField {
-            index: index_name.to_string(),
-        })),
-        _ => {
-            let mut primary_key_projection = vec![];
-            for field in primary_key {
-                let Some((idx, _)) = schema.column_with_name(field.name().as_str()) else {
-                    return ColumnNotFoundSnafu {
-                        index: index_name.to_string(),
-                        column: field.name().clone(),
-                    }
-                    .fail()
-                    .map_err(Box::from);
-                };
-                primary_key_projection.push(idx);
-            }
-            let pk =
-                record
-                    .project(&primary_key_projection)
-                    .context(IssueWithArrowProcessingSnafu {
-                        index: index_name.to_string(),
-                    })?;
-
-            let mut writer = arrow_json::ArrayWriter::new(Vec::new());
-            writer
-                .write_batches(&[&pk])
-                .context(IssueWithArrowProcessingSnafu {
-                    index: index_name.to_string(),
-                })?;
-            writer.finish().context(IssueWithArrowProcessingSnafu {
-                index: index_name.to_string(),
-            })?;
-
-            let values = serde_json::from_reader::<_, Vec<Value>>(writer.into_inner().as_slice())
-                .context(IssueWithJsonProcessingSnafu {
-                index: index_name.to_string(),
-            })?;
-
-            values
-                .into_iter()
-                .map(|v| serde_json::to_string(&v).map(Some))
-                .collect::<Result<Vec<_>, _>>()
-                .context(IssueWithJsonProcessingSnafu {
-                    index: index_name.to_string(),
-                })
-                .map_err(Box::from)
-        }
-    }
+    sort_columns_alphabetically(updated_record).map_err(|e| Error::from(*e))
 }
 
 pub fn extract_and_format_metadata(
     index_name: &str,
     metadata_columns: &[String],
     record: &RecordBatch,
-) -> Result<HashMap<String, Vec<Option<Value>>>, Box<Error>> {
+) -> Result<HashMap<String, Vec<Option<Value>>>, Error> {
     let schema = record.schema();
     let mut metadata_projection = vec![];
     for name in metadata_columns {
         let Some((idx, _)) = schema.column_with_name(name) else {
-            return ColumnNotFoundSnafu {
+            return write_util::ColumnNotFoundSnafu {
                 index: index_name.to_string(),
                 column: name,
             }
             .fail()
-            .map_err(Box::from);
+            .map_err(Error::from);
         };
         metadata_projection.push(idx);
     }
 
     let encoder_options = EncoderOptions::default();
-    let metadata: HashMap<String, Vec<Option<Value>>> = metadata_projection
-        .iter()
-        .filter_map(|i| {
-            let c = record.column(*i);
-            let field = Arc::new(schema.field(*i).clone());
-            let name = field.name();
+    let mut metadata = HashMap::with_capacity(metadata_projection.len());
+    for i in metadata_projection {
+        let column = record.column(i);
+        let field = Arc::new(schema.field(i).clone());
+        let name = field.name().clone();
+        let mut encoder = make_encoder(&field, column, &encoder_options).context(
+            MetadataColumnEncodingSnafu {
+                index: index_name.to_string(),
+                column: name.clone(),
+            },
+        )?;
 
-            let mut encoder = make_encoder(&field, c, &encoder_options).ok()?;
-
-            let mut values = vec![];
-            let mut value = Vec::new();
-            for row in 0..c.len() {
-                if encoder.is_null(row) {
-                    values.push(None);
-                } else {
-                    encoder.encode(row, &mut value);
-                    values.push(serde_json::from_slice(&value).ok());
-                    value.clear();
-                }
+        let mut values = Vec::with_capacity(column.len());
+        let mut value = Vec::new();
+        for row in 0..column.len() {
+            if encoder.is_null(row) {
+                values.push(None);
+            } else {
+                encoder.encode(row, &mut value);
+                let metadata_value =
+                    serde_json::from_slice(&value).context(MetadataValueJsonSnafu {
+                        index: index_name.to_string(),
+                        column: name.clone(),
+                        row,
+                    })?;
+                values.push(Some(metadata_value));
+                value.clear();
             }
+        }
 
-            Some((name.clone(), values))
-        })
-        .collect();
+        metadata.insert(name, values);
+    }
     Ok(metadata)
 }
 
-fn to_string_vec<'a, I>(iter: I) -> Vec<Option<String>>
-where
-    I: Iterator<Item = Option<&'a str>>,
-{
-    iter.map(|opt| opt.map(ToString::to_string)).collect()
-}
-
-/// Embed the given `column_idx` from the [`RecordBatch`]s, assuming it is a String-like value.
+/// Filter out the rows this batch will not store a vector for.
 ///
-/// Return results a nullable array of vectors. Null is original string is null or empty.
-async fn embed_column(
-    rb: &RecordBatch,
-    column_idx: usize,
-    model: Arc<dyn Embed>,
-) -> Result<Vec<Option<Vec<f32>>>, Error> {
-    let Some(data) = convert_string_arrow_to_iterator!(rb.column(column_idx)) else {
-        return Ok(vec![]);
-    };
-
-    let mut nulls = vec![];
-    let mut column = vec![];
-
-    for (i, o) in data.enumerate() {
-        if o.is_none_or(str::is_empty) {
-            nulls.push(i);
-        } else if let Some(s) = o {
-            column.push(s.to_string());
-        }
-    }
-
-    let embedded_data = model
-        .embed(EmbeddingInput::StringArray(column))
-        .await
-        .context(FailedToEmbedSnafu)?;
-
-    Ok(distribute_nulls(embedded_data, nulls))
-}
-
-/// Update the embedding column in the `RecordBatch` with the computed embeddings.
-fn update_embedding_column_in_batch(
-    record: &RecordBatch,
-    embedded_column_name: &str,
-    embedding_vectors: &[Option<Vec<f32>>],
-    dimension: i32,
-) -> Result<RecordBatch, Box<Error>> {
-    let embedding_column_name = embedding_col(embedded_column_name);
-
-    let schema = record.schema();
-    let mut columns = record.columns().to_vec();
-
-    // Create new embedding array that will replace the existing column or be added as a new column
-    let embedding_array = create_embedding_array(embedding_vectors, dimension)?;
-
-    // Check if the embedding column already exists
-    let target_schema = if let Some((idx, _)) = schema.column_with_name(&embedding_column_name) {
-        // Replace existing embedding column
-        columns[idx] = embedding_array;
-        schema
-    } else {
-        // Create new schema with the embedding column appended
-        let mut fields = schema.fields().to_vec();
-        fields.push(Arc::new(Field::new(
-            &embedding_column_name,
-            embedding_array.data_type().clone(),
-            true,
-        )));
-        // Append embedding column
-        columns.push(embedding_array);
-        Arc::new(arrow_schema::Schema::new(fields))
-    };
-
-    RecordBatch::try_new(target_schema, columns)
-        .context(CannotUpdateEmbeddingColumnSnafu)
-        .map_err(Box::from)
-}
-
-/// Create an Arrow array from embedding vectors.
-#[expect(clippy::cast_sign_loss)]
-fn create_embedding_array(
-    embedding_vectors: &[Option<Vec<f32>>],
-    dimension: i32,
-) -> Result<Arc<dyn Array>, Box<Error>> {
-    let mut dimension = dimension;
-    if dimension <= 0 {
-        // Fallback: determine embedding dimension from first non-null embedding
-        dimension = i32::try_from(
-            embedding_vectors
-                .iter()
-                .find_map(|opt| opt.as_ref().map(Vec::len))
-                .unwrap_or(0),
-        )
-        .context(EmbeddingDimensionTooLargeSnafu)
-        .map_err(Box::from)?;
-        if dimension <= 0 {
-            CannotDetermineEmbeddingDimensionSnafu {}
-                .fail()
-                .map_err(Box::from)?;
-        }
-    }
-
-    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dimension);
-    let field = Field::new_list_field(DataType::Float32, false);
-    builder = builder.with_field(field);
-
-    let expected_dim = dimension as usize;
-    for (row_index, embedding_opt) in embedding_vectors.iter().enumerate() {
-        if let Some(embedding) = embedding_opt {
-            // Validate embedding dimension matches expected dimension
-            if embedding.len() != expected_dim {
-                return Err(Box::new(Error::EmbeddingDimensionMismatch {
-                    expected: expected_dim,
-                    actual: embedding.len(),
-                    row_index,
-                }));
-            }
-            // Optimized: append_slice automatically marks all values as valid
-            // without needing to allocate a separate validity vector
-            builder.values().append_slice(embedding);
-            builder.append(true);
-        } else {
-            builder.values().append_nulls(expected_dim);
-            builder.append(false);
-        }
-    }
-
-    Ok(Arc::new(builder.finish()))
-}
-
-/// Filter out invalid embedding vectors where all values are either zero or NaN.
+/// A vector is dropped when it has no defined direction under any metric the index offers,
+/// which [`write_util::classify_vector`] decides: every component zero or `NaN`, or any
+/// component non-finite. For example:
+/// - `[0.0, 0.0]` -> filtered (no direction: all zero)
+/// - `[NaN, NaN]` -> filtered (no direction: all NaN)
+/// - `[0.0, NaN]` -> filtered (no direction: every component is zero or NaN)
+/// - `[1.0, NaN]` -> filtered (non-finite: every distance to it is `NaN`)
+/// - `[0.0, Inf]` -> filtered (non-finite, and note the all-zero test does not catch it)
+/// - `[1.0, 0.0]` -> kept (a finite, non-zero direction)
 ///
-/// This filters vectors that consist entirely of invalid values (zeros and/or NaNs).
-/// A vector with any valid non-zero, non-NaN value is kept.
-/// For example:
-/// - `[0.0, 0.0]` -> filtered (all zeros)
-/// - `[NaN, NaN]` -> filtered (all NaN)
-/// - `[0.0, NaN]` -> filtered (all values are either zero or NaN)
-/// - `[1.0, 0.0]` -> kept (has a valid non-zero value)
-/// - `[1.0, NaN]` -> kept (has a valid non-NaN value)
+/// The fourth element is the keys this batch will not store a vector for and so must
+/// delete, per [`write_util::keys_to_evict`]. It covers the rows filtered here and the
+/// rows carrying no embedding at all — `write_data` drops a `None` embedding, which
+/// leaves an earlier vector in place just as a filtered row does.
+///
+/// A row whose key is evicted is dropped from the write as well, even when its own vector
+/// is fine: the delete runs before the put, so storing it would restore under that key a
+/// row a later row of the same batch replaced with one this write cannot embed.
 #[expect(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
@@ -540,21 +322,63 @@ fn filter_zero_vectors(
     Vec<Option<Vec<f32>>>,
     Vec<Option<String>>,
     HashMap<String, Vec<Option<Value>>>,
+    Vec<String>,
 ) {
-    // Filter in reverse order to avoid index shifting when removing elements
-    for i in (0..embeddings.len()).rev() {
-        if let Some(embedding) = &embeddings[i]
-            // Single pass: check if all values are zero or NaN (both are invalid embeddings)
-            && embedding.iter().all(|&x| x == 0.0 || x.is_nan())
-        {
-            let key_str = primary_keys
-                .get(i)
-                .and_then(|k| k.as_ref().map(String::as_str))
-                .unwrap_or("unknown");
-            tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values"
-            );
+    // Per row: the key this row would be stored under, or `None` for a row that addresses
+    // no stored vector, and what this write would do with it. In row order, because that is
+    // what decides a key the batch carries more than once.
+    let rows: Vec<(Option<&str>, write_util::RowOutcome)> = embeddings
+        .iter()
+        .zip(primary_keys.iter())
+        .map(|(embedding, key)| {
+            let outcome = match embedding {
+                Some(embedding) => match write_util::classify_vector(embedding) {
+                    Some(rejection) => {
+                        let key_str = key.as_deref().unwrap_or("unknown");
+                        let reason = rejection.reason();
+                        tracing::warn!(
+                            "Skipping record '{key_str}' for S3 Vector index '{index_name}': {reason}. Any vector already stored for this record is removed, so it is not returned at its previous value"
+                        );
+                        write_util::RowOutcome::Rejected
+                    }
+                    None => write_util::RowOutcome::Indexed,
+                },
+                // `write_data` skips a row whose embedding is `None` (a NULL or empty search
+                // text), so those keys keep whatever vector an earlier text stored.
+                None => write_util::RowOutcome::Rejected,
+            };
+            // A NULL key addresses no stored vector, so there is nothing to remove.
+            (key.as_deref(), outcome)
+        })
+        .collect();
 
+    let evicted = write_util::keys_to_evict(
+        rows.iter()
+            .filter_map(|(key, outcome)| key.map(|key| (key, *outcome))),
+    );
+    let evicted_keys: HashSet<&str> = evicted.iter().map(String::as_str).collect();
+
+    // A row this write will not store: its own vector is invalid, or a later row of the
+    // batch decided its key against it and the delete below would otherwise be undone by
+    // the put. A row with no embedding at all is left in place either way — `write_data`
+    // skips it, so removing it would only change the arrays for no effect.
+    let drop_row: Vec<bool> = rows
+        .iter()
+        .zip(embeddings.iter())
+        .map(|((key, outcome), embedding)| {
+            embedding.is_some()
+                && match outcome {
+                    write_util::RowOutcome::Rejected => true,
+                    write_util::RowOutcome::Indexed => {
+                        key.is_some_and(|key| evicted_keys.contains(key))
+                    }
+                }
+        })
+        .collect();
+
+    // In reverse order to avoid index shifting when removing elements.
+    for i in (0..drop_row.len()).rev() {
+        if drop_row[i] {
             embeddings.remove(i);
             primary_keys.remove(i);
             for values in metadata.values_mut() {
@@ -563,183 +387,71 @@ fn filter_zero_vectors(
         }
     }
 
-    (embeddings, primary_keys, metadata)
+    (embeddings, primary_keys, metadata, evicted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{FixedSizeListArray, Float32Array, Float32Builder, StringArray};
-    use arrow::datatypes::{DataType, Schema};
+    use arrow::array::{Int32Array, UnionArray};
+    use arrow_schema::{DataType, Schema, UnionFields, UnionMode};
 
-    // Helper function to create a test RecordBatch with text and embedding columns
-    #[expect(clippy::cast_sign_loss)]
-    fn create_test_record_batch_with_embeddings(
-        texts: Vec<Option<&str>>,
-        embeddings: Vec<Option<Vec<f32>>>,
-        dim: i32,
-    ) -> RecordBatch {
-        let text_array = StringArray::from(texts);
+    /// Regression test for #13872. The batch carries one key twice and the row that
+    /// *decides* it carries a vector the index cannot use. Before the shared classifier,
+    /// only the all-zero / all-NaN shapes were a rejection here, so a partially non-finite
+    /// deciding row evicted nothing and the stale vector stayed searchable — while the
+    /// unusable vector was itself put alongside it.
+    #[test]
+    fn every_unindexable_shape_evicts_its_key_and_is_not_put() {
+        for (name, deciding, _) in write_util::unindexable_shapes(2) {
+            let embeddings = vec![
+                Some(vec![1.0_f32, 2.0]),
+                Some(vec![3.0_f32, 4.0]),
+                Some(deciding),
+            ];
+            let keys = vec![
+                Some("same".to_string()),
+                Some("other".to_string()),
+                Some("same".to_string()),
+            ];
+            let (kept, kept_keys, _metadata, evicted) =
+                filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
 
-        // Create embedding array
-        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim);
-        let field = Field::new_list_field(DataType::Float32, false);
-        builder = builder.with_field(field);
-        for embedding_opt in embeddings {
-            if let Some(embedding) = embedding_opt {
-                // Optimized: append_slice is more efficient than append_values with manual validity
-                builder.values().append_slice(&embedding);
-                builder.append(true);
-            } else {
-                builder.values().append_nulls(dim as usize);
-                builder.append(false);
-            }
+            assert_eq!(
+                evicted,
+                vec!["same".to_string()],
+                "the deciding row for 'same' is a {name} vector, so whatever S3 Vectors \
+                 already holds under that key must be removed"
+            );
+            assert_eq!(
+                kept_keys.into_iter().flatten().collect::<Vec<_>>(),
+                vec!["other".to_string()],
+                "the delete runs before the put, so putting the earlier row would restore \
+                 the entry the eviction exists to remove"
+            );
+            assert_eq!(kept.len(), 1);
         }
-        let embedding_array = builder.finish();
-
-        let schema = Schema::new(vec![
-            Field::new("text", DataType::Utf8, true),
-            Field::new(
-                "text_embedding",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, false)),
-                    dim,
-                ),
-                true,
-            ),
-        ]);
-
-        RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(text_array), Arc::new(embedding_array)],
-        )
-        .expect("Failed to create test RecordBatch")
     }
 
-    // Helper function to create a test RecordBatch with only text column
-    fn create_test_record_batch_text_only(texts: Vec<Option<&str>>) -> RecordBatch {
-        let text_array = StringArray::from(texts);
-        let schema = Schema::new(vec![Field::new("text", DataType::Utf8, true)]);
-
-        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(text_array)])
-            .expect("Failed to create test RecordBatch with text only")
-    }
-
+    /// The control: an ordinary deciding vector leaves both rows in the put and evicts
+    /// nothing, so the guard above is measuring the shapes and not the repeated key.
     #[test]
-    #[expect(clippy::float_cmp)]
-    fn test_create_embedding_array_valid_embeddings() {
-        let embeddings = vec![Some(vec![0.1, 0.2, 0.3]), None, Some(vec![0.7, 0.8, 0.9])];
+    fn an_ordinary_deciding_vector_evicts_nothing_and_puts_every_row() {
+        let embeddings = vec![
+            Some(vec![1.0_f32, 2.0]),
+            Some(vec![3.0_f32, 4.0]),
+            Some(write_util::indexable_shape(2)),
+        ];
+        let keys = vec![
+            Some("same".to_string()),
+            Some("other".to_string()),
+            Some("same".to_string()),
+        ];
+        let (kept, _kept_keys, _metadata, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
 
-        let result =
-            create_embedding_array(&embeddings, 3).expect("Failed to create embedding array");
-
-        let list_array = result
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .expect("Result should be FixedSizeListArray");
-
-        assert_eq!(list_array.len(), 3);
-        assert!(!list_array.is_null(0));
-        assert!(list_array.is_null(1));
-        assert!(!list_array.is_null(2));
-
-        // Check first embedding values
-        let first_values = list_array.value(0);
-        let first_floats = first_values
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .expect("Values should be Float32Array");
-        assert_eq!(first_floats.value(0), 0.1);
-        assert_eq!(first_floats.value(1), 0.2);
-        assert_eq!(first_floats.value(2), 0.3);
-    }
-
-    #[test]
-    fn test_create_embedding_array_empty_embeddings() {
-        let embeddings: Vec<Option<Vec<f32>>> = vec![None, None];
-
-        let result = create_embedding_array(&embeddings, 0);
-
-        // Should fail because no valid embeddings to determine dimension
-        assert!(result.is_err());
-        assert!(matches!(
-            *result.expect_err("Expected error for empty embeddings"),
-            Error::CannotDetermineEmbeddingDimension
-        ));
-    }
-
-    #[test]
-    #[expect(clippy::float_cmp)]
-    fn test_update_embedding_column_in_batch_with_existing_column() {
-        let record = create_test_record_batch_with_embeddings(
-            vec![Some("hello"), Some("world")],
-            vec![None, None], // Existing embeddings are null
-            3,
-        );
-
-        let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
-
-        let result = update_embedding_column_in_batch(&record, "text", &new_embeddings, 3)
-            .expect("Failed to update embedding column");
-
-        // Verify the updated batch has the new embeddings
-        let embedding_column = result.column(1);
-        let list_array = embedding_column
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .expect("Embedding column should be FixedSizeListArray");
-
-        assert!(!list_array.is_null(0));
-        assert!(!list_array.is_null(1));
-
-        let first_values = list_array.value(0);
-        let first_floats = first_values
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .expect("Values should be Float32Array");
-        assert_eq!(first_floats.value(0), 0.1);
-        assert_eq!(first_floats.value(1), 0.2);
-        assert_eq!(first_floats.value(2), 0.3);
-    }
-
-    #[test]
-    #[expect(clippy::float_cmp)]
-    fn test_update_embedding_column_in_batch_append_embedding_column() {
-        let record = create_test_record_batch_text_only(vec![Some("hello"), Some("world")]);
-
-        let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
-
-        let result = update_embedding_column_in_batch(&record, "text", &new_embeddings, 3)
-            .expect("Failed to handle missing embedding column");
-
-        // Should append the embedding column with the correct name
-        let expected_embedding_col = embedding_col("text");
-        assert_eq!(result.num_columns(), record.num_columns() + 1);
-        assert_eq!(result.num_rows(), record.num_rows());
-
-        // Check that the last column is the embedding column
-        let schema = result.schema();
-        let embedding_field = schema.field(result.num_columns() - 1);
-        assert_eq!(embedding_field.name(), &expected_embedding_col);
-
-        // Check that the embedding column contains the correct values
-        let embedding_column = result.column(result.num_columns() - 1);
-        let list_array = embedding_column
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .expect("Embedding column should be FixedSizeListArray");
-
-        assert!(!list_array.is_null(0));
-        assert!(!list_array.is_null(1));
-
-        let first_values = list_array.value(0);
-        let first_floats = first_values
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .expect("Values should be Float32Array");
-        assert_eq!(first_floats.value(0), 0.1);
-        assert_eq!(first_floats.value(1), 0.2);
-        assert_eq!(first_floats.value(2), 0.3);
+        assert!(evicted.is_empty());
+        assert_eq!(kept.len(), 3);
     }
 
     #[test]
@@ -770,7 +482,7 @@ mod tests {
             ],
         );
 
-        let (filtered_embeddings, filtered_keys, filtered_metadata) =
+        let (filtered_embeddings, filtered_keys, filtered_metadata, _evicted) =
             filter_zero_vectors(embeddings, keys, metadata, "test_index");
 
         assert_eq!(filtered_embeddings.len(), 3);
@@ -815,7 +527,7 @@ mod tests {
             ],
         );
 
-        let (filtered_embeddings, filtered_keys, filtered_metadata) =
+        let (filtered_embeddings, filtered_keys, filtered_metadata, _evicted) =
             filter_zero_vectors(embeddings, keys, metadata, "test_index");
 
         // Should keep only the 2 valid vectors
@@ -830,50 +542,152 @@ mod tests {
         assert_eq!(filtered_keys[1], Some("key4".to_string()));
     }
 
-    /// Test that create_embedding_array correctly detects dimension mismatch.
-    #[test]
-    fn test_embedding_dimension_mismatch() {
-        // Embeddings with mismatched dimensions: expected 2, but row 1 has 3
-        let embeddings = vec![
-            Some(vec![0.1, 0.2]),      // dimension 2 - correct
-            Some(vec![0.3, 0.4, 0.5]), // dimension 3 - MISMATCH!
-        ];
-
-        let result = create_embedding_array(&embeddings, 2);
-
-        assert!(
-            result.is_err(),
-            "Should fail when embedding dimensions don't match"
-        );
-        let error = *result.expect_err("Expected error for dimension mismatch");
-        match error {
-            Error::EmbeddingDimensionMismatch {
-                expected,
-                actual,
-                row_index,
-            } => {
-                assert_eq!(expected, 2, "Expected dimension should be 2");
-                assert_eq!(actual, 3, "Actual dimension should be 3");
-                assert_eq!(row_index, 1, "Mismatch should be at row 1");
-            }
-            _ => panic!("Expected EmbeddingDimensionMismatch error, got: {error:?}"),
-        }
+    fn keys_of(keys: &[Option<&str>]) -> Vec<Option<String>> {
+        keys.iter().map(|k| k.map(ToString::to_string)).collect()
     }
 
-    /// Test that create_embedding_array accepts embeddings with correct dimensions.
+    /// Regression test for #13504. A row rewritten from an indexable embedding to a rejected
+    /// one is dropped from the `PutVectors` call, so without a delete beside it the vector
+    /// its previous text produced stays in the index and goes on being returned.
     #[test]
-    fn test_embedding_dimension_correct() {
+    fn a_rejected_row_is_named_for_deletion() {
         let embeddings = vec![
-            Some(vec![0.1, 0.2, 0.3]),
-            Some(vec![0.4, 0.5, 0.6]),
-            None, // Null embeddings should be handled correctly
-            Some(vec![0.7, 0.8, 0.9]),
+            Some(vec![1.0, 2.0]),           // indexed
+            Some(vec![0.0, 0.0]),           // rejected — all zeros
+            Some(vec![f32::NAN, f32::NAN]), // rejected — all NaN
         ];
+        let keys = keys_of(&[Some("kept"), Some("zeroed"), Some("nan")]);
 
-        let result = create_embedding_array(&embeddings, 3);
-        assert!(
-            result.is_ok(),
-            "Should succeed when all embedding dimensions match"
+        let (_, _, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        let mut evicted = evicted;
+        evicted.sort();
+        assert_eq!(
+            evicted,
+            vec!["nan".to_string(), "zeroed".to_string()],
+            "every rejected row must be deleted; the row that was indexed must not be"
         );
+    }
+
+    /// `write_data` drops a `None` embedding as silently as a filtered one, so the same
+    /// stale vector survives a row whose search text became NULL or empty.
+    #[test]
+    fn a_row_with_no_embedding_at_all_is_named_for_deletion() {
+        let embeddings = vec![Some(vec![1.0, 2.0]), None];
+        let keys = keys_of(&[Some("kept"), Some("no_text")]);
+
+        let (_, _, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert_eq!(evicted, vec!["no_text".to_string()]);
+    }
+
+    /// A NULL primary key addresses no stored vector, so there is nothing to delete for it —
+    /// and inventing a key would delete something else.
+    #[test]
+    fn a_rejected_row_with_a_null_key_names_nothing_for_deletion() {
+        let embeddings = vec![Some(vec![0.0, 0.0]), None];
+        let keys = keys_of(&[None, None]);
+
+        let (_, _, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert!(evicted.is_empty(), "a NULL key names no stored vector");
+    }
+
+    /// The same key rejected and then stored within one batch: the row that decides the key
+    /// is the one the put re-establishes, so a delete would only cost a round trip.
+    #[test]
+    fn a_key_this_batch_stores_after_rejecting_is_not_named_for_deletion() {
+        let embeddings = vec![Some(vec![0.0, 0.0]), Some(vec![1.0, 2.0])];
+        let keys = keys_of(&[Some("same"), Some("same")]);
+
+        let (filtered_embeddings, filtered_keys, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert!(evicted.is_empty());
+        assert_eq!(
+            filtered_embeddings,
+            vec![Some(vec![1.0, 2.0])],
+            "the deciding row is still stored"
+        );
+        assert_eq!(filtered_keys, keys_of(&[Some("same")]));
+    }
+
+    /// Regression test for #13848. The same pair the other way round: the row that decides
+    /// the key cannot be embedded, so the vector the earlier row would have stored is
+    /// exactly what a search must stop returning — the key is deleted, and the earlier row
+    /// is dropped from the put that would otherwise restore it.
+    #[test]
+    fn a_key_whose_deciding_row_is_rejected_is_deleted_and_not_stored() {
+        let embeddings = vec![Some(vec![1.0, 2.0]), Some(vec![0.0, 0.0])];
+        let keys = keys_of(&[Some("same"), Some("same")]);
+
+        let (filtered_embeddings, filtered_keys, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert_eq!(evicted, vec!["same".to_string()]);
+        assert!(
+            filtered_embeddings.is_empty(),
+            "storing the earlier row would write the stale vector back over its own delete"
+        );
+        assert!(filtered_keys.is_empty());
+    }
+
+    #[test]
+    fn a_batch_that_rejects_nothing_names_nothing_for_deletion() {
+        let embeddings = vec![Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])];
+        let keys = keys_of(&[Some("a"), Some("b")]);
+
+        let (_, _, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert!(
+            evicted.is_empty(),
+            "the happy path must issue no delete call at all"
+        );
+    }
+
+    #[test]
+    fn configured_metadata_column_with_unsupported_json_type_fails() {
+        let union_fields = vec![(
+            0_i8,
+            Arc::new(Field::new("integer", DataType::Int32, false)),
+        )]
+        .into_iter()
+        .collect::<UnionFields>();
+        let union_array = UnionArray::try_new(
+            union_fields.clone(),
+            vec![0_i8].into(),
+            None,
+            vec![Arc::new(Int32Array::from(vec![1_i32]))],
+        )
+        .expect("union array should be valid");
+        let field = Field::new(
+            "filterable_metadata",
+            DataType::Union(union_fields, UnionMode::Sparse),
+            false,
+        );
+        let record = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(union_array)],
+        )
+        .expect("record batch should be valid");
+
+        let error = extract_and_format_metadata(
+            "test_index",
+            &["filterable_metadata".to_string()],
+            &record,
+        )
+        .expect_err("unsupported metadata must fail indexing instead of being omitted");
+
+        match error {
+            Error::MetadataColumnEncoding { index, column, .. } => {
+                assert_eq!(index, "test_index");
+                assert_eq!(column, "filterable_metadata");
+            }
+            other => panic!("expected metadata encoding error, got {other}"),
+        }
     }
 }

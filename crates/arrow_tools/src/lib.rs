@@ -14,8 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod batch_bytes;
 pub mod decimal;
 pub mod format;
+pub mod ipc;
+pub mod map_entries;
+pub mod metadata_keys;
 pub mod record_batch;
 pub mod schema;
 pub mod schema_evolution;

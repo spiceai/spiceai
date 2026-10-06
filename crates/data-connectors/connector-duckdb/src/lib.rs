@@ -25,21 +25,23 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::Read;
+use data_components::duckdb::with_utc_session_timezone;
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
+    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult,
+};
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-    DataConnectorFactory, DataConnectorResult,
-};
-use runtime::datafusion::dialect::new_duckdb_dialect;
-use runtime::datafusion::udf::deny_spice_functions_for_duckdb_table_providers;
-use runtime::parameters::ParameterSpec;
+use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
+use runtime_parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -49,7 +51,7 @@ use std::sync::Arc;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: open. Specify a DuckDB file with the `open` parameter"
+        "Missing required parameter `duckdb_open`. Set it to the DuckDB database file to read, for example `duckdb_open: ./data.duckdb`. For details, visit: https://spiceai.org/docs/components/data-connectors/duckdb"
     ))]
     MissingDuckDBFile,
 }
@@ -96,7 +98,7 @@ impl DuckDB {
     ///
     /// Returns an error if the in-memory `DuckDB` connection cannot be established.
     pub fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
-        let pool = Arc::new(
+        let pool = Arc::new(with_utc_session_timezone(
             DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
@@ -108,7 +110,7 @@ impl DuckDB {
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
                 ),
-        );
+        ));
 
         Ok(Self::with_spice_deny_list(
             DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()),
@@ -121,7 +123,7 @@ impl DuckDB {
     ///
     /// Returns an error if the file-based `DuckDB` connection cannot be established.
     pub fn create_file(path: &str, params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
-        let pool = Arc::new(
+        let pool = Arc::new(with_utc_session_timezone(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
@@ -133,7 +135,7 @@ impl DuckDB {
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
                 ),
-        );
+        ));
 
         Ok(Self::with_spice_deny_list(
             DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()),
@@ -171,10 +173,11 @@ impl DataConnectorFactory for DuckDBFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let duckdb_factory =
                 if let Some(db_path) = params.parameters.clone().get("open").expose().ok() {
@@ -243,7 +246,8 @@ impl DataConnector for DuckDB {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path: TableReference = dataset.path().into();
 
@@ -261,5 +265,28 @@ impl DataConnector for DuckDB {
                 dataconnector: "duckdb",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
+    }
+}
+
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_duckdb as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+data_connector_api::register_data_connector!(
+    register_duckdb_connector,
+    DUCKDB_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    DuckDBFactory
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_error_names_the_spicepod_key() {
+        assert_eq!(
+            Error::MissingDuckDBFile.to_string(),
+            "Missing required parameter `duckdb_open`. Set it to the DuckDB database file to read, for example `duckdb_open: ./data.duckdb`. For details, visit: https://spiceai.org/docs/components/data-connectors/duckdb"
+        );
     }
 }

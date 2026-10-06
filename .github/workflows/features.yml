@@ -7,14 +7,26 @@ on:
     paths:
       - '**/Cargo.toml'
   pull_request:
-    paths:
-      - '**/Cargo.toml'
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   workflow_dispatch:
 
 concurrency:
-  # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
-  cancel-in-progress: true
+  # A newer run cancels the one in progress for the same pull request, merge group, non-trunk
+  # branch or manually dispatched trunk commit. Trunk pushes share one group and never cancel
+  # the running check on `spiceai-macos-large`: a newer push replaces only the run still waiting.
+  # The trunk commit is the merge-group commit that already passed this workflow.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ (github.ref_name == 'trunk' && github.event_name != 'push') && github.sha || 'any-sha' }}
+  cancel-in-progress: ${{ github.ref_name != 'trunk' || github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,14 +38,21 @@ env:
   CARGO_HTTP_TIMEOUT: 60
 
 jobs:
+  # Required check, so it runs on every merge-queue entry (merge_group can't
+  # path-filter). Feature-combination breakage can come from any code change, so
+  # running unconditionally is intentional; step-gate on Cargo changes if queue
+  # latency ever becomes a concern.
   build:
     name: Features Check
-    runs-on: spiceai-macos
+    # Emit the required context on pull requests without running the expensive
+    # feature matrix; the real check runs on the merge-group commit.
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: spiceai-macos-large
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -44,13 +63,19 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
 
       - name: Set up make
         uses: ./.github/actions/setup-make
@@ -74,6 +99,8 @@ jobs:
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Cache cargo-hack binary
         id: cache-cargo-hack
@@ -107,6 +134,22 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      # `mcp` is excluded from the powerset above, so nothing else compiles
+      # `runtime-tools` under its own `mcp` feature: it is otherwise only ever built as
+      # part of a graph including `runtime`, which supplies the feature's real
+      # requirements and hides them from the declaration.
+      #
+      # `-p` is what makes this a guard rather than another workspace build. Without it
+      # Cargo selects the workspace `default-members` (`bin/spiced`) and checks that whole
+      # graph, which both costs far more and re-admits the feature unification the check
+      # exists to escape.
+      - name: Check runtime-tools/mcp feature
+        run: cargo check -p runtime-tools --features mcp --profile lint
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
       - name: Check snapshots feature
         run: cargo check --no-default-features --features snapshots --profile lint
         env:
@@ -115,8 +158,13 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Show sccache stats
-        if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != ''
-        run: sccache --show-stats
+        if: always() && (runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != '')
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''

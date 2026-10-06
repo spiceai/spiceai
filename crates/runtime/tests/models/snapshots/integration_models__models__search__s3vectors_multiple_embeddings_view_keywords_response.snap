@@ -25,6 +25,36 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs_view",
       "matches": {
         "answer": [
+          "The number of ways is \\( 18 \\times 17 \\times 16 = \\boxed{4896} \\)."
+        ],
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        ]
+      },
+      "primary_key": {
+        "id": 361
+      }
+    },
+    {
+      "_score": "0.03",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "To find the number of groups of 7 in 21, divide 21 by 7:  \n\\[ 21 \\div 7 = 3 \\]  \nThus, there are $\\boxed{3}$ groups of 7 in 21."
+        ],
+        "question": [
+          "Find the number of groups of 7 in 21."
+        ]
+      },
+      "primary_key": {
+        "id": 359
+      }
+    },
+    {
+      "_score": "0.03",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
           "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
@@ -33,30 +63,6 @@ expression: "normalize_search_response(resp, round_scores)"
       },
       "primary_key": {
         "id": 1277
-      }
-    },
-    {
-      "_score": "0.02",
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 458
-      }
-    },
-    {
-      "_score": "0.02",
-      "dataset": "qs_view",
-      "matches": {
-        "question": [
-          "Calculate the number of permutations of 14 items taken 4 at a time."
-        ]
-      },
-      "primary_key": {
-        "id": 41
       }
     }
   ]

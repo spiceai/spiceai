@@ -1071,7 +1071,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
             assert!(tools.iter().all(|tool| matches!(
                 tool,
                 ToolDefinition::CodeInterpreter(_)
-                    | ToolDefinition::WebSearchPreview(_)
+                    | ToolDefinition::WebSearch(_)
                     | ToolDefinition::Function(_)
             )));
 
@@ -1081,7 +1081,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
                     ToolDefinition::CodeInterpreter(_) => {
                         assert!(desired_tools.remove("code_interpreter"));
                     }
-                    ToolDefinition::WebSearchPreview(_) => {
+                    ToolDefinition::WebSearch(_) => {
                         assert!(desired_tools.remove("web_search"));
                     }
                     ToolDefinition::Function(FunctionTool { name, .. }) => {
@@ -1248,6 +1248,7 @@ async fn get_openai_chat_model(
     let model_secrets = get_params_with_secrets_value(&model_with_tools.params, &rt).await;
     try_to_chat_model(&model_with_tools, &model_secrets, rt)
         .await
+        .map(|loaded| loaded.chat)
         .map_err(anyhow::Error::from)
 }
 

@@ -16,8 +16,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{Runtime, metrics, status, worker::try_construct_worker};
+use crate::{Runtime, status, worker::try_construct_worker};
 use opentelemetry::KeyValue;
+use runtime_metrics as metrics;
 use telemetry::timing::TimeMeasurement;
 
 impl Runtime {

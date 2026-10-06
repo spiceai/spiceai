@@ -20,7 +20,11 @@ limitations under the License.
 //! discovery via Oracle dictionary view queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
+use crate::{
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use data_components::RefreshableCatalogProvider;
@@ -211,7 +215,7 @@ impl CatalogConnector for OracleCatalog {
 
         let pool = Arc::new(pool);
 
-        let catalog_provider = Arc::new(OracleCatalogProvider::new(pool, catalog.include.clone()));
+        let catalog_provider = Arc::new(OracleCatalogProvider::new(pool, table_selector(catalog)));
 
         catalog_provider
             .refresh()

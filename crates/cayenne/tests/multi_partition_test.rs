@@ -435,8 +435,10 @@ async fn test_composite_partition_metadata_impl(
         false,
     );
 
-    // Verify the composite key generation
-    assert_eq!(composite_partition.composite_key(), "2025/10");
+    // Verify the composite key generation. The key is versioned and
+    // length-prefixed ("v1:" then `<len>:<value>` per component) so distinct
+    // tuples can't collide — not the legacy slash-joined "2025/10".
+    assert_eq!(composite_partition.composite_key(), "v1:4:20252:10");
     println!(
         "✓ Composite key correctly generated: '{}'",
         composite_partition.composite_key()
@@ -464,7 +466,7 @@ async fn test_composite_partition_metadata_impl(
 
     assert_eq!(single_partition.partition_columns, vec!["region"]);
     assert_eq!(single_partition.partition_values, vec!["us-east-1"]);
-    assert_eq!(single_partition.composite_key(), "us-east-1");
+    assert_eq!(single_partition.composite_key(), "v1:9:us-east-1");
     println!("✓ Single partition backward compatibility verified");
 
     println!("\n✅ Composite partition metadata test passed with {backend_name}!");

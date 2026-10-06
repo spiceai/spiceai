@@ -4,7 +4,7 @@ The GCS data connector enables querying files stored in Google Cloud Storage buc
 
 ## Features
 
-- **Multiple File Formats**: Supports Parquet, CSV, JSON (including NDJSON via `json_format` parameter), and other formats
+- **Multiple File Formats**: Supports Parquet, ORC, CSV, JSON (including NDJSON via `json_format` parameter), and other formats
 - **Multiple Authentication Methods**: Service account keys, Application Default Credentials (ADC), or anonymous access for public buckets
 - **URL Schemes**: Supports both `gcs://` and `gs://` URL schemes
 - **Retry Configuration**: Configurable retry behavior with exponential backoff
@@ -105,7 +105,7 @@ datasets:
 | `gcs_backoff_max_duration`            | string  | *       | Maximum backoff duration                                                              |
 | `gcs_backoff_base`                    | float   | *       | Base of the exponential backoff                                                       |
 | `client_timeout`                      | string  | none    | Timeout for GCS client operations                                                     |
-| `file_format`                         | string  | none    | File format: `parquet`, `csv`, `json`, `jsonl`                                        |
+| `file_format`                         | string  | none    | File format: `parquet`, `orc`, `csv`, `json`, `jsonl`                                 |
 | `json_format`                         | string  | `jsonl` | JSON sub-format when `file_format` is `json`: `jsonl`, `ndjson`, `ldjson`, or `array` |
 | `hive_partitioning_enabled`           | boolean | `false` | Enable Hive-style partitioning                                                        |
 
@@ -122,6 +122,18 @@ datasets:
     params:
       file_format: parquet
 ```
+
+### ORC
+
+```yaml
+datasets:
+  - from: gcs://my-bucket/orc-data/
+    name: orc_data
+    params:
+      file_format: orc
+```
+
+The `.orc` extension is enough to infer the format when `file_format` is omitted. Listing connectors other than GCS (S3, ABFS, file, …) use the same `file_format: orc` parameter.
 
 ### CSV
 

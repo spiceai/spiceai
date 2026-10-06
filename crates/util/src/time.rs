@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,14 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Small wall-clock time helpers shared across crates.
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Milliseconds since the Unix epoch for a wall-clock [`SystemTime`].
-///
-/// Returns `None` for pre-epoch times or if the millisecond count overflows
-/// `i64`. Used to derive `source_commit_ts_ms`-style timestamps for the CDC
+/// Convert a [`SystemTime`] to Unix-epoch milliseconds as an `i64`, returning
+/// `None` for pre-epoch instants or values that overflow `i64`. Used to derive
+/// `source_commit_ts_ms`-style timestamps and to read the wall clock for the CDC
 /// replication-lag metric (`now_ms - source_commit_ts_ms`).
 #[must_use]
 pub fn system_time_to_unix_ms(t: SystemTime) -> Option<i64> {

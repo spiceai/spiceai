@@ -17,11 +17,12 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
-    Runtime, UnableToInitializeLlmToolSnafu, metrics, status,
+    Runtime, UnableToInitializeLlmToolSnafu, status,
     tools::{self, Tooling, factory::default_available_catalogs},
 };
 use futures::future::join_all;
 use opentelemetry::KeyValue;
+use runtime_metrics as metrics;
 use runtime_secrets::get_params_with_secrets;
 use runtime_tools::catalog::SpiceToolCatalog;
 use secrecy::SecretString;
@@ -73,6 +74,11 @@ impl Runtime {
                     .collect(),
             },
         );
+        #[cfg(feature = "mcp")]
+        {
+            runtime_tools::mcp::attach_mcp_schema_snapshot(t.as_ref(), &self.mcp_schemas);
+            self.refresh_mcp_tool_schemas(&tools_map);
+        }
         tracing::trace!("Tool catalog {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool_catalog", name.clone())]);
         self.status
@@ -84,6 +90,13 @@ impl Runtime {
         let mut tools_map = self.tools.write().await;
 
         tools_map.insert(name.clone(), t);
+        #[cfg(feature = "mcp")]
+        {
+            if let Some(Tooling::Catalog { tools: catalog, .. }) = tools_map.get(&name) {
+                runtime_tools::mcp::attach_mcp_schema_snapshot(catalog.as_ref(), &self.mcp_schemas);
+            }
+            self.refresh_mcp_tool_schemas(&tools_map);
+        }
         tracing::trace!("Tool {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool", name.clone())]);
         self.status

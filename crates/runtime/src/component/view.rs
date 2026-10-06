@@ -15,10 +15,11 @@ limitations under the License.
 */
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::prelude::*;
 use spicepod::{component::view as spicepod_view, vector::VectorStore};
-use std::{collections::HashMap, fs, sync::Arc, time::Duration};
+use std::ops::{Deref, DerefMut};
+use std::{collections::HashMap, fs, sync::Arc};
 
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 
@@ -31,31 +32,37 @@ use super::{
 };
 use spicepod::semantic::Column;
 
-/// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
+// Config-only spec lives in `runtime-component`; re-export for path
+// compatibility (`crate::component::view::ViewSpec`).
+pub use runtime_component::view::ViewSpec;
+
+/// `Arc<Runtime>`-bound wrapper over a [`ViewSpec`]. Derefs to the spec so
+/// `view.acceleration`, `view.columns`, `view.is_accelerated()`, etc. keep
+/// working unchanged.
 #[derive(Clone)]
 pub struct View {
-    pub name: TableReference,
-    pub sql: Arc<str>,
-    pub metadata: HashMap<String, String>,
-    pub columns: Vec<Column>,
-    pub acceleration: Option<acceleration::Acceleration>,
-    pub ready_state: ReadyState,
+    pub spec: ViewSpec,
     pub runtime: Arc<Runtime>,
-    pub vectors: Option<VectorStore>,
-    pub params: HashMap<String, String>,
     pub app: Arc<App>,
+}
+
+impl Deref for View {
+    type Target = ViewSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spec
+    }
+}
+
+impl DerefMut for View {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.spec
+    }
 }
 
 impl PartialEq for View {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.sql == other.sql
-            && self.metadata == other.metadata
-            && self.columns == other.columns
-            && self.acceleration == other.acceleration
-            && self.vectors == other.vectors
-            && self.params == other.params
-            && self.ready_state == other.ready_state
+        self.spec == other.spec
     }
 }
 
@@ -75,7 +82,6 @@ impl std::fmt::Debug for View {
 }
 
 impl View {
-    #[expect(clippy::result_large_err)]
     fn load_sql_ref(sql_ref: &str) -> crate::Result<String> {
         let sql = fs::read_to_string(sql_ref)
             .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;
@@ -83,57 +89,10 @@ impl View {
     }
 
     #[must_use]
-    pub fn is_accelerated(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.enabled;
-        }
-
-        false
-    }
-
-    #[must_use]
-    pub fn refresh_check_interval(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_check_interval;
-        }
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_max_jitter(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration
-            && acceleration.refresh_jitter_enabled
-        {
-            // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
-            return match acceleration.refresh_jitter_max {
-                Some(jitter) => Some(jitter),
-                None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
-            };
-        }
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_retry_enabled(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_retry_enabled;
-        }
-        false
-    }
-
-    #[must_use]
-    pub fn refresh_retry_max_attempts(&self) -> Option<usize> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_retry_max_attempts;
-        }
-        None
-    }
-
-    #[must_use]
     pub async fn is_accelerator_initialized(&self) -> bool {
         if let Some(acceleration_settings) = &self.acceleration {
             let Some(accelerator) = self
-                .runtime()
+                .runtime
                 .accelerator_engine_registry()
                 .get_accelerator_engine(acceleration_settings.engine)
                 .await
@@ -145,18 +104,6 @@ impl View {
         }
 
         false
-    }
-
-    #[must_use]
-    pub fn has_embeddings(&self) -> bool {
-        self.columns.iter().any(|c| !c.embeddings.is_empty())
-    }
-
-    #[must_use]
-    pub fn has_full_text_column(&self) -> bool {
-        self.columns
-            .iter()
-            .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
     }
 }
 
@@ -191,6 +138,19 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
 
         let metadata = view.metadata();
 
+        // `acceleration.ready_state` is a legitimate member of the acceleration block, so it
+        // parses cleanly on a view as well as on a dataset. A dataset reads it out of the block
+        // and applies it; resolve it the same way here so the key means one thing wherever it is
+        // written, rather than being accepted and dropped on one of the two components. See
+        // `DatasetBuilder::try_from` for the dataset side. The deprecation is reported by the
+        // load path (`init::dataset::warn_about_acceleration_block`), not from this
+        // conversion, which read-only callers run too.
+        #[expect(deprecated)]
+        let ready_state = match view.acceleration.as_ref().map(|a| a.ready_state) {
+            Some(Some(ready_state)) => ReadyState::from(ready_state),
+            _ => ReadyState::from(view.ready_state),
+        };
+
         let acceleration = view
             .acceleration
             .map(acceleration::Acceleration::try_from)
@@ -221,7 +181,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             metadata,
             columns: view.columns,
             acceleration,
-            ready_state: ReadyState::from(view.ready_state),
+            ready_state,
             vectors: view.vectors,
             params: view
                 .params
@@ -255,8 +215,14 @@ impl AccelerationSource for View {
         Arc::clone(&self.app)
     }
 
-    fn runtime(&self) -> Arc<Runtime> {
-        Arc::clone(&self.runtime)
+    fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+        self.runtime.secrets()
+    }
+
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        self.runtime.datafusion().snapshot_notifications()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {
@@ -267,12 +233,79 @@ impl AccelerationSource for View {
         &self.name
     }
 
+    fn connector_name(&self) -> Option<&str> {
+        // A view has no `from:` — its rows come from its SQL, not a connector — so
+        // there is no connector default to apply. `ViewBuilder::try_from` also
+        // rejects every refresh mode except `full`, which is the fallback a `None`
+        // resolves to.
+        None
+    }
+
+    fn on_schema_change(&self) -> Option<runtime_acceleration::OnSchemaChange> {
+        // A view declares no `on_schema_change`: its columns follow its SQL, so there is
+        // no source schema for an accelerator to reconcile against.
+        None
+    }
+
+    fn allows_write(&self) -> bool {
+        // A view is not writable, and `ViewBuilder::try_from` rejects every refresh mode
+        // except `full`, so a view is never the read-only CDC replica the scan-freshness
+        // decision is about.
+        false
+    }
+
     fn time_column(&self) -> Option<&str> {
         None
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn initialized_sources<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<Arc<dyn runtime_acceleration::AccelerationSource>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let app = self.app();
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let datasets: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
+                Arc::clone(&runtime)
+                    .get_initialized_datasets(&app, crate::LogErrors(false))
+                    .await
+                    .into_iter()
+                    .map(|ds| ds as Arc<dyn runtime_acceleration::AccelerationSource>)
+                    .collect();
+            #[cfg(feature = "duckdb")]
+            {
+                let views: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
+                    Arc::clone(&runtime)
+                        .get_initialized_views(&app, crate::LogErrors(false))
+                        .await
+                        .into_iter()
+                        .map(|v| v as Arc<dyn runtime_acceleration::AccelerationSource>)
+                        .collect();
+                datasets.into_iter().chain(views).collect()
+            }
+            #[cfg(not(feature = "duckdb"))]
+            datasets
+        })
+    }
+
+    fn checkpointer_factory(
+        &self,
+        snapshot_behavior: runtime_acceleration::snapshot::SnapshotBehavior,
+    ) -> runtime_acceleration::dataset_checkpoint::DatasetCheckpointerFactory {
+        crate::dataaccelerator::spice_sys::checkpointer_factory(
+            self,
+            self.runtime.accelerator_engine_registry(),
+            snapshot_behavior,
+        )
     }
 }
 
@@ -294,16 +327,170 @@ impl ViewBuilder {
     #[must_use]
     pub fn build_with(self, runtime: Arc<Runtime>, app: Arc<App>) -> View {
         View {
-            name: self.name,
-            sql: Arc::from(self.sql),
-            metadata: self.metadata,
-            columns: self.columns,
-            acceleration: self.acceleration,
-            ready_state: self.ready_state,
-            vectors: self.vectors,
-            params: self.params,
+            spec: ViewSpec {
+                name: self.name,
+                sql: Arc::from(self.sql),
+                metadata: self.metadata,
+                columns: self.columns,
+                acceleration: self.acceleration,
+                ready_state: self.ready_state,
+                vectors: self.vectors,
+                params: self.params,
+            },
             runtime,
             app,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadyState, ViewBuilder};
+    use crate::component::{AcceleratedComponent, deprecated_ready_state_warning};
+    use spicepod::component::view as spicepod_view;
+
+    /// Resolves a view from its Spicepod YAML, so the test covers the same parse that a
+    /// `spicepod.yaml` goes through rather than a hand-built struct that could disagree with it.
+    fn ready_state_of(view_yaml: &str) -> ReadyState {
+        let view: spicepod_view::View = yaml::from_str(view_yaml).expect("view yaml parses");
+        ViewBuilder::try_from(view)
+            .expect("view builds")
+            .ready_state
+    }
+
+    /// Regression test for #13615. The key parses on a view whether or not anything reads it, so
+    /// assert the value the built view carries rather than that the Spicepod was accepted.
+    #[test]
+    fn acceleration_ready_state_is_applied_to_a_view() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+acceleration:
+  enabled: true
+  ready_state: on_registration
+",
+        );
+
+        assert_eq!(
+            ready_state,
+            ReadyState::OnRegistration,
+            "a view's `acceleration.ready_state` must reach the built view"
+        );
+    }
+
+    /// The block being switched off does not discard the setting, matching the dataset. That is
+    /// what `spicepod`'s `CONSUMED_WHEN_DISABLED` relies on when it leaves `ready_state` out of
+    /// the "discarded because `enabled: false`" warning.
+    #[test]
+    fn acceleration_ready_state_is_applied_even_when_acceleration_is_disabled() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+acceleration:
+  enabled: false
+  ready_state: on_schema_resolved
+",
+        );
+
+        assert_eq!(ready_state, ReadyState::OnSchemaResolved);
+    }
+
+    /// The deprecated key wins over the view's own field, the same precedence `DatasetBuilder`
+    /// applies, so the two components cannot resolve the same pair of settings differently.
+    ///
+    /// Both values are non-default and differ from each other. `on_load` would be useless on
+    /// either side: it is the `#[default]`, so a written-out `ready_state: on_load` is
+    /// indistinguishable from an omitted one, and the assertion would hold for an implementation
+    /// that ignored one of the two fields entirely.
+    #[test]
+    fn acceleration_ready_state_takes_precedence_over_the_views_own_field() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+ready_state: on_schema_resolved
+acceleration:
+  enabled: true
+  ready_state: on_registration
+",
+        );
+
+        assert_eq!(
+            ready_state,
+            ReadyState::OnRegistration,
+            "the acceleration block's value must win over the view's own"
+        );
+    }
+
+    #[test]
+    fn the_views_own_ready_state_is_used_when_the_acceleration_block_omits_it() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+ready_state: on_registration
+acceleration:
+  enabled: true
+",
+        );
+
+        assert_eq!(ready_state, ReadyState::OnRegistration);
+    }
+
+    #[test]
+    fn a_view_with_no_acceleration_block_uses_its_own_ready_state() {
+        assert_eq!(
+            ready_state_of(
+                r"
+name: daily_totals
+sql: SELECT 1
+ready_state: on_schema_resolved
+"
+            ),
+            ReadyState::OnSchemaResolved
+        );
+        assert_eq!(
+            ready_state_of(
+                r"
+name: daily_totals
+sql: SELECT 1
+"
+            ),
+            ReadyState::OnLoad,
+            "an unset `ready_state` keeps the default"
+        );
+    }
+
+    /// The wording itself is asserted beside the shared builder in `component::tests`. What is
+    /// specific to the view — and what makes that escaping load-bearing rather than decorative — is
+    /// that a name carrying a newline gets through `ViewBuilder::try_from` at all: a *quoted*
+    /// identifier may legally contain a newline, and `validate_identifier` accepts one, so a name
+    /// that passes validation could otherwise break the line in two and forge a second record.
+    /// `disabled_acceleration_warning` escapes for exactly this reason.
+    #[test]
+    fn a_view_name_carrying_a_newline_cannot_forge_a_second_log_line() {
+        let hostile = "\"api\nWARN forged\"";
+
+        // The escaping only matters if such a name reaches the warning at all, so assert that
+        // the builder accepts it rather than assuming it does.
+        let view: spicepod_view::View =
+            yaml::from_str(&format!("name: {hostile:?}\nsql: SELECT 1\n")).expect("yaml parses");
+        assert!(
+            ViewBuilder::try_from(view).is_ok(),
+            "a quoted identifier containing a newline is accepted by the builder, which is what \
+             makes escaping load-bearing rather than decorative"
+        );
+
+        let message = deprecated_ready_state_warning(AcceleratedComponent::View, hostile);
+        assert!(
+            !message.contains('\n'),
+            "an embedded newline must not survive into the log line: {message:?}"
+        );
+        assert!(
+            message.contains("WARN forged"),
+            "the name is still reported in full, only escaped: {message:?}"
+        );
     }
 }

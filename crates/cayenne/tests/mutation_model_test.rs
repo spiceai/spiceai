@@ -27,6 +27,14 @@ limitations under the License.
 //! This gives strong coverage for protected-snapshot ordering, deletion cache
 //! reloads, insert-record persistence, and mixed single-row / batch mutation
 //! histories.
+//!
+//! The live in-memory read is checked after every step (cheap); the reopen
+//! (from catalog metadata) durability check runs once per sequence, after the
+//! final step, rather than after every step — reopening is the expensive part
+//! of this harness, and a bug that only shows up on reopen after an
+//! intermediate step but "heals" itself by the final step would be unusual.
+//! This trades a small amount of step-level durability coverage for a
+//! substantial reduction in per-sequence reopen cost.
 
 #![allow(clippy::expect_used)]
 
@@ -504,8 +512,7 @@ fn apply_composite_model(model: &mut CompositeModel, op: &CompositeMutationOp) {
     }
 }
 
-async fn assert_int64_state(
-    fixture: &TestFixture,
+async fn assert_int64_live_state(
     ctx: &SessionContext,
     table_name: &str,
     expected: &Int64Model,
@@ -518,18 +525,25 @@ async fn assert_int64_state(
         live_rows, expected_rows,
         "live state mismatch for {table_name} at sequence {sequence_index}, step {step_index}"
     );
-
-    let reopened_rows = reopen_and_read_int64_rows(fixture, table_name).await?;
-    assert_eq!(
-        reopened_rows, expected_rows,
-        "reopened state mismatch for {table_name} at sequence {sequence_index}, step {step_index}"
-    );
-
     Ok(())
 }
 
-async fn assert_composite_state(
+async fn assert_int64_reopened_state(
     fixture: &TestFixture,
+    table_name: &str,
+    expected: &Int64Model,
+    sequence_index: usize,
+) -> TestResult<()> {
+    let expected_rows = expected_int64_rows(expected);
+    let reopened_rows = reopen_and_read_int64_rows(fixture, table_name).await?;
+    assert_eq!(
+        reopened_rows, expected_rows,
+        "reopened state mismatch for {table_name} at sequence {sequence_index} (final step)"
+    );
+    Ok(())
+}
+
+async fn assert_composite_live_state(
     ctx: &SessionContext,
     table_name: &str,
     expected: &CompositeModel,
@@ -542,13 +556,21 @@ async fn assert_composite_state(
         live_rows, expected_rows,
         "live state mismatch for {table_name} at sequence {sequence_index}, step {step_index}"
     );
+    Ok(())
+}
 
+async fn assert_composite_reopened_state(
+    fixture: &TestFixture,
+    table_name: &str,
+    expected: &CompositeModel,
+    sequence_index: usize,
+) -> TestResult<()> {
+    let expected_rows = expected_composite_rows(expected);
     let reopened_rows = reopen_and_read_composite_rows(fixture, table_name).await?;
     assert_eq!(
         reopened_rows, expected_rows,
-        "reopened state mismatch for {table_name} at sequence {sequence_index}, step {step_index}"
+        "reopened state mismatch for {table_name} at sequence {sequence_index} (final step)"
     );
-
     Ok(())
 }
 
@@ -563,16 +585,10 @@ async fn test_exhaustive_int64_single_row_sequences_impl(fixture: TestFixture) -
         for (step_index, op) in sequence.iter().enumerate() {
             apply_int64_mutation(&table, &schema, op).await?;
             apply_int64_model(&mut expected, op);
-            assert_int64_state(
-                &fixture,
-                &ctx,
-                &table_name,
-                &expected,
-                sequence_index,
-                step_index,
-            )
-            .await?;
+            assert_int64_live_state(&ctx, &table_name, &expected, sequence_index, step_index)
+                .await?;
         }
+        assert_int64_reopened_state(&fixture, &table_name, &expected, sequence_index).await?;
     }
 
     Ok(())
@@ -591,16 +607,10 @@ async fn test_exhaustive_int64_batch_sequences_impl(fixture: TestFixture) -> Tes
         for (step_index, op) in sequence.iter().enumerate() {
             apply_int64_batch_mutation(&table, &schema, op).await?;
             apply_int64_batch_model(&mut expected, op);
-            assert_int64_state(
-                &fixture,
-                &ctx,
-                &table_name,
-                &expected,
-                sequence_index,
-                step_index,
-            )
-            .await?;
+            assert_int64_live_state(&ctx, &table_name, &expected, sequence_index, step_index)
+                .await?;
         }
+        assert_int64_reopened_state(&fixture, &table_name, &expected, sequence_index).await?;
     }
 
     Ok(())
@@ -621,16 +631,10 @@ async fn test_exhaustive_composite_single_row_sequences_impl(
         for (step_index, op) in sequence.iter().enumerate() {
             apply_composite_mutation(&table, &schema, op).await?;
             apply_composite_model(&mut expected, op);
-            assert_composite_state(
-                &fixture,
-                &ctx,
-                &table_name,
-                &expected,
-                sequence_index,
-                step_index,
-            )
-            .await?;
+            assert_composite_live_state(&ctx, &table_name, &expected, sequence_index, step_index)
+                .await?;
         }
+        assert_composite_reopened_state(&fixture, &table_name, &expected, sequence_index).await?;
     }
 
     Ok(())

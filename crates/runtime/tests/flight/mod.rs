@@ -27,16 +27,17 @@ use arrow_flight::{
     FlightClient, FlightDescriptor, PutResult, encode::FlightDataEncoderBuilder, error::FlightError,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::{Stream, TryStreamExt as _};
 use rand::RngExt as _;
 use runtime::{
-    Runtime, accelerated_table::refresh::Refresh, auth::EndpointAuth,
+    Runtime, accelerated::refresh::Refresh, auth::EndpointAuth,
     component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
-    flight::RateLimits, internal_table::create_internal_accelerated_table, secrets::Secrets,
+    flight::RateLimits, internal_table::create_internal_accelerated_table,
 };
 use runtime_auth::FlightBasicAuth;
-use spicepod::component::dataset::Dataset;
+use runtime_secrets::Secrets;
+use spicepod::component::{caching::SQLResultsCacheConfig, dataset::Dataset};
 use tokio::{sync::RwLock, time::sleep};
 use tonic::transport::Channel;
 
@@ -52,6 +53,7 @@ mod do_put;
 mod prepared_statements;
 mod statement_substrait_plan;
 mod statement_update;
+mod trace_id;
 
 async fn start_spice_test_app(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
@@ -59,7 +61,22 @@ async fn start_spice_test_app(
     test_dataset: Option<Dataset>,
 ) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
     let (channel, df, _metrics_port) =
-        start_spice_test_app_with_metrics_port(flight_auth, rate_limits, test_dataset).await?;
+        start_spice_test_app_with_metrics_port(flight_auth, rate_limits, test_dataset, None)
+            .await?;
+    Ok((channel, df))
+}
+
+/// Starts an app whose SQL results cache is configured.
+///
+/// Without a config the app has no cache provider at all and every query
+/// reports `CacheDisabled`, which is what the tests that do not care about
+/// caching want — so they keep passing `None` through the helpers above.
+async fn start_spice_test_app_with_cache(
+    flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    sql_cache: SQLResultsCacheConfig,
+) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
+    let (channel, df, _metrics_port) =
+        start_spice_test_app_with_metrics_port(flight_auth, None, None, Some(sql_cache)).await?;
     Ok((channel, df))
 }
 
@@ -67,6 +84,7 @@ async fn start_spice_test_app_with_metrics_port(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     rate_limits: Option<RateLimits>,
     test_dataset: Option<Dataset>,
+    sql_cache: Option<SQLResultsCacheConfig>,
 ) -> Result<(Channel, Arc<DataFusion>, u16), anyhow::Error> {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
@@ -91,13 +109,14 @@ async fn start_spice_test_app_with_metrics_port(
         rt_builder = rt_builder.with_rate_limits(rate_limits);
     }
 
-    let app = if let Some(dataset) = test_dataset {
-        app::AppBuilder::new("test_app")
-            .with_dataset(dataset)
-            .build()
-    } else {
-        app::AppBuilder::new("test_app").build()
-    };
+    let mut app_builder = app::AppBuilder::new("test_app");
+    if let Some(dataset) = test_dataset {
+        app_builder = app_builder.with_dataset(dataset);
+    }
+    if let Some(sql_cache) = sql_cache {
+        app_builder = app_builder.with_sql_cache(sql_cache);
+    }
+    let app = app_builder.build();
     let rt = Arc::new(rt_builder.with_app(app).build().await);
 
     let cloned_rt = Arc::clone(&rt);
@@ -243,7 +262,7 @@ async fn register_test_table(
     .map_err(anyhow::Error::from)?;
 
     datafusion
-        .register_table_as_writable_and_with_schema(table_name, table)
+        .register_table_as_writable_and_with_schema(table_name, table.into_table())
         .map_err(anyhow::Error::from)?;
 
     Ok(())

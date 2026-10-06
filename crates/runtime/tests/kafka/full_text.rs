@@ -25,9 +25,10 @@ use super::bootstrap::{make_kafka_dataset, send_messages_to_kafka, start_kafka_d
 use super::{run_and_snapshot_query, wait_for_query_rows};
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check;
-use crate::{init_tracing, utils::test_request_context};
-
-const KAFKA_PORT: u16 = 19094;
+use crate::{
+    init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 #[tokio::test]
 async fn kafka_full_text_index() -> anyhow::Result<()> {
@@ -36,7 +37,8 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
     test_request_context()
         .scope(async {
             let (running_container, producer) =
-                start_kafka_docker_container(KAFKA_PORT, &["stack_qa"]).await?;
+                start_kafka_docker_container(&["stack_qa"]).await?;
+            let port = running_container.host_port(19092)?;
 
             tracing::debug!("Container started");
 
@@ -44,7 +46,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
             let stack_qa_json: Vec<serde_json::Value> = stack_qa_json();
             send_messages_to_kafka(&producer, "stack_qa", &stack_qa_json).await?;
 
-            let mut ds = make_kafka_dataset("stack_qa", "stack_qa", KAFKA_PORT, None);
+            let mut ds = make_kafka_dataset("stack_qa", "stack_qa", port, None);
             ds.columns =
                 vec![Column::new("title").with_full_text_search(
                     FullTextSearchConfig::enabled().with_row_id("question_id"),
@@ -54,6 +56,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());

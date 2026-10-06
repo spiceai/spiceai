@@ -1,12 +1,12 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.95.0
+ARG RUST_VERSION=1.98.1
 FROM rust:${RUST_VERSION}-slim-trixie as build
 
 # cache mounts below may already exist and owned by root
 USER root
 
 RUN apt update \
-    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev libclang-dev \
+    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev clang lld libclang-dev \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 COPY . /build
@@ -38,7 +38,8 @@ RUN \
     else \
       cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default}; \
     fi && \
-    cp /build/target/${RUST_PROFILE}/spiced /root/spiced
+    cp /build/target/${RUST_PROFILE}/spiced /root/spiced && \
+    cp "$(find /build/target -name libpdfium.so -print -quit)" /root/libpdfium.so
 
 FROM debian:trixie-slim as sandbox-setup
 
@@ -71,6 +72,11 @@ RUN mkdir -p /spice_sandbox/bin && \
 # Copy the binary
 COPY --from=build /root/spiced /spice_sandbox/usr/local/bin/
 
+# Copy PDFium (used for PDF document parsing). liteparse dlopen's it at runtime,
+# so it is not linked into spiced and is not reported by ldd; ship it next to the
+# binary where the loader's "next to the executable" search path finds it.
+COPY --from=build /root/libpdfium.so /spice_sandbox/usr/local/bin/
+
 # Copy CA certificates
 RUN cp -r /etc/ssl/certs /spice_sandbox/etc/ssl/certs
 
@@ -79,6 +85,10 @@ RUN cp -r /usr/share/zoneinfo /spice_sandbox/usr/share/zoneinfo
 
 # Copy every dependent library reported by ldd
 RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
+
+# Copy PDFium's own shared-library dependencies (they are a subset of spiced's,
+# but sweep explicitly since ldd on spiced does not see the dlopen'd PDFium)
+RUN ldd /spice_sandbox/usr/local/bin/libpdfium.so | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
 
 # Copy additional required libraries
 RUN find /lib /usr/lib -name 'libpthread.so.0' -exec sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"' \;
@@ -126,6 +136,10 @@ RUN echo 'nobody:x:65534:65534:nobody:/app:/usr/sbin/nologin' > /spice_sandbox/e
 RUN mkdir -p /spice_sandbox/.duckdb
 RUN chmod 755 /spice_sandbox/.duckdb
 
+# Create a writable temp directory so std::env::temp_dir() (e.g. an
+# acceleration-snapshot upload) has somewhere to write on this scratch image.
+RUN mkdir -p /spice_sandbox/app/tmp
+
 # Give the nobody user ownership of app dir
 RUN chown -R 65534:65534 /spice_sandbox/app
 
@@ -149,5 +163,6 @@ ENV HF_HOME=/.cache/huggingface
 ENV HF_HUB_CACHE=/.cache/huggingface/hub
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_DIR=/etc/ssl/certs
+ENV TMPDIR=/app/tmp
 
 ENTRYPOINT ["/usr/local/bin/spiced"]

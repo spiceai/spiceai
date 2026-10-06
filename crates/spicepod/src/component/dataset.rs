@@ -24,6 +24,7 @@ use serde_json::Value;
 use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
 use crate::acceleration::Acceleration;
 use crate::component::access::AccessMode;
+use crate::drasi::Drasi as DrasiConfig;
 use crate::fts::FtsStore;
 use crate::metadata::metadata_value_to_string;
 use crate::metric::Metrics;
@@ -40,6 +41,7 @@ pub enum TimeFormat {
     Timestamptz,
     UnixSeconds,
     UnixMillis,
+    UnixNanos,
     #[serde(rename = "ISO8601")]
     ISO8601,
     Date,
@@ -56,6 +58,7 @@ impl<'de> serde::Deserialize<'de> for TimeFormat {
             "timestamptz" => Ok(TimeFormat::Timestamptz),
             "unix_seconds" => Ok(TimeFormat::UnixSeconds),
             "unix_millis" => Ok(TimeFormat::UnixMillis),
+            "unix_nanos" => Ok(TimeFormat::UnixNanos),
             "iso8601" => Ok(TimeFormat::ISO8601),
             "date" => Ok(TimeFormat::Date),
             _ => Err(serde::de::Error::unknown_variant(
@@ -65,6 +68,7 @@ impl<'de> serde::Deserialize<'de> for TimeFormat {
                     "timestamptz",
                     "unix_seconds",
                     "unix_millis",
+                    "unix_nanos",
                     "ISO8601",
                     "date",
                 ],
@@ -150,40 +154,6 @@ pub enum CheckAvailability {
     Disabled,
 }
 
-/// Selects the depth of source-schema inference.
-///
-/// Base column/type inference is always performed and required — this knob only
-/// controls whether the runtime *additionally* infers the table's primary key,
-/// secondary indexes, and sort/clustering columns to fill acceleration settings
-/// the user did not specify in the Spicepod.
-///
-/// Applies to all refresh modes. Only connectors that emit inferred-schema
-/// metadata (currently `PostgreSQL` and `MongoDB`) are affected; others treat
-/// `extended` as a no-op.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum SchemaInference {
-    /// Base column/type inference only (default) — exactly as before. The column
-    /// schema is always inferred from the source; no primary-key/index/sort
-    /// detection is performed.
-    #[default]
-    Standard,
-    /// In addition to the base column schema, auto-detect and apply the primary
-    /// key, secondary indexes, and sort/clustering columns from the source when
-    /// they are not explicitly configured.
-    Extended,
-}
-
-impl std::fmt::Display for SchemaInference {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SchemaInference::Standard => write!(f, "standard"),
-            SchemaInference::Extended => write!(f, "extended"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -262,20 +232,27 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_search: Option<FtsStore>,
 
+    /// Forwards this dataset's change-data-capture stream to a Drasi source, so
+    /// Drasi continuous queries observe the same changes the runtime applies to
+    /// the local accelerator. Requires `acceleration.refresh_mode: changes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drasi: Option<DrasiConfig>,
+
     /// Configures whether the dataset availability monitor is enabled for this dataset.
     /// When enabled, the runtime will periodically check dataset availability
     /// and report metrics. Dataset availability is only checked if the dataset is not accelerated.
     #[serde(default, skip_serializing_if = "is_default")]
     pub check_availability: CheckAvailability,
 
-    /// Controls the depth of source-schema inference (primary key, indexes, sort columns).
-    ///
-    /// Options: `standard` / `extended`. Defaults to `standard` (base column/type
-    /// inference only, exactly as before). When `extended`, the runtime additionally
-    /// fills any acceleration settings the user left unset using metadata inferred from
-    /// the source (currently the `PostgreSQL` and `MongoDB` connectors).
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub schema_inference: SchemaInference,
+    /// How often the runtime probes the (non-accelerated) source backing this
+    /// dataset to confirm it is still reachable. Accepts a duration string
+    /// (e.g. `60s`, `5m`). Availability monitoring is **opt-in**: leave this
+    /// unset and the dataset is not monitored. Only applies to non-accelerated
+    /// datasets with `check_availability: auto`. When a probe fails the dataset
+    /// is marked `Error` (visible via `GET /v1/datasets?status=true`) until a
+    /// later probe succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_availability_interval: Option<String>,
 }
 
 impl Nameable for Dataset {
@@ -310,8 +287,9 @@ impl Dataset {
             metrics: None,
             vectors: None,
             full_text_search: None,
+            drasi: None,
             check_availability: CheckAvailability::default(),
-            schema_inference: SchemaInference::default(),
+            check_availability_interval: None,
         }
     }
 
@@ -401,8 +379,9 @@ impl WithDependsOn<Dataset> for Dataset {
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
             full_text_search: self.full_text_search.clone(),
+            drasi: self.drasi.clone(),
             check_availability: self.check_availability,
-            schema_inference: self.schema_inference,
+            check_availability_interval: self.check_availability_interval.clone(),
         }
     }
 }
@@ -482,10 +461,12 @@ struct DatasetDeserializer {
     vectors: Option<VectorStore>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     full_text_search: Option<FtsStore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drasi: Option<DrasiConfig>,
     #[serde(default, skip_serializing_if = "is_default")]
     check_availability: CheckAvailability,
-    #[serde(default, skip_serializing_if = "is_default")]
-    schema_inference: SchemaInference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check_availability_interval: Option<String>,
 }
 
 #[expect(deprecated)]
@@ -538,8 +519,9 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
             full_text_search: deserializer.full_text_search,
+            drasi: deserializer.drasi,
             check_availability: deserializer.check_availability,
-            schema_inference: deserializer.schema_inference,
+            check_availability_interval: deserializer.check_availability_interval,
         })
     }
 }
@@ -580,43 +562,53 @@ mod check_availability_tests {
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.check_availability, CheckAvailability::Auto);
     }
-}
-
-#[cfg(test)]
-mod schema_inference_tests {
-    use super::*;
-    use yaml;
 
     #[test]
-    fn test_schema_inference_standard_by_default() {
+    fn test_check_availability_interval_unset_by_default() {
         let yaml = r"
             name: test
-            from: postgres:public.orders
+            from: file://test.csv
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert_eq!(dataset.schema_inference, SchemaInference::Standard);
+        assert_eq!(dataset.check_availability_interval, None);
     }
 
     #[test]
-    fn test_schema_inference_extended_via_config() {
+    fn test_check_availability_interval_parsed_from_config() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+            check_availability_interval: 30s
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.check_availability_interval.as_deref(), Some("30s"));
+    }
+}
+
+#[cfg(test)]
+mod schema_inference_removed_tests {
+    use super::*;
+    use yaml;
+
+    /// `schema_inference` was removed; because `DatasetDeserializer` denies unknown
+    /// fields, a Spicepod still specifying it must fail to parse rather than be
+    /// silently ignored. Guards the breaking-change behavior.
+    #[test]
+    fn schema_inference_field_is_rejected() {
         let yaml = r"
             name: test
             from: postgres:public.orders
             schema_inference: extended
         ";
-        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert_eq!(dataset.schema_inference, SchemaInference::Extended);
-    }
-
-    #[test]
-    fn test_schema_inference_standard_via_config() {
-        let yaml = r"
-            name: test
-            from: postgres:public.orders
-            schema_inference: standard
-        ";
-        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert_eq!(dataset.schema_inference, SchemaInference::Standard);
+        let err = yaml::from_str::<Dataset>(yaml)
+            .expect_err("`schema_inference` must be rejected as an unknown field");
+        // Assert it failed for the RIGHT reason — the deny_unknown_fields rejection
+        // naming `schema_inference` — not some unrelated YAML/serde error.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") && msg.contains("schema_inference"),
+            "expected an unknown-field error naming `schema_inference`, got: {msg}"
+        );
     }
 }
 
@@ -624,6 +616,49 @@ mod schema_inference_tests {
 mod tests {
     use super::*;
     use yaml;
+
+    #[test]
+    fn a_disabled_acceleration_block_reports_what_the_dataset_will_ignore() {
+        // The shape the runtime reads this through: the whole dataset as
+        // written, its acceleration block still optional. Asserted here so the
+        // caller's expression is exercised against the same types it uses.
+        let yaml = r"
+            name: api_data
+            from: https://api.example.com
+            acceleration:
+              enabled: false
+              engine: duckdb
+              refresh_mode: caching
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let ignored = dataset
+            .acceleration
+            .as_ref()
+            .map(Acceleration::fields_ignored_when_disabled)
+            .unwrap_or_default();
+        assert_eq!(
+            ignored.join(", "),
+            "engine, refresh_mode",
+            "a dataset that turns acceleration off has to say what it dropped"
+        );
+    }
+
+    #[test]
+    fn a_dataset_with_no_acceleration_block_reports_nothing() {
+        let yaml = r"
+            name: api_data
+            from: https://api.example.com
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert!(
+            dataset
+                .acceleration
+                .as_ref()
+                .map(Acceleration::fields_ignored_when_disabled)
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn test_invalid_type_action_migration() {
@@ -766,6 +801,15 @@ mod tests {
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::UnixMillis));
+
+        // Mixed case Unix_Nanos
+        let yaml = r"
+            name: test
+            from: test
+            time_format: Unix_Nanos
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::UnixNanos));
 
         // Mixed case Timestamptz
         let yaml = r"

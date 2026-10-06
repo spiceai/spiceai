@@ -53,8 +53,9 @@ use rand::RngExt;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
-use runtime::{Runtime, auth::EndpointAuth, config::Config, tls::TlsConfig};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use runtime_auth::IdentitySource;
+use runtime_tls::TlsConfig;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -144,7 +145,7 @@ async fn start_runtime_with_mtls(
     metrics_port: u16,
     pki: &TestPki,
     identity_source: IdentitySource,
-    enforcement: runtime::tls::ClientAuthEnforcement,
+    enforcement: runtime_tls::ClientAuthEnforcement,
 ) {
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
@@ -283,7 +284,7 @@ async fn test_public_mtls_required_channel_mode() -> Result<(), anyhow::Error> {
                 metrics_port,
                 &pki,
                 IdentitySource::Channel,
-                runtime::tls::ClientAuthEnforcement::Required,
+                runtime_tls::ClientAuthEnforcement::Required,
             )
             .await;
 
@@ -440,7 +441,7 @@ async fn test_public_mtls_required_anonymous_mode() -> Result<(), anyhow::Error>
                 metrics_port,
                 &pki,
                 IdentitySource::Anonymous,
-                runtime::tls::ClientAuthEnforcement::Required,
+                runtime_tls::ClientAuthEnforcement::Required,
             )
             .await;
 
@@ -550,7 +551,7 @@ async fn test_public_mtls_request_mode() -> Result<(), anyhow::Error> {
                 metrics_port,
                 &pki,
                 IdentitySource::Channel,
-                runtime::tls::ClientAuthEnforcement::Requested,
+                runtime_tls::ClientAuthEnforcement::Requested,
             )
             .await;
 

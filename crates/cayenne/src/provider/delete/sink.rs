@@ -48,26 +48,36 @@ limitations under the License.
 //! 6. Update in-memory caches for immediate query consistency
 
 use super::super::Error;
+use super::super::deletion_index::{DeletionIndex, KeyDeletionIndex};
 use super::super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
 };
 use super::super::memory_account::CayenneMemoryAccount;
-use super::super::utils::convert_to_u64_box;
-use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
+use super::super::on_conflict::{PkDeletionSnapshot, pk_deletion_snapshot_for_strategy};
+use super::super::pk_validation::null_primary_key_message;
+use super::super::utils::{bytes_key, convert_to_u64_box, i64_key};
+use super::filter_exec::{InsertRecordHandling, is_pk_visible_i64, is_pk_visible_row_key};
+use super::vector_io::DeletionVectorWriteResult;
+use super::vector_io::{
+    DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
+    cleanup_uncommitted_delete_paths,
+};
 use crate::catalog::MetadataCatalog;
-use crate::metadata::TableMetadata;
+use crate::metadata::{DeleteFile, TableMetadata};
 use arc_swap::ArcSwap;
-use arrow::array::ArrayRef;
-use arrow_row::RowConverter;
+use arrow::array::{Array, ArrayRef};
 use arrow_schema::SchemaRef;
+use std::collections::HashMap;
+
+use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
-use datafusion::execution::config::SessionConfig;
+use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
-use datafusion::physical_plan::{collect, execute_stream};
+use datafusion::physical_plan::execute_stream;
 use datafusion_catalog::TableProvider;
 use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
@@ -75,7 +85,9 @@ use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
 
 // Position-based deletion methods implemented in sink/position_based.rs
@@ -89,6 +101,340 @@ use pk_filter_extract::ExtractedPkDeletes;
 
 const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
 
+enum StagedPkDelete {
+    Int64 {
+        delete_files: Vec<DeleteFile>,
+        /// Tombstone snapshot captured when the delete began. Used only to count
+        /// how many keys are newly deleted (not already tombstoned) — it is never
+        /// re-published, so a concurrent update is never observed here.
+        initial: Arc<Int64PkDeletionSnapshot>,
+        /// This delete's primary keys, de-duplicated across chunks. Published by
+        /// merging (compare-and-swap) onto the live snapshot at commit.
+        new_pks: HashSet<i64>,
+        /// The single delete sequence shared by every chunk of this delete.
+        delete_sequence: Option<i64>,
+    },
+    RowKeys {
+        delete_files: Vec<DeleteFile>,
+        initial: Arc<RowConverterDeletionSnapshot>,
+        new_keys: HashSet<Box<[u8]>>,
+        delete_sequence: Option<i64>,
+    },
+}
+
+impl Drop for StagedPkDelete {
+    fn drop(&mut self) {
+        let delete_files = match self {
+            Self::Int64 { delete_files, .. } | Self::RowKeys { delete_files, .. } => {
+                std::mem::take(delete_files)
+            }
+        };
+        if delete_files.is_empty() {
+            return;
+        }
+        let paths = delete_files
+            .into_iter()
+            .map(|file| std::path::PathBuf::from(file.path))
+            .collect::<Vec<_>>();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                cleanup_uncommitted_delete_paths(&paths).await;
+            });
+        } else {
+            cleanup_uncommitted_delete_paths_blocking(paths);
+        }
+    }
+}
+
+/// Bump `scan_input_version` so [`crate::ScanViewReuse::UntilInvalidated`] recaptures.
+fn bump_scan_input_version(version: Option<&AtomicU64>) {
+    if let Some(version) = version {
+        version.fetch_add(1, Ordering::Release);
+    }
+}
+
+pub(crate) struct PreparedDeletionPublish {
+    strategy: PkDeletionStrategyWithCache,
+    table_memory: Arc<CayenneMemoryAccount>,
+    delete_files: Vec<DeleteFile>,
+    publish: PreparedDeletionCache,
+    deleted_count: u64,
+    cleanup_armed: bool,
+    scan_input_version: Option<Arc<AtomicU64>>,
+}
+
+enum PreparedDeletionCache {
+    Int64 {
+        pks: HashSet<i64>,
+        sequence: Option<i64>,
+    },
+    RowKeys {
+        keys: HashSet<Box<[u8]>>,
+        sequence: Option<i64>,
+    },
+}
+
+impl PreparedDeletionPublish {
+    pub(crate) fn delete_files(&self) -> &[DeleteFile] {
+        &self.delete_files
+    }
+
+    pub(crate) fn deleted_count(&self) -> u64 {
+        self.deleted_count
+    }
+
+    /// Replace the computed count with the non-authoritative sentinel `0`. Used
+    /// by the CDC `pk IN (...)` fast path: its extracted keys are an upper bound
+    /// (not verified live rows), so returning a real count would require the
+    /// table scan that path deliberately skips. The CDC caller discards the count.
+    #[must_use]
+    pub(crate) fn with_sentinel_count(mut self) -> Self {
+        self.deleted_count = 0;
+        self
+    }
+
+    fn cleanup_paths(&self) -> Vec<std::path::PathBuf> {
+        self.delete_files
+            .iter()
+            .map(|file| std::path::PathBuf::from(&file.path))
+            .collect()
+    }
+
+    pub(crate) fn publish(mut self) -> super::super::Result<()> {
+        let publish = std::mem::replace(
+            &mut self.publish,
+            PreparedDeletionCache::Int64 {
+                pks: HashSet::new(),
+                sequence: None,
+            },
+        );
+        match publish {
+            PreparedDeletionCache::Int64 { pks, sequence } => {
+                let snapshot =
+                    self.strategy
+                        .int64_pk_snapshot()
+                        .ok_or_else(|| Error::Internal {
+                            table: "unknown".to_string(),
+                            message: "Atomic Int64 deletion used with incompatible strategy"
+                                .to_string(),
+                        })?;
+                if let Some(sequence) = sequence {
+                    snapshot.rcu(|current| {
+                        Arc::new(Int64PkDeletionSnapshot::from_index(
+                            current
+                                .tombstones
+                                .extend_max_deletes(pks.iter().map(|&pk| (pk, sequence))),
+                        ))
+                    });
+                }
+            }
+            PreparedDeletionCache::RowKeys { keys, sequence } => {
+                let snapshot =
+                    self.strategy
+                        .row_keys_snapshot()
+                        .ok_or_else(|| Error::Internal {
+                            table: "unknown".to_string(),
+                            message: "Atomic key deletion used with incompatible strategy"
+                                .to_string(),
+                        })?;
+                if let Some(sequence) = sequence {
+                    snapshot.rcu(|current| {
+                        Arc::new(RowConverterDeletionSnapshot::from_index(
+                            current
+                                .tombstones
+                                .extend_max_deletes(keys.iter().map(|key| (key, sequence))),
+                        ))
+                    });
+                }
+            }
+        }
+        self.table_memory
+            .set_deletion_bytes(self.strategy.approx_resident_bytes());
+        bump_scan_input_version(self.scan_input_version.as_deref());
+        Ok(())
+    }
+
+    pub(crate) fn mark_catalog_committed(&mut self) {
+        self.cleanup_armed = false;
+    }
+}
+
+impl Drop for PreparedDeletionPublish {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        let paths = self.cleanup_paths();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                cleanup_uncommitted_delete_paths(&paths).await;
+            });
+        } else {
+            cleanup_uncommitted_delete_paths_blocking(paths);
+        }
+    }
+}
+
+fn cleanup_uncommitted_delete_paths_blocking(paths: Vec<std::path::PathBuf>) {
+    std::thread::spawn(move || {
+        for path in paths {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    "Failed to clean uncommitted deletion-vector file"
+                ),
+            }
+        }
+    });
+}
+
+/// One table a filtered delete scans, with the visibility rules its rows are read under.
+///
+/// Both are carried rather than derived from each other, because the three sources do
+/// not line up two-by-two: the main listing applies re-inserts with no sequence cutoff
+/// (`apply_deletion_filter_with_insert_records`), a protected snapshot ignores them and
+/// has a cutoff (`apply_partial_deletion_filter`), and the COLD tier ignores them with
+/// NO cutoff (`apply_deletion_filter`). Deriving the mode from "is there a cutoff" gets
+/// cold wrong, and cold is the case where it costs a row: its files hold fully
+/// superseded data, so treating a re-inserted key as live there matches the stale value
+/// and tombstones the key — deleting the replacement that never matched the predicate.
+#[derive(Clone)]
+pub(crate) struct DeleteScanSource {
+    /// Only deletions NEWER than this apply to these rows. `None` — every deletion
+    /// applies — for the main listing and the cold tier.
+    pub(crate) min_delete_seq: Option<i64>,
+    /// Whether a key re-inserted after its delete reads as live again.
+    pub(crate) insert_records: InsertRecordHandling,
+    pub(crate) table: Arc<ListingTable>,
+    /// The deletion index as it stood when `table` was captured, taken under the same
+    /// `listing_fence` read. `None` for a source captured without one (the cold tier).
+    ///
+    /// A row's liveness is only meaningful against the index its source was captured
+    /// with. A seq-prefix bake or a current-snapshot compaction folds the rows a
+    /// tombstone hides out of the files and then prunes that tombstone, both under
+    /// `listing_fence.write()`, so a source captured before that publish still holds the
+    /// superseded version while the live index no longer says it is superseded. Judged
+    /// by the live index alone, a predicate matching the retired value then tombstones
+    /// the KEY and deletes the replacement that never matched (#13913). The live index
+    /// is still consulted as well, because a tombstone added after the capture — an
+    /// upsert that superseded the version in between — must hide it too.
+    pub(crate) tombstones_at_capture: Option<PkDeletionSnapshot>,
+}
+
+impl StagedPkDelete {
+    fn new(strategy: &PkDeletionStrategyWithCache, table_name: &str) -> super::super::Result<Self> {
+        match strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => Ok(Self::Int64 {
+                delete_files: Vec::new(),
+                initial: deletion_snapshot.load_full(),
+                new_pks: HashSet::new(),
+                delete_sequence: None,
+            }),
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => Ok(Self::RowKeys {
+                delete_files: Vec::new(),
+                initial: deletion_snapshot.load_full(),
+                new_keys: HashSet::new(),
+                delete_sequence: None,
+            }),
+            PkDeletionStrategyWithCache::PositionBased { .. } => Err(Error::Internal {
+                table: table_name.to_string(),
+                message: "Primary-key delete staging used with position-based strategy".to_string(),
+            }),
+        }
+    }
+
+    fn absorb(
+        &mut self,
+        results: Vec<DeletionVectorWriteResult>,
+        delete_sequence: i64,
+        table_name: &str,
+    ) -> super::super::Result<()> {
+        match self {
+            Self::Int64 {
+                delete_files,
+                new_pks,
+                delete_sequence: staged_sequence,
+                ..
+            } => {
+                // Every chunk shares the one reserved delete sequence.
+                *staged_sequence = Some(delete_sequence);
+                for result in results {
+                    delete_files.push(result.delete_file);
+                    match result.identifiers {
+                        DeletionIdentifier::KeyBased(keys) => {
+                            for key in keys {
+                                let bytes: [u8; 8] =
+                                    key.as_ref().try_into().map_err(|_| Error::Internal {
+                                        table: table_name.to_string(),
+                                        message:
+                                            "Int64 deletion key did not contain exactly 8 bytes"
+                                                .to_string(),
+                                    })?;
+                                new_pks.insert(i64::from_be_bytes(bytes));
+                            }
+                        }
+                        DeletionIdentifier::PositionBased { .. } => {
+                            return Err(Error::Internal {
+                                table: table_name.to_string(),
+                                message: "Unexpected position identifiers in atomic Int64 delete"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            Self::RowKeys {
+                delete_files,
+                new_keys,
+                delete_sequence: staged_sequence,
+                ..
+            } => {
+                *staged_sequence = Some(delete_sequence);
+                for result in results {
+                    delete_files.push(result.delete_file);
+                    match result.identifiers {
+                        DeletionIdentifier::KeyBased(result_keys) => new_keys.extend(result_keys),
+                        DeletionIdentifier::PositionBased { .. } => {
+                            return Err(Error::Internal {
+                                table: table_name.to_string(),
+                                message: "Unexpected position identifiers in atomic key delete"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Number of keys this delete newly tombstones — keys not already deleted
+    /// when the delete began. Re-deletions of already-tombstoned keys are not
+    /// counted, preserving the pre-refactor "rows affected" semantics.
+    fn new_count(&self) -> usize {
+        match self {
+            Self::Int64 {
+                initial, new_pks, ..
+            } => new_pks
+                .iter()
+                .filter(|pk| initial.tombstones.get(**pk).is_none())
+                .count(),
+            Self::RowKeys {
+                initial, new_keys, ..
+            } => new_keys
+                .iter()
+                .filter(|key| initial.tombstones.get(key.as_ref()).is_none())
+                .count(),
+        }
+    }
+}
+
 /// Deletion sink for Cayenne tables.
 ///
 /// This sink handles the process of marking rows as deleted by writing
@@ -96,6 +442,7 @@ const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
 /// - Position-based deletion (for tables without primary key)
 /// - Int64 PK deletion (for tables with single-column Int64 primary key)
 /// - Key-based deletion (for tables with composite/non-integer primary key)
+#[derive(Clone)]
 pub struct CayenneDeletionSink {
     table_metadata: TableMetadata,
     catalog: Arc<dyn MetadataCatalog>,
@@ -111,10 +458,33 @@ pub struct CayenneDeletionSink {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
-    /// Extra listing tables to also scan for deletion keys, beyond the main
-    /// listing table — the protected snapshots and (for cold-tier tables) the
-    /// cold-tier files. The sink treats every entry uniformly.
-    additional_scan_tables: Vec<Arc<ListingTable>>,
+    /// Extra listing tables to also scan for deletion keys, beyond the main listing
+    /// table — the protected snapshots and (for cold-tier tables) the cold-tier files —
+    /// each paired with the delete sequence its rows are visible above.
+    ///
+    /// A protected snapshot carries `max_delete_seq_at_creation`: only deletes NEWER than
+    /// that apply to its rows, which is precisely what tells a superseded version from
+    /// the row that replaced it. Without it, a key-based delete can match a version an
+    /// upsert already retired and tombstone the KEY, taking the live row with it. `None`
+    /// is the base case — the current snapshot and cold-tier files, where every delete
+    /// applies.
+    additional_scan_tables: Vec<DeleteScanSource>,
+    /// How the main listing table treats an upsert's re-insert marker. Carried from the
+    /// caller rather than fixed here, because it is conditional in exactly the way
+    /// `scan` makes it conditional: with no protected snapshot, main holds the only copy
+    /// of a key and a re-insert marker means the row is live (`Apply`); with a protected
+    /// snapshot present, the replacement lives THERE and main holds only the superseded
+    /// version, which the marker must not resurrect (`Ignore`). Assuming `Apply` lets a
+    /// predicate matching only the retired value tombstone the KEY and take the
+    /// replacement — which never matched the predicate — with it.
+    main_insert_records: InsertRecordHandling,
+    /// The table's live protected-snapshot map, re-read under the execution-time
+    /// `write_lock` to catch the one transition `main_insert_records` cannot be captured
+    /// across: the plan is built before that lock is taken, so an ordinary upsert can
+    /// publish a protected snapshot in between and turn a captured `Apply` into the
+    /// resurrection case. Only 0 -> non-empty is unsafe; a capture that already saw one
+    /// is `Ignore` and stays correct however many more appear.
+    protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
     /// Shared `RuntimeEnv` for S3 object store access.
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
@@ -126,6 +496,11 @@ pub struct CayenneDeletionSink {
     /// allocations through the SAME allocator as every other writer of this
     /// table, so memory and the DB `current_sequence_number` never diverge.
     seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
+    /// The owning table's `scan_input_version`. Bumped when this sink publishes
+    /// a deletion so [`crate::ScanViewReuse::UntilInvalidated`] recaptures
+    /// rather than serving the pre-delete view. `None` on internal persist-only
+    /// helpers that are not a user-visible delete.
+    scan_input_version: Option<Arc<AtomicU64>>,
     /// Whether this sink must return a VERIFIED deleted-row count — i.e. it backs
     /// a user-visible `DELETE`, where the count is surfaced to the SQL client as
     /// "rows affected". When false (the CDC/internal default), the `pk IN (...)`
@@ -137,6 +512,33 @@ pub struct CayenneDeletionSink {
     /// bypassed so the scan-based path returns an exact count of the live rows
     /// actually removed.
     count_exact: bool,
+    /// The owning table's `listing_fence` and `scan_state_lock`, taken in that order —
+    /// the pairing `scan` uses — to capture the main listing together with the deletion
+    /// index it is judged by (see [`DeleteScanSource::tombstones_at_capture`]). `None` on
+    /// internal persist-only helpers, which capture without them.
+    capture_locks: Option<CaptureLocks>,
+}
+
+/// The locks a coherent (listing, deletion index) capture holds, outer first.
+#[derive(Clone)]
+pub(crate) struct CaptureLocks {
+    pub(crate) listing_fence: Arc<tokio::sync::RwLock<()>>,
+    pub(crate) scan_state_lock: Arc<tokio::sync::RwLock<()>>,
+}
+
+impl CaptureLocks {
+    /// Both read guards, taken in `scan`'s order: `listing_fence`, then
+    /// `scan_state_lock`.
+    pub(crate) async fn read(
+        &self,
+    ) -> (
+        tokio::sync::RwLockReadGuard<'_, ()>,
+        tokio::sync::RwLockReadGuard<'_, ()>,
+    ) {
+        let fence = self.listing_fence.read().await;
+        let state = self.scan_state_lock.read().await;
+        (fence, state)
+    }
 }
 
 impl CayenneDeletionSink {
@@ -152,7 +554,9 @@ impl CayenneDeletionSink {
         table_memory: Arc<CayenneMemoryAccount>,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
-        additional_scan_tables: Vec<Arc<ListingTable>>,
+        additional_scan_tables: Vec<DeleteScanSource>,
+        main_insert_records: InsertRecordHandling,
+        protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
         seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
@@ -168,21 +572,63 @@ impl CayenneDeletionSink {
             pk_row_converter,
             pk_column_indices,
             additional_scan_tables,
+            main_insert_records,
+            protected_snapshots,
             runtime_env,
             write_lock,
             seq_allocator,
             count_exact: false,
+            scan_input_version: None,
+            capture_locks: None,
         }
     }
 
-    /// Mark this sink as needing an exact, verified deleted-row count (a
-    /// user-visible `DELETE`, where "rows affected" is shown to the client).
-    /// Bypasses the count-skipping `pk IN (...)` fast path so the scan-based
-    /// path counts only the live rows actually removed. The default (unset)
-    /// keeps the fast path for CDC/internal callers that do not surface the
-    /// count. See [`Self::count_exact`].
-    pub(crate) fn with_exact_count(mut self) -> Self {
-        self.count_exact = true;
+    /// Wire the owning table's capture locks, so the main listing is captured with the
+    /// deletion index it is judged by.
+    #[must_use]
+    pub(crate) fn with_capture_locks(mut self, capture_locks: CaptureLocks) -> Self {
+        self.capture_locks = Some(capture_locks);
+        self
+    }
+
+    /// The main listing as a scan source, captured together with the deletion index
+    /// under the same read guards `scan` captures the same rows under.
+    async fn capture_main_scan_source(&self) -> DeleteScanSource {
+        let _guards = match &self.capture_locks {
+            Some(locks) => Some(locks.read().await),
+            None => None,
+        };
+        let table = self.listing_table.load_full();
+        let tombstones_at_capture = pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy);
+        DeleteScanSource {
+            min_delete_seq: None,
+            insert_records: self.live_main_insert_records(),
+            table,
+            tombstones_at_capture: Some(tombstones_at_capture),
+        }
+    }
+
+    /// Wire the owning table's scan-input version so a published delete
+    /// invalidates the demand scan-view cache.
+    #[must_use]
+    pub(crate) fn with_scan_input_version(mut self, version: Arc<AtomicU64>) -> Self {
+        self.scan_input_version = Some(version);
+        self
+    }
+
+    pub(super) fn notify_scan_input_change(&self) {
+        bump_scan_input_version(self.scan_input_version.as_deref());
+    }
+
+    /// Set whether this sink must return an exact, verified deleted-row count.
+    ///
+    /// `true` (a user-visible `DELETE`, where "rows affected" is shown to the
+    /// client) bypasses the count-skipping `pk IN (...)` fast path so the
+    /// scan-based path counts only the live rows actually removed. `false` (the
+    /// default) keeps the fast path for CDC/internal callers that do not surface
+    /// the count. See [`Self::count_exact`].
+    pub(crate) fn with_exact_count(mut self, exact: bool) -> Self {
+        self.count_exact = exact;
         self
     }
 
@@ -191,35 +637,71 @@ impl CayenneDeletionSink {
             .set_deletion_bytes(self.pk_deletion_strategy.approx_resident_bytes());
     }
 
-    async fn delete_all_rows_from_tables(
+    fn assigned_delete_sequence(
+        sequence: Option<i64>,
+        table_name: &str,
+    ) -> super::super::Result<i64> {
+        sequence.ok_or_else(|| Error::Internal {
+            table: table_name.to_string(),
+            message: "Deletion-vector write completed without assigning a delete sequence"
+                .to_string(),
+        })
+    }
+
+    async fn prepare_delete_all_rows_from_tables(
         &self,
         ctx: &SessionContext,
         tables: &[Arc<ListingTable>],
-    ) -> super::super::Result<u64> {
+    ) -> super::super::Result<Option<PreparedDeletionPublish>> {
         let table_name = &self.table_metadata.table_name;
         // For position-based deletions, we need per-file row tracking
         // For PK-based deletions, we can still batch across all files
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                // Int64 PK deletion - collect all batches and extract PK values
-                let mut all_batches = Vec::new();
+                let mut pending_pk_values = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
+                let mut delete_sequence = None;
+                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
                 for table in tables {
-                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
-                    let batches = collect(scan_plan, ctx.task_ctx()).await?;
-                    all_batches.extend(batches);
+                    let scan_plan = table
+                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
+                        .await?;
+                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
+                    while let Some(batch) = stream.next().await {
+                        let batch = batch?;
+                        pending_pk_values.extend(self.extract_int64_pk_values(&batch, &[0])?);
+                        if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
+                            let row_keys = pending_pk_values.drain().map(i64_key).collect();
+                            let results = self
+                                .write_key_based_chunk_with_shared_sequence(
+                                    row_keys,
+                                    &mut delete_sequence,
+                                )
+                                .await?;
+                            staged.absorb(
+                                results,
+                                Self::assigned_delete_sequence(delete_sequence, table_name)?,
+                                table_name,
+                            )?;
+                        }
+                    }
                 }
-
-                if all_batches.is_empty() {
-                    return Ok(0);
+                if !pending_pk_values.is_empty() {
+                    let row_keys = pending_pk_values.into_iter().map(i64_key).collect();
+                    let results = self
+                        .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
+                        .await?;
+                    staged.absorb(
+                        results,
+                        Self::assigned_delete_sequence(delete_sequence, table_name)?,
+                        table_name,
+                    )?;
                 }
-
-                let concatenated_batch =
-                    arrow::compute::concat_batches(&self.schema, &all_batches)?;
-                let pk_values = self.extract_int64_pk_values(&concatenated_batch)?;
-                self.persist_int64_pk_deletions(pk_values).await
+                if delete_sequence.is_none() {
+                    return Ok(None);
+                }
+                self.prepare_staged_pk_deletions(staged).map(Some)
             }
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                // RowConverter-based deletion for composite/non-integer PKs
                 let Some(ref row_converter) = self.pk_row_converter else {
                     return Err(Error::Internal {
                         table: table_name.clone(),
@@ -227,22 +709,61 @@ impl CayenneDeletionSink {
                             .to_string(),
                     });
                 };
-
-                let mut all_batches = Vec::new();
+                let mut pending_row_keys = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
+                let mut delete_sequence = None;
+                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
                 for table in tables {
-                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
-                    let batches = collect(scan_plan, ctx.task_ctx()).await?;
-                    all_batches.extend(batches);
+                    let scan_plan = table
+                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
+                        .await?;
+                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
+                    let projected_indices: Vec<usize> = (0..self.pk_column_indices.len()).collect();
+                    while let Some(batch) = stream.next().await {
+                        let batch = batch?;
+                        let pk_columns: Vec<ArrayRef> = projected_indices
+                            .iter()
+                            .map(|&index| Arc::clone(batch.column(index)))
+                            .collect();
+                        if pk_columns.iter().any(|column| column.null_count() > 0) {
+                            return Err(Error::DataValidation {
+                                table: table_name.clone(),
+                                message: null_primary_key_message(&batch, &projected_indices),
+                            });
+                        }
+                        let rows = row_converter.convert_columns(&pk_columns)?;
+                        pending_row_keys.extend(rows.iter().map(|row| bytes_key(row.as_ref())));
+                        if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
+                            let results = self
+                                .write_key_based_chunk_with_shared_sequence(
+                                    pending_row_keys.drain().collect(),
+                                    &mut delete_sequence,
+                                )
+                                .await?;
+                            staged.absorb(
+                                results,
+                                Self::assigned_delete_sequence(delete_sequence, table_name)?,
+                                table_name,
+                            )?;
+                        }
+                    }
                 }
-
-                if all_batches.is_empty() {
-                    return Ok(0);
+                if !pending_row_keys.is_empty() {
+                    let results = self
+                        .write_key_based_chunk_with_shared_sequence(
+                            pending_row_keys.into_iter().collect(),
+                            &mut delete_sequence,
+                        )
+                        .await?;
+                    staged.absorb(
+                        results,
+                        Self::assigned_delete_sequence(delete_sequence, table_name)?,
+                        table_name,
+                    )?;
                 }
-
-                let concatenated_batch =
-                    arrow::compute::concat_batches(&self.schema, &all_batches)?;
-                let row_keys = self.extract_row_keys(&concatenated_batch, row_converter)?;
-                self.persist_key_based_deletions(row_keys).await
+                if delete_sequence.is_none() {
+                    return Ok(None);
+                }
+                self.prepare_staged_pk_deletions(staged).map(Some)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based deletion for "delete all" (delete w/o filters)
@@ -257,23 +778,21 @@ impl CayenneDeletionSink {
 
     // NOTE: delete_filtered_rows_streaming_position_based is implemented in sink/position_based.rs
 
-    /// Extract Int64 primary key values from a batch.
+    /// Extract Int64 primary key values from a batch whose key is at `pk_indices`.
     fn extract_int64_pk_values(
         &self,
         batch: &arrow::array::RecordBatch,
+        pk_indices: &[usize],
     ) -> super::super::Result<Vec<i64>> {
         use arrow::array::Int64Array;
 
         let table_name = &self.table_metadata.table_name;
 
         // For Int64 PK strategy, we only have one PK column
-        let pk_column_index = self
-            .pk_column_indices
-            .first()
-            .ok_or_else(|| Error::Internal {
-                table: table_name.clone(),
-                message: "Int64 PK strategy requires exactly one PK column index".to_string(),
-            })?;
+        let pk_column_index = pk_indices.first().ok_or_else(|| Error::Internal {
+            table: table_name.clone(),
+            message: "Int64 PK strategy requires exactly one PK column index".to_string(),
+        })?;
 
         let pk_column = batch.column(*pk_column_index);
         let pk_array = pk_column
@@ -287,43 +806,154 @@ impl CayenneDeletionSink {
                 ),
             })?;
 
+        if pk_array.null_count() > 0 {
+            return Err(Error::DataValidation {
+                table: table_name.clone(),
+                message: null_primary_key_message(batch, std::slice::from_ref(pk_column_index)),
+            });
+        }
+
         let pk_values: Vec<i64> = pk_array.values().iter().copied().collect();
         Ok(pk_values)
     }
 
-    /// Extract row keys from a batch using the `RowConverter`.
+    /// How the main listing table must treat an upsert's re-insert marker, re-checked
+    /// against the live protected-snapshot map.
+    ///
+    /// `main_insert_records` is decided while the DELETE plan is built, which is before
+    /// the execution-time `write_lock` is held, so an ordinary upsert can publish a
+    /// protected snapshot in the gap. Scanning main with `Apply` once one exists is the
+    /// resurrection case: main then holds only the superseded version, a predicate
+    /// matching its retired value tombstones the KEY, and that tombstone hides the
+    /// replacement that never matched.
+    ///
+    /// Downgrading to `Ignore` leaves a residual, and it is the safe direction to be
+    /// wrong in. The snapshot published after the capture is not in
+    /// `additional_scan_tables` either, so a key whose superseded version matched is
+    /// left undeleted rather than destroyed. The resulting STATE is the one the serial
+    /// order "this DELETE, then that upsert" produces — the key survives at the
+    /// replacement value, which is where the upsert put it — so no row is lost or
+    /// resurrected. What diverges is the `rows affected` handed back to the client: it
+    /// under-reports those keys, and a user `DELETE` has no later pass to correct that
+    /// (retention, which re-runs, does). The next `DELETE` captures the snapshot and
+    /// sees them.
+    ///
+    /// Rebuilding the scan sources here against the live map would narrow that window
+    /// but not close it: `write_lock` is not the boundary that orders protected-snapshot
+    /// publication. A mem-tier checkpoint drops `write_lock` right after its capture and
+    /// publishes under `listing_fence.write()` alone (see `RewriteScope`), so a snapshot
+    /// can still appear while this DELETE holds `write_lock`, and mid-scan.
+    fn live_main_insert_records(&self) -> InsertRecordHandling {
+        if self.main_insert_records == InsertRecordHandling::Apply
+            && !self.protected_snapshots.load().is_empty()
+        {
+            // Counted, because the trade is only sound while it stays rare: a rate that
+            // climbs with ingest load means user DELETEs routinely under-report the rows
+            // they affected, which is the point at which rebuilding the scan sources
+            // against the live map — and paying a fence for the residual race above —
+            // buys something. Without the counter that is unanswerable.
+            telemetry::cayenne::track_delete_main_visibility_downgrade(&[
+                telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+            ]);
+            return InsertRecordHandling::Ignore;
+        }
+        self.main_insert_records
+    }
+
+    /// Whether an Int64-keyed row from a snapshot whose deletions are visible above
+    /// `min_delete_seq` is still live. `None` is the base case — the current snapshot and
+    /// cold tier, where every delete applies.
+    ///
+    /// Delegates to the read path's own predicate rather than probing the index directly:
+    /// a bare `get_with_min_seq(..).is_none()` is only half the rule, and misses that a
+    /// tombstoned key re-inserted after its delete is visible again.
+    ///
+    /// Live only if live under BOTH the index captured with the source and the current
+    /// one — see [`DeleteScanSource::tombstones_at_capture`] for why neither alone is
+    /// enough. The second probe is skipped while the two are the same index, which is
+    /// every row unless a prune landed after the capture.
+    fn is_live_int64_pk(&self, pk: i64, source: &DeleteScanSource) -> bool {
+        let PkDeletionStrategyWithCache::Int64Pk {
+            deletion_snapshot, ..
+        } = &self.pk_deletion_strategy
+        else {
+            return true;
+        };
+        let visible = |tombstones: &DeletionIndex| {
+            is_pk_visible_i64(pk, tombstones, source.insert_records, source.min_delete_seq)
+        };
+        let current = deletion_snapshot.load();
+        visible(&current.tombstones)
+            && match &source.tombstones_at_capture {
+                Some(PkDeletionSnapshot::Int64Pk { tombstones })
+                    if !Arc::ptr_eq(tombstones, &current.tombstones) =>
+                {
+                    visible(tombstones)
+                }
+                _ => true,
+            }
+    }
+
+    /// [`Self::is_live_int64_pk`] for composite / non-integer primary keys.
+    fn is_live_row_key(&self, key: &[u8], source: &DeleteScanSource) -> bool {
+        let PkDeletionStrategyWithCache::RowConverterBased {
+            deletion_snapshot, ..
+        } = &self.pk_deletion_strategy
+        else {
+            return true;
+        };
+        let visible = |tombstones: &KeyDeletionIndex| {
+            is_pk_visible_row_key(
+                key,
+                tombstones,
+                source.insert_records,
+                source.min_delete_seq,
+            )
+        };
+        let current = deletion_snapshot.load();
+        visible(&current.tombstones)
+            && match &source.tombstones_at_capture {
+                Some(PkDeletionSnapshot::RowConverterBased { tombstones })
+                    if !Arc::ptr_eq(tombstones, &current.tombstones) =>
+                {
+                    visible(tombstones)
+                }
+                _ => true,
+            }
+    }
+
+    /// Extract row keys from a batch whose key is at `pk_indices`, using the `RowConverter`.
     fn extract_row_keys(
-        &self,
         batch: &arrow::array::RecordBatch,
+        pk_indices: &[usize],
         row_converter: &RowConverter,
     ) -> super::super::Result<Vec<Box<[u8]>>> {
-        let pk_columns: Vec<ArrayRef> = self
-            .pk_column_indices
+        let pk_columns: Vec<ArrayRef> = pk_indices
             .iter()
             .map(|&idx| Arc::clone(batch.column(idx)))
             .collect();
 
         let rows = row_converter.convert_columns(&pk_columns)?;
 
-        let row_keys: Vec<Box<[u8]>> = rows
-            .iter()
-            .map(|row| row.as_ref().to_vec().into_boxed_slice())
-            .collect();
+        let row_keys: Vec<Box<[u8]>> = rows.iter().map(|row| bytes_key(row.as_ref())).collect();
 
         Ok(row_keys)
     }
 
-    async fn delete_filtered_rows_from_tables(
+    async fn prepare_delete_filtered_rows_from_tables(
         &self,
         ctx: &SessionContext,
-        tables: &[Arc<ListingTable>],
-    ) -> super::super::Result<u64> {
+        tables: &[DeleteScanSource],
+    ) -> super::super::Result<Option<PreparedDeletionPublish>> {
         let table_name = &self.table_metadata.table_name;
 
         // For position-based deletion, use the streaming per-file approach directly.
         // This avoids loading all data into memory and provides correct file-local row IDs.
         if self.pk_deletion_strategy.is_position_based() {
-            return self.delete_filtered_rows_position_based(ctx, tables).await;
+            return Err(Error::Internal {
+                table: table_name.clone(),
+                message: "Staged key delete cannot use a position-based strategy".to_string(),
+            });
         }
 
         let coerced_filters = self.coerce_filters_for_schema()?;
@@ -350,8 +980,23 @@ impl CayenneDeletionSink {
                         count = pk_values.len(),
                         "Fast-path delete: extracted Int64 PK values directly from filters, skipping table scan"
                     );
-                    self.persist_int64_pk_deletions(pk_values).await?;
-                    return Ok(0);
+                    if pk_values.is_empty() {
+                        return Ok(None);
+                    }
+                    let mut delete_sequence = None;
+                    let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                    let row_keys = pk_values.into_iter().map(i64_key).collect();
+                    let results = self
+                        .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
+                        .await?;
+                    staged.absorb(
+                        results,
+                        Self::assigned_delete_sequence(delete_sequence, table_name)?,
+                        table_name,
+                    )?;
+                    return self
+                        .prepare_staged_pk_deletions(staged)
+                        .map(|prepared| Some(prepared.with_sentinel_count()));
                 }
                 Some(ExtractedPkDeletes::RowKeys(row_keys)) => {
                     tracing::debug!(
@@ -359,24 +1004,46 @@ impl CayenneDeletionSink {
                         count = row_keys.len(),
                         "Fast-path delete: extracted row keys directly from filters, skipping table scan"
                     );
-                    self.persist_key_based_deletions(row_keys).await?;
-                    return Ok(0);
+                    if row_keys.is_empty() {
+                        return Ok(None);
+                    }
+                    let mut delete_sequence = None;
+                    let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                    let results = self
+                        .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
+                        .await?;
+                    staged.absorb(
+                        results,
+                        Self::assigned_delete_sequence(delete_sequence, table_name)?,
+                        table_name,
+                    )?;
+                    return self
+                        .prepare_staged_pk_deletions(staged)
+                        .map(|prepared| Some(prepared.with_sentinel_count()));
                 }
                 None => {}
             }
         }
 
-        let physical_filters = self.build_physical_filters(&coerced_filters)?;
+        // Read only the key and filter columns. Filters are pushed to the scan for
+        // pruning only and are re-applied exactly below.
+        let (scan_projection, scan_schema) = self.filtered_delete_projection(&coerced_filters)?;
+        let physical_filters = Self::build_physical_filters(&coerced_filters, &scan_schema)?;
+        // Key columns lead the projected batch.
+        let projected_pk_indices: Vec<usize> = (0..self.pk_column_indices.len()).collect();
 
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
                 let mut pending_pk_values: Vec<i64> =
                     Vec::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
                 let mut delete_sequence: Option<i64> = None;
-                let mut deleted_rows: u64 = 0;
+                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
-                for table in tables {
-                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+                for source in tables {
+                    let scan_plan = source
+                        .table
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -386,45 +1053,52 @@ impl CayenneDeletionSink {
                             continue;
                         }
 
-                        pending_pk_values.extend(self.extract_int64_pk_values(&batch)?);
+                        // Drop rows this snapshot's own visibility already retires. A
+                        // tombstone newer than the snapshot's threshold means an upsert
+                        // superseded this version; tombstoning its KEY would take the row
+                        // that replaced it — which never matched the predicate — with it.
+                        // One bloom-prefiltered probe per row: no second scan, and nothing
+                        // held that the raw scan did not already hold.
+                        pending_pk_values.extend(
+                            self.extract_int64_pk_values(&batch, &projected_pk_indices)?
+                                .into_iter()
+                                .filter(|pk| self.is_live_int64_pk(*pk, source)),
+                        );
 
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let chunk_values = std::mem::take(&mut pending_pk_values);
-                            let chunk_deleted = self
-                                .persist_int64_pk_chunk_with_shared_sequence(
-                                    chunk_values,
+                            let row_keys = chunk_values.into_iter().map(i64_key).collect();
+                            let results = self
+                                .write_key_based_chunk_with_shared_sequence(
+                                    row_keys,
                                     &mut delete_sequence,
                                 )
                                 .await?;
-                            deleted_rows =
-                                deleted_rows.checked_add(chunk_deleted).ok_or_else(|| {
-                                    Error::Internal {
-                                        table: table_name.clone(),
-                                        message: "Deleted row count overflowed u64".to_string(),
-                                    }
-                                })?;
+                            staged.absorb(
+                                results,
+                                Self::assigned_delete_sequence(delete_sequence, table_name)?,
+                                table_name,
+                            )?;
                         }
                     }
                 }
 
                 if !pending_pk_values.is_empty() {
                     let chunk_values = std::mem::take(&mut pending_pk_values);
-                    let chunk_deleted = self
-                        .persist_int64_pk_chunk_with_shared_sequence(
-                            chunk_values,
-                            &mut delete_sequence,
-                        )
+                    let row_keys = chunk_values.into_iter().map(i64_key).collect();
+                    let results = self
+                        .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;
-                    deleted_rows =
-                        deleted_rows
-                            .checked_add(chunk_deleted)
-                            .ok_or_else(|| Error::Internal {
-                                table: table_name.clone(),
-                                message: "Deleted row count overflowed u64".to_string(),
-                            })?;
+                    staged.absorb(
+                        results,
+                        Self::assigned_delete_sequence(delete_sequence, table_name)?,
+                        table_name,
+                    )?;
                 }
-
-                Ok(deleted_rows)
+                if delete_sequence.is_none() {
+                    return Ok(None);
+                }
+                self.prepare_staged_pk_deletions(staged).map(Some)
             }
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 let Some(row_converter) = self.pk_row_converter.as_ref() else {
@@ -438,10 +1112,13 @@ impl CayenneDeletionSink {
                 let mut pending_row_keys: Vec<Box<[u8]>> =
                     Vec::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
                 let mut delete_sequence: Option<i64> = None;
-                let mut deleted_rows: u64 = 0;
+                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
-                for table in tables {
-                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+                for source in tables {
+                    let scan_plan = source
+                        .table
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -451,51 +1128,85 @@ impl CayenneDeletionSink {
                             continue;
                         }
 
-                        pending_row_keys.extend(self.extract_row_keys(&batch, row_converter)?);
+                        // See the Int64 branch: this snapshot's threshold is what tells
+                        // a superseded version from the row that replaced it.
+                        pending_row_keys.extend(
+                            Self::extract_row_keys(&batch, &projected_pk_indices, row_converter)?
+                                .into_iter()
+                                .filter(|key| self.is_live_row_key(key, source)),
+                        );
 
                         if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let chunk_keys = std::mem::take(&mut pending_row_keys);
-                            let chunk_deleted = self
-                                .persist_key_based_chunk_with_shared_sequence(
+                            let results = self
+                                .write_key_based_chunk_with_shared_sequence(
                                     chunk_keys,
                                     &mut delete_sequence,
                                 )
                                 .await?;
-                            deleted_rows =
-                                deleted_rows.checked_add(chunk_deleted).ok_or_else(|| {
-                                    Error::Internal {
-                                        table: table_name.clone(),
-                                        message: "Deleted row count overflowed u64".to_string(),
-                                    }
-                                })?;
+                            staged.absorb(
+                                results,
+                                Self::assigned_delete_sequence(delete_sequence, table_name)?,
+                                table_name,
+                            )?;
                         }
                     }
                 }
 
                 if !pending_row_keys.is_empty() {
                     let chunk_keys = std::mem::take(&mut pending_row_keys);
-                    let chunk_deleted = self
-                        .persist_key_based_chunk_with_shared_sequence(
+                    let results = self
+                        .write_key_based_chunk_with_shared_sequence(
                             chunk_keys,
                             &mut delete_sequence,
                         )
                         .await?;
-                    deleted_rows =
-                        deleted_rows
-                            .checked_add(chunk_deleted)
-                            .ok_or_else(|| Error::Internal {
-                                table: table_name.clone(),
-                                message: "Deleted row count overflowed u64".to_string(),
-                            })?;
+                    staged.absorb(
+                        results,
+                        Self::assigned_delete_sequence(delete_sequence, table_name)?,
+                        table_name,
+                    )?;
                 }
-
-                Ok(deleted_rows)
+                if delete_sequence.is_none() {
+                    return Ok(None);
+                }
+                self.prepare_staged_pk_deletions(staged).map(Some)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 unreachable!(
                     "PositionBased strategy should have returned early via delete_filtered_rows_position_based"
                 )
             }
+        }
+    }
+
+    pub(crate) async fn prepare_delete(
+        &self,
+    ) -> super::super::Result<Option<PreparedDeletionPublish>> {
+        if self.pk_deletion_strategy.is_position_based() {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "Staged delete publication is unsupported for position-based deletes"
+                    .to_string(),
+            });
+        }
+        let ctx = SessionContext::new_with_config_rt(
+            util::session_state::session_config(),
+            Arc::clone(&self.runtime_env),
+        );
+        let mut all_tables = vec![self.capture_main_scan_source().await];
+        all_tables.extend(self.additional_scan_tables.iter().cloned());
+        if self.filters.is_empty() {
+            // Delete-all removes every row, so no version is preferred over another and
+            // the thresholds carry no information.
+            let plain: Vec<Arc<ListingTable>> = all_tables
+                .iter()
+                .map(|source| Arc::clone(&source.table))
+                .collect();
+            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
+        } else {
+            self.prepare_delete_filtered_rows_from_tables(&ctx, &all_tables)
+                .await
         }
     }
 
@@ -576,16 +1287,35 @@ impl CayenneDeletionSink {
         Ok(coerced_filters)
     }
 
-    fn build_physical_filters(
+    /// Projection for a filtered delete scan: key columns first, then any other
+    /// column the filters reference.
+    fn filtered_delete_projection(
         &self,
         filters: &[Expr],
+    ) -> super::super::Result<(Vec<usize>, SchemaRef)> {
+        let mut projection = self.pk_column_indices.clone();
+        for filter in filters {
+            for column in filter.column_refs() {
+                let index = self.schema.index_of(&column.name)?;
+                if !projection.contains(&index) {
+                    projection.push(index);
+                }
+            }
+        }
+        let schema = Arc::new(self.schema.project(&projection)?);
+        Ok((projection, schema))
+    }
+
+    fn build_physical_filters(
+        filters: &[Expr],
+        schema: &SchemaRef,
     ) -> super::super::Result<Vec<Arc<dyn PhysicalExpr>>> {
-        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let df_schema = DFSchema::try_from(Arc::clone(schema))?;
         let execution_props = ExecutionProps::new();
 
         let physical_filters = filters
             .iter()
-            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props))
+            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default()))
             .collect::<datafusion_common::Result<Vec<_>>>()?;
 
         Ok(physical_filters)
@@ -622,15 +1352,14 @@ impl CayenneDeletionSink {
         Ok(batch)
     }
 
-    async fn persist_key_based_chunk_with_shared_sequence(
+    async fn write_key_based_chunk_with_shared_sequence(
         &self,
         row_keys: Vec<Box<[u8]>>,
         delete_sequence: &mut Option<i64>,
-    ) -> super::super::Result<u64> {
+    ) -> super::super::Result<Vec<DeletionVectorWriteResult>> {
         if row_keys.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
-
         let sequence = if let Some(sequence) = delete_sequence {
             *sequence
         } else {
@@ -645,298 +1374,72 @@ impl CayenneDeletionSink {
             *delete_sequence = Some(sequence);
             sequence
         };
-
-        self.persist_key_based_deletions_with_sequence(row_keys, sequence)
+        let mut metadata = self.table_metadata.clone();
+        metadata.current_sequence_number = sequence;
+        DeletionVectorWriter::new(&metadata)
+            .write(vec![DeletionVectorWriteSpec::new_key_based(row_keys)])
             .await
     }
 
-    async fn persist_int64_pk_chunk_with_shared_sequence(
+    fn prepare_staged_pk_deletions(
         &self,
-        pk_values: Vec<i64>,
-        delete_sequence: &mut Option<i64>,
-    ) -> super::super::Result<u64> {
-        if pk_values.is_empty() {
-            return Ok(0);
-        }
-
-        let sequence = if let Some(sequence) = delete_sequence {
-            *sequence
-        } else {
-            let sequence = super::super::table::reserve_sequences_in(
-                &self.seq_allocator,
-                &self.catalog,
-                &self.table_metadata.table_id,
-                &self.table_metadata.table_name,
-                1,
-            )
-            .await?;
-            *delete_sequence = Some(sequence);
-            sequence
-        };
-
-        self.persist_int64_pk_deletions_with_sequence(pk_values, sequence)
-            .await
-    }
-
-    async fn persist_key_based_deletions(
-        &self,
-        row_keys: Vec<Box<[u8]>>,
-    ) -> super::super::Result<u64> {
-        let filtered_row_keys = Self::filter_existing_key_deletions(row_keys);
-
-        if filtered_row_keys.is_empty() {
-            return Ok(0);
-        }
-
-        let table_name = &self.table_metadata.table_name;
-        let mut delete_sequence: Option<i64> = None;
-        let mut deleted_rows: u64 = 0;
-        let mut row_keys_iter = filtered_row_keys.into_iter();
-
-        loop {
-            let chunk_keys: Vec<Box<[u8]>> = row_keys_iter
-                .by_ref()
-                .take(PK_DELETE_FLUSH_BATCH_SIZE)
-                .collect();
-            if chunk_keys.is_empty() {
-                return Ok(deleted_rows);
-            }
-
-            let chunk_deleted = self
-                .persist_key_based_chunk_with_shared_sequence(chunk_keys, &mut delete_sequence)
-                .await?;
-            deleted_rows =
-                deleted_rows
-                    .checked_add(chunk_deleted)
-                    .ok_or_else(|| Error::Internal {
-                        table: table_name.clone(),
-                        message: "Deleted row count overflowed u64".to_string(),
-                    })?;
-        }
-    }
-
-    async fn persist_key_based_deletions_with_sequence(
-        &self,
-        row_keys: Vec<Box<[u8]>>,
-        delete_sequence: i64,
-    ) -> super::super::Result<u64> {
-        let start = std::time::Instant::now();
-        let table_name = &self.table_metadata.table_name;
-
-        // Get the row keys snapshot from the PkDeletionStrategy (only valid for RowConverterBased)
-        let deletion_snapshot = self
-            .pk_deletion_strategy
-            .row_keys_snapshot()
-            .ok_or_else(|| Error::Internal {
-                table: table_name.clone(),
-                message: "persist_key_based_deletions called with incompatible PkDeletionStrategy"
-                    .to_string(),
-            })?;
-
-        if row_keys.is_empty() {
-            return Ok(0);
-        }
-
-        // Count how many keys are NEW deletions (not already in the cache).
-        // This gives an accurate count of newly deleted rows for the return value.
-        // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
-        let current = deletion_snapshot.load_full();
-        let new_deletion_count = row_keys
-            .iter()
-            .filter(|key| current.tombstones.get(key.as_ref()).is_none())
-            .count();
-
-        // Create a temporary metadata with the delete sequence number
-        let mut temp_metadata = self.table_metadata.clone();
-        temp_metadata.current_sequence_number = delete_sequence;
-
-        let writer = DeletionVectorWriter::new(&temp_metadata);
-        let mut results = writer
-            .write(vec![DeletionVectorWriteSpec::new_key_based(row_keys)])
-            .await?;
-
-        let Some(result) = results.pop() else {
-            return Ok(0);
-        };
-
-        self.catalog.add_delete_file(result.delete_file).await?;
-
-        // Extract row keys from the result
-        let written_row_keys = match &result.identifiers {
-            DeletionIdentifier::KeyBased(keys) => keys,
-            DeletionIdentifier::PositionBased { .. } => {
-                return Err(Error::Internal {
-                    table: table_name.clone(),
-                    message: "Unexpected position-based deletion in key-based sink".to_string(),
-                });
-            }
-        };
-
-        // Build a fresh snapshot with the new deletions and publish via ArcSwap.
-        deletion_snapshot.rcu(|current| {
-            let updated = current
-                .tombstones
-                .extend_max_deletes(written_row_keys.iter().map(|key| (key, delete_sequence)));
-            Arc::new(RowConverterDeletionSnapshot::from_index(updated))
-        });
-        self.refresh_deletion_memory_accounting();
-
+        mut staged: StagedPkDelete,
+    ) -> super::super::Result<PreparedDeletionPublish> {
         let deleted_count =
-            convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
+            convert_to_u64_box(staged.new_count(), "deleted row count").map_err(|error| {
                 Error::Internal {
-                    table: table_name.clone(),
-                    message: e.to_string(),
+                    table: self.table_metadata.table_name.clone(),
+                    message: error.to_string(),
                 }
             })?;
-
-        tracing::debug!(
-            "Key-based deletion vector written and cache updated: {} key(s) (seq={}) duration_ms={} at {:?}",
-            deleted_count,
-            delete_sequence,
-            start.elapsed().as_millis(),
-            result.path
-        );
-
-        Ok(deleted_count)
-    }
-
-    async fn persist_int64_pk_deletions(&self, pk_values: Vec<i64>) -> super::super::Result<u64> {
-        let filtered_pk_values = Self::filter_existing_int64_pk_deletions(pk_values);
-
-        if filtered_pk_values.is_empty() {
-            return Ok(0);
-        }
-
-        let table_name = &self.table_metadata.table_name;
-        let mut delete_sequence: Option<i64> = None;
-        let mut deleted_rows: u64 = 0;
-        let mut pk_values_iter = filtered_pk_values.into_iter();
-
-        loop {
-            let chunk_values: Vec<i64> = pk_values_iter
-                .by_ref()
-                .take(PK_DELETE_FLUSH_BATCH_SIZE)
-                .collect();
-            if chunk_values.is_empty() {
-                return Ok(deleted_rows);
-            }
-
-            let chunk_deleted = self
-                .persist_int64_pk_chunk_with_shared_sequence(chunk_values, &mut delete_sequence)
-                .await?;
-            deleted_rows =
-                deleted_rows
-                    .checked_add(chunk_deleted)
-                    .ok_or_else(|| Error::Internal {
-                        table: table_name.clone(),
-                        message: "Deleted row count overflowed u64".to_string(),
-                    })?;
-        }
-    }
-
-    async fn persist_int64_pk_deletions_with_sequence(
-        &self,
-        pk_values: Vec<i64>,
-        delete_sequence: i64,
-    ) -> super::super::Result<u64> {
-        let table_name = &self.table_metadata.table_name;
-
-        // Get the int64 pk snapshot from the PkDeletionStrategy (only valid for Int64Pk)
-        let deletion_snapshot = self
-            .pk_deletion_strategy
-            .int64_pk_snapshot()
-            .ok_or_else(|| Error::Internal {
-                table: table_name.clone(),
-                message: "persist_int64_pk_deletions called with incompatible PkDeletionStrategy"
-                    .to_string(),
-            })?;
-
-        if pk_values.is_empty() {
-            return Ok(0);
-        }
-
-        // Count how many PKs are NEW deletions (not already in the cache).
-        // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
-        let current = deletion_snapshot.load_full();
-        let new_deletion_count = pk_values
-            .iter()
-            .filter(|pk| current.tombstones.get(**pk).is_none())
-            .count();
-
-        // For Int64 PK deletions, we store them as key-based deletions
-        // where each key is the 8-byte big-endian representation of the i64 value.
-        // This allows efficient storage and lookup.
-        let row_keys: Vec<Box<[u8]>> = pk_values
-            .iter()
-            .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-            .collect();
-
-        // Create a temporary metadata with the delete sequence number
-        let mut temp_metadata = self.table_metadata.clone();
-        temp_metadata.current_sequence_number = delete_sequence;
-
-        let writer = DeletionVectorWriter::new(&temp_metadata);
-        let mut results = writer
-            .write(vec![DeletionVectorWriteSpec::new_key_based(row_keys)])
-            .await?;
-
-        let Some(result) = results.pop() else {
-            return Ok(0);
+        let (delete_files, publish) = match &mut staged {
+            StagedPkDelete::Int64 {
+                new_pks,
+                delete_sequence,
+                delete_files,
+                ..
+            } => (
+                std::mem::take(delete_files),
+                PreparedDeletionCache::Int64 {
+                    pks: std::mem::take(new_pks),
+                    sequence: *delete_sequence,
+                },
+            ),
+            StagedPkDelete::RowKeys {
+                new_keys,
+                delete_sequence,
+                delete_files,
+                ..
+            } => (
+                std::mem::take(delete_files),
+                PreparedDeletionCache::RowKeys {
+                    keys: std::mem::take(new_keys),
+                    sequence: *delete_sequence,
+                },
+            ),
         };
-
-        self.catalog.add_delete_file(result.delete_file).await?;
-
-        // Build a fresh snapshot with the new deletions and publish via ArcSwap.
-        deletion_snapshot.rcu(|current| {
-            let updated = current
-                .tombstones
-                .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
-            Arc::new(Int64PkDeletionSnapshot::from_index(updated))
-        });
-        self.refresh_deletion_memory_accounting();
-
-        let deleted_count =
-            convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
-                Error::Internal {
-                    table: table_name.clone(),
-                    message: e.to_string(),
-                }
-            })?;
-
-        tracing::debug!(
-            "Int64 PK deletion vector written and cache updated: {} key(s) (seq={}) at {:?}",
+        Ok(PreparedDeletionPublish {
+            strategy: self.pk_deletion_strategy.clone(),
+            table_memory: Arc::clone(&self.table_memory),
+            delete_files,
+            publish,
             deleted_count,
-            delete_sequence,
-            result.path
-        );
-
-        Ok(deleted_count)
+            cleanup_armed: true,
+            scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
+        })
     }
 
-    fn filter_existing_int64_pk_deletions(pk_values: Vec<i64>) -> Vec<i64> {
-        // For sequence-based ordering, we MUST write new deletion files even for
-        // PKs that were already deleted, because the new deletion has a higher
-        // sequence number. This ensures proper ordering: data written after the
-        // first delete but before the second delete will be properly filtered.
-        //
-        // We only deduplicate within the current batch (in DeletionVectorWriter).
-        pk_values
-    }
-
-    fn filter_existing_key_deletions(row_keys: Vec<Box<[u8]>>) -> Vec<Box<[u8]>> {
-        // For sequence-based ordering, we MUST write new deletion files even for
-        // PKs that were already deleted, because the new deletion has a higher
-        // sequence number. This ensures proper ordering: data written after the
-        // first delete but before the second delete will be properly filtered.
-        //
-        // We only deduplicate within the current batch (in DeletionVectorWriter).
-        row_keys
+    async fn cleanup_uncommitted_delete_file(path: &str) {
+        cleanup_uncommitted_delete_paths(&[std::path::PathBuf::from(path)]).await;
     }
 }
 
 #[async_trait]
 impl DeletionSink for CayenneDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock (if provided) to prevent racing with concurrent inserts or catalog refreshes.
         // When called from within write_all_append (e.g. retention filters), the caller already
         // holds the lock, so write_lock is None to avoid deadlocking the non-reentrant mutex.
@@ -946,32 +1449,55 @@ impl DeletionSink for CayenneDeletionSink {
         };
 
         let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             Arc::clone(&self.runtime_env),
         );
 
-        // Wait-free ArcSwap snapshot. Concurrent listing-table refreshes are
-        // serialized against this code path by `self.write_lock`, which the
-        // caller holds (or, for sub-sinks, is held by the orchestrating
-        // operation), so we never observe a torn swap here.
-        let listing_table = self.listing_table.load_full();
-
         // Collect all tables to scan: main listing table + the extra tables
         // (protected snapshots and, for cold-tier tables, the cold-tier files).
-        let mut all_tables = vec![Arc::clone(&listing_table)];
-        for extra_table in &self.additional_scan_tables {
-            all_tables.push(Arc::clone(extra_table));
-        }
+        let mut all_tables = vec![self.capture_main_scan_source().await];
+        all_tables.extend(self.additional_scan_tables.iter().cloned());
 
-        if self.filters.is_empty() {
+        let prepared = if self.filters.is_empty() {
+            // See above: delete-all needs no per-snapshot visibility.
+            let plain: Vec<Arc<ListingTable>> = all_tables
+                .iter()
+                .map(|source| Arc::clone(&source.table))
+                .collect();
+            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
+        } else if self.pk_deletion_strategy.is_position_based() {
+            // A position tombstone names a file and row position, so it can only ever
+            // hide the version it matched — the per-snapshot thresholds that keep a key
+            // tombstone off a live row carry nothing for it.
+            let position_tables: Vec<Arc<ListingTable>> = all_tables
+                .iter()
+                .map(|source| Arc::clone(&source.table))
+                .collect();
             return self
-                .delete_all_rows_from_tables(&ctx, &all_tables)
+                .delete_filtered_rows_position_based(&ctx, &position_tables)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+        } else {
+            self.prepare_delete_filtered_rows_from_tables(&ctx, &all_tables)
+                .await
         }
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        self.delete_filtered_rows_from_tables(&ctx, &all_tables)
+        let Some(mut prepared) = prepared else {
+            return Ok(0);
+        };
+        if let Err(error) = self
+            .catalog
+            .add_delete_files(prepared.delete_files().to_vec())
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        {
+            return Err(Box::new(error));
+        }
+        let deleted = prepared.deleted_count();
+        prepared.mark_catalog_committed();
+        prepared
+            .publish()
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+        Ok(deleted)
     }
 }

@@ -14,11 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "clickhouse")]
-pub mod clickhouseconn;
-#[cfg(feature = "odbc")]
-pub mod odbcconn;
-#[cfg(feature = "scylladb")]
-pub mod scylladbconn;
 #[cfg(feature = "snowflake")]
 pub mod snowflakeconn;

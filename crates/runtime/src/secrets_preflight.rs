@@ -22,6 +22,12 @@ limitations under the License.
 //! store surfaces as one consolidated, root-caused report up front instead of
 //! as scattered per-component "missing required parameter" errors later.
 //!
+//! Driven from the start of [`Runtime::load_components`](crate::Runtime::load_components)
+//! so it sees the same stores a component will: the built-in stores the runtime
+//! registers on itself after it is built — Cloud Connect's delivered secrets,
+//! restored from their local cache — are in place by then, and a check that ran
+//! any earlier would report them all as missing.
+//!
 //! This is diagnostics only: it never changes whether or how components load,
 //! and it never logs secret values (it consumes [`RefStatus`], which carries
 //! store/key names and error text only).
@@ -60,15 +66,39 @@ impl LocatedRef {
     }
 }
 
+/// What the preflight found, as the summary it will be logged as.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The app declares no secret references, so nothing is logged.
+    NoReferences,
+    /// Every reference resolved.
+    AllResolved { total: usize },
+    /// At least one reference did not resolve; `report` is the `WARN` block,
+    /// carrying store/key names and error text only.
+    Unresolved { report: String },
+}
+
 /// Runs the preflight against the app's components and logs a single summary.
 ///
 /// On success: one `INFO` line (or nothing when there are no references). On
 /// problems: one `WARN` block listing each unresolved reference with its
 /// provenance and root cause. Never aborts; never logs secret values.
 pub(crate) async fn run(app: &App, secrets: &Secrets) {
+    match evaluate(app, secrets).await {
+        Outcome::NoReferences => {}
+        Outcome::AllResolved { total } => {
+            tracing::info!("Secrets: all {total} secret reference(s) resolved.");
+        }
+        Outcome::Unresolved { report } => tracing::warn!("{report}"),
+    }
+}
+
+/// Resolves every reference and builds the summary, so what the operator reads
+/// can be asserted without a subscriber.
+async fn evaluate(app: &App, secrets: &Secrets) -> Outcome {
     let refs = collect_references(app);
     if refs.is_empty() {
-        return;
+        return Outcome::NoReferences;
     }
 
     // Resolve each distinct (store, key) once — components loading right after
@@ -92,8 +122,7 @@ pub(crate) async fn run(app: &App, secrets: &Secrets) {
     }
 
     if problems.is_empty() {
-        tracing::info!("Secrets: all {} secret reference(s) resolved.", refs.len());
-        return;
+        return Outcome::AllResolved { total: refs.len() };
     }
 
     let mut report = format!(
@@ -112,7 +141,7 @@ pub(crate) async fn run(app: &App, secrets: &Secrets) {
         );
     }
     let _ = write!(report, "\nDocs: {DOCS_URL}");
-    tracing::warn!("{report}");
+    Outcome::Unresolved { report }
 }
 
 /// Human-readable explanation of a [`RefStatus`]. Carries only store/key
@@ -334,6 +363,83 @@ mod tests {
             .with_dataset(dataset_with_params("plain", &[("host", "localhost")]))
             .build();
         assert!(collect_references(&app).is_empty());
+    }
+
+    /// A key no environment (and no `.env`) is expected to hold, so `env`
+    /// cannot answer for the store under test. Unprefixed on purpose: the
+    /// `env` store also looks a key up as `SPICE_<key>`.
+    const DELIVERED_KEY: &str = "PREFLIGHT_TEST_UNSET_SECRET";
+
+    /// Stands in for Cloud Connect's delivered-secrets store: registered on the
+    /// runtime itself, after the spicepod's `secrets:` section was loaded.
+    struct FixedStore {
+        key: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl runtime_secrets::SecretStore for FixedStore {
+        async fn get_secret(
+            &self,
+            key: &str,
+        ) -> runtime_secrets::AnyErrorResult<Option<secrecy::SecretString>> {
+            Ok((key == self.key).then(|| secrecy::SecretString::from("delivered")))
+        }
+    }
+
+    fn app_referencing(key: &str) -> app::App {
+        let reference = format!("${{ secrets:{key} }}");
+        AppBuilder::new("test")
+            .with_dataset(dataset_with_params(
+                "orders",
+                &[("pg_pass", reference.as_str())],
+            ))
+            .build()
+    }
+
+    /// A spicepod with only the default `env` store: the reference is named,
+    /// located, and root-caused in one block.
+    #[tokio::test]
+    async fn unresolved_reference_is_reported_with_provenance_and_cause() {
+        let mut secrets = Secrets::new();
+        secrets.load_from(&[]).await.expect("env store loads");
+
+        let Outcome::Unresolved { report } =
+            evaluate(&app_referencing(DELIVERED_KEY), &secrets).await
+        else {
+            panic!("expected the reference to be reported as unresolved");
+        };
+        assert!(
+            report.contains("Secrets: 1 of 1 secret reference(s) could not be resolved:"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "✗ ${{ secrets:{DELIVERED_KEY} }}  dataset 'orders' (pg_pass) — not found in [env]"
+            )),
+            "{report}"
+        );
+        assert!(report.contains(DOCS_URL), "{report}");
+    }
+
+    /// The preflight runs at the start of the component load, so the built-in
+    /// stores the runtime registers on itself after the spicepod's `secrets:`
+    /// section — Cloud Connect's delivered secrets, restored from their local
+    /// cache — answer for it, the same as they do for the components that load
+    /// next. Checking any earlier reported every delivered secret as missing
+    /// while the dataset referencing it went on to register.
+    #[tokio::test]
+    async fn reference_served_by_a_builtin_store_resolves() {
+        let mut secrets = Secrets::new();
+        secrets.load_from(&[]).await.expect("env store loads");
+        secrets.register_builtin_store(
+            "cloud",
+            std::sync::Arc::new(FixedStore { key: DELIVERED_KEY }),
+        );
+
+        assert_eq!(
+            evaluate(&app_referencing(DELIVERED_KEY), &secrets).await,
+            Outcome::AllResolved { total: 1 }
+        );
     }
 
     #[test]

@@ -15,7 +15,11 @@ limitations under the License.
 */
 
 use super::{RowCounts, get_dataset_app_and_start_request, load_app};
-use crate::{args::DatasetTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper};
+use crate::{
+    args::{DatasetTestArgs, SourceType},
+    health::HealthMonitor,
+    spiced_metrics::MetricsScraper,
+};
 use chbench_driver::ChBenchDriver as _;
 use std::{
     path::Path,
@@ -29,6 +33,7 @@ use test_framework::{
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
+    snapshot::SnapshotMode,
     spiced::SpicedInstance,
     spicepod::acceleration::Mode,
     spicetest::{
@@ -69,6 +74,7 @@ pub(crate) fn emit_acceleration_size_if_applicable(
 }
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
+    super::ensure_shared_client_connections(args, "bench")?;
     // Two SUT acquisition paths: when a system adapter is configured, delegate
     // setup() to it over JSON-RPC; otherwise spawn a local `spiced` as before.
     // The rest of the benchmark flow is identical apart from a few
@@ -87,7 +93,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             let scale_factor = args.scale_factor.unwrap_or(1.0);
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let terminals = (scale_factor * 10.0) as usize;
-            prepare_chbench_source(scale_factor, terminals, None, false).await?;
+            prepare_chbench_source(scale_factor, terminals, None, false, args.source_type).await?;
         }
 
         let instance = SpicedInstance::start(start_request).await?;
@@ -301,13 +307,121 @@ async fn run_inner(
 
 /// List of query results that should not be snapshotted because they don't return deterministic results
 const DISABLED_SNAPSHOT_QUERIES: &[&str] = &[
+    "tpcds_q65", // The ORDER BY clause specifies columns that have multiple matches, so the order is unspecified between those rows
+    "tpcds_q71", // The ORDER BY clause specifies columns that have multiple matches, so the order is unspecified between those rows
     "tpcds_q77", // The ORDER BY clause specifies columns that have multiple matches, so the order is unspecified between those rows
 ];
 
-/// Only snapshot the official TPCH and TPCDS queries, not the "simple" extensions as they don't return consistent results
-fn snapshot_predicate(query_name: &str) -> bool {
-    (query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q"))
-        && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
+/// The `ClickBench` queries whose recorded rows are the same however the engine
+/// breaks ties, so they can be snapshotted.
+///
+/// `ClickBench` needs an allow-list where TPC-H and TPC-DS need a deny-list. Most of
+/// its set ranks by a metric with no unique tiebreaker (`ORDER BY COUNT(*) DESC
+/// LIMIT 10`), and q18 has no `ORDER BY` at all, so which rows reach the top N —
+/// and in what order — follows partitioning and aggregation order rather than the
+/// query. The snapshot keeps the first ten rows as returned, so those queries would
+/// record a plan detail rather than an answer.
+///
+/// `AVG` rules out two more. `avg` coerces its integer argument to `Float64` before
+/// aggregating — the plan for q4 is `avg(CAST(hits.UserID AS Float64))` — and the
+/// summed `UserID` magnitudes exceed 2^53, so the partial sums round, and combining
+/// them in partition-completion order moves the low bits with the runner's core
+/// count. `ClickBench` scenarios assert exact rendered results (they are not in
+/// [`FLOAT_SOURCE_SCENARIO_PREFIXES`]), so q3 and q4 would record the shape of the
+/// machine that ran them.
+///
+/// What is left still answers the question a result snapshot is here to ask — did
+/// the table load, and do the aggregates over it come out right. Every query below
+/// returns one exactly-computed aggregate row, except q20 and q26, which project a
+/// column holding the same value in every row that could be selected.
+const SNAPSHOTTED_CLICKBENCH_QUERIES: &[&str] = &[
+    "clickbench_q1",  // COUNT(*)
+    "clickbench_q2",  // COUNT(*) with a filter
+    "clickbench_q5",  // COUNT(DISTINCT)
+    "clickbench_q6",  // COUNT(DISTINCT)
+    "clickbench_q7",  // MIN and MAX over a timestamp conversion
+    "clickbench_q20", // Projects only the literal the filter pins
+    "clickbench_q21", // COUNT(*) over a LIKE filter
+    "clickbench_q26", // Ordered by the only projected column
+    "clickbench_q30", // 90 integer SUMs
+];
+
+const IGNORED_SNAPSHOT_RESULT_QUERIES: &[(&str, &[&str])] = {
+    &[
+        // This scenario has refresh_sql with limit - which makes these queries non-deterministic
+        (
+            "s3[parquet]-arrow-partitioned",
+            &[
+                "clickbench_q2",
+                "clickbench_q5",
+                "clickbench_q6",
+                "clickbench_q21",
+                "clickbench_q26",
+                "clickbench_q30",
+            ],
+        ),
+        // This scenario has refresh_sql with limit - which makes these queries non-deterministic
+        (
+            "s3[parquet]-postgres",
+            &[
+                "clickbench_q2",
+                "clickbench_q5",
+                "clickbench_q6",
+                "clickbench_q21",
+                "clickbench_q26",
+                "clickbench_q30",
+            ],
+        ),
+    ]
+};
+
+/// Scenario-name prefixes whose data sources surface numeric columns as floats
+/// (`DynamoDB` has no decimal type; Glue CSV and Iceberg Hadoop schema inference
+/// yield doubles), so their aggregates sum `Float64` partial sums across
+/// partitions and the low bits differ per machine. Result snapshots for these
+/// scenarios round float columns to a fixed number of significant digits
+/// ([`SnapshotMode::RoundedFloats`]); every other scenario asserts exact rendered
+/// results. Scenarios whose sources keep exact numerics (parquet → `Decimal128`)
+/// derive their float output columns from exact aggregates in a single division,
+/// which is deterministic — a scenario belongs on this list only when its float
+/// *inputs* are summed, the signature being result snapshots that re-record with
+/// last-digit float drift on a different machine.
+const FLOAT_SOURCE_SCENARIO_PREFIXES: &[&str] = &[
+    "dynamodb",
+    "glue[csv]",
+    "iceberg[hadoop]",
+    "iceberg[hadoop[catalog]]",
+];
+
+/// Only snapshot query sets whose recorded rows are reproducible: the official TPC-H
+/// and TPC-DS queries — not the "simple" extensions, which don't return consistent
+/// results — and the `ClickBench` queries listed in [`SNAPSHOTTED_CLICKBENCH_QUERIES`].
+/// Scenarios listed in [`FLOAT_SOURCE_SCENARIO_PREFIXES`] snapshot with float
+/// columns rounded; all others assert the exact rendered results.
+fn snapshot_predicate(scenario_name: &str, query_name: &str) -> SnapshotMode {
+    let snapshotted = if query_name.starts_with("clickbench_q") {
+        SNAPSHOTTED_CLICKBENCH_QUERIES.contains(&query_name)
+            && !IGNORED_SNAPSHOT_RESULT_QUERIES
+                .iter()
+                .any(|(scenario, queries)| {
+                    *scenario == scenario_name && queries.contains(&query_name)
+                })
+    } else {
+        (query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q"))
+            && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
+    };
+    if !snapshotted {
+        return SnapshotMode::Skip;
+    }
+
+    if FLOAT_SOURCE_SCENARIO_PREFIXES
+        .iter()
+        .any(|prefix| scenario_name.starts_with(prefix))
+    {
+        SnapshotMode::RoundedFloats
+    } else {
+        SnapshotMode::Exact
+    }
 }
 
 /// Build CH-benCH Postgres source config from environment variables.
@@ -319,7 +433,7 @@ fn snapshot_predicate(query_name: &str) -> bool {
 /// | `CHBENCH_PG_DB` | `chbench` |
 /// | `CHBENCH_PG_USER` | `bench` |
 /// | `CHBENCH_PG_PASS` | `bench` |
-fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceConfig> {
+pub(crate) fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceConfig> {
     let mut source = chbench_driver::PostgresSourceConfig::default();
     if let Ok(v) = std::env::var("CHBENCH_PG_HOST") {
         source.host = v;
@@ -341,8 +455,40 @@ fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceCon
     Ok(source)
 }
 
+/// Build CH-benCH `MySQL` source config from environment variables.
+///
+/// | Variable | Default |
+/// |----------|---------|
+/// | `CHBENCH_MYSQL_HOST` | `127.0.0.1` |
+/// | `CHBENCH_MYSQL_PORT` | `3306` |
+/// | `CHBENCH_MYSQL_DB` | `chbench` |
+/// | `CHBENCH_MYSQL_USER` | `bench` |
+/// | `CHBENCH_MYSQL_PASS` | `bench` |
+fn chbench_mysql_source_from_env() -> anyhow::Result<chbench_driver::MysqlSourceConfig> {
+    let mut source = chbench_driver::MysqlSourceConfig::default();
+    if let Ok(v) = std::env::var("CHBENCH_MYSQL_HOST") {
+        source.host = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_MYSQL_PORT") {
+        source.port = v.parse().map_err(|e| {
+            anyhow::anyhow!("CHBENCH_MYSQL_PORT={v:?} is not a valid port number: {e}")
+        })?;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_MYSQL_DB") {
+        source.db = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_MYSQL_USER") {
+        source.user = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_MYSQL_PASS") {
+        source.pass = v;
+    }
+    Ok(source)
+}
+
 /// Validate scale factor, build the CH-benCH config, and connect to the source
-/// Postgres. Unless `skip_prepare` is set, also create the schema and load seed data.
+/// database (`Postgres` or `MySQL`, per `source_type`). Unless `skip_prepare` is
+/// set, also create the schema and load seed data.
 ///
 /// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
 /// `terminals` specifies the target number of terminals.
@@ -355,7 +501,8 @@ pub(crate) async fn prepare_chbench_source(
     terminals: usize,
     rate: Option<u32>,
     skip_prepare: bool,
-) -> anyhow::Result<chbench_driver::PostgresChBenchDriver> {
+    source_type: SourceType,
+) -> anyhow::Result<std::sync::Arc<dyn chbench_driver::ChBenchDriver>> {
     if scale_factor < 1.0 || scale_factor.fract() != 0.0 {
         anyhow::bail!(
             "CH-benCH --scale-factor must be a positive integer (>= 1), got {scale_factor}. \
@@ -374,22 +521,216 @@ pub(crate) async fn prepare_chbench_source(
     };
 
     println!(
-        "Preparing CH-benCHmark source, SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s)"
+        "Preparing CH-benCHmark source ({source_type:?}), SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s)"
     );
 
-    let source = chbench_source_from_env()?;
-    let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
-    if skip_prepare {
-        // Source is assumed already populated (e.g. restored from a template).
-        // Verify it actually is — and matches the requested scale factor —
-        // before running against it; a missing/mismatched source would otherwise
-        // yield silently-wrong results instead of a clear error.
-        driver.verify_prepared().await?;
-        println!("Skipping CH-benCHmark seed (--skip-prepare): verified existing source");
-    } else {
-        driver.prepare().await?;
-    }
+    // `verify_prepared`/`prepare` are inherent methods on the concrete driver, so
+    // run the prepare/verify step before erasing the type to `dyn ChBenchDriver`.
+    let driver: std::sync::Arc<dyn chbench_driver::ChBenchDriver> = match source_type {
+        SourceType::Postgres => {
+            let source = chbench_source_from_env()?;
+            let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
+            if skip_prepare {
+                // Source is assumed already populated (e.g. restored from a template).
+                // Verify it actually is — and matches the requested scale factor —
+                // before running against it; a missing/mismatched source would otherwise
+                // yield silently-wrong results instead of a clear error.
+                driver.verify_prepared().await?;
+                println!("Skipping CH-benCHmark seed (--skip-prepare): verified existing source");
+            } else {
+                driver.prepare().await?;
+            }
+            std::sync::Arc::new(driver)
+        }
+        SourceType::Mysql => {
+            let source = chbench_mysql_source_from_env()?;
+            let driver = chbench_driver::MysqlChBenchDriver::connect(config, source).await?;
+            if skip_prepare {
+                driver.verify_prepared().await?;
+                println!("Skipping CH-benCH seed (--skip-prepare): verified existing source");
+            } else {
+                driver.prepare().await?;
+            }
+            std::sync::Arc::new(driver)
+        }
+    };
 
     println!("CH-benCHmark source is ready");
     Ok(driver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        IGNORED_SNAPSHOT_RESULT_QUERIES, SNAPSHOTTED_CLICKBENCH_QUERIES, SnapshotMode,
+        snapshot_predicate,
+    };
+
+    /// A decimal-source scenario: asserts exact rendered results.
+    const EXACT_SCENARIO: &str = "s3[parquet]-federated";
+
+    #[test]
+    fn snapshots_the_official_tpch_and_tpcds_queries() {
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "tpch_q1"),
+            SnapshotMode::Exact
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "tpcds_q1"),
+            SnapshotMode::Exact
+        );
+        // The "simple" extensions are not part of either spec.
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "tpch_simple_q4"),
+            SnapshotMode::Skip
+        );
+        // Deny-listed for an unspecified order between equal rows.
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "tpcds_q77"),
+            SnapshotMode::Skip
+        );
+    }
+
+    #[test]
+    fn float_source_scenarios_round_their_float_columns() {
+        for scenario in [
+            "dynamodb-arrow",
+            "dynamodb-federated",
+            "dynamodb-duckdb[file]",
+            "dynamodb-scylladb-alternator-federated",
+            "glue[csv]-federated",
+            "iceberg[hadoop]-federated",
+            "iceberg[hadoop[catalog]]-federated",
+        ] {
+            assert_eq!(
+                snapshot_predicate(scenario, "tpch_q1"),
+                SnapshotMode::RoundedFloats,
+                "{scenario} sums float source columns and must round"
+            );
+        }
+        // The deny-list still wins over rounding.
+        assert_eq!(
+            snapshot_predicate("dynamodb-arrow", "tpcds_q77"),
+            SnapshotMode::Skip
+        );
+    }
+
+    /// Parquet-backed variants of the same connectors keep exact numerics, so
+    /// the prefix list must not swallow them.
+    #[test]
+    fn decimal_source_scenarios_assert_exact_results() {
+        for scenario in [
+            "glue[parquet]-federated",
+            "glue[catalog]-federated",
+            "iceberg[catalog]-federated",
+            "iceberg-duckdb[file]",
+            "s3[parquet]-duckdb[file]",
+        ] {
+            assert_eq!(
+                snapshot_predicate(scenario, "tpch_q1"),
+                SnapshotMode::Exact,
+                "{scenario} has exact numeric sources and must assert exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshots_only_the_reproducible_clickbench_queries() {
+        for query in SNAPSHOTTED_CLICKBENCH_QUERIES {
+            assert_eq!(
+                snapshot_predicate(EXACT_SCENARIO, query),
+                SnapshotMode::Exact,
+                "{query} should be snapshotted"
+            );
+        }
+        // Ranks by a metric with no unique tiebreaker.
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q13"),
+            SnapshotMode::Skip
+        );
+        // No ORDER BY at all.
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q18"),
+            SnapshotMode::Skip
+        );
+        // Averages in Float64 whose sums exceed 2^53, so the low bits follow
+        // the partition count.
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q3"),
+            SnapshotMode::Skip
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q4"),
+            SnapshotMode::Skip
+        );
+    }
+
+    /// Scenarios in [`IGNORED_SNAPSHOT_RESULT_QUERIES`] skip only the queries
+    /// listed for them, whose source data no longer matches their previously
+    /// recorded rows; every other scenario sharing the same allow-list keeps
+    /// asserting them.
+    #[test]
+    fn stale_data_scenarios_skip_their_unreliable_clickbench_queries() {
+        for (scenario, queries) in IGNORED_SNAPSHOT_RESULT_QUERIES {
+            for query in *queries {
+                assert_eq!(
+                    snapshot_predicate(scenario, query),
+                    SnapshotMode::Skip,
+                    "{query} should not be snapshotted for {scenario}"
+                );
+                assert_eq!(
+                    snapshot_predicate(EXACT_SCENARIO, query),
+                    SnapshotMode::Exact,
+                    "{query} should still be snapshotted for {EXACT_SCENARIO}"
+                );
+            }
+            // Queries not on the scenario's exclusion list are unaffected.
+            assert_eq!(
+                snapshot_predicate(scenario, "clickbench_q1"),
+                SnapshotMode::Exact
+            );
+            assert_eq!(
+                snapshot_predicate(scenario, "clickbench_q7"),
+                SnapshotMode::Exact
+            );
+            assert_eq!(
+                snapshot_predicate(scenario, "clickbench_q20"),
+                SnapshotMode::Exact
+            );
+        }
+    }
+
+    /// The allow-list matches whole names, so a listed query must not also enable
+    /// the queries it is a prefix of.
+    #[test]
+    fn clickbench_allow_list_matches_whole_query_names() {
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q1"),
+            SnapshotMode::Exact
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q11"),
+            SnapshotMode::Skip
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q2"),
+            SnapshotMode::Exact
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q22"),
+            SnapshotMode::Skip
+        );
+    }
+
+    #[test]
+    fn does_not_snapshot_other_query_sets() {
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "chbench_q1"),
+            SnapshotMode::Skip
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "scenario_q1"),
+            SnapshotMode::Skip
+        );
+    }
 }

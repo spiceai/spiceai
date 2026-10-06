@@ -22,15 +22,14 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use duckdb::AccessMode;
 use futures::TryStreamExt;
 
-use anyhow::anyhow;
-use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
+use runtime::Runtime;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use std::sync::Arc;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{register_test_connectors, runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, test_request_context},
 };
 
 use super::get_params;
@@ -73,39 +72,8 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
             configure_test_datafusion();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-            let app_ref = rt.app();
-            let app_lock = app_ref.read().await;
-            let Some(app) = app_lock.as_ref() else {
-                return Err(anyhow!("Failed to obtain app from runtime"));
-            };
-
-            let cloned_rt = Arc::clone(&rt);
-            let runtime_datasets = app
-                .datasets
-                .clone()
-                .into_iter()
-                .map(DatasetBuilder::try_from)
-                .map(move |ds_builder| {
-                    ds_builder
-                        .map_err(|e| anyhow!("Failed to create dataset builder: {e}"))
-                        .and_then(|ds_builder| {
-                            ds_builder
-                                .with_app(Arc::clone(app))
-                                .with_runtime(Arc::clone(&cloned_rt))
-                                .build()
-                                .map_err(|e| anyhow!("Failed to build dataset: {e}"))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
-                }
-                () = Arc::clone(&rt).load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            let runtime_datasets =
+                super::load_runtime_datasets(&rt, std::time::Duration::from_mins(1)).await?;
 
             // Verify checkpoints are created before shutting down runtime
             wait_for_checkpoints(runtime_datasets, 120).await?;

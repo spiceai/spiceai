@@ -17,12 +17,13 @@ limitations under the License.
 use arrow::{
     array::{Array, RecordBatch},
     datatypes::{Field, Schema, SchemaRef},
-    ipc::reader::StreamReader,
 };
+use arrow_tools::map_entries;
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
+    common::TableReference, datasource::TableProvider, error::DataFusionError,
+    execution::SendableRecordBatchStream, physical_plan::EmptyRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::{
@@ -41,7 +42,6 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     error::Error as StdError,
     fmt::{Display, Formatter},
-    io::Cursor,
     pin::Pin,
     str::FromStr,
     sync::{
@@ -67,6 +67,7 @@ use crate::schema_discovery::{
     discover_schema,
 };
 use crate::{DESCRIPTION_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
 
@@ -290,6 +291,15 @@ pub enum Error {
     ArrowStreamReadFailed { source: arrow::error::ArrowError },
 
     #[snafu(display(
+        "Failed to read query results from Databricks SQL Warehouse ({source}), so the query cannot return rows. \
+        Cast the MAP column to a supported type in the query, or select it as a string with `to_json(<column>)`. \
+        See: https://spiceai.org/docs/components/data-connectors/databricks"
+    ))]
+    MapEntriesNotNormalizable {
+        source: arrow_tools::map_entries::Error,
+    },
+
+    #[snafu(display(
         "Failed to load the dataset (databricks): {}",
         format_datafusion_error(source)
     ))]
@@ -377,6 +387,7 @@ enum WarehouseType {
 pub struct DatabricksSqlWarehouse {
     pool: Arc<dyn DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> + Send + Sync>,
     metrics: Arc<DatabricksMetrics>,
+    api: Arc<SqlWarehouseApi>,
 }
 
 impl DatabricksSqlWarehouse {
@@ -497,17 +508,29 @@ impl DatabricksSqlWarehouse {
             rate_controller,
         )?);
         let pool = Arc::new(SqlWarehouseConnectionPool {
-            api,
+            api: Arc::clone(&api),
             metrics: Arc::clone(&metrics),
             permissions,
         });
-        Ok(Self { pool, metrics })
+        Ok(Self { pool, metrics, api })
     }
 
     /// Returns the shared metrics for this SQL Warehouse instance.
     #[must_use]
     pub fn metrics(&self) -> &Arc<DatabricksMetrics> {
         &self.metrics
+    }
+
+    /// Returns whether this connector uses a Classic SQL warehouse.
+    ///
+    /// Lakehouse Federation foreign tables require a Pro or Serverless
+    /// warehouse even when Classic can return their schema with `DESCRIBE`.
+    pub async fn is_classic_warehouse(&self) -> Result<bool, Error> {
+        let token = self.api.token_provider.get_token();
+        Ok(matches!(
+            self.api.get_warehouse_type(&token).await?,
+            WarehouseType::Classic
+        ))
     }
 }
 
@@ -1123,19 +1146,14 @@ impl SqlWarehouseApi {
     async fn fetch_external_links(
         self: Arc<Self>,
         result_object: Value,
+        projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Error> {
         let token = self.token_provider.get_token();
         let initial_external_link = Self::extract_external_links(result_object)?;
 
         // If no external link, return an empty stream
         if initial_external_link.is_none() {
-            let empty_stream: Pin<
-                Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>,
-            > = Box::pin(stream::empty::<Result<RecordBatch, DataFusionError>>());
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                Arc::new(Schema::empty()),
-                empty_stream,
-            )) as SendableRecordBatchStream);
+            return Ok(empty_result_stream(projected_schema));
         }
 
         let token = token.clone();
@@ -1156,7 +1174,7 @@ impl SqlWarehouseApi {
                     Err(e) => return Some((Err(e), None)),
                 };
 
-                let batches = match Self::read_arrow_batches(bytes) {
+                let batches = match Self::read_arrow_batches(&bytes) {
                     Ok(batches) => batches,
                     Err(e) => return Some((Err(e), None)),
                 };
@@ -1230,13 +1248,7 @@ impl SqlWarehouseApi {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => return Err(e),
             None => {
-                let empty_stream: Pin<
-                    Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>,
-                > = Box::pin(stream::empty::<Result<RecordBatch, DataFusionError>>());
-                return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::new(Schema::empty()),
-                    empty_stream,
-                )) as SendableRecordBatchStream);
+                return Ok(empty_result_stream(projected_schema));
             }
         };
 
@@ -1304,16 +1316,23 @@ impl SqlWarehouseApi {
         result
     }
 
-    fn read_arrow_batches(
-        bytes: bytes::Bytes,
-    ) -> Result<Vec<arrow::record_batch::RecordBatch>, Error> {
-        let cursor = Cursor::new(bytes);
-        let reader = StreamReader::try_new(cursor, None).context(ArrowStreamReadFailedSnafu)?;
-        Ok(reader
-            .collect::<Result<Vec<_>, _>>()
-            .context(ArrowStreamReadFailedSnafu)?
+    fn read_arrow_batches(bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>, Error> {
+        // The warehouse declares a MAP's `entries` field nullable, which the Arrow map layout
+        // forbids — and which `ArrayData` validation refuses inside the decode, over the one part
+        // of the column that holds no data, naming neither the column nor which of the two map
+        // rules was broken. Reading through `arrow_tools` decodes those buffers as the list they
+        // are laid out as and brings the column into line where it can still be named, so the
+        // chunk is readable and the batches carry the type the scan publishes.
+        let batches = map_entries::read_ipc_stream(bytes).map_err(|error| match error {
+            map_entries::Error::UndecodableStream { source } => {
+                Error::ArrowStreamReadFailed { source }
+            }
+            named => Error::MapEntriesNotNormalizable { source: named },
+        })?;
+
+        Ok(batches
             .into_iter()
-            .filter(|batch| batch.num_rows() > 0)
+            .filter(|batch| batch.num_rows() != 0)
             .collect())
     }
 
@@ -1957,7 +1976,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
         })?;
 
         let mut stream = Arc::clone(&self.api)
-            .fetch_external_links(response)
+            .fetch_external_links(response, None)
             .await
             .map_err(|e| dbconnection::Error::UnableToGetSchemas {
                 source: Box::new(e),
@@ -1999,7 +2018,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
         &self,
         sql: &str,
         _: &[&'a dyn Sync],
-        _projected_schema: Option<SchemaRef>,
+        projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let token = self.api.token_provider.get_token();
         let payload = json!({
@@ -2034,7 +2053,12 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             .build()
         })?;
 
-        Ok(SqlWarehouseApi::fetch_external_links(Arc::clone(&self.api), result_object).await?)
+        Ok(SqlWarehouseApi::fetch_external_links(
+            Arc::clone(&self.api),
+            result_object,
+            projected_schema,
+        )
+        .await?)
     }
 
     async fn execute(
@@ -2044,6 +2068,18 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         Ok(NotImplementedSnafu.fail()?)
     }
+}
+
+/// The stream for a statement whose result carried no chunks.
+///
+/// Every other schema on this path is read off the first batch, so when there is
+/// no batch the schema has to come from the projected schema the plan was built
+/// from. Falling back to [`Schema::empty`] would hand back a stream whose schema
+/// contradicts the columns the query selected. Callers with no plan behind them
+/// — schema discovery, for one — pass `None` and keep the empty schema.
+fn empty_result_stream(projected_schema: Option<SchemaRef>) -> SendableRecordBatchStream {
+    let schema = projected_schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+    Box::pin(EmptyRecordBatchStream::new(schema))
 }
 
 fn databricks_dialect() -> super::dialect::DatabricksDialect {
@@ -2062,7 +2098,12 @@ impl crate::Read for DatabricksSqlWarehouse {
             SqlTable::new("databricks", &self.pool, table_reference, None)
                 .await
                 .context(SqlTableInitializationFailedSnafu)?
-                .with_dialect(dialect),
+                .with_dialect(dialect)
+                // Databricks evaluates none of the Spice functions, so a plan or
+                // filter naming one runs locally instead of being unparsed into
+                // a statement the warehouse answers `UNRESOLVED_ROUTINE` to
+                // (#10703, #13664).
+                .with_function_support(Some(deny_spice_functions_for_table_providers())),
         );
 
         Ok(Arc::new(
@@ -2078,6 +2119,162 @@ mod tests {
     use super::*;
     use arrow::datatypes::DataType;
     use serde_json::json;
+
+    /// Writes `batch` as an Arrow IPC stream, the way the warehouse hands back a result
+    /// chunk. Neither the writer nor the reader checks the `Map` layout rules, which is how
+    /// a non-conforming map reaches the plan.
+    fn arrow_stream_bytes(batch: &RecordBatch) -> bytes::Bytes {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
+                .expect("stream writer");
+            writer.write(batch).expect("write batch");
+            writer.finish().expect("finish stream");
+        }
+        bytes::Bytes::from(buf)
+    }
+
+    fn map_entry_fields() -> arrow::datatypes::Fields {
+        vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into()
+    }
+
+    /// A one-row MAP column declared the way the warehouse declares it — `entries` nullable,
+    /// which the Arrow map layout forbids. Built through `ArrayData` rather than
+    /// `MapArray::try_new`, the way the IPC reader does, since `try_new` is what refuses it.
+    fn wire_map_column_batch(entry_nulls: Option<arrow::buffer::NullBuffer>) -> RecordBatch {
+        let entries = arrow::array::StructArray::try_new(
+            map_entry_fields(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["k0"])) as arrow::array::ArrayRef,
+                Arc::new(arrow::array::StringArray::from(vec![Some("v0")]))
+                    as arrow::array::ArrayRef,
+            ],
+            entry_nulls,
+        )
+        .expect("entries struct");
+
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(map_entry_fields()),
+                true,
+            )),
+            false,
+        );
+        let builder = arrow::array::ArrayData::builder(map_type.clone())
+            .len(1)
+            .add_buffer(arrow::buffer::Buffer::from_slice_ref([0i32, 1]))
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("col_map", map_type, true)])),
+            vec![Arc::new(arrow::array::MapArray::from(data)) as arrow::array::ArrayRef],
+        )
+        .expect("batch")
+    }
+
+    /// Regression test for #7307: the warehouse declares a `MAP`'s `entries` field nullable,
+    /// which the Arrow map layout forbids. Read as-is, the column publishes a schema no
+    /// kernel can rebuild — so a `SELECT` of the column fails with
+    /// `MapArray entries cannot contain nulls` even though the data holds no nulls.
+    #[test]
+    fn a_map_column_is_published_with_a_non_nullable_entries_field() {
+        let wire = wire_map_column_batch(None);
+
+        let batches = SqlWarehouseApi::read_arrow_batches(&arrow_stream_bytes(&wire))
+            .expect("the chunk is readable");
+        let published = batches
+            .first()
+            .expect("one batch was written")
+            .schema()
+            .field(0)
+            .data_type()
+            .clone();
+
+        match &published {
+            DataType::Map(entries, _) => assert!(
+                !entries.is_nullable(),
+                "the published entries field must be non-nullable: {published}"
+            ),
+            other => panic!("expected a Map, got {other}"),
+        }
+
+        // A plan casts batches to the schema the scan published, so that type has to be one
+        // `MapArray` accepts as a cast target.
+        arrow::compute::cast(batches[0].column(0), &published)
+            .expect("the published map type is a legal cast target");
+    }
+
+    /// Entries carrying real nulls cannot be relabelled — Arrow has no meaning for a null
+    /// entry — so the read fails naming the column and what to do instead, rather than
+    /// surfacing Arrow's message about a layout the user never chose.
+    #[test]
+    fn entry_level_nulls_fail_the_read_with_an_actionable_message() {
+        let wire = wire_map_column_batch(Some(arrow::buffer::NullBuffer::from(vec![false])));
+
+        let err = SqlWarehouseApi::read_arrow_batches(&arrow_stream_bytes(&wire))
+            .expect_err("entry nulls must fail the read");
+
+        let message = err.to_string();
+        assert!(
+            matches!(err, Error::MapEntriesNotNormalizable { .. }),
+            "unexpected error: {message}"
+        );
+        for expected in [
+            "col_map",
+            "Databricks SQL Warehouse",
+            "to_json(<column>)",
+            "https://spiceai.org/docs/components/data-connectors/databricks",
+        ] {
+            assert!(
+                message.contains(expected),
+                "message must mention {expected}: {message}"
+            );
+        }
+    }
+
+    /// Regression test for #13015: a statement whose result carries no chunks
+    /// must still carry the projected schema, so an empty result is an empty
+    /// table with the columns the query selected rather than no columns at all.
+    #[test]
+    fn empty_result_stream_keeps_the_projected_schema() {
+        let projected: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let mut stream = empty_result_stream(Some(Arc::clone(&projected)));
+
+        assert_eq!(
+            stream.schema().as_ref(),
+            projected.as_ref(),
+            "an empty result must carry the projected schema"
+        );
+        assert!(
+            futures::executor::block_on(stream.next()).is_none(),
+            "an empty result must not yield a batch"
+        );
+    }
+
+    #[test]
+    fn empty_result_stream_without_a_projection_has_no_columns() {
+        let stream = empty_result_stream(None);
+
+        assert_eq!(
+            stream.schema().fields().len(),
+            0,
+            "schema discovery has no plan behind it and keeps the empty schema"
+        );
+    }
 
     /// Helper to create a valid Databricks schema response JSON.
     fn make_schema_response(data_array: &Value) -> Value {

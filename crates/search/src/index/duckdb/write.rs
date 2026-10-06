@@ -123,7 +123,12 @@ async fn embed_column(
         .await
         .context(FailedToEmbedSnafu)?;
 
-    Ok(distribute_nulls(embedded, nulls))
+    // `embed` yields the cache's shared handle; `distribute_nulls` consumes an
+    // owned Vec, so take it out of the Arc as the shared write helper does.
+    Ok(distribute_nulls(
+        std::sync::Arc::unwrap_or_clone(embedded),
+        nulls,
+    ))
 }
 
 fn update_embedding_column_in_batch(
@@ -190,7 +195,8 @@ fn create_embedding_array(
                 });
             }
             None => {
-                builder.values().append_nulls(expected);
+                // Store `f32` child values, not `Option<f32>`; the list slot represents a null embedding.
+                builder.values().append_value_n(0.0, expected);
                 builder.append(false);
             }
         }

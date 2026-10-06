@@ -138,6 +138,159 @@ impl Catalog for RestCatalog {
     }
 }
 
+/// Guards the `SigV4` signing middleware the `spiceai/iceberg-rust` fork adds to its
+/// REST catalog client, which is what lets a Glue-backed Iceberg catalog
+/// authenticate at all.
+///
+/// The parameter wiring is compile-guarded — `crates/runtime/src/catalogconnector/iceberg.rs`
+/// sets `rest.sigv4-enabled` — but that only proves the flag reaches the client. If
+/// a re-cut drops the middleware while keeping the flag, every request goes out
+/// unsigned and Glue rejects it, which reads as a credentials problem rather than a
+/// lost patch.
+///
+/// Signed against a local stub with static credentials, so this needs no AWS
+/// account: what is asserted is the request Spice puts on the wire.
+/// `docs/dev/fork_patches.md` is the ledger this guard is named in.
+#[cfg(test)]
+mod sigv4_signing {
+    use std::collections::HashMap;
+
+    use iceberg::{Catalog as _, CatalogBuilder};
+    use iceberg_catalog_rest::RestCatalogBuilder;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::RestCatalog;
+
+    const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+    const REGION: &str = "ap-northeast-2";
+
+    /// A stub REST catalog that answers the two calls a `list_namespaces` makes: the
+    /// config fetch the client always issues first, and the listing itself.
+    async fn stub_catalog() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {},
+                "overrides": {},
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "namespaces": [] })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// List namespaces through a catalog built from `props`, and return one entry per
+    /// request the stub saw — `None` where that request carried no `Authorization`.
+    ///
+    /// One entry per *request*, not per header: filtering the unsigned ones out would
+    /// let a middleware that signs only some requests pass the assertion below, since
+    /// the requests it skipped would simply not appear.
+    async fn authorization_headers(
+        server: &MockServer,
+        props: HashMap<String, String>,
+    ) -> Vec<Option<String>> {
+        let catalog = RestCatalog::new(
+            RestCatalogBuilder::default()
+                .load("rest", props)
+                .await
+                .expect("the REST catalog is configured"),
+        );
+        catalog
+            .list_namespaces(None)
+            .await
+            .expect("the stub answers the listing");
+
+        server
+            .received_requests()
+            .await
+            .expect("the stub records what it received")
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string)
+            })
+            .collect()
+    }
+
+    fn props(server: &MockServer, sigv4: bool) -> HashMap<String, String> {
+        let mut props = HashMap::from([("uri".to_string(), server.uri())]);
+        if sigv4 {
+            props.extend([
+                ("rest.sigv4-enabled".to_string(), "true".to_string()),
+                ("rest.signing-region".to_string(), REGION.to_string()),
+                ("rest.signing-name".to_string(), "glue".to_string()),
+                ("rest.access-key-id".to_string(), ACCESS_KEY.to_string()),
+                (
+                    "rest.secret-access-key".to_string(),
+                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                ),
+            ]);
+        }
+        props
+    }
+
+    #[tokio::test]
+    async fn a_sigv4_catalog_signs_every_request_it_sends() {
+        let server = stub_catalog().await;
+        let requests = authorization_headers(&server, props(&server, true)).await;
+
+        assert!(
+            !requests.is_empty(),
+            "the stub saw no request at all, so this asserts nothing"
+        );
+        // Every request, not merely every signature: a catalog that signs the config
+        // fetch and not the listing authenticates for exactly as long as it takes to
+        // reach the first real call.
+        let unsigned = requests.iter().filter(|header| header.is_none()).count();
+        assert_eq!(
+            unsigned,
+            0,
+            "{unsigned} of {} requests carried no Authorization header, so the signing middleware is missing or applied to only some calls",
+            requests.len()
+        );
+        for header in requests.iter().flatten() {
+            assert!(
+                header.starts_with("AWS4-HMAC-SHA256 "),
+                "expected a SigV4 signature, got: {header}"
+            );
+            // The credential scope is what Glue checks after the signature: the wrong
+            // region or service name is rejected the same way an unsigned request is.
+            assert!(
+                header.contains(&format!("Credential={ACCESS_KEY}/")),
+                "the signature does not name the configured key: {header}"
+            );
+            assert!(
+                header.contains(&format!("/{REGION}/glue/aws4_request")),
+                "the signature's credential scope is not the configured region and service: {header}"
+            );
+        }
+    }
+
+    /// The control: without the flag the same client sends nothing, so the assertion
+    /// above is reading the middleware rather than a header the client always sets.
+    #[tokio::test]
+    async fn a_catalog_without_sigv4_sends_no_signature() {
+        let server = stub_catalog().await;
+        let requests = authorization_headers(&server, props(&server, false)).await;
+        assert!(!requests.is_empty(), "the stub saw no request at all");
+        assert!(
+            requests.iter().all(Option::is_none),
+            "a catalog with no SigV4 configured signed a request anyway: {requests:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::prelude::SessionContext;

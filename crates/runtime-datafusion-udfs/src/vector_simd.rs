@@ -66,13 +66,38 @@ pub(crate) enum Kernel {
     Dot,
     /// Squared L2 distance. Sqrt is left to the caller when true L2 is needed.
     L2Squared,
+    /// Cosine distance via `simsimd`, which returns `1 - cosine_similarity` ∈ [0, 2].
+    /// The caller divides by 2 in `post_process` to map into the [0, 1] range.
+    Cosine,
 }
 
 impl Kernel {
+    /// Whether a non-finite input can reach this kernel's output as a finite,
+    /// plausible-looking number.
+    ///
+    /// `Dot` and `L2Squared` accumulate their inputs directly, so `NaN` or an
+    /// infinity propagates and the output check below catches it for free.
+    /// `Cosine` normalizes, and `simsimd` answers **0** — distance 0, an exact
+    /// match — for a row carrying `NaN`. Nothing about the output distinguishes
+    /// that from two genuinely parallel vectors, so this kernel is the one that
+    /// has to screen its input. The shared non-finite test drives all three
+    /// kernels, so if this is ever wrong for `Dot`/`L2Squared` — a simsimd
+    /// change, a different SIMD dispatch — that test fails rather than the
+    /// missing guard going unnoticed.
+    fn hides_non_finite_input(self) -> bool {
+        match self {
+            Self::Dot | Self::L2Squared => false,
+            Self::Cosine => true,
+        }
+    }
+
     fn apply(self, a: &[f32], b: &[f32]) -> Option<f64> {
         match self {
             Self::Dot => f32::dot(a, b),
             Self::L2Squared => f32::l2sq(a, b),
+            // `SpatialSimilarity::cos` returns `1 - cosine_similarity` ∈ [0, 2].
+            // The caller divides by 2 to map into the standard [0, 1] distance range.
+            Self::Cosine => <f32 as SpatialSimilarity>::cos(a, b),
         }
     }
 }
@@ -144,6 +169,26 @@ fn as_fsl(arr: &ArrayRef) -> DataFusionResult<&FixedSizeListArray> {
         })
 }
 
+/// Returns `true` when every element of `values` is finite.
+///
+/// Branch-free by design; see the note in the body for why.
+#[inline]
+fn all_finite(values: &[f32]) -> bool {
+    // An `f32` is non-finite exactly when every exponent bit is set, so the
+    // test is a mask-and-compare with no branch. Branch-free is the point: a
+    // short-circuiting `iter().all(f32::is_finite)` cannot auto-vectorize, and
+    // over a 10000x1536 batch it cost ~4x the kernel it guards. Two other forms
+    // measured worse than this one and are recorded so they are not retried —
+    // a float `acc += v * 0.0` chain (~7x, serial FP dependency) and an 8-lane
+    // manual split (~2x, defeats the compiler's own reduction).
+    const EXPONENT_MASK: u32 = 0x7F80_0000;
+    let mut non_finite: u32 = 0;
+    for &v in values {
+        non_finite |= u32::from((v.to_bits() & EXPONENT_MASK) == EXPONENT_MASK);
+    }
+    non_finite == 0
+}
+
 fn flat_f32(fsl: &FixedSizeListArray) -> DataFusionResult<&[f32]> {
     let values = fsl.values();
     let f32 = values
@@ -207,6 +252,8 @@ where
     let b_inner = b.values().logical_nulls();
     let check_inner_nulls = a_inner.is_some() || b_inner.is_some();
 
+    let screen_input = kernel.hides_non_finite_input();
+
     let n = a.len();
     let mut builder = Float64Builder::with_capacity(n);
     let iter = flat_a.chunks_exact(dim).zip(flat_b.chunks_exact(dim));
@@ -229,12 +276,28 @@ where
                 continue;
             }
         }
+        // A non-finite element makes the whole row's score undefined, and the
+        // kernels do not report that themselves: `simsimd`'s `cos` answers 0 —
+        // distance 0, an exact match — for a row carrying NaN, which puts a
+        // failed embedding at the top of `ORDER BY _score DESC`. Screen the
+        // input rather than the output, because a fabricated score is finite.
+        if screen_input && (!all_finite(slice_a) || !all_finite(slice_b)) {
+            builder.append_null();
+            continue;
+        }
         let raw = kernel.apply(slice_a, slice_b).ok_or_else(|| {
             DataFusionError::Execution(
                 "vector_simd: simsimd returned None (length mismatch)".to_string(),
             )
         })?;
-        builder.append_value(post_process(raw));
+        // Finite inputs can still overflow to a non-finite result; NULL is the
+        // honest answer there too.
+        let value = post_process(raw);
+        if value.is_finite() {
+            builder.append_value(value);
+        } else {
+            builder.append_null();
+        }
     }
 
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -278,6 +341,9 @@ pub(crate) fn compute_fsl_f32_l2_norm(array: &ArrayRef) -> DataFusionResult<Arra
                 continue;
             }
         }
+        // No input screen here: a sum of squares has no cancelling terms, so a
+        // non-finite element always reaches `sq` as NaN or an infinity and the
+        // check below catches it. Same reasoning as `Kernel::hides_non_finite_input`.
         let sq = f32::dot(slice, slice).ok_or_else(|| {
             DataFusionError::Execution("vector_simd: simsimd dot returned None".to_string())
         })?;
@@ -285,7 +351,12 @@ pub(crate) fn compute_fsl_f32_l2_norm(array: &ArrayRef) -> DataFusionResult<Arra
             clippy::cast_possible_truncation,
             reason = "sq fits in f32 by construction (bounded by input f32 magnitudes)"
         )]
-        builder.append_value((sq as f32).sqrt());
+        let norm = (sq as f32).sqrt();
+        if norm.is_finite() {
+            builder.append_value(norm);
+        } else {
+            builder.append_null();
+        }
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -294,6 +365,19 @@ pub(crate) fn compute_fsl_f32_l2_norm(array: &ArrayRef) -> DataFusionResult<Arra
 pub(crate) mod testing {
     use super::*;
     use arrow_schema::Field;
+
+    /// Builds a `List<Float32>` (`O = i32`) or `LargeList<Float32>` (`O = i64`)
+    /// with one row per slice. Sibling of [`fsl_f32`] for the non-SIMD dispatch
+    /// paths.
+    pub(crate) fn list_f32<O: arrow::array::OffsetSizeTrait>(rows: &[&[f32]]) -> ArrayRef {
+        Arc::new(arrow::array::GenericListArray::<O>::from_iter_primitive::<
+            arrow::datatypes::Float32Type,
+            _,
+            _,
+        >(
+            rows.iter().map(|r| Some(r.iter().copied().map(Some)))
+        )) as ArrayRef
+    }
 
     pub(crate) fn fsl_f32(rows: &[&[f32]]) -> Arc<FixedSizeListArray> {
         let dim = i32::try_from(rows[0].len()).expect("dim fits in i32");
@@ -338,6 +422,69 @@ mod tests {
         assert!((out.value(0) - 9.0).abs() < 1e-5);
     }
 
+    /// Regression test for #11263.
+    ///
+    /// Every kernel behind `compute_fsl_f32` must refuse a row carrying a
+    /// non-finite element. `Kernel::Cosine` is the one that made this visible:
+    /// `simsimd` answers 0 — distance 0, an exact match — rather than NaN, so a
+    /// guard on the *output* passes it through and a failed embedding ranks
+    /// first. Asserting on the raw kernel output is what keeps this honest: an
+    /// output-only guard makes the cosine case pass and this one fail.
+    #[test]
+    fn non_finite_input_row_is_null_for_every_kernel() {
+        for probe in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for (label, kernel) in [
+                ("dot", Kernel::Dot),
+                ("l2sq", Kernel::L2Squared),
+                ("cosine", Kernel::Cosine),
+            ] {
+                // Row 0 is poisoned; row 1 is clean and must still be scored,
+                // so one bad vector cannot void the rest of the batch.
+                let a = testing::fsl_f32(&[&[probe, 2.0, 3.0], &[1.0, 2.0, 3.0]]);
+                let b = testing::fsl_f32(&[&[1.0_f32, 2.0, 3.0], &[1.0, 2.0, 3.0]]);
+                let out = compute_fsl_f32(&[a as ArrayRef, b as ArrayRef], kernel, |v| v)
+                    .expect("kernel evaluates");
+                let out = out.as_primitive::<Float64Type>();
+                assert!(
+                    out.is_null(0),
+                    "{label} kernel must return NULL for a {probe} element, got {}",
+                    out.value(0)
+                );
+                assert!(
+                    !out.is_null(1),
+                    "{label} kernel must still score the clean row in the same batch"
+                );
+            }
+        }
+    }
+
+    /// A zero vector is finite, defined input — it stays scored, which is what
+    /// separates it from the non-finite rows above.
+    #[test]
+    fn zero_magnitude_row_is_still_scored() {
+        let a = testing::fsl_f32(&[&[0.0_f32, 0.0, 0.0]]);
+        let b = testing::fsl_f32(&[&[1.0_f32, 2.0, 3.0]]);
+        let out = compute_fsl_f32(&[a as ArrayRef, b as ArrayRef], Kernel::Cosine, |v| v / 2.0)
+            .expect("kernel evaluates");
+        let out = out.as_primitive::<Float64Type>();
+        assert!(
+            !out.is_null(0) && (out.value(0) - 0.5).abs() < 1e-5,
+            "a zero vector is orthogonal, not undefined"
+        );
+    }
+
+    #[test]
+    fn l2_norm_non_finite_row_is_null() {
+        let a = testing::fsl_f32(&[&[f32::NAN, 2.0, 3.0], &[3.0, 4.0, 0.0]]) as ArrayRef;
+        let out = compute_fsl_f32_l2_norm(&a).expect("kernel evaluates");
+        let out = out.as_primitive::<arrow::datatypes::Float32Type>();
+        assert!(out.is_null(0), "NaN element must yield a NULL norm");
+        assert!(
+            !out.is_null(1) && (out.value(1) - 5.0).abs() < 1e-5,
+            "the clean row must still report its norm"
+        );
+    }
+
     #[test]
     fn null_outer_row_propagates() {
         let a = testing::fsl_f32(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
@@ -370,5 +517,50 @@ mod tests {
             .expect_err("should error");
         let msg = err.to_string();
         assert!(msg.contains("dimensions differ"), "got: {msg}");
+    }
+
+    fn cosine_distance_via_simd(a_row: &[f32], b_row: &[f32]) -> Option<f64> {
+        let a = testing::fsl_f32(&[a_row]) as ArrayRef;
+        let b = testing::fsl_f32(&[b_row]) as ArrayRef;
+        // simsimd `cos` returns `1 - cosine_similarity`; divide by 2 to get [0, 1].
+        let out = compute_fsl_f32(&[a, b], Kernel::Cosine, |v| v / 2.0).expect("ok");
+        let out = out.as_primitive::<arrow::datatypes::Float64Type>();
+        if out.is_null(0) {
+            None
+        } else {
+            let v = out.value(0);
+            v.is_finite().then_some(v)
+        }
+    }
+
+    #[test]
+    fn cosine_identical_vectors() {
+        // identical vectors → similarity 1 → distance 0
+        let d = cosine_distance_via_simd(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
+        assert!(matches!(d, Some(v) if v.abs() < 1e-5), "got: {d:?}");
+    }
+
+    #[test]
+    fn cosine_orthogonal_vectors() {
+        // orthogonal vectors → similarity 0 → distance 0.5
+        let d = cosine_distance_via_simd(&[1.0, 0.0], &[0.0, 1.0]);
+        assert!(matches!(d, Some(v) if (v - 0.5).abs() < 1e-5), "got: {d:?}");
+    }
+
+    #[test]
+    fn cosine_opposite_vectors() {
+        // opposite vectors → similarity -1 → distance 1.0
+        let d = cosine_distance_via_simd(&[1.0, 2.0, 3.0], &[-1.0, -2.0, -3.0]);
+        assert!(matches!(d, Some(v) if (v - 1.0).abs() < 1e-5), "got: {d:?}");
+    }
+
+    #[test]
+    fn cosine_zero_magnitude_vector_yields_orthogonal_distance() {
+        // zero-magnitude vector → simsimd treats dot product as 0 (orthogonal) → distance 0.5
+        let d = cosine_distance_via_simd(&[0.0, 0.0, 0.0], &[1.0, 2.0, 3.0]);
+        assert!(
+            matches!(d, Some(v) if (v - 0.5).abs() < 1e-5),
+            "expected 0.5 for zero-magnitude input, got: {d:?}"
+        );
     }
 }

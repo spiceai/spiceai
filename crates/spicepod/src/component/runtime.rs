@@ -25,7 +25,7 @@ use super::{
 use crate::metric::Metrics;
 use crate::param::Params;
 #[cfg(feature = "schemars")]
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
@@ -59,6 +59,12 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
 
+    /// Forwards writes to the runtime's own tables (`task_history`, `metrics`)
+    /// to a Drasi source, so continuous queries can react to Spice's own
+    /// operational events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drasi: Option<crate::drasi::RuntimeDrasi>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
 
@@ -80,7 +86,7 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: RuntimeReadyState,
 
-    /// Configures log level for the runtime. Can be overriden if flags or environment variables
+    /// Configures log level for the runtime. Can be overridden if flags or environment variables
     /// are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_level: Option<OutputLevel>,
@@ -89,7 +95,17 @@ pub struct Runtime {
     pub query: Option<Query>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<Cpu>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+
+    /// Shared object-store location for runtime state (`file://`, `s3://`,
+    /// `abfs://`, `abfss://`). Used for SQL results-cache warmup, source
+    /// rate-control, and distributed query state when those sections do not
+    /// set their own `state_location`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RuntimeState>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
@@ -102,6 +118,30 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Scheduler config with field-level fallback onto [`Self::state`].
+    ///
+    /// `runtime.scheduler.state_location` (and params) may be omitted when
+    /// `runtime.state` is set; other scheduler tuning fields are preserved.
+    #[must_use]
+    pub fn resolved_scheduler(&self) -> Option<Scheduler> {
+        match (&self.scheduler, &self.state) {
+            (Some(scheduler), state) => {
+                let mut resolved = scheduler.clone();
+                if resolved.state_location.is_none()
+                    && let Some(state) = state
+                {
+                    resolved.state_location = Some(state.location.clone());
+                    if resolved.params.is_none() {
+                        resolved.params.clone_from(&state.params);
+                    }
+                }
+                Some(resolved)
+            }
+            (None, Some(state)) => Some(Scheduler::from_shared_state(state)),
+            (None, None) => None,
+        }
+    }
+
     pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
         if let Some(timeout_str) = &self.shutdown_timeout {
             let duration = duration_parse::parse_duration(timeout_str)
@@ -448,12 +488,35 @@ pub struct TelemetryConfig {
     /// `OpenTelemetry` 0.31's SDK does not support per-reader name transforms,
     /// so this knob is intentionally placed at the telemetry level rather
     /// than under any single exporter.
+    ///
+    /// Validated against the `OpenTelemetry` instrument name syntax so prefixed
+    /// names stay valid for OTLP backends and remain sanitizable to Prometheus
+    /// legacy names (`[a-zA-Z_:][a-zA-Z0-9_:]*`). Must start with an ASCII
+    /// letter, contain only ASCII letters, digits, `_`, `.`, `-`, or `/`, and
+    /// be at most [`METRIC_PREFIX_MAX_LEN`] characters (128; ≥127 characters of
+    /// headroom remain under the 255-char `OpenTelemetry` instrument name
+    /// limit for the base metric name). A trailing `.` or `_` is recommended
+    /// (e.g. `spiceai.`).
+    /// See: <https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix>
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metric_prefix: Option<String>,
     /// Optional configuration for pushing metrics to an OpenTelemetry collector
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otel_exporter: Option<OtelExporterConfig>,
 }
+
+/// Maximum length for `runtime.telemetry.metric_prefix`.
+///
+/// Cap at a round power of two so namespaces stay short. Prefixed names must
+/// still fit the `OpenTelemetry` 255-character instrument name limit
+/// (`prefix` + base metric name ≤ 255), so 128 leaves ≥127 characters of
+/// headroom for the base name.
+pub const METRIC_PREFIX_MAX_LEN: usize = 128;
+
+/// Non-alphanumeric characters allowed in `OpenTelemetry` instrument names
+/// (and therefore in `metric_prefix`). Matches the `OTel` Metrics API ABNF and
+/// the Rust SDK's `INSTRUMENT_NAME_ALLOWED_NON_ALPHANUMERIC_CHARS`.
+const METRIC_PREFIX_ALLOWED_NON_ALPHANUMERIC: [char; 4] = ['_', '.', '-', '/'];
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
@@ -467,7 +530,72 @@ impl Default for TelemetryConfig {
     }
 }
 
-/// Configuration for the MCP (Model Context Protocol) HTTP endpoint.
+/// Validate `runtime.telemetry.metric_prefix` against OpenTelemetry instrument
+/// name syntax so `{prefix}{instrument}` stays a valid metric name for OTLP
+/// and maps cleanly through Prometheus name sanitization.
+///
+/// Non-empty prefixes must (mirroring the `OTel` Metrics API / SDK):
+/// - start with an ASCII alphabetic character
+/// - contain only ASCII alphanumeric characters, `_`, `.`, `-`, or `/`
+/// - have length ≤ [`METRIC_PREFIX_MAX_LEN`] (128; leaves ≥127 characters of
+///   headroom under the 255-char `OTel` instrument name limit for the base
+///   metric name)
+///
+/// # Errors
+///
+/// Returns a user-facing error describing the violation and how to fix it.
+pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+
+    // Check character validity before length so non-ASCII input reports the
+    // actionable "invalid character" error instead of a misleading length error
+    // (UTF-8 byte length can exceed the limit even when char count does not).
+    if !prefix
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return Err(format!(
+            "Invalid 'runtime.telemetry.metric_prefix' value {prefix:?}: must start with an ASCII letter (A-Z or a-z). Example: 'spiceai.'. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
+        ));
+    }
+
+    if let Some(invalid) = prefix
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && !METRIC_PREFIX_ALLOWED_NON_ALPHANUMERIC.contains(c))
+    {
+        return Err(format!(
+            "Invalid 'runtime.telemetry.metric_prefix' value {prefix:?}: contains invalid character {invalid:?}. Allowed characters are ASCII letters, digits, '_', '.', '-', and '/'. Example: 'spiceai.'. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
+        ));
+    }
+
+    // Character count (not UTF-8 bytes) matches the OpenTelemetry ABNF limit.
+    let char_len = prefix.chars().count();
+    if char_len > METRIC_PREFIX_MAX_LEN {
+        return Err(format!(
+            "Invalid 'runtime.telemetry.metric_prefix' value {prefix:?}: length {char_len} exceeds the maximum of {METRIC_PREFIX_MAX_LEN} characters. Shorten the prefix so prefixed metric names stay within the OpenTelemetry 255-character instrument name limit. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Configuration for the MCP (Model Context Protocol) HTTP endpoint (`POST /v1/mcp`).
+///
+/// Spice is dual-era: it serves the [`2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28/)
+/// revision (stateless `server/discover`, per-request `_meta`, Streamable HTTP
+/// `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers) and still
+/// answers legacy `initialize` so existing Cursor/Claude clients keep working.
+/// Unsupported versions return JSON-RPC `-32022` listing the versions this
+/// runtime supports.
+///
+/// Browser `Origin` validation is not a field here: it uses
+/// [`CorsConfig::mcp_allowed_origins`]. `"*"` (the CORS default) and an
+/// empty list expand to localhost defaults so the rmcp list is never empty
+/// (empty accepts every `Origin`). A concrete list rejects a mismatched
+/// `Origin` with `HTTP` 403. Requests with no `Origin` still pass.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -773,11 +901,39 @@ pub struct ApiKeyAuth {
 ///
 /// All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
 /// constant-time comparison via the `subtle` crate to prevent timing attacks.
+///
+/// YAML/JSON configuration accepts a string. Optional `:ro` (default) or `:rw`
+/// suffix selects capability (for example `sk_live:rw`).
 #[derive(Clone)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ApiKey {
     ReadOnly { key: String },
     ReadWrite { key: String },
+}
+
+/// Aligns the generated Spicepod JSON Schema with [`Deserialize`] / [`Serialize`],
+/// which accept and emit API keys as strings (not externally-tagged enum objects).
+#[cfg(feature = "schemars")]
+impl JsonSchema for ApiKey {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ApiKey".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::ApiKey").into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "description": "API key for authentication. Keys can be read-only or read-write.
+The key value is redacted in Debug output to prevent credential leakage.
+
+Pass the key as a string. Optional `:ro` (default) or `:rw` suffix selects capability.
+
+All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
+constant-time comparison via the `subtle` crate to prevent timing attacks.",
+        })
+    }
 }
 
 /// Constant-time comparison for `ApiKey` to `ApiKey`.
@@ -820,6 +976,9 @@ impl std::fmt::Debug for ApiKey {
 pub struct CorsConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Browser origins allowed when [`Self::enabled`] is true. Also the source
+    /// for MCP Streamable HTTP `Origin` checks on `/v1/mcp` — see
+    /// [`Self::mcp_allowed_origins`].
     #[serde(default = "default_allowed_origins")]
     pub allowed_origins: Vec<String>,
 }
@@ -828,11 +987,50 @@ fn default_allowed_origins() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+/// Localhost origins used when `runtime.cors.allowed_origins` is `"*"` or
+/// empty. `"*"` is not a valid RFC 6454 origin; expanding it here keeps the
+/// rmcp allow-list non-empty so default spicepods enforce the 2026-07-28
+/// Origin check. Entries omit a port so rmcp matches any port on that host.
+const DEFAULT_MCP_ALLOWED_ORIGINS: &[&str] = &[
+    "http://localhost",
+    "http://127.0.0.1",
+    "http://[::1]",
+    "https://localhost",
+    "https://127.0.0.1",
+    "https://[::1]",
+];
+
 impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             allowed_origins: default_allowed_origins(),
+        }
+    }
+}
+
+impl CorsConfig {
+    /// Origins to install on rmcp Streamable HTTP.
+    ///
+    /// `"*"` is not a valid RFC 6454 origin. CORS treats it as allow-all for
+    /// browser HTTP, but MCP Streamable HTTP must validate `Origin` (DNS
+    /// rebinding). Both `"*"` (the CORS default) and an empty list expand to
+    /// localhost defaults so the rmcp list is never empty — empty accepts
+    /// every `Origin`.
+    ///
+    /// A concrete list is the 2026-07-28 Streamable HTTP origin policy:
+    /// a mismatched `Origin` is 403. Requests with no `Origin` still pass.
+    #[must_use]
+    pub fn mcp_allowed_origins(&self) -> Vec<String> {
+        if self.allowed_origins.iter().any(|origin| origin == "*")
+            || self.allowed_origins.is_empty()
+        {
+            DEFAULT_MCP_ALLOWED_ORIGINS
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        } else {
+            self.allowed_origins.clone()
         }
     }
 }
@@ -923,6 +1121,87 @@ pub enum OutputLevel {
     VeryVerbose,
 }
 
+/// How many CPUs the runtime should behave as though it has.
+///
+/// Detection reads a cgroup CPU *quota* and otherwise falls back to the node's
+/// core count, so a Kubernetes pod that sets `resources.requests.cpu` without a
+/// matching `resources.limits.cpu` is sized for the whole node. This section is
+/// the explicit override, in the `GOMAXPROCS` / `-XX:ActiveProcessorCount`
+/// idiom: one entitlement that feeds every thread pool, the query fan-out, and
+/// accelerator concurrency coherently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct Cpu {
+    /// The CPU entitlement, as a Kubernetes CPU quantity: `4`, `3.5`, `3500m`.
+    /// `auto` (the default) detects it, which on a pod that declares a CPU
+    /// request means a bounded multiple of that request. `all` means every
+    /// available core regardless of the request — a CPU limit, if one is set, is
+    /// still respected, and a value set here still narrows an `all` coming from
+    /// `SPICE_CPU_CORES` or `--cpu-cores`. Applied at startup only — the thread pools it sizes
+    /// cannot be resized on a spicepod reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<CpuQuantity>,
+}
+
+/// A CPU quantity, held verbatim so it can be echoed back in an error message.
+///
+/// Accepts a YAML number (`cores: 4`, `cores: 3.5`) or a string
+/// (`cores: 3500m`, `cores: auto`, `cores: all`); it always serializes as a
+/// string, so
+/// `--set-runtime cpu.cores=…` round-trips through YAML unchanged. Validation
+/// lives in `cpu_budget`, which is where the value is used.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(transparent)]
+pub struct CpuQuantity(String);
+
+impl CpuQuantity {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CpuQuantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for CpuQuantity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ScalarVisitor;
+
+        impl serde::de::Visitor<'_> for ScalarVisitor {
+            type Value = CpuQuantity;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a CPU quantity such as 4, 3.5, 3500m, or auto")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(CpuQuantity(v.to_string()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(CpuQuantity(v.to_string()))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(CpuQuantity(v.to_string()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(CpuQuantity(v.to_string()))
+            }
+        }
+
+        deserializer.deserialize_any(ScalarVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -952,9 +1231,10 @@ pub struct Query {
     /// and memory pool and starving each other under load (e.g. analytical
     /// queries alongside CDC ingestion and compaction). The permit is held for
     /// the plan's full execution and result-streaming lifetime; a results-cache
-    /// hit is never gated. Unset = unbounded (the prior behavior). A configured
-    /// value is clamped to a minimum of `1` in the runtime builder, so `0` means
-    /// one concurrent query (not unbounded).
+    /// hit is never gated.
+    ///
+    /// Unset sizes the bound from the CPU budget (four plans per core). `0` opts
+    /// out and leaves admission unbounded. Any other value is that limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_queries: Option<usize>,
 
@@ -987,6 +1267,86 @@ pub struct Query {
     /// `DataFusion` default (`0`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eager_aggregation_max_pushed_groups: Option<usize>,
+
+    /// Maximum wall-clock duration a query may run before it is automatically
+    /// cancelled, as a human-readable duration (e.g. `30s`, `5m`). The clock
+    /// covers the query's full lifetime: planning, admission-control waits
+    /// (`max_concurrent_queries`), execution, and streaming results to the
+    /// client. Applies to queries issued through the runtime's query APIs
+    /// (HTTP, Flight, Flight SQL); internal runtime queries (acceleration
+    /// refreshes, health checks) are exempt. Enforcement is cooperative
+    /// (best-effort): the query is cancelled at its next cancellation
+    /// checkpoint, so actual runtime can slightly exceed the configured
+    /// value. On expiry the query fails with a timeout error: HTTP 504 /
+    /// gRPC `DEADLINE_EXCEEDED` when the timeout is observed before the
+    /// response starts; once results are already streaming the status can
+    /// no longer change, so the in-progress stream is terminated with the
+    /// error instead — data streamed before expiry will have been
+    /// delivered, but the stream never ends silently as if complete.
+    /// Unset = no timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+
+    /// Whether the Cayenne query path should materialize a non-recursive CTE
+    /// once and reuse the result at every reference.
+    ///
+    /// `DataFusion` inlines `WITH` bodies, so a CTE used twice is planned and
+    /// executed twice. `auto` finds those multi-reference CTEs whose body is
+    /// expensive (aggregation, join, window, distinct, sort, unnest, or union)
+    /// and that scan a Cayenne-accelerated table, computes the body once into
+    /// a memory-accounted buffer, and shares it. Simple pass-through CTEs are
+    /// left inlined so projection pushdown can still prune columns.
+    ///
+    /// Default `disabled` preserves the inlining behavior. No-op on queries
+    /// that do not scan Cayenne.
+    ///
+    /// ```yaml
+    /// runtime:
+    ///   query:
+    ///     cte_materialization: auto   # disabled (default) | auto
+    /// ```
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub cte_materialization: CteMaterialization,
+}
+
+/// How the Cayenne query path treats multi-reference `WITH` clauses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CteMaterialization {
+    /// Inline every CTE at each reference (`DataFusion`'s default).
+    #[default]
+    Disabled,
+    /// Materialize a CTE once when it is referenced more than once, its body is
+    /// expensive, and it scans a Cayenne-accelerated table.
+    Auto,
+}
+
+impl CteMaterialization {
+    /// Returns `true` when CTE materialization should run on the Cayenne path.
+    #[must_use]
+    pub const fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+impl Query {
+    pub fn timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
+        if let Some(timeout_str) = &self.timeout {
+            let duration = duration_parse::parse_duration(timeout_str)
+                .map_err(|e| format!("Failed to parse 'runtime.query.timeout': {e}"))?;
+
+            if duration.is_zero() {
+                return Err(
+                    "'runtime.query.timeout' must be a positive duration greater than 0".into(),
+                );
+            }
+
+            Ok(Some(duration))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -999,12 +1359,27 @@ pub enum SpillCompression {
     Uncompressed,
 }
 
+/// Shared object-store location for runtime state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct RuntimeState {
+    /// Root URI (`file://`, `s3://`, `abfs://`, `abfss://`).
+    pub location: String,
+
+    /// Optional object store params (for example S3 `s3_region` / `s3_auth`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Scheduler {
-    /// Root URI for shared cluster state.
-    pub state_location: String,
+    /// Root URI for shared cluster state. Optional when [`Runtime::state`]
+    /// provides the location via [`Runtime::resolved_scheduler`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_location: Option<String>,
 
     /// Optional object store params for the shared cluster state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1025,6 +1400,22 @@ pub struct Scheduler {
     /// How long to wait for partition discovery before timing out.
     #[serde(default = "default_partition_discovery_timeout")]
     pub partition_discovery_timeout: String,
+}
+
+impl Scheduler {
+    /// Build scheduler config that stores cluster state at the shared runtime location.
+    #[must_use]
+    pub fn from_shared_state(state: &RuntimeState) -> Self {
+        Self {
+            state_location: Some(state.location.clone()),
+            params: state.params.clone(),
+            partition_assignment_interval: default_partition_assignment_interval(),
+            max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(
+            ),
+            max_partitions_per_executor: default_max_partitions_per_executor(),
+            partition_discovery_timeout: default_partition_discovery_timeout(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1109,6 +1500,8 @@ pub struct RuntimeDeserializer {
     #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drasi: Option<crate::drasi::RuntimeDrasi>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub cors: CorsConfig,
@@ -1140,7 +1533,11 @@ pub struct RuntimeDeserializer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<Query>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<Cpu>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RuntimeState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1203,6 +1600,14 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             }
         }
 
+        if let Some(prefix) = &deserializer.telemetry.metric_prefix {
+            validate_metric_prefix(prefix)?;
+        }
+
+        if let Some(sql_results) = &caching.sql_results {
+            crate::component::caching::validate_sql_results_warmup_config(sql_results)?;
+        }
+
         Ok(Runtime {
             caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
@@ -1211,6 +1616,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             telemetry: deserializer.telemetry,
             params: deserializer.params,
             task_history: deserializer.task_history,
+            drasi: deserializer.drasi,
             auth: deserializer.auth,
             cors: deserializer.cors,
             flight: deserializer.flight,
@@ -1223,7 +1629,9 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             } else {
                 Some(query)
             },
+            cpu: deserializer.cpu,
             metrics: deserializer.metrics,
+            state: deserializer.state,
             scheduler: deserializer.scheduler,
             source_rate_control: deserializer.source_rate_control,
             functions: deserializer.functions,
@@ -1235,6 +1643,41 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 mod tests {
     use super::*;
     use yaml;
+
+    #[cfg(feature = "schemars")]
+    #[test]
+    fn test_api_key_json_schema_is_string() {
+        use schemars::schema_for;
+        let schema = schema_for!(ApiKey);
+        let value = serde_json::to_value(&schema).expect("schema serializes");
+        assert_eq!(
+            value.get("type").and_then(|v| v.as_str()),
+            Some("string"),
+            "ApiKey JSON Schema must match string Deserialize/Serialize: {value}"
+        );
+        assert!(
+            value.get("oneOf").is_none(),
+            "ApiKey must not use externally-tagged object oneOf: {value}"
+        );
+    }
+
+    #[test]
+    fn test_runtime_rejects_warmup_with_sql_cache_key_type() {
+        let yaml = r"
+            caching:
+              sql_results:
+                enabled: true
+                cache_key_type: sql
+                warmup: on_first_refresh
+        ";
+        let err = yaml::from_str::<Runtime>(yaml)
+            .expect_err("warmup + cache_key_type: sql must fail spicepod load");
+        let message = err.to_string();
+        assert!(
+            message.contains("cache_key_type: plan") || message.contains("warmup"),
+            "error must name the corrective action, got: {message}"
+        );
+    }
 
     #[test]
     fn test_deserialize_api_keys() {
@@ -1299,7 +1742,7 @@ mod tests {
         };
 
         // Test exact match
-        assert!(key == *"secret-api-key-12345");
+        assert_eq!(key, *"secret-api-key-12345");
 
         // Test mismatch at different positions
         assert!(key != *"xecret-api-key-12345"); // First char different
@@ -1315,7 +1758,7 @@ mod tests {
         let rw_key = ApiKey::ReadWrite {
             key: "rw-key".to_string(),
         };
-        assert!(rw_key == *"rw-key");
+        assert_eq!(rw_key, *"rw-key");
         assert!(rw_key != *"rw-key2");
     }
 
@@ -1397,6 +1840,50 @@ mod tests {
         );
     }
 
+    /// `cores` must accept every shape an operator (or the Helm downward API)
+    /// writes it in — a YAML integer, a YAML float, and a quoted millicore or
+    /// `auto` string — and must always serialize back as a string so
+    /// `--set-runtime cpu.cores=…` round-trips through YAML unchanged.
+    #[test]
+    fn test_cpu_cores_accepts_every_quantity_shape() {
+        for (input, expected) in [
+            ("cores: 4", "4"),
+            ("cores: 3.5", "3.5"),
+            ("cores: 3500m", "3500m"),
+            ("cores: auto", "auto"),
+            ("cores: \"2\"", "2"),
+        ] {
+            let parsed: Cpu = yaml::from_str(input).expect("parses");
+            assert_eq!(
+                parsed.cores.as_ref().map(CpuQuantity::as_str),
+                Some(expected),
+                "{input}"
+            );
+            let round_tripped: Cpu =
+                yaml::from_value(yaml::to_value(&parsed).expect("serializes")).expect("re-parses");
+            assert_eq!(round_tripped, parsed, "{input}");
+        }
+    }
+
+    #[test]
+    fn test_cpu_section_parses_from_runtime() {
+        let runtime: Runtime = yaml::from_str("cpu:\n  cores: 3500m\n").expect("parses");
+        assert_eq!(
+            runtime
+                .cpu
+                .as_ref()
+                .and_then(|cpu| cpu.cores.as_ref())
+                .map(CpuQuantity::as_str),
+            Some("3500m")
+        );
+
+        // Absent by default, and absent from the serialized form.
+        let empty: Runtime = yaml::from_str("{}").expect("parses");
+        assert_eq!(empty.cpu, None);
+        let serialized = yaml::to_string(&empty).expect("serializes");
+        assert!(!serialized.contains("cpu"), "{serialized}");
+    }
+
     #[test]
     fn test_memory_limit_migration() {
         // Test when only memory_limit is present
@@ -1407,15 +1894,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
-                temp_directory: None,
                 memory_limit: Some("100MiB".to_string()),
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
+                ..Query::default()
             })
         );
 
@@ -1428,15 +1908,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
-                temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
+                ..Query::default()
             })
         );
 
@@ -1450,15 +1923,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
-                temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
+                ..Query::default()
             })
         );
 
@@ -1479,15 +1945,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
                 temp_directory: Some("/foo".to_string()),
-                memory_limit: None,
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
+                ..Query::default()
             })
         );
 
@@ -1500,15 +1959,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None,
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
+                ..Query::default()
             })
         );
 
@@ -1522,15 +1974,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None,
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
+                ..Query::default()
             })
         );
 
@@ -1566,6 +2011,106 @@ mod tests {
                 .as_ref()
                 .and_then(|q| q.max_concurrent_queries),
             None
+        );
+    }
+
+    #[test]
+    fn test_query_timeout_parse() {
+        // Set: nested under runtime.query parses into the new field and the
+        // helper converts the human-readable duration.
+        let yaml = r"
+            query:
+                timeout: 30s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let query = runtime.query.expect("query section should be present");
+        assert_eq!(query.timeout, Some("30s".to_string()));
+        assert_eq!(
+            query.timeout().expect("30s should parse"),
+            Some(Duration::from_secs(30))
+        );
+
+        // Minute-granularity durations parse too.
+        let query = Query {
+            timeout: Some("5m".to_string()),
+            ..Query::default()
+        };
+        assert_eq!(
+            query.timeout().expect("5m should parse"),
+            Some(Duration::from_mins(5))
+        );
+
+        // Absent → None (no timeout), guarding against a serde rename/regression.
+        let yaml = r"
+            query:
+                target_partitions: 8
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let query = runtime.query.expect("query section should be present");
+        assert_eq!(query.timeout, None);
+        assert_eq!(query.timeout().expect("absent timeout is valid"), None);
+    }
+
+    #[test]
+    fn test_query_timeout_invalid_values() {
+        // Zero is rejected: it would mean "cancel every query immediately".
+        let query = Query {
+            timeout: Some("0s".to_string()),
+            ..Query::default()
+        };
+        let err = query
+            .timeout()
+            .expect_err("zero timeout should be an error");
+        assert!(
+            err.to_string().contains("positive duration"),
+            "unexpected error: {err}"
+        );
+
+        // Unparseable values are rejected with the field name in the message.
+        let query = Query {
+            timeout: Some("not-a-duration".to_string()),
+            ..Query::default()
+        };
+        let err = query
+            .timeout()
+            .expect_err("garbage timeout should be an error");
+        assert!(
+            err.to_string().contains("runtime.query.timeout"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_query_cte_materialization_parses() {
+        let empty: Runtime = yaml::from_str("{}").expect("parses");
+        assert_eq!(empty.query, None);
+
+        let yaml = r"
+            query:
+                cte_materialization: auto
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("parses");
+        let query = runtime.query.expect("query section should be present");
+        assert_eq!(query.cte_materialization, CteMaterialization::Auto);
+        assert!(query.cte_materialization.is_auto());
+
+        let yaml = r"
+            query:
+                cte_materialization: disabled
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("parses");
+        // `disabled` is the default, so a query section that only sets it is
+        // dropped on deserialize (same as an omitted `query:`).
+        assert_eq!(runtime.query, None);
+
+        let yaml = r"
+            query:
+                cte_materialization: always
+        ";
+        let err = yaml::from_str::<Runtime>(yaml).expect_err("unknown variant");
+        assert!(
+            err.to_string().contains("cte_materialization") || err.to_string().contains("always"),
+            "unexpected error: {err}"
         );
     }
 
@@ -2054,6 +2599,125 @@ datasets:
         "#;
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.telemetry.metric_prefix.as_deref(), Some("spiceai."));
+    }
+
+    #[test]
+    fn test_metric_prefix_underscore_separator_accepted() {
+        let yaml = r#"
+            telemetry:
+                metric_prefix: "spiceai_"
+        "#;
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.telemetry.metric_prefix.as_deref(), Some("spiceai_"));
+    }
+
+    #[test]
+    fn test_metric_prefix_empty_accepted() {
+        let yaml = r#"
+            telemetry:
+                metric_prefix: ""
+        "#;
+        let runtime: Runtime = yaml::from_str(yaml).expect("empty metric_prefix must parse");
+        assert_eq!(runtime.telemetry.metric_prefix.as_deref(), Some(""));
+        validate_metric_prefix("").expect("empty metric_prefix must be valid");
+    }
+
+    #[test]
+    fn test_metric_prefix_leading_digit_rejected() {
+        let yaml = r#"
+            telemetry:
+                metric_prefix: "1spice."
+        "#;
+        let result: Result<Runtime, _> = yaml::from_str(yaml);
+        let err = result.expect_err("leading digit metric_prefix must fail to parse");
+        assert!(
+            err.to_string().contains("must start with an ASCII letter"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_metric_prefix_invalid_characters_rejected() {
+        for invalid in ["spice ai.", "spiceai:", "spiceai@", "spiceai🚀."] {
+            let yaml = format!(
+                r#"
+            telemetry:
+                metric_prefix: "{invalid}"
+        "#
+            );
+            let result: Result<Runtime, _> = yaml::from_str(&yaml);
+            let err = result.expect_err("metric_prefix with invalid characters must fail to parse");
+            assert!(
+                err.to_string().contains("invalid character"),
+                "unexpected error for '{invalid}': {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_metric_prefix_too_long_rejected() {
+        let too_long = format!("{}{}", "a", "x".repeat(METRIC_PREFIX_MAX_LEN));
+        assert_eq!(too_long.chars().count(), METRIC_PREFIX_MAX_LEN + 1);
+        let yaml = format!(
+            r#"
+            telemetry:
+                metric_prefix: "{too_long}"
+        "#
+        );
+        let result: Result<Runtime, _> = yaml::from_str(&yaml);
+        let err = result.expect_err("overlong metric_prefix must fail to parse");
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_metric_prefix_non_ascii_reports_invalid_character_not_length() {
+        // Multi-byte UTF-8 must fail on character validity, not a misleading
+        // byte-length overflow (🚀 is 4 UTF-8 bytes).
+        let err = validate_metric_prefix("spiceai🚀.")
+            .expect_err("non-ASCII metric_prefix must be rejected");
+        assert!(
+            err.contains("invalid character"),
+            "expected invalid-character error, got: {err}"
+        );
+        assert!(
+            !err.contains("exceeds the maximum"),
+            "non-ASCII must not be reported as a length error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_metric_prefix_error_keeps_control_chars_on_one_line() {
+        let err = validate_metric_prefix("spice\nai.")
+            .expect_err("control characters in metric_prefix must be rejected");
+        assert!(
+            !err.contains('\n'),
+            "error must stay on one line when prefix contains newlines: {err:?}"
+        );
+        assert!(
+            err.contains("spice\\nai."),
+            "prefix must be debug-escaped in the error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_metric_prefix_accepts_otel_charset() {
+        let max_len = "a".repeat(METRIC_PREFIX_MAX_LEN);
+        for valid in ["spiceai.", "spiceai_", "a", "A-B/c_d.e", max_len.as_str()] {
+            validate_metric_prefix(valid)
+                .unwrap_or_else(|e| panic!("expected '{valid}' to be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_validate_metric_prefix_rejects_prometheus_colon() {
+        // Prometheus reserves ':' for recording rules; OTel instrument syntax
+        // also disallows it. Keep both backends happy by rejecting colons.
+        let err = validate_metric_prefix("spice:ai.")
+            .expect_err("colon in metric_prefix must be rejected");
+        assert!(err.contains("invalid character"));
     }
 
     #[test]
@@ -2661,6 +3325,69 @@ datasets:
         assert!(
             result.is_err(),
             "expected unknown client_auth_mode value to be rejected"
+        );
+    }
+
+    #[test]
+    fn mcp_allowed_origins_default_wildcard_expands_to_localhost() {
+        let origins = CorsConfig::default().mcp_allowed_origins();
+        assert!(
+            origins.iter().any(|origin| origin == "http://localhost"),
+            "default CORS * must expand to localhost defaults, got {origins:?}"
+        );
+        assert!(
+            !origins.is_empty(),
+            "default CORS * must not leave the rmcp Origin list empty"
+        );
+        assert!(
+            !origins.iter().any(|origin| origin == "*"),
+            "rmcp does not treat * as a wildcard Origin, got {origins:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_allowed_origins_wildcard_expands_to_localhost() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+        };
+        let origins = cors.mcp_allowed_origins();
+        assert!(
+            origins.iter().any(|origin| origin == "http://localhost"),
+            "CORS * must expand to localhost defaults, got {origins:?}"
+        );
+        assert!(
+            !origins.is_empty(),
+            "CORS * must not leave the rmcp Origin list empty"
+        );
+    }
+
+    #[test]
+    fn mcp_allowed_origins_empty_list_expands_to_localhost() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec![],
+        };
+        let origins = cors.mcp_allowed_origins();
+        assert!(
+            origins.iter().any(|origin| origin == "http://localhost"),
+            "empty CORS list (no *) must expand to localhost defaults, got {origins:?}"
+        );
+        assert!(
+            !origins.iter().any(|origin| origin == "*"),
+            "rmcp does not treat * as a wildcard Origin, got {origins:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_allowed_origins_concrete_list_is_used_as_is() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["https://app.example.com".to_string()],
+        };
+        assert_eq!(
+            cors.mcp_allowed_origins(),
+            vec!["https://app.example.com".to_string()]
         );
     }
 }

@@ -21,6 +21,7 @@ use std::time::Duration;
 use cayenne::{CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider};
 use clap::Parser;
 use data_components::RefreshableCatalogProvider as _;
+use data_components::catalog_filter::TableSelector;
 use datafusion::{
     catalog::{CatalogProvider as _, SchemaProvider},
     execution::{SessionStateBuilder, runtime_env::RuntimeEnvBuilder},
@@ -169,6 +170,7 @@ async fn main() -> Result<()> {
                 data_dir: args.cayenne_data_dir.clone(),
                 metadata_dir: args.cayenne_metadata_dir.clone(),
                 spice_data_base_path: args.spice_data_base_path.clone(),
+                catalog_name: None,
                 footer_cache_mb: args.cayenne_footer_cache_mb,
                 segment_cache_mb: args.cayenne_segment_cache_mb,
                 target_file_size_mb: args.cayenne_target_file_size_mb,
@@ -188,6 +190,9 @@ async fn main() -> Result<()> {
                 bake_deletion_index_trigger: None,
             },
             ctx.runtime_env(),
+            // This tool serves one Cayenne directory directly and takes no include/exclude
+            // arguments, so every table it finds is one the operator asked for.
+            TableSelector::select_all(),
         )
         .await
         .context(CayenneCatalogInitSnafu)?,
@@ -308,6 +313,9 @@ fn ensure_default_schema_exists(
                 Arc::clone(provider.metadata_catalog()),
                 default_schema.to_string(),
                 Arc::clone(provider.runtime_env()),
+                // A schema created here is part of the catalog above, so it filters by the same
+                // selector — a table admitted into one must not be hidden by the other.
+                provider.table_selector().clone(),
             )) as Arc<dyn SchemaProvider>,
         )
         .map_err(|source| Error::CreateDefaultSchema {
@@ -381,6 +389,7 @@ mod tests {
                     data_dir: None,
                     metadata_dir: None,
                     spice_data_base_path: base_path.to_string_lossy().to_string(),
+                    catalog_name: None,
                     footer_cache_mb: None,
                     segment_cache_mb: None,
                     target_file_size_mb: None,
@@ -400,6 +409,7 @@ mod tests {
                     bake_deletion_index_trigger: None,
                 },
                 ctx.runtime_env(),
+                TableSelector::select_all(),
             )
             .await
             .expect("catalog provider should initialize"),

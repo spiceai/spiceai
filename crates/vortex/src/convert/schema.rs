@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::HashMap;
+
 use arrow_schema::DataType;
 use arrow_schema::Field;
 use arrow_schema::Schema;
 use datafusion_common::Result as DFResult;
 use datafusion_common::exec_datafusion_err;
-use vortex::array::arrow::ArrowSession;
+use vortex::arrow::ArrowSession;
 use vortex::dtype::DType;
+use vortex::dtype::Nullability;
 
 /// Calculate the physical Arrow schema for a Vortex file given its `DType` and the expected logical schema.
 ///
@@ -16,6 +19,9 @@ use vortex::dtype::DType;
 /// - Utf8/LargeUtf8 become `Utf8View`
 /// - Binary/LargeBinary become `BinaryView`
 /// - `RunEndEncoded` loses its encoding
+/// - `Map` keeps its key and value dtypes but not Arrow's names for the entries field and its
+///   two children (a file written before Vortex had a map dtype stores it as
+///   `List<Struct<keys, values>>`)
 /// - Lists are even more complex, with various sizes and physical layouts that are lost
 ///
 /// For these types, we use the logical schema's type instead of the `DType`'s natural Arrow
@@ -31,12 +37,29 @@ pub fn calculate_physical_schema(
         ));
     };
 
+    // `Schema::field_with_name` is a linear scan (Arrow keeps no name index), so
+    // resolving each of the file's fields against the reference schema that way is
+    // O(fields^2) per file — and this runs on every file open, with the same
+    // reference schema, so the cost repeats per file across a scan. Index the
+    // reference schema once (first match wins, matching `field_with_name`) and the
+    // per-field lookup becomes O(1).
+    let logical_by_name: HashMap<&str, &Field> = {
+        let logical_fields = reference_logical_schema.fields();
+        let mut by_name = HashMap::with_capacity(logical_fields.len());
+        for field in logical_fields {
+            by_name
+                .entry(field.name().as_str())
+                .or_insert(field.as_ref());
+        }
+        by_name
+    };
+
     let fields: Vec<Field> = struct_dtype
         .names()
         .iter()
         .zip(struct_dtype.fields())
         .map(|(name, field_dtype)| {
-            let logical_field = reference_logical_schema.field_with_name(name.as_ref()).ok();
+            let logical_field = logical_by_name.get(name.as_ref()).copied();
             let arrow_type = match &logical_field {
                 Some(lf) => {
                     calculate_physical_field_type(&field_dtype, lf.data_type(), arrow_session)?
@@ -53,7 +76,10 @@ pub fn calculate_physical_schema(
                     .clone()
                     .with_data_type(arrow_type)
                     .with_nullable(field_dtype.is_nullable()),
-                None => Field::new(name.to_string(), arrow_type, field_dtype.is_nullable()),
+                // FieldName's Display escapes control bytes (`\x08` → `\u{8}`),
+                // so `to_string` would rename the column. `as_ref` keeps the
+                // raw name. See spiraldb/vortex#9049.
+                None => Field::new(name.as_ref(), arrow_type, field_dtype.is_nullable()),
             })
         })
         .collect::<DFResult<Vec<_>>>()?;
@@ -119,7 +145,9 @@ fn calculate_physical_field_type(
                                 .with_data_type(arrow_type)
                                 .with_nullable(field_dtype.is_nullable()),
                             None => {
-                                Field::new(name.to_string(), arrow_type, field_dtype.is_nullable())
+                                // Same as the top-level unmatched branch: do
+                                // not go through FieldName's Display.
+                                Field::new(name.as_ref(), arrow_type, field_dtype.is_nullable())
                             }
                         })
                     })
@@ -155,6 +183,56 @@ fn calculate_physical_field_type(
                     "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
                 ));
             }
+        }
+
+        // The map identity - the entries field name, the key and value names, and the
+        // `ordered` flag - survives only in the logical schema, so it is re-applied here.
+        // Vortex's map dtype names its key and value `key` and `value` whatever Arrow called
+        // them, and a file written before Vortex had a map dtype stores the entries under the
+        // `List<Struct<keys, values>>` alias; both resolve to the entries struct the logical
+        // schema declares.
+        DataType::Map(logical_entries, ordered) => {
+            let entries_dtype = match dtype {
+                DType::Map(map_dtype, _) => {
+                    let DataType::Struct(logical_pair) = logical_entries.data_type() else {
+                        return Err(exec_datafusion_err!(
+                            "Failed to convert dtype to arrow: map entries field '{}' is {} rather than a struct of keys and values",
+                            logical_entries.name(),
+                            logical_entries.data_type()
+                        ));
+                    };
+                    let [keys, values] = logical_pair.as_ref() else {
+                        return Err(exec_datafusion_err!(
+                            "Failed to convert dtype to arrow: map entries field '{}' has {} fields rather than keys and values",
+                            logical_entries.name(),
+                            logical_pair.len()
+                        ));
+                    };
+                    DType::struct_(
+                        [
+                            (keys.name().as_str(), map_dtype.key_dtype()),
+                            (values.name().as_str(), map_dtype.value_dtype()),
+                        ],
+                        Nullability::NonNullable,
+                    )
+                }
+                DType::List(entries_dtype, _) => entries_dtype.as_ref().clone(),
+                _ => {
+                    return Err(exec_datafusion_err!(
+                        "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
+                    ));
+                }
+            };
+            let physical_entries_type = calculate_physical_field_type(
+                &entries_dtype,
+                logical_entries.data_type(),
+                arrow_session,
+            )?;
+            let physical_entries = logical_entries
+                .as_ref()
+                .clone()
+                .with_data_type(physical_entries_type);
+            DataType::Map(physical_entries.into(), *ordered)
         }
 
         // For fixed-size list types, recursively check the element type
@@ -214,7 +292,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::Fields;
-    use vortex::array::arrow::ArrowSession;
+    use vortex::arrow::ArrowSession;
     use vortex::dtype::Nullability;
     use vortex::dtype::PType;
     use vortex::dtype::StructFields;
@@ -246,6 +324,145 @@ mod tests {
             physical_schema.field(0).data_type(),
             &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
         );
+    }
+
+    /// A file written before Vortex had a map dtype stores an Arrow `Map` as
+    /// `List<Struct<keys, values>>`, so its `DType` alone reads back as a list. The reference
+    /// schema is the only place the map identity survives, and reconciliation has to re-apply
+    /// it or such a column comes back as a list and no longer matches the table it was
+    /// written from.
+    #[test]
+    fn test_map_type_is_restored_from_the_reference_schema_over_the_list_alias() {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Utf8, true),
+            ])),
+            false,
+        );
+        let map_type = DataType::Map(Arc::new(entries), false);
+        let logical_schema = Schema::new(vec![Field::new("headers", map_type.clone(), true)]);
+
+        // What the file actually holds: a nullable list of non-nullable key/value structs.
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "headers",
+                DType::List(
+                    Arc::new(DType::Struct(
+                        StructFields::from_iter([
+                            ("keys", DType::Utf8(Nullability::NonNullable)),
+                            ("values", DType::Utf8(Nullability::Nullable)),
+                        ]),
+                        Nullability::NonNullable,
+                    )),
+                    Nullability::Nullable,
+                ),
+            )]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("map physical schema should be calculated");
+
+        assert_eq!(physical_schema.field(0).data_type(), &map_type);
+    }
+
+    /// Vortex's map dtype carries the key and value dtypes but names them `key` and `value`
+    /// whatever Arrow called them, and has no name for the entries field. All three names
+    /// have to come from the reference schema, or the column reads back as a map type the
+    /// table it was written from does not match.
+    #[test]
+    fn test_map_type_is_restored_from_the_reference_schema_over_the_map_dtype() {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Utf8, true),
+            ])),
+            false,
+        );
+        let map_type = DataType::Map(Arc::new(entries), false);
+        let logical_schema = Schema::new(vec![Field::new("headers", map_type.clone(), true)]);
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "headers",
+                DType::Map(
+                    vortex::dtype::MapDType::try_new(
+                        DType::Utf8(Nullability::NonNullable),
+                        DType::Utf8(Nullability::Nullable),
+                        false,
+                    )
+                    .expect("map dtype should be valid"),
+                    Nullability::Nullable,
+                ),
+            )]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("map physical schema should be calculated");
+
+        assert_eq!(physical_schema.field(0).data_type(), &map_type);
+    }
+
+    #[test]
+    fn test_reconciliation_matches_by_name_not_position() {
+        // The reference schema lists columns in the opposite order to the file
+        // DType. Reconciliation must match fields by name (via the name index),
+        // so each output field takes the matching reference field's preserved
+        // logical type regardless of position.
+        let logical_schema = Schema::new(vec![
+            Field::new(
+                "b_dict",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("a_utf8", DataType::Utf8, false),
+        ]);
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("a_utf8", DType::Utf8(Nullability::NonNullable)),
+                ("b_dict", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+            .expect("schema should reconcile by name");
+
+        // Output follows the DType field order; types come from the matching
+        // reference fields.
+        assert_eq!(physical.field(0).name(), "a_utf8");
+        assert_eq!(physical.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(physical.field(1).name(), "b_dict");
+        assert_eq!(
+            physical.field(1).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
+    }
+
+    #[test]
+    fn test_duplicate_reference_name_uses_first_match() {
+        // A reference schema with duplicate field names must resolve against the
+        // FIRST match, matching Arrow's `field_with_name`; the name index
+        // preserves that via first-insert-wins.
+        let logical_schema = Schema::new(vec![
+            Field::new("x", DataType::Utf8, false),     // first "x" wins
+            Field::new("x", DataType::LargeUtf8, true), // second "x" ignored
+        ]);
+        let dtype = DType::Struct(
+            StructFields::from_iter([("x", DType::Utf8(Nullability::NonNullable))]),
+            Nullability::NonNullable,
+        );
+
+        let physical = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+            .expect("duplicate-name reconciliation should pick the first match");
+
+        assert_eq!(physical.field(0).data_type(), &DataType::Utf8);
     }
 
     #[test]
@@ -503,5 +720,162 @@ mod tests {
         } else {
             panic!("Expected list type");
         }
+    }
+
+    /// Names carrying raw control bytes must reach Arrow byte-for-byte.
+    /// `FieldName`'s `Display` escapes via `StringEscape`, so building the
+    /// field with `to_string` renames `\x08` to the literal five characters
+    /// `\u{8}`. The scanned batch then disagrees with the table schema the
+    /// scan was planned against, and the query fails with "column types must
+    /// match schema types".
+    ///
+    /// Regression test for spiraldb/vortex#9049.
+    #[test]
+    fn test_control_byte_column_names_are_not_escaped() {
+        let column_names = ["plain", "\u{8}", "check_id\u{10}"];
+        let logical_schema = Schema::new(
+            column_names
+                .iter()
+                .map(|n| Field::new(*n, DataType::Utf8, true))
+                .collect::<Fields>(),
+        );
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("plain", DType::Utf8(Nullability::Nullable)),
+                ("\u{8}", DType::Utf8(Nullability::Nullable)),
+                ("check_id\u{10}", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("control-byte column names should reconcile");
+
+        let names: Vec<&str> = physical_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, column_names);
+    }
+
+    /// Same, one level down: struct children are built at a separate call
+    /// site in `calculate_physical_field_type`. The children here are
+    /// run-end-encoded dictionaries, so this also covers the branches that
+    /// take the type from the reference schema instead of the `DType`.
+    ///
+    /// Regression test for spiraldb/vortex#9049.
+    #[test]
+    fn test_control_byte_struct_field_names_are_not_escaped() {
+        let label_names = ["app", "\u{8}", "check_id\u{10}"];
+        let ree = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new(
+                "values",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                true,
+            )),
+        );
+        let logical_schema = Schema::new(vec![Field::new_struct(
+            "labels",
+            label_names
+                .iter()
+                .map(|n| Field::new(*n, ree.clone(), true))
+                .collect::<Fields>(),
+            false,
+        )]);
+
+        let labels_dtype = DType::Struct(
+            StructFields::from_iter([
+                ("app", DType::Utf8(Nullability::Nullable)),
+                ("\u{8}", DType::Utf8(Nullability::Nullable)),
+                ("check_id\u{10}", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+        let dtype = DType::Struct(
+            StructFields::from_iter([("labels", labels_dtype)]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("control-byte struct field names should reconcile");
+
+        let DataType::Struct(labels) = physical_schema.field(0).data_type() else {
+            panic!("expected labels to be a struct");
+        };
+        let names: Vec<&str> = labels.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, label_names);
+    }
+
+    /// Fields present in the file `DType` but not the reference schema take
+    /// their Arrow name from `FieldName` at the `Field::new` sites. Those
+    /// sites must use `as_ref`, not `to_string` (`Display` escapes).
+    ///
+    /// Regression test for spiraldb/vortex#9049.
+    #[test]
+    fn test_control_byte_unmatched_column_names_are_not_escaped() {
+        let column_names = ["plain", "\u{8}", "check_id\u{10}"];
+        let logical_schema = Schema::new(vec![Field::new("other", DataType::Int32, false)]);
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("plain", DType::Utf8(Nullability::Nullable)),
+                ("\u{8}", DType::Utf8(Nullability::Nullable)),
+                ("check_id\u{10}", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("unmatched control-byte column names should not be escaped");
+
+        let names: Vec<&str> = physical_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, column_names);
+    }
+
+    /// Same unmatched-name path one level down, at the `Field::new` site in
+    /// `calculate_physical_field_type`.
+    ///
+    /// Regression test for spiraldb/vortex#9049.
+    #[test]
+    fn test_control_byte_unmatched_struct_field_names_are_not_escaped() {
+        let label_names = ["app", "\u{8}", "check_id\u{10}"];
+        let logical_schema = Schema::new(vec![Field::new_struct(
+            "labels",
+            Fields::from(vec![Field::new("other", DataType::Utf8, true)]),
+            false,
+        )]);
+
+        let labels_dtype = DType::Struct(
+            StructFields::from_iter([
+                ("app", DType::Utf8(Nullability::Nullable)),
+                ("\u{8}", DType::Utf8(Nullability::Nullable)),
+                ("check_id\u{10}", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+        let dtype = DType::Struct(
+            StructFields::from_iter([("labels", labels_dtype)]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("unmatched nested control-byte names should not be escaped");
+
+        let DataType::Struct(labels) = physical_schema.field(0).data_type() else {
+            panic!("expected labels to be a struct");
+        };
+        let names: Vec<&str> = labels.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, label_names);
     }
 }

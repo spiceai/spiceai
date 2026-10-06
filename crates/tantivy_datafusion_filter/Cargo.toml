@@ -1,0 +1,18 @@
+[package]
+description = "DataFusion filter pushdown into tantivy full-text queries"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "tantivy_datafusion_filter"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+datafusion.workspace = true
+snafu.workspace = true
+tantivy = { workspace = true }
+
+[lints]
+workspace = true

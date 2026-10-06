@@ -241,6 +241,42 @@ pub(super) async fn all_spill_tables(
     )
 }
 
+/// Every index (base + every spill index currently discoverable via `ListIndexes`) backing the
+/// virtual index identified by `table.idx`.
+///
+/// Unlike [`all_spill_tables`], this doesn't take a writer's in-memory `spill_index` position —
+/// which spill index a given key's vector actually landed in depends on write-time AWS quota
+/// state and isn't recoverable from the key alone, so a delete broadcasts to every index this
+/// finds rather than routing to one. `DeleteVectors` against a key absent from a given index is a
+/// no-op, so broadcasting is safe; it costs one delete call per existing physical index.
+pub async fn all_existing_spill_tables(
+    table: &S3VectorsTable,
+) -> Result<Vec<S3VectorsTable>, super::Error> {
+    let (_, Some(bucket_name), Some(index_name)) = table.idx.index_identifier_variables() else {
+        // ARN-identified indexes never spill (`current_index` always resolves back to the same
+        // ARN) — the base table is the only possible target.
+        return Ok(vec![table.clone()]);
+    };
+
+    let all_index_names = list_index_names(&table.client, &bucket_name, &index_name).await?;
+    let mut names = SpillIndex::get_all_indexes_for_virtual_index(&index_name, &all_index_names);
+    if !names.contains(&index_name) {
+        // Always include the base index even if `ListIndexes` didn't return it (e.g. eventual
+        // consistency) — matches the pre-broadcast behavior of always attempting the base delete.
+        names.insert(0, index_name.clone());
+    }
+
+    Ok(names
+        .into_iter()
+        .map(|name| {
+            table.clone().with_new_id(S3VectorIdentifier::Index {
+                bucket_name: bucket_name.clone(),
+                index_name: name,
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +378,150 @@ mod tests {
                 "myindex-02".to_string(),
             ]
         );
+    }
+
+    use crate::s3_vectors::{
+        MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    };
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::{Constraint, Constraints};
+    use s3_vectors::{
+        CreateIndexInput, CreateVectorBucketInput, DataType as S3DataType, DistanceMetric,
+        S3Vectors, mock::MockClient,
+    };
+
+    fn test_table(
+        client: Arc<dyn S3Vectors + Send + Sync>,
+        idx: S3VectorIdentifier,
+    ) -> S3VectorsTable {
+        S3VectorsTable {
+            idx: Arc::new(idx),
+            client,
+            schema: Arc::new(Schema::new(vec![
+                Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+                Field::new_fixed_size_list(
+                    S3_VECTOR_EMBEDDING_NAME,
+                    Field::new("item", DataType::Float32, false),
+                    3,
+                    false,
+                ),
+            ])),
+            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            dimension: 3,
+            columns: MetadataColumns::none(),
+            distance_metric: DistanceMetric::Cosine,
+        }
+    }
+
+    async fn create_index(client: &Arc<dyn S3Vectors + Send + Sync>, index_name: &str) {
+        client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name("test-bucket")
+                    .build()
+                    .expect("valid input"),
+            )
+            .await
+            .ok();
+        client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .index_name(index_name)
+                    .vector_bucket_name("test-bucket")
+                    .data_type(S3DataType::Float32)
+                    .dimension(3)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()
+                    .expect("valid input"),
+            )
+            .await
+            .expect("create_index should succeed");
+    }
+
+    #[tokio::test]
+    async fn all_existing_spill_tables_discovers_base_and_every_spill() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        for name in ["virtual-index", "virtual-index-01", "virtual-index-02"] {
+            create_index(&client, name).await;
+        }
+        // An unrelated index sharing a prefix must not be swept in.
+        create_index(&client, "virtual-index-other-05").await;
+
+        let table = test_table(
+            client,
+            S3VectorIdentifier::Index {
+                bucket_name: "test-bucket".to_string(),
+                index_name: "virtual-index".to_string(),
+            },
+        );
+
+        let tables = all_existing_spill_tables(&table)
+            .await
+            .expect("should discover indexes");
+        let names: Vec<String> = tables
+            .iter()
+            .map(|t| {
+                t.idx
+                    .index_identifier_variables()
+                    .2
+                    .expect("index-backed identifier")
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "virtual-index".to_string(),
+                "virtual-index-01".to_string(),
+                "virtual-index-02".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_existing_spill_tables_no_spillover_returns_just_the_base() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        create_index(&client, "virtual-index").await;
+
+        let table = test_table(
+            client,
+            S3VectorIdentifier::Index {
+                bucket_name: "test-bucket".to_string(),
+                index_name: "virtual-index".to_string(),
+            },
+        );
+
+        let tables = all_existing_spill_tables(&table)
+            .await
+            .expect("should discover indexes");
+        let names: Vec<String> = tables
+            .iter()
+            .map(|t| {
+                t.idx
+                    .index_identifier_variables()
+                    .2
+                    .expect("index-backed identifier")
+            })
+            .collect();
+        assert_eq!(names, vec!["virtual-index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn all_existing_spill_tables_arn_identifier_returns_just_the_base() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+
+        let table = test_table(
+            client,
+            S3VectorIdentifier::IndexArn(
+                "arn:aws:s3vectors:us-east-1:123:index/virtual".to_string(),
+            ),
+        );
+
+        let tables = all_existing_spill_tables(&table)
+            .await
+            .expect("ARN identifiers never spill, so this must not error");
+        assert_eq!(tables.len(), 1);
     }
 }
