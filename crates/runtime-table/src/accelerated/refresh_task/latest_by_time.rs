@@ -25,7 +25,7 @@ limitations under the License.
 //! later arrival winning the tie. A NULL time is older than any time. A row with the same
 //! time and contents is a re-read: it writes nothing, and is counted as superseded by
 //! arrival. Every row not written is counted in
-//! `dataset_acceleration_refresh_rows_superseded`. On append, the selector is first seeded
+//! `dataset_acceleration_rows_superseded`. On append, the selector is first seeded
 //! with the rows the acceleration already stores from the append window start, so a late
 //! row never replaces a newer stored version. Within a refresh, the rows passed for a key
 //! arrive in non-decreasing time order, so the last one written for a key wins.

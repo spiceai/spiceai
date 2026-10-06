@@ -190,23 +190,21 @@ pub static REFRESH_ROWS_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("dataset_acceleration_refresh_rows_written")
         .with_description(
-            "Cumulative number of rows read from the federated source and written to the accelerated table, including rows the table does not keep (dataset_acceleration_refresh_rows_superseded).",
+            "Cumulative number of rows read from the federated source and written to the accelerated table, including rows the table does not keep (dataset_acceleration_rows_superseded).",
         )
         .with_unit("rows")
         .build()
 });
 
-/// Rows a refresh received but the accelerated table did not keep, by `reason`:
+/// Rows a refresh received but the accelerated table did not keep, because another
+/// version of the same primary key was kept, by `reason`:
 ///
-/// - `unchanged`: an identical copy of a row the table kept;
-/// - `arrival`: a different version of the key, settled by the order versions arrived in;
-/// - `older`: under `on_conflict: upsert_by_time`, a version of the key with a greater
-///   `time_column` was kept;
-/// - `equal_time`: under `on_conflict: upsert_by_time`, a different row with the kept
-///   version's time, so `time_column` is not unique per key.
-pub static REFRESH_ROWS_SUPERSEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+/// - `older`: a version of the key with a greater `time_column` was kept;
+/// - `arrival`: a version of the key that arrived later (with the same
+///   `time_column`, when the dataset sets one) was kept.
+pub static ROWS_SUPERSEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("dataset_acceleration_refresh_rows_superseded")
+        .u64_counter("dataset_acceleration_rows_superseded")
         .with_description(
             "Cumulative number of rows a refresh received but the accelerated table did not keep, because another version of the same primary key was kept, by reason.",
         )

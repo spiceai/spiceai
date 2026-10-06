@@ -78,6 +78,7 @@ pub mod refresh_task_runner;
 pub mod retention;
 pub(crate) mod sink;
 pub mod snapshots;
+pub(crate) mod superseded;
 pub mod synchronized_table;
 pub mod timestamp_metrics_utils;
 pub mod write;

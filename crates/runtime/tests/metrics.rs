@@ -1432,7 +1432,7 @@ async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
     let superseded = |dataset: &str, reason: &str| {
         counter_value(
             registry,
-            "dataset_acceleration_refresh_rows_superseded",
+            "dataset_acceleration_rows_superseded",
             &[("dataset", dataset), ("reason", reason)],
         )
     };

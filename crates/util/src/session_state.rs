@@ -49,27 +49,22 @@ pub fn session_context() -> SessionContext {
 /// Why a write did not keep a row it received.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupersededReason {
-    /// An identical copy of a row the write kept.
-    Unchanged,
-    /// A different version of a key, settled by the order versions arrived in.
+    /// A version of a key that arrived later (with the same time, when versions
+    /// are ordered by time) was kept.
     Arrival,
-    /// A version of a key with an earlier time than the version kept.
+    /// A version of a key with a later time was kept.
     Older,
-    /// A version of a key with the kept version's time but different content.
-    EqualTime,
 }
 
 impl SupersededReason {
-    pub const ALL: [Self; 4] = [Self::Unchanged, Self::Arrival, Self::Older, Self::EqualTime];
+    pub const ALL: [Self; 2] = [Self::Arrival, Self::Older];
 
     /// The `reason` label a metric reports this under.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Unchanged => "unchanged",
             Self::Arrival => "arrival",
             Self::Older => "older",
-            Self::EqualTime => "equal_time",
         }
     }
 

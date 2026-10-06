@@ -1153,15 +1153,7 @@ impl RefreshTask {
 
         // Rows the table did not keep, counted only once the write succeeded:
         // a failed refresh changes nothing.
-        for reason in util::session_state::SupersededReason::ALL {
-            let rows = superseded.get(reason);
-            if rows > 0 {
-                metrics::REFRESH_ROWS_SUPERSEDED.add(
-                    rows,
-                    &self.dataset_metric_labels.tagged("reason", reason.label()),
-                );
-            }
-        }
+        super::superseded::record(&self.dataset_metric_labels, &superseded);
 
         let refresh_stat = on_written_data_stat_available.try_recv().ok();
 

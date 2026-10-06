@@ -169,7 +169,7 @@ pub(crate) fn warn_about_acceleration_block(
     }
 }
 
-/// Publish `dataset_acceleration_refresh_rows_superseded` at `0` for each reason a
+/// Publish `dataset_acceleration_rows_superseded` at `0` for each reason a
 /// refresh of `ds` can report, so the series exist before the first one. A
 /// dataset whose refreshes report none gets no series.
 fn seed_superseded_rows(ds: &Dataset) {
@@ -185,7 +185,7 @@ fn seed_superseded_rows(ds: &Dataset) {
         Some(KeyRule::ChangeOrder) | None => return,
     };
     for reason in reasons {
-        metrics::acceleration::REFRESH_ROWS_SUPERSEDED.add(
+        metrics::acceleration::ROWS_SUPERSEDED.add(
             0,
             &[
                 KeyValue::new("dataset", ds.name.to_string()),
