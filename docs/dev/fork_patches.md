@@ -114,7 +114,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `02550cf9462b9f56506b6b1cd07eabf08c46e200` | `spiceai-55` |
+| [datafusion](#datafusion) | `1749ce4eed18d34cc7df7b19f25cec60235e8329` | `viktor/spiceai-55-patches-5-mark-join-projection` (TEMPORARY: spiceai/datafusion#250 into #249, then #249 into `spiceai-55`) |
 | [datafusion-ballista](#datafusion-ballista) | `a7c4c58502a16e2181a26fdb8e937ee005807e5e` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `9ca84a39760d7728bdeb5eac8480a3f9ee8422be` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `465926a30443ebfbbc95366b6f0277bff80a8ba9` | `spiceai-55` |
@@ -197,11 +197,15 @@ row here. Its behaviour is covered where the code lives, by
 ## datafusion
 
 Upstream [apache/datafusion](https://github.com/apache/datafusion), branch
-`spiceai-55-patches` (upstream `55.1.0` merged into the previous line). The branch
-also carries upstream's own `[branch-52]` … `[branch-55]` backports; those are
-upstream commits and are not Spice patches. Every row below was re-confirmed present
-at the pinned revision except the Spark `concat` row, whose behaviour upstream
-adopted in 55; the last three rows are new with this line. Fixes cherry-picked from upstream `main` ahead of any release are listed
+`spiceai-55` (upstream `55.2.0-rc1` merged into the previous line in
+spiceai/datafusion#248) plus spiceai/datafusion#249, which carries three
+`spiceai-54` patches onto 55, and #250, a review fix to it. The branch also carries
+upstream's own `[branch-52]` … `[branch-55]` backports; those are upstream commits
+and are not Spice patches. The `55.2.0-rc1` merge changed no Spice patch: outside
+`Cargo.lock`, its diff from the previous pin is upstream's `55.1.0...55.2.0-rc1`
+diff hunk for hunk, except `datafusion-spark`'s `quote.rs`, which the fork's backport
+had already made identical to `55.2.0-rc1`'s, so that backport's row is dropped
+(upstream carries the fix as apache/datafusion#25277). Fixes cherry-picked from upstream `main` ahead of any release are listed
 below like Spice patches: a re-cut onto a release that already has one drops its row,
 and a re-cut onto one that does not has to carry it.
 
@@ -275,7 +279,6 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Unparser: a `Date32` literal's cast is spelled with the dialect's date type (spiceai/datafusion#237 on `spiceai-54`, carried onto 55 as `fc84f2d1`, spiceai/datafusion#242) | `SQLite` reads `CAST('1994-01-01' AS DATE)` as the number `1994`, so a date range pushed to `SQLite` compares text against a number and matches no row | silent (wrong data) | `crates/data_components/src/federation.rs::tests::a_date_range_unparsed_for_sqlite_keeps_the_rows_it_selects` (with `--features sqlite` it runs the SQL on `SQLite` and counts the rows) |
 | Listing prunes files by metadata-column predicates (`_last_modified`, `_size`, `_location`) before opening them and reports those filters `Exact` (spiceai/datafusion#229 on `spiceai-54`: `135916ca4`, `cf7ddaaec`, `4cf679211`) | Metadata filters stay `Inexact` and are applied above the scan, so every file in the listing is opened: the same rows, at the cost of reading files the filter would have skipped | not carried | none — not carried on 55: nothing in this repo fails without it, so it waits for a guard before it is ported (spiceai/datafusion#240) |
 | Unparser: `rescope_projection_over_projection` — a projection over an unaliased derived projection is rescoped rather than left naming qualifiers the derived table hides (made in the DataFusion 55 merge; upstream `55.1.0`, `branch-55` and `main` all lack it) | The unparser emits an unaliased `FROM (SELECT … FROM products AS p LEFT JOIN …)` whose outer `SELECT` still references `"p"."…"`, which the remote engine refuses — DuckDB with "Referenced table p not found" — so the federated query fails ([apache/datafusion#22961](https://github.com/apache/datafusion/issues/22961)'s query). Upstream's own `optimized_duckdb_unparse_preserves_derived_table_scope` passes on the broken output | silent (query failure) | `crates/data_components/src/federation.rs::a_projection_over_a_derived_projection_reads_only_relations_in_scope` unparses the shape in every federation dialect and asserts the outer `SELECT` qualifies no column by a relation the derived table hides — for unique outputs, read by name, and for the same-named pair, merged — that the volatile merge is refused, and, when built with `duckdb`, that `DuckDB` binds the statement. In the fork, `plan_to_sql.rs::test_projection_over_projection_merges_same_named_columns` (the #22961 regression test), `::test_projection_over_projection_reads_unique_columns_by_name` and `::test_projection_over_projection_same_named_columns_over_volatile_is_refused` |
-| `datafusion-spark` `quote.rs` imports its expression types from `datafusion_expr` rather than `datafusion::logical_expr` (commits `4524751d`, `4085e114`; a backport — `55.1.0` has the broken import, upstream `branch-55` and `main` the fixed one) | `datafusion-spark` does not compile with its `core` feature off, which is how this workspace builds it | build | compile-guarded by every crate here that depends on `datafusion-spark` (`crates/runtime`, `crates/runtime-datafusion`, `crates/accelerators/accelerator-duckdb`) |
 | Backport of apache/datafusion#24817: an aggregate builds a dynamic filter only when every aggregate in it can contribute one | The filter is built from the plain-column `MIN`/`MAX` aggregates alone and prunes the rows that decide an expression aggregate beside them, so `MIN(c + 1)` is computed from a subset of the rows | silent (wrong data) | `crates/cayenne/tests/datafusion_dynamic_filter_backports_test.rs::an_aggregate_dynamic_filter_keeps_rows_an_expression_aggregate_needs` |
 | Backport of apache/datafusion#25259, applied over #24428, which it is written against: a filter pushed through an operator has its columns mapped by position, not by name | A join or `TopK` dynamic filter pushed below an operator whose output holds two columns of one name (nested joins, a filter or projection over a join, a `GROUP BY`) lands on the wrong one: the join loses its matches, or `ORDER BY … LIMIT` returns the wrong row | silent (wrong data) | `…::a_join_dynamic_filter_maps_same_named_columns_by_position`, `…::a_topk_dynamic_filter_maps_same_named_columns_by_position` |
 | Backport of apache/datafusion#24248: bitwise `XOR` simplification keeps NULL | `(a # b) # a` is folded to `b` and `a # a` to `0`, so a NULL `a` answers a number | silent (wrong data) | `…::xor_simplification_keeps_null` |
