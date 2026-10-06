@@ -238,7 +238,7 @@ impl CacheKeyClaim {
         batches: Arc<Vec<RecordBatch>>,
         charge: Option<Arc<RetainedBufferCharge>>,
     ) {
-        self.input_charge = charge.clone();
+        self.input_charge.clone_from(&charge);
         self.sender.send_replace(FetchState::Ready(batches, charge));
         self.published = true;
     }
@@ -356,9 +356,11 @@ impl UncoalescedFetch<'_> {
             Ok(batches) if !batches.is_empty() => {
                 let batch_schema = batches[0].schema();
 
-                // A failing origin arrives as a successful fetch whose rows
-                // carry a 429 or 5xx status; serve the expired cached response
-                // instead when `caching_stale_if_error` allows it.
+                // The guard for a 429 or 5xx status reaching here on a
+                // *successful* fetch; serve the expired cached response instead
+                // when `caching_stale_if_error` allows it. The HTTP connector
+                // refuses such a status itself, so its own failures take the
+                // `Err` arm.
                 if !cache::batches_cacheable(&batches)
                     && let Some(stale) = match expired_batches {
                         Some(fallback) => fallback.read().await,
@@ -1204,13 +1206,13 @@ struct StaleCacheEntry {
 
 /// What a revalidation learned about the source.
 ///
-/// The distinction matters because a failing origin does not arrive as an
-/// error. Once the HTTP connector has exhausted its own `max_retries`, it
-/// surfaces the failure as a *successful* fetch whose rows carry a 429 or 5xx
-/// status — so a caller that only inspects `Result` sees "the source answered"
-/// and cannot tell that it answered with a failure. That is the dominant
-/// failure mode of the connectors caching mode accepts, and it is precisely
-/// when `caching_stale_if_error` is supposed to act.
+/// The distinction matters because a failing origin need not arrive as an
+/// error: a fetch can succeed and carry a 429 or 5xx in its rows, so a caller
+/// that only inspects `Result` sees "the source answered" and cannot tell that
+/// it answered with a failure. That is precisely when `caching_stale_if_error`
+/// is supposed to act. The HTTP connector refuses such a status itself — see
+/// its `on_error_response` — so this outcome is what covers a row that reaches
+/// the cache by any other route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevalidationOutcome {
     /// The source answered, and its rows were queued to replace the entry.
@@ -1435,6 +1437,7 @@ impl CacheRefreshHelper {
     /// Returns a `DataFusionError` if the accelerator cannot be scanned for stale
     /// rows, if re-executing a query against the federated source fails, or if
     /// writing the refreshed rows back to the accelerator fails.
+    #[expect(clippy::too_many_arguments)]
     pub async fn refresh_all_stale_rows(
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
@@ -1553,12 +1556,13 @@ impl CacheRefreshHelper {
                     return Ok::<usize, datafusion::error::DataFusionError>(0);
                 }
 
-                // A failing origin arrives as a successful fetch whose rows
-                // carry a 429 or 5xx status, and this path overwrites the entry
-                // it refreshes. Writing that would replace the last good
-                // response with the origin's error body and serve it as a
-                // cache hit until it expires — so keep what is cached, which is
-                // also what `caching_stale_if_error` exists to do.
+                // This path overwrites the entry it refreshes, so a fetch
+                // that succeeded while carrying a 429 or 5xx would replace the
+                // last good response with the origin's error body and serve it
+                // as a cache hit until it expires — keep what is cached, which
+                // is also what `caching_stale_if_error` exists to do. The HTTP
+                // connector refuses such a status itself; this covers a row
+                // reaching here by any other route.
                 if !cache::batches_cacheable(&batches) {
                     tracing::debug!(
                         "Background refresh for dataset '{dataset_name}' found the origin failing (transient HTTP error response); keeping what is cached"
@@ -2491,10 +2495,9 @@ impl CacheRefreshHelper {
                     })
                     .ok()
             });
-        let complete = completion
-            .as_ref()
-            .is_some_and(|token| token.is_complete_single_request())
-            && (memory_pool.is_none() || charge.is_some());
+        let complete = completion.as_ref().is_some_and(
+            data_components::http::provider::HttpFetchCompletion::is_complete_single_request,
+        ) && (memory_pool.is_none() || charge.is_some());
 
         tracing::debug!(
             "Federated source returned {} batches for dataset={}",
@@ -2624,14 +2627,13 @@ impl CacheRefreshHelper {
                 // errors.
                 let batches_cacheable = cache::batches_cacheable(&batches);
 
-                // A failing origin does not arrive as an error. Once the HTTP
-                // connector has exhausted its own retries it reports the
-                // failure as a successful fetch whose rows carry a 429 or 5xx
-                // status, so serving stale data only from the `Err` arm below
-                // would miss the dominant failure mode — an operator who asked
-                // for `caching_stale_if_error` would get the origin's error
-                // body instead of the cached response they asked to fall back
-                // to.
+                // A failing origin usually takes the `Err` arm below: the HTTP
+                // connector refuses a 429 or 5xx that outlives its retries
+                // whatever `on_error_response` says. This arm is the guard for
+                // such a row reaching here by some other route, because an
+                // operator who asked for
+                // `caching_stale_if_error` would otherwise be served the
+                // origin's error body instead of the cached response.
                 if !batches_cacheable
                     && let Some(stale) = match expired_batches {
                         Some(fallback) => fallback.read().await,
@@ -2908,7 +2910,7 @@ impl CacheRefreshHelper {
         schema: SchemaRef,
         filters: &[Expr],
         in_flight_revalidations: &InFlightRevalidations,
-        batch_write_tx: CacheWriteSender,
+        batch_write_tx: &CacheWriteSender,
         namespace: CacheNamespace,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
@@ -3249,6 +3251,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         vec![Distribution::SinglePartition; self.children().len()]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.input {
             CachingScanInput::Planned(input) => vec![input],
@@ -3338,7 +3351,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             let stale_if_error = self.stale_if_error;
             let io_runtime = self.io_runtime.clone();
             let synchronized_children = Arc::clone(&self.synchronized_children);
-            let batch_write_tx = batch_write_tx.clone();
             let in_flight_revalidations = Arc::clone(&self.in_flight_revalidations);
             let stream = futures::stream::once(async move {
                 let namespace = request_context.as_deref().map_or(
@@ -3403,7 +3415,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let io_runtime = self.io_runtime.clone();
         let in_flight_revalidations = Arc::clone(&self.in_flight_revalidations);
         let synchronized_children = Arc::clone(&self.synchronized_children);
-        let batch_write_tx = batch_write_tx.clone();
 
         tracing::debug!(
             "CacheAccelerationScanExec::execute about to spawn cache check for dataset={}",
@@ -3507,7 +3518,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     Arc::clone(&schema_clone),
                     &filters,
                     &in_flight_revalidations,
-                    batch_write_tx.clone(),
+                    &batch_write_tx,
                     namespace,
                 )
             } else {
@@ -4425,6 +4436,7 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion::prelude::SessionContext;
     use parking_lot::RwLock;
     use std::sync::Arc;
@@ -5777,7 +5789,7 @@ mod tests {
             Arc::clone(&schema),
             &access_filters,
             &in_flight_revalidations,
-            batch_write_tx,
+            &batch_write_tx,
             CacheNamespace::Public,
         );
 
@@ -7624,6 +7636,17 @@ mod tests {
             self.inner.properties()
         }
 
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
         }
@@ -7989,7 +8012,10 @@ mod tests {
             cached_input(vec![]),
             vec![col("request_path").eq(lit("/api/rewritten"))],
         )
-        .with_new_children(vec![cached_input(vec![])])
+        .replace_children(
+            vec![cached_input(vec![])],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .expect("with_new_children");
         let rows: Vec<RecordBatch> = rewritten
             .execute(0, Arc::new(TaskContext::default()))

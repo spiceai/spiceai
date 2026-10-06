@@ -80,7 +80,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
             let cmd = CreateExternalTable {
                 schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema))?,
                 name: TableReference::bare("test_table"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -176,7 +176,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
             let cmd = CreateExternalTable {
                 schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema))?,
                 name: TableReference::bare("test_table"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,

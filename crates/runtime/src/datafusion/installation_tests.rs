@@ -174,7 +174,7 @@ async fn installation(outcome: Outcome) {
             Outcome::CancelMetadata => drop(registration),
             Outcome::FailMetadata | Outcome::FailCatalog | Outcome::RestoreMetadata | Outcome::FailMetadataPublication => {
                 source.release.add_permits(1);
-                assert!(registration.await.is_err());
+                registration.await.expect_err("failed preparation fails registration");
             }
             Outcome::CancelBookkeeping => {
                 let bookkeeping = df.accelerated_tables.write().await;

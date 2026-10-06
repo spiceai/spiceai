@@ -22,15 +22,17 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::optimizer::OptimizerRule;
-use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use runtime_datafusion::dialect::new_bigquery_dialect;
-use runtime_datafusion::function_support::deny_spice_functions_for_bigquery_table_providers;
+use runtime_datafusion::function_support::{
+    deny_spice_functions_for_bigquery_table_providers, expression_support_for_engine,
+};
 use runtime_datafusion::optimizer_rule::{JsonGetNullCheckRewrite, RegexpMatchNullCheckRewrite};
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
 
@@ -55,11 +57,19 @@ pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + 
 
 /// The federation function-support policy for a driver. Defaults to denying
 /// every Spice function, which is correct for a driver whose dialect rewrites
-/// none of them.
+/// none of them, plus the per-expression gate for the engine behind the
+/// driver where one exists: a `duckdb`, `postgresql` or `mysql` driver reaches
+/// an engine that rounds a fractional-to-integer cast `DataFusion` truncates,
+/// and the cast has to stay local on this route as on the engine's own
+/// connector (issue #14482).
 fn function_support_for_driver(driver_name: &str) -> FunctionSupport {
-    match driver_name {
-        BIGQUERY_DRIVER => deny_spice_functions_for_bigquery_table_providers(),
-        _ => deny_spice_functions_for_table_providers(),
+    if driver_name == BIGQUERY_DRIVER {
+        return deny_spice_functions_for_bigquery_table_providers();
+    }
+    let support = deny_spice_functions_for_table_providers();
+    match expression_support_for_engine(driver_name) {
+        Some(gate) => support.with_expression_support(gate),
+        None => support,
     }
 }
 

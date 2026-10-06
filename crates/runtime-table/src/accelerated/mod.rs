@@ -35,11 +35,11 @@ use data_connector_api::accelerated::{
 };
 use data_connector_api::write_back::WriteBackDeliverer;
 use datafusion::catalog::Session;
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::sql::TableReference;
 use datafusion::{datasource::TableProvider, logical_expr::Expr};
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
@@ -1435,7 +1435,8 @@ impl AcceleratedTable {
                 // Accepted cache jobs can still be fetching or preparing input.
                 // Their sink must remain open until they have published.
                 let publication = if cache_work.is_none() {
-                    sink.as_ref().map(|sink| sink.begin_close())
+                    sink.as_ref()
+                        .map(runtime_acceleration::change_sink::ChangeSink::begin_close)
                 } else {
                     None
                 };
@@ -1464,8 +1465,10 @@ impl AcceleratedTable {
                         Some(cache_work) => cache_work.wait().await,
                         None => Ok(()),
                     };
-                    let publication =
-                        publication.or_else(|| sink.as_ref().map(|sink| sink.begin_close()));
+                    let publication = publication.or_else(|| {
+                        sink.as_ref()
+                            .map(runtime_acceleration::change_sink::ChangeSink::begin_close)
+                    });
                     let storage_result = match publication {
                         Some(publication) => publication.wait().await,
                         None => Ok(()),
@@ -1495,6 +1498,10 @@ impl AcceleratedTable {
 
     /// Stop producers and drain accepted changes before the storage target can
     /// be removed or rebound. Cancellation stops waiting, not the owned drain.
+    ///
+    /// # Errors
+    ///
+    /// Returns every producer, cache-work and storage failure the drain observed.
     pub async fn drain_changes(&self) -> DataFusionResult<()> {
         self.begin_changes_drain().wait().await
     }

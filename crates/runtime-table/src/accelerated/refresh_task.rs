@@ -45,12 +45,12 @@ use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_planner::ExtensionPlanner;
 use datafusion::{
+    common::TableReference,
     dataframe::DataFrame,
     datasource::TableProvider,
     error::DataFusionError,
     logical_expr::{Expr, Operator, col},
     physical_plan::stream::RecordBatchStreamAdapter,
-    sql::TableReference,
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};

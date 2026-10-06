@@ -32,8 +32,8 @@ use std::{
 };
 
 use datafusion::{
+    common::{ResolvedTableReference, TableReference},
     error::{DataFusionError, Result},
-    sql::{ResolvedTableReference, TableReference},
 };
 use runtime_acceleration::change_sink::Publication;
 use tokio::{
@@ -120,6 +120,10 @@ pub(crate) struct PreparedGeneration<T> {
 impl<T> PreparedGeneration<T> {
     pub(crate) fn value(&self) -> &T {
         &self.value
+    }
+
+    pub(crate) fn value_mut(&mut self) -> &mut T {
+        &mut self.value
     }
 
     pub(crate) fn is_for(&self, name: &TableReference) -> bool {
@@ -703,11 +707,9 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
-            tokio::time::timeout(Duration::ZERO, drain.wait())
-                .await
-                .is_err()
-        );
+        tokio::time::timeout(Duration::ZERO, drain.wait())
+            .await
+            .expect_err("drain remains pending");
         finish
             .send(())
             .expect("owned constructor survives shutdown wait timeout");

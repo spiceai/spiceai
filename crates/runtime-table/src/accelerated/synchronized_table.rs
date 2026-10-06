@@ -20,7 +20,7 @@ use std::sync::{
 };
 
 use datafusion::catalog::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use tokio::sync::{Mutex, OwnedRwLockWriteGuard};
 
 use crate::accelerated::AcceleratedTable;

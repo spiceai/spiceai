@@ -77,6 +77,7 @@ openapi = ["dep:utoipa", "runtime-acceleration/openapi"]
 cpu-budget = { path = "../cpu-budget" }
 ctor.workspace = true
 insta.workspace = true
+runtime-acceleration = { path = "../runtime-acceleration", features = ["test-support"] }
 opentelemetry-prometheus.workspace = true
 opentelemetry_sdk.workspace = true
 prometheus.workspace = true

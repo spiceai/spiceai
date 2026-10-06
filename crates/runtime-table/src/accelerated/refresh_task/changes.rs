@@ -39,6 +39,7 @@ use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
+use datafusion::common::TableReference;
 #[cfg(test)]
 use datafusion::error::DataFusionError;
 #[cfg(test)]
@@ -50,7 +51,6 @@ use datafusion::logical_expr::lit;
 #[cfg(test)]
 use datafusion::physical_plan::collect;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
 #[cfg(test)]
 use futures::StreamExt;
 use futures::stream;
@@ -352,12 +352,12 @@ fn fold_committers(
     let mut folded: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
         Vec::with_capacity(committers.len());
     for committer in committers {
-        if let Some(last) = folded.last_mut() {
-            if last.try_absorb(committer.as_ref()) {
-                continue;
-            }
-            // The same committer type can carry different source identities.
-            // A refused merge retains both commits in their original order.
+        // The same committer type can carry different source identities.
+        // A refused merge retains both commits in their original order.
+        if let Some(last) = folded.last_mut()
+            && last.try_absorb(committer.as_ref())
+        {
+            continue;
         }
         folded.push(committer);
     }
@@ -3391,7 +3391,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare(name.to_string()),
+            datafusion::common::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -3414,7 +3414,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(federated));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare(name.to_string()),
+            datafusion::common::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -3475,7 +3475,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare("test".to_string()),
+            datafusion::common::TableReference::bare("test".to_string()),
             federated,
             None,
             accelerator,
@@ -3527,7 +3527,7 @@ mod tests {
                 MemTable::try_new(Arc::clone(&stored), vec![vec![]])
                     .expect("mem table should be created"),
             );
-            let dataset = datafusion::sql::TableReference::bare(name.to_string());
+            let dataset = datafusion::common::TableReference::bare(name.to_string());
             install_cdc_schema_evolution(
                 &dataset,
                 CdcSchemaEvolution {
@@ -3610,7 +3610,7 @@ mod tests {
 
         let dataset = "cdc_map_entries_accepted";
         install_cdc_schema_evolution(
-            &datafusion::sql::TableReference::bare(dataset.to_string()),
+            &datafusion::common::TableReference::bare(dataset.to_string()),
             CdcSchemaEvolution {
                 policy: OnSchemaChange::Fail,
                 constraint_columns: vec![],
@@ -5303,6 +5303,17 @@ mod tests {
         fn properties(&self) -> &Arc<PlanProperties> {
             self.inner.properties()
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
         }

@@ -69,7 +69,11 @@ async fn only_eof_in_every_partition_completes() {
     );
     let (mut second, _) = tracked(&completion, 1, false, vec![Ok(batch())]);
     assert!(!completion.is_complete());
-    assert!(second.next().await.expect("row").is_ok());
+    second
+        .next()
+        .await
+        .expect("row")
+        .expect("second execution yields its row");
     assert!(!completion.is_complete());
     assert!(second.next().await.is_none());
     assert!(completion.is_complete());
@@ -146,7 +150,7 @@ async fn actual_http_pagination_tracks_followed_pages_not_configuration() {
                         .await.expect("HTTP response");
                 }
             });
-            let provider = HttpTableProvider::new(url.parse().expect("URL"), Default::default(), "text".into(), true)
+            let provider = HttpTableProvider::new(url.parse().expect("URL"), reqwest::Client::default(), "text".into(), true)
                 .with_allowed_paths(["/items"]).expect("allowed path")
                 .with_max_retries(0)
                 .with_pagination(PaginationConfig::default()).expect("automatic pagination");
@@ -205,7 +209,11 @@ async fn failed_stream_cannot_complete_after_eof() {
         false,
         vec![Err(DataFusionError::Execution("HTTP failure".into()))],
     );
-    assert!(response.next().await.expect("error item").is_err());
+    response
+        .next()
+        .await
+        .expect("error item")
+        .expect_err("failed fetch yields an error");
     assert!(response.next().await.is_none());
     assert!(!completion.is_complete());
 }

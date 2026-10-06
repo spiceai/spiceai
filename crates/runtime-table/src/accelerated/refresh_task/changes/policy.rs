@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution, WideningPlan};
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::sql::TableReference;
 use runtime_acceleration::change_sink::source_policy::{CdcPolicy, SchemaDecision};
 use runtime_acceleration::change_sink::{ChangeCapabilities, SchemaEvolutionSupport};
 use runtime_component::dataset::OnSchemaChange;

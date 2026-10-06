@@ -25,8 +25,8 @@ use cayenne::{
     metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig},
 };
 use datafusion::{
-    datasource::memory::MemorySourceConfig, logical_expr::dml::InsertOp, physical_plan::collect,
-    sql::TableReference,
+    common::TableReference, datasource::memory::MemorySourceConfig, logical_expr::dml::InsertOp,
+    physical_plan::collect,
 };
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,

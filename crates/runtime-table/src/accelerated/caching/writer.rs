@@ -41,7 +41,8 @@ use datafusion::execution::{
 };
 use datafusion::logical_expr::{Expr, Operator, col, lit};
 use datafusion::physical_plan::{
-    ExecutionPlan, coalesce_partitions::CoalescePartitionsExec, projection::ProjectionExec,
+    ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions,
+    coalesce_partitions::CoalescePartitionsExec, projection::ProjectionExec,
 };
 use futures::{FutureExt, TryStreamExt};
 use runtime_acceleration::change_sink::batching::{AppendIngress, CoalescingLimits};
@@ -161,7 +162,7 @@ impl RetainedBufferCharge {
         Ok(Arc::new_cyclic(|this| {
             peers.entries.push(PeerCharge {
                 pool: Arc::downgrade(pool),
-                charge: this.clone(),
+                charge: Weak::clone(this),
             });
             Self {
                 pool: Arc::clone(pool),
@@ -602,6 +603,11 @@ impl CacheWriteSender {
 
     /// Send to a batched cache consumer. Native writes require `send_claimed`
     /// so exclusive scope ownership spans observation, fetch and publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer is closed or does not admit the request
+    /// within the admission timeout.
     pub async fn send(&self, request: CacheWriteRequest) -> Result<()> {
         match self {
             Self::Batched(sender) => tokio::time::timeout(ADMISSION_TIMEOUT, sender.send(request))
@@ -614,6 +620,11 @@ impl CacheWriteSender {
 
     /// Transfer both input and claim to the writer. Accepted writes retain the
     /// claim even if the fetching query is cancelled or drops its response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer is closed or does not admit the request
+    /// within the admission timeout. A refused request releases its claim.
     pub async fn send_claimed(
         &self,
         request: CacheWriteRequest,
@@ -636,6 +647,11 @@ impl CacheWriteSender {
 
     /// Wait for a sink-owned background refresh or child initialization to publish.
     /// Cancelling this observer does not cancel accepted storage work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a batched writer, when the request is not admitted,
+    /// or when the accepted write fails to publish.
     pub async fn send_claimed_and_wait(
         &self,
         request: CacheWriteRequest,
@@ -682,7 +698,7 @@ impl CacheSinkWriter {
                     .columns()
                     .iter()
                     .filter(|column| !input_columns.iter().any(|input| Arc::ptr_eq(input, column)))
-                    .map(|column| column.get_array_memory_size())
+                    .map(Array::get_array_memory_size)
                     .fold(0, usize::saturating_add);
                 reservation.try_grow(extra)?;
                 Ok(cast)
@@ -913,9 +929,10 @@ pub(super) fn canonical_request_filters(filters: &[Expr]) -> Option<Vec<Expr>> {
     )
 }
 
-fn tracked_http_plan(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Option<(Arc<dyn ExecutionPlan>, HttpFetchCompletion, bool)>> {
+/// A cache-fetch plan, its completion token, and whether it can authorize a replacement.
+type TrackedHttpPlan = (Arc<dyn ExecutionPlan>, HttpFetchCompletion, bool);
+
+fn tracked_http_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<TrackedHttpPlan>> {
     if let Some(http) = plan.downcast_ref::<HttpExec>() {
         // The completion token must also prove that execution did not follow
         // another page: page metadata can describe different storage keys.
@@ -932,7 +949,10 @@ fn tracked_http_plan(
             && let Some((child, completion, eligible)) = tracked_http_plan(children[0])?
         {
             return Ok(Some((
-                Arc::clone(plan).with_new_children(vec![child])?,
+                Arc::clone(plan).replace_children(
+                    vec![child],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )?,
                 completion,
                 eligible,
             )));
@@ -961,11 +981,7 @@ fn own_snapshot_batch(batch: RecordBatch, reservation: &MemoryReservation) -> Re
         return Ok(batch);
     }
 
-    let data: Vec<_> = batch
-        .columns()
-        .iter()
-        .map(|column| column.to_data())
-        .collect();
+    let data: Vec<_> = batch.columns().iter().map(Array::to_data).collect();
     let mut budget = SnapshotCopyBudget::default();
     let mut array_metadata = 0usize;
     for (column, data) in batch.columns().iter().zip(&data) {
@@ -1027,7 +1043,7 @@ fn own_snapshot_batch(batch: RecordBatch, reservation: &MemoryReservation) -> Re
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct SnapshotDescriptorBudget {
     bytes: usize,
     datatype_bytes: usize,
@@ -1059,7 +1075,7 @@ fn datatype_clone_bytes(data_type: &DataType, depth: usize) -> Result<usize> {
     )
 }
 
-/// Bounds descriptor construction without allocating ArrayData or cloning a
+/// Bounds descriptor construction without allocating `ArrayData` or cloning a
 /// container. Two descriptor sets cover conversion temporaries plus the stored
 /// set. Variable byte-view buffer counts come from the array, not its row count.
 fn snapshot_descriptor_budget(array: &dyn Array, depth: usize) -> Result<SnapshotDescriptorBudget> {

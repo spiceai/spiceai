@@ -20,7 +20,7 @@ use arrow::{
     array::{Int64Array, RecordBatch},
     datatypes::{DataType, Field, Schema},
 };
-use datafusion::{datasource::TableProvider, prelude::SessionContext, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider, prelude::SessionContext};
 use runtime_acceleration::change_sink::{
     ChangeBatch, ChangeSink, ChangeSinkContext, WriteOptions, provider::ProviderChangeSinkBackend,
 };

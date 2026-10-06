@@ -38,6 +38,7 @@ limitations under the License.
 
 #![cfg(not(windows))]
 #![allow(clippy::expect_used)]
+#![recursion_limit = "256"]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;

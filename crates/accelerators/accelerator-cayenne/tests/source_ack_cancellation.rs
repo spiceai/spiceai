@@ -38,7 +38,7 @@ use cayenne::{
 use data_accelerator_api::DataAccelerator;
 use data_components::cdc::{self, ChangeEnvelope, CommitChange, CommitError};
 use datafusion::{
-    datasource::TableProvider, execution::context::SessionContext, sql::TableReference,
+    common::TableReference, datasource::TableProvider, execution::context::SessionContext,
 };
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,

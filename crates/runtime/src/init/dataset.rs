@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
+use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
@@ -37,9 +37,9 @@ use crate::{
     DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackPrerequisitesUnmetSnafu,
     DurableWriteBackRecreatingModeSnafu, DurableWriteBackUndeclaredPrimaryKeySnafu,
     DurableWriteBackUnsupportedBySourceSnafu, DurableWriteBackWithRetentionSnafu, Error,
-    FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshTimedOutSnafu, LogErrors,
-    OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshFailedSnafu,
+    HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
+    Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
     UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     component::dataset::{
@@ -50,7 +50,7 @@ use crate::{
     component::{
         AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
     },
-    dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
+    dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR, SCYLLADB_DATACONNECTOR,
         SCYLLADB_FEATURE,
@@ -65,7 +65,7 @@ use crate::{
     tracing_util::dataset_registered_trace,
 };
 use app::App;
-use datafusion::sql::{ResolvedTableReference, TableReference};
+use datafusion::common::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
@@ -89,6 +89,40 @@ use util::{error_spaced, warn_spaced};
 /// datasets sequentially, so an apply changing several of them can spend this
 /// bound once per dataset.
 const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// What a caller of [`Runtime::invalidate_cached_results_because`] is doing to the
+/// dataset, which decides what the operator is told they will observe when the
+/// invalidation itself fails.
+#[derive(Clone, Copy, Debug)]
+enum CacheInvalidation {
+    /// The dataset stays configured and will be queryable again, though its contents
+    /// may change. It may be unregistered while its replacement is registered, so this
+    /// says nothing about whether the table stays in place.
+    Reload,
+    /// The dataset is being unloaded and stops being queryable.
+    Unload,
+}
+
+/// The warning for a cached-results invalidation that failed — a degrade-and-continue
+/// path, so this line is the only account an operator gets of why a removed or reloaded
+/// dataset keeps answering.
+///
+/// A pure function so the wording is asserted rather than assumed: see
+/// `a_failed_unload_invalidation_says_the_dataset_keeps_answering`.
+fn cache_invalidation_warning(
+    dataset: &TableReference,
+    cause: CacheInvalidation,
+    source: &dyn std::fmt::Display,
+) -> String {
+    match cause {
+        CacheInvalidation::Reload => format!(
+            "Dataset '{dataset}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {source}"
+        ),
+        CacheInvalidation::Unload => format!(
+            "Dataset '{dataset}' was unloaded, but the results cached from it could not be invalidated, so queries may keep being answered from the dataset that is no longer there until they expire. Cause: {source}"
+        ),
+    }
+}
 
 /// Warn an operator about what their dataset's or view's acceleration block asks for and
 /// the runtime will not do as written: settings that `enabled: false` discards (#13514), and
@@ -214,8 +248,8 @@ impl Runtime {
         //
         // `LogErrors(true)` here, and `LogErrors(false)` in `load_views` below, because
         // the two validate the same views and only one of them may report: this pre-pass
-        // is the one that always runs. The snapshot validations between here and
-        // `load_views` return early on failure, so reporting from `load_views` instead
+        // is the one that always runs. The snapshot validation between here and
+        // `load_views` returns early on failure, so reporting from `load_views` instead
         // loses every view's load error, its status update, and its
         // discarded-acceleration warning on exactly the startups that already went wrong.
         let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
@@ -224,14 +258,23 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
         let startup_datasets = valid_datasets;
 
-        // Validate Cayenne snapshot consistency before initializing accelerators.
-        // All Cayenne datasets sharing the same metadata directory must have the same
-        // snapshot configuration (either all enabled or all disabled).
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
-            tracing::error!("{err}");
-            return;
+        if let Some(snapshots) = app.snapshots.as_deref() {
+            let any_snapshot_mode_dataset = startup_datasets.iter().any(|ds| {
+                ds.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.enabled
+                        && acceleration
+                            .refresh_mode
+                            .is_some_and(|mode| mode.is_snapshot_only())
+                })
+            });
+            if let Some(warning) =
+                runtime_acceleration::snapshot::notifications::unread_queue_warning(
+                    snapshots,
+                    any_snapshot_mode_dataset,
+                )
+            {
+                tracing::warn!("{warning}");
+            }
         }
 
         let init_results = self
@@ -251,11 +294,24 @@ impl Runtime {
             return;
         }
 
-        // Create a map of dataset names to their futures
-        let mut dataset_futures = HashMap::new();
-        let mut localpod_datasets = Vec::new();
+        // Keyed by resolved name, so a `localpod` path of `source`, `public.source`, or
+        // `spice.public.source` finds the same parent. The value carries the dataset's own name
+        // for the log line its task writes.
+        let mut dataset_futures: HashMap<
+            ResolvedTableReference,
+            (TableReference, PendingDatasetLoad),
+        > = HashMap::new();
+        // Loads waiting on a snapshot's first publication, which component startup does not
+        // wait for. Their tasks stay registered for cancellation on reload or shutdown.
+        let mut background_roots = HashSet::new();
+        let mut background_chains: Vec<(TableReference, PendingDatasetLoad)> = Vec::new();
+        // Keyed by parent so several `localpod` datasets reading from one dataset all chain
+        // behind the same load, rather than the first one consuming it.
+        let mut localpod_by_parent: HashMap<
+            ResolvedTableReference,
+            Vec<(Arc<Dataset>, AcceleratorBootstrap)>,
+        > = HashMap::new();
 
-        // First create futures for non-localpod datasets
         for ds in &startup_datasets {
             let bootstrap_status = match init_results.get(&ds.name) {
                 Some(Ok(status)) => status.clone(),
@@ -269,79 +325,131 @@ impl Runtime {
                 }
             };
 
-            if ds.source() == LOCALPOD_DATACONNECTOR {
-                localpod_datasets.push((Arc::clone(ds), bootstrap_status));
+            self.status
+                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+
+            if let Some(parent) = localpod_parent(ds) {
+                localpod_by_parent
+                    .entry(parent)
+                    .or_default()
+                    .push((Arc::clone(ds), bootstrap_status));
                 continue;
             }
 
-            self.status
-                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+            let pending = bootstrap_status.is_pending();
             let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
             let load_semaphore = Arc::clone(&semaphore);
             let load = self.dataset_loads.begin(&ds.name);
-            let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+            let future: PendingDatasetLoad = Box::pin(async move {
                 cloned_self
                     .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
                     .await;
-            })
-                as Pin<Box<dyn Future<Output = ()> + Send>>;
-            dataset_futures.insert(ds.name.clone(), future);
+            });
+            let resolved = resolve_table_reference(ds.name.clone());
+            let future = if pending {
+                background_roots.insert(resolved.clone());
+                self.track_snapshot_bootstrap(
+                    &ds.name,
+                    future,
+                    Some(self.initial_load.cancel.clone()),
+                )
+                .await
+            } else {
+                future
+            };
+            dataset_futures.insert(resolved, (ds.name.clone(), future));
         }
 
-        // For each localpod dataset, chain it after its parent's future
-        for (ds, bootstrap_status) in localpod_datasets {
-            self.status
-                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-
-            // Get the parent dataset path from the localpod dataset
-            let path = ds.path();
-            let path_table_ref = TableReference::parse_str(path);
-
-            // Find and remove the parent dataset's future
-            if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
-                let ds_clone = Arc::clone(&ds);
-                let cloned_self = Arc::clone(&self);
-                let load_semaphore = Arc::clone(&semaphore);
-                // Registered now rather than once the parent has loaded, so a
-                // Spicepod change can supersede the load while it waits.
-                let load = self.dataset_loads.begin(&ds.name);
-                // Chain the localpod dataset load after its parent
-                let chained_future = Box::pin(async move {
-                    parent_future.await;
-                    cloned_self
-                        .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
+        // Each `localpod` dataset loads after the dataset it reads from, and a `localpod`
+        // dataset reading from another `localpod` dataset loads after that one, so every chain
+        // hangs off the load of a non-`localpod` dataset.
+        let roots: Vec<_> = localpod_by_parent
+            .extract_if(|parent, _| dataset_futures.contains_key(parent))
+            .collect();
+        for (parent, children) in roots {
+            let parent_background = background_roots.contains(&parent);
+            // Signalled once the parent's load ends, however it ends, so a chain running in
+            // the background starts only after its parent.
+            let parent_done = tokio_util::sync::CancellationToken::new();
+            let mut chains = Vec::new();
+            for (ds, bootstrap_status) in children {
+                let background = parent_background
+                    || localpod_chain_pending(&ds, &bootstrap_status, &localpod_by_parent);
+                let name = ds.name.clone();
+                let chain = Arc::clone(&self).localpod_load_chain(
+                    ds,
+                    bootstrap_status,
+                    &mut localpod_by_parent,
+                    ReplacesRegistration::No,
+                );
+                if background {
+                    let parent_done = parent_done.clone();
+                    let chain: PendingDatasetLoad = Box::pin(async move {
+                        parent_done.cancelled().await;
+                        chain.await;
+                    });
+                    let chain = self
+                        .track_snapshot_bootstrap(
+                            &name,
+                            chain,
+                            Some(self.initial_load.cancel.clone()),
+                        )
                         .await;
-                }) as Pin<Box<dyn Future<Output = ()> + Send>>;
-
-                // Replace parent future with the chained future
-                dataset_futures.insert(ds.name.clone(), chained_future);
-            } else {
-                // Parent doesn't exist, provide an error message to the user
-                tracing::error!(
-                    "Failed to load localpod dataset '{}': Parent dataset '{}' doesn't exist. \
-                    Ensure the '{}' dataset is configured in the Spicepod.",
-                    ds.name,
-                    path_table_ref,
-                    path_table_ref
-                );
-                self.status.update_dataset(
-                    &ds.name,
-                    status::ComponentStatus::error_with_message(format!(
-                        "Parent dataset '{path_table_ref}' doesn't exist"
-                    )),
-                );
+                    background_chains.push((name, chain));
+                } else {
+                    chains.push(chain);
+                }
+            }
+            if let Some((_, parent_future)) = dataset_futures.get_mut(&parent) {
+                let parent_load = std::mem::replace(parent_future, Box::pin(async {}));
+                *parent_future = Box::pin(async move {
+                    {
+                        let _parent_done = parent_done.drop_guard();
+                        parent_load.await;
+                    }
+                    join_all(chains).await;
+                });
             }
         }
 
-        let mut spawned_tasks = vec![];
+        // Whatever is still queued has no chain to a dataset that is loading: its parent is
+        // not configured, failed to initialize, or is part of a `localpod` cycle.
+        for (ds, _) in localpod_by_parent.into_values().flatten() {
+            let path_table_ref = TableReference::parse_str(ds.path());
+            tracing::error!(
+                "Failed to load localpod dataset '{}': Parent dataset '{}' doesn't exist. \
+                Ensure the '{}' dataset is configured in the Spicepod.",
+                ds.name,
+                path_table_ref,
+                path_table_ref
+            );
+            self.status.update_dataset(
+                &ds.name,
+                status::ComponentStatus::error_with_message(format!(
+                    "Parent dataset '{path_table_ref}' doesn't exist"
+                )),
+            );
+        }
 
-        for (ds, dataset_load_future) in dataset_futures {
+        let mut spawned_tasks = vec![];
+        let dispatched = dataset_futures.len() + background_chains.len();
+
+        for (resolved, (ds, dataset_load_future)) in dataset_futures {
             let handle = tokio::spawn(async move {
                 tracing::info!("Dataset {ds} initializing...");
                 dataset_load_future.await;
             });
-            spawned_tasks.push(handle);
+            // A reader's first publication is independent of component startup.
+            if !background_roots.contains(&resolved) {
+                spawned_tasks.push(handle);
+            }
+        }
+        for (ds, chain) in background_chains {
+            tokio::spawn(async move {
+                tracing::info!("Dataset {ds} initializing...");
+                chain.await;
+            });
         }
 
         // Aggregate startup summary so users see "3/5 queued, 2 skipped at init" at a glance
@@ -351,7 +459,6 @@ impl Runtime {
         // parent dataset's task. Wording avoids the words "failed" / "error" so it
         // doesn't trip quickstart CI checks that grep spice.log for those tokens as a
         // sentinel for real failures.
-        let dispatched = spawned_tasks.len();
         let init_skipped = init_results.values().filter(|r| r.is_err()).count();
         let total = startup_datasets.len();
         if total > 0 {
@@ -597,7 +704,8 @@ impl Runtime {
         // placeholder and skip eager connector construction. The
         // resolver hook in `datafusion::create_logical_plan` will
         // trigger `ensure_ready` on first reference.
-        if self.is_deferral_eligible(&ds)
+        if bootstrap_status.is_none()
+            && self.is_deferral_eligible(&ds)
             && let Some(deferred_schema) = self.try_static_schema_for_dataset(&ds).await
         {
             let runtime = ds.runtime();
@@ -728,12 +836,15 @@ impl Runtime {
         load_semaphore: Arc<Semaphore>,
         load: DatasetLoad,
     ) {
+        let shutdown_token = self.status.shutdown_token();
         // A dataset that reads snapshots has no acceleration to load them into until
         // the engine that created them is known, which only their metadata says.
+        // Outside the supersede scope below: a supersede waits for a restore that has
+        // started rather than dropping it (see `dataset_loads`), and the resolution
+        // stops on its own while it is only waiting.
         let (ds, bootstrap_status) = if ds.is_pending_snapshot_source() {
-            let shutdown_token = self.status.shutdown_token();
             let resolved = tokio::select! {
-                resolved = self.resolve_snapshot_source(&ds, &load_semaphore) => resolved,
+                resolved = self.resolve_snapshot_source(&ds, &load_semaphore, &load) => resolved,
                 () = shutdown_token.cancelled() => None,
             };
             let Some(resolved) = resolved else {
@@ -743,15 +854,71 @@ impl Runtime {
         } else {
             (ds, bootstrap_status)
         };
+        let load_fut = async {
+            let pending = bootstrap_status.is_pending();
+            let bootstrap_status = if pending
+                && ds.ready_state == crate::component::dataset::ReadyState::OnRegistration
+                && !self.df.table_exists(&ds.name)
+            {
+                // Source fallback must not open the acceleration file. Race it with
+                // the restore so an unavailable source cannot delay a publication.
+                // It holds no storage generation, so it cannot reinitialize the one
+                // the restore writes under.
+                let fallback = self.load_dataset_with_retry(
+                    Arc::clone(&ds),
+                    bootstrap_status.source_fallback(),
+                    Arc::clone(&load_semaphore),
+                    &load,
+                );
+                let restore = bootstrap_status.complete();
+                tokio::pin!(restore);
+                tokio::select! {
+                    status = &mut restore => status,
+                    () = fallback => restore.await,
+                }
+            } else {
+                bootstrap_status.complete().await
+            };
+            // A restore completed at initialization already updated the cached
+            // timestamps there; only one completed here still needs it.
+            let restored = pending && bootstrap_status.is_bootstrapped();
+            if restored && ds.is_snapshot_source() && self.refuses_projected_publisher(&ds).await {
+                return;
+            }
+            if restored {
+                update_cached_dataset_timestamps(ds.as_ref()).await;
+            }
+            self.load_dataset_with_retry(Arc::clone(&ds), bootstrap_status, load_semaphore, &load)
+                .await;
+            if restored {
+                self.df.clear_cached_plans().await;
+                self.invalidate_cached_results_for(&ds.name).await;
+            }
+        };
 
+        // Use tokio::select! so that backoff sleeps inside `retry` are immediately
+        // interrupted when the runtime begins shutting down (e.g. on ctrl-c), or
+        // when a Spicepod change supersedes this load. Dropping `load_fut` there
+        // drops any attempt in progress, which releases the attempt lock that
+        // `DatasetLoads::supersede` waits for before the change applies.
+        tokio::select! {
+            () = load_fut => {},
+            () = shutdown_token.cancelled() => {},
+            () = load.superseded() => {},
+        }
+    }
+
+    async fn load_dataset_with_retry(
+        &self,
+        ds: Arc<Dataset>,
+        bootstrap_status: AcceleratorBootstrap,
+        load_semaphore: Arc<Semaphore>,
+        load: &DatasetLoad,
+    ) {
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
-
-        let runtime = Arc::clone(&self);
         let bootstrap_status = tokio::sync::Mutex::new(bootstrap_status);
-        let shutdown_token = runtime.status.shutdown_token();
-        let retry_fut = retry(retry_strategy, || async {
-            // Exit immediately if the runtime is shutting down (e.g. after a backoff sleep completes).
-            if runtime.status.is_shutdown() {
+        let _ = retry(retry_strategy, || async {
+            if self.status.is_shutdown() {
                 return Err(RetryError::permanent(
                     crate::Error::UnableToInitializeDataConnector {
                         source: "Runtime is shutting down".into(),
@@ -771,7 +938,7 @@ impl Runtime {
 
             let mut bootstrap = bootstrap_status.lock().await;
             if bootstrap.needs_reinitialization() {
-                let Some(result) = runtime
+                let Some(result) = self
                     .initialize_datasets_accelerators(std::slice::from_ref(&ds))
                     .await
                     .remove(&ds.name)
@@ -782,9 +949,10 @@ impl Runtime {
                         },
                     ));
                 };
-                *bootstrap = result.map_err(RetryError::transient)?;
+                // Initialization leaves a reader's restore pending, as at startup.
+                *bootstrap = result.map_err(RetryError::transient)?.restore_once().await;
             }
-            match runtime
+            match self
                 .try_load_dataset_once(
                     Arc::clone(&ds),
                     bootstrap.clone(),
@@ -793,23 +961,70 @@ impl Runtime {
                 .await
             {
                 Ok(()) => Ok(()),
-                Err(err) if runtime.status.is_shutdown() => Err(RetryError::permanent(err)),
+                Err(err) if self.status.is_shutdown() => Err(RetryError::permanent(err)),
                 Err(err) if matches!(err, Error::PermanentDatasetFailure { .. }) => {
                     Err(RetryError::permanent(err))
                 }
                 Err(err) => Err(RetryError::transient(err)),
             }
-        });
+        })
+        .await;
+    }
 
-        // Use tokio::select! so that backoff sleeps inside `retry` are immediately
-        // interrupted when the runtime begins shutting down (e.g. on ctrl-c), or
-        // when a Spicepod change supersedes this load. Dropping `retry_fut` there
-        // drops any attempt in progress, which releases the attempt lock that
-        // `DatasetLoads::supersede` waits for before the change applies.
-        tokio::select! {
-            _ = retry_fut => {},
-            () = shutdown_token.cancelled() => {},
-            () = load.superseded() => {},
+    fn snapshot_bootstrap_task_name(name: &TableReference) -> String {
+        format!(
+            "snapshot_bootstrap:{}",
+            resolve_table_reference(name.clone())
+        )
+    }
+
+    /// Keeps background bootstrap in the runtime's task registry until it can
+    /// register the reader, or its configuration is replaced or removed.
+    async fn track_snapshot_bootstrap(
+        self: &Arc<Self>,
+        name: &TableReference,
+        load: Pin<Box<dyn Future<Output = ()> + Send>>,
+        initial_load_cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let cancel = self.status.shutdown_token().child_token();
+        let task_cancel = cancel.clone();
+        let completion = self
+            .start_runtime_task(
+                &Self::snapshot_bootstrap_task_name(name),
+                Some(cancel),
+                async move {
+                    let initial_load_cancel = async move {
+                        match initial_load_cancel {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        () = task_cancel.cancelled() => {},
+                        () = initial_load_cancel => {},
+                        () = load => {},
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+        let name = name.clone();
+        Box::pin(async move {
+            if let Err(err) = completion.await {
+                tracing::error!("Failed to initialize snapshot reader '{name}': {err}");
+            }
+        })
+    }
+
+    async fn cancel_snapshot_bootstrap(&self, name: &TableReference) {
+        let task = self
+            .tasks
+            .write()
+            .await
+            .remove(&Self::snapshot_bootstrap_task_name(name));
+        if let Some(task) = task {
+            task.cancel(Duration::from_secs(5)).await;
         }
     }
 
@@ -969,6 +1184,9 @@ impl Runtime {
         // Owned (not borrowed from `ds`) so the dataset can be rebuilt below by
         // schema inference without holding a borrow across the reassignment.
         let source = ds.source().to_string();
+        let snapshot_fallback = bootstrap_status.is_pending();
+        let replaces_snapshot_reader =
+            bootstrap_status.is_bootstrapped() && self.df.table_exists(&ds.name);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         if let Some(acceleration) = &ds.acceleration
             && data_connector.resolve_refresh_mode(acceleration.refresh_mode)
@@ -1078,24 +1296,35 @@ impl Runtime {
                 let resolved_refresh_mode = data_connector
                     .resolve_refresh_mode(ds.acceleration.as_ref().and_then(|a| a.refresh_mode));
                 ds = Self::apply_inferred_acceleration(ds, &provider, resolved_refresh_mode);
-                FederatedTable::new(
-                    Arc::new(ds.spec.clone()),
-                    provider,
-                    ConnectorRefreshSource::new_arc(Arc::clone(&data_connector), Arc::clone(&ds)),
-                    self.status.shutdown_token(),
-                    allow_schema_mismatch,
-                )
-                .await
+                if snapshot_fallback {
+                    FederatedTable::new_unchecked(provider)
+                } else {
+                    FederatedTable::new(
+                        Arc::new(ds.spec.clone()),
+                        provider,
+                        ConnectorRefreshSource::new_arc(
+                            Arc::clone(&data_connector),
+                            Arc::clone(&ds),
+                        ),
+                        self.status.shutdown_token(),
+                        allow_schema_mismatch,
+                    )
+                    .await
+                }
             }
             Err(err) => {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
-                if let Some(federated_table) = FederatedTable::new_deferred(
-                    Arc::new(ds.spec.clone()),
-                    ConnectorRefreshSource::new_arc(Arc::clone(&data_connector), Arc::clone(&ds)),
-                    self.status.shutdown_token(),
-                )
-                .await
+                if !snapshot_fallback
+                    && let Some(federated_table) = FederatedTable::new_deferred(
+                        Arc::new(ds.spec.clone()),
+                        ConnectorRefreshSource::new_arc(
+                            Arc::clone(&data_connector),
+                            Arc::clone(&ds),
+                        ),
+                        self.status.shutdown_token(),
+                    )
+                    .await
                 {
                     tracing::warn!(
                         "Failed to connect to the source for dataset {}. Serving data from the existing acceleration for {} while retrying the connection. {err}",
@@ -1195,7 +1424,9 @@ impl Runtime {
                         }
                     },
                 );
-                metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
+                if !replaces_snapshot_reader {
+                    metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
+                }
 
                 if let Some(message) = schema_change_failure {
                     self.status.update_dataset(
@@ -1227,28 +1458,39 @@ impl Runtime {
         }
     }
 
+    /// Unregisters `ds_name` and discards what is cached over it.
+    ///
+    /// `cause` is the caller's intent, which this cannot infer: most callers
+    /// unregister the dataset only to register a replacement, and telling the
+    /// results cache those were unloads would deny them the stale-serving window
+    /// their reload is exactly what revalidates.
     async fn remove_dataset(
         self: Arc<Self>,
         ds_name: TableReference,
         ds_acceleration: Option<&Acceleration>,
+        cause: CacheInvalidation,
     ) -> bool {
-        self.remove_dataset_with_bootstrap(ds_name, ds_acceleration, &BootstrapStatus::None.into())
-            .await
+        self.remove_dataset_with_bootstrap(
+            ds_name,
+            ds_acceleration,
+            cause,
+            &BootstrapStatus::None.into(),
+        )
+        .await
     }
 
     async fn remove_dataset_with_bootstrap(
         self: Arc<Self>,
         ds_name: TableReference,
         ds_acceleration: Option<&Acceleration>,
+        cause: CacheInvalidation,
         bootstrap: &AcceleratorBootstrap,
     ) -> bool {
         let was_registered = self.df.table_exists(&ds_name);
-        if was_registered {
-            if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
-                datasets_health_monitor
-                    .deregister_dataset(&ds_name.to_string())
-                    .await;
-            }
+        if was_registered && let Some(datasets_health_monitor) = &self.datasets_health_monitor {
+            datasets_health_monitor
+                .deregister_dataset(&ds_name.to_string())
+                .await;
         }
         // Pending construction also owns storage without a catalog entry.
         if let Err(e) = self
@@ -1263,6 +1505,24 @@ impl Runtime {
         // Drop the dataset's CDC schema-evolution settings; a reload re-installs
         // them at registration before the changes stream starts.
         crate::accelerated::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
+
+        // Deregistering the table is not enough to stop it being read: a cached
+        // logical plan holds the `TableSource` it was planned against, so a query
+        // executed before this point keeps executing against the retired provider,
+        // answering rows from a dataset the catalog no longer lists (#14251). A
+        // cached result reads the same way. Both discards happen *here*, after the
+        // deregistration, rather than in the callers that used to do them before it:
+        // a query planning in the window between a caller's discard and the
+        // deregistration would otherwise cache a plan over the provider being retired.
+        //
+        // The plan discard is deliberately the blanket one, as `update_dataset` and
+        // `remove_view` both use. `invalidate_for_table` would reach this dataset's own
+        // plans, but a dataset leaves the app at human timescale and the cost of being
+        // wrong about which plans reach it is the defect above, so the price paid is a
+        // replan of everything else.
+        self.df.clear_cached_plans().await;
+        self.invalidate_cached_results_because(&ds_name, cause)
+            .await;
 
         tracing::info!("Unloaded dataset {}", &ds_name);
         let engine = ds_acceleration.map_or_else(
@@ -1371,7 +1631,11 @@ impl Runtime {
                 // Drain that generation and initialize a fresh one rather than reuse its status.
                 let bootstrap = if bootstrap.is_consumed() {
                     if !Arc::clone(&self)
-                        .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                        .remove_dataset(
+                            ds.name.clone(),
+                            ds.acceleration.as_ref(),
+                            CacheInvalidation::Reload,
+                        )
                         .await
                     {
                         return;
@@ -1391,6 +1655,7 @@ impl Runtime {
                     .remove_dataset_with_bootstrap(
                         ds.name.clone(),
                         ds.acceleration.as_ref(),
+                        CacheInvalidation::Reload,
                         &bootstrap,
                     )
                     .await
@@ -1441,15 +1706,32 @@ impl Runtime {
     /// an operator learns that queries may keep being answered from the previous
     /// contents until `item_ttl` expires.
     async fn invalidate_cached_results_for(&self, dataset: &TableReference) {
-        if let Err(e) = self
-            .df
-            .caching()
-            .invalidate_for_table(dataset.clone())
-            .await
-        {
-            tracing::warn!(
-                "Dataset '{dataset}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {e}"
-            );
+        self.invalidate_cached_results_because(dataset, CacheInvalidation::Reload)
+            .await;
+    }
+
+    /// [`Self::invalidate_cached_results_for`], for a caller that is unloading the
+    /// dataset rather than reloading it — which is what the warning on the degrade
+    /// path has to say, because the two leave the operator observing different
+    /// things: a reload keeps answering from the previous contents, an unload keeps
+    /// answering at all.
+    async fn invalidate_cached_results_because(
+        &self,
+        dataset: &TableReference,
+        cause: CacheInvalidation,
+    ) {
+        let caching = self.df.caching();
+        // An unload takes the evicting path, which a `cache_key_type: sql` hit needs
+        // because such a hit is answered before planning and the plan cache therefore
+        // never reaches it. See [`cache::QueryResultsCacheProvider::evict_for_table`]
+        // for why the stale-serving window must not absorb an unload.
+        let outcome = match cause {
+            CacheInvalidation::Reload => caching.invalidate_for_table(dataset.clone()).await,
+            CacheInvalidation::Unload => caching.evict_for_table(dataset.clone()).await,
+        };
+
+        if let Err(e) = outcome {
+            tracing::warn!("{}", cache_invalidation_warning(dataset, cause, &e));
         }
     }
 
@@ -1783,10 +2065,12 @@ impl Runtime {
 
         let replicate = ds.replication.as_ref().is_some_and(|r| r.enabled);
         // FEDERATED TABLE
-        if !ds.is_accelerated() {
+        if !ds.is_accelerated() || bootstrap_status.is_pending() {
             // `on_schema_change` only governs accelerated datasets in v1: federated
             // queries always reflect the live source schema, so the policy is inert.
-            if ds.on_schema_change != crate::component::dataset::OnSchemaChange::Block {
+            if !ds.is_accelerated()
+                && ds.on_schema_change != crate::component::dataset::OnSchemaChange::Block
+            {
                 tracing::warn!(
                     dataset = %ds.name,
                     "`on_schema_change: {policy}` has no effect on non-accelerated datasets; it applies to accelerated datasets only",
@@ -1868,7 +2152,7 @@ impl Runtime {
                 crate::datafusion::Table::Accelerated {
                     source: data_connector,
                     federated_read_table,
-                    accelerated_table,
+                    accelerated_table: accelerated_table.map(Box::new),
                     secrets: self.secrets(),
                     bootstrap_status,
                     initial_partition_filters,
@@ -1967,14 +2251,6 @@ impl Runtime {
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
 
-        // Validate Cayenne snapshot consistency before initializing accelerators.
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
-            tracing::error!("{err}");
-            return;
-        }
-
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
         // Only the datasets this diff loads or updates are initialized: `mode: file_create`
@@ -2001,6 +2277,12 @@ impl Runtime {
         // or registers it. A dataset whose load was still retrying never
         // registered, so its new configuration is loaded below like an added
         // dataset's, retrying until its source answers, rather than updated once.
+        //
+        // A snapshot reader still waiting for its first publication is such a
+        // load: superseding it drops its bootstrap, so the source table it may
+        // have registered meanwhile is replaced below rather than kept serving
+        // the replaced configuration. Its runtime task has then ended, and only
+        // its registry entry is left to remove.
         let removed_datasets = current_app
             .datasets
             .iter()
@@ -2013,8 +2295,9 @@ impl Runtime {
             .chain(removed_datasets)
         {
             if self.dataset_loads.supersede(&name).await {
-                still_loading.insert(name);
+                still_loading.insert(name.clone());
             }
+            self.cancel_snapshot_bootstrap(&name).await;
         }
 
         let init_results = self
@@ -2073,16 +2356,16 @@ impl Runtime {
                     && (added_futures.contains_key(&parent)
                         || is_queued_localpod(&localpod_by_parent, &parent))
                 {
-                    // What `update_dataset` does around its own swap: a plan or result cached
-                    // over the table being unloaded must not answer once the chain below
-                    // registers its replacement. An accelerated dataset's initial refresh
-                    // invalidates again on completion; a pass-through one has only this.
-                    self.df.clear_cached_plans().await;
-                    self.invalidate_cached_results_for(&ds.name).await;
+                    // A plan or result cached over the table being unloaded must not
+                    // answer once the chain below registers its replacement;
+                    // `remove_dataset` discards both, after the deregistration. An
+                    // accelerated dataset's initial refresh invalidates again on
+                    // completion; a pass-through one has only this.
                     if !Arc::clone(&self)
                         .remove_dataset_with_bootstrap(
                             ds.name.clone(),
                             ds.acceleration.as_ref(),
+                            CacheInvalidation::Reload,
                             &bootstrap_status,
                         )
                         .await
@@ -2113,6 +2396,7 @@ impl Runtime {
                         .remove_dataset_with_bootstrap(
                             ds.name.clone(),
                             current_acceleration.as_ref(),
+                            CacheInvalidation::Reload,
                             &bootstrap_status,
                         )
                         .await
@@ -2136,28 +2420,50 @@ impl Runtime {
                     continue;
                 }
 
-                Arc::clone(&self)
-                    .update_dataset_with_bootstrap(Arc::clone(ds), bootstrap_status)
-                    .await;
-                continue;
+                if !bootstrap_status.is_pending() {
+                    Arc::clone(&self)
+                        .update_dataset_with_bootstrap(Arc::clone(ds), bootstrap_status)
+                        .await;
+                    continue;
+                }
+                // Keep the serving table until the replacement snapshot has been
+                // restored and its provider can be registered in place.
             }
 
-            // A superseded attempt can be dropped after it registered the table
-            // and before its load completed.
-            if still_loading.contains(&ds.name)
-                && !Arc::clone(&self)
+            // A snapshot reader keeps serving its table until the replacement snapshot
+            // has been restored, including when an earlier replacement was still
+            // waiting for its own: the superseded wait never registered anything, so
+            // the table is still the one that was serving before either change.
+            let pending = bootstrap_status.is_pending();
+            let serving = if still_loading.contains(&ds.name) && !pending {
+                // A superseded attempt can be dropped after it registered the table
+                // and before its load completed. Pending construction also owns
+                // storage without a catalog entry.
+                if !Arc::clone(&self)
                     .remove_dataset_with_bootstrap(
                         ds.name.clone(),
                         ds.acceleration.as_ref(),
+                        CacheInvalidation::Reload,
                         &bootstrap_status,
                     )
                     .await
-            {
-                continue;
-            }
-
-            self.status
-                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                {
+                    continue;
+                }
+                false
+            } else {
+                // A snapshot reader keeps serving its table until the replacement
+                // snapshot has been restored (see above).
+                self.df.table_exists(&ds.name)
+            };
+            self.status.update_dataset(
+                &ds.name,
+                if serving {
+                    status::ComponentStatus::Refreshing
+                } else {
+                    status::ComponentStatus::Initializing
+                },
+            );
 
             if let Some(parent) = localpod_parent(ds) {
                 localpod_by_parent
@@ -2173,14 +2479,18 @@ impl Runtime {
             let ds_clone = Arc::clone(ds);
             let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
             let load = self.dataset_loads.begin(&ds.name);
-            added_futures.insert(
-                resolve_table_reference(ds.name.clone()),
-                Box::pin(async move {
-                    runtime
-                        .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
-                        .await;
-                }),
-            );
+            let load_future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+                runtime
+                    .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
+                    .await;
+            });
+            let load_future = if pending {
+                self.track_snapshot_bootstrap(&ds.name, load_future, None)
+                    .await
+            } else {
+                load_future
+            };
+            added_futures.insert(resolve_table_reference(ds.name.clone()), load_future);
         }
 
         // Every queued `localpod` dataset loads behind its parent: a load this diff spawns
@@ -2204,6 +2514,7 @@ impl Runtime {
                         ds,
                         bootstrap_status,
                         &mut localpod_by_parent,
+                        ReplacesRegistration::Yes,
                     )
                 })
                 .collect();
@@ -2253,7 +2564,7 @@ impl Runtime {
                 // after it is removed; one added again reads its snapshots' metadata afresh.
                 self.snapshot_sources().forget(&ds_name);
                 Arc::clone(&self)
-                    .remove_dataset(ds_name, ds_acceleration.as_ref())
+                    .remove_dataset(ds_name, ds_acceleration.as_ref(), CacheInvalidation::Unload)
                     .await;
             }
         }
@@ -2271,13 +2582,19 @@ impl Runtime {
             ResolvedTableReference,
             Vec<(Arc<Dataset>, AcceleratorBootstrap)>,
         >,
+        replaces_registration: ReplacesRegistration,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let children: Vec<_> = localpod_by_parent
             .remove(&resolve_table_reference(ds.name.clone()))
             .unwrap_or_default()
             .into_iter()
             .map(|(child, child_status)| {
-                Arc::clone(&self).localpod_load_chain(child, child_status, localpod_by_parent)
+                Arc::clone(&self).localpod_load_chain(
+                    child,
+                    child_status,
+                    localpod_by_parent,
+                    replaces_registration,
+                )
             })
             .collect();
         let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
@@ -2292,8 +2609,11 @@ impl Runtime {
             // The registration this dataset reads through has just been replaced, so mark its
             // results-cache clock again, as `update_dataset` does after its swap: a result read
             // from the previous registration after the mark above must not be stored as fresh.
-            // For a dataset new to this apply the mark is a no-op.
-            self.invalidate_cached_results_for(&name).await;
+            // For a dataset new to this apply the mark is a no-op; at startup there is no previous
+            // registration, so it is skipped.
+            if replaces_registration == ReplacesRegistration::Yes {
+                self.invalidate_cached_results_for(&name).await;
+            }
             join_all(children).await;
         })
     }
@@ -2440,12 +2760,18 @@ pub struct RegisterDatasetContext {
 /// signal is closed when it is built and the waiter resolves at once rather than
 /// spending the bound.
 ///
-/// Returns `Ok(())` when the table loaded (or the runtime is shutting down), and
-/// [`Error::HotReloadRefreshTimedOut`] when the table is still unloaded once
-/// there is nothing left to wait for, which drops the in-place swap in favour of
-/// a full reload. That is either the bound expiring or the new table being
-/// dropped before its first refresh: waiting out the rest of the bound on a
-/// table nobody can refresh only delays the same verdict.
+/// Returns `Ok(())` when the table loaded (or the runtime is shutting down).
+///
+/// When the table is still unloaded once there is nothing left to wait for,
+/// drops the in-place swap in favour of a full reload:
+/// - [`Error::HotReloadRefreshFailed`] for a terminal refresh failure (or the
+///   new table being dropped before its first refresh), so an immediate load
+///   failure is not reported as a timeout.
+/// - [`Error::HotReloadRefreshTimedOut`] when the bound expires with no
+///   completion.
+///
+/// Waiting out the rest of the bound on a table nobody can refresh only delays
+/// the same verdict.
 async fn await_hot_reload_initial_refresh(
     dataset_name: &TableReference,
     initial_load_completed: &(dyn Fn() -> bool + Sync),
@@ -2457,15 +2783,19 @@ async fn await_hot_reload_initial_refresh(
         return Ok(());
     }
 
+    let mut wait_outcome = None;
     tokio::select! {
         // A `RefreshCompletionWaiter` for any completion is satisfied by a
-        // refresh that finished before this wait began, so the load cannot be
-        // missed by arriving here late. An abandoned wait falls through to the
-        // flag re-check below rather than returning: every recorder is gone, so
-        // no refresh is coming, but a load that landed before they went still
-        // counts.
-        outcome = completion.wait() => if outcome.is_answered() {
-            return Ok(());
+        // *successful* refresh that finished before this wait began, so the
+        // load cannot be missed by arriving here late. An abandoned wait or a
+        // terminal failure falls through to the flag re-check below rather
+        // than returning: no successful load is coming, but a load that
+        // landed before the recorders went still counts.
+        outcome = completion.wait() => {
+            if outcome.is_answered() {
+                return Ok(());
+            }
+            wait_outcome = Some(outcome);
         },
         () = shutdown_token.cancelled() => return Ok(()),
         () = tokio::time::sleep(timeout) => {}
@@ -2476,6 +2806,18 @@ async fn await_hot_reload_initial_refresh(
     // leaves a table that must not be discarded.
     if initial_load_completed() {
         return Ok(());
+    }
+
+    // A terminal failure (or abandoned wait) ended immediately — do not claim
+    // the bound expired.
+    if matches!(
+        wait_outcome,
+        Some(RefreshCompletionOutcome::TerminalFailure | RefreshCompletionOutcome::Abandoned)
+    ) {
+        return HotReloadRefreshFailedSnafu {
+            dataset: dataset_name.clone(),
+        }
+        .fail();
     }
 
     HotReloadRefreshTimedOutSnafu {
@@ -2803,6 +3145,35 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 /// Whether a dataset's `drasi:` block is live.
 fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
+}
+
+/// A dataset's pending load, as startup queues it before spawning.
+type PendingDatasetLoad = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Whether a `localpod` load chain runs over registrations a spicepod apply is replacing, whose
+/// cached results must be invalidated once each dataset reloads, or at startup, where nothing was
+/// registered before.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplacesRegistration {
+    Yes,
+    No,
+}
+
+/// Whether `ds`, or a `localpod` dataset queued anywhere below it, is still waiting for a
+/// snapshot's first publication, so its chain must not hold up component startup.
+fn localpod_chain_pending(
+    ds: &Dataset,
+    bootstrap_status: &AcceleratorBootstrap,
+    localpod_by_parent: &HashMap<ResolvedTableReference, Vec<(Arc<Dataset>, AcceleratorBootstrap)>>,
+) -> bool {
+    bootstrap_status.is_pending()
+        || localpod_by_parent
+            .get(&resolve_table_reference(ds.name.clone()))
+            .is_some_and(|children| {
+                children.iter().any(|(child, child_status)| {
+                    localpod_chain_pending(child, child_status, localpod_by_parent)
+                })
+            })
 }
 
 /// The dataset a `localpod` dataset reads through, resolved as the query engine resolves it (so
@@ -3460,14 +3831,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             _context: &dyn crate::dataconnector::ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-            let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                "id",
-                arrow_schema::DataType::Int64,
-                false,
-            )]));
-            let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
-                .expect("empty MemTable with a single column");
-            Ok(Arc::new(table) as Arc<dyn TableProvider>)
+            Ok(empty_table())
         }
     }
 
@@ -3507,6 +3871,21 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 
     fn spicepod_dataset(from: &str, name: &str) -> spicepod::component::dataset::Dataset {
         spicepod::component::dataset::Dataset::new(from, name)
+    }
+
+    /// An empty single-column table: a schema for a connector to answer with, and a real
+    /// registration for the removal path to deregister rather than passing over a name
+    /// that was never there.
+    fn empty_table() -> Arc<dyn TableProvider> {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        Arc::new(
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
+                .expect("empty MemTable with a single column"),
+        )
     }
 
     /// Regression test for #12862: `apply_dataset_diff` awaited each added
@@ -4101,6 +4480,35 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             .expect("a load that lands at the bound must not discard the table");
         }
 
+        /// A one-shot load failure must not accept the unloaded table. Recording
+        /// that failure as an ordinary completion would return `Ok` here.
+        #[tokio::test(start_paused = true)]
+        async fn a_terminal_failure_does_not_accept_an_unloaded_table() {
+            let completion = RefreshCompletion::new();
+            completion.record_terminal_failure(completion.issue());
+
+            let started = tokio::time::Instant::now();
+            let err = await_hot_reload_initial_refresh(
+                &reloading(),
+                &|| false,
+                completion.any(),
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect_err("a failed one-shot load is not a loaded table");
+
+            assert!(
+                matches!(err, Error::HotReloadRefreshFailed { .. }),
+                "expected a terminal refresh failure, got: {err}"
+            );
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "a terminal failure must end the wait immediately, not spend the bound"
+            );
+        }
+
         /// Shutdown ends the wait without reporting a reload failure.
         #[tokio::test(start_paused = true)]
         async fn shutdown_ends_the_wait() {
@@ -4280,6 +4688,55 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             is_permanent_dataset_failure(&err),
             "an out-of-vocabulary parameter value is a pure function of the Spicepod"
         );
+    }
+
+    /// Regression test for #14609: a source that is down when the dataset loads
+    /// reports `UnableToConnectInvalidHostOrPort`, which must not be a permanent
+    /// failure, so the dataset keeps retrying and recovers once the source is
+    /// reachable. Rejected credentials and TLS failures are configuration errors and
+    /// stay permanent.
+    #[test]
+    fn an_unreachable_source_stays_retriable_but_rejected_credentials_do_not() {
+        let component = crate::dataconnector::ConnectorComponent::Dataset(Arc::new(
+            crate::component::dataset::DatasetSpec::new(
+                "postgres:public.orders",
+                TableReference::bare("orders"),
+            ),
+        ));
+        let boxed =
+            |source: dataconnector::DataConnectorError| Error::UnableToInitializeDataConnector {
+                source: Box::new(source),
+            };
+
+        let unreachable = boxed(
+            dataconnector::DataConnectorError::UnableToConnectInvalidHostOrPort {
+                dataconnector: "postgres".to_string(),
+                connector_component: component.clone(),
+                host: "db".to_string(),
+                port: "5432".to_string(),
+            },
+        );
+        assert!(
+            !is_permanent_dataset_failure(&unreachable),
+            "a source that cannot be reached right now must be retried: {unreachable}"
+        );
+
+        for configuration_error in [
+            dataconnector::DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                dataconnector: "postgres".to_string(),
+                connector_component: component.clone(),
+            },
+            dataconnector::DataConnectorError::UnableToConnectTlsError {
+                dataconnector: "postgres".to_string(),
+                connector_component: component,
+            },
+        ] {
+            let err = boxed(configuration_error);
+            assert!(
+                is_permanent_dataset_failure(&err),
+                "a credential or TLS misconfiguration must not be retried: {err}"
+            );
+        }
     }
 
     /// An error type neither downcast recognises must not be assumed permanent —
@@ -5072,4 +5529,130 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             "both datasets of the cycle are selected"
         );
     }
+
+    /// #14251: deregistering the table is not what stops it being read. A cached logical
+    /// plan holds the `TableSource` it was planned against, so a query executed before the
+    /// removal keeps answering from the retired provider, while a *new* query correctly
+    /// fails to plan and `information_schema.tables` no longer lists the dataset.
+    ///
+    /// Scope: this asserts the cached plan, and nothing about memory. The reproduction on
+    /// #14251 shows a query-pool reservation still held after both caches are cleared, so
+    /// some other holder keeps it; this test's empty `MemTable` reserves nothing and could
+    /// not tell either way.
+    ///
+    /// Before the fix this read `Some(1)`: `update_dataset` and `remove_view` both discard
+    /// cached plans, and the removal arm was the one that did not.
+    #[tokio::test]
+    async fn removing_a_dataset_discards_cached_plans() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let name = TableReference::bare("removed_ds");
+        runtime
+            .df
+            .ctx
+            .register_table(name.clone(), empty_table())
+            .expect("the table registers");
+
+        runtime
+            .df
+            .cache_one_plan("SELECT id FROM removed_ds")
+            .await
+            .expect("the query plans while the dataset is registered");
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+
+        Arc::clone(&runtime)
+            .apply_dataset_diff(&app_with_datasets(&["removed_ds"]), &app_with_datasets(&[]))
+            .await;
+
+        assert!(
+            !runtime.df.table_exists(&name),
+            "the premise: the dataset really was unloaded"
+        );
+        assert_eq!(
+            runtime.df.cached_plan_count().await,
+            Some(0),
+            "a plan cached over the removed dataset still resolves through its retired provider, so an already-executed query keeps answering from a dataset the catalog no longer lists"
+        );
+
+        // What the operator actually observes. Going back through the same cache key is the
+        // whole defect: on `trunk` this returns the stale plan and the query answers rows,
+        // which is why asserting only on the count above would be a weaker claim than the
+        // issue makes.
+        let replanned = runtime.df.cache_one_plan("SELECT id FROM removed_ds").await;
+        let err = replanned.expect_err(
+            "the previously executed SQL must be replanned against the catalog, which no longer has the dataset",
+        );
+        assert!(
+            err.to_string().contains("removed_ds"),
+            "and it must fail for the reason a new query fails — table not found: {err}"
+        );
+    }
+
+    /// The premise the test above rests on: the discard belongs to the *removal*, not to
+    /// applying a diff. Were `apply_dataset_diff` to clear unconditionally, the assertion
+    /// above would hold for a reason that has nothing to do with `remove_dataset`.
+    #[tokio::test]
+    async fn an_apply_that_removes_no_dataset_keeps_cached_plans() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
+
+        Arc::clone(&runtime)
+            .apply_dataset_diff(&app_with_datasets(&[]), &app_with_datasets(&[]))
+            .await;
+
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+    }
+
+    /// The warning is the only account an operator gets of why a dataset that is gone keeps
+    /// answering, so it has to say *that*, not that the dataset "is updating" — which is what
+    /// the one shared message said before the unload path had its own.
+    #[test]
+    fn a_failed_unload_invalidation_says_the_dataset_keeps_answering() {
+        let dataset = TableReference::partial("public", "orders");
+        let unload = cache_invalidation_warning(
+            &dataset,
+            CacheInvalidation::Unload,
+            &"cache backend unavailable",
+        );
+        assert!(
+            unload.contains("'public.orders'"),
+            "the dataset is named, and quoted so an empty or word-like name survives: {unload}"
+        );
+        assert!(
+            unload.contains("unloaded"),
+            "an operator reading this must not be told the dataset is updating: {unload}"
+        );
+        assert!(
+            unload.contains("cache backend unavailable"),
+            "the cause is carried: {unload}"
+        );
+        assert!(!unload.contains('\n'), "one log line: {unload}");
+
+        let reload = cache_invalidation_warning(
+            &dataset,
+            CacheInvalidation::Reload,
+            &"cache backend unavailable",
+        );
+        assert!(
+            reload.contains("is updating") && reload.contains("previous contents"),
+            "the reload wording is unchanged, so an operator's existing alert keeps matching: {reload}"
+        );
+    }
+
+    /// An app declaring `names` as `file:` datasets. The `from` never has to resolve: the
+    /// removal arm reads only which names left the app.
+    fn app_with_datasets(names: &[&str]) -> Arc<App> {
+        let mut builder = app::AppBuilder::new("dataset_removal");
+        for name in names {
+            builder = builder.with_dataset(spicepod_dataset("file:data.csv", name));
+        }
+        Arc::new(builder.build())
+    }
 }
+
+#[cfg(all(test, feature = "snapshots", feature = "duckdb"))]
+#[path = "dataset_snapshot_bootstrap_tests.rs"]
+mod snapshot_bootstrap_tests;

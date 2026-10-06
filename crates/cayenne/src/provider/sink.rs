@@ -176,7 +176,7 @@ impl DataSink for CayenneDataSink {
         if self.table.is_memory_resident_mode() {
             let overwrite = self.overwrite == InsertOp::Overwrite;
             let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
-            let mut incoming_bytes: u64 = 0;
+            let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
             // Acquire the write lock BEFORE draining so memory-mode writes are
             // serialized during buffering: two concurrent writes must not each buffer
             // a large payload while both pass `enforce_memory_limit` against the same
@@ -189,7 +189,7 @@ impl DataSink for CayenneDataSink {
             // memory-mode writers are serialized on exactly this lock, so taking it
             // first is what makes that snapshot current rather than one write stale.
             // Nothing under `prepare_stream_for_insert` takes `write_lock`.
-            let _write_guard = self.table.write_lock().lock().await;
+            let write_guard = self.table.write_lock().lock().await;
 
             // An APPEND must run primary-key conflict detection, so `on_conflict`
             // is honoured: the validation records which resident rows the incoming
@@ -214,8 +214,8 @@ impl DataSink for CayenneDataSink {
 
             while let Some(batch) = data.next().await {
                 let batch = batch?;
-                incoming_bytes =
-                    incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+                incoming.add(&batch);
+                let incoming_bytes = incoming.total();
                 // Enforce the hard RAM bound while buffering so an oversized refresh
                 // fails fast with a structured error instead of OOMing during
                 // collection (memory mode never spills). Always count resident +
@@ -241,7 +241,7 @@ impl DataSink for CayenneDataSink {
 
             let rows = self
                 .table
-                .write_batches_memory_mode(batches, incoming_bytes, overwrite, &deletions)
+                .write_batches_memory_mode(batches, incoming.total(), overwrite, &deletions)
                 .await
                 .map_err(datafusion_common::DataFusionError::from)?;
 
@@ -252,6 +252,10 @@ impl DataSink for CayenneDataSink {
                 let record_seq = self.table.sequence_high_water().await;
                 self.table.record_mem_tier_pk_keys(&keys, record_seq);
             }
+            drop(write_guard);
+            // Memory mode arms retention here — see the method's own doc for why nowhere
+            // else can (#14045).
+            self.table.arm_retention_after_memory_resident_write();
             return Ok(rows);
         }
 
