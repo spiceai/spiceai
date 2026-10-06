@@ -456,11 +456,10 @@ struct UpsertOutcome {
 enum CoalescedRunOutcome {
     /// Written (and committers handed off); continue with the next group.
     Applied,
-    /// The group was skipped without acking (concat failure) — the rest of
-    /// the run must also be skipped so later commits can't advance the source
-    /// offset past the unapplied envelopes. The stream itself continues.
-    SkipRun,
-    /// Fatal: stop the stream.
+    /// Fatal: drop unacked committers and stop the stream. Required whenever
+    /// a group is discarded without acknowledging — continuing would let a
+    /// later burst ack past the gap, and a source that tracks delivered
+    /// envelopes (MySQL shared dump) would skip the window on reconnect.
     Stop,
 }
 
@@ -2255,8 +2254,9 @@ impl RefreshTask {
         // requires equal schemas. When the dataset's policy allows evolution,
         // split the run into contiguous same-schema groups applied in order —
         // the common case stays a single group. With `block` (or no installed
-        // settings) the run is one group and a mixed-schema concat keeps
-        // today's error/skip behavior verbatim.
+        // settings) the run is one group and a mixed-schema concat fails the
+        // write path and stops the stream so the source redelivers after the
+        // member re-registers.
         let split_on_schema_change = cdc_schema_evolution_for(context.dataset_name)
             .is_some_and(|evolution| !matches!(evolution.policy, OnSchemaChange::Block));
         let groups = group_run_by_schema(batches, committers, split_on_schema_change);
@@ -2266,7 +2266,7 @@ impl RefreshTask {
             // batches (no extra build — `into_parts` already built them);
             // `num_rows_hint()` would over-count a PK-changing UPDATE as two
             // rows. Computed before `apply_coalesced_run` consumes the batches,
-            // but recorded only AFTER the group applies, so a SkipRun/Stop
+            // but recorded only AFTER the group applies, so a Stop
             // failure can't inflate the throughput metric with rows that were
             // never written.
             let group_rows = group_batches
@@ -2286,10 +2286,6 @@ impl RefreshTask {
                     metrics::CDC_APPLY_BURST_ROWS_TOTAL
                         .add(group_rows, context.metric_labels.dataset());
                 }
-                // A skipped group's committers were dropped without acking —
-                // later groups must not apply (their commits would advance the
-                // source offset past the skipped, unapplied envelopes).
-                CoalescedRunOutcome::SkipRun => return true,
                 CoalescedRunOutcome::Stop => return false,
             }
         }
@@ -2334,10 +2330,13 @@ impl RefreshTask {
                         status::ComponentStatus::error_with_message(error_message),
                     )
                     .await;
-                    // Drop committers without acking — the source will
-                    // re-send these envelopes on reconnect, and CDC apply
-                    // is idempotent at the upsert/delete level.
-                    return CoalescedRunOutcome::SkipRun;
+                    // Drop committers without acking and stop the stream. A
+                    // continued stream would leave a source delivered
+                    // watermark ahead of this unapplied window; reconnect
+                    // replay would then skip it. Stopping drops the receiver
+                    // so the member re-registers and delivered resets with
+                    // committed (see `AckSlot::routes`).
+                    return CoalescedRunOutcome::Stop;
                 }
             }
         };
@@ -3453,8 +3452,8 @@ fn group_run_by_schema(
 /// `insert_into` call. All batches in a single CDC stream share the same
 /// `changes_schema(table_schema)`, so the schema check inside
 /// `arrow::compute::concat_batches` will not fail in normal operation; if it
-/// does we surface the error and let the caller skip committing those
-/// envelopes (the source will redeliver them).
+/// does we surface the error and the caller stops the stream so the source
+/// redelivers after the member re-registers.
 fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<ChangeBatch> {
     debug_assert!(
         !batches.is_empty(),
@@ -7473,11 +7472,12 @@ mod tests {
         );
     }
 
-    /// Without an evolution policy installed, a mixed-schema run keeps
-    /// today's behavior verbatim: the concat fails, the run is skipped with
-    /// no commits (the source redelivers), and the dataset status is error.
+    /// Without an evolution policy installed, a mixed-schema run fails
+    /// concat, commits nothing, marks the dataset error, and stops the
+    /// stream so a source that tracks delivered envelopes can re-register
+    /// and redeliver the window.
     #[tokio::test]
-    async fn test_apply_envelope_run_mixed_schemas_without_policy_keeps_error_skip() {
+    async fn test_apply_envelope_run_mixed_schemas_without_policy_stops_stream() {
         let dataset_name = TableReference::bare("schema_evo_mixed_block");
         let metric_labels = DatasetMetricLabels::new(&dataset_name);
         let task = make_refresh_task_named(
@@ -7521,8 +7521,8 @@ mod tests {
             .await;
 
         assert!(
-            applied,
-            "concat failure skips the run but does not stop the stream"
+            !applied,
+            "concat failure must stop the stream so later commits cannot skip an uncommitted gap"
         );
         assert!(
             context.pending_commit.is_none(),
