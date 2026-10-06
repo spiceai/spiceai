@@ -37,7 +37,7 @@ use data_components::postgres_replication::{
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::parameters::ConnectorContext;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use futures::StreamExt;
 use opentelemetry::KeyValue;

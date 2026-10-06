@@ -211,8 +211,7 @@ fn batch_size() -> usize {
 /// query, and which would otherwise sit inside every number below including
 /// `plan_only`.
 fn ctx_for(table: &Arc<CayenneTableProvider>) -> SessionContext {
-    let mut config = datafusion::prelude::SessionConfig::new();
-    config.options_mut().execution.batch_size = batch_size();
+    let config = datafusion::prelude::SessionConfig::new().with_batch_size(batch_size());
     let ctx = SessionContext::new_with_config(config);
     ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
         .expect("register");

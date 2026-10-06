@@ -18,6 +18,7 @@ limitations under the License.
 // (the runtime's Cayenne catalog connector) can seed the adaptive-tuning knobs from
 // the same hardware-derived profile this accelerator path uses.
 pub(crate) mod autotune;
+mod change_sink;
 mod imds;
 pub mod partitioned_insert_strategy;
 pub mod s3;
@@ -2977,7 +2978,7 @@ fn native_vector_indexes_for_schema(
                 .map(|(_, f)| f.as_ref().clone())
         })
         .collect();
-    let table_ref = datafusion::sql::TableReference::bare(table_name.to_string());
+    let table_ref = datafusion::common::TableReference::bare(table_name.to_string());
 
     schema
         .fields()
@@ -3275,6 +3276,31 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
 
 #[async_trait]
 impl DataAccelerator for CayenneAccelerator {
+    async fn change_sink(
+        &self,
+        context: runtime_acceleration::change_sink::ChangeSinkContext,
+        runtime: &tokio::runtime::Handle,
+        capacity: usize,
+    ) -> datafusion::error::Result<Option<runtime_acceleration::change_sink::ChangeSink>> {
+        let backend = change_sink::CayenneChangeSinkBackend::try_new(context.clone())
+            .unwrap_or_else(|| {
+                let schema_evolution = change_sink::provider_schema_evolution(&context.table);
+                Arc::new(
+                    runtime_acceleration::change_sink::provider::ProviderChangeSinkBackend::new(
+                        context,
+                    )
+                    .with_ordered_replacement()
+                    .with_schema_evolution(schema_evolution),
+                )
+            });
+        Ok(Some(runtime_acceleration::change_sink::ChangeSink::new(
+            backend,
+            util::session_state::session_context(),
+            runtime,
+            capacity,
+        )))
+    }
+
     async fn adaptive_tuning_seeds(
         &self,
         tuning: Option<&str>,

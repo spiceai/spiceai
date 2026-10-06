@@ -29,12 +29,12 @@ use arrow::array::RecordBatch;
 use chrono::{DateTime, Utc};
 use datafusion::{
     catalog::TableProvider,
+    common::TableReference,
     datasource::DefaultTableSource,
     error::DataFusionError,
     execution::SessionStateBuilder,
     logical_expr::LogicalPlanBuilder,
     prelude::{DataFrame, SessionContext, col, lit},
-    sql::TableReference,
 };
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
