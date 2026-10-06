@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Guard for the DataFusion fork's metadata-column pruning patch
+//! Guard for the `DataFusion` fork's metadata-column pruning patch
 //! (spiceai/datafusion#229): a `_last_modified`/`_size`/`_location` predicate must
 //! prune the object-store listing before any file is opened, rather than falling
 //! back to a row-level `FilterExec` that opens every file (see

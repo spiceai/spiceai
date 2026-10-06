@@ -408,7 +408,7 @@ impl TableProvider for LocationPruningListingTable {
         let non_location_metadata: Vec<&str> = options
             .metadata_cols
             .iter()
-            .map(|c| c.name())
+            .map(datafusion_datasource::metadata::MetadataColumn::name)
             .filter(|name| *name != "_location")
             .collect();
 
@@ -537,6 +537,7 @@ impl TableProvider for LocationPruningListingTable {
                 meta,
                 &metadata_filters,
                 metadata_cols,
+                state.execution_props(),
             )?
             else {
                 continue;
@@ -4091,6 +4092,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_location_pushdown_stays_inexact_for_other_metadata_filters() {
+        use datafusion_expr::{col, lit};
         // `scan`'s head()-based fast path only ever applies the `_location`
         // predicates it can extract — it never evaluates any other filter. A
         // `_last_modified` predicate combined with a `_location` predicate must
@@ -4141,7 +4143,6 @@ mod tests {
             ".parquet",
         );
 
-        use datafusion_expr::{col, lit};
         let location_filter = col("_location").eq(lit("s3://bucket/prefix/file.parquet"));
         let last_modified_filter = col("_last_modified").gt(lit(
             ScalarValue::TimestampMicrosecond(Some(0), Some("UTC".into())),
@@ -5414,7 +5415,7 @@ mod tests {
     /// Regression matrix for the object-store request pattern of the `_location`
     /// fast path and the metadata-column prune (spiceai/spiceai#14264):
     ///
-    /// | # | predicate                                  | LIST | opens the file? | residual FilterExec |
+    /// | # | predicate                                  | LIST | opens the file? | residual `FilterExec` |
     /// |---|--------------------------------------------|------|-----------------|---------------------|
     /// | 1 | `_location = X`                            | no   | yes             | no                  |
     /// | 2 | `_location = X AND _last_modified > W`     | no   | only if it passes W | no              |
@@ -5480,6 +5481,10 @@ mod tests {
                 );
                 self.list_calls.fetch_add(1, Ordering::SeqCst);
                 let prefix = prefix.cloned();
+                #[expect(
+                    clippy::needless_collect,
+                    reason = "the returned stream is 'static and cannot borrow self"
+                )]
                 let metas: Vec<_> = self
                     .metas
                     .iter()
@@ -5572,7 +5577,7 @@ mod tests {
             create_meta("prefix/new.csv", 2_000_000_000, 20)
         }
 
-        fn provider(ctx: &SessionContext, store: Arc<MatrixStore>) -> LocationPruningListingTable {
+        fn provider(ctx: &SessionContext, store: &Arc<MatrixStore>) -> LocationPruningListingTable {
             let store_url = Url::parse("s3://bucket").expect("store url");
             ctx.runtime_env()
                 .register_object_store(&store_url, Arc::clone(&store) as Arc<dyn ObjectStore>);
@@ -5586,7 +5591,6 @@ mod tests {
             let options =
                 ListingOptions::new(Arc::new(CsvFormat::default()) as Arc<dyn FileFormat>)
                     .with_file_extension(".csv")
-                    .with_collect_stat(false)
                     .with_table_partition_cols(vec![])
                     .with_metadata_cols(vec![
                         DfMeta::Location(Some("s3://bucket/".into())),
@@ -5611,8 +5615,10 @@ mod tests {
         /// Plan `sql` against a freshly registered provider and return the indented
         /// physical plan string.
         async fn plan_of(store: Arc<MatrixStore>, sql: &str) -> String {
-            let ctx = SessionContext::new();
-            ctx.register_table("t", Arc::new(provider(&ctx, store)))
+            let ctx = SessionContext::new_with_config(
+                datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+            );
+            ctx.register_table("t", Arc::new(provider(&ctx, &store)))
                 .expect("register table");
             let plan = ctx
                 .sql(sql)
