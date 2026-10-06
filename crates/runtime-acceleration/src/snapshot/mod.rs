@@ -6808,7 +6808,7 @@ mod tests {
         let newer = manager
             .create_snapshot_as_writer(
                 &schema,
-                Arc::clone(&mutex).lock_owned().await,
+                Arc::clone(&mutex).lock_owned().await.into(),
                 None,
                 None,
                 ForceCreate(true),
@@ -6823,7 +6823,7 @@ mod tests {
         let older = manager
             .create_snapshot_as_writer(
                 &schema,
-                Arc::clone(&mutex).lock_owned().await,
+                Arc::clone(&mutex).lock_owned().await.into(),
                 None,
                 None,
                 ForceCreate(true),

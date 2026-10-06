@@ -811,7 +811,7 @@ struct SnapshotSweepPins {
 }
 
 /// Keeps maintenance from deleting the table's files until dropped, then reruns
-/// the snapshot-directory sweeps it may have deferred.
+/// the snapshot-directory sweeps it deferred.
 /// See [`CayenneTableProvider::pin_for_snapshot`].
 pub struct SnapshotArchivePin {
     guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
@@ -821,11 +821,24 @@ pub struct SnapshotArchivePin {
 impl Drop for SnapshotArchivePin {
     fn drop(&mut self) {
         drop(self.guard.take());
-        if tokio::runtime::Handle::try_current().is_ok() {
+        let rerun = {
+            let mut pins = self.table.snapshot_pins.lock();
+            pins.held = pins.held.saturating_sub(1);
+            pins.held == 0 && std::mem::take(&mut pins.deferred)
+        };
+        if rerun && tokio::runtime::Handle::try_current().is_ok() {
             self.table.sweep_retired_snapshot_dirs();
             self.table.schedule_old_snapshot_cleanup();
         }
     }
+}
+
+/// Snapshot pins held on a table, and whether a snapshot-directory sweep skipped
+/// its pass for one.
+#[derive(Default)]
+struct SnapshotPins {
+    held: usize,
+    deferred: bool,
 }
 
 /// What one superseded-snapshot sweep must preserve.
@@ -2594,10 +2607,12 @@ pub struct CayenneTableProvider {
     /// on the dedicated compaction runtime; a signal raised while it runs marks
     /// the state dirty so the worker takes another pass against the newer floor.
     orphan_dv_sweep_state: Arc<AtomicU8>,
-    /// Held shared by a [`SnapshotArchivePin`] and exclusively while maintenance
-    /// deletes files: the orphaned-DV sweep waits for it, the snapshot-directory
-    /// sweeps skip the pass when it is held.
-    file_reclaim_fence: Arc<tokio::sync::RwLock<()>>,
+    /// Held shared by a [`SnapshotArchivePin`] and exclusively by the orphaned-DV
+    /// sweep while it unlinks, so the sweep never removes a file being archived.
+    orphan_dv_sweep_fence: Arc<tokio::sync::RwLock<()>>,
+    /// Snapshot pins held; the snapshot-directory sweeps skip their pass while any
+    /// is, and the last pin to drop reruns them.
+    snapshot_pins: Arc<ParkingMutex<SnapshotPins>>,
     /// Admission gate for the footprint sample, throttling it to
     /// [`FOOTPRINT_SAMPLE_MIN_INTERVAL`].
     ///
@@ -6578,10 +6593,6 @@ impl CayenneTableProvider {
     /// never propagated — a failed sweep costs disk, not correctness, and the
     /// next commit retries it.
     async fn run_old_snapshot_cleanup(&self) {
-        // Rerun by the snapshot pin when it drops.
-        let Ok(_reclaim) = Arc::clone(&self.file_reclaim_fence).try_write_owned() else {
-            return;
-        };
         let (protected_snapshot_ids, in_use_snapshot_ids) = self.snapshot_cleanup_pins();
         let pins = SnapshotSweepPins {
             current_snapshot_id: self.get_current_snapshot_id(),
@@ -6589,6 +6600,9 @@ impl CayenneTableProvider {
             in_use_snapshot_ids,
             grace: Self::SNAPSHOT_CLEANUP_GRACE,
         };
+        if self.defer_for_snapshot_pin() {
+            return;
+        }
 
         let swept = if self.table_metadata.path.starts_with("s3://") {
             self.cleanup_old_snapshots_s3(&pins).await
@@ -7257,11 +7271,9 @@ impl CayenneTableProvider {
         // live snapshot references its files in place, or fail the unlink — so an
         // outcome recorded at this point would report a reclaim that never
         // happened. It is emitted once the task knows what it actually removed.
-        // A snapshot being archived may reference a directory retired after its
-        // slice was exported; its pin reruns this sweep when it drops.
-        let Ok(reclaim) = Arc::clone(&self.file_reclaim_fence).try_write_owned() else {
+        if self.defer_for_snapshot_pin() {
             return;
-        };
+        }
         let sweep_table_name = self.table_metadata.table_name.clone();
         // The LIVE snapshot set whose manifests pin files alive: the current
         // snapshot plus every protected snapshot. Built here (under the same
@@ -7277,7 +7289,6 @@ impl CayenneTableProvider {
         let last_listed = Arc::clone(&self.snapshot_last_listed);
         let catalog = Arc::clone(&self.catalog);
         tokio::spawn(async move {
-            let _reclaim = reclaim;
             // Ref-count source: every manifest row for the table, so a file a
             // retired dir holds but a LIVE snapshot references in place (an
             // in-place compaction reference) is NOT unlinked. An empty manifest
@@ -9460,7 +9471,8 @@ impl CayenneTableProvider {
             protected_merge_claims: Arc::new(ParkingMutex::new(ProtectedMergeClaims::default())),
             post_write_compaction_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
             orphan_dv_sweep_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
-            file_reclaim_fence: Arc::new(tokio::sync::RwLock::new(())),
+            orphan_dv_sweep_fence: Arc::new(tokio::sync::RwLock::new(())),
+            snapshot_pins: Arc::new(ParkingMutex::new(SnapshotPins::default())),
             footprint_sample_gate: Arc::new(SampleGate::default()),
             data_dir_sample_gate: Arc::new(SampleGate::default()),
             in_memory_sample_gate: Arc::new(SampleGate::default()),
@@ -11537,7 +11549,8 @@ impl CayenneTableProvider {
             protected_merge_claims: Arc::clone(&self.protected_merge_claims),
             post_write_compaction_state: Arc::clone(&self.post_write_compaction_state),
             orphan_dv_sweep_state: Arc::clone(&self.orphan_dv_sweep_state),
-            file_reclaim_fence: Arc::clone(&self.file_reclaim_fence),
+            orphan_dv_sweep_fence: Arc::clone(&self.orphan_dv_sweep_fence),
+            snapshot_pins: Arc::clone(&self.snapshot_pins),
             footprint_sample_gate: Arc::clone(&self.footprint_sample_gate),
             data_dir_sample_gate: Arc::clone(&self.data_dir_sample_gate),
             in_memory_sample_gate: Arc::clone(&self.in_memory_sample_gate),
@@ -19658,10 +19671,22 @@ impl CayenneTableProvider {
     /// slice references is deleted under the archive. Waits for an in-flight
     /// deletion to finish.
     pub async fn pin_for_snapshot(&self) -> SnapshotArchivePin {
+        let guard = Arc::clone(&self.orphan_dv_sweep_fence).read_owned().await;
+        self.snapshot_pins.lock().held += 1;
         SnapshotArchivePin {
-            guard: Some(Arc::clone(&self.file_reclaim_fence).read_owned().await),
+            guard: Some(guard),
             table: self.clone_for_write(),
         }
+    }
+
+    /// Whether a snapshot-directory sweep must skip its pass for a snapshot pin;
+    /// the last pin to drop reruns it. Call after reading the current snapshot:
+    /// a slice exported under a later pin cannot reference a directory already
+    /// retired by then.
+    fn defer_for_snapshot_pin(&self) -> bool {
+        let mut pins = self.snapshot_pins.lock();
+        pins.deferred |= pins.held > 0;
+        pins.held > 0
     }
 
     /// Signal that orphaned key-based deletion vectors may now exist: a
@@ -20004,7 +20029,7 @@ impl CayenneTableProvider {
         // Wait for any acceleration snapshot archiving this table; held until the
         // catalog rows are removed, so a snapshot sees both the file and its row or
         // neither.
-        let _reclaim = self.file_reclaim_fence.write().await;
+        let _reclaim = self.orphan_dv_sweep_fence.write().await;
 
         // Unlink the `.arrow` file FIRST, then remove its catalog row. A crash in
         // the non-atomic window leaves a DISCOVERABLE dangling row (file gone, row
@@ -39822,13 +39847,8 @@ mod tests {
             .store(COALESCED_TASK_IDLE, Ordering::Release);
     }
 
-    /// The retired-snapshot sweep keeps a retired directory while a snapshot pin
-    /// is held, because the archive may reference it; dropping the pin reruns it.
-    #[tokio::test]
-    async fn snapshot_pin_defers_the_retired_snapshot_sweep() {
-        let ctx = SessionContext::new();
-        let (provider, _tmp, _ids) =
-            build_seq_prefix_fixture("snapshot_pin", ctx.runtime_env(), &[10]).await;
+    /// A retired snapshot directory past its grace period, with one file.
+    fn seed_due_retired_dir(provider: &CayenneTableProvider) -> std::path::PathBuf {
         let retired = uuid::Uuid::now_v7().to_string();
         let dir = provider.snapshot_dir_path_for(&retired);
         std::fs::create_dir_all(&dir).expect("create retired dir");
@@ -39839,6 +39859,29 @@ mod tests {
                 .checked_sub(Duration::from_secs(60))
                 .expect("retired a minute ago"),
         );
+        dir
+    }
+
+    async fn wait_until_removed(dir: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while dir.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the sweep removes {}",
+                dir.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The retired-snapshot sweep keeps a retired directory while a snapshot pin
+    /// is held, because the archive may reference it; dropping the pin reruns it.
+    #[tokio::test]
+    async fn snapshot_pin_defers_the_retired_snapshot_sweep() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) =
+            build_seq_prefix_fixture("snapshot_pin", ctx.runtime_env(), &[10]).await;
+        let dir = seed_due_retired_dir(&provider);
 
         let pin = provider.pin_for_snapshot().await;
         provider.clone_for_write().sweep_retired_snapshot_dirs();
@@ -39846,14 +39889,21 @@ mod tests {
         assert!(dir.exists(), "the sweep must keep the dir while pinned");
 
         drop(pin);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while dir.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "the sweep removes the dir once unpinned"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_until_removed(&dir).await;
+    }
+
+    /// An orphaned-DV sweep in progress does not hold off the retired-snapshot
+    /// sweep; only a snapshot pin does.
+    #[tokio::test]
+    async fn orphan_dv_sweep_does_not_defer_the_retired_snapshot_sweep() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) =
+            build_seq_prefix_fixture("snapshot_pin_dv", ctx.runtime_env(), &[10]).await;
+        let dir = seed_due_retired_dir(&provider);
+
+        let _dv_sweep = provider.orphan_dv_sweep_fence.write().await;
+        provider.sweep_retired_snapshot_dirs();
+        wait_until_removed(&dir).await;
     }
 
     /// Signalling a table whose worker is already running must record the signal
