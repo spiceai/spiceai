@@ -578,7 +578,10 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_key: Option<String>,
 
+    /// Deprecated, and removed in 3.0: a Cayenne acceleration keeps one row per
+    /// `primary_key`, the newest by `time_column` when the dataset sets one.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[cfg_attr(feature = "schemars", schemars(extend("deprecated" = true)))]
     pub on_conflict: HashMap<String, OnConflictBehavior>,
 
     #[serde(default, skip_serializing_if = "is_default_maintained_aggregates")]
