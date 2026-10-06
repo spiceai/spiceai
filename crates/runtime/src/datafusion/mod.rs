@@ -3361,16 +3361,26 @@ impl DataFusion {
                 retention.as_ref(),
                 retention_delete_expr.clone(),
             ) {
-                Ok(Some(keep)) => {
-                    keep.validate(&source_table_provider.schema()).context(
-                        RetentionUseSourceUntranslatableSnafu {
-                            dataset_name: dataset.name.to_string(),
-                            connector: dataset.source().to_string(),
-                        },
-                    )?;
-                    accelerated_table_builder.fallback_retention_keep(Some(keep));
+                Ok(keep) => {
+                    let keep = crate::accelerated::FallbackRetentionKeep::with_unscheduled_time(
+                        keep,
+                        declared_retention_runs,
+                        dataset.retention_period(),
+                        dataset.time_column.clone(),
+                        dataset.time_format,
+                        dataset.time_partition_column.clone(),
+                        dataset.time_partition_format,
+                    );
+                    if let Some(keep) = keep {
+                        keep.validate(&source_table_provider.schema()).context(
+                            RetentionUseSourceUntranslatableSnafu {
+                                dataset_name: dataset.name.to_string(),
+                                connector: dataset.source().to_string(),
+                            },
+                        )?;
+                        accelerated_table_builder.fallback_retention_keep(Some(keep));
+                    }
                 }
-                Ok(None) => {}
                 Err(source) => {
                     return Err(Error::RetentionUseSourceUntranslatable {
                         dataset_name: dataset.name.to_string(),

@@ -1966,8 +1966,10 @@ impl AcceleratedTable {
                     )
                     .await?;
                 let fallback_keep_filters = if let Some(ref keep) = self.fallback_retention_keep {
-                    let federated_provider = self.federated.table_provider().await;
-                    keep.keep_filters(&federated_provider.schema())
+                    // Schema only. Awaiting `table_provider()` would block every
+                    // accelerated scan on a deferred source, including ones that
+                    // never fall back. Source resolution stays in `fallback_fn`.
+                    keep.keep_filters(&self.federated.schema())
                         .map_err(|e| DataFusionError::Plan(e.to_string()))?
                 } else {
                     Vec::new()

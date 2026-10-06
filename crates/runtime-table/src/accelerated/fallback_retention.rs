@@ -112,6 +112,59 @@ impl FallbackRetentionKeep {
         })
     }
 
+    /// Time retention inverted onto fallback when no scheduled worker runs.
+    ///
+    /// Cayenne still hides expired rows at scan time without a ticker. `DuckDB`
+    /// and Arrow do not, but applying the same cutoff on fallback is safe: a
+    /// still-present expired accelerator row never takes this path.
+    #[must_use]
+    pub fn from_time(
+        period: std::time::Duration,
+        time_column: String,
+        time_format: Option<TimeFormat>,
+        time_partition_column: Option<String>,
+        time_partition_format: Option<TimeFormat>,
+    ) -> Self {
+        Self {
+            filters: vec![DataRetentionFilter::Time {
+                period,
+                time_column,
+                time_format,
+                time_partition_column,
+                time_partition_format,
+            }],
+        }
+    }
+
+    /// Merge `keep` with unscheduled time retention when the ticker is off.
+    #[must_use]
+    pub fn with_unscheduled_time(
+        keep: Option<Self>,
+        scheduled_runs: bool,
+        period: Option<std::time::Duration>,
+        time_column: Option<String>,
+        time_format: Option<TimeFormat>,
+        time_partition_column: Option<String>,
+        time_partition_format: Option<TimeFormat>,
+    ) -> Option<Self> {
+        let time = match (scheduled_runs, period, time_column) {
+            (false, Some(period), Some(time_column)) => Some(Self::from_time(
+                period,
+                time_column,
+                time_format,
+                time_partition_column,
+                time_partition_format,
+            )),
+            _ => None,
+        };
+        match (keep, time) {
+            (Some(keep), Some(time)) => Some(keep.merge(time)),
+            (Some(keep), None) => Some(keep),
+            (None, Some(time)) => Some(time),
+            (None, None) => None,
+        }
+    }
+
     #[must_use]
     pub fn merge(mut self, other: Self) -> Self {
         self.filters.extend(other.filters);
@@ -383,6 +436,56 @@ mod tests {
         .expect("sql still inverts when the scheduled policy is computed-only")
         .expect("a keep spec");
         assert_eq!(keep.filters.len(), 1);
+    }
+
+    #[test]
+    fn with_unscheduled_time_covers_ticker_off() {
+        let keep = FallbackRetentionKeep::with_unscheduled_time(
+            None,
+            false,
+            Some(Duration::from_secs(3600)),
+            Some("ts".to_string()),
+            Some(TimeFormat::UnixSeconds),
+            None,
+            None,
+        )
+        .expect("time period without a ticker is still invertible");
+        keep.validate(&events_schema())
+            .expect("ts is a source time column");
+        assert_eq!(keep.filters.len(), 1);
+    }
+
+    #[test]
+    fn with_unscheduled_time_does_not_duplicate_scheduled() {
+        let scheduled = Retention {
+            filters: vec![DataRetentionFilter::Time {
+                period: Duration::from_secs(3600),
+                time_column: "ts".to_string(),
+                time_format: Some(TimeFormat::UnixSeconds),
+                time_partition_column: None,
+                time_partition_format: None,
+            }],
+            check_interval: Duration::from_secs(1),
+            computed: None,
+        };
+        let keep = FallbackRetentionKeep::from_configured(Some(&scheduled), None)
+            .expect("scheduled time is invertible")
+            .expect("a keep spec");
+        let merged = FallbackRetentionKeep::with_unscheduled_time(
+            Some(keep),
+            true,
+            Some(Duration::from_secs(3600)),
+            Some("ts".to_string()),
+            Some(TimeFormat::UnixSeconds),
+            None,
+            None,
+        )
+        .expect("scheduled keep is kept");
+        assert_eq!(
+            merged.filters.len(),
+            1,
+            "unscheduled time must not double the scheduled cutoff"
+        );
     }
 
     #[derive(Debug)]

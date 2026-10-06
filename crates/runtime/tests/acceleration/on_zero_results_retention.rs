@@ -119,6 +119,29 @@ fn timed_events_dataset(dir: &Path, name: &str) -> Dataset {
     dataset
 }
 
+#[cfg(not(target_os = "windows"))]
+fn cayenne_unscheduled_time_dataset(dir: &Path, name: &str) -> Dataset {
+    let mut dataset = Dataset::new(format!("file://{}", dir.join("timed.csv").display()), name);
+    dataset.params = Some(Params::from_string_map(
+        [("file_format".to_string(), "csv".to_string())].into(),
+    ));
+    dataset.time_column = Some("ts".to_string());
+    dataset.time_format = Some(TimeFormat::UnixSeconds);
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: spicepod::acceleration::Mode::Memory,
+        on_zero_results: ZeroResultsAction::UseSource,
+        refresh_sql: Some(format!("SELECT * FROM {name} WHERE id != 3")),
+        refresh_data_window: Some("10000d".to_string()),
+        retention_check_enabled: false,
+        retention_check_interval: None,
+        retention_period: Some("1h".to_string()),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
 fn arrow_write_time_events_dataset(dir: &Path, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", dir.join("events.csv").display()), name);
     dataset.params = Some(Params::from_string_map(
@@ -312,6 +335,66 @@ async fn arrow_write_time_retention_sql_does_not_resurrect_via_fallback() -> any
                 ids(&fallback),
                 vec![3],
                 "a row never loaded, that retention would keep, must still fall back"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn cayenne_unscheduled_time_retention_does_not_resurrect_via_fallback() -> anyhow::Result<()>
+{
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            // 1_000_000_000 is 2001-09-09; 4_102_444_800 is 2100-01-01.
+            std::fs::write(
+                dir.path().join("timed.csv"),
+                "id,ts\n1,4102444800\n2,1000000000\n3,4102444800\n",
+            )?;
+
+            let app = AppBuilder::new("cayenne_unscheduled_time_fallback")
+                .with_dataset(cayenne_unscheduled_time_dataset(
+                    dir.path(),
+                    "cayenne_unscheduled_time",
+                ))
+                .build();
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, Duration::from_mins(1)).await?;
+
+            let ids_in_accel = accelerator_ids(&rt, "cayenne_unscheduled_time").await;
+            assert!(
+                ids_in_accel.contains(&1),
+                "refresh must load id=1, leftover {ids_in_accel:?}"
+            );
+            assert!(
+                !ids_in_accel.contains(&2),
+                "Cayenne scan-time retention must hide expired id=2 without a scheduled worker, leftover {ids_in_accel:?}"
+            );
+            assert!(
+                !ids_in_accel.contains(&3),
+                "refresh_sql must leave id=3 out of the accelerator so fallback is the only path"
+            );
+
+            let evicted_row =
+                run_query(&rt, "SELECT id FROM cayenne_unscheduled_time WHERE id = 2").await?;
+            assert_eq!(
+                ids(&evicted_row),
+                Vec::<i64>::new(),
+                "a row Cayenne hides at scan time must not come back from the source"
+            );
+
+            let fallback =
+                run_query(&rt, "SELECT id FROM cayenne_unscheduled_time WHERE id = 3").await?;
+            assert_eq!(
+                ids(&fallback),
+                vec![3],
+                "a recent row never loaded must still fall back"
             );
 
             rt.shutdown().await;
