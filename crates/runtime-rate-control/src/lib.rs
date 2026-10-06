@@ -20,9 +20,10 @@ limitations under the License.
 //! * **In-memory** (default): a local `governor` rate limiter per quota, plus
 //!   an optional concurrency semaphore. No coordination across replicas.
 //! * **Cluster** (when `with_object_store_persistence_for_instance` is
-//!   configured): each named quota is enforced by a `LeasedBucket` which
-//!   negotiates a per-window slice of the cluster-wide budget through OCC
-//!   writes to the configured `object_store`. See [`leased`].
+//!   configured, which the runtime does when `runtime.state.location` is set):
+//!   each named quota is enforced by a `LeasedBucket` which negotiates a
+//!   per-window slice of the cluster-wide budget through OCC writes to the
+//!   configured `object_store`. See [`leased`].
 //!
 //! When cluster mode is enabled, the configured `requests_per_second_limit` /
 //! `requests_per_minute_limit` is interpreted as the **cluster-wide** limit,
@@ -46,6 +47,7 @@ use governor::{
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 mod adaptive;
 mod leased;
@@ -55,7 +57,8 @@ pub use adaptive::{
     AdaptiveController, AdaptiveRateControl, AdaptiveRateControlError,
     DEFAULT_ADAPTIVE_FAILURE_THRESHOLD, DEFAULT_ADAPTIVE_WINDOW, RequestOutcome,
 };
-use leased::{LeasedBucket, LeasedBucketConfig, LeasedBucketMetrics};
+pub use leased::LeasedBucketMetrics;
+use leased::{LeasedAdaptiveConfig, LeasedBucket, LeasedBucketConfig};
 
 const DEFAULT_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(90);
 
@@ -72,6 +75,40 @@ const DEFAULT_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(90);
 const ADAPTIVE_WEIGHT_RESOLUTION: u32 = 100;
 
 type GovernorRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
+
+/// The cluster adaptive decay half-life, as a count of windows.
+///
+/// The shared state records request outcomes per window, so one window is the
+/// shortest half-life it can express. An unset `rate_control_window` therefore
+/// takes the window itself — the `refresh_interval` — rather than the
+/// single-node [`DEFAULT_ADAPTIVE_WINDOW`]. An explicit value keeps its exact
+/// ratio to the window, fractions included, and is floored at one window.
+///
+/// A half-life of exactly one window is the least robust setting against
+/// failures grouped at one end of a window; the worst case is a factor of
+/// `2 ^ (window / half_life)`, which is 2 here and 1.15 at five windows. That
+/// matters only while an origin is failing or recovering, so it is the right
+/// default and the wrong thing to be stuck with — hence the floor is logged
+/// rather than silent.
+fn half_life_windows(origin: &str, configured: Option<Duration>, window: Duration) -> f64 {
+    let Some(configured) = configured else {
+        return 1.0;
+    };
+    let window_ms = duration_millis_u64(window).max(1);
+    let configured_ms = duration_millis_u64(configured);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "both are millisecond durations; the quotient is a small window count"
+    )]
+    let windows = (configured_ms as f64) / (window_ms as f64);
+    if windows < 1.0 {
+        tracing::info!(
+            "Cluster rate control for origin '{origin}' raised `rate_control_window` from {configured_ms}ms to the {window_ms}ms `refresh_interval`. The shared state records request outcomes one window at a time, so the reaction and recovery half-life cannot be shorter than one window."
+        );
+        return 1.0;
+    }
+    windows
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -93,6 +130,75 @@ pub enum Error {
         "The rate limiter has insufficient capacity for a request with weight '{weight}'. Reduce the request size, or increase the rate limit, and try again."
     ))]
     InsufficientCapacity { weight: u32 },
+
+    #[snafu(display(
+        "Timed out after {waited:?} waiting for rate-control capacity{target} to admit the request. The configured rate limit could not free a slot in time. Increase the rate limit, raise `rate_control_acquire_timeout`, or lower request concurrency, then try again. See: https://spiceai.org/docs/reference/spicepod/runtime#http-rate-control"
+    ))]
+    AcquireTimeout {
+        target: RateControlTarget,
+        waited: Duration,
+    },
+}
+
+/// The rate-limited upstream named in user-facing errors. HTTP rate control
+/// knows the origin; other callers (models, UDFs) have none to name, so the
+/// type — not the message — decides whether the clause appears.
+///
+/// [`Display`](std::fmt::Display) writes a leading-space clause (` for origin
+/// 'x'`), or nothing when the origin is unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RateControlTarget(Option<String>);
+
+impl RateControlTarget {
+    /// A target with no known origin.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self(None)
+    }
+
+    /// The origin this controller limits, e.g. `https://api.example.com`.
+    #[must_use]
+    pub fn origin(origin: impl Into<String>) -> Self {
+        Self(Some(origin.into()))
+    }
+
+    /// The origin, when one is known.
+    #[must_use]
+    pub fn as_origin(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl std::fmt::Display for RateControlTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(origin) => write!(formatter, " for origin '{origin}'"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Bound one wait for rate-control capacity. `None` waits indefinitely.
+///
+/// The bound is per attempt: one call covers every wait source inside
+/// `future`, and a later attempt gets the full bound again. This is the only
+/// place [`Error::AcquireTimeout`] is built, so the acquire and the retry
+/// re-check report it the same way.
+async fn within<T, F>(bound: Option<Duration>, target: &RateControlTarget, future: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let Some(bound) = bound else {
+        return future.await;
+    };
+
+    match tokio::time::timeout(bound, future).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(Error::AcquireTimeout {
+            target: target.clone(),
+            waited: bound,
+        }),
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -118,10 +224,11 @@ impl QuotaDefinition {
     }
 
     /// Cluster-wide tokens permitted in one `window_duration`.
+    ///
+    /// Quota replenishes one token every `replenish_interval`. So in
+    /// `window` time, `window / replenish_interval` tokens are permitted.
+    /// Round to nearest, but at least 1.
     fn burst_per_window(&self, window: Duration) -> u64 {
-        // Quota replenishes one token every `replenish_interval`. So in
-        // `window` time, `window / replenish_interval` tokens are permitted.
-        // Round to nearest, but at least 1.
         let replenish_ns = self.quota.replenish_interval().as_nanos().max(1);
         let window_ns = window.as_nanos();
         let tokens = window_ns / replenish_ns;
@@ -180,7 +287,11 @@ pub struct RateControllerBuilder {
     weighted_quota: Option<QuotaDefinition>,
     metrics: Option<Arc<RateControllerMetrics>>,
     persistence: Option<PersistenceConfig>,
-    adaptive: Option<(AdaptiveRateControl, String)>,
+    adaptive: Option<AdaptiveRateControl>,
+    acquire_timeout: Option<Duration>,
+    /// The single origin this builder knows. It names the target in
+    /// [`Error::AcquireTimeout`] and the adaptive log lines.
+    origin: Option<String>,
 }
 
 impl RateControllerBuilder {
@@ -207,21 +318,43 @@ impl RateControllerBuilder {
         self
     }
 
+    /// Bound how long one acquire attempt may wait for capacity before failing
+    /// with [`Error::AcquireTimeout`]. The bound covers every wait source of
+    /// that attempt — the semaphore, the quotas, the cluster leased buckets and
+    /// jitter. Each attempt gets the bound again, so a caller that retries can
+    /// wait up to the bound per attempt. Unset means wait indefinitely.
+    ///
+    /// Cluster mode: leased-bucket tokens already spent when the bound fires
+    /// are not returned to the window, so the bound is exact for single-node
+    /// (local) rate control and best-effort for cluster rate control.
+    #[must_use]
+    pub fn with_acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.acquire_timeout = Some(timeout);
+        self
+    }
+
+    /// Name the upstream origin this controller limits, so user-facing errors
+    /// can identify it. Cluster mode supplies it from the persistence config.
+    #[must_use]
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
+        self
+    }
+
     /// Attach an adaptive controller that dynamically scales every configured
     /// limit by its admission coefficient. `origin` names the upstream in the
-    /// controller's throttling and recovery log lines.
+    /// controller's throttling and recovery log lines, and becomes the
+    /// controller's origin, exactly as [`Self::with_origin`] sets it.
     ///
-    /// Ignored when object-store persistence is configured: the leased cluster
-    /// buckets do not adapt yet, so a cluster controller applies the configured
-    /// limits unchanged.
+    /// With object-store persistence, the settings go to the leased cluster
+    /// buckets instead: every replica derives one coefficient from the shared
+    /// state and scales the cluster request-rate budget by it. The local
+    /// concurrency semaphore is not scaled in cluster mode.
     #[must_use]
-    pub fn with_adaptive(
-        mut self,
-        control: AdaptiveRateControl,
-        origin: impl Into<String>,
-    ) -> Self {
-        self.adaptive = Some((control, origin.into()));
-        self
+    pub fn with_adaptive(self, control: AdaptiveRateControl, origin: impl Into<String>) -> Self {
+        let mut builder = self.with_origin(origin);
+        builder.adaptive = Some(control);
+        builder
     }
 
     #[must_use]
@@ -310,18 +443,14 @@ impl RateControllerBuilder {
         let jitter = self.jitter;
         let metrics = self.metrics.unwrap_or_default();
 
-        // The leased cluster buckets do not adapt yet (see `with_adaptive`).
-        let adaptive = if self.persistence.is_some() {
-            None
-        } else {
-            self.adaptive
-        };
-
         // With adaptive control, every limiter is built at `ADAPTIVE_WEIGHT_RESOLUTION` x capacity
         // and a healthy request charges `ADAPTIVE_WEIGHT_RESOLUTION` cells, so the adaptive weight
         // has sub-integer resolution (see [`ADAPTIVE_WEIGHT_RESOLUTION`]). Without
         // adaptive control the resolution is 1 and nothing is scaled.
-        let resolution = if adaptive.is_some() {
+        // Cluster mode is excluded: it scales the budget, not the charge, and
+        // leased buckets are never resolution-scaled, so a `resolution` above 1
+        // would only mis-size the concurrency semaphore.
+        let resolution = if self.adaptive.is_some() && self.persistence.is_none() {
             ADAPTIVE_WEIGHT_RESOLUTION
         } else {
             1
@@ -351,6 +480,24 @@ impl RateControllerBuilder {
         let mut local_limiters: Vec<(Arc<GovernorRateLimiter>, u32)> = Vec::new();
         let mut leased_buckets: Vec<Arc<LeasedBucket>> = Vec::new();
 
+        // In cluster mode the coefficient is agreed through the shared file, so
+        // the adaptive settings go to the leased buckets and no local controller
+        // is built. A local coefficient would throttle each replica on its own
+        // view, and the demand-weighted share would then hand the released
+        // budget to a healthier replica: the throttle would move rather than the
+        // load on the origin fall.
+        let cluster_adaptive = self.persistence.as_ref().and_then(|persistence| {
+            self.adaptive.map(|control| LeasedAdaptiveConfig {
+                k: control.k(),
+                failure_threshold: control.failure_threshold(),
+                half_life_windows: half_life_windows(
+                    &persistence.origin,
+                    control.configured_window(),
+                    persistence.window_duration,
+                ),
+            })
+        });
+
         for (index, quota_def) in self.quotas.into_iter().enumerate() {
             let fallback_name = format!("quota-{index}");
             let limiter_key = quota_def.persistence_key(&fallback_name);
@@ -359,8 +506,9 @@ impl RateControllerBuilder {
                 // Leased buckets are deliberately NOT `resolution`-scaled. Their
                 // `acquire()` registers one unit of cluster demand per call, so
                 // charging `resolution` tokens would inflate the demand-weighted
-                // lease sharing across replicas. A persisted controller has no
-                // adaptive control (see `with_adaptive`), so `resolution` is 1.
+                // lease sharing across replicas. A leased bucket throttles by
+                // scaling the cluster budget it leases against, not by charging
+                // a fractional weight, so it never needs the resolution trick.
                 let burst_per_window = quota_def.burst_per_window(persistence.window_duration);
                 leased_buckets.push(LeasedBucket::new(LeasedBucketConfig {
                     store: Arc::clone(&persistence.store),
@@ -371,6 +519,7 @@ impl RateControllerBuilder {
                     window_duration: persistence.window_duration,
                     limiter_key,
                     burst_per_window,
+                    adaptive: cluster_adaptive,
                 }));
             } else {
                 let quota = scale_quota_rate(quota_def.quota, resolution);
@@ -379,10 +528,27 @@ impl RateControllerBuilder {
             }
         }
 
-        let persistence_origin = self.persistence.as_ref().map(|p| p.origin.clone());
+        // An explicit origin wins; cluster mode already carries one.
+        let target = self
+            .origin
+            .or_else(|| self.persistence.as_ref().map(|p| p.origin.clone()))
+            .map_or_else(RateControlTarget::unknown, RateControlTarget::origin);
 
-        let adaptive =
-            adaptive.map(|(control, origin)| Arc::new(AdaptiveController::new(control, origin)));
+        // The adaptive controller names the same origin in its log lines, so it
+        // takes it from the target. `with_adaptive` always sets an origin, so
+        // the fallback is unreachable.
+        // In cluster mode the leased buckets adapt, so no local controller is
+        // built.
+        let adaptive = cluster_adaptive
+            .is_none()
+            .then_some(self.adaptive)
+            .flatten()
+            .map(|control| {
+                Arc::new(AdaptiveController::new(
+                    control,
+                    target.as_origin().unwrap_or_default(),
+                ))
+            });
 
         RateController::new(
             jitter,
@@ -391,9 +557,10 @@ impl RateControllerBuilder {
             weighted_rate_limiter,
             semaphore,
             metrics,
-            persistence_origin,
+            target,
             adaptive,
             resolution,
+            self.acquire_timeout,
         )
     }
 }
@@ -478,8 +645,8 @@ pub struct RateController {
     weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
     semaphore: Option<MaxCapacityLimits<Semaphore>>,
     metrics: Arc<RateControllerMetrics>,
-    /// Origin string used for log/error context when in cluster mode.
-    persistence_origin: Option<String>,
+    /// The upstream this controller limits, named in user-facing errors.
+    target: RateControlTarget,
     /// When present, scales each limit down by an admission coefficient in
     /// `[0, 1.0]` based on recent [`RequestOutcome`]. See [`Self::record_outcome`].
     /// Buckets, semaphores and limits stay static; each request charges an
@@ -491,6 +658,12 @@ pub struct RateController {
     /// is scaled by). [`ADAPTIVE_WEIGHT_RESOLUTION`] with adaptive control, else
     /// `1`. Purely internal — divided back out of any logical metric.
     resolution: u32,
+    /// Upper bound on how long one acquire attempt waits for capacity before
+    /// returning [`Error::AcquireTimeout`]. `None` = wait indefinitely (the
+    /// legacy behaviour). Applied per attempt: each `acquire*` call, and each
+    /// [`Permit::until_ready`] re-check, gets the whole bound for the
+    /// semaphore, the governor quotas, the leased buckets and jitter.
+    acquire_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for RateController {
@@ -506,9 +679,10 @@ impl std::fmt::Debug for RateController {
             )
             .field("semaphore", &self.semaphore.is_some())
             .field("metrics", &self.metrics)
-            .field("persistence_origin", &self.persistence_origin)
+            .field("target", &self.target)
             .field("adaptive", &self.adaptive.is_some())
             .field("resolution", &self.resolution)
+            .field("acquire_timeout", &self.acquire_timeout)
             .finish()
     }
 }
@@ -533,15 +707,22 @@ impl Permit {
     /// Re-check the quotas from an existing permit. The caller retains its
     /// permit but acquires fresh rate-limit budget — used on retry paths.
     ///
+    /// This re-check is its own attempt, so it gets the whole
+    /// `rate_control_acquire_timeout` again rather than what an earlier acquire
+    /// left over.
+    ///
     /// # Errors
     ///
     /// Returns the same errors as [`RateController::acquire`].
     pub async fn until_ready(&self) -> Result<()> {
-        let wait_start = tokio::time::Instant::now();
-        let result = self
-            .rate_controller
-            .wait_for_rate_limiters(self.weight)
-            .await;
+        let controller = &self.rate_controller;
+        let wait_start = Instant::now();
+        let result = within(
+            controller.acquire_timeout,
+            &controller.target,
+            controller.wait_for_rate_limiters(self.weight),
+        )
+        .await;
 
         let wait_duration = wait_start.elapsed();
         match result {
@@ -645,8 +826,9 @@ impl RateController {
             }
         }
         // Cluster leased buckets: each acquire consumes one token, may wait.
-        // A persisted controller has no adaptive control, so each request
-        // charges exactly one token.
+        // Always exactly one token: a leased bucket throttles by leasing
+        // against a smaller cluster budget, not by charging a heavier weight,
+        // so the charge never carries the adaptive coefficient.
         for bucket in &self.leased_buckets {
             bucket.acquire().await.map_err(|e| match e {
                 leased::Error::FailClosed { origin } => Error::ClusterBudgetExhausted { origin },
@@ -688,9 +870,10 @@ impl RateController {
         weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
         semaphore: Option<(Arc<Semaphore>, u32)>,
         metrics: Arc<RateControllerMetrics>,
-        persistence_origin: Option<String>,
+        target: RateControlTarget,
         adaptive: Option<Arc<AdaptiveController>>,
         resolution: u32,
+        acquire_timeout: Option<Duration>,
     ) -> Arc<Self> {
         let jitter_config = jitter.unwrap_or(JitterConfig {
             min: Duration::ZERO,
@@ -704,27 +887,73 @@ impl RateController {
             weighted_rate_limiter,
             semaphore,
             metrics,
-            persistence_origin,
+            target,
             adaptive,
             resolution,
+            acquire_timeout,
         })
     }
 
-    /// Record the outcome of one request, feeding the adaptive controller (a
-    /// no-op when adaptive control is disabled).
+    /// Record the outcome of one request, feeding whichever adaptive control is
+    /// in force (a no-op when adaptive control is disabled).
+    ///
+    /// Exactly one of the two arms does work: local mode builds an
+    /// [`AdaptiveController`], cluster mode builds none and publishes the counts
+    /// through the leased buckets instead.
+    ///
+    /// An origin has at most two rate quotas, so at most two buckets hold the
+    /// same numbers. Each publishes its own copy under its own limiter key on
+    /// its own write, and the copies can differ by one tick — which is fine,
+    /// because each bucket scales only its own budget and the invariant is per
+    /// limiter.
+    ///
+    /// Only an *upstream* outcome belongs here. A request that never reached the
+    /// origin, such as one that ran out of `rate_control_acquire_timeout`, must
+    /// not be recorded: counting it would close a loop where throttling produces
+    /// the acquire timeouts that deepen the throttle. The connectors record
+    /// outcomes only after the permit is held and the request has been sent, so
+    /// an acquire timeout returns before any call reaches this method.
     pub fn record_outcome(&self, outcome: RequestOutcome) {
         if let Some(adaptive) = &self.adaptive {
             adaptive.record(outcome);
         }
+        for bucket in &self.leased_buckets {
+            bucket.record_outcome(outcome);
+        }
     }
 
     /// The adaptive admission coefficient in `[0, 1]`, or `None` when adaptive
-    /// control is disabled. Computed live, so it reflects window decay.
+    /// control is disabled.
+    ///
+    /// In local mode this is computed live, so it reflects window decay. In
+    /// cluster mode it is the ratio the shared file fixed for the window this
+    /// replica last leased, so every replica reports the same value. An origin
+    /// with both a per-second and a per-minute quota reports the tighter of the
+    /// two, keeping the single-coefficient contract of local mode.
     #[must_use]
     pub fn admission_coefficient(&self) -> Option<f64> {
-        self.adaptive
-            .as_ref()
-            .map(|adaptive| adaptive.admission_coefficient())
+        if let Some(adaptive) = &self.adaptive {
+            return Some(adaptive.admission_coefficient());
+        }
+        self.leased_buckets
+            .iter()
+            .filter_map(|bucket| bucket.admission_coefficient())
+            .min_by(f64::total_cmp)
+    }
+
+    /// Snapshot of the cluster budget each leased bucket is currently spending
+    /// against, as `(limiter_key, effective_burst)` pairs. Empty in local mode.
+    #[must_use]
+    pub fn cluster_effective_bursts(&self) -> Vec<(String, u64)> {
+        self.leased_buckets
+            .iter()
+            .map(|bucket| {
+                (
+                    bucket.limiter_key().to_string(),
+                    bucket.metrics().cluster_effective_burst(),
+                )
+            })
+            .collect()
     }
 
     /// The real-valued weight (in scaled cells) one request wants to charge right
@@ -773,10 +1002,36 @@ impl RateController {
     ///
     /// # Errors
     ///
-    /// See [`Self::acquire_weighted`].
+    /// See [`Self::acquire_weighted`]. Additionally returns
+    /// [`Error::AcquireTimeout`] if a bound is configured and the wait for
+    /// capacity exceeds it.
     pub async fn acquire_weighted_opt(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
+        let wait_start = Instant::now();
+        let result = within(
+            self.acquire_timeout,
+            &self.target,
+            self.acquire_inner(weight),
+        )
+        .await;
+
+        // Only the bound above produces `AcquireTimeout`, and it cancels
+        // `acquire_inner` at the await it was parked on, so the inner call
+        // records no outcome — attribute the failure here.
+        //
+        // Cluster mode: each leased-bucket acquire charges exactly one token,
+        // and a token already spent when the bound fires is not returned to the
+        // window. The bound is therefore exact for local (single-node) rate
+        // control and best-effort for cluster rate control.
+        if matches!(&result, Err(Error::AcquireTimeout { .. })) {
+            self.metrics.record_acquire_error(wait_start.elapsed());
+        }
+
+        result
+    }
+
+    async fn acquire_inner(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
         let self_cloned = Arc::clone(self);
-        let wait_start = tokio::time::Instant::now();
+        let wait_start = Instant::now();
 
         // Snapshot the adaptive weight once for this acquire. A rounded charge
         // above the healthy baseline (`resolution` cells) means adaptive is
@@ -784,7 +1039,15 @@ impl RateController {
         // request actually paid for the origin's failures, which the
         // admission-coefficient gauge (intensity) does not count.
         let desired_weight = self.adaptive_desired_weight();
-        if desired_weight.round() > f64::from(self.resolution) {
+        // Local mode throttles by charging more than the healthy baseline;
+        // cluster mode throttles by leasing against a smaller budget. Either way
+        // this request paid for the throttle, which is what the counter reports.
+        if desired_weight.round() > f64::from(self.resolution)
+            || self
+                .leased_buckets
+                .iter()
+                .any(|bucket| bucket.is_throttling())
+        {
             self.metrics.record_adaptive_throttle();
         }
 
@@ -1008,6 +1271,49 @@ mod tests {
         }
     }
 
+    const TEST_ORIGIN: &str = "https://origin.example.com";
+
+    /// The half-life is the plain ratio of `rate_control_window` to the window:
+    /// a value that is not a whole number of windows keeps its fraction.
+    #[test]
+    fn half_life_windows_keeps_the_configured_ratio() {
+        let window = Duration::from_secs(30);
+
+        let exact = half_life_windows(TEST_ORIGIN, Some(Duration::from_mins(1)), window);
+        assert!(
+            (exact - 2.0).abs() < 1e-9,
+            "expected 2 windows, got {exact}"
+        );
+
+        let fractional = half_life_windows(TEST_ORIGIN, Some(Duration::from_secs(45)), window);
+        assert!(
+            (fractional - 1.5).abs() < 1e-9,
+            "expected 1.5 windows, got {fractional}"
+        );
+    }
+
+    /// The shared state records outcomes one window at a time, so a half-life
+    /// shorter than a window cannot be expressed and clamps to one.
+    #[test]
+    fn half_life_windows_is_floored_at_one_window() {
+        let floored = half_life_windows(
+            TEST_ORIGIN,
+            Some(Duration::from_secs(10)),
+            Duration::from_secs(30),
+        );
+        assert!(
+            (floored - 1.0).abs() < 1e-9,
+            "expected 1 window, got {floored}"
+        );
+    }
+
+    /// Unset, the half-life is the window itself — not the single-node default.
+    #[test]
+    fn half_life_windows_defaults_to_one_window() {
+        let unset = half_life_windows(TEST_ORIGIN, None, Duration::from_secs(30));
+        assert!((unset - 1.0).abs() < 1e-9, "expected 1 window, got {unset}");
+    }
+
     /// Drive the adaptive window to a target admission coefficient, then read the
     /// desired per-request weight. With the resolution multiplier a coefficient of
     /// 0.9 charges ~`M/0.9` cells (throttles), where the old integer scheme would
@@ -1089,5 +1395,62 @@ mod tests {
         assert_eq!(controller.available_permits(), Some(7));
         drop(permit);
         assert_eq!(controller.available_permits(), Some(8));
+    }
+
+    /// The bound is per attempt. A `Permit::until_ready` re-check gets the whole
+    /// bound of its own, however much time the original acquire used: it never
+    /// inherits a shared, already-spent deadline.
+    #[tokio::test(start_paused = true)]
+    async fn until_ready_gets_the_whole_bound_for_its_own_attempt() {
+        let bound = Duration::from_secs(10);
+        let controller = RateControllerBuilder::new()
+            .with_jitter(JitterConfig::zero())
+            // One request per minute: the first passes, the next must wait.
+            .add_quota(Quota::per_minute(NonZeroU32::new(1).expect("non-zero")))
+            .with_acquire_timeout(bound)
+            .with_origin("https://api.example.com")
+            .build();
+
+        let permit = controller
+            .acquire()
+            .await
+            .expect("the first request passes");
+
+        // Spend most of the bound doing the request itself, then retry.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let recheck_start = Instant::now();
+        let error = permit
+            .until_ready()
+            .await
+            .expect_err("the quota is empty, so the re-check must hit the bound");
+
+        assert!(
+            recheck_start.elapsed() >= bound,
+            "the re-check must wait its own full bound, not the remainder of an earlier one"
+        );
+        let message = error.to_string();
+        let Error::AcquireTimeout { target, waited } = &error else {
+            panic!("expected an acquire timeout, got {error:?}");
+        };
+        assert_eq!(target.as_origin(), Some("https://api.example.com"));
+        assert_eq!(*waited, bound);
+        assert!(
+            message.contains("api.example.com"),
+            "the error must name the origin: {message}"
+        );
+    }
+
+    /// Without an origin the message stays grammatical: the clause is dropped.
+    #[test]
+    fn an_unknown_target_leaves_the_message_grammatical() {
+        let message = Error::AcquireTimeout {
+            target: RateControlTarget::unknown(),
+            waited: Duration::from_secs(5),
+        }
+        .to_string();
+        assert!(
+            message.contains("rate-control capacity to admit the request"),
+            "unexpected message: {message}"
+        );
     }
 }

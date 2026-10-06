@@ -18153,11 +18153,13 @@ version = "2.4.0-unstable"
 dependencies = [
  "futures",
  "governor",
+ "insta",
  "object_store 0.13.2",
  "object_store_occ",
  "parking_lot",
  "rand 0.10.1",
  "serde",
+ "serde_json",
  "snafu",
  "tempfile",
  "tokio",

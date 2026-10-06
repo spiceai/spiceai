@@ -166,6 +166,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("Minimum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
     ParameterSpec::runtime("rate_control_jitter_max")
         .description("Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
+    ParameterSpec::runtime("rate_control_acquire_timeout")
+        .description("Maximum time a Databricks HTTP request waits for rate-control capacity before it fails. Overrides runtime.params.http_rate_control_acquire_timeout when set. Accepts durations such as '30s' or '500ms'. Defaults to `client_timeout`. Use '0' for no limit."),
 
     ParameterSpec::component("token")
         .secret()
@@ -858,12 +860,15 @@ async fn reserve_databricks_rate_controller<S: std::hash::BuildHasher>(
     // The Databricks clients (Unity Catalog, SQL Warehouse, Spark Connect) do
     // not yet record per-request outcomes, so the configured limits apply
     // unchanged.
-    let rate_control = http_rate_control::resolve_limits_for_component(
+    let mut rate_control = http_rate_control::resolve_limits_for_component(
         params,
         runtime_rate_control_params,
         component,
         CONNECTOR_NAME,
     )?;
+    rate_control.apply_default_acquire_timeout(
+        runtime::catalogconnector::databricks::effective_client_timeout(params),
+    );
 
     Arc::clone(&rate_control_registry)
         .reserve_shared_rate_controller_for_component(
@@ -1473,6 +1478,7 @@ mod tests {
             "requests_per_minute_limit",
             "rate_control_jitter_min",
             "rate_control_jitter_max",
+            "rate_control_acquire_timeout",
         ] {
             assert!(
                 PARAMETERS
@@ -1682,6 +1688,54 @@ mod tests {
         )
         .await
         .expect("a Databricks dataset with no rate-control parameters should resolve");
+    }
+
+    /// Databricks bounds its rate-control wait with its own `client_timeout`,
+    /// the rule the HTTPS and GraphQL connectors follow. Datasets that share an
+    /// origin then resolve the same bound whichever connector reaches it first.
+    #[tokio::test]
+    async fn databricks_rate_control_defaults_the_acquire_timeout_to_client_timeout() {
+        let parameters = Parameters::try_new(
+            "connector databricks",
+            vec![
+                (
+                    "databricks_endpoint".to_string(),
+                    secrecy::SecretString::from("dbc-abcd.cloud.databricks.com"),
+                ),
+                (
+                    "databricks_requests_per_second_limit".to_string(),
+                    secrecy::SecretString::from("10"),
+                ),
+                (
+                    "client_timeout".to_string(),
+                    secrecy::SecretString::from("45s"),
+                ),
+            ],
+            "databricks",
+            Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("databricks parameters should be accepted");
+        let dataset = make_dataset("databricks:catalog.schema.table", "acquire_timeout").await;
+        let component = ConnectorComponent::from(&dataset);
+
+        let reservation = reserve_databricks_rate_controller(
+            &parameters,
+            None::<&HashMap<String, String>>,
+            Arc::new(http_rate_control::HttpRateControlRegistry::default()),
+            &component,
+            "spicepod",
+        )
+        .await
+        .expect("a Databricks dataset with a rate limit should resolve")
+        .expect("a dataset reserves a rate controller");
+
+        assert_eq!(
+            reservation.shared().config.acquire_timeout,
+            Some(std::time::Duration::from_secs(45)),
+            "the acquire bound must come from client_timeout"
+        );
     }
 
     /// Databricks does not record request outcomes yet, so its adaptive

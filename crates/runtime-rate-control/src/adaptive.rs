@@ -100,6 +100,14 @@ pub struct AdaptiveRateControl {
     k: f64,
     /// Decaying-window half-life.
     window: Duration,
+    /// Whether `window` came from [`DEFAULT_ADAPTIVE_WINDOW`] rather than from
+    /// an explicit `rate_control_window`.
+    ///
+    /// Cluster rate control defaults the half-life to the shared
+    /// `refresh_interval` instead, because one window is the smallest unit of
+    /// time its shared state records; only a value the user did not set may be
+    /// retargeted that way.
+    window_is_default: bool,
 }
 
 impl AdaptiveRateControl {
@@ -125,6 +133,21 @@ impl AdaptiveRateControl {
             failure_threshold,
             k: 1.0 / (1.0 - failure_threshold),
             window,
+            window_is_default: false,
+        })
+    }
+
+    /// Build with the half-life left unset, so single-node and cluster rate
+    /// control each apply their own default: [`DEFAULT_ADAPTIVE_WINDOW`] for a
+    /// single node, and the shared `refresh_interval` for a cluster.
+    ///
+    /// # Errors
+    /// Returns [`AdaptiveRateControlError::FailureThresholdInvalid`] when
+    /// `failure_threshold` is not a finite fraction strictly between 0 and 1.
+    pub fn with_default_window(failure_threshold: f64) -> Result<Self, AdaptiveRateControlError> {
+        Self::new(failure_threshold, DEFAULT_ADAPTIVE_WINDOW).map(|control| Self {
+            window_is_default: true,
+            ..control
         })
     }
 
@@ -133,15 +156,37 @@ impl AdaptiveRateControl {
     pub fn failure_threshold(&self) -> f64 {
         self.failure_threshold
     }
+
+    /// The decay half-life, with the single-node default applied.
+    #[must_use]
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
+    /// The half-life the user configured, or `None` when they left it unset and
+    /// single-node or cluster rate control applies its own default.
+    #[must_use]
+    pub fn configured_window(&self) -> Option<Duration> {
+        (!self.window_is_default).then_some(self.window)
+    }
+
+    /// The factor the weighted accept count is multiplied by,
+    /// `1 / (1 - failure_threshold)`.
+    #[must_use]
+    pub fn k(&self) -> f64 {
+        self.k
+    }
 }
 
 impl Default for AdaptiveRateControl {
-    /// [`DEFAULT_ADAPTIVE_FAILURE_THRESHOLD`] and [`DEFAULT_ADAPTIVE_WINDOW`].
+    /// [`DEFAULT_ADAPTIVE_FAILURE_THRESHOLD`] with the window left unset, so
+    /// cluster rate control may retarget it to its `refresh_interval`.
     fn default() -> Self {
         Self {
             failure_threshold: DEFAULT_ADAPTIVE_FAILURE_THRESHOLD,
             k: 1.0 / (1.0 - DEFAULT_ADAPTIVE_FAILURE_THRESHOLD),
             window: DEFAULT_ADAPTIVE_WINDOW,
+            window_is_default: true,
         }
     }
 }
@@ -178,8 +223,12 @@ pub struct AdaptiveController {
 }
 
 /// What the origin is doing, as the log reports it.
+///
+/// Shared with the leased (cluster) bucket, which reaches the same two states
+/// through the shared file rather than a local decaying window, so both modes
+/// report a change of state in the same words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThrottleState {
+pub(crate) enum ThrottleState {
     /// The error rate is at or below the failure threshold: the origin gets the
     /// full configured limits.
     Healthy,
@@ -197,6 +246,22 @@ impl ThrottleState {
             Self::Healthy
         } else {
             Self::Throttling
+        }
+    }
+
+    /// Report this state for `origin`.
+    ///
+    /// The change of state is logged, never the value: a rate is true only at
+    /// the moment it is printed, so the live numbers belong in the metrics.
+    pub(crate) fn report(self, origin: &str, failure_threshold: f64) {
+        match self {
+            Self::Throttling => tracing::warn!(
+                "Upstream '{origin}' is failing more than the {} `rate_control_failure_threshold`, so adaptive rate control is reducing requests to it below the configured limits until it recovers. See: {RATE_CONTROL_DOCS_URL}",
+                format_percentage(failure_threshold),
+            ),
+            Self::Healthy => tracing::info!(
+                "Upstream '{origin}' has recovered, so adaptive rate control is sending it the full configured limits again."
+            ),
         }
     }
 }
@@ -237,7 +302,7 @@ impl AdaptiveController {
         Self {
             k: control.k,
             failure_threshold: control.failure_threshold,
-            half_life: control.window,
+            half_life: control.window(),
             origin: origin.into(),
             state: Mutex::new(ControllerState {
                 window: DecayWindow {
@@ -245,24 +310,15 @@ impl AdaptiveController {
                     accepts: 0.0,
                     last_update: None,
                 },
-                phases: PhaseChangeLog::new(ThrottleState::Healthy, control.window),
+                phases: PhaseChangeLog::new(ThrottleState::Healthy, control.window()),
             }),
         }
     }
 
     /// Record the outcome of one request.
     pub fn record(&self, outcome: RequestOutcome) {
-        match self.record_and_evaluate(outcome) {
-            Some(ThrottleState::Throttling) => tracing::warn!(
-                "Upstream '{}' is failing more than the {} `rate_control_failure_threshold`, so adaptive rate control is reducing requests to it below the configured limits until it recovers. See: {RATE_CONTROL_DOCS_URL}",
-                self.origin,
-                format_percentage(self.failure_threshold),
-            ),
-            Some(ThrottleState::Healthy) => tracing::info!(
-                "Upstream '{}' has recovered, so adaptive rate control is sending it the full configured limits again.",
-                self.origin,
-            ),
-            None => {}
+        if let Some(state) = self.record_and_evaluate(outcome) {
+            state.report(&self.origin, self.failure_threshold);
         }
     }
 
