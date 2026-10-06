@@ -382,8 +382,12 @@ impl ColumnStatsAccumulator {
                 continue;
             };
 
-            // Only a NaN fails to compare equal to itself.
-            if value.partial_cmp(&value) != Some(std::cmp::Ordering::Equal) {
+            if matches!(
+                value,
+                ScalarValue::Float16(Some(v)) if v.is_nan()
+            ) || matches!(value, ScalarValue::Float32(Some(v)) if v.is_nan())
+                || matches!(value, ScalarValue::Float64(Some(v)) if v.is_nan())
+            {
                 return (None, None);
             }
 

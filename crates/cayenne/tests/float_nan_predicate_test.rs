@@ -276,3 +276,187 @@ async fn float_files_without_nan_are_still_pruned() {
         );
     }
 }
+
+/// The key a per-file statistics row is stored under: the object-store location.
+fn statistics_row_key(
+    data_path: &std::path::Path,
+    table_id: &str,
+    file: &cayenne::metadata::SnapshotFile,
+) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        data_path
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .trim_end_matches('/'),
+        table_id,
+        file.snapshot_id,
+        file.file_path
+    )
+}
+
+/// Rewrites every per-file statistics row of `table` as a build that did not
+/// account for NaN wrote it: the float column's bounds as they are, with the NaN
+/// count that marks them NaN-free removed. Returns the rewritten rows' keys.
+async fn seed_blobs_without_nan_counts(
+    fixture: &common::TestFixture,
+    table: &cayenne::CayenneTableProvider,
+    nan_free_bounds: (f64, f64),
+) -> Vec<(String, String)> {
+    use cayenne::MetadataCatalog;
+    use datafusion::datasource::TableProvider;
+    use vortex::expr::stats::{Precision as VortexPrecision, Stat};
+    use vortex::flatbuffers::WriteFlatBufferExt;
+
+    let table_id = table.table_id().to_string();
+    let schema = table.schema();
+    let files = fixture
+        .catalog
+        .get_all_snapshot_files(&table_id)
+        .await
+        .expect("manifest");
+    assert!(!files.is_empty(), "the write produced no data file");
+    let mut seeded = Vec::new();
+    for file in &files {
+        let key = statistics_row_key(&fixture.data_path, &table_id, file);
+        let row = fixture
+            .catalog
+            .get_snapshot_file_statistics(&table_id, &file.snapshot_id, &key)
+            .await
+            .expect("statistics row")
+            .expect("the scans above persisted the file's statistics");
+        let file_stats = cayenne::stats::deserialize_file_statistics(&row.statistics_blob, &schema)
+            .expect("blob decodes");
+        let mut sets: Vec<_> = file_stats.into_iter().map(|(set, _)| set.clone()).collect();
+        // The `K` column: NaN-excluding bounds and no NaN count.
+        sets[1].clear(Stat::NaNCount);
+        sets[1].set(
+            Stat::Min,
+            VortexPrecision::Exact(vortex::scalar::ScalarValue::from(nan_free_bounds.0)),
+        );
+        sets[1].set(
+            Stat::Max,
+            VortexPrecision::Exact(vortex::scalar::ScalarValue::from(nan_free_bounds.1)),
+        );
+        let dtype = vortex::arrow::ArrowSession::default()
+            .from_arrow_schema(&schema)
+            .expect("schema converts");
+        let legacy = vortex::file::FileStatistics::new_with_dtype(sets.into(), &dtype)
+            .write_flatbuffer_bytes()
+            .expect("blob encodes")
+            .as_slice()
+            .to_vec();
+        fixture
+            .catalog
+            .upsert_snapshot_file_statistics(&cayenne::metadata::SnapshotFileStatistics {
+                statistics_blob: legacy,
+                ..row
+            })
+            .await
+            .expect("seed row");
+        seeded.push((file.snapshot_id.clone(), key));
+    }
+    seeded
+}
+
+/// An installation that upgrades into the NaN fix already holds per-file blobs
+/// whose float bounds leave NaN out. Those bounds must not prune a NaN row, and
+/// the blob must be re-inferred from the footer and rewritten, so a file that
+/// holds no NaN gets its pruning back rather than losing it for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blobs_written_before_nan_was_accounted_for_are_not_trusted() {
+    use cayenne::MetadataCatalog;
+    use vortex::expr::stats::Stat;
+
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let files_scanned = |plan: &[RecordBatch]| {
+        let plan = arrow::util::pretty::pretty_format_batches(plan)
+            .expect("plan renders")
+            .to_string();
+        assert!(
+            plan.contains(" files_scanned="),
+            "the plan reports no Cayenne file scan:\n{plan}"
+        );
+        explain_total(&plan, "files_scanned")
+    };
+
+    for (name, has_nan) in [("legacy_blob_nan", true), ("legacy_blob_no_nan", false)] {
+        let mut values: Vec<Option<f64>> = (0..ROWS)
+            .map(|row| Some(f64::from(u32::try_from(row).expect("fits")) * 0.25))
+            .collect();
+        if has_nan {
+            values[ROWS / 2] = Some(f64::NAN);
+        }
+        let batch = batch(&DataType::Float64, &values);
+        let spec = || TableSpec::new(name, batch.schema(), &[]);
+        let table = open_table(&fixture, Arc::clone(&runtime_env), spec()).await;
+        overwrite(&table, vec![batch.clone()]).await;
+        // Scan once so every file's statistics row is written.
+        query(&table, "t", "SELECT count(*) FROM t WHERE \"K\" > 1.0").await;
+        let seeded = seed_blobs_without_nan_counts(&fixture, &table, (0.0, 4999.75)).await;
+
+        let reopened = open_table(&fixture, Arc::clone(&runtime_env), spec()).await;
+        let nan_rows = rendered(
+            &query(
+                &reopened,
+                "t",
+                "SELECT \"AutoId\" FROM t WHERE \"K\" = CAST('NaN' AS DOUBLE)",
+            )
+            .await,
+        );
+        let beyond = query(
+            &reopened,
+            "t",
+            "EXPLAIN ANALYZE SELECT \"AutoId\" FROM t WHERE \"K\" > 60000.0",
+        )
+        .await;
+        if has_nan {
+            assert_eq!(nan_rows, vec![(ROWS / 2).to_string()], "{name}");
+        } else {
+            assert!(nan_rows.is_empty(), "{name}: {nan_rows:?}");
+            assert_eq!(
+                files_scanned(&beyond),
+                0,
+                "{name}: a file holding no NaN must be pruned again once its blob is re-inferred"
+            );
+        }
+
+        // Every seeded row was re-inferred and rewritten: a file holding a NaN has
+        // no float bounds, and every other file's bounds carry a zero NaN count.
+        let table_id = reopened.table_id().to_string();
+        let schema = datafusion::datasource::TableProvider::schema(reopened.as_ref());
+        let mut unbounded_files = 0;
+        for (snapshot_id, key) in &seeded {
+            let row = fixture
+                .catalog
+                .get_snapshot_file_statistics(&table_id, snapshot_id, key)
+                .await
+                .expect("statistics row")
+                .expect("row present");
+            let file_stats =
+                cayenne::stats::deserialize_file_statistics(&row.statistics_blob, &schema)
+                    .expect("blob decodes");
+            let (k_stats, _) = file_stats.into_iter().nth(1).expect("K column");
+            let bounded = !k_stats.get(Stat::Max).is_absent();
+            let nan_count = k_stats
+                .get_as::<u64>(Stat::NaNCount, &vortex::dtype::PType::U64.into())
+                .as_exact();
+            assert!(
+                !bounded || nan_count == Some(0),
+                "{name}: row {key} was not rewritten (bounded, nan_count={nan_count:?})"
+            );
+            if !bounded {
+                unbounded_files += 1;
+            }
+        }
+        assert_eq!(
+            unbounded_files,
+            usize::from(has_nan),
+            "{name}: only the file holding the NaN may lose its bounds ({} files)",
+            seeded.len()
+        );
+    }
+}
