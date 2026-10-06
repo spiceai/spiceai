@@ -1362,7 +1362,8 @@ impl RefreshTask {
             && match update.update_type {
                 UpdateType::Overwrite => true,
                 UpdateType::Append => {
-                    refresh.write_retention_sql_delete_expr.is_none()
+                    dedup.appends_resolved_after_write
+                        && refresh.write_retention_sql_delete_expr.is_none()
                         && self.acceleration_is_empty().await?
                 }
                 UpdateType::Changes => false,

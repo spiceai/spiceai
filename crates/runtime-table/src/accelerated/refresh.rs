@@ -81,9 +81,12 @@ pub enum Error {
 /// How a refresh that keeps each key's newest version by `time_column` resolves it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VersionsByTime {
-    /// The accelerator resolves a full refresh's repeated keys after writing them, by
-    /// the row versions the refresh supplies (unpartitioned file-mode Cayenne).
+    /// The accelerator resolves a full refresh's repeated keys as it writes them, by
+    /// the row versions the refresh supplies (unpartitioned Cayenne).
     pub versions_resolved_after_write: bool,
+    /// It also resolves them for an append into an empty table (unpartitioned
+    /// file-mode Cayenne).
+    pub appends_resolved_after_write: bool,
 }
 
 #[derive(Clone, Debug)]

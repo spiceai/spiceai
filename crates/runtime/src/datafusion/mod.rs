@@ -3239,10 +3239,15 @@ impl DataFusion {
                 .orders_versions_by_time(dataset.time_column.as_deref(), refresh_mode)
                 .then(|| {
                     VersionsByTime {
-                        // An unpartitioned file-mode Cayenne table resolves a full refresh's
-                        // repeated keys after writing them, ordered by the row versions the
-                        // refresh supplies.
+                        // An unpartitioned Cayenne table resolves a full refresh's repeated
+                        // keys as it writes them, ordered by the row versions the refresh
+                        // supplies: in file mode after writing, in memory mode over the
+                        // buffered write. Only file mode does so for an append into an
+                        // empty table.
                         versions_resolved_after_write: acceleration_settings.engine
+                            == Engine::Cayenne
+                            && acceleration_settings.partition_by.is_empty(),
+                        appends_resolved_after_write: acceleration_settings.engine
                             == Engine::Cayenne
                             && acceleration_settings.mode == Mode::File
                             && acceleration_settings.partition_by.is_empty(),
