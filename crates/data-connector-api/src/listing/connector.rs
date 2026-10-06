@@ -4675,6 +4675,179 @@ mod tests {
         assert_eq!(value, "new");
     }
 
+    /// A partition directory holding only an empty file contributes no row, so
+    /// `MAX` of the partition column must not be that partition's value. With
+    /// exact row counts collected, `MIN`/`MAX` of a partition column is answered
+    /// from the listing's statistics, and the `spiceai/datafusion` fork gives a
+    /// file that holds no rows no bounds for its partition columns
+    /// (spiceai/datafusion#251).
+    #[tokio::test]
+    async fn max_of_a_partition_column_skips_a_partition_holding_only_an_empty_file() {
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        for (partition, rows) in [("1", 5_i64), ("2", 5), ("3", 5), ("99", 0)] {
+            let partition_dir = dir.path().join(format!("p={partition}"));
+            std::fs::create_dir_all(&partition_dir).expect("create partition directory");
+            let batch = RecordBatch::try_new(
+                Arc::clone(&file_schema),
+                vec![Arc::new(arrow::array::Int64Array::from_iter_values(
+                    0..rows,
+                ))],
+            )
+            .expect("valid batch");
+            let mut writer = ArrowWriter::try_new(
+                std::fs::File::create(partition_dir.join("f.parquet")).expect("create parquet"),
+                Arc::clone(&file_schema),
+                None,
+            )
+            .expect("parquet writer");
+            writer.write(&batch).expect("write parquet");
+            writer.close().expect("close parquet");
+        }
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        let (connector, mut dataset) = setup_connector(table_url.clone(), params);
+        dataset
+            .params
+            .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+
+        let url = Url::parse(&table_url).expect("table url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("parquet listing format")
+        else {
+            panic!("expected a parquet file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table production path");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("hive", provider)
+            .expect("register listing table");
+
+        // The listing carries exact row counts, so an aggregate the statistics
+        // can answer is answered from them; otherwise this test would pass
+        // without ever reaching the bounds it is about.
+        let count_plan = ctx
+            .sql("SELECT count(*) FROM hive")
+            .await
+            .expect("plan count")
+            .create_physical_plan()
+            .await
+            .expect("physical count plan");
+        let count_plan = datafusion::physical_plan::displayable(count_plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            count_plan.contains("PlaceholderRowExec"),
+            "precondition: count(*) must be answered from exact statistics:\n{count_plan}"
+        );
+
+        let batches = ctx
+            .sql("SELECT min(p) AS lo, max(p) AS hi FROM hive")
+            .await
+            .expect("plan min/max")
+            .collect()
+            .await
+            .expect("run min/max");
+        let rendered: Vec<String> = ["lo", "hi"]
+            .iter()
+            .map(|name| {
+                let column = batches[0].column_by_name(name).expect("min/max column");
+                arrow::util::display::array_value_to_string(column, 0).expect("value renders")
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            ["1", "3"],
+            "partition 99 holds no rows, so it is neither the minimum nor the maximum"
+        );
+    }
+
+    /// `ListingTable` prunes the listing by a predicate on a metadata column
+    /// before it opens a file, and reports that predicate `Exact`
+    /// (spiceai/datafusion#240): with `_size < 50` only the small files are
+    /// scanned.
+    #[tokio::test]
+    async fn listing_table_prunes_files_by_a_metadata_column_predicate() {
+        use datafusion::datasource::file_format::json::JsonFormat;
+        use datafusion::datasource::physical_plan::FileScanConfig;
+        use datafusion::datasource::source::DataSourceExec;
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion_expr::{col, lit};
+
+        fn scanned_files(plan: &Arc<dyn ExecutionPlan>) -> usize {
+            if let Some(scan) = plan.downcast_ref::<DataSourceExec>()
+                && let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>()
+            {
+                return config.file_groups.iter().map(|group| group.len()).sum();
+            }
+            plan.children()
+                .iter()
+                .map(|child| scanned_files(child))
+                .sum()
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Three one-row files and one fifty-row file, told apart by `_size`.
+        for (name, rows) in [("a", 1), ("b", 1), ("c", 1), ("d", 50)] {
+            let content: String = (0..rows).map(|n| format!("{{\"id\": {n}}}\n")).collect();
+            std::fs::write(dir.path().join(format!("{name}.json")), content)
+                .expect("write json file");
+        }
+
+        let ctx = SessionContext::new();
+        let options = ListingOptions::new(Arc::new(JsonFormat::default()))
+            .with_file_extension(".json")
+            .with_metadata_cols(vec![datafusion_datasource::metadata::MetadataColumn::Size]);
+        let config = ListingTableConfig::new(
+            ListingTableUrl::parse(format!("file://{}/", dir.path().display()))
+                .expect("listing url"),
+        )
+        .with_listing_options(options)
+        .infer_schema(&ctx.state())
+        .await
+        .expect("infer schema");
+        let table = Arc::new(ListingTable::try_new(config).expect("listing table"));
+
+        let filter = col("_size").lt(lit(50_u64));
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&filter])
+                .expect("filter pushdown"),
+            vec![TableProviderFilterPushDown::Exact],
+            "a predicate on a metadata column is decided per file, so the listing answers it exactly"
+        );
+
+        ctx.register_table("t", table)
+            .expect("register listing table");
+        let plan = ctx
+            .table("t")
+            .await
+            .expect("open table")
+            .filter(filter)
+            .expect("apply `_size <` filter")
+            .select_columns(&["id"])
+            .expect("project id")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert_eq!(
+            scanned_files(&plan),
+            3,
+            "the fifty-row file must be pruned from the listing:\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+    }
+
     /// Location predicates used to warn and skip a matching object whose Hive
     /// path could not be parsed, which is the same silent-omit as the
     /// format-selected listing scan.
