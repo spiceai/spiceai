@@ -3887,8 +3887,10 @@ mod pool_tests {
         .expect("accepted cache drain must settle");
     }
 
+    /// A cache job that failed before reaching storage has still finished, so it
+    /// must not fence the generation: a later reload has to be able to replace it.
     #[tokio::test]
-    async fn drain_reports_cache_job_failure_and_still_closes_storage() {
+    async fn drain_settles_failed_cache_jobs_without_fencing_and_closes_storage() {
         tokio::time::timeout(Duration::from_secs(5), async {
             for panics in [false, true] {
                 let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
@@ -3908,21 +3910,11 @@ mod pool_tests {
                 let first = table.begin_changes_drain();
                 let second = table.begin_changes_drain();
                 release.send(()).expect("release failed work");
-                let error = first.wait().await.expect_err("accepted job failure");
-                assert_eq!(
-                    error.to_string(),
-                    second
-                        .wait()
-                        .await
-                        .expect_err("latched failure")
-                        .to_string()
-                );
-                let expected = if panics {
-                    "task panicked"
-                } else {
-                    "controlled cache preparation failure"
-                };
-                assert!(error.to_string().contains(expected), "{error}");
+                first
+                    .wait()
+                    .await
+                    .expect("a finished job does not fail the drain");
+                second.wait().await.expect("repeated drain observer");
                 assert!(
                     sink.reserve().await.is_err(),
                     "failed cache work must not skip storage close"

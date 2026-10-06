@@ -1461,10 +1461,9 @@ impl AcceleratedTable {
                             )));
                         }
                     }
-                    let cache_result = match cache_work {
-                        Some(cache_work) => cache_work.wait().await,
-                        None => Ok(()),
-                    };
+                    if let Some(cache_work) = cache_work {
+                        cache_work.wait().await;
+                    }
                     let publication = publication.or_else(|| {
                         sink.as_ref()
                             .map(runtime_acceleration::change_sink::ChangeSink::begin_close)
@@ -1479,11 +1478,10 @@ impl AcceleratedTable {
                     if let Some(synchronized) = synchronized {
                         synchronized.unregister_cache_child(&claims).await;
                     }
-                    let failures: Vec<_> =
-                        [storage_result.err(), cache_result.err(), producer_failure]
-                            .into_iter()
-                            .flatten()
-                            .collect();
+                    let failures: Vec<_> = [storage_result.err(), producer_failure]
+                        .into_iter()
+                        .flatten()
+                        .collect();
                     let result = if failures.is_empty() {
                         Ok(())
                     } else {
@@ -1501,7 +1499,7 @@ impl AcceleratedTable {
     ///
     /// # Errors
     ///
-    /// Returns every producer, cache-work and storage failure the drain observed.
+    /// Returns every producer and storage failure the drain observed.
     pub async fn drain_changes(&self) -> DataFusionResult<()> {
         self.begin_changes_drain().wait().await
     }

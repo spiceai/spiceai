@@ -249,25 +249,17 @@ pub struct CacheWorkDrain {
 }
 
 impl CacheWorkDrain {
-    /// Wait for all accepted cache jobs, preserving their first failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns a preparation, publication, or task failure from an accepted job.
-    pub async fn wait(&self) -> Result<()> {
+    /// Wait for every accepted cache job to finish. A finished job proves its
+    /// cleanup whatever its outcome: it reports its own failure, and storage
+    /// failures are latched by the sink, whose close fails the generation drain.
+    pub async fn wait(&self) {
         self.work.tasks.wait().await;
-        self.work
-            .failure
-            .lock()
-            .clone()
-            .map_or(Ok(()), |error| Err(DataFusionError::Shared(error)))
     }
 }
 
 struct CacheWork {
     tasks: TaskTracker,
     closed: parking_lot::Mutex<bool>,
-    failure: parking_lot::Mutex<Option<Arc<DataFusionError>>>,
 }
 
 /// Cache policy and completion effects for an already-bound table owner.
@@ -366,7 +358,6 @@ impl CacheWriteSender {
             work: Arc::new(CacheWork {
                 tasks: TaskTracker::new(),
                 closed: parking_lot::Mutex::new(false),
-                failure: parking_lot::Mutex::new(None),
             }),
             append_ingress,
             freshness: Arc::new(CacheFreshness::default()),
@@ -429,20 +420,14 @@ impl CacheWriteSender {
                         "Cache generation is draining; new cache preparation is refused".into(),
                     ));
                 }
-                let owner = Arc::clone(&writer.work);
+                let dataset = writer.health.lock().dataset.clone();
                 drop(writer.work.tasks.spawn_on(
                     async move {
-                        let result =
-                            AssertUnwindSafe(work)
-                                .catch_unwind()
-                                .await
-                                .unwrap_or_else(|_| {
-                                    Err(DataFusionError::Execution(
-                                        "Cache preparation or publication task panicked".into(),
-                                    ))
-                                });
-                        if let Err(error) = result {
-                            owner.failure.lock().get_or_insert_with(|| Arc::new(error));
+                        // A job reports its own failure; only a panic is reported here.
+                        if AssertUnwindSafe(work).catch_unwind().await.is_err() {
+                            tracing::error!(
+                                "A cache population task for dataset '{dataset}' panicked, so its response was not cached and the next query for it will be answered from the origin."
+                            );
                         }
                     },
                     runtime,
