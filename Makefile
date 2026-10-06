@@ -349,6 +349,8 @@ lint: lint-rust
 # Full workspace lint (default), or scoped via PACKAGES=… for a fast fail-first pass.
 lint-rust:
 	cargo fmt $(_FMT_FLAGS) -- --check
+	## Shared guard helpers (fast, no compile): each guard below that reads `cargo metadata` must exit 2, never 1, when cargo cannot answer — 1 would report a broken toolchain as a violation
+	$(PYTHON) scripts/test_rust_guard_common.py
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
 	$(PYTHON) scripts/check_crate_layers.py
 	## Table-layer guard (fast, no compile): a provider-wrapping TableProvider silently stops every layer walk. See docs/dev/crate_layering.md

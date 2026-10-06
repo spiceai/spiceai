@@ -9,10 +9,6 @@ name: testoperator cluster bench dispatch
 # Spice Cloud resource usage bounded.
 
 on:
-  schedule:
-    # Daily SF10 distributed TPC-H baseline (08:00 UTC). Scheduled runs build
-    # from trunk and fan out the tpch/sf10/distributed dispatch matrix.
-    - cron: '0 8 * * *'
   workflow_dispatch:
     inputs:
       spiced_ref:
@@ -131,9 +127,7 @@ jobs:
       (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
     runs-on: spiceai-dev-runners
     env:
-      # Scheduled runs target the SF10 distributed matrix; manual dispatch
-      # overrides via the dispatch_dir input.
-      DISPATCH_DIR: ${{ github.event.inputs.dispatch_dir || (github.event_name == 'schedule' && 'tpch/sf10/distributed') || '.' }}
+      DISPATCH_DIR: ${{ github.event.inputs.dispatch_dir || '.' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
