@@ -1866,6 +1866,43 @@ mod tests {
         assert_eq!(rendered.to_string(), "('a' || 'b')");
     }
 
+    /// `DuckDB`'s `date_part('dow', …)` counts Sunday as 0, matching
+    /// `DataFusion` and `PostgreSQL` `EXTRACT(DOW)`. Spark's simplify stub rewrites
+    /// `'dow'` / `'DOW'` / mixed case to the built-in plus one (Sunday = 1).
+    /// The dialect must not apply that shift when unparsing: a
+    /// `DuckDB`-accelerated `GROUP BY date_part('dow', …)` would then disagree
+    /// with the local result once the session keeps the built-in.
+    #[test]
+    fn date_part_dow_unparses_without_a_sunday_one_shift() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let ts = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "ts".to_string(),
+            spans: Spans::new(),
+        });
+
+        for field in ["dow", "DOW", "Dow"] {
+            let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+                datafusion::functions::datetime::date_part(),
+                vec![lit(field), ts.clone()],
+            ));
+            let rendered = unparser
+                .expr_to_sql(&call)
+                .expect("date_part unparses for DuckDB")
+                .to_string();
+            assert!(
+                !rendered.contains("+ 1") && !rendered.contains("+1"),
+                "DuckDB date_part('{field}') must not shift Sunday to 1: {rendered}"
+            );
+            let lower = rendered.to_lowercase();
+            assert!(
+                lower.contains("date_part") || lower.contains("dow"),
+                "expected a weekday extraction for '{field}', got {rendered}"
+            );
+        }
+    }
+
     /// The premise the rewrite rests on, pinned against the function the
     /// runtime actually registers.
     ///
