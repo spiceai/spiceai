@@ -22,9 +22,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use parking_lot::Mutex;
 use runtime_acceleration::Engine;
+use runtime_acceleration::acceleration::DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL;
 use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotManager};
 use runtime_metrics as metrics;
 use snafu::prelude::*;
@@ -39,14 +40,11 @@ use crate::component::dataset::{
         waiting_for_snapshot_message,
     },
 };
-use crate::dataaccelerator::{
-    AccelerationSource, BootstrapStatus, CayenneSnapshotValidationError, acceleration_file_path,
-    validate_snapshot_consistency,
-};
+use crate::dataaccelerator::{BootstrapStatus, acceleration_file_path};
 use crate::dataconnector::snapshot_source::{
     projected_publisher_message, publisher_column_projection,
 };
-use crate::datafusion::{DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL, engine_to_acceleration_engine};
+use crate::datafusion::engine_to_acceleration_engine;
 use crate::init::dataset_loads::DatasetLoad;
 use crate::{LogErrors, Runtime, UnableToBuildDatasetSnafu, status};
 
@@ -222,6 +220,11 @@ impl Runtime {
                 .remove(&resolved.name)?
                 // `initialize_datasets_accelerators` reports its own failures.
                 .ok()?
+                // The engines leave a reader's restore pending; it runs here, under
+                // the attempt, so a reload waits for it and the check below reads the
+                // restored copy. One that finds nothing keeps waiting in the load.
+                .restore_once()
+                .await
         };
         // A reload that superseded this resolution while the snapshot was restored loads
         // the dataset as it now is; this load must not also register it.
@@ -230,8 +233,7 @@ impl Runtime {
         }
         // Refused here, before registration: once a snapshot is restored, a failure to
         // describe the dataset's source would serve the restored copy while retrying.
-        if let Some(refresh_sql) = publisher_column_projection(&resolved).await {
-            self.refuse_snapshot_source(&name, &projected_publisher_message(&name, &refresh_sql));
+        if self.refuses_projected_publisher(&resolved).await {
             return None;
         }
 
@@ -372,32 +374,6 @@ impl Runtime {
         };
         let datasets = Arc::clone(self).get_valid_datasets(&dataset.app(), LogErrors(false));
 
-        // Cayenne keeps every dataset of one metadata directory in one catalog, which
-        // must not mix datasets that restore snapshots with datasets that do not.
-        let sources: Vec<Arc<dyn AccelerationSource>> =
-            datasets.iter().map(|other| other.clone_arc()).collect();
-        match validate_snapshot_consistency(&sources) {
-            Ok(()) => {}
-            Err(CayenneSnapshotValidationError::InconsistentSnapshotSettings {
-                metadata_dir,
-                disabled_datasets,
-                ..
-            }) => {
-                return Err(cannot_load_snapshot_message(
-                    &dataset.name,
-                    &format!(
-                        "it shares the Cayenne catalog in '{metadata_dir}' with Cayenne datasets that do not restore snapshots ({disabled_datasets}), and one catalog cannot hold both. Accelerate those datasets with another engine, or serve this dataset from another Spice instance"
-                    ),
-                ));
-            }
-            Err(err) => {
-                return Err(cannot_load_snapshot_message(
-                    &dataset.name,
-                    &err.to_string(),
-                ));
-            }
-        }
-
         // Restoring a `DuckDB`, `SQLite` or Turso snapshot replaces the whole file, so a
         // file two datasets share would serve whichever restored last to both.
         let param = match acceleration.engine {
@@ -457,6 +433,20 @@ impl Runtime {
     }
 
     /// Reports a snapshot dataset that no retry can load.
+    /// Refuses `dataset` when its restored snapshots come from a publisher whose
+    /// `refresh_sql` stores only some of its source's columns. Checked against the
+    /// restored copy, so it runs wherever a restore completes, before registration.
+    pub(super) async fn refuses_projected_publisher(&self, dataset: &Dataset) -> bool {
+        let Some(refresh_sql) = publisher_column_projection(dataset).await else {
+            return false;
+        };
+        self.refuse_snapshot_source(
+            &dataset.name,
+            &projected_publisher_message(&dataset.name, &refresh_sql),
+        );
+        true
+    }
+
     fn refuse_snapshot_source(&self, dataset: &TableReference, message: &str) {
         self.status.update_dataset(
             dataset,

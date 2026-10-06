@@ -85,7 +85,7 @@ use crate::provider::{Error, InternalSnafu, Result};
 use crate::resource_starvation::ResourceStarvationTracker;
 use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, BooleanBufferBuilder, Int64Array};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
+use arrow_schema::{DataType, Field, Fields, SchemaBuilder, SchemaRef};
 use hash_index::PrehashedBuildHasher;
 use snafu::ensure;
 
@@ -113,13 +113,15 @@ use datafusion_common::{
 };
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
-use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
-use datafusion_datasource::{PartitionedFile, TableSchema, compute_all_files_statistics};
-use datafusion_execution::cache::TableScopedPath;
-use datafusion_execution::cache::cache_manager::{
-    CachedFileList, CachedFileMetadata, FileStatisticsCache,
+use datafusion_datasource::file_scan_config::{
+    FileScanConfig, FileScanConfigBuilder, output_partitioning_from_partition_fields,
 };
-use datafusion_execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
+use datafusion_datasource::{PartitionedFile, TableSchema, compute_all_files_statistics};
+use datafusion_execution::cache::cache_manager::{
+    CachedFileList, CachedFileMetadata, DEFAULT_FILE_STATISTICS_MEMORY_LIMIT, FileStatisticsCache,
+};
+use datafusion_execution::cache::default_cache::DefaultCache;
+use datafusion_execution::cache::{SchemaFingerprint, TableScopedPath};
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::utils::conjunction;
@@ -755,10 +757,30 @@ fn inline_memtable_pressure_with_thresholds(
     None
 }
 
+/// The listing options a snapshot scan plans with, plus the two session settings
+/// the snapshot scan planner reads alongside them. `DataFusion` reads
+/// `target_partitions` and `collect_statistics` from the scanning session rather
+/// than from [`ListingOptions`]; the planner carries them here because a scan may
+/// override `collect_stat` for itself (see `lookup_index_snapshot_files`).
+#[derive(Clone, Debug)]
+pub(crate) struct SnapshotScanOptions {
+    pub(crate) listing: ListingOptions,
+    pub(crate) target_partitions: usize,
+    pub(crate) collect_stat: bool,
+}
+
+impl SnapshotScanOptions {
+    #[must_use]
+    fn with_collect_stat(mut self, collect_stat: bool) -> Self {
+        self.collect_stat = collect_stat;
+        self
+    }
+}
+
 struct SnapshotScanListingRequest<'a> {
     state: &'a dyn Session,
     table_url: &'a ListingTableUrl,
-    options: &'a ListingOptions,
+    options: &'a SnapshotScanOptions,
     partition_filters: &'a [Expr],
     data_filters: &'a [Expr],
     snapshot_id: &'a str,
@@ -849,11 +871,24 @@ pub(super) fn serialize_batches_to_ipc(
 }
 
 /// Deserialize Arrow IPC bytes back to a `RecordBatch`.
+///
+/// Read through `arrow_tools` rather than the IPC reader directly: a blob holding a `Map`
+/// column may have been written under the declaration the Arrow map layout forbids
+/// (`entries` nullable), which the decode refuses outright. `get_table` repairs the
+/// table's stored declaration, but not the blob's own, so the inline corpus of such a table
+/// is readable only if the stream is repaired on the way in.
 fn deserialize_ipc_to_batch(
     ipc_bytes: &[u8],
 ) -> std::result::Result<Vec<RecordBatch>, arrow::error::ArrowError> {
-    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc_bytes), None)?;
-    reader.collect()
+    use arrow_tools::map_entries::Error;
+
+    arrow_tools::map_entries::read_ipc_stream(ipc_bytes).map_err(|e| match e {
+        Error::UndecodableStream { source } => source,
+        // A blob whose map entries hold nulls has no map to be read back as. The refusal names
+        // the column, which the decoder's own does not, so it is carried across rather than
+        // flattened into the IPC failure above.
+        named => arrow::error::ArrowError::InvalidArgumentError(named.to_string()),
+    })
 }
 
 /// Tombstone payload format discriminator (cycle-5 TASK 2a).
@@ -1251,13 +1286,12 @@ struct RawScanInput {
     /// Current snapshot id captured under the read fence and pinned against GC
     /// by [`Self::scan_guard`]. Its directory can still receive in-place appends.
     current_snapshot_id: String,
-    /// The secondary index published when this view was captured. A full
-    /// refresh publishes its index inside the same fenced flip that makes its
-    /// snapshot visible, so this is never an index for a newer snapshot than
-    /// [`Self::current_snapshot_id`]. Every lookup this view plans, including one
-    /// probed by a join long after planning, uses this index, so an index a
-    /// refresh publishes mid-query is never mistaken for a stale one.
-    lookup_index: Option<Arc<super::lookup_index::SnapshotLookupIndex>>,
+    /// The secondary index view pinned when this view was captured, under the
+    /// same fence as [`Self::warm_files`]. It answers for the files it covers
+    /// and every other file is read in full, so every lookup this view plans,
+    /// including one probed by a join long after planning, is judged against
+    /// the files this view reads.
+    lookup_index: Option<Arc<super::lookup_index::LookupIndexView>>,
     /// Warm files captured under the same fence as the inline and deletion views.
     /// A checkpoint may add files to the same directory after capture; those files
     /// must not be unioned with this view's pre-checkpoint inline rows.
@@ -1797,7 +1831,7 @@ pub struct CayenneTableProvider {
     /// File statistics cache used by the direct snapshot scan planner. This
     /// replaces the per-scan `ListingTable` cache while preserving repeated
     /// scan behavior when `collect_statistics` asks us to read Vortex footers.
-    scan_file_statistics: Arc<dyn FileStatisticsCache>,
+    scan_file_statistics: Arc<FileStatisticsCache>,
     /// Unpruned snapshot directory listing (paths + footer stats) for the
     /// current file set. Keyed by snapshot id, [`Self::current_dir_generation`],
     /// and [`Self::listing_cache_epoch`] so a publish that adds files cannot
@@ -2049,6 +2083,9 @@ pub struct CayenneTableProvider {
     /// `indexes`. `None` when it declares none. Owned by the provider and its
     /// clones, so dropping the table drops the index and its reservation.
     lookup_index: Option<Arc<super::lookup_index::LookupIndexState>>,
+    /// Each protected snapshot's files, listed once for the secondary index's
+    /// live set (see `lookup_index_protected_files`).
+    lookup_index_protected_listings: Arc<ParkingMutex<HashMap<String, Arc<[String]>>>>,
     /// Secondary indexes over a memory-mode table's rows, kept with each
     /// memory-tier segment. `None` in file mode and without `indexes`.
     mem_tier_index: Option<Arc<super::mem_tier_index::MemTierIndexer>>,
@@ -2747,25 +2784,44 @@ pub struct CayenneTableProviderBuilder {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    index_word_bits: Option<u32>,
 }
 
-/// Resolves every configured lookup-index column before table creation/open.
-/// Returning the resolved specs lets `create` fail before it mutates the
-/// catalog, while `open` repeats the check against the persisted schema.
+/// Resolves every configured lookup-index column before table creation/open,
+/// and returns the keys over the table's spelling of their columns: a key
+/// column resolves whatever case `indexes` spelled it in, and a filter names
+/// the table column. Resolving first lets `create` fail before it mutates the
+/// catalog, while `open` repeats the check against the persisted schema. A
+/// file-mode table's index also needs a column type it can encode.
 fn validated_lookup_index_keys(
     table_name: &str,
     schema: &arrow_schema::Schema,
     indexes: &[Vec<String>],
+    memory_mode: bool,
 ) -> CatalogResult<Vec<super::lookup_index::KeySpec>> {
-    let keys = super::lookup_index::KeySpec::from_indexes(indexes);
-    for key in &keys {
+    let invalid = |message| Error::InvalidConfiguration {
+        table: table_name.to_string(),
+        message,
+    };
+    let mut keys: Vec<super::lookup_index::KeySpec> = Vec::new();
+    for key in super::lookup_index::KeySpec::from_indexes(indexes) {
+        let mut columns = Vec::with_capacity(key.columns().len());
         for column in key.columns() {
-            super::lookup_index::KeyColumn::resolve(schema, column).map_err(|message| {
-                Error::InvalidConfiguration {
-                    table: table_name.to_string(),
-                    message,
-                }
-            })?;
+            let column =
+                super::lookup_index::KeyColumn::resolve(schema, column).map_err(invalid)?;
+            if !memory_mode {
+                super::lookup_index::supported_key_type(&column.data_type).map_err(|cause| {
+                    invalid(format!(
+                        "lookup index column '{}' has type {}, which cannot be indexed ({cause}); index a column of a scalar type such as an integer, decimal, string, or timestamp",
+                        column.name, column.data_type
+                    ))
+                })?;
+            }
+            columns.push(column.name);
+        }
+        // Two entries spelling one key's columns in different case are one key.
+        if !keys.iter().any(|existing| existing.columns() == columns) {
+            keys.push(key.with_columns(columns));
         }
     }
     Ok(keys)
@@ -2868,6 +2924,7 @@ struct CayenneTableProviderOpenOptions {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    index_word_bits: Option<u32>,
 }
 
 impl CayenneTableProviderBuilder {
@@ -2886,6 +2943,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
             secondary_indexes: Vec::new(),
+            index_word_bits: None,
         }
     }
 
@@ -2980,6 +3038,17 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Hash every secondary index key to a word of only `bits` bits, so that
+    /// many keys share a word and every lookup returns other keys' rows as
+    /// candidates. For tests that queries still return exact results: never
+    /// use it to serve queries.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_index_word_bits(mut self, bits: u32) -> Self {
+        self.index_word_bits = Some(bits);
+        self
+    }
+
     /// Open an existing table by name.
     ///
     /// # Errors
@@ -2997,6 +3066,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            index_word_bits: self.index_word_bits,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -3012,7 +3082,12 @@ impl CayenneTableProviderBuilder {
     /// created in the catalog.
     pub async fn create(self, options: CreateTableOptions) -> CatalogResult<CayenneTableProvider> {
         let table_name = options.table_name.clone();
-        validated_lookup_index_keys(&table_name, &options.schema, &self.secondary_indexes)?;
+        validated_lookup_index_keys(
+            &table_name,
+            &options.schema,
+            &self.secondary_indexes,
+            options.vortex_config.memory_mode,
+        )?;
         let _table_id = self.catalog.create_table(options).await?;
         let options = CayenneTableProviderOpenOptions {
             retention_filters: self.retention_filters,
@@ -3024,6 +3099,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            index_word_bits: self.index_word_bits,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -3061,6 +3137,17 @@ fn retention_deferred_until_durable_message(table_name: &str) -> String {
 fn retention_deferred_transient_message(table_name: &str) -> String {
     format!(
         "Failed to apply the retention policy to accelerated dataset '{table_name}': a write to this dataset is still being published, so rows matching `retention_sql` stay queryable for the moment. The next pass applies it; retry a manual drain in a few seconds. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
+/// The line an operator reads when `retention_sql` actually removed rows.
+///
+/// The one positive signal that the policy ran, so it carries the dataset in the text and
+/// not only in a `tracing` field: a reader grepping this line needs to know which dataset
+/// it ran for, and the field is invisible to `grep`.
+fn retention_deleted_message(table_name: &str, deleted: u64) -> String {
+    format!(
+        "Retention deleted {deleted} row(s) matching `retention_sql` from accelerated dataset '{table_name}'"
     )
 }
 
@@ -4401,7 +4488,14 @@ fn merge_input_statistics(plans: &[Arc<dyn ExecutionPlan>]) -> Vec<Arc<Statistic
     let aggregates = || -> Vec<Arc<Statistics>> {
         plans
             .iter()
-            .map(|plan| plan.partition_statistics(None).ok())
+            .map(|plan| {
+                datafusion_physical_plan::StatisticsContext::new()
+                    .compute(
+                        plan.as_ref(),
+                        &datafusion_physical_plan::StatisticsArgs::new(),
+                    )
+                    .ok()
+            })
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default()
     };
@@ -4417,7 +4511,10 @@ fn merge_input_statistics(plans: &[Arc<dyn ExecutionPlan>]) -> Vec<Arc<Statistic
     let mut bands = Vec::with_capacity(partitions);
     for plan in plans {
         for partition in 0..plan.output_partitioning().partition_count() {
-            let Ok(stats) = plan.partition_statistics(Some(partition)) else {
+            let Ok(stats) = datafusion_physical_plan::StatisticsContext::new().compute(
+                plan.as_ref(),
+                &datafusion_physical_plan::StatisticsArgs::new().with_partition(Some(partition)),
+            ) else {
                 return aggregates();
             };
             bands.push(stats);
@@ -5350,6 +5447,19 @@ impl CayenneTableProvider {
             }
         }
 
+        // The secondary index's keys under the evolved schema, before anything
+        // is committed: a key column widened to a type the index cannot hold
+        // refuses the change, as opening the table with that schema would.
+        let index_shapes = self
+            .lookup_index
+            .as_ref()
+            .map(|state| state.shapes_for(&plan.evolved_schema))
+            .transpose()
+            .map_err(|message| Error::InvalidConfiguration {
+                table: self.table_metadata.table_name.clone(),
+                message,
+            })?;
+
         let started = Instant::now();
         let _write_guard = self.write_lock.lock().await;
 
@@ -5407,6 +5517,9 @@ impl CayenneTableProvider {
                     .map_err(|source| Error::Catalog { source })?;
             }
             self.table_schema.store(Arc::clone(&plan.evolved_schema));
+            if let (Some(state), Some(shapes)) = (&self.lookup_index, index_shapes) {
+                state.adopt_shapes(shapes);
+            }
             {
                 // Cached optimizer statistics are column-indexed against the
                 // old schema width (DataFusion expects column_statistics.len()
@@ -6019,11 +6132,6 @@ impl CayenneTableProvider {
         // (via `update_current_snapshot_id` + `invalidate_inlined_cache`) advance the
         // freshness gate; no torn-capture discard is possible.
         self.update_current_snapshot_id(new_snapshot_id);
-        // The refresh's write-time index becomes visible with its snapshot, never
-        // before: a probe can then treat any index for another snapshot as stale.
-        if let Some(lookup_index) = &self.lookup_index {
-            lookup_index.promote_staged(new_snapshot_id);
-        }
         self.clear_all_deletion_caches();
         // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
         // catalog atomically with the snapshot flip, but didn't bump
@@ -7689,7 +7797,10 @@ impl CayenneTableProvider {
     ) -> Result<Arc<ListingTable>> {
         let table_url = ListingTableUrl::parse(snapshot_dir_url)?;
 
-        let listing_options = Self::create_listing_options(vortex_format, strategy, session_config);
+        // `DataFusion` reads `target_partitions` and `collect_statistics` from the
+        // scanning session, so only the listing options are handed to the table.
+        let listing_options =
+            Self::create_listing_options(vortex_format, strategy, session_config).listing;
 
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(listing_options)
@@ -7716,11 +7827,15 @@ impl CayenneTableProvider {
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
         session_config: &SessionConfig,
-    ) -> ListingOptions {
+    ) -> SnapshotScanOptions {
         let file_format: Arc<dyn FileFormat> = Arc::new(
             vortex_format.with_access_plan_provider(Self::position_deletion_plans(strategy)),
         );
-        ListingOptions::new(file_format).with_session_config_options(session_config)
+        SnapshotScanOptions {
+            listing: ListingOptions::new(file_format),
+            target_partitions: session_config.target_partitions(),
+            collect_stat: session_config.collect_statistics(),
+        }
     }
 
     /// The per-file access plans every scan of this table attaches: the
@@ -8905,6 +9020,7 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             secondary_indexes,
+            index_word_bits,
         } = options;
 
         let table_metadata = catalog.get_table(table_name).await?;
@@ -9088,8 +9204,12 @@ impl CayenneTableProvider {
         ));
         // Secondary indexes over the table's Vortex files, or — for a memory-mode
         // table, which writes no files — over its rows where they live.
-        let index_keys =
-            validated_lookup_index_keys(table_name, &table_metadata.schema, &secondary_indexes)?;
+        let index_keys = validated_lookup_index_keys(
+            table_name,
+            &table_metadata.schema,
+            &secondary_indexes,
+            table_metadata.vortex_config.memory_mode,
+        )?;
         // Shared with the lookup index, which invalidates cached scan views when
         // its published index changes.
         let scan_input_version = Arc::new(AtomicU64::new(0));
@@ -9108,10 +9228,16 @@ impl CayenneTableProvider {
                 super::lookup_index::LookupIndexState::new(
                     table_name,
                     index_keys,
+                    &table_metadata.schema,
                     Arc::clone(&context.runtime_env().memory_pool),
                     Arc::clone(&table_memory),
                     Arc::clone(&scan_input_version),
-                ),
+                    index_word_bits,
+                )
+                .map_err(|message| Error::InvalidConfiguration {
+                    table: table_name.to_string(),
+                    message,
+                })?,
                 None,
             )
         };
@@ -9169,7 +9295,12 @@ impl CayenneTableProvider {
             catalog,
             listing_table: Arc::new(ArcSwap::new(listing_table)),
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
-            scan_file_statistics: Arc::new(DefaultFileStatisticsCache::default()),
+            scan_file_statistics: Arc::new(
+                DefaultCache::<TableScopedPath, CachedFileMetadata>::new(
+                    DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
+                )
+                .with_name("DefaultFileStatisticsCache"),
+            ),
             cached_snapshot_listing: Arc::new(ArcSwapOption::empty()),
             listing_cache_epoch: Arc::new(AtomicU64::new(0)),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
@@ -9214,6 +9345,7 @@ impl CayenneTableProvider {
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
             lookup_index,
+            lookup_index_protected_listings: Arc::default(),
             mem_tier_index,
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
@@ -9781,7 +9913,6 @@ impl CayenneTableProvider {
             estimated_bytes,
             policy,
             None,
-            None,
         )
         .await
     }
@@ -9795,10 +9926,11 @@ impl CayenneTableProvider {
     /// (see [`Self::overwrite_range_plan`]). A streaming write has no such view,
     /// passes `None`, and hashes as before.
     ///
-    /// `write_observer`, when set, is told each batch's file and file-local row
-    /// position as it is written: the full-refresh overwrite builds the
-    /// point-lookup index from it, so the index publishes with the snapshot
-    /// instead of being rebuilt from the finished files afterwards.
+    /// On an indexed table every write also builds the secondary index's runs
+    /// for the files it writes, from each batch's file and file-local row
+    /// position as the sink writes it, and publishes them when the write
+    /// returns: so the files are indexed by the time the caller makes them
+    /// visible, whatever kind of write produced them.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn write_to_snapshot_range_partitioned(
         &self,
@@ -9809,7 +9941,6 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
         policy: super::delta_encoding::WritePolicy,
         range: Option<RangePartitioning<'_>>,
-        write_observer: Option<Arc<dyn VortexWriteObserver>>,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
@@ -9946,8 +10077,17 @@ impl CayenneTableProvider {
                 None => Arc::clone(self.context.file_format()),
             },
         };
-        let write_format = match write_observer {
-            Some(observer) => Arc::new(write_format.with_write_observer(observer)),
+        let index_observer = self.lookup_index.as_ref().map(|state| {
+            // A rewrite replaces files: it indexes every row before it is
+            // swapped in, even when its indexing falls behind.
+            let replaces = matches!(write_class, super::delta_encoding::WriteClass::Maintenance);
+            (Arc::clone(state), state.write_observer(replaces))
+        });
+        let write_format = match &index_observer {
+            Some((_, observer)) => Arc::new(
+                write_format
+                    .with_write_observer(Arc::clone(observer) as Arc<dyn VortexWriteObserver>),
+            ),
             None => write_format,
         };
 
@@ -10002,7 +10142,13 @@ impl CayenneTableProvider {
         let total_rows_written = Arc::new(AtomicU64::new(0));
 
         // Column stats accumulator — updated per batch during writes
-        let stats_accumulator = Arc::new(ColumnStatsAccumulator::new(&self.table_schema()));
+        let stats_accumulator = Arc::new(
+            ColumnStatsAccumulator::new(&self.table_schema()).map_err(|e| Error::Vortex {
+                operation: "derive the column statistics types from the table schema",
+                table: self.table_name().to_string(),
+                source: Box::new(e),
+            })?,
+        );
 
         // Log when starting S3 upload process
         if is_s3_storage {
@@ -10148,6 +10294,12 @@ impl CayenneTableProvider {
             self.record_current_snapshot_files_added(writer_ops);
         }
 
+        // The write's files are complete; its caller makes them visible next.
+        if let Some((state, observer)) = index_observer {
+            // A rewrite replaces files: it is covered before its caller swaps it in.
+            state.finish_write(&observer).await;
+        }
+
         Ok((total_rows, writer_ops, stats_accumulator))
     }
 
@@ -10245,7 +10397,14 @@ impl CayenneTableProvider {
         // error (so the slot is NOT advanced and the tier is not cleared); the
         // already-written shard files are unreferenced and swept as orphans.
         let mut total_files = 0usize;
-        let merged_stats = Arc::new(ColumnStatsAccumulator::new(schema));
+        let merged_stats =
+            Arc::new(
+                ColumnStatsAccumulator::new(schema).map_err(|e| Error::Vortex {
+                    operation: "derive the column statistics types from the table schema",
+                    table: self.table_name().to_string(),
+                    source: Box::new(e),
+                })?,
+            );
         for handle in handles {
             let (_rows, files, stats) = handle.await.map_err(|source| Error::Internal {
                 table: self.table_name().to_string(),
@@ -10534,10 +10693,7 @@ impl CayenneTableProvider {
         // file and nothing bounds it, so the count is the growth signal even
         // without a byte figure.
         telemetry::cayenne::track_scan_file_statistics_entries(
-            u64::try_from(datafusion_execution::cache::CacheAccessor::len(
-                &*self.scan_file_statistics,
-            ))
-            .unwrap_or(u64::MAX),
+            u64::try_from(self.scan_file_statistics.len()).unwrap_or(u64::MAX),
             &dimensions,
         );
     }
@@ -11054,7 +11210,12 @@ impl CayenneTableProvider {
         let bounds = if let Some(bounds) = histogram {
             bounds
         } else {
-            let stats = merged.partition_statistics(None).ok()?;
+            let stats = datafusion_physical_plan::StatisticsContext::new()
+                .compute(
+                    merged.as_ref(),
+                    &datafusion_physical_plan::StatisticsArgs::new(),
+                )
+                .ok()?;
             range_bounds_from_statistics(&stats, index, shards)?
         };
 
@@ -11283,6 +11444,7 @@ impl CayenneTableProvider {
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
             lookup_index: self.lookup_index.as_ref().map(Arc::clone),
+            lookup_index_protected_listings: Arc::clone(&self.lookup_index_protected_listings),
             mem_tier_index: self.mem_tier_index.as_ref().map(Arc::clone),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
@@ -11934,6 +12096,16 @@ impl CayenneTableProvider {
         let mut guard = self.pk_keyset_cache.lock();
         let restored = checkout.close();
         if restored.index_must_be_discarded() {
+            // Drop this index only. The per-shard index is a separate cache with its
+            // own checkout log, and it sees every committed key (other writers'
+            // through the commit mirror in `record_pk_keys_with_location`, the
+            // in-memory sharded apply's directly), so neither reason leaves it missing
+            // one: an event that invalidates the table's keys clears both caches as it
+            // happens (`clear_cached_pk_keyset`), a checkpoint relabels the per-shard
+            // index itself, and an overflow is this log's alone. Dropping it too would
+            // cost the next in-memory CDC apply a full-table keyset rebuild under
+            // `write_lock`.
+            *guard = None;
             drop(guard);
             self.track_pk_index_discard(
                 "table_keyset",
@@ -11947,7 +12119,10 @@ impl CayenneTableProvider {
                  table's live keys (the cache was invalidated, or concurrent commits during \
                  validation exceeded the pending-key budget)"
             );
-            self.clear_cached_pk_keyset();
+            // The next rebuild floor-stamps every key or returns a Bloom, so no stale
+            // stamp behind a degraded per-key OCC flag survives it.
+            self.pk_keyset_occ_degraded.store(false, Ordering::Release);
+            self.publish_single_keyset_bytes(0);
             return;
         }
         let mut index = index;
@@ -18232,8 +18407,11 @@ impl CayenneTableProvider {
         let ctx = self.create_session_context();
         let state = ctx.state();
         let plan = TableProvider::scan(self, &state, Some(&vec![index]), &[], None).await?;
-        let total_rows = plan
-            .partition_statistics(None)
+        let total_rows = datafusion_physical_plan::StatisticsContext::new()
+            .compute(
+                plan.as_ref(),
+                &datafusion_physical_plan::StatisticsArgs::new(),
+            )
             .ok()
             .and_then(|stats| stats.num_rows.get_value().copied());
         // Without a row count, sample sparsely rather than hold the column.
@@ -20387,7 +20565,8 @@ impl CayenneTableProvider {
                     if deleted > 0 {
                         tracing::info!(
                             table = self.table_metadata.table_name.as_str(),
-                            "Background retention deleted {deleted} row(s)"
+                            "{}",
+                            retention_deleted_message(&self.table_metadata.table_name, deleted)
                         );
                     }
                 }
@@ -24518,7 +24697,6 @@ impl CayenneTableProvider {
                     run_sort_bytes: None,
                     bounds_estimated: false,
                 }),
-                None,
             )
             .await;
 
@@ -26228,6 +26406,8 @@ impl CayenneTableProvider {
             retention_filter,
             &df_schema,
             &execution_props,
+            &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(
+            ),
         )?;
 
         let filter_exec = FilterExec::try_new(physical_filter, plan)?;
@@ -26290,6 +26470,8 @@ impl CayenneTableProvider {
             &predicate,
             &df_schema,
             &execution_props,
+            &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(
+            ),
         )
         .and_then(|physical_filter| FilterExec::try_new(physical_filter, Arc::clone(&plan)))
         {
@@ -26311,15 +26493,29 @@ impl CayenneTableProvider {
         }
     }
 
+    /// The error a failed retention pass reports, whatever step of the pass failed.
+    ///
+    /// One function rather than a `format!` per arm so a reword cannot land on some of
+    /// them: whichever step of the pass fails, a user reading the error is owed the same
+    /// three things — which dataset, what is still queryable because of it, and where to
+    /// look next.
+    fn retention_failed_message(&self) -> String {
+        format!(
+            "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+            self.table_metadata.table_name
+        )
+    }
+
     /// Apply retention filters by running the configured delete sink against
     /// the current table state.
     ///
     /// The sole caller is the post-write maintenance loop (see
     /// [`Self::run_maintenance_state`]), which runs outside any writer's
     /// `write_lock`. The pass takes `write_lock` itself and holds it across making
-    /// the in-memory CDC tier durable, building the deletion sink and running it,
-    /// so no insert or listing refresh lands between what the sink scans and what
-    /// it deletes.
+    /// the in-memory CDC tier durable, building the deletion sink and running both
+    /// arms of the delete — the durable sink, then the mem-tier arm — so no insert
+    /// or listing refresh lands between what the sink scans and what it deletes, or
+    /// between the two halves of one pass.
     pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<RetentionPass> {
         let table_name = self.table_metadata.table_name.as_str();
         if self.retention_filters.is_empty() {
@@ -26409,10 +26605,7 @@ impl CayenneTableProvider {
                     MaintenanceOutcome::Failed,
                 );
                 CatalogError::InvalidOperation {
-                    message: format!(
-                        "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                        self.table_metadata.table_name
-                    ),
+                    message: self.retention_failed_message(),
                     source: Box::new(err),
                 }
             })?;
@@ -26432,10 +26625,7 @@ impl CayenneTableProvider {
             &self.table_schema(),
         )
         .map_err(|err| CatalogError::InvalidOperation {
-            message: format!(
-                "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                self.table_metadata.table_name
-            ),
+            message: self.retention_failed_message(),
             source: Box::new(err),
         })?;
         // Composed through the shared builder rather than hand-rolled, so retention gets
@@ -26462,9 +26652,9 @@ impl CayenneTableProvider {
         // snapshot that checkpoint published, inside ONE `write_lock` hold that also
         // covers the delete: the same treatment a user DELETE gets in
         // `InlineAwareDeletionSink` (#13828). The sink is built without a lock of its
-        // own because this hold is it. `retention_sql` still does not reach a
-        // `mode: memory` tier, which has no durable tier to checkpoint into; the
-        // accelerator warns about that at registration.
+        // own because this hold is it. In memory-resident mode the checkpoint returns
+        // immediately — there the tier is the permanent store, with no durable tier to
+        // checkpoint into — and the mem-tier arm below reaches it under this same hold.
         let retention_failed = |err: Box<dyn std::error::Error + Send + Sync>| {
             maintenance_metrics::track_maintenance(
                 table_name,
@@ -26472,10 +26662,7 @@ impl CayenneTableProvider {
                 MaintenanceOutcome::Failed,
             );
             CatalogError::InvalidOperation {
-                message: format!(
-                    "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                    self.table_metadata.table_name
-                ),
+                message: self.retention_failed_message(),
                 source: err,
             }
         };
@@ -26495,24 +26682,44 @@ impl CayenneTableProvider {
         // before the durable delete for the reason documented on it.
         let sink = self.taint_row_count_exactness(Arc::new(sink));
 
-        let deleted = sink
+        let file_deleted = sink
             .delete_from(Arc::new(util::session_state::task_context()))
-            .await;
+            .await
+            .map_err(retention_failed)?;
+
+        // The sink above addresses durable Vortex files and catalog-inlined rows, so a
+        // row resident in the RAM mem-tier is in neither — and under `mode: memory`
+        // that tier IS the table, which is why a retention predicate reached nothing
+        // there (#14045).
+        //
+        // `delete_mem_tier_rows_matching` DIRECTLY rather than `apply_mem_tier_delete`,
+        // which is what a client `DELETE` composes. That wrapper routes an all-true
+        // predicate to `purge_mem_tier_all`, which releases the discarded bytes against
+        // the process-global mem-tier budget. A memory-resident write never RESERVES those
+        // bytes, so a `retention_sql` of `DELETE FROM t WHERE TRUE` would credit another
+        // table's reservation with bytes this one never took. The filtered arm is gated on
+        // `is_memory_resident_mode()` and handles an all-true predicate by rebuilding the
+        // tier empty, which is the same outcome without that release.
+        //
+        // Outside memory-resident mode that gate makes this arm a no-op, and nothing is
+        // left for it: the `checkpoint_mem_tier_for_delete` above made the tier durable,
+        // so the sink already reached those rows.
+        let mem_tier_deleted = self
+            .delete_mem_tier_rows_matching(&filters)
+            .await
+            .map_err(|err| retention_failed(Box::new(err)))?;
+
+        // Cleared INSIDE the hold, unlike the durable clear below. A key this pass just
+        // removed from the tier stays in the existence cache until something clears it,
+        // and on a `DoNothing` table a concurrent insert that takes `write_lock` in that
+        // window is dropped as a duplicate of a row that no longer exists. Clearing after
+        // the fact cannot undo a conflict decision already taken.
+        if mem_tier_deleted > 0 {
+            self.clear_cached_pk_keyset();
+        }
         drop(write_guard);
-        let deleted_count = match deleted {
-            Ok(deleted) => deleted,
-            Err(err) => {
-                maintenance_metrics::track_maintenance(
-                    table_name,
-                    MaintenanceOp::Retention,
-                    MaintenanceOutcome::Failed,
-                );
-                return Err(CatalogError::InvalidOperation {
-                    message: "Failed to execute retention filters.".to_string(),
-                    source: err,
-                });
-            }
-        };
+
+        let deleted_count = file_deleted.saturating_add(mem_tier_deleted);
 
         maintenance_metrics::track_maintenance(
             table_name,
@@ -26540,7 +26747,14 @@ impl CayenneTableProvider {
 
         // Refresh deletion cache after applying retention filters
         if deleted_count > 0 {
-            self.clear_cached_pk_keyset();
+            // `file_deleted`, not `deleted_count`: the mem-tier arm already cleared its own
+            // keys inside the hold above. A file delete clears here, before
+            // `refresh_deletion_cache` awaits the catalog, so a writer in that window cannot
+            // judge a deleted key present; the refresh clears again once it has loaded the
+            // new deletion vectors.
+            if file_deleted > 0 {
+                self.clear_cached_pk_keyset();
+            }
             if self.pk_deletion_strategy.is_position_based() {
                 self.clear_scan_file_statistics_cache();
             }
@@ -27075,6 +27289,83 @@ impl CayenneTableProvider {
         }
     }
 
+    /// The files of every protected snapshot in `protected`, for the secondary
+    /// index's live set, and a digest of their ids that versions it. A
+    /// protected snapshot's files do not change once it is published, so each
+    /// is listed once and remembered until it leaves the map.
+    async fn lookup_index_protected_files(
+        &self,
+        protected: &HashMap<String, i64>,
+    ) -> datafusion_common::Result<(u64, Vec<String>)> {
+        let mut ids: Vec<&String> = protected.keys().collect();
+        ids.sort_unstable();
+        let digest =
+            hash_index::hash_key_bytes(&ids.iter().map(|id| id.as_bytes()).collect::<Vec<_>>());
+        let missing: Vec<String> = {
+            let listings = self.lookup_index_protected_listings.lock();
+            ids.iter()
+                .filter(|id| !listings.contains_key(id.as_str()))
+                .map(|id| (*id).clone())
+                .collect()
+        };
+        for id in missing {
+            let files: Arc<[String]> = self
+                .capture_warm_files(&id)
+                .await?
+                .files
+                .iter()
+                .map(|file| file.object_meta.location.to_string())
+                .collect();
+            self.lookup_index_protected_listings
+                .lock()
+                .insert(id, files);
+        }
+        let mut listings = self.lookup_index_protected_listings.lock();
+        listings.retain(|id, _| protected.contains_key(id));
+        let files = ids
+            .iter()
+            .filter_map(|id| listings.get(id.as_str()))
+            .flat_map(|files| files.iter().cloned())
+            .collect();
+        Ok((digest, files))
+    }
+
+    /// Retires, in the background, the secondary index runs of files a
+    /// snapshot change just replaced, so a table nobody scans still returns
+    /// their memory. Runs as a task: callers hold the listing fence.
+    fn spawn_lookup_index_reconcile(&self) {
+        if self.lookup_index.is_none() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let provider = self.shared_handle();
+        handle.spawn(async move {
+            let Some(state) = &provider.lookup_index else {
+                return;
+            };
+            let _fence = provider.listing_fence.read().await;
+            let snapshot_id = provider.get_current_snapshot_id();
+            let protected_map = provider.protected_snapshots.load_full();
+            let listed = match provider.capture_warm_files(&snapshot_id).await {
+                Ok(files) => provider
+                    .lookup_index_protected_files(&protected_map)
+                    .await
+                    .map(|protected| (files, protected)),
+                Err(error) => Err(error),
+            };
+            match listed {
+                Ok((files, (protected, protected_files))) => {
+                    reconcile_lookup_index(state, &snapshot_id, &files, protected, &protected_files);
+                }
+                Err(error) => {
+                    tracing::debug!(table = %provider.table_metadata.table_name, %error, "Secondary index runs were not reconciled after a snapshot change; the next scan does it");
+                }
+            }
+        });
+    }
+
     /// Fire (and consume) the test-only post-keyset-capture hook, if one is
     /// installed. See [`Self::test_post_keyset_capture_hook`].
     #[cfg(test)]
@@ -27111,6 +27402,7 @@ impl CayenneTableProvider {
     /// in sync with the catalog.
     ///
     pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) {
+        self.spawn_lookup_index_reconcile();
         // [sound output_ordering] Any snapshot-id change invalidates the
         // sorted-snapshot attestation. The sorted compaction rewrite re-sets it
         // AFTER calling this; every other id change (overwrite, restore, catalog
@@ -27474,8 +27766,8 @@ impl CayenneTableProvider {
     /// `location`, so a re-published file is not double-listed) and `put` back.
     /// Listing-cache filtering is prefix-based and order-independent, so no sort
     /// is required. On the pinned `DataFusion` fork the `ListFilesCache` value
-    /// type is `CachedFileList` (a wrapper around `Arc<Vec<ObjectMeta>>`); the
-    /// non-extra `CacheAccessor::{get,put}` variants are used here.
+    /// type is `CachedFileList` (a wrapper around `Arc<Vec<ObjectMeta>>`), read and
+    /// written through `Cache::{get,put}`.
     fn apply_list_files_cache_additions(
         runtime_env: &Arc<RuntimeEnv>,
         snapshot_dir_url: &str,
@@ -29287,11 +29579,27 @@ impl CayenneTableProvider {
         // Capture the complete warm file set under the fence. Pinning a snapshot
         // directory alone does not exclude files added there by a later checkpoint.
         let current_snapshot_id = self.get_current_snapshot_id();
-        let lookup_index = self
-            .lookup_index
-            .as_ref()
-            .and_then(|state| state.published());
         let warm_files = self.capture_warm_files(&current_snapshot_id).await?;
+        // The secondary index answers for the files its runs cover, judged file
+        // by file against this listing; retire what this listing no longer holds
+        // before pinning it.
+        // Protected snapshots' files are part of that set: an upsert's rows
+        // live there until compaction folds them in.
+        let lookup_index = match &self.lookup_index {
+            Some(state) => {
+                let (protected, protected_files) =
+                    self.lookup_index_protected_files(&protected_map).await?;
+                reconcile_lookup_index(
+                    state,
+                    &current_snapshot_id,
+                    &warm_files,
+                    protected,
+                    &protected_files,
+                );
+                Some(state.published())
+            }
+            None => None,
+        };
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
         // The cold half of the file set, resolved under the SAME held fence as the
@@ -31936,6 +32244,22 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Arm retention over the rows a `mode: memory` write has just made visible.
+    ///
+    /// [`Self::arm_retention_after_checkpoint`] is what gives a `cdc_durability: memory`
+    /// table retention, and it can be, because those rows become durable at a
+    /// checkpoint. A `mode: memory` table never reaches one — the RAM tier is its
+    /// permanent store and [`Self::checkpoint_mem_tier_inner`] returns immediately — and
+    /// `write_cdc_in_memory` returns before any durable publish path schedules
+    /// maintenance. Nothing else queues the request, so its `retention_sql` predicate was
+    /// accepted at registration and then never evaluated (#14045).
+    ///
+    pub(crate) fn arm_retention_after_memory_resident_write(&self) {
+        if self.is_memory_resident_mode() {
+            self.arm_retention_after_checkpoint();
+        }
+    }
+
     /// SEAL the ACTIVE ingestion piece: durably shadow the un-sealed RAM delta
     /// into the UNPUBLISHED inline corpus and advance the source replication slot,
     /// WITHOUT the heavy protected-snapshot checkpoint. This is the fresh-durability
@@ -33362,7 +33686,17 @@ impl CayenneTableProvider {
     /// (`apply_retention_filters`): the pipelined CDC path inlines without consulting
     /// `InlineMutationPolicy`, so its table can hold one. That caller checks
     /// `pending_inline_tombstones` itself, under `write_lock`, and defers instead.
+    ///
+    /// A no-op under `mode: memory`, where `inlined_row_count` nets in the RAM tier
+    /// rather than tracking a catalog inline corpus this mode never writes (the
+    /// accelerator zeroes `inline_max_rows`/`inline_max_bytes` for it). Without the gate
+    /// `checkpoint_inlined_data`'s no-batches arm re-syncs that counter from the empty
+    /// corpus and stores `0` over a populated tier — the clobber
+    /// `delete_mem_tier_rows_matching` separately documents having to defend against.
     async fn checkpoint_inlined_data_if_present_for_delete(&self) -> datafusion_common::Result<()> {
+        if self.is_memory_resident_mode() {
+            return Ok(());
+        }
         let inlined_count = self.cached_inlined_row_count();
 
         if inlined_count > 0 {
@@ -33527,7 +33861,7 @@ impl CayenneTableProvider {
 
         filters
             .iter()
-            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props))
+            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default()))
             .collect()
     }
 
@@ -34012,7 +34346,10 @@ impl CayenneTableProvider {
     async fn scan_protected_snapshots(
         &self,
         scan: ProtectedSnapshotScan<'_>,
-    ) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
+    ) -> datafusion_common::Result<(
+        Vec<Arc<dyn ExecutionPlan>>,
+        Vec<super::lookup_index::LookupIndexExplain>,
+    )> {
         // Warn only on genuine amplification (compaction losing ground), not the
         // normal steady-state equilibrium. Under sustained CDC the protected-
         // snapshot count naturally sits at/above the compaction TRIGGER — fresh
@@ -34027,7 +34364,7 @@ impl CayenneTableProvider {
 
         // `protected_snapshots` is captured by the caller together with the deletion snapshot
         if scan.protected_snapshots.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         tracing::trace!(
@@ -34053,8 +34390,10 @@ impl CayenneTableProvider {
         }
 
         let mut plans = Vec::with_capacity(scan.protected_snapshots.len());
+        let mut explains = Vec::new();
 
         for (snapshot_id, max_delete_seq_at_creation) in scan.protected_snapshots.iter() {
+            let mut explain = super::lookup_index::LookupIndexExplain::not_applicable(None);
             let plan = self
                 .create_snapshot_scan_plan_with_config(
                     scan.state,
@@ -34076,9 +34415,9 @@ impl CayenneTableProvider {
                     // that multiplies file opens ~50× for no parallelism gain
                     Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
                     None,
-                    None,
-                    None,
-                    None,
+                    scan.lookup_selection.clone(),
+                    scan.pinned_lookup_index.clone(),
+                    scan.lookup_selection.is_some().then_some(&mut explain),
                 )
                 .await?;
 
@@ -34091,9 +34430,12 @@ impl CayenneTableProvider {
             )?;
 
             plans.push(filtered_plan);
+            if scan.lookup_selection.is_some() {
+                explains.push(explain);
+            }
         }
 
-        Ok(plans)
+        Ok((plans, explains))
     }
 
     /// Unions [`ExecutionPlan`]s, dropping any [`EmptyExec`], instead of needlessly widening the
@@ -34117,12 +34459,12 @@ impl CayenneTableProvider {
         }
     }
 
-    fn snapshot_scan_schema(file_schema: &SchemaRef, options: &ListingOptions) -> SchemaRef {
+    fn snapshot_scan_schema(file_schema: &SchemaRef, options: &SnapshotScanOptions) -> SchemaRef {
         // `SchemaBuilder::from(&Schema)` clones the metadata HashMap, but we then
         // overwrite that metadata via `.with_metadata(...)` below. Building from
         // `Fields` skips the wasted first clone.
         let mut builder = SchemaBuilder::from(file_schema.fields());
-        for (name, data_type) in &options.table_partition_cols {
+        for (name, data_type) in &options.listing.table_partition_cols {
             builder.push(Field::new(name, data_type.clone(), false));
         }
         Arc::new(
@@ -34134,16 +34476,18 @@ impl CayenneTableProvider {
 
     fn snapshot_file_table_schema(
         file_schema: &SchemaRef,
-        options: &ListingOptions,
+        options: &SnapshotScanOptions,
     ) -> TableSchema {
-        TableSchema::new(
-            Arc::clone(file_schema),
-            options
-                .table_partition_cols
-                .iter()
-                .map(|(name, data_type)| Arc::new(Field::new(name, data_type.clone(), false)))
-                .collect(),
-        )
+        TableSchema::builder(Arc::clone(file_schema))
+            .with_table_partition_cols(
+                options
+                    .listing
+                    .table_partition_cols
+                    .iter()
+                    .map(|(name, data_type)| Arc::new(Field::new(name, data_type.clone(), false)))
+                    .collect::<Vec<_>>(),
+            )
+            .build()
     }
 
     /// Build the `file_sort_order` (`Vec<Vec<SortExpr>>`) advertised on a
@@ -34220,6 +34564,14 @@ impl CayenneTableProvider {
     /// than the decode parallelism it buys.
     const SMALL_GROUP_REPARTITION_OPT_OUT_BYTES: u64 = 256 * 1024 * 1024;
 
+    /// Below this TOTAL, the main query scan opts its Vortex files out of
+    /// byte-range splitting. `DataFusion` 55 lowered `repartition_file_min_size`
+    /// from 10 MiB to 1 MiB (apache/datafusion#22439), so a 1–10 MiB dimension
+    /// table is split `target_partitions` ways and every range pays its own
+    /// Vortex footer open. Keeping the pre-55 10 MiB threshold for Cayenne leaves
+    /// Parquet listing scans on the new default, where the extra parallelism pays.
+    const MAIN_SCAN_REPARTITION_OPT_OUT_BYTES: u64 = 10 * 1024 * 1024;
+
     async fn create_snapshot_scan_plan(
         &self,
         state: &dyn Session,
@@ -34287,15 +34639,16 @@ impl CayenneTableProvider {
         // main query branch keeps default splitting behavior).
         small_group_repartition_opt_out_bytes: u64,
         captured_files: Option<&CapturedSnapshotFiles>,
-        // Candidate row addresses for this scan's equality key, still to be
-        // validated against the file list resolved below. Only the main `scan()`
-        // path ever supplies one.
+        // Candidate row addresses for this scan's equality key, applied file by
+        // file to the file list resolved below. Only the main `scan()` path ever
+        // supplies one.
         lookup_selection: Option<super::lookup_index::LookupSelection>,
-        // The secondary index the scan's view pinned with its snapshot. A join's
-        // runtime lookup probes this one, never whatever is published by then.
-        pinned_lookup_index: Option<Arc<super::lookup_index::SnapshotLookupIndex>>,
+        // The secondary index view the scan's view pinned with its files. A
+        // join's runtime lookup probes this one, never whatever is published by
+        // then.
+        pinned_lookup_index: Option<Arc<super::lookup_index::LookupIndexView>>,
         // Scan-local lookup-index evidence. The file listing below finalizes a
-        // provisional selection as selected, empty, or snapshot_mismatch.
+        // provisional selection's coverage: none, partial or full.
         lookup_index_explain: Option<&mut super::lookup_index::LookupIndexExplain>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let allow_runtime_lookup = lookup_index_explain.is_some();
@@ -34330,10 +34683,11 @@ impl CayenneTableProvider {
             && let Some(file_sort_order) =
                 Self::sort_columns_to_file_sort_order(self.context.sort_columns(), &scan_schema)
         {
-            options = options.with_file_sort_order(file_sort_order);
+            options.listing.file_sort_order = file_sort_order;
         }
 
         let partition_column_names = options
+            .listing
             .table_partition_cols
             .iter()
             .map(|(name, _)| name.as_str())
@@ -34387,23 +34741,16 @@ impl CayenneTableProvider {
         // it, so the selection is composed with the provider this scan would
         // otherwise attach: deleted candidates are removed from the selection,
         // never resurrected.
-        // The file set the scan's files were listed at: the captured one when the
-        // caller captured its files with the snapshot.
-        let scan_file_set = captured_files.map_or_else(
-            || self.file_set_version(),
-            |files| super::lookup_index::FileSetVersion {
-                dir_generation: files.dir_generation,
-                listing_epoch: files.listing_epoch,
-            },
-        );
         let mut lookup_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>> = None;
         if let Some(selection) = lookup_selection {
-            let (restricted_files, provider, explain) = selection.restrict(
-                snapshot_id,
+            let (restricted_files, provider, explain, uncovered) = selection.restrict(
                 partitioned_file_lists,
                 Self::position_deletion_plans(&self.pk_deletion_strategy),
-                scan_file_set,
             );
+            // Files no run covers were read in full; have them indexed.
+            if uncovered {
+                self.shared_handle().request_runtime_lookup_index_build();
+            }
             partitioned_file_lists = restricted_files;
             lookup_plan_provider = provider;
             if let Some(slot) = lookup_index_explain {
@@ -34431,7 +34778,7 @@ impl CayenneTableProvider {
 
         let output_ordering = create_lex_ordering(
             &scan_schema,
-            &options.file_sort_order,
+            &options.listing.file_sort_order,
             state.execution_props(),
         )?;
         // [sound output_ordering] Advertise the per-partition ordering ONLY when the
@@ -34483,6 +34830,7 @@ impl CayenneTableProvider {
         };
 
         let mut file_source = options
+            .listing
             .format
             .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
 
@@ -34547,7 +34895,8 @@ impl CayenneTableProvider {
             .lookup_index
             .as_ref()
             .filter(|_| allow_runtime_lookup && lookup_plan_provider.is_none())
-            .map(|index| {
+            .zip(pinned_lookup_index.clone())
+            .map(|(index, pinned)| {
                 let request_build = self.weak_self.get().cloned().map(|weak| {
                     Arc::new(move || {
                         if let Some(provider) = weak.upgrade() {
@@ -34557,9 +34906,7 @@ impl CayenneTableProvider {
                 });
                 Arc::new(super::lookup_index::DynamicLookupAccessPlanProvider::new(
                     Arc::clone(index),
-                    pinned_lookup_index.clone(),
-                    snapshot_id.to_string(),
-                    scan_file_set,
+                    pinned,
                     partitioned_file_lists
                         .iter()
                         .flat_map(FileGroup::iter)
@@ -34591,7 +34938,26 @@ impl CayenneTableProvider {
                     ))
                     .with_runtime_access_plan_provider(runtime),
             ),
-            (None, None) => Arc::clone(&options.format),
+            (None, None) => Arc::clone(&options.listing.format),
+        };
+
+        // Files grouped by partition value are read one group per partition, so the
+        // scan declares hash partitioning on the partition columns and the optimizer
+        // can skip repartitioning for aggregates and joins on them.
+        let output_partitioning = if grouped_by_partition {
+            let partition_fields: Fields = options
+                .listing
+                .table_partition_cols
+                .iter()
+                .map(|(name, data_type)| Field::new(name, data_type.clone(), false))
+                .collect();
+            output_partitioning_from_partition_fields(
+                &scan_schema,
+                &partition_fields,
+                partitioned_file_lists.len(),
+            )
+        } else {
+            None
         };
 
         plan_format
@@ -34604,7 +34970,7 @@ impl CayenneTableProvider {
                     .with_projection_indices(projection.cloned())?
                     .with_limit(scan_pushdown_limit)
                     .with_output_ordering(output_ordering)
-                    .with_partitioned_by_file_group(grouped_by_partition)
+                    .with_output_partitioning(output_partitioning)
                     .build(),
             )
             .await
@@ -34760,6 +35126,7 @@ impl CayenneTableProvider {
         };
 
         let mut file_source = options
+            .listing
             .format
             .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
         if selective
@@ -34771,6 +35138,7 @@ impl CayenneTableProvider {
         }
 
         let plan = options
+            .listing
             .format
             .create_physical_plan(
                 state,
@@ -34818,7 +35186,7 @@ impl CayenneTableProvider {
     ) -> Option<Vec<PartitionedFile>> {
         // The manifest carries no partition values; let directory listing own
         // partitioned tables (it derives the values from the object path).
-        if !request.options.table_partition_cols.is_empty() {
+        if !request.options.listing.table_partition_cols.is_empty() {
             return None;
         }
 
@@ -34951,7 +35319,7 @@ impl CayenneTableProvider {
             .optimizer
             .preserve_file_partitions;
         let (file_groups, grouped_by_partition) = if threshold > 0
-            && !request.options.table_partition_cols.is_empty()
+            && !request.options.listing.table_partition_cols.is_empty()
         {
             let grouped = file_group.group_by_partition_values(request.options.target_partitions);
             if grouped.len() >= threshold {
@@ -35003,8 +35371,8 @@ impl CayenneTableProvider {
             store.as_ref(),
             request.table_url,
             request.partition_filters,
-            &request.options.file_extension,
-            &request.options.table_partition_cols,
+            &request.options.listing.file_extension,
+            &request.options.listing.table_partition_cols,
         )
         .await
     }
@@ -35044,11 +35412,13 @@ impl CayenneTableProvider {
             .state
             .runtime_env()
             .object_store(request.table_url)?;
-        let meta_fetch_concurrency = request
-            .state
-            .config_options()
-            .execution
-            .meta_fetch_concurrency;
+        let meta_fetch_concurrency = usize::from(
+            request
+                .state
+                .config_options()
+                .execution
+                .meta_fetch_concurrency,
+        );
 
         let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
             if let Some(captured) = request.captured_files {
@@ -35065,7 +35435,7 @@ impl CayenneTableProvider {
                         request.state,
                         request.snapshot_id,
                         &store,
-                        request.options.format.as_ref(),
+                        request.options.listing.format.as_ref(),
                         &part_file,
                     )
                     .await?
@@ -35140,10 +35510,14 @@ impl CayenneTableProvider {
         format: &dyn FileFormat,
         part_file: &PartitionedFile,
     ) -> datafusion_common::Result<Arc<Statistics>> {
+        // The statistics below are computed against the table schema, so a cached
+        // entry is valid only for the schema it was computed with.
+        let table_schema = self.table_schema();
+        let schema_fingerprint = Arc::new(SchemaFingerprint::from_schema(&table_schema));
         if let Some(cached) = self.scan_file_statistics.get(&TableScopedPath {
             table: None,
             path: part_file.object_meta.location.clone(),
-        }) && cached.is_valid_for(&part_file.object_meta)
+        }) && cached.is_valid_for(&part_file.object_meta, &schema_fingerprint)
         {
             return Ok(cached.statistics);
         }
@@ -35177,6 +35551,7 @@ impl CayenneTableProvider {
                 },
                 CachedFileMetadata::new(
                     part_file.object_meta.clone(),
+                    Arc::clone(&schema_fingerprint),
                     Arc::clone(&statistics),
                     None,
                 ),
@@ -35224,7 +35599,12 @@ impl CayenneTableProvider {
                 table: None,
                 path: part_file.object_meta.location.clone(),
             },
-            CachedFileMetadata::new(part_file.object_meta.clone(), Arc::clone(&statistics), None),
+            CachedFileMetadata::new(
+                part_file.object_meta.clone(),
+                schema_fingerprint,
+                Arc::clone(&statistics),
+                None,
+            ),
         );
 
         Ok(statistics)
@@ -35326,7 +35706,12 @@ impl CayenneTableProvider {
             return None;
         };
         // DataFusion accessor for whole-plan (all-partition) statistics.
-        let stats = plan.partition_statistics(None).ok()?;
+        let stats = datafusion_physical_plan::StatisticsContext::new()
+            .compute(
+                plan.as_ref(),
+                &datafusion_physical_plan::StatisticsArgs::new(),
+            )
+            .ok()?;
         let col = stats.column_statistics.get(*pk_idx)?;
         let (DFPrecision::Exact(lo), DFPrecision::Exact(hi)) = (&col.min_value, &col.max_value)
         else {
@@ -35606,17 +35991,18 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Diffs the published secondary index against a fresh build made by reading
-    /// the snapshot's finished files.
+    /// Diffs the published secondary index runs against a read-back of the
+    /// files they cover that a lookup reads: the current snapshot's and the
+    /// protected snapshots'.
     ///
-    /// The write-time index takes its positions from the writer, which is only
-    /// correct while the writer appends batches in arrival order. This is how
-    /// that invariant gets checked rather than assumed.
+    /// A write's runs take their positions from the writer, which is only
+    /// correct while the writer appends batches in the order it reports them.
+    /// This is how that invariant gets checked rather than assumed.
     ///
     /// # Errors
     ///
-    /// Returns an error when the table is not indexed, no index is published, or
-    /// the snapshot's files cannot be listed.
+    /// Returns an error when the table is not indexed or the snapshot's files
+    /// cannot be listed or read.
     pub async fn verify_lookup_index_against_read_back(
         &self,
     ) -> std::result::Result<super::lookup_index::LookupIndexVerification, String> {
@@ -35624,24 +36010,34 @@ impl CayenneTableProvider {
             .lookup_index
             .as_ref()
             .ok_or_else(|| "table is not indexed".to_string())?;
-        let published = state
-            .published()
-            .ok_or_else(|| "no published index to verify".to_string())?;
         let read_schema = self.read_schema();
         let ctx = self.create_session_context();
         let session = ctx.state();
-        let (store, files) = self
-            .lookup_index_snapshot_files(&session, published.snapshot_id(), &read_schema)
-            .await
-            .ok_or_else(|| "could not list the indexed snapshot's files".to_string())?;
-        super::lookup_index::verify_against_read_back(
-            state,
-            published,
-            &store,
-            files,
-            &self.table_schema(),
-        )
-        .await
+        // The file list and the view, taken together under the fence as a scan
+        // captures them.
+        let (snapshot_id, store, files, view) = {
+            let _fence = self.listing_fence.read().await;
+            let snapshot_id = self.get_current_snapshot_id();
+            let (store, mut files) = self
+                .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
+                .await
+                .ok_or_else(|| "could not list the current snapshot's files".to_string())?;
+            // A lookup reads the protected snapshots' files too.
+            let (_, protected_files) = self
+                .lookup_index_protected_files(&self.protected_snapshots.load_full())
+                .await
+                .map_err(|error| {
+                    format!("could not list the protected snapshots' files: {error}")
+                })?;
+            files.extend(
+                protected_files
+                    .into_iter()
+                    .map(|path| super::lookup_index::IndexedFile { path }),
+            );
+            let view = state.published();
+            (snapshot_id, store, files, view)
+        };
+        super::lookup_index::verify_against_read_back(state, view, snapshot_id, &store, files).await
     }
 
     /// Probe and build accounting for this table's secondary indexes, or `None`
@@ -35703,31 +36099,41 @@ impl CayenneTableProvider {
         let Some(indexer) = &self.mem_tier_index else {
             return Ok(None);
         };
-        let scalar_for = |column: &str| {
+        let column_type = |column: &str| self.lookup_column_type(column);
+        let values_for = |column: &str| {
             filters
                 .iter()
-                .find_map(|filter| bare_column_scalar_for(filter, column))
+                .find_map(|filter| bare_column_values_for(filter, column, column_type(column)))
         };
-        let Some(probe) = indexer.probe_key(&scalar_for) else {
-            return Ok(Some((
-                None,
-                super::lookup_index::LookupIndexExplain::not_applicable(None),
-            )));
+        let probe = match indexer.probe_key(&values_for) {
+            Ok(probe) => probe,
+            Err(reason) => {
+                return Ok(Some((
+                    None,
+                    super::lookup_index::LookupIndexExplain::scanned(None, reason),
+                )));
+            }
         };
         let mut segments = Vec::new();
-        let mut read_whole = false;
+        // Batches read narrowed by their index, and batches read whole
+        // because they have none.
+        let mut narrowed = 0_usize;
+        let mut read_whole = 0_usize;
+        let mut candidate_batches = 0_usize;
         let mut candidate_rows = 0u64;
         for shard in shards {
             let deletion_maps = Self::mem_tier_deletion_maps(shard);
             for segment in shard.segments.iter() {
                 let batches = if let Some(index) = &segment.index {
                     let candidates = index.candidates(&segment.batches, &probe)?;
-                    read_whole |= candidates.read_whole;
+                    read_whole += candidates.read_whole;
+                    narrowed += candidates.indexed;
                     candidates.batches
                 } else {
-                    read_whole |= !segment.batches.is_empty();
+                    read_whole += segment.batches.len();
                     segment.batches.to_vec()
                 };
+                candidate_batches += batches.len();
                 let mut visible = Vec::with_capacity(batches.len());
                 for batch in batches {
                     candidate_rows = candidate_rows.saturating_add(batch.num_rows() as u64);
@@ -35755,207 +36161,170 @@ impl CayenneTableProvider {
                 }
             }
         }
-        let outcome = if read_whole {
-            super::lookup_index::ProbeOutcome::Unbuilt
-        } else if segments.is_empty() {
-            super::lookup_index::ProbeOutcome::Empty
-        } else {
-            super::lookup_index::ProbeOutcome::Selected
-        };
-        indexer.record(probe.label, outcome, candidate_rows);
-        let explain_outcome = match outcome {
-            super::lookup_index::ProbeOutcome::Selected => {
-                super::lookup_index::LookupIndexExplainOutcome::Selected
-            }
-            super::lookup_index::ProbeOutcome::Empty => {
-                super::lookup_index::LookupIndexExplainOutcome::Empty
-            }
-            super::lookup_index::ProbeOutcome::Unbuilt => {
-                super::lookup_index::LookupIndexExplainOutcome::Unbuilt
-            }
-            super::lookup_index::ProbeOutcome::SnapshotMismatch => {
-                super::lookup_index::LookupIndexExplainOutcome::SnapshotMismatch
-            }
-        };
+        // As in file mode, over the batches read: `none` when no batch read
+        // was indexed, `partial` when some were and the rest were read whole,
+        // else `full`.
+        let coverage = super::lookup_index::Coverage::of(narrowed > 0, read_whole > 0);
+        indexer.record(probe.label, coverage, candidate_rows);
+        let explain_outcome = super::lookup_index::LookupIndexExplainOutcome::Probed(coverage);
         Ok(Some((
             Some(segments),
-            super::lookup_index::LookupIndexExplain::selection(
-                probe.label.to_string(),
-                explain_outcome,
-                None,
-                candidate_rows,
-            ),
+            super::lookup_index::LookupIndexExplain {
+                candidate_batches: Some(candidate_batches),
+                uncovered_batches: Some(read_whole),
+                ..super::lookup_index::LookupIndexExplain::selection(
+                    probe.label.to_string(),
+                    explain_outcome,
+                    None,
+                    candidate_rows,
+                )
+            },
         )))
     }
 
-    /// The table's file-set version, sampled before a listing it describes.
-    fn file_set_version(&self) -> super::lookup_index::FileSetVersion {
-        super::lookup_index::FileSetVersion {
-            dir_generation: self.current_dir_generation.load(Ordering::Relaxed),
-            listing_epoch: self.listing_cache_epoch.load(Ordering::Acquire),
-        }
+    /// The type of the table column `column` in the table's current schema,
+    /// which a live schema change may have widened since the table opened.
+    fn lookup_column_type(&self, column: &str) -> Option<DataType> {
+        self.table_schema()
+            .field_with_name(column)
+            .ok()
+            .map(|field| field.data_type().clone())
     }
 
-    /// Starts a write-time secondary index build for `snapshot_id`, or `None`
-    /// when the table is not indexed.
-    pub(crate) fn begin_lookup_index_build(
-        &self,
-        snapshot_id: &str,
-    ) -> Option<Arc<dyn VortexWriteObserver>> {
-        let state = self.lookup_index.as_ref()?;
-        // Keys are encoded against the STORED schema, so the same value encodes
-        // identically whether it arrives from a write stream or from a scan that
-        // decoded it as a view type.
-        let builder = state.begin_incremental_build(snapshot_id, &self.table_schema())?;
-        Some(builder as Arc<dyn VortexWriteObserver>)
+    /// This provider as an `Arc` a background task can hold: the one it is
+    /// registered as, or a clone sharing all of its state when it was never
+    /// `Arc`-wrapped.
+    fn shared_handle(&self) -> Arc<Self> {
+        self.weak_self
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(self.clone_for_write()))
     }
 
-    /// Drops a write-time index build whose snapshot is being abandoned.
-    pub(crate) fn discard_lookup_index_build(&self) {
-        if let Some(state) = &self.lookup_index {
-            state.discard_pending();
-        }
-    }
-
-    /// Finishes the write-time index for `snapshot_id` BEFORE its snapshot becomes
-    /// visible, so the flip that makes it visible can publish the index with it
-    /// and no query is served by a full scan while an index is rebuilt.
+    /// Starts a background build of the files no secondary index run covers,
+    /// requested by a lookup that had to read some in full.
     ///
-    /// Best-effort by construction: a refused or failed build leaves the refreshed
-    /// table to a background build, and the snapshot publishes regardless. Data
-    /// availability must never depend on this index.
-    pub(crate) async fn stage_lookup_index_for_snapshot(&self, snapshot_id: &str) {
-        let Some(state) = &self.lookup_index else {
-            return;
-        };
-        let file_set = self.file_set_version();
-        let read_schema = self.read_schema();
-        let ctx = self.create_session_context();
-        let session = ctx.state();
-        match self
-            .lookup_index_snapshot_files(&session, snapshot_id, &read_schema)
-            .await
-        {
-            Some((_store, files)) => {
-                state.stage_pending(snapshot_id, files, file_set).await;
-            }
-            None => {
-                state.discard_pending();
-            }
-        }
-    }
-
-    /// Starts a read-back build requested by an exact runtime join filter.
-    ///
-    /// The first dynamic lookup after a restart or file-set change scans normally
-    /// while this detached task lists and builds the visible snapshot. The claim
-    /// keeps concurrent file openers and queries from starting duplicate builds.
+    /// The lookup that asked scans those files normally while this detached
+    /// task lists and reads them back. The claim keeps concurrent file openers
+    /// and queries from starting duplicate builds.
     fn request_runtime_lookup_index_build(self: &Arc<Self>) {
         let Some(index_state) = &self.lookup_index else {
             return;
         };
-        let visible_snapshot = self.get_current_snapshot_id();
-        let Some(claim) = index_state.claim_build(&visible_snapshot) else {
+        let Some(claim) = index_state.claim_build() else {
             return;
         };
         let provider = Arc::clone(self);
         tokio::spawn(async move {
-            let read_schema = provider.read_schema();
-            let ctx = provider.create_session_context();
-            provider
-                .start_lookup_index_build(claim, visible_snapshot, &ctx.state(), &read_schema)
-                .await;
+            provider.start_lookup_index_build(claim).await;
         });
     }
 
-    /// Lists `snapshot_id`'s files and starts the background build `claim`
-    /// holds, or frees the claim when the files cannot be listed.
-    async fn start_lookup_index_build(
-        &self,
-        claim: super::lookup_index::BuildClaim,
-        snapshot_id: String,
-        state: &dyn Session,
-        read_schema: &SchemaRef,
-    ) {
-        // Sampled before listing, so a file added while listing makes the
-        // index's file set older than the table's, never newer.
-        let file_set = self.file_set_version();
-        match self
-            .lookup_index_snapshot_files(state, &snapshot_id, read_schema)
+    /// Lists the files a lookup reads, the current snapshot's and the protected
+    /// snapshots', and starts the background build `claim` holds over the ones
+    /// no run covers, or frees the claim when the files cannot be listed.
+    async fn start_lookup_index_build(self: &Arc<Self>, claim: super::lookup_index::BuildClaim) {
+        let Some(index_state) = &self.lookup_index else {
+            return;
+        };
+        let read_schema = self.read_schema();
+        let ctx = self.create_session_context();
+        let session = ctx.state();
+        let snapshot_id = self.get_current_snapshot_id();
+        let Some((store, files)) = self
+            .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
             .await
-        {
-            Some((store, files)) => super::lookup_index::spawn_build(
-                claim,
-                snapshot_id,
-                store,
-                files,
-                self.table_schema(),
-                file_set,
-            ),
-            None => claim.unpublished(),
-        }
+        else {
+            claim.unpublished();
+            return;
+        };
+        // A lookup reads the protected snapshots' files too (an upsert's rows
+        // stay there until compaction folds them in), so they are indexed with
+        // the current snapshot's.
+        let protected_map = self.protected_snapshots.load_full();
+        let Ok((_, protected_files)) = self.lookup_index_protected_files(&protected_map).await
+        else {
+            claim.unpublished();
+            return;
+        };
+        let view = index_state.published();
+        let mut seen: HashSet<String> = HashSet::new();
+        let uncovered: Vec<super::lookup_index::IndexedFile> = files
+            .into_iter()
+            .chain(
+                protected_files
+                    .into_iter()
+                    .map(|path| super::lookup_index::IndexedFile { path }),
+            )
+            .filter(|file| !view.covers(&file.path) && seen.insert(file.path.clone()))
+            .collect();
+        super::lookup_index::spawn_build(claim, store, uncovered, self.lookup_index_list_live());
+    }
+
+    /// Lists the files a reader sees now under the listing fence, the current
+    /// snapshot's warm files and the protected snapshots', for an index build to
+    /// publish its runs against.
+    fn lookup_index_list_live(&self) -> super::lookup_index::ListLive {
+        let provider = self.shared_handle();
+        Box::new(move || {
+            Box::pin(async move {
+                let _fence = provider.listing_fence.read().await;
+                let snapshot_id = provider.get_current_snapshot_id();
+                let files = provider.capture_warm_files(&snapshot_id).await.ok()?;
+                let protected_map = provider.protected_snapshots.load_full();
+                let (_, protected_files) = provider
+                    .lookup_index_protected_files(&protected_map)
+                    .await
+                    .ok()?;
+                Some(
+                    files
+                        .files
+                        .iter()
+                        .map(|file| file.object_meta.location.to_string())
+                        .chain(protected_files)
+                        .collect(),
+                )
+            })
+        })
     }
 
     /// Resolves the secondary index for this scan.
     ///
-    /// Only a query whose filters pin every column of an indexed key to an
-    /// equality literal touches the index at all: it probes the published index
-    /// and, when there is none for the visible snapshot, may start the one
-    /// background build that replaces it — as the build schedule allows, so a
-    /// build that cannot fit or keeps failing is not retried on every lookup.
-    /// Returned candidate row addresses are still unvalidated against the file
-    /// list the plan resolves. The outer `None` means the table declares no
-    /// file-mode index; an indexed table always returns an explain decision.
-    async fn resolve_lookup_index_selection(
+    /// Only a query whose filters pin every column of an indexed key to
+    /// equality literals or `IN` lists touches the index at all: it probes
+    /// the view the scan pinned and, when that view covers none of the table's
+    /// files, may start the one background build that indexes them — as the
+    /// build schedule allows, so a build that cannot fit or keeps failing is
+    /// not retried on every lookup. The returned selection is applied file by
+    /// file to the file list the plan resolves. The outer `None` means the
+    /// table declares no file-mode index; an indexed table always returns an
+    /// explain decision.
+    fn resolve_lookup_index_selection(
         &self,
-        state: &dyn Session,
         filters: &[Expr],
-        read_schema: &SchemaRef,
-        pinned_index: Option<&Arc<super::lookup_index::SnapshotLookupIndex>>,
-        visible_snapshot: &str,
+        pinned_index: Option<&Arc<super::lookup_index::LookupIndexView>>,
     ) -> Option<(
         Option<super::lookup_index::LookupSelection>,
         super::lookup_index::LookupIndexExplain,
     )> {
         let index_state = self.lookup_index.as_ref()?;
-        let scalar_for = |column: &str| {
+        // An indexed table's scan always pins its published view.
+        let pinned_index = pinned_index?;
+        let column_type = |column: &str| self.lookup_column_type(column);
+        let values_for = |column: &str| {
             filters
                 .iter()
-                .find_map(|filter| bare_column_scalar_for(filter, column))
+                .find_map(|filter| bare_column_values_for(filter, column, column_type(column)))
         };
-        let Some(shape) = index_state.matched_shape(&scalar_for) else {
-            return Some((
-                None,
-                super::lookup_index::LookupIndexExplain::not_applicable(None),
-            ));
+        let (selection, explain) = match index_state.probe(pinned_index, &values_for) {
+            super::lookup_index::LookupProbe::Selection(selection) => {
+                let explain = super::lookup_index::LookupIndexExplain::not_applicable(Some(
+                    selection.shape().to_string(),
+                ));
+                (Some(selection), explain)
+            }
+            super::lookup_index::LookupProbe::Fallback(explain) => (None, explain),
         };
-
-        // Probe first: a stale index is dropped here, so a build claimed below
-        // replaces nothing rather than an index that is already gone. The probe
-        // uses the index and snapshot the scan's view captured together.
-        let (selection, explain, should_build) =
-            match index_state.probe(pinned_index, visible_snapshot, &scalar_for) {
-                super::lookup_index::LookupProbe::Selection(selection) => (
-                    Some(selection),
-                    super::lookup_index::LookupIndexExplain::not_applicable(Some(
-                        shape.to_string(),
-                    )),
-                    false,
-                ),
-                super::lookup_index::LookupProbe::Fallback(explain) => {
-                    let should_build = matches!(
-                        explain.outcome,
-                        super::lookup_index::LookupIndexExplainOutcome::Unbuilt
-                            | super::lookup_index::LookupIndexExplainOutcome::SnapshotMismatch
-                    );
-                    (None, explain, should_build)
-                }
-            };
-        if should_build && let Some(claim) = index_state.claim_build(visible_snapshot) {
-            // The claim frees its slot if this scan is dropped while listing.
-            self.start_lookup_index_build(claim, visible_snapshot.to_string(), state, read_schema)
-                .await;
-        }
         Some((selection, explain))
     }
 
@@ -36006,8 +36375,6 @@ impl CayenneTableProvider {
             .flat_map(FileGroup::iter)
             .map(|file| super::lookup_index::IndexedFile {
                 path: file.object_meta.location.to_string(),
-                size: file.object_meta.size,
-                last_modified_ms: file.object_meta.last_modified.timestamp_millis(),
             })
             .collect();
         // A snapshot with no files — a refresh small enough to be inlined into the
@@ -36233,6 +36600,122 @@ fn bare_column_scalar_for(expr: &Expr, name: &str) -> Option<ScalarValue> {
         &|e| matches!(e, Expr::Column(col) if col.name == name),
         &evaluated_literal,
     )
+}
+
+/// Retires the secondary index's runs over files that have left the file set
+/// a reader of `snapshot_id` sees: its warm files `warm` and the files of the
+/// protected snapshots (`protected` digests them).
+fn reconcile_lookup_index(
+    state: &Arc<super::lookup_index::LookupIndexState>,
+    snapshot_id: &str,
+    warm: &CapturedSnapshotFiles,
+    protected: u64,
+    protected_files: &[String],
+) {
+    state.reconcile(
+        snapshot_id,
+        super::lookup_index::FileSetVersion {
+            dir_generation: warm.dir_generation,
+            listing_epoch: warm.listing_epoch,
+            protected,
+        },
+        warm.files
+            .iter()
+            .map(|file| file.object_meta.location.as_ref())
+            .chain(protected_files.iter().map(String::as_str)),
+    );
+}
+
+/// The values a filter pins the BARE column `name` to, for the point-lookup
+/// index: one for an equality, several for a non-negated `IN` list of
+/// literals or a disjunction whose every branch pins the column (the planner
+/// rewrites an `IN` of up to three values into `=`s joined by `OR`), found
+/// through conjunctions. A NULL value matches nothing, so it is kept for the
+/// index to drop. The column side must be bare for the reason
+/// [`bare_column_scalar_for`] gives.
+///
+/// A non-negated `BETWEEN` of integer bounds pins an integer column
+/// (`column_type`) to every value in the range, up to the lookup bound: the
+/// planner rewrites an `IN` list of consecutive integers into one, which would
+/// otherwise pin nothing. On any other column type a range holds values no
+/// enumeration lists, so it pins nothing.
+fn bare_column_values_for(
+    expr: &Expr,
+    name: &str,
+    column_type: Option<DataType>,
+) -> Option<Vec<ScalarValue>> {
+    match expr {
+        Expr::BinaryExpr(bin) if bin.op == Operator::Or => {
+            let mut values = bare_column_values_for(&bin.left, name, column_type.clone())?;
+            values.extend(bare_column_values_for(&bin.right, name, column_type)?);
+            Some(values)
+        }
+        // A branch that is never true selects no row: the planner folds
+        // `column = NULL` to a NULL literal, so `column IN (NULL, 5)` arrives
+        // as `NULL OR column = 5`.
+        Expr::Literal(ScalarValue::Boolean(None | Some(false)) | ScalarValue::Null, _) => {
+            Some(Vec::new())
+        }
+        Expr::InList(in_list)
+            if !in_list.negated
+                && matches!(in_list.expr.as_ref(), Expr::Column(col) if col.name == name) =>
+        {
+            in_list.list.iter().map(evaluated_literal).collect()
+        }
+        Expr::Between(between)
+            if !between.negated
+                && column_type.as_ref().is_some_and(DataType::is_integer)
+                && matches!(between.expr.as_ref(), Expr::Column(col) if col.name == name) =>
+        {
+            integer_range(
+                &evaluated_literal(&between.low)?,
+                &evaluated_literal(&between.high)?,
+            )
+        }
+        Expr::BinaryExpr(bin) if bin.op == Operator::And => {
+            bare_column_values_for(&bin.left, name, column_type.clone())
+                .or_else(|| bare_column_values_for(&bin.right, name, column_type))
+        }
+        _ => bare_column_scalar_for(expr, name).map(|value| vec![value]),
+    }
+}
+
+/// Every integer from `low` to `high` inclusive, as `BETWEEN` selects them:
+/// none when a bound is NULL or the range is empty, and `None` — no
+/// enumeration — past the lookup bound or when a bound is not an integer.
+fn integer_range(low: &ScalarValue, high: &ScalarValue) -> Option<Vec<ScalarValue>> {
+    fn as_i128(value: &ScalarValue) -> Option<i128> {
+        match value {
+            ScalarValue::Int8(v) => v.map(i128::from),
+            ScalarValue::Int16(v) => v.map(i128::from),
+            ScalarValue::Int32(v) => v.map(i128::from),
+            ScalarValue::Int64(v) => v.map(i128::from),
+            ScalarValue::UInt8(v) => v.map(i128::from),
+            ScalarValue::UInt16(v) => v.map(i128::from),
+            ScalarValue::UInt32(v) => v.map(i128::from),
+            ScalarValue::UInt64(v) => v.map(i128::from),
+            _ => None,
+        }
+    }
+    if low.is_null() || high.is_null() {
+        return Some(Vec::new());
+    }
+    let (low, high) = (as_i128(low)?, as_i128(high)?);
+    if high < low {
+        return Some(Vec::new());
+    }
+    let bound = i128::try_from(super::lookup_index::RUNTIME_INDEX_MAX_KEYS).ok()?;
+    if high - low >= bound {
+        return None;
+    }
+    (low..=high)
+        .map(|value| {
+            i64::try_from(value)
+                .map(|value| ScalarValue::Int64(Some(value)))
+                .or_else(|_| u64::try_from(value).map(|value| ScalarValue::UInt64(Some(value))))
+                .ok()
+        })
+        .collect()
 }
 
 /// The constant `expr` evaluates to: a literal, or casts applied to one. `None`
@@ -36704,15 +37187,8 @@ impl TableProvider for CayenneTableProvider {
         // Secondary index: candidate row addresses for an exact equality key
         // over indexed columns. `None` keeps the ordinary scan, which is what a
         // table without `indexes` and every other predicate shape resolve to.
-        let lookup_resolution = self
-            .resolve_lookup_index_selection(
-                state,
-                scan_filters,
-                &read_schema,
-                pinned_lookup_index.as_ref(),
-                &current_snapshot_id,
-            )
-            .await;
+        let lookup_resolution =
+            self.resolve_lookup_index_selection(scan_filters, pinned_lookup_index.as_ref());
 
         // A PK point lookup (e.g. `WHERE pk_col = K`), small IN / tight BETWEEN,
         // or an index-restricted file set is selective: each file that survives
@@ -36775,6 +37251,10 @@ impl TableProvider for CayenneTableProvider {
         // (file scan, protected snapshots, inline + RAM tiers) so they agree with
         // each other and with the captured data even across a concurrent
         // schema-evolution, and joins plan on view arrays. See `viewify_read_schema`.
+        // Protected snapshots are narrowed by the same selection, against their
+        // own files.
+        let protected_lookup_selection = lookup_selection.clone();
+        let protected_pinned_lookup_index = pinned_lookup_index.clone();
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -36787,12 +37267,12 @@ impl TableProvider for CayenneTableProvider {
                 allow_sorted_ordering,
                 Some(Arc::clone(&read_schema)),
                 is_pk_selective_scan,
-                // The main branch keeps default splitting (opt-out disabled).
-                // Unlike protected-snapshot branches — which sit under a Union
-                // whose sibling branches already saturate the cores — the main
-                // branch is often the scan's ONLY source, so byte-range
-                // splitting can be its only decode parallelism.
-                0,
+                // The main branch is often the scan's ONLY source, so byte-range
+                // splitting can be its only decode parallelism; it opts out only
+                // for small scans, where the footer opens outweigh it. Protected-
+                // snapshot branches sit under a Union whose siblings already
+                // saturate the cores, so they use the larger 256 MiB threshold.
+                Self::MAIN_SCAN_REPARTITION_OPT_OUT_BYTES,
                 Some(&warm_files),
                 lookup_selection,
                 pinned_lookup_index,
@@ -36807,7 +37287,7 @@ impl TableProvider for CayenneTableProvider {
         // captured warm file set excludes later additions to that same directory.
 
         // Check for protected snapshots that need to be scanned with partial deletion filter.
-        let protected_snapshot_plans = self
+        let (protected_snapshot_plans, protected_explains) = self
             .scan_protected_snapshots(ProtectedSnapshotScan {
                 state,
                 projection: effective_projection.as_ref(),
@@ -36817,8 +37297,21 @@ impl TableProvider for CayenneTableProvider {
                 protected_snapshots: protected_map,
                 deletion_snapshot: &deletion_snapshot,
                 read_schema: Arc::clone(&read_schema),
+                lookup_selection: protected_lookup_selection,
+                pinned_lookup_index: protected_pinned_lookup_index,
             })
             .await?;
+        // One decision for the whole scan, recorded once: a key found only in
+        // a protected snapshot is still a selection.
+        if let Some(main) = lookup_index_explain.take() {
+            let explain = protected_explains
+                .into_iter()
+                .fold(main, super::lookup_index::LookupIndexExplain::merge);
+            if let Some(state) = &self.lookup_index {
+                state.record_lookup(&explain);
+            }
+            lookup_index_explain = Some(explain);
+        }
 
         // Build the COLD object-store tier branch (storage-cascade bottom tier) from
         // the CAPTURED manifest. Cold files hold OLD, fully-superseded data, so they
@@ -37075,6 +37568,7 @@ impl TableProvider for CayenneTableProvider {
             &util::session_state::session_config(),
         );
         let partition_column_names = options
+            .listing
             .table_partition_cols
             .iter()
             .map(|(name, _)| name.as_str())
@@ -38529,6 +39023,75 @@ mod tests {
 
     fn url(s: &str) -> String {
         s.to_string()
+    }
+
+    /// The planner rewrites an `IN` list of consecutive integers into a
+    /// `BETWEEN`, so a range on an integer key column pins the values it covers.
+    /// On any other type, a negated range, or past the bound, it pins nothing.
+    #[test]
+    fn integer_between_pins_every_value_of_its_range() {
+        use datafusion::prelude::{col, lit};
+        let int = Some(DataType::Int64);
+        let range = col("b").between(lit(3_i64), lit(6_i64));
+        assert_eq!(
+            bare_column_values_for(&range, "b", int.clone()),
+            Some((3..=6).map(|v| ScalarValue::Int64(Some(v))).collect())
+        );
+        assert_eq!(bare_column_values_for(&range, "a", int.clone()), None);
+        assert_eq!(
+            bare_column_values_for(&range, "b", Some(DataType::Float64)),
+            None,
+            "a float range holds values no enumeration lists"
+        );
+        assert_eq!(
+            bare_column_values_for(
+                &col("b").not_between(lit(3_i64), lit(6_i64)),
+                "b",
+                int.clone()
+            ),
+            None
+        );
+        assert_eq!(
+            bare_column_values_for(&col("b").between(lit(6_i64), lit(3_i64)), "b", int.clone()),
+            Some(Vec::new()),
+            "an empty range matches no row"
+        );
+        assert_eq!(
+            bare_column_values_for(
+                &col("b").between(lit(ScalarValue::Int64(None)), lit(3_i64)),
+                "b",
+                int.clone()
+            ),
+            Some(Vec::new()),
+            "a NULL bound matches no row"
+        );
+        let bound =
+            i64::try_from(super::super::lookup_index::RUNTIME_INDEX_MAX_KEYS).expect("fits");
+        assert_eq!(
+            bare_column_values_for(
+                &col("b").between(lit(0_i64), lit(bound - 1)),
+                "b",
+                int.clone()
+            )
+            .map(|values| values.len()),
+            Some(super::super::lookup_index::RUNTIME_INDEX_MAX_KEYS)
+        );
+        assert_eq!(
+            bare_column_values_for(&col("b").between(lit(0_i64), lit(bound)), "b", int.clone()),
+            None,
+            "a range past the bound is not enumerated"
+        );
+        // Through a conjunction, beside an equality on another column.
+        let both = col("a")
+            .eq(lit(7_i64))
+            .and(col("b").between(lit(1_i64), lit(2_i64)));
+        assert_eq!(
+            bare_column_values_for(&both, "b", int),
+            Some(vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2))
+            ])
+        );
     }
 
     /// A scan converts an absolute local snapshot directory to its listing URL
@@ -42738,7 +43301,8 @@ mod tests {
             byte_size: datafusion_common::stats::Precision::Absent,
         };
         let stats_set = crate::stats::column_stats_to_stats_set(&column_stats);
-        let file_stats = crate::stats::build_file_statistics(vec![stats_set], &schema);
+        let file_stats = crate::stats::build_file_statistics(vec![stats_set], &schema)
+            .expect("statistics types convert");
         let statistics_blob =
             crate::stats::serialize_file_statistics(&file_stats).expect("stats should serialize");
         let table_stats = TableStatistics {
@@ -43148,7 +43712,7 @@ mod tests {
         let cmd = CreateExternalTable {
             schema: Arc::new(arrow_record.schema().to_dfschema().expect("to df schema")),
             name: table_name.into(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -51366,11 +51930,17 @@ mod tests {
 
         assert_eq!(direct_plan.schema(), listing_plan.schema());
         assert_eq!(
-            direct_plan
-                .partition_statistics(None)
+            datafusion_physical_plan::StatisticsContext::new()
+                .compute(
+                    direct_plan.as_ref(),
+                    &datafusion_physical_plan::StatisticsArgs::new()
+                )
                 .expect("direct scan plan statistics should be available"),
-            listing_plan
-                .partition_statistics(None)
+            datafusion_physical_plan::StatisticsContext::new()
+                .compute(
+                    listing_plan.as_ref(),
+                    &datafusion_physical_plan::StatisticsArgs::new()
+                )
                 .expect("ListingTable scan plan statistics should be available")
         );
         assert_eq!(
@@ -51441,12 +52011,22 @@ mod tests {
         )
         .await;
 
-        let n: i64 = 100_000;
+        // Large enough on disk (incompressible `value`s, > 10 MiB) that the main
+        // scan's small-scan opt-out (`MAIN_SCAN_REPARTITION_OPT_OUT_BYTES`) does
+        // not apply, so the non-selective control still fans out.
+        let n: i64 = 1_500_000;
+        let value_of = |x: i64| {
+            x.cast_unsigned()
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407)
+                .rotate_left(29)
+                .cast_signed()
+        };
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
                 Arc::new(Int64Array::from_iter_values(0..n)),
-                Arc::new(Int64Array::from_iter_values((0..n).map(|x| x * 10))),
+                Arc::new(Int64Array::from_iter_values((0..n).map(value_of))),
             ],
         )
         .expect("batch built");
@@ -51483,8 +52063,11 @@ mod tests {
             .create_physical_plan()
             .await
             .expect("selective physical plan");
+        // The control has to reach the files: a bare `sum(value)` is answered from the
+        // scan's exact column statistics and plans as a `PlaceholderRowExec`, which has
+        // no file group to split. Summing an expression keeps the full scan.
         let after_nonsel = ctx
-            .sql("SELECT sum(value) FROM t")
+            .sql("SELECT sum(value + 1) FROM t")
             .await
             .expect("non-selective sql")
             .create_physical_plan()
@@ -51718,9 +52301,12 @@ mod tests {
     }
 
     /// Small file groups opt the Vortex source out of `repartition_file_scans`
-    /// on internal/protected-snapshot scan plans: byte-range-splitting a small
-    /// snapshot into `target_partitions` scan units multiplies footer opens
-    /// ~tp× for no decode parallelism
+    /// on internal/protected-snapshot scan plans and on the main query scan:
+    /// byte-range-splitting a small snapshot into `target_partitions` scan units
+    /// multiplies footer opens ~tp× for no decode parallelism. The main scan's
+    /// threshold (`MAIN_SCAN_REPARTITION_OPT_OUT_BYTES`, 10 MiB) keeps the
+    /// pre-`DataFusion`-55 behavior that its 1 MiB `repartition_file_min_size`
+    /// default dropped.
     #[tokio::test]
     async fn small_snapshot_groups_opt_out_of_repartitioning() {
         fn scan_source_allows_repartitioning(plan: &Arc<dyn ExecutionPlan>) -> Option<bool> {
@@ -51776,15 +52362,16 @@ mod tests {
              repartition_file_scans does not byte-range-split it"
         );
 
-        // Main-branch control: default splitting stays enabled (threshold 0).
+        // Main query branch: a scan totalling far less than 10 MiB opts out too.
         let main_plan = provider
             .scan(&ctx.state(), None, &[], None)
             .await
             .expect("main scan plan");
         assert_eq!(
             scan_source_allows_repartitioning(&main_plan),
-            Some(true),
-            "the main query branch keeps default repartitioning"
+            Some(false),
+            "the main query branch must not byte-range-split a scan below \
+             MAIN_SCAN_REPARTITION_OPT_OUT_BYTES"
         );
     }
 
@@ -53077,7 +53664,7 @@ mod tests {
 
         // A non-empty accumulator: an empty one bails before the read, which would
         // pass this test without ever exercising the failure under test.
-        let accumulator = ColumnStatsAccumulator::new(&schema);
+        let accumulator = ColumnStatsAccumulator::new(&schema).expect("supported schema");
         accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 16, 4));
         assert!(
             accumulator.row_count() > 0,
@@ -53171,7 +53758,7 @@ mod tests {
                 .await
                 .expect("reopen over an intact statistics record");
 
-        let accumulator = ColumnStatsAccumulator::new(&schema);
+        let accumulator = ColumnStatsAccumulator::new(&schema).expect("supported schema");
         accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 16, 4));
         assert!(
             accumulator.row_count() > 0,
@@ -53344,7 +53931,7 @@ mod tests {
             .expect("persist the baseline statistics");
 
         // An authoritative `Set`: `raw` is now an exact record and no gap is open.
-        let accumulator = ColumnStatsAccumulator::new(&schema);
+        let accumulator = ColumnStatsAccumulator::new(&schema).expect("supported schema");
         accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 0, 16));
         provider
             .persist_table_stats_after_snapshot_rewrite(&accumulator)
@@ -58707,8 +59294,11 @@ mod tests {
             .scan(&ctx.state(), None, &[], None)
             .await
             .expect("scan plan builds");
-        let stats = plan
-            .partition_statistics(None)
+        let stats = datafusion_physical_plan::StatisticsContext::new()
+            .compute(
+                plan.as_ref(),
+                &datafusion_physical_plan::StatisticsArgs::new(),
+            )
             .expect("partition statistics available");
         if let DFPrecision::Exact(n) = stats.num_rows {
             let n = i64::try_from(n).expect("num_rows fits i64");
@@ -59638,6 +60228,40 @@ mod tests {
             inlined_before,
             "the seal shadow must not be materialized: its rows are still live in RAM"
         );
+    }
+
+    /// The success line is the only evidence a user gets that `retention_sql` ran, so a
+    /// reword must not be able to drop what they read it for: which dataset, that the
+    /// rows went because of `retention_sql`, and how many. Pinned here because the text
+    /// is the surface specified in #14337, and a `tracing` field is not a substitute for
+    /// the dataset appearing in the text a `grep` returns.
+    #[test]
+    fn retention_deleted_message_names_the_dataset_predicate_and_count() {
+        let message = retention_deleted_message("events", 7);
+
+        assert!(
+            message.contains("'events'"),
+            "the line must name the dataset in its text, not only in a field: {message}"
+        );
+        assert!(
+            message.contains("retention_sql"),
+            "it must say WHY the rows went, so it is not read as an unexplained delete: {message}"
+        );
+        assert!(
+            message.contains("7 row(s)"),
+            "it must carry the row count next to its unit, so the line reads as one fact \
+             and the quantity no prose reconstructs cannot drift from what it counts: {message}"
+        );
+        assert!(
+            !message.contains('\n'),
+            "log messages stay on one line: {message}"
+        );
+        for internal in ["sink", "deletion vector", "tier", "seal"] {
+            assert!(
+                !message.contains(internal),
+                "'{internal}' is an internal concept the operator cannot act on: {message}"
+            );
+        }
     }
 
     /// Both deferral errors reach an operator through a synchronous maintenance drain, so
@@ -69124,12 +69748,18 @@ mod tests {
     /// delta-apply helper has a cache to operate on regardless of the default
     /// session configuration.
     fn runtime_env_with_list_files_cache() -> Arc<RuntimeEnv> {
-        use datafusion_execution::cache::DefaultListFilesCache;
-        use datafusion_execution::cache::cache_manager::CacheManagerConfig;
+        use datafusion_execution::cache::cache_manager::{
+            CacheManagerConfig, DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT,
+        };
         use datafusion_execution::runtime_env::RuntimeEnvBuilder;
 
-        let cache_config = CacheManagerConfig::default()
-            .with_list_files_cache(Some(Arc::new(DefaultListFilesCache::default())));
+        let cache_config = CacheManagerConfig::default().with_list_files_cache(Some(Arc::new(
+            DefaultCache::<TableScopedPath, CachedFileList>::new_with_ttl(
+                DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT,
+                None,
+            )
+            .with_name("DefaultListFilesCache"),
+        )));
         Arc::new(
             RuntimeEnvBuilder::new()
                 .with_cache_manager(cache_config)
@@ -69287,6 +69917,17 @@ mod tests {
         fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
             &self.properties
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
         }
@@ -69913,6 +70554,115 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+
+    /// The table-wide index and the per-shard index are separate caches, each with
+    /// its own checkout log, and the per-shard index sees every committed key. So
+    /// when the table-wide index comes back unusable — here its log overflowed while
+    /// it was checked out, as the concurrent chunk commits of a large initial load
+    /// can make it — only that index may be dropped. Dropping the per-shard index
+    /// with it makes the next CDC apply rebuild that index from a full-table key scan
+    /// under `write_lock`, which at SF-1000 stalled the binlog stream every `MySQL`
+    /// table shares for 9 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_table_keyset_discard_keeps_the_per_shard_index() {
+        let ctx = SessionContext::new();
+        // A 1 MiB index budget is 512 KiB per cache at N>1, so the table-wide log (a
+        // quarter of that) overflows at ~1.4 K keys while the per-shard index still
+        // holds the same keys exactly.
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_table_discard_keeps_sharded",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                cdc_mem_tier_min_flush_bytes: 0,
+                cdc_mem_tier_max_bytes: 0,
+                cdc_mem_tier_shards: 4,
+                pk_keyset_cache_mb: Some(1),
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        // The initial load writes durably (no slot advancer yet), and those commits
+        // record their keys into both indexes.
+        let seed: Vec<(i64, i64)> = (0..100).map(|id| (id, 1)).collect();
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &seed)
+                .await
+                .is_none(),
+            "precondition: the initial load writes durably"
+        );
+
+        // A validation holds the table-wide index while a concurrent commit publishes
+        // more keys than its log may hold.
+        let (table_index, checkout) = provider.take_cached_pk_index();
+        let table_index = table_index.expect("the warm table-wide index is cached");
+        let concurrent: Vec<i64> = (1_000..3_000).collect();
+        provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &concurrent), 11);
+        provider.store_cached_pk_index(table_index, checkout);
+        assert!(
+            provider.pk_keyset_cache.lock().is_none(),
+            "precondition: the table-wide index whose log overflowed is dropped"
+        );
+
+        let key_7 = pk_digest_set_for_ids(&converter, &[7])
+            .iter_with_digest()
+            .next()
+            .expect("one key")
+            .0;
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => assert!(
+                keysets
+                    .iter()
+                    .any(|keyset| keyset.location_by_digest(key_7).is_some()),
+                "the per-shard index must still hold key 7"
+            ),
+            other => panic!(
+                "the per-shard index must survive the table-wide discard, present={}",
+                other.is_some()
+            ),
+        }
+
+        // CDC starts: the next apply takes the in-memory sharded path, reuses the
+        // per-shard index instead of rebuilding it from a table scan, and still
+        // replaces key 7's row.
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let rebuilt = Arc::new(AtomicBool::new(false));
+        {
+            let rebuilt = Arc::clone(&rebuilt);
+            *provider.test_post_keyset_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    rebuilt.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)])
+                .await
+                .is_some(),
+            "precondition: the upsert takes the in-memory sharded path"
+        );
+        assert!(
+            !rebuilt.load(Ordering::SeqCst),
+            "the next apply must reuse the per-shard index, not rebuild it from a table scan"
+        );
+        let rows = collect_id_value_pairs(&ctx, &provider, "pk_table_discard_keeps_sharded").await;
+        let expected: Vec<(i64, i64)> = (0..100)
+            .map(|id| (id, if id == 7 { 2 } else { 1 }))
+            .collect();
+        assert_eq!(rows, expected, "one live row per key, key 7 upserted");
     }
 
     /// A checkpoint that moves the inline rows into files while an apply has the

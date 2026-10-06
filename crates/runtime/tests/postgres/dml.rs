@@ -182,8 +182,8 @@ async fn test_postgres_write_through_delete_with_where() -> Result<(), anyhow::E
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
             let pool = common::get_postgres_connection_pool(port, None).await?;
             seed_items(&pool, "items").await?;
 
@@ -245,8 +245,8 @@ async fn test_postgres_write_through_update_with_where() -> Result<(), anyhow::E
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
             let pool = common::get_postgres_connection_pool(port, None).await?;
             seed_items(&pool, "items").await?;
 
@@ -311,8 +311,8 @@ async fn test_postgres_write_through_delete_all() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
             let pool = common::get_postgres_connection_pool(port, None).await?;
             seed_items(&pool, "items").await?;
 
@@ -353,8 +353,8 @@ async fn test_postgres_duckdb_accel_delete_with_where() -> Result<(), anyhow::Er
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
             let pool = common::get_postgres_connection_pool(port, None).await?;
             seed_items(&pool, "items").await?;
 
@@ -420,8 +420,8 @@ async fn test_postgres_duckdb_accel_update_with_where() -> Result<(), anyhow::Er
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
             let pool = common::get_postgres_connection_pool(port, None).await?;
             seed_items(&pool, "items").await?;
 
@@ -493,8 +493,8 @@ async fn test_postgres_duckdb_accel_update_all() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
             let pool = common::get_postgres_connection_pool(port, None).await?;
             seed_items(&pool, "items").await?;
 

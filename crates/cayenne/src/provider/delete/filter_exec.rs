@@ -79,11 +79,11 @@ use datafusion_execution::memory_pool::{
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
-use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion_physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
+use datafusion_physical_plan::{ChildStats, ExecutionPlan, StatisticsArgs, StatisticsContext};
 use std::sync::Arc;
 
 /// Per-partition metrics for a deletion-filter exec.
@@ -462,11 +462,31 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         &self,
         partition: Option<usize>,
     ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        StatisticsContext::new().compute(self, &StatisticsArgs::new().with_partition(partition))
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<datafusion_common::Statistics>],
+        args: &StatisticsArgs,
+    ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        let [input_stats] = input_stats else {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "{} expects statistics for exactly one input, got {}",
+                self.name(),
+                input_stats.len()
+            )));
+        };
         // Only the whole-table aggregate (`partition == None`) is delete-aware, and
         // only outside a protected-snapshot cutoff — see `net_table_deletions`. Both
         // gates short-circuit here so the per-partition path skips the scan-subtree
         // filter walk entirely.
-        let net_deletions = if partition.is_none() && self.min_delete_seq_to_apply.is_none() {
+        let net_deletions = if args.partition().is_none() && self.min_delete_seq_to_apply.is_none()
+        {
             net_table_deletions(
                 self.insert_record_handling,
                 crate::provider::scan::plan_has_pushed_filter(&self.input),
@@ -477,9 +497,20 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
             0
         };
         Ok(Arc::new(deletion_filtered_statistics(
-            self.input.partition_statistics(partition)?.as_ref().clone(),
+            input_stats.as_ref().clone(),
             net_deletions,
         )))
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -975,11 +1006,31 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
         &self,
         partition: Option<usize>,
     ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        StatisticsContext::new().compute(self, &StatisticsArgs::new().with_partition(partition))
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<datafusion_common::Statistics>],
+        args: &StatisticsArgs,
+    ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        let [input_stats] = input_stats else {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "{} expects statistics for exactly one input, got {}",
+                self.name(),
+                input_stats.len()
+            )));
+        };
         // Only the whole-table aggregate (`partition == None`) is delete-aware, and
         // only outside a protected-snapshot cutoff — see `net_table_deletions`. Both
         // gates short-circuit here so the per-partition path skips the scan-subtree
         // filter walk entirely.
-        let net_deletions = if partition.is_none() && self.min_delete_seq_to_apply.is_none() {
+        let net_deletions = if args.partition().is_none() && self.min_delete_seq_to_apply.is_none()
+        {
             net_table_deletions(
                 self.insert_record_handling,
                 crate::provider::scan::plan_has_pushed_filter(&self.input),
@@ -990,9 +1041,20 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
             0
         };
         Ok(Arc::new(deletion_filtered_statistics(
-            self.input.partition_statistics(partition)?.as_ref().clone(),
+            input_stats.as_ref().clone(),
             net_deletions,
         )))
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1411,6 +1473,17 @@ mod tests {
             &self.properties
         }
 
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
         }
@@ -1817,8 +1890,11 @@ mod tests {
     #[test]
     fn clean_scan_reports_exact_partition_statistics() {
         let scan = exact_int64_scan();
-        let stats = scan
-            .partition_statistics(Some(0))
+        let stats = StatisticsContext::new()
+            .compute(
+                scan.as_ref(),
+                &StatisticsArgs::new().with_partition(Some(0)),
+            )
             .expect("partition statistics");
         assert_eq!(stats.num_rows, Precision::Exact(3));
     }
@@ -1836,16 +1912,16 @@ mod tests {
             0,
             None,
         );
-        let stats = exec
-            .partition_statistics(Some(0))
+        let stats = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new().with_partition(Some(0)))
             .expect("partition statistics");
         // Per-partition: the upper bound (3), precision relaxed — the per-partition
         // delete distribution is unknown, so no subtraction here.
         assert_eq!(stats.num_rows, Precision::Inexact(3));
         // Aggregate (partition = None) is delete-aware: 3 rows - 1 deleted key
         // (Ignore -> the delete is not overridden) = 2 live rows.
-        let agg = exec
-            .partition_statistics(None)
+        let agg = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
             .expect("aggregate statistics");
         assert_eq!(agg.num_rows, Precision::Inexact(2));
     }
@@ -1864,8 +1940,8 @@ mod tests {
             ),
             None,
         );
-        let stats = exec
-            .partition_statistics(Some(0))
+        let stats = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new().with_partition(Some(0)))
             .expect("partition statistics");
         assert_eq!(stats.num_rows, Precision::Inexact(3));
     }
@@ -1885,12 +1961,12 @@ mod tests {
             0,
             None,
         );
-        let agg = exec
-            .partition_statistics(None)
+        let agg = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
             .expect("aggregate statistics");
         assert_eq!(agg.num_rows, Precision::Inexact(2));
-        let per = exec
-            .partition_statistics(Some(0))
+        let per = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new().with_partition(Some(0)))
             .expect("partition statistics");
         assert_eq!(per.num_rows, Precision::Inexact(3));
     }
@@ -1907,8 +1983,8 @@ mod tests {
             0,
             Some(0),
         );
-        let agg = exec
-            .partition_statistics(None)
+        let agg = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
             .expect("aggregate statistics");
         assert_eq!(agg.num_rows, Precision::Inexact(3));
     }
@@ -1933,8 +2009,8 @@ mod tests {
             0,
             None,
         );
-        let agg = exec
-            .partition_statistics(None)
+        let agg = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
             .expect("aggregate statistics");
         assert_eq!(agg.num_rows, Precision::Inexact(2));
     }
@@ -1960,8 +2036,8 @@ mod tests {
             None,
         );
         // 5 deletes >= 3 scanned rows -> keep the upper bound (3), not 0.
-        let agg = exec
-            .partition_statistics(None)
+        let agg = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
             .expect("aggregate statistics");
         assert_eq!(agg.num_rows, Precision::Inexact(3));
     }

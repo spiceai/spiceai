@@ -49,7 +49,8 @@ use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
 use data_accelerator_api::{
-    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, upsert_dedup,
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, keep_first,
+    upsert_dedup,
 };
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_checkpoint_api::CheckpointError;
@@ -527,9 +528,12 @@ impl DataAccelerator for SqliteAccelerator {
                 None,
                 resolved_refresh_mode(source, acceleration),
             )
-            .await;
+            .await?;
 
-            self.get_shared_pool(source).await?;
+            // A pending bootstrap must restore the file before any connection opens it.
+            if !matches!(bootstrap_status, BootstrapStatus::Pending { .. }) {
+                self.get_shared_pool(source).await?;
+            }
 
             return Ok(bootstrap_status);
         }
@@ -624,6 +628,16 @@ impl DataAccelerator for SqliteAccelerator {
             sqlite_writer,
             &cmd.options,
             cmd.constraints.clone(),
+        );
+        // The per-batch uniqueness check refuses a key repeated within one
+        // write before `ON CONFLICT DO NOTHING` can drop it, so `drop` keeps
+        // the first copy here.
+        let write_provider = keep_first::wrap_with_keep_first_if_needed(
+            write_provider,
+            &cmd.options,
+            cmd.schema.as_arrow(),
+            &cmd.constraints,
+            keep_first::NanKey::Null,
         );
 
         let table_provider =
@@ -829,7 +843,7 @@ mod tests {
     };
     use data_accelerator_api::DataAccelerator;
     use datafusion::{
-        common::{Constraints, TableReference, ToDFSchema},
+        common::{Constraint, Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
         logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
@@ -853,7 +867,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -906,6 +920,181 @@ mod tests {
             .expect("deletion should be successful");
     }
 
+    fn id_v_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("v", DataType::Utf8, false),
+        ]))
+    }
+
+    fn id_v_batch(rows: &[(i64, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            id_v_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch should be created")
+    }
+
+    async fn id_v_table(
+        name: &str,
+        on_conflict: &str,
+        constraints: Vec<Constraint>,
+    ) -> Arc<dyn datafusion::datasource::TableProvider> {
+        let external_table = CreateExternalTable {
+            schema: ToDFSchema::to_dfschema_ref(id_v_schema()).expect("df schema"),
+            name: TableReference::bare(name),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: [("on_conflict".to_string(), on_conflict.to_string())]
+                .into_iter()
+                .collect(),
+            constraints: Constraints::new_unverified(constraints),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("table should be created")
+    }
+
+    async fn write_id_v(
+        table: &Arc<dyn datafusion::datasource::TableProvider>,
+        batches: Vec<RecordBatch>,
+        op: InsertOp,
+    ) {
+        let ctx = SessionContext::new();
+        let exec = MockExec::new(batches.into_iter().map(Ok).collect(), id_v_schema());
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), op)
+            .await
+            .expect("insertion should be planned");
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("a repeated key must not fail a drop write");
+    }
+
+    /// `(id, v)` rows the table holds, ordered by `id`.
+    async fn id_v_rows(
+        table: &Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Vec<(i64, String)> {
+        let ctx = SessionContext::new();
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should be planned");
+        let mut rows = Vec::new();
+        for batch in collect(scan, ctx.task_ctx()).await.expect("scan") {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let vals = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("v is Utf8");
+            rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), vals.value(i).to_string())));
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Regression test for #14629: under `on_conflict: drop`, a write that
+    /// repeats a key keeps its first copy, whether the repeat is within one
+    /// record batch (which the per-batch uniqueness check used to refuse) or
+    /// in a later one.
+    #[tokio::test]
+    async fn drop_keeps_the_first_copy_of_a_key_a_write_repeats() {
+        let table = id_v_table(
+            "drop_repeats",
+            "do_nothing:id",
+            vec![Constraint::PrimaryKey(vec![0])],
+        )
+        .await;
+        write_id_v(
+            &table,
+            vec![
+                id_v_batch(&[(1, "a"), (2, "b"), (1, "c")]),
+                id_v_batch(&[(2, "d"), (3, "e")]),
+            ],
+            InsertOp::Overwrite,
+        )
+        .await;
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "e".to_string())
+            ]
+        );
+    }
+
+    /// `SQLite` matches an `on_conflict` target to its column ignoring case, so
+    /// `do_nothing:ID` over a column `id` keeps the first copy of an `id`.
+    #[tokio::test]
+    async fn drop_resolves_a_target_spelled_in_another_case() {
+        let table = id_v_table(
+            "drop_target_case",
+            "do_nothing:ID",
+            vec![Constraint::PrimaryKey(vec![0])],
+        )
+        .await;
+        write_id_v(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (2, "b"), (1, "c")])],
+            InsertOp::Overwrite,
+        )
+        .await;
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
+    /// With `drop` on two constraints, an append must not drop a row because of
+    /// a key carried by an earlier incoming row that the table itself rejects:
+    /// `(1, 'b')` conflicts with the stored `(1, 'a')`, so it is never written,
+    /// and `(2, 'b')` then conflicts with nothing.
+    #[tokio::test]
+    async fn drop_on_every_constraint_appends_rows_only_a_rejected_row_conflicted_with() {
+        let table = id_v_table(
+            "drop_all_append",
+            "do_nothing_all",
+            vec![Constraint::PrimaryKey(vec![0]), Constraint::Unique(vec![1])],
+        )
+        .await;
+        write_id_v(&table, vec![id_v_batch(&[(1, "a")])], InsertOp::Overwrite).await;
+        write_id_v(
+            &table,
+            vec![id_v_batch(&[(1, "b")]), id_v_batch(&[(2, "b")])],
+            InsertOp::Append,
+        )
+        .await;
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
     /// Regression test for the DF53 / table-providers v0.11 `SQLite` Decimal
     /// round-trip. A `Decimal128`/`Decimal256` column accelerated into `SQLite`
     /// must read back as a decimal, not fail with
@@ -935,7 +1124,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("decimal_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1029,7 +1218,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("list_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1148,7 +1337,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("dict_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,

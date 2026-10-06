@@ -60,6 +60,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::RecordBatch;
 use datafusion::common::Result;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::projection::ProjectionExprs;
@@ -159,6 +160,14 @@ impl FileSource for FirstRecordProbeSource {
         // A filter pushed into the wrapped scan must still run: it decides which
         // rows count, so it decides whether a file yields a probe row at all.
         self.inner.filter()
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        // The wrapped source's filter and projection are evaluated unchanged.
+        self.inner.apply_expressions(f)
     }
 
     fn projection(&self) -> Option<&ProjectionExprs> {
@@ -273,6 +282,16 @@ impl FileSource for FirstRecordProbeSource {
     )]
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         self.inner.schema_adapter_factory()
+    }
+
+    /// Not serializable. Forwarding to `inner` would ship a plain scan of every
+    /// record, so a remote executor would silently drop the one-row-per-file limit.
+    fn try_to_proto(
+        &self,
+        _base: &FileScanConfig,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 }
 

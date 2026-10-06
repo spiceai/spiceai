@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use parking_lot::{Mutex, RwLock};
 use runtime_acceleration::Engine;
 use runtime_acceleration::snapshot::CurrentSnapshotError;
@@ -265,6 +265,23 @@ impl SnapshotSource {
             );
         }
 
+        if engine != Engine::Cayenne
+            && let Some(param) = acceleration.params.as_ref().and_then(|params| {
+                CAYENNE_PATH_PARAMS
+                    .iter()
+                    .find(|param| params.data.contains_key(**param))
+            })
+        {
+            return InvalidConfigurationSnafu {
+                config_key: "acceleration.params",
+                message: format!(
+                    "Dataset '{name}' reads snapshots from '{}' that were created with the '{engine}' engine, so `acceleration.params.{param}`, which sets where a Cayenne copy is kept, does not apply. Remove `acceleration.params.{param}`. See: {SNAPSHOT_SOURCE_DOCS}",
+                    self.location
+                ),
+            }
+            .fail();
+        }
+
         acceleration.enabled = true;
         acceleration.engine = Some(engine.to_string());
         acceleration.mode = Mode::File;
@@ -382,15 +399,19 @@ impl SnapshotSource {
 
 /// The accelerator params that choose where a dataset's data lives on disk. Where a
 /// snapshot dataset keeps its local copy is Spice's choice; see [`local_copy_params`].
+/// [`CAYENNE_PATH_PARAMS`] are allowed: a Cayenne copy is per dataset, not per
+/// location, wherever it lives.
 const LOCAL_COPY_PARAMS: &[&str] = &[
     "duckdb_file",
     "duckdb_data_dir",
     "sqlite_file",
     "turso_file",
-    "cayenne_file_path",
-    "cayenne_metadata_dir",
     "cayenne_s3_zone_ids",
 ];
+
+/// Where a Cayenne snapshot dataset keeps its copy, when it chooses. Rejected once the
+/// snapshots turn out to be another engine's.
+const CAYENNE_PATH_PARAMS: &[&str] = &["cayenne_file_path", "cayenne_metadata_dir"];
 
 /// Where a snapshot dataset keeps its local copy, for the engines that keep one file
 /// per dataset: under `.spice/data`, in a file named for the dataset and the location it
@@ -403,9 +424,9 @@ const LOCAL_COPY_PARAMS: &[&str] = &[
 /// one dataset's snapshot would replace the others'.
 ///
 /// Cayenne keeps its own layout: one catalog per process, in the shared metadata
-/// directory, and a data directory per dataset. A snapshot dataset never serves a copy
-/// it did not restore in this process, whatever the engine; see
-/// `DataFusion::create_accelerated_table`.
+/// directory, and a data directory per dataset, both under `.spice/data` unless the
+/// dataset sets them. A snapshot dataset never serves a copy it did not restore in this
+/// process, whatever the engine; see `DataFusion::create_accelerated_table`.
 fn local_copy_params(
     dataset: &TableReference,
     location: &str,
@@ -881,6 +902,51 @@ mod tests {
                 .map(ParamValue::as_string)
                 .as_deref(),
             Some("2GB")
+        );
+    }
+
+    #[test]
+    fn cayenne_paths_for_the_local_copy_can_be_set() {
+        let mut declared = snapshot_dataset();
+        declared.acceleration = Some(spicepod_acceleration::Acceleration {
+            params: Some(Params::from_string_map(HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    "/data/modules/".to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    "/data/metadata/".to_string(),
+                ),
+            ]))),
+            ..Default::default()
+        });
+        let acceleration = source(&declared)
+            .acceleration(&TableReference::bare("modules"), Engine::Cayenne)
+            .expect("Cayenne paths are accepted");
+        let param = |name: &str| {
+            acceleration
+                .params
+                .as_ref()
+                .and_then(|params| params.data.get(name))
+                .map(ParamValue::as_string)
+        };
+        assert_eq!(
+            param("cayenne_file_path").as_deref(),
+            Some("/data/modules/")
+        );
+        assert_eq!(
+            param("cayenne_metadata_dir").as_deref(),
+            Some("/data/metadata/")
+        );
+
+        let message = source(&declared)
+            .acceleration(&TableReference::bare("modules"), Engine::DuckDB)
+            .expect_err("Cayenne paths do not apply to DuckDB snapshots")
+            .to_string();
+        assert!(
+            message.contains("Remove `acceleration.params.cayenne_"),
+            "{message}"
         );
     }
 
