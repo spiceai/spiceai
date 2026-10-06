@@ -28,7 +28,7 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
