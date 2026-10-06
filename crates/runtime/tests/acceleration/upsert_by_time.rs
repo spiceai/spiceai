@@ -315,7 +315,7 @@ async fn values_in(rt: &Arc<Runtime>, table: &str, id: i64) -> Vec<String> {
 async fn refresh_and_wait(rt: &Arc<Runtime>, table: &str) {
     let waiter = rt
         .datafusion()
-        .refresh_table(&datafusion::sql::TableReference::from(table), None)
+        .refresh_table(&datafusion::common::TableReference::from(table), None)
         .await
         .expect("trigger refresh")
         .expect("refresh notifier");
@@ -414,7 +414,7 @@ async fn a_synchronized_child_keeps_the_same_versions_as_its_parent() {
             // A refresh that is not applied records no completion; its error status is
             // the signal that it finished.
             trigger_refresh(&rt, TABLE).await.expect("trigger refresh");
-            let table = datafusion::sql::TableReference::bare(TABLE);
+            let table = datafusion::common::TableReference::bare(TABLE);
             let failed = wait_until_true(Duration::from_mins(1), || {
                 let status = rt.status().get_dataset_status(&table);
                 async move {

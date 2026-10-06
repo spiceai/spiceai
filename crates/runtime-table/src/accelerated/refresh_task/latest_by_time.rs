@@ -46,7 +46,18 @@ use datafusion::common::hash_utils::{RandomState, create_hashes};
 use datafusion::datasource::file_format::options::ArrowReadOptions;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::execution::disk_manager::{DiskManager, RefCountedTempFile};
+use datafusion::execution::SpillFile;
+use datafusion::execution::disk_manager::DiskManager;
+
+/// A spill file the disk manager created, deleted once the last handle drops.
+type Spill = Arc<dyn SpillFile>;
+
+/// The local path of `file`, which this mode reads back directly.
+fn spill_path(file: &Spill) -> Result<&std::path::Path, DataFusionError> {
+    file.path().ok_or_else(|| {
+        spill_failed(&"the configured spill storage has no local file to read back")
+    })
+}
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -230,7 +241,7 @@ pub(crate) struct LatestByTime {
     disk: Option<Arc<DiskManager>>,
     runtime_env: Option<Arc<RuntimeEnv>>,
     /// The map's entries spilled so far, each a run sorted by key.
-    runs: Vec<RefCountedTempFile>,
+    runs: Vec<Spill>,
     /// Once the map has spilled it no longer knows every key, so every later row is
     /// written here and decided after the last one, against every run.
     deferred: Option<DeferredRows>,
@@ -338,7 +349,7 @@ impl LatestByTime {
     async fn write_run(
         &self,
         entries: Vec<(u128, Kept)>,
-    ) -> Result<RefCountedTempFile, DataFusionError> {
+    ) -> Result<Spill, DataFusionError> {
         let disk = self.spill_disk()?;
         tokio::task::spawn_blocking(move || write_run(&disk, entries))
             .await
@@ -477,7 +488,7 @@ impl LatestByTime {
                 .with_sort_spill_reservation_bytes(merge_reservation),
             runtime_env,
         );
-        let path = file.path().to_string_lossy().to_string();
+        let path = spill_path(&file)?.to_string_lossy().to_string();
         let sorted = ctx
             .read_arrow(
                 path,
@@ -800,18 +811,17 @@ const RUN_CHUNK: usize = 32_768;
 fn write_run(
     disk: &Arc<DiskManager>,
     mut entries: Vec<(u128, Kept)>,
-) -> Result<RefCountedTempFile, DataFusionError> {
+) -> Result<Spill, DataFusionError> {
     use std::io::Write as _;
     entries.sort_unstable_by_key(|(key, _)| *key);
-    let mut file = disk.create_tmp_file("upsert_by_time key spill")?;
+    let file = disk.create_tmp_file("upsert_by_time key spill")?;
     {
-        let mut out = std::io::BufWriter::new(file.inner().as_file());
+        let mut out = std::io::BufWriter::new(file.open_writer()?);
         for (key, kept) in &entries {
             write_entry(&mut out, *key, *kept)?;
         }
         out.flush()?;
     }
-    file.update_disk_usage()?;
     Ok(file)
 }
 
@@ -829,9 +839,9 @@ struct RunReader {
 }
 
 impl RunReader {
-    fn open(run: &RefCountedTempFile) -> Result<Self, DataFusionError> {
+    fn open(run: &Spill) -> Result<Self, DataFusionError> {
         Ok(Self {
-            reader: std::io::BufReader::new(std::fs::File::open(run.path())?),
+            reader: std::io::BufReader::new(std::fs::File::open(spill_path(run)?)?),
         })
     }
 
@@ -862,8 +872,8 @@ impl RunReader {
 /// Merge `runs` into one run holding each key's newest version, or `None` without runs.
 fn merge_runs(
     disk: &Arc<DiskManager>,
-    runs: &[RefCountedTempFile],
-) -> Result<Option<RefCountedTempFile>, DataFusionError> {
+    runs: &[Spill],
+) -> Result<Option<Spill>, DataFusionError> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     use std::io::Write as _;
@@ -880,9 +890,9 @@ fn merge_runs(
             heap.push(Reverse((key, source, kept.time, kept.hash)));
         }
     }
-    let mut file = disk.create_tmp_file("upsert_by_time merged key spill")?;
+    let file = disk.create_tmp_file("upsert_by_time merged key spill")?;
     {
-        let mut out = std::io::BufWriter::new(file.inner().as_file());
+        let mut out = std::io::BufWriter::new(file.open_writer()?);
         let mut current: Option<(u128, Kept)> = None;
         while let Some(Reverse((key, source, time, hash))) = heap.pop() {
             if let Some((next_key, kept)) = readers[source].next_entry()? {
@@ -908,20 +918,19 @@ fn merge_runs(
         }
         out.flush()?;
     }
-    file.update_disk_usage()?;
     Ok(Some(file))
 }
 
 /// The merged run, read in chunks off the async runtime.
 struct RunCursor {
-    file: RefCountedTempFile,
+    file: Spill,
     reader: Option<RunReader>,
     buffer: VecDeque<(u128, Kept)>,
     exhausted: bool,
 }
 
 impl RunCursor {
-    fn new(file: RefCountedTempFile) -> Self {
+    fn new(file: Spill) -> Self {
         Self {
             file,
             reader: None,
@@ -991,11 +1000,16 @@ const HASH: &str = "__spice_upsert_by_time_hash";
 /// The helper columns deferral appends after a row's own columns.
 const HELPERS: usize = 5;
 
+/// Writes the deferred rows' Arrow IPC spill file.
+type DeferredWriter = arrow::ipc::writer::FileWriter<Box<dyn datafusion::execution::SpillWriter>>;
+
 /// Rows read after the map spilled, with their key, time and read order, in an Arrow IPC
 /// spill file.
 struct DeferredRows {
-    file: RefCountedTempFile,
-    writer: Option<arrow::ipc::writer::FileWriter<std::fs::File>>,
+    file: Spill,
+    /// Only ever reached through `&mut self` (`get_mut`); the mutex makes the selector
+    /// `Sync`, which `DataFusion`'s spill writer is not.
+    writer: parking_lot::Mutex<Option<DeferredWriter>>,
     schema: SchemaRef,
     next_seq: u64,
 }
@@ -1015,13 +1029,13 @@ impl DeferredRows {
             .create_tmp_file("upsert_by_time deferred rows")
             .map_err(|e| spill_failed(&e))?;
         let writer = arrow::ipc::writer::FileWriter::try_new(
-            file.inner().reopen().map_err(|e| spill_failed(&e))?,
+            file.open_writer().map_err(|e| spill_failed(&e))?,
             &schema,
         )
         .map_err(|e| spill_failed(&e))?;
         Ok(Self {
             file,
-            writer: Some(writer),
+            writer: parking_lot::Mutex::new(Some(writer)),
             schema,
             next_seq: 0,
         })
@@ -1052,26 +1066,24 @@ impl DeferredRows {
         let tagged = RecordBatch::try_new(Arc::clone(&self.schema), columns)?;
         let mut writer = self
             .writer
+            .get_mut()
             .take()
             .ok_or_else(|| DataFusionError::Internal("deferred rows already finished".into()))?;
         let writer = tokio::task::spawn_blocking(move || writer.write(&tagged).map(|()| writer))
             .await
             .map_err(|e| spill_failed(&e))?
             .map_err(|e| spill_failed(&e))?;
-        self.writer = Some(writer);
+        *self.writer.get_mut() = Some(writer);
         Ok(())
     }
 
-    async fn finish(mut self) -> Result<RefCountedTempFile, DataFusionError> {
-        if let Some(mut writer) = self.writer.take() {
+    async fn finish(mut self) -> Result<Spill, DataFusionError> {
+        if let Some(mut writer) = self.writer.get_mut().take() {
             tokio::task::spawn_blocking(move || writer.finish())
                 .await
                 .map_err(|e| spill_failed(&e))?
                 .map_err(|e| spill_failed(&e))?;
         }
-        self.file
-            .update_disk_usage()
-            .map_err(|e| spill_failed(&e))?;
         Ok(self.file)
     }
 }
@@ -1093,7 +1105,7 @@ struct DeferredResolver {
     group: Option<Group>,
     superseded: Superseded,
     /// Keeps the deferred-rows spill file alive while it is read.
-    _file: RefCountedTempFile,
+    _file: Spill,
 }
 
 impl DeferredResolver {
