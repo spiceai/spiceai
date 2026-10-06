@@ -42,10 +42,10 @@ pub enum ChangeOp {
 }
 
 impl ChangeOp {
-    /// Maps a CDC or internal runtime-table operation code onto a Drasi operation.
+    /// Maps a CDC operation code onto a Drasi operation.
     ///
     /// Debezium creates (`c`), snapshot reads (`r`), and updates (`u`) become
-    /// updates. The internal runtime-table insert marker (`i`) remains an insert.
+    /// updates. Runtime-table insert markers are not valid CDC operations.
     ///
     /// # Errors
     ///
@@ -55,7 +55,6 @@ impl ChangeOp {
     /// source no longer has.
     pub fn from_op_code(code: &str) -> std::result::Result<Self, &str> {
         match code {
-            "i" => Ok(ChangeOp::Insert),
             "c" | "r" | "u" => Ok(ChangeOp::Update),
             "d" => Ok(ChangeOp::Delete),
             other => Err(other),
@@ -289,8 +288,8 @@ mod tests {
     }
 
     #[test]
-    fn internal_runtime_table_insert_marker_stays_insert() {
-        assert_eq!(ChangeOp::from_op_code("i"), Ok(ChangeOp::Insert));
+    fn internal_runtime_table_insert_marker_is_not_a_cdc_operation() {
+        assert_eq!(ChangeOp::from_op_code("i"), Err("i"));
     }
 
     #[test]

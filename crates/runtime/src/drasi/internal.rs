@@ -72,18 +72,21 @@ impl InternalForwarders {
         for table in &spec.tables {
             let table_ref = TableReference::partial(SPICE_RUNTIME_SCHEMA, table.name.clone());
             let name = table_ref.to_string();
-            let sink = super::build_sink(
-                name.clone(),
-                &spec.source_id,
-                labels_for(table, &name),
-                spec.transport,
-                // Surfaced, not skipped: a runtime table has no replication
-                // position to replay, so the dead-letter store is the only
-                // thing that can retain a failed batch — and it only sees one
-                // if the sink reports it.
-                super::QUEUED_SINK_POLICY,
-                spec.params.as_ref(),
-            )?;
+            let sink = std::sync::Arc::new(
+                super::build_sink(
+                    name.clone(),
+                    &spec.source_id,
+                    labels_for(table, &name),
+                    spec.transport,
+                    // Surfaced, not skipped: a runtime table has no replication
+                    // position to replay, so the dead-letter store is the only
+                    // thing that can retain a failed batch — and it only sees one
+                    // if the sink reports it.
+                    super::QUEUED_SINK_POLICY,
+                    spec.params.as_ref(),
+                )?
+                .for_runtime_table(),
+            );
 
             let store = super::open_dead_letter_store(&name).await;
 

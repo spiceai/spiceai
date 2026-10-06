@@ -59,6 +59,8 @@ pub struct DrasiChangeRows<'a> {
 pub struct DrasiSink {
     config: DrasiSinkConfig,
     transport: Arc<dyn DrasiTransport>,
+    /// Only runtime-table sinks accept the internal append marker.
+    runtime_table: bool,
     /// Changes that were dropped under [`OnDeliveryError::Skip`].
     skipped: AtomicU64,
 }
@@ -93,6 +95,7 @@ impl DrasiSink {
         Ok(Self {
             config,
             transport,
+            runtime_table: false,
             skipped: AtomicU64::new(0),
         })
     }
@@ -103,8 +106,16 @@ impl DrasiSink {
         Self {
             config,
             transport,
+            runtime_table: false,
             skipped: AtomicU64::new(0),
         }
+    }
+
+    /// Marks this sink as an internal runtime-table sink, permitting append inserts.
+    #[must_use]
+    pub fn for_runtime_table(mut self) -> Self {
+        self.runtime_table = true;
+        self
     }
 
     /// How many changes have been dropped undelivered under
@@ -129,7 +140,12 @@ impl DrasiSink {
         let mut prepared = Vec::with_capacity(rendered.len());
         for (index, row) in rendered.into_iter().enumerate() {
             let code = rows.op_codes.get(index).copied().unwrap_or_default();
-            let op = ChangeOp::from_op_code(code).map_err(|unsupported| {
+            let operation = if self.runtime_table && code == "i" {
+                Ok(ChangeOp::Insert)
+            } else {
+                ChangeOp::from_op_code(code)
+            };
+            let op = operation.map_err(|unsupported| {
                 UnsupportedOperationSnafu {
                     dataset: &self.config.dataset,
                     operation: unsupported.to_string(),
@@ -373,7 +389,8 @@ mod tests {
         let sink = DrasiSink::with_transport(
             config(OnDeliveryError::Block),
             RecordingTransport::always_ok(),
-        );
+        )
+        .for_runtime_table();
         let data = batch();
         let prepared = sink
             .prepare(&rows(&data, vec!["i", "i"]))
@@ -383,6 +400,37 @@ mod tests {
             prepared.iter().map(|change| change.op).collect::<Vec<_>>(),
             vec![ChangeOp::Insert, ChangeOp::Insert]
         );
+    }
+
+    #[tokio::test]
+    async fn cdc_insert_marker_is_rejected_under_fail_policy() {
+        let transport = RecordingTransport::always_ok();
+        let sink =
+            DrasiSink::with_transport(config(OnDeliveryError::Fail), Arc::clone(&transport) as _);
+        let data = batch();
+        let error = sink
+            .forward(&rows(&data, vec!["i", "i"]))
+            .await
+            .expect_err("CDC cannot use an internal runtime-table marker");
+        let Error::UnsupportedOperation { dataset, operation } = error else {
+            panic!("expected UnsupportedOperation");
+        };
+        assert_eq!(dataset, "orders");
+        assert_eq!(operation, "i");
+        assert_eq!(transport.attempts(), 0);
+    }
+
+    #[tokio::test]
+    async fn cdc_insert_marker_is_counted_under_skip_policy() {
+        let transport = RecordingTransport::always_ok();
+        let sink =
+            DrasiSink::with_transport(config(OnDeliveryError::Skip), Arc::clone(&transport) as _);
+        let data = batch();
+        sink.forward(&rows(&data, vec!["i", "i"]))
+            .await
+            .expect("skip absorbs the unsupported CDC operation");
+        assert_eq!(sink.skipped_count(), 2);
+        assert_eq!(transport.attempts(), 0);
     }
 
     /// Truncate cannot be expressed as a set of deletes, and dropping it would
