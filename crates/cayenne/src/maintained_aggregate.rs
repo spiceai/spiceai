@@ -1686,6 +1686,10 @@ impl MaintainedAggregateRegistry {
             .transpose()?;
         state.status = RegistryStatus::Stale;
         reset_retained_state(state);
+        // The table is at `hold_from`. Queued deltas at or below it are in the
+        // snapshot; advance so the first held delta is `hold_from + 1` even
+        // when those queued deltas have not drained yet.
+        state.epoch = state.epoch.max(hold_from);
         state.rebuild = Some(PendingRebuild {
             hold_from,
             deltas: Vec::new(),
@@ -3197,8 +3201,22 @@ enum Pass {
 /// order: a skipped or out-of-order epoch would leave the views missing or
 /// double-counting a write, so it marks the registry stale, clears it, and
 /// abandons any rebuild.
+///
+/// A rebuild in progress is the exception for epochs at or below its
+/// `hold_from`: those writes are already in the snapshot it reads — including
+/// deltas still queued when a full apply queue called `mark_stale` at
+/// `hold_from`. They are skipped without treating the jump as a gap, so later
+/// epochs stay held.
 fn begin_maintenance_pass(state: &mut RegistryState, epoch: u64) -> Pass {
     if epoch <= state.rebuilt_through {
+        return Pass::Skip;
+    }
+    if let Some(rebuild) = &state.rebuild
+        && epoch <= rebuild.hold_from
+    {
+        if epoch == state.epoch.saturating_add(1) {
+            state.epoch = epoch;
+        }
         return Pass::Skip;
     }
     if epoch != state.epoch.saturating_add(1) {
@@ -3209,14 +3227,9 @@ fn begin_maintenance_pass(state: &mut RegistryState, epoch: u64) -> Pass {
         return Pass::Skip;
     }
     state.epoch = epoch;
-    if let Some(rebuild) = &state.rebuild {
-        return if epoch <= rebuild.hold_from {
-            Pass::Skip
-        } else {
-            Pass::Hold
-        };
-    }
-    if state.status == RegistryStatus::Stale || state.views.is_empty() {
+    if state.rebuild.is_some() {
+        Pass::Hold
+    } else if state.status == RegistryStatus::Stale || state.views.is_empty() {
         Pass::Skip
     } else {
         Pass::Apply
@@ -4117,6 +4130,90 @@ mod tests {
         assert_eq!(
             sum_i_by_name(&registry)?,
             BTreeMap::from([("a".to_string(), 31)])
+        );
+        Ok(())
+    }
+
+    /// A full apply queue can `mark_stale(N)` while N-1 is still queued
+    /// (`feed_staged_ivm_under_fence`). The rebuild that recovers starts holding
+    /// at N; the queued earlier delta is already in that snapshot and must not
+    /// be treated as an epoch gap that abandons the rebuild and drops later
+    /// writes.
+    #[test]
+    fn a_queued_delta_behind_a_stale_mark_does_not_abandon_the_rebuild() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        registry.mark_stale(10);
+        let mut rebuilder = registry.begin_rebuild(10)?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "begin_rebuild must leave a current rebuild"
+        );
+
+        registry.apply_insert_batches(9, &[group_batch(&[("a", 2, 20)])])?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "a queued delta at or below hold_from must not abandon the rebuild"
+        );
+
+        registry.apply_insert_batches(11, &[group_batch(&[("b", 3, 5)])])?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "the first epoch after hold_from must be held for the rebuild"
+        );
+
+        assert!(rebuilder.set_snapshot_epoch(10));
+        rebuilder.apply_projected(&group_batch(&[("a", 1, 10), ("a", 2, 20)]), &[0, 1, 2, 3])?;
+        assert!(registry.finish_rebuild(rebuilder)?, "the rebuild installs");
+        assert!(!registry.is_stale());
+        assert_eq!(registry.epoch_for_test(), 11);
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 30), ("b".to_string(), 5)]),
+            "the rebuilt views include the write held after the snapshot"
+        );
+        Ok(())
+    }
+
+    /// Epochs assigned and queued before `begin_rebuild`, with no stale mark
+    /// jumping the registry epoch, must still leave later holds dense: skip
+    /// them as already in the snapshot, then hold the first epoch after
+    /// `hold_from`.
+    #[test]
+    fn queued_deltas_before_hold_from_keep_later_holds_dense() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        let mut rebuilder = registry.begin_rebuild(3)?;
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 20)])])?;
+        registry.apply_insert_batches(3, &[group_batch(&[("b", 3, 5)])])?;
+        registry.apply_insert_batches(4, &[group_batch(&[("b", 4, 1)])])?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "queued deltas at or below hold_from must not abandon a later hold"
+        );
+
+        assert!(rebuilder.set_snapshot_epoch(3));
+        rebuilder.apply_projected(
+            &group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)]),
+            &[0, 1, 2, 3],
+        )?;
+        assert!(registry.finish_rebuild(rebuilder)?, "the rebuild installs");
+        assert!(!registry.is_stale());
+        assert_eq!(registry.epoch_for_test(), 4);
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 30), ("b".to_string(), 6)]),
+            "the rebuilt views include the write held after the snapshot"
         );
         Ok(())
     }
