@@ -20,7 +20,7 @@ limitations under the License.
 //! conversion between `DataFusion` [`ColumnStatistics`] and Vortex [`StatsSet`].
 
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::datatypes::i256 as ArrowI256;
 use arrow_schema::{DataType, Schema};
@@ -28,7 +28,7 @@ use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
 use vortex::VortexSessionDefault;
 use vortex::array::stats::StatsSet;
-use vortex::arrow::{FromArrowType, ToArrowDatum};
+use vortex::arrow::{ArrowSession, ToArrowDatum};
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::{DType, DecimalDType, Nullability, i256 as VortexI256};
 use vortex::error::VortexResult;
@@ -97,7 +97,9 @@ fn df_scalar_to_vortex(sv: &ScalarValue) -> Option<vortex::scalar::ScalarValue> 
         ScalarValue::Date32(Some(v))
         | ScalarValue::Time32Second(Some(v))
         | ScalarValue::Time32Millisecond(Some(v)) => {
-            let dtype = DType::from_arrow((&sv.data_type(), Nullability::Nullable));
+            let dtype = ARROW_SESSION
+                .from_arrow_datatype(&sv.data_type(), Nullability::Nullable)
+                .ok()?;
             Scalar::try_new(dtype, Some(vortex::scalar::ScalarValue::from(*v))).ok()?
         }
         ScalarValue::Date64(Some(v))
@@ -107,7 +109,9 @@ fn df_scalar_to_vortex(sv: &ScalarValue) -> Option<vortex::scalar::ScalarValue> 
         | ScalarValue::TimestampMillisecond(Some(v), _)
         | ScalarValue::TimestampMicrosecond(Some(v), _)
         | ScalarValue::TimestampNanosecond(Some(v), _) => {
-            let dtype = DType::from_arrow((&sv.data_type(), Nullability::Nullable));
+            let dtype = ARROW_SESSION
+                .from_arrow_datatype(&sv.data_type(), Nullability::Nullable)
+                .ok()?;
             Scalar::try_new(dtype, Some(vortex::scalar::ScalarValue::from(*v))).ok()?
         }
         _ => return None,
@@ -198,9 +202,7 @@ fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
         }
         DType::Binary(_) => {
             let bytes = scalar.as_binary().value().cloned()?;
-            Some(ScalarValue::Binary(Some(Vec::<u8>::from(
-                bytes.into_inner(),
-            ))))
+            Some(ScalarValue::Binary(Some(bytes.as_slice().to_vec())))
         }
         DType::Extension(_) => {
             // Temporal types (Date/Time/Timestamp) are represented as Vortex
@@ -614,7 +616,7 @@ pub fn statistics_to_persisted_blob(stats: &Statistics, schema: &Schema) -> Opti
             column_stats_to_stats_set(&align_column_stats_to_schema(cs, field.data_type()))
         })
         .collect();
-    let file_stats = build_file_statistics(column_stats, schema);
+    let file_stats = build_file_statistics(column_stats, schema).ok()?;
     serialize_file_statistics(&file_stats).ok()
 }
 
@@ -676,6 +678,26 @@ pub(crate) fn statistics_from_persisted_blob(
     )))
 }
 
+/// Whether a restored blob was written by a build that persists per-column byte
+/// sizes.
+///
+/// Such a build writes `Stat::UncompressedSizeInBytes` for every column the file
+/// carries, so one sized column is enough to recognise it; a blob written before
+/// those sizes were persisted carries none on any column.
+///
+/// This is deliberately not `total_byte_size != Absent`. That total is summed with
+/// an absorbing [`Precision::add`], so one column without a size makes it `Absent`
+/// — and a column the file does not carry never has one. A table widened after a
+/// file was written therefore has a total that can never be restored, and reading
+/// the total as the freshness signal would reject those files' blobs on every cold
+/// scan for the life of the file (spiceai/spiceai#13829).
+pub(crate) fn blob_carries_per_column_byte_sizes(statistics: &Statistics) -> bool {
+    statistics
+        .column_statistics
+        .iter()
+        .any(|column| column.byte_size != Precision::Absent)
+}
+
 /// Serialize a Vortex [`FileStatistics`] to bytes.
 pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<Vec<u8>> {
     let fb = stats.write_flatbuffer_bytes()?;
@@ -691,7 +713,7 @@ pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<
 /// Returns an error if the flatbuffer bytes are malformed or do not match the
 /// expected schema.
 pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
-    let struct_dtype = vortex_struct_dtype_from_schema(schema);
+    let struct_dtype = vortex_struct_dtype_from_schema(schema)?;
     let fb_stats = flatbuffers::root::<vortex::flatbuffers::footer::FileStatistics>(bytes)?;
     FileStatistics::from_flatbuffer(
         &fb_stats,
@@ -700,18 +722,34 @@ pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResul
     )
 }
 
+/// The Arrow/Vortex type conversions statistics use: the same default session
+/// the Vortex writer converts a table's schema with, so a statistics blob is typed
+/// like the file it describes.
+pub(crate) static ARROW_SESSION: LazyLock<ArrowSession> = LazyLock::new(ArrowSession::default);
+
 /// Convert an Arrow [`Schema`] to a Vortex struct [`DType`].
-pub(crate) fn vortex_struct_dtype_from_schema(schema: &Schema) -> DType {
-    DType::from_arrow(schema)
+///
+/// # Errors
+///
+/// Returns an error for an Arrow type Vortex cannot represent.
+pub(crate) fn vortex_struct_dtype_from_schema(schema: &Schema) -> VortexResult<DType> {
+    ARROW_SESSION.from_arrow_schema(schema)
 }
 
 /// Build a [`FileStatistics`] from per-column [`StatsSet`] entries and the table schema.
+///
+/// # Errors
+///
+/// Returns an error for an Arrow type Vortex cannot represent.
 pub(crate) fn build_file_statistics(
     column_stats: Vec<StatsSet>,
     schema: &Schema,
-) -> FileStatistics {
-    let struct_dtype = vortex_struct_dtype_from_schema(schema);
-    FileStatistics::new_with_dtype(Arc::from(column_stats.into_boxed_slice()), &struct_dtype)
+) -> VortexResult<FileStatistics> {
+    let struct_dtype = vortex_struct_dtype_from_schema(schema)?;
+    Ok(FileStatistics::new_with_dtype(
+        Arc::from(column_stats.into_boxed_slice()),
+        &struct_dtype,
+    ))
 }
 
 /// Merge an existing serialized [`FileStatistics`] blob with new per-column
@@ -770,8 +808,9 @@ pub(crate) fn merge_serialized_stats(
         .map(|((existing, new), dtype)| existing.merge_unordered(new, dtype))
         .collect();
 
-    let file_stats = build_file_statistics(merged, schema);
-    match serialize_file_statistics(&file_stats) {
+    match build_file_statistics(merged, schema)
+        .and_then(|file_stats| serialize_file_statistics(&file_stats))
+    {
         Ok(bytes) => Some(bytes),
         Err(e) => {
             tracing::warn!("merge_serialized_stats: failed to serialize merged stats: {e}");
@@ -876,8 +915,9 @@ mod tests {
 
     /// A blob written before byte sizes were persisted has none, and a total
     /// summed from only the columns that happen to carry one would be wrong
-    /// rather than missing. `Absent` is also the signal
-    /// `collect_scan_file_statistics` re-infers such a blob from the footer on.
+    /// rather than missing. Freshness is decided by
+    /// [`blob_carries_per_column_byte_sizes`] rather than by this total, which a
+    /// widened table's file can never restore.
     #[test]
     fn a_missing_column_byte_size_leaves_the_total_absent() {
         let schema = Arc::new(Schema::new(vec![
@@ -927,6 +967,52 @@ mod tests {
         );
     }
 
+    /// The freshness signal has to separate "written before sizes were persisted"
+    /// from "written after, for a file that does not carry every column of the
+    /// table" — the second is what a widening schema evolution leaves behind, and
+    /// both restore a total of `Absent` (spiceai/spiceai#13829).
+    #[test]
+    fn one_sized_column_is_enough_to_recognise_a_blob_that_carries_sizes() {
+        let sized = ColumnStatistics {
+            null_count: DfPrecision::Exact(0),
+            min_value: DfPrecision::Absent,
+            max_value: DfPrecision::Absent,
+            sum_value: DfPrecision::Absent,
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Exact(32),
+        };
+        let unsized_column = ColumnStatistics {
+            byte_size: DfPrecision::Absent,
+            ..sized.clone()
+        };
+        let statistics = |columns: Vec<ColumnStatistics>| Statistics {
+            num_rows: DfPrecision::Exact(4),
+            total_byte_size: DfPrecision::Absent,
+            column_statistics: columns,
+        };
+
+        assert!(
+            !blob_carries_per_column_byte_sizes(&statistics(vec![
+                unsized_column.clone(),
+                unsized_column.clone()
+            ])),
+            "a blob with no size on any column predates them and must be re-inferred"
+        );
+        assert!(
+            blob_carries_per_column_byte_sizes(&statistics(vec![sized.clone(), unsized_column])),
+            "a file missing one of the table's columns still carries sizes for the rest, \
+             and its blob must be served rather than re-read on every scan"
+        );
+        assert!(
+            blob_carries_per_column_byte_sizes(&statistics(vec![sized.clone(), sized])),
+            "a blob with every column sized carries sizes"
+        );
+        assert!(
+            !blob_carries_per_column_byte_sizes(&statistics(vec![])),
+            "a blob with no columns carries no sizes"
+        );
+    }
+
     #[test]
     fn utf8_min_max_roundtrip_through_file_statistics() {
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
@@ -955,7 +1041,8 @@ mod tests {
             "max present in StatsSet"
         );
 
-        let file_stats = build_file_statistics(vec![set], &schema);
+        let file_stats =
+            build_file_statistics(vec![set], &schema).expect("statistics types convert");
         let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
         let rt = deserialize_file_statistics(&bytes, &schema).expect("deserialize ok");
 
@@ -993,12 +1080,14 @@ mod tests {
         };
         let first_set = column_stats_to_stats_set(&first_stats);
         let second_set = column_stats_to_stats_set(&second_stats);
-        let first_file_stats = build_file_statistics(vec![first_set], &schema);
+        let first_file_stats =
+            build_file_statistics(vec![first_set], &schema).expect("statistics types convert");
         let first_blob = serialize_file_statistics(&first_file_stats).expect("serialize ok");
-        let dtypes = vec![DType::from_arrow((
-            schema.field(0).data_type(),
-            Nullability::Nullable,
-        ))];
+        let dtypes = vec![
+            ARROW_SESSION
+                .from_arrow_datatype(schema.field(0).data_type(), Nullability::Nullable)
+                .expect("supported type"),
+        ];
 
         let merged_blob = merge_serialized_stats(&first_blob, &[second_set], &dtypes, &schema)
             .expect("statistics should merge");
@@ -1338,7 +1427,8 @@ mod tests {
             "sum present in StatsSet"
         );
 
-        let file_stats = build_file_statistics(vec![set], &schema);
+        let file_stats =
+            build_file_statistics(vec![set], &schema).expect("statistics types convert");
         let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
         let rt = deserialize_file_statistics(&bytes, &schema).expect("deserialize ok");
 
@@ -1363,13 +1453,15 @@ mod tests {
         };
         let first_set = column_stats_to_stats_set(&mk_sum(60));
         let second_set = column_stats_to_stats_set(&mk_sum(30));
-        let first_blob =
-            serialize_file_statistics(&build_file_statistics(vec![first_set], &schema))
-                .expect("serialize ok");
-        let dtypes = vec![DType::from_arrow((
-            schema.field(0).data_type(),
-            Nullability::Nullable,
-        ))];
+        let first_blob = serialize_file_statistics(
+            &build_file_statistics(vec![first_set], &schema).expect("statistics types convert"),
+        )
+        .expect("serialize ok");
+        let dtypes = vec![
+            ARROW_SESSION
+                .from_arrow_datatype(schema.field(0).data_type(), Nullability::Nullable)
+                .expect("supported type"),
+        ];
 
         let merged_blob = merge_serialized_stats(&first_blob, &[second_set], &dtypes, &schema)
             .expect("statistics should merge");

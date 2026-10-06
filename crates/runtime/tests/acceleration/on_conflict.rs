@@ -41,8 +41,8 @@ async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port: usize = 20963;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
             let db_conn = pool

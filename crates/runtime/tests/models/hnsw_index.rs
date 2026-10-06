@@ -26,7 +26,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use app::AppBuilder;
 use arrow::array::{RecordBatch, StringArray};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;

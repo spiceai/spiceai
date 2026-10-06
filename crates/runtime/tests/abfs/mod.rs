@@ -54,11 +54,11 @@ const AZURITE_ACCOUNT_KEY: &str =
 const AZURITE_CONTAINER: &str = "testcontainer";
 
 #[instrument]
-pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static>, anyhow::Error> {
+pub async fn start_azurite_docker_container() -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new("spice_test_azurite")
         .image("mcr.microsoft.com/azure-storage/azurite:latest".to_string())
-        .add_port_binding(10001, 10001)
-        .add_port_binding(10000, 10000)
+        .publish_port(10001)
+        .publish_port(10000)
         .healthcheck(HealthConfig {
             test: Some(vec![
                 "CMD-SHELL".to_string(),
@@ -74,16 +74,22 @@ pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static
         .run(Some(AZURITE_CONTAINER_START_TIMEOUT))
         .await?;
 
-    wait_for_tcp_port("127.0.0.1", 10000, AZURITE_HOST_PORT_READY_TIMEOUT).await?;
+    wait_for_tcp_port(
+        "127.0.0.1",
+        running_container.host_port(10000)?,
+        AZURITE_HOST_PORT_READY_TIMEOUT,
+    )
+    .await?;
     Ok(running_container)
 }
 
-pub async fn upload_sample_file() -> Result<(), anyhow::Error> {
-    create_azurite_container().await?;
+pub async fn upload_sample_file(port: u16) -> Result<(), anyhow::Error> {
+    create_azurite_container(port).await?;
     tracing::trace!("Storage container created");
     tracing::trace!("Uploading sample file");
     let sample_file = include_str!("../test_data/taxi_sample.csv");
     put_azurite_blob(
+        port,
         "taxi_sample.csv",
         Bytes::copy_from_slice(sample_file.as_bytes()),
     )
@@ -92,10 +98,10 @@ pub async fn upload_sample_file() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-async fn create_azurite_container() -> Result<(), anyhow::Error> {
+async fn create_azurite_container(port: u16) -> Result<(), anyhow::Error> {
     let credential = AzureCredential::AccessKey(AzureAccessKey::try_new(AZURITE_ACCOUNT_KEY)?);
     let mut request = http::Request::put(format!(
-        "http://127.0.0.1:10000/{AZURITE_ACCOUNT}/{AZURITE_CONTAINER}?restype=container"
+        "http://127.0.0.1:{port}/{AZURITE_ACCOUNT}/{AZURITE_CONTAINER}?restype=container"
     ))
     .body(HttpRequestBody::empty())?;
     AzureAuthorizer::new(&credential, AZURITE_ACCOUNT).authorize(&mut request);
@@ -112,10 +118,13 @@ async fn create_azurite_container() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-async fn put_azurite_blob(path: &str, contents: Bytes) -> Result<(), anyhow::Error> {
+async fn put_azurite_blob(port: u16, path: &str, contents: Bytes) -> Result<(), anyhow::Error> {
     let store = MicrosoftAzureBuilder::new()
         .with_container_name(AZURITE_CONTAINER)
-        .with_use_emulator(true)
+        .with_account(AZURITE_ACCOUNT)
+        .with_access_key(AZURITE_ACCOUNT_KEY)
+        .with_endpoint(format!("http://127.0.0.1:{port}/{AZURITE_ACCOUNT}"))
+        .with_allow_http(true)
         .build()?;
     store
         .put(&Path::from(path), PutPayload::from(contents))
@@ -123,11 +132,11 @@ async fn put_azurite_blob(path: &str, contents: Bytes) -> Result<(), anyhow::Err
     Ok(())
 }
 
-pub async fn prepare_container() -> Result<RunningContainer<'static>, anyhow::Error> {
+pub async fn prepare_container() -> Result<RunningContainer, anyhow::Error> {
     let azurite_container = start_azurite_docker_container().await?;
     tracing::info!("Azurite container started");
     tracing::info!("Uploading sample file to Azure Blob Storage");
-    match upload_sample_file().await {
+    match upload_sample_file(azurite_container.host_port(10000)?).await {
         Ok(()) => Ok(azurite_container),
         Err(e) => {
             azurite_container.stop().await?;
@@ -143,7 +152,9 @@ async fn test_spice_with_abfs() -> Result<(), anyhow::Error> {
     tracing::info!("Starting AzureBlobFS connector test");
     let azurite_container = prepare_container().await?;
 
-    let res = test_request_context().scope(run_queries()).await;
+    let res = test_request_context()
+        .scope(run_queries(azurite_container.host_port(10000)?))
+        .await;
     tracing::info!("Test completed");
     azurite_container.stop().await?;
     azurite_container.remove().await?;
@@ -154,13 +165,21 @@ fn make_test_query(table_name: &str) -> String {
     format!("SELECT DISTINCT(\"VendorID\") FROM {table_name} ORDER BY \"VendorID\" DESC")
 }
 
-async fn run_queries() -> Result<(), anyhow::Error> {
+fn azurite_params(port: u16) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        ("abfs_account".into(), AZURITE_ACCOUNT.into()),
+        ("abfs_access_key".into(), AZURITE_ACCOUNT_KEY.into()),
+        (
+            "abfs_endpoint".into(),
+            format!("http://127.0.0.1:{port}/{AZURITE_ACCOUNT}"),
+        ),
+        ("allow_http".into(), "true".into()),
+    ])
+}
+
+async fn run_queries(port: u16) -> Result<(), anyhow::Error> {
     let mut emulator_dataset = Dataset::new("abfs://testcontainer/taxi_sample.csv", "emulator");
-    let emulator_params = DatasetParams::from_string_map(
-        vec![("abfs_use_emulator".to_string(), "true".to_string())]
-            .into_iter()
-            .collect(),
-    );
+    let emulator_params = DatasetParams::from_string_map(azurite_params(port));
     emulator_dataset.params = Some(emulator_params);
 
     let mut abfs_dataset = Dataset::new(
@@ -260,7 +279,9 @@ async fn test_azure_parquet_reading_with_object_meta() -> Result<(), anyhow::Err
     let azurite_container = prepare_container().await?;
 
     let res = test_request_context()
-        .scope(run_parquet_query_with_meta())
+        .scope(run_parquet_query_with_meta(
+            azurite_container.host_port(10000)?,
+        ))
         .await;
     tracing::info!("Test completed");
     azurite_container.stop().await?;
@@ -268,7 +289,7 @@ async fn test_azure_parquet_reading_with_object_meta() -> Result<(), anyhow::Err
     res.map_err(|e| anyhow::anyhow!(e))
 }
 
-async fn upload_parquet_file() -> Result<(), anyhow::Error> {
+async fn upload_parquet_file(port: u16) -> Result<(), anyhow::Error> {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::parquet::arrow::ArrowWriter;
@@ -286,26 +307,21 @@ async fn upload_parquet_file() -> Result<(), anyhow::Error> {
         writer.close()?;
     }
 
-    put_azurite_blob("test_data.parquet", Bytes::from(buffer)).await?;
+    put_azurite_blob(port, "test_data.parquet", Bytes::from(buffer)).await?;
 
     tracing::trace!("Parquet file uploaded to Azure");
     Ok(())
 }
 
-async fn run_parquet_query_with_meta() -> Result<(), anyhow::Error> {
+async fn run_parquet_query_with_meta(port: u16) -> Result<(), anyhow::Error> {
     // First upload a parquet file
-    upload_parquet_file().await?;
+    upload_parquet_file(port).await?;
 
     let mut emulator_dataset =
         Dataset::new("abfs://testcontainer/test_data.parquet", "azure_parquet");
-    let emulator_params = DatasetParams::from_string_map(
-        vec![
-            ("abfs_use_emulator".to_string(), "true".to_string()),
-            ("file_format".to_string(), "parquet".to_string()),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    let mut params = azurite_params(port);
+    params.insert("file_format".into(), "parquet".into());
+    let emulator_params = DatasetParams::from_string_map(params);
     emulator_dataset.params = Some(emulator_params);
 
     let app = AppBuilder::new("azure_parquet_test")

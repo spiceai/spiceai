@@ -320,6 +320,17 @@ impl ExecutionPlan for IcebergDeleteExec {
         &self.plan_properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -719,7 +730,7 @@ impl IcebergDeletionProvider {
             let physical_filter = datafusion::physical_expr::create_physical_expr(
                 &combined_filter,
                 &df_schema,
-                state.execution_props(),
+                state.execution_props(), &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
             )?;
             Arc::new(datafusion::physical_plan::filter::FilterExec::try_new(
                 physical_filter,

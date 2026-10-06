@@ -26,7 +26,7 @@ use axum::{
     http::{header, status},
     response::{IntoResponse, Response},
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use iceberg::spec::TableMetadata;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::Serialize;

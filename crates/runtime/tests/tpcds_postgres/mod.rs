@@ -100,9 +100,7 @@ use crate::docker::RunningContainer;
 use crate::utils::runtime_ready_check_with_timeout;
 use crate::{
     configure_test_datafusion, init_tracing,
-    postgres::common::{
-        PG_PASSWORD, get_pg_params, get_random_port, start_postgres_docker_container,
-    },
+    postgres::common::{PG_PASSWORD, get_pg_params, start_postgres_docker_container},
     utils::test_request_context,
 };
 
@@ -114,7 +112,7 @@ mod q86;
 /// Initialized once and reused across all TPC-DS query tests.
 struct SharedTestEnv {
     rt: Arc<Runtime>,
-    running_container: RunningContainer<'static>,
+    running_container: RunningContainer,
 }
 
 /// Global shared test environment, initialized lazily on first use.
@@ -125,8 +123,8 @@ static SHARED_ENV: OnceCell<SharedTestEnv> = OnceCell::const_new();
 async fn init_shared_env() -> Result<SharedTestEnv, anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let port = get_random_port()?;
-    let running_container = start_postgres_docker_container(port).await?;
+    let running_container = start_postgres_docker_container().await?;
+    let port = usize::from(running_container.host_port(5432)?);
 
     let pg_db = "tpcds_test";
 

@@ -277,9 +277,9 @@ fn create_partition_physical_exprs(
             Expr::Column(c) => create_physical_expr(
                 &Expr::Column(Column::new_unqualified(c.name.clone())),
                 &input_dfschema,
-                &execution_props,
+                &execution_props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
             ),
-            other => create_physical_expr(other, &input_dfschema, &execution_props),
+            other => create_physical_expr(other, &input_dfschema, &execution_props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default()),
         })
         .collect()
 }

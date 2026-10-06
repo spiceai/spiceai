@@ -229,7 +229,10 @@ message TaskCancelInfo {
     uint32 task_id = 1;
     string job_id = 2;
     uint32 stage_id = 3;
-    uint32 partition_id = 4;
+    // Was partition_id. A task can cover several partitions, so it is
+    // identified by (job_id, stage_id, task_id) alone.
+    reserved 4;
+    reserved "partition_id";
 }
 
 // Command sent from scheduler to executor to refresh a specific dataset.

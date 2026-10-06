@@ -20,14 +20,20 @@
 //! Requires `--features result-correctness-chdb` (not `chdb-bench`). Does **not**
 //! link DuckDB (engines cannot co-exist in one process).
 //!
-//! Runs: micro SQL shapes + SQLLancer corpus. Multi-table analytical suites are
-//! inventory-excluded for chDB with dialect reasons — see `support::inventory`
-//! and `tests/correctness/README.md`.
+//! Runs: TPC-H and TPC-DS at SF1, ClickBench on the reduced `hits` table,
+//! CH-benCHmark after each load mode, SQLLancer corpus and micro SQL shapes. The
+//! benchmark suites go through `support::oracle_lane`, which rewrites each query
+//! for ClickHouse with `support::dialect`; what ClickHouse cannot express is
+//! excluded in `support::inventory`. See `tests/correctness/README.md`.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::too_many_lines)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::format_push_string)]
+#![allow(clippy::map_unwrap_or)]
 
 #[path = "correctness/support/mod.rs"]
 mod support;
@@ -39,12 +45,11 @@ use arrow::array::RecordBatch;
 use chdb_rust::arg::Arg;
 use chdb_rust::format::OutputFormat;
 use chdb_rust::session::SessionBuilder;
-use support::inventory::build_inventory;
+use support::inventory::{build_inventory, fixture};
 use support::report::{RunResult, summary_line, write_coverage_report};
 use support::{
-    CayenneHarness, ParityOutcome, assert_all_pass_or_excluded, compare_actual_results,
-    compare_actual_results_detailed, execute_cayenne, keep_unverified_order, make_dim_batch,
-    make_fact_batch, micro_bench_queries, write_parquet,
+    CayenneHarness, ParityOutcome, compare_actual_results_detailed, execute_cayenne,
+    keep_unverified_order, make_dim_batch, make_fact_batch, micro_bench_queries, write_parquet,
 };
 use test_framework::queries::Query;
 use test_framework::queries::validation::QueryValidationFailReason;
@@ -142,12 +147,82 @@ fn chdb_sql(sql: &str) -> String {
     sql.to_string()
 }
 
-/// chDB is process-global — only one session at a time. Keep micro + SQLLancer
-/// sequential inside this single test so they never co-construct fixtures.
+/// chDB keeps process-wide state, so only one session may exist at a time. Every
+/// test in this binary holds this lock for as long as its sessions live; the test
+/// harness otherwise runs them on parallel threads of one process.
+static CHDB_SESSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Micro + SQLLancer stay sequential inside this single test so they never
+/// co-construct fixtures.
 #[tokio::test(flavor = "multi_thread")]
 async fn micro_and_sqllancer_parity_vs_chdb() {
+    let _session = CHDB_SESSION.lock().await;
     micro_bench_shapes_full_result_parity_vs_chdb_inner().await;
     sqllancer_corpus_parity_vs_chdb_inner().await;
+}
+
+/// TPC-H against chDB, from the fixture the DuckDB and SQLite lanes compare too.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_full_result_parity_vs_chdb() {
+    use support::chdb_engine::ChdbOracle;
+    use support::oracle_lane::run_fixture_suite;
+    use support::{LoadMode, TPCH_TABLES};
+    use test_framework::queries::get_tpch_test_queries;
+
+    let _session = CHDB_SESSION.lock().await;
+    let sf = support::env_f64("CAYENNE_PARITY_TPCH_SF", 1.0);
+    let parquet_dir = support::scratch_dir().join(format!("tpch_sf{sf}"));
+    support::tpch_data::ensure_tpch_fixture(&parquet_dir, sf);
+
+    let chdb = ChdbOracle::new();
+    chdb.load_parquet_dir(&parquet_dir, TPCH_TABLES);
+    let results = run_fixture_suite(
+        &chdb,
+        &parquet_dir,
+        TPCH_TABLES,
+        "tpch",
+        &get_tpch_test_queries(None),
+        &[LoadMode::Full],
+        Clone::clone,
+    )
+    .await;
+    support::report::finish_lane(
+        &results,
+        &[],
+        "cayenne_chdb_tpch_parity.log",
+        &format!("TPC-H SF={sf} Cayenne vs chDB"),
+    );
+}
+
+/// ClickBench against chDB, on the same reduced `hits` fixture the DuckDB and
+/// SQLite lanes build (or `CLICKBENCH_HITS_PARQUET`).
+#[tokio::test(flavor = "multi_thread")]
+async fn clickbench_full_result_parity_vs_chdb() {
+    use support::LoadMode;
+    use support::chdb_engine::ChdbOracle;
+    use support::oracle_lane::run_fixture_suite;
+    use test_framework::queries::get_clickbench_test_queries;
+
+    let _session = CHDB_SESSION.lock().await;
+    let hits_dir = support::clickbench_data::hits_fixture_dir();
+    let chdb = ChdbOracle::new();
+    chdb.load_parquet_dir(hits_dir.path(), &["hits"]);
+    let results = run_fixture_suite(
+        &chdb,
+        hits_dir.path(),
+        &["hits"],
+        "clickbench",
+        &get_clickbench_test_queries(None),
+        &[LoadMode::Full],
+        Clone::clone,
+    )
+    .await;
+    support::report::finish_lane(
+        &results,
+        &[("clickbench", fixture::clickbench_hits())],
+        "cayenne_chdb_clickbench_parity.log",
+        "ClickBench Cayenne vs chDB",
+    );
 }
 
 async fn micro_bench_shapes_full_result_parity_vs_chdb_inner() {
@@ -256,7 +331,7 @@ async fn micro_bench_shapes_full_result_parity_vs_chdb_inner() {
         .filter(|r| r.suite == "micro")
         .cloned()
         .collect();
-    let micro_fails = support::report::unexplained(&micro, &build_inventory());
+    let micro_fails = support::report::unexplained(&micro, &build_inventory(), &[]);
     assert!(
         micro_fails.is_empty(),
         "chDB micro-bench full-result parity failures: {micro_fails:#?}\nsee {}",
@@ -475,10 +550,82 @@ async fn sqllancer_corpus_parity_vs_chdb_inner() {
         .filter(|r| r.suite == "sqllancer")
         .cloned()
         .collect();
-    let sl_fails = support::report::unexplained(&sqllancer, &build_inventory());
+    let sl_fails = support::report::unexplained(&sqllancer, &build_inventory(), &[]);
     assert!(
         sl_fails.is_empty(),
         "SQLLancer Cayenne↔chDB failures: {sl_fails:#?}\nsee {}",
         log_path.display()
+    );
+}
+
+/// TPC-DS against chDB, on the `tpcdsgen` fixture the SQLite lane loads too.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpcds_full_result_parity_vs_chdb() {
+    use support::chdb_engine::ChdbOracle;
+    use support::oracle_lane::run_fixture_suite;
+    use support::tpcds_data::{TPCDS_TABLES, ensure_tpcds_fixture};
+    use test_framework::queries::get_tpcds_test_queries;
+
+    let _session = CHDB_SESSION.lock().await;
+    let sf = support::env_f64("CAYENNE_PARITY_TPCDS_SF", 1.0);
+    let dir = support::scratch_dir().join(format!("tpcds_tpcdsgen_sf{sf}"));
+    ensure_tpcds_fixture(&dir, sf);
+    let chdb = ChdbOracle::new();
+    chdb.load_parquet_dir(&dir, TPCDS_TABLES);
+    let results = run_fixture_suite(
+        &chdb,
+        &dir,
+        TPCDS_TABLES,
+        "tpcds",
+        &get_tpcds_test_queries(None, Some(1.0)),
+        &[support::LoadMode::Full],
+        Clone::clone,
+    )
+    .await;
+    support::report::finish_lane(
+        &results,
+        &[("tpcds", &fixture::tpcds_tpcdsgen(sf))],
+        "cayenne_chdb_tpcds_parity.log",
+        &format!("TPC-DS SF={sf} Cayenne vs chDB"),
+    );
+}
+
+/// CH-benCHmark against chDB, after each of the three ways Cayenne loads data.
+#[tokio::test(flavor = "multi_thread")]
+async fn chbench_load_mode_matrix_vs_chdb() {
+    use support::chbench_data::{
+        CHBENCH_TABLES, chbench_sql_for_datafusion, ensure_chbench_fixture,
+    };
+    use support::chdb_engine::ChdbOracle;
+    use support::oracle_lane::run_fixture_suite;
+    use test_framework::queries::get_chbench_test_queries;
+
+    let _session = CHDB_SESSION.lock().await;
+    let warehouses = support::env_f64("CAYENNE_PARITY_CHBENCH_SF", 1.0) as i64;
+    let dir = support::scratch_dir().join(format!("chbench_sf{warehouses}"));
+    ensure_chbench_fixture(&dir, warehouses);
+    let chdb = ChdbOracle::new();
+    chdb.load_parquet_dir(&dir, CHBENCH_TABLES);
+    let results = run_fixture_suite(
+        &chdb,
+        &dir,
+        CHBENCH_TABLES,
+        "chbench",
+        &get_chbench_test_queries(None),
+        support::LoadMode::all(),
+        |q| {
+            Query::new(
+                Arc::clone(&q.name),
+                chbench_sql_for_datafusion(&q.sql).into(),
+                false,
+            )
+        },
+    )
+    .await;
+    support::report::finish_lane(
+        &results,
+        &[],
+        "cayenne_chdb_chbench_parity.log",
+        &format!("CH-benCHmark SF={warehouses} full|append|changes Cayenne vs chDB"),
     );
 }

@@ -20,7 +20,7 @@ use std::time::Duration;
 use crate::datafusion::error::format_datafusion_error;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
@@ -45,7 +45,11 @@ pub enum Error {
         "Failed to register the internal metrics table: {}",
         format_datafusion_error(source)
     ))]
-    UnableToRegisterToMetricsTable { source: DataFusionError },
+    UnableToRegisterToMetricsTable {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(DataFusionError, Box::new)))]
+        source: Box<DataFusionError>,
+    },
 }
 
 /// Uses a `Weak` reference to `DataFusion` to prevent blocking its cleanup after runtime termination.

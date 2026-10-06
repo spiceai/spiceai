@@ -134,13 +134,11 @@ pub struct AsyncMarker {
 }
 
 impl AsyncMarker {
-    // This can only be called in async contexts due to .await
-    #[must_use]
-    #[expect(clippy::unused_async)]
-    pub async fn new() -> Self {
-        AsyncMarker {
+    /// Callers `.await` this, so it does not compile from synchronous code.
+    pub fn new() -> impl Future<Output = Self> + Send {
+        std::future::ready(AsyncMarker {
             marker: PhantomData,
-        }
+        })
     }
 }
 

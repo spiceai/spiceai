@@ -45,12 +45,12 @@ use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_planner::ExtensionPlanner;
 use datafusion::{
+    common::TableReference,
     dataframe::DataFrame,
     datasource::TableProvider,
     error::DataFusionError,
     logical_expr::{Expr, Operator, col},
     physical_plan::stream::RecordBatchStreamAdapter,
-    sql::TableReference,
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
@@ -1725,6 +1725,9 @@ impl RefreshTask {
                 cpu_runtime_handle,
                 request_context,
                 span,
+                // The scan computes the dataset's indexes as it reads, so it must not start
+                // before the sink has opened their write window (#14619).
+                managed_runtime::StreamStart::OnFirstPoll,
                 async move {
                     // Create ctx inside the managed runtime to avoid creating it twice
                     let mut ctx = Self::create_refresh_df_context(

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::{
     LogErrors, Runtime,
     accelerated::refresh::RefreshOverrides,
-    component::dataset::Dataset,
+    component::dataset::{Dataset, snapshot_source},
     datafusion::{
         DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
         request_context_extension::get_current_datafusion,
@@ -33,7 +33,7 @@ use axum::{
     http::status,
     response::{IntoResponse, Response},
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -337,17 +337,28 @@ pub(crate) async fn refresh(
     let requested_ref = TableReference::parse_str(&dataset_name)
         .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
 
-    // Search both datasets and accelerated views for the given name.
-    let (name, acceleration) = if let Some(dataset) = readable_app.datasets.iter().find(|d| {
-        TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-            == requested_ref
-    }) {
-        (dataset.name.as_str(), &dataset.acceleration)
+    // Search both datasets and accelerated views for the given name. A dataset that reads
+    // snapshots (`file_format: snapshot`) is accelerated whether or not it writes an
+    // `acceleration` block, and a refresh checks for a newer snapshot.
+    let (name, acceleration, reads_snapshots) = if let Some(dataset) =
+        readable_app.datasets.iter().find(|d| {
+            TableReference::parse_str(&d.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                == requested_ref
+        }) {
+        let reads_snapshots = dataset
+            .params
+            .as_ref()
+            .is_some_and(|params| snapshot_source::is_snapshot_format(&params.as_string_map()));
+        (
+            dataset.name.as_str(),
+            &dataset.acceleration,
+            reads_snapshots,
+        )
     } else if let Some(view) = readable_app.views.iter().find(|v| {
         TableReference::parse_str(&v.name).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
             == requested_ref
     }) {
-        (view.name.as_str(), &view.acceleration)
+        (view.name.as_str(), &view.acceleration, false)
     } else {
         return (
             status::StatusCode::NOT_FOUND,
@@ -358,7 +369,7 @@ pub(crate) async fn refresh(
             .into_response();
     };
 
-    let acceleration_enabled = acceleration.as_ref().is_some_and(|f| f.enabled);
+    let acceleration_enabled = reads_snapshots || acceleration.as_ref().is_some_and(|f| f.enabled);
 
     if !acceleration_enabled {
         return (

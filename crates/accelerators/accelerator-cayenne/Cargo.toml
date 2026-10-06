@@ -37,6 +37,7 @@ runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-table-partition = { path = "../../runtime-table-partition" }
 async-trait.workspace = true
+parking_lot.workspace = true
 datafusion.workspace = true
 linkme.workspace = true
 paste.workspace = true
