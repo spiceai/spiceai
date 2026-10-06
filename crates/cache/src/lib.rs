@@ -114,6 +114,11 @@ pub enum Error {
         "Invalid hashing algorithm. Please refer to the documentation for supported algorithms: https://spiceai.org/docs/features/caching#choosing-a-hashing_algorithm"
     ))]
     InvalidHashingAlgorithm,
+
+    #[snafu(display(
+        "The query result ({size} bytes) is larger than the SQL results cache max_size ({max_size} bytes), so it was not cached"
+    ))]
+    ResultLargerThanMaxSize { size: u64, max_size: u64 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1129,7 +1134,8 @@ impl QueryResultsCacheProvider {
     ///
     /// # Errors
     ///
-    /// Will return `Err` if method fails to access the cache
+    /// Will return `Err` if method fails to access the cache, or
+    /// [`Error::ResultLargerThanMaxSize`] when `result` is heavier than `max_size`.
     pub async fn store_raw_key(
         &self,
         raw_key: &RawCacheKey,
@@ -1151,14 +1157,15 @@ impl QueryResultsCacheProvider {
             EntryValidity::Valid | EntryValidity::StaleWhileRevalidate => {
                 let weight = weight.unwrap_or_else(|| result.get_memory_size());
                 // The cache refuses a result heavier than `max_size` before it consults
-                // the resident, so that refusal is not storage: the key may stay empty.
+                // the resident. That refusal is neither storage nor invalidation, and the
+                // key may stay empty, so it is an error the caller can tell apart.
                 let weight_bytes = u64::try_from(weight).unwrap_or(u64::MAX);
                 if weight_bytes > self.cache_max_size {
-                    tracing::debug!(
-                        "The query result ({weight_bytes} bytes) is larger than the SQL results cache max_size ({} bytes), skipping cache storage",
-                        self.cache_max_size
-                    );
-                    return Ok(false);
+                    return ResultLargerThanMaxSizeSnafu {
+                        size: weight_bytes,
+                        max_size: self.cache_max_size,
+                    }
+                    .fail();
                 }
                 let stored = self
                     .put_raw_key_unless_older_read(raw_key, result, weight)
@@ -3290,26 +3297,31 @@ mod tests {
         }
     }
 
-    /// A result heavier than `max_size` is refused before any resident is consulted,
-    /// so it is reported as not stored, and the key stays empty.
+    /// A result heavier than `max_size` is refused before any resident is consulted.
+    /// That is reported as its own error, not as storage or invalidation, and the key
+    /// stays empty.
     #[tokio::test]
-    async fn store_raw_key_reports_a_result_heavier_than_the_cache_as_not_stored() {
+    async fn store_raw_key_reports_a_result_heavier_than_the_cache_as_an_error() {
         let provider =
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid provider");
         let key = RawCacheKey::new(1);
-        let too_heavy = usize::try_from(provider.max_size()).expect("max_size fits usize") + 1;
+        let max_size = provider.max_size();
+        let too_heavy = usize::try_from(max_size).expect("max_size fits usize") + 1;
 
-        assert!(
-            !provider
-                .store_raw_key(
-                    &key,
-                    cached_result_for("customer", Instant::now()).await,
-                    Some(too_heavy)
-                )
-                .await
-                .expect("cache access should succeed"),
-            "a result heavier than max_size is not stored"
+        let err = provider
+            .store_raw_key(
+                &key,
+                cached_result_for("customer", Instant::now()).await,
+                Some(too_heavy),
+            )
+            .await
+            .expect_err("a result heavier than max_size is not stored");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "The query result ({too_heavy} bytes) is larger than the SQL results cache max_size ({max_size} bytes), so it was not cached"
+            )
         );
         assert!(
             provider
