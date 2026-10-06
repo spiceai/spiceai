@@ -26,7 +26,7 @@ use std::{num::NonZeroU32, path::Path, sync::Arc, time::Duration};
 
 use app::{App, AppBuilder};
 use data_connector_api::ConnectorComponent;
-use data_http_rate_control::{HttpRateControlConfig, RateControlMode};
+use data_http_rate_control::{AdaptiveRateControl, HttpRateControlConfig};
 use runtime::{
     Runtime,
     component::dataset::{Dataset, builder::DatasetBuilder},
@@ -67,7 +67,7 @@ fn rps_config(rps: u32) -> HttpRateControlConfig {
         requests_per_minute: None,
         jitter_min: Duration::ZERO,
         jitter_max: Duration::ZERO,
-        mode: RateControlMode::Static,
+        adaptive: AdaptiveRateControl::default(),
     }
 }
 
@@ -168,7 +168,7 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
     );
 }
 
-/// Configuration validation for adaptive HTTP rate control.
+/// Shared-origin rules for adaptive HTTP rate control.
 ///
 /// These tests live here rather than in `data-http-rate-control` because they
 /// need a `ConnectorComponent`, which requires `runtime-component`; that crate
@@ -180,8 +180,7 @@ mod adaptive_config_validation {
 
     use data_connector_api::{ConnectorComponent, DataConnectorError};
     use data_http_rate_control::{
-        AdaptiveRateControl, HttpRateControlConfig, HttpRateControlRegistry, RateControlMode,
-        ensure_adaptive_has_static_limit,
+        AdaptiveRateControl, HttpRateControlConfig, HttpRateControlRegistry,
     };
     use object_store::memory::InMemory;
     use runtime_component::dataset::DatasetSpec;
@@ -192,16 +191,14 @@ mod adaptive_config_validation {
     fn test_component() -> ConnectorComponent {
         ConnectorComponent::Dataset(Arc::new(DatasetSpec::new(
             TEST_ORIGIN,
-            "rate_control_mode_test".into(),
+            "rate_control_test".into(),
         )))
     }
 
-    fn adaptive_control() -> AdaptiveRateControl {
-        AdaptiveRateControl::new(0.5, Duration::from_secs(10))
-            .expect("test control should be valid")
-    }
-
-    fn config(mode: RateControlMode, requests_per_second: Option<u32>) -> HttpRateControlConfig {
+    fn config(
+        adaptive: AdaptiveRateControl,
+        requests_per_second: Option<u32>,
+    ) -> HttpRateControlConfig {
         HttpRateControlConfig {
             max_concurrent_requests: None,
             requests_per_second: requests_per_second
@@ -209,70 +206,34 @@ mod adaptive_config_validation {
             requests_per_minute: None,
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
-            mode,
+            adaptive,
         }
     }
 
-    #[test]
-    fn adaptive_mode_without_a_static_limit_is_a_config_error() {
-        let component = test_component();
-        let error = ensure_adaptive_has_static_limit(
-            &config(RateControlMode::Adaptive(adaptive_control()), None),
-            &component,
-            "https",
-        )
-        .expect_err("adaptive mode with no static rate limit must be rejected");
-
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("`rate_control_mode: adaptive`"),
-                    "message must name the parameter: {message}"
-                );
-                assert!(
-                    message.contains("requests_per_second_limit")
-                        && message.contains("max_concurrent_requests"),
-                    "message must name the fix: {message}"
-                );
-                assert!(
-                    message.contains("`rate_control_mode: static`"),
-                    "message must offer static mode: {message}"
-                );
-                assert!(
-                    message.contains("spiceai.org/docs"),
-                    "message must include a docs link: {message}"
-                );
-            }
-            other => panic!("expected an invalid-configuration error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn adaptive_mode_with_a_static_limit_is_accepted() {
-        let component = test_component();
-        ensure_adaptive_has_static_limit(
-            &config(RateControlMode::Adaptive(adaptive_control()), Some(10)),
-            &component,
-            "https",
-        )
-        .expect("adaptive mode with a static limit is a valid configuration");
-    }
-
-    #[test]
-    fn static_mode_needs_no_static_limit() {
-        ensure_adaptive_has_static_limit(
-            &config(RateControlMode::Static, None),
-            &test_component(),
-            "https",
-        )
-        .expect("static mode requires no static limit");
-    }
-
-    /// Cluster rate control charges whole-number weights, so adaptive mode would
-    /// be a partial no-op. It is a configuration error until a weighted cluster
-    /// acquire lands.
+    /// With no rate limit there is nothing for adaptive control to scale, so the
+    /// configuration is accepted and no controller is built.
     #[tokio::test]
-    async fn adaptive_mode_with_cluster_rate_control_is_a_config_error() {
+    async fn no_rate_limit_is_accepted_and_builds_no_controller() {
+        let registry = Arc::new(HttpRateControlRegistry::default());
+        let origin = Url::parse(TEST_ORIGIN).expect("test URL should parse");
+
+        let shared = registry
+            .shared_rate_controller_for_component(
+                &origin,
+                &config(AdaptiveRateControl::default(), None),
+                "spicepod",
+                &test_component(),
+                "https",
+            )
+            .await
+            .expect("no rate limit is a valid configuration");
+        assert!(shared.controller.is_none());
+    }
+
+    /// Cluster rate control accepts every configuration. The leased cluster
+    /// bucket does not adapt yet, so it applies the configured limits unchanged.
+    #[tokio::test]
+    async fn cluster_rate_control_applies_the_configured_limits() {
         let registry = Arc::new(HttpRateControlRegistry::with_persisted_governor_state(
             Arc::new(InMemory::new()),
             "",
@@ -280,55 +241,77 @@ mod adaptive_config_validation {
         ));
         let origin = Url::parse(TEST_ORIGIN).expect("test URL should parse");
 
-        let error = Arc::clone(&registry)
+        let reservation = Arc::clone(&registry)
             .reserve_shared_rate_controller_for_component(
                 &origin,
-                &config(RateControlMode::Adaptive(adaptive_control()), Some(10)),
+                &config(AdaptiveRateControl::default(), Some(10)),
                 "spicepod",
                 &test_component(),
                 "https",
             )
             .await
-            .expect_err("adaptive mode with cluster rate control must be rejected");
+            .expect("cluster rate control accepts the configuration");
+        let controller = reservation
+            .shared()
+            .controller
+            .clone()
+            .expect("a rate-limited origin has a controller");
+        assert_eq!(
+            controller.admission_coefficient(),
+            None,
+            "the leased cluster bucket does not adapt"
+        );
+        reservation.rollback().await;
+    }
+
+    /// Components that share an origin share one controller, so they must agree
+    /// on the adaptive tuning as well as on the limits.
+    #[tokio::test]
+    async fn different_adaptive_tuning_on_one_origin_is_a_config_error() {
+        let registry = Arc::new(HttpRateControlRegistry::default());
+        let origin = Url::parse(TEST_ORIGIN).expect("test URL should parse");
+
+        registry
+            .shared_rate_controller_for_component(
+                &origin,
+                &config(AdaptiveRateControl::default(), Some(10)),
+                "spicepod",
+                &test_component(),
+                "https",
+            )
+            .await
+            .expect("the first component sets the origin's config");
+
+        let other_tuning = AdaptiveRateControl::new(0.5, Duration::from_secs(10))
+            .expect("test control should be valid");
+        let error = registry
+            .shared_rate_controller_for_component(
+                &origin,
+                &config(other_tuning, Some(10)),
+                "spicepod",
+                &test_component(),
+                "https",
+            )
+            .await
+            .expect_err("a different failure threshold on the same origin must be rejected");
 
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("not yet supported with cluster rate control"),
+                    message.contains("different rate-control settings"),
                     "message must name the conflict: {message}"
                 );
                 assert!(
-                    message.contains("runtime.source_rate_control.state_location"),
-                    "message must name the cluster setting: {message}"
+                    message.contains("rate_control_failure_threshold")
+                        && message.contains("rate_control_window"),
+                    "message must name the adaptive parameters: {message}"
                 );
                 assert!(
-                    message.contains("https://origin.example.com"),
-                    "message must name the origin: {message}"
+                    !message.contains("rate_control_mode"),
+                    "message must not name a removed parameter: {message}"
                 );
             }
             other => panic!("expected an invalid-configuration error, got {other:?}"),
         }
-    }
-
-    /// Static mode is unaffected by cluster rate control.
-    #[tokio::test]
-    async fn static_mode_with_cluster_rate_control_is_accepted() {
-        let registry = Arc::new(HttpRateControlRegistry::with_persisted_governor_state(
-            Arc::new(InMemory::new()),
-            "",
-            Duration::from_secs(1),
-        ));
-        let origin = Url::parse(TEST_ORIGIN).expect("test URL should parse");
-
-        Arc::clone(&registry)
-            .reserve_shared_rate_controller_for_component(
-                &origin,
-                &config(RateControlMode::Static, Some(10)),
-                "spicepod",
-                &test_component(),
-                "https",
-            )
-            .await
-            .expect("static mode is supported with cluster rate control");
     }
 }

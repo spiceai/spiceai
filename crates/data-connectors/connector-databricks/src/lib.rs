@@ -856,9 +856,9 @@ async fn reserve_databricks_rate_controller<S: std::hash::BuildHasher>(
         }
     })?;
     // The Databricks clients (Unity Catalog, SQL Warehouse, Spark Connect) do
-    // not yet record per-request outcomes, so only the static limits apply.
-    http_rate_control::log_static_rate_control_once(CONNECTOR_NAME, runtime_rate_control_params);
-    let rate_control = http_rate_control::resolve_static_config_for_component(
+    // not yet record per-request outcomes, so the configured limits apply
+    // unchanged.
+    let rate_control = http_rate_control::resolve_limits_for_component(
         params,
         runtime_rate_control_params,
         component,
@@ -1652,9 +1652,10 @@ mod tests {
         Some(headers_end.saturating_add(content_length))
     }
 
-    /// Databricks does not declare the `rate_control_mode` family, so resolving
-    /// its rate control must not look those parameters up: an undeclared lookup
-    /// panics, which would fail every Databricks dataset at load.
+    /// Databricks does not declare the adaptive tuning parameters
+    /// (`rate_control_failure_threshold`, `rate_control_window`), so resolving
+    /// its rate control must not look them up: an undeclared lookup panics,
+    /// which would fail every Databricks dataset at load.
     #[tokio::test]
     async fn databricks_rate_control_resolves_without_adaptive_parameters() {
         let parameters = Parameters::try_new(
@@ -1683,13 +1684,12 @@ mod tests {
         .expect("a Databricks dataset with no rate-control parameters should resolve");
     }
 
-    /// `runtime.params.http_rate_control_mode` is a runtime-wide default for the
-    /// HTTP connectors that record request outcomes. Databricks does not yet, so
-    /// the default must not stop a Databricks dataset from loading — and there is
-    /// no dataset-level `rate_control_mode` to escape it with, because Databricks
-    /// does not declare that parameter.
+    /// Databricks does not record request outcomes yet, so its adaptive
+    /// controller stays at full admission and the configured limits apply
+    /// unchanged. The runtime-wide adaptive tuning defaults must not stop a
+    /// Databricks dataset from loading.
     #[tokio::test]
-    async fn runtime_adaptive_default_does_not_block_databricks_dataset() {
+    async fn databricks_rate_control_applies_the_configured_limits() {
         let parameters = Parameters::try_new(
             "connector databricks",
             vec![
@@ -1708,8 +1708,13 @@ mod tests {
         )
         .await
         .expect("databricks parameters should be accepted");
-        let runtime_params =
-            HashMap::from([("http_rate_control_mode".to_string(), "adaptive".to_string())]);
+        let runtime_params = HashMap::from([
+            (
+                "http_rate_control_failure_threshold".to_string(),
+                "25%".to_string(),
+            ),
+            ("http_rate_control_window".to_string(), "30s".to_string()),
+        ]);
         let dataset = make_dataset("databricks:catalog.schema.table", "adaptive_default").await;
         let component = ConnectorComponent::from(&dataset);
 
@@ -1721,12 +1726,19 @@ mod tests {
             "spicepod",
         )
         .await
-        .expect("the runtime-wide adaptive default must not fail a Databricks dataset");
+        .expect("the runtime-wide adaptive defaults must not fail a Databricks dataset");
         let reservation = reservation.expect("a dataset reserves a rate controller");
-        assert!(
-            !reservation.shared().config.adaptive_enabled(),
-            "Databricks must not run adaptive rate control"
+        let controller = reservation
+            .shared()
+            .controller
+            .as_ref()
+            .expect("a rate-limited dataset has a controller");
+        assert_eq!(
+            controller.admission_coefficient(),
+            Some(1.0),
+            "with no reported outcomes the configured limits apply unchanged"
         );
+        reservation.rollback().await;
     }
 
     async fn make_dataset(from: &str, name: &str) -> Dataset {

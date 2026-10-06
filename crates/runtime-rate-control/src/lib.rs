@@ -210,6 +210,10 @@ impl RateControllerBuilder {
     /// Attach an adaptive controller that dynamically scales every configured
     /// limit by its admission coefficient. `origin` names the upstream in the
     /// controller's throttling and recovery log lines.
+    ///
+    /// Ignored when object-store persistence is configured: the leased cluster
+    /// buckets do not adapt yet, so a cluster controller applies the configured
+    /// limits unchanged.
     #[must_use]
     pub fn with_adaptive(
         mut self,
@@ -306,11 +310,18 @@ impl RateControllerBuilder {
         let jitter = self.jitter;
         let metrics = self.metrics.unwrap_or_default();
 
+        // The leased cluster buckets do not adapt yet (see `with_adaptive`).
+        let adaptive = if self.persistence.is_some() {
+            None
+        } else {
+            self.adaptive
+        };
+
         // With adaptive control, every limiter is built at `ADAPTIVE_WEIGHT_RESOLUTION` x capacity
         // and a healthy request charges `ADAPTIVE_WEIGHT_RESOLUTION` cells, so the adaptive weight
         // has sub-integer resolution (see [`ADAPTIVE_WEIGHT_RESOLUTION`]). Without
         // adaptive control the resolution is 1 and nothing is scaled.
-        let resolution = if self.adaptive.is_some() {
+        let resolution = if adaptive.is_some() {
             ADAPTIVE_WEIGHT_RESOLUTION
         } else {
             1
@@ -348,9 +359,8 @@ impl RateControllerBuilder {
                 // Leased buckets are deliberately NOT `resolution`-scaled. Their
                 // `acquire()` registers one unit of cluster demand per call, so
                 // charging `resolution` tokens would inflate the demand-weighted
-                // lease sharing across replicas. Adaptive mode is rejected at
-                // configuration time when cluster rate control is set, so a leased
-                // bucket never has an adaptive weight to apply.
+                // lease sharing across replicas. A persisted controller has no
+                // adaptive control (see `with_adaptive`), so `resolution` is 1.
                 let burst_per_window = quota_def.burst_per_window(persistence.window_duration);
                 leased_buckets.push(LeasedBucket::new(LeasedBucketConfig {
                     store: Arc::clone(&persistence.store),
@@ -371,9 +381,8 @@ impl RateControllerBuilder {
 
         let persistence_origin = self.persistence.as_ref().map(|p| p.origin.clone());
 
-        let adaptive = self
-            .adaptive
-            .map(|(control, origin)| Arc::new(AdaptiveController::new(control, origin)));
+        let adaptive =
+            adaptive.map(|(control, origin)| Arc::new(AdaptiveController::new(control, origin)));
 
         RateController::new(
             jitter,
@@ -636,8 +645,8 @@ impl RateController {
             }
         }
         // Cluster leased buckets: each acquire consumes one token, may wait.
-        // Adaptive mode and cluster rate control are mutually exclusive (rejected
-        // at configuration time), so each request charges exactly one token.
+        // A persisted controller has no adaptive control, so each request
+        // charges exactly one token.
         for bucket in &self.leased_buckets {
             bucket.acquire().await.map_err(|e| match e {
                 leased::Error::FailClosed { origin } => Error::ClusterBudgetExhausted { origin },
