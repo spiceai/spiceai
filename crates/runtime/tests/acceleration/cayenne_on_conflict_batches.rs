@@ -442,12 +442,15 @@ async fn a_partitioned_update_one_partition_refuses_changes_none() {
             // unlikely the refusing one is always reached first.
             for attempt in 0..2 {
                 let moving = ["a", "b", "c", "d", "e"];
-                let mut rows = String::from("id,region,ts,v\n");
-                for region in moving {
-                    rows.push_str(&format!("1,{region},2026-01-01T00:00:00,{region}1\n"));
-                    rows.push_str(&format!("3,{region},2026-01-01T00:00:00,{region}3\n"));
-                }
-                rows.push_str("1,z,2026-01-01T00:00:00,z1\n2,z,2026-01-01T00:00:00,z2\n");
+                let rows: String = std::iter::once("id,region,ts,v\n".to_string())
+                    .chain(moving.iter().flat_map(|region| {
+                        [
+                            format!("1,{region},2026-01-01T00:00:00,{region}1\n"),
+                            format!("3,{region},2026-01-01T00:00:00,{region}3\n"),
+                        ]
+                    }))
+                    .chain(["1,z,2026-01-01T00:00:00,z1\n2,z,2026-01-01T00:00:00,z2\n".to_string()])
+                    .collect();
                 let case = Case {
                     mode: Mode::File,
                     refresh: RefreshMode::Full,
