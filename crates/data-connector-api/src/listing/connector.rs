@@ -40,7 +40,11 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::error::DataFusionError;
-use datafusion::execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
+use datafusion::execution::cache::TableScopedPath;
+use datafusion::execution::cache::cache_manager::{
+    CachedFileMetadata, DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
+};
+use datafusion::execution::cache::default_cache::DefaultCache;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -201,6 +205,7 @@ impl MetadataPruningListingTable {
             metadata_size_hint: None,
             ordering: None,
             table_reference: None,
+            arrow_schema: None,
         })
     }
 
@@ -305,13 +310,14 @@ impl MetadataPruningListingTable {
             .map(|(name, dtype)| Field::new(name, dtype.clone(), true))
             .collect();
 
-        let table_schema = TableSchema::new(
-            self.file_schema(),
-            partition_fields
-                .iter()
-                .map(|f| Arc::new(f.clone()))
-                .collect(),
-        );
+        let table_schema = TableSchema::builder(self.file_schema())
+            .with_table_partition_cols(
+                partition_fields
+                    .iter()
+                    .map(|f| Arc::new(f.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .build();
         let file_source = self.inner.options().format.file_source(table_schema);
 
         let mut builder = FileScanConfigBuilder::new(self.object_store_url(), file_source)
@@ -637,6 +643,19 @@ impl TableProvider for MetadataPruningListingTable {
         state: &dyn datafusion::catalog::Session,
     ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         self.inner.truncate(state).await
+    }
+
+    async fn merge_into(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        source: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: datafusion_expr::Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
     }
 }
 
@@ -1786,10 +1805,10 @@ pub trait ListingTableConnector: DataConnector {
             sanitized_url = schema_infer_url.sanitized_url(),
         );
 
-        let session_state = ctx.state();
+        // `target_partitions` and `collect_statistics` are read from the scanning
+        // session's config at scan time, so they are no longer copied onto the options.
         let mut options = ListingOptions::new(Arc::clone(&file_format))
-            .with_file_extension(datafusion_listing_file_extension(extension))
-            .with_session_config_options(session_state.config());
+            .with_file_extension(datafusion_listing_file_extension(extension));
 
         options =
             options.with_object_versioning_type(self.object_versioning_type().map(|v| match v {
@@ -1917,7 +1936,12 @@ pub trait ListingTableConnector: DataConnector {
                 connector_component: ConnectorComponent::from(dataset),
                 code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
             })?
-            .with_cache(Some(Arc::new(DefaultFileStatisticsCache::default())));
+            .with_cache(Some(Arc::new(
+                DefaultCache::<TableScopedPath, CachedFileMetadata>::new(
+                    DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
+                )
+                .with_name("DefaultFileStatisticsCache"),
+            )));
 
         // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
         // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
@@ -2759,7 +2783,7 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
 mod tests {
     use arrow::array::{Array, RecordBatch};
     use chrono::{TimeZone, Utc};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion_table_providers::util::secrets::to_secret_map;
     use futures::StreamExt;
     use futures::stream::{self, BoxStream};
@@ -5453,6 +5477,10 @@ mod tests {
     /// Azure Blob Storage does not serve suffix ranges, so a reader that falls back to
     /// one cannot read Parquet from ABFS at all.
     #[tokio::test]
+    #[expect(
+        deprecated,
+        reason = "guards the Spice patches to arrow-rs's `ParquetObjectReader`, which is deprecated upstream but still carries them (docs/dev/fork_patches.md)"
+    )]
     async fn a_versioned_parquet_read_pins_every_request_to_one_object_version() {
         use datafusion::parquet::arrow::ArrowWriter;
         use datafusion::parquet::arrow::async_reader::{
@@ -5719,6 +5747,10 @@ mod tests {
     /// `Version` pin that only sends `version=` is then a no-op; every request
     /// has to carry `If-Match` instead, or a replacement is read as a mixture.
     #[tokio::test]
+    #[expect(
+        deprecated,
+        reason = "guards the Spice patches to arrow-rs's `ParquetObjectReader`, which is deprecated upstream but still carries them (docs/dev/fork_patches.md)"
+    )]
     async fn a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id() {
         use datafusion::parquet::arrow::ArrowWriter;
         use datafusion::parquet::arrow::async_reader::{
