@@ -2185,6 +2185,8 @@ pub struct TableStorageStats {
     pub file_statistics_rows: i64,
     /// Re-insert records held in the metastore.
     pub insert_records: i64,
+    /// Registered persisted secondary-index runs.
+    pub index_run_rows: i64,
     /// Inline (level-0) data entries not yet checkpointed to Vortex files.
     pub inlined_entries: i64,
     /// Rows held in those inline entries.

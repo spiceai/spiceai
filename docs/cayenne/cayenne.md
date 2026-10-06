@@ -1612,7 +1612,7 @@ The split resolves it, and neither half means much alone:
 ### Metastore size
 
 - `cayenne_metastore_db_bytes{catalog}` and `cayenne_metastore_wal_bytes{catalog}` — the database file and its `-wal`; together, the whole metadata footprint.
-- `cayenne_metastore_table_rows{table, metastore_table}` — per-**dataset-table** row counts across `cayenne_snapshot_file`, `cayenne_snapshot_file_statistics`, `cayenne_snapshot_sequence`, `cayenne_delete_file`, `cayenne_insert_record`, `cayenne_inlined_data`, `cayenne_inlined_delete`, `cayenne_cold_tier_file`. These are row counts, not state — see the section above before reading a large `cayenne_snapshot_file` value as a large table.
+- `cayenne_metastore_table_rows{table, metastore_table}` — per-**dataset-table** row counts across `cayenne_snapshot_file`, `cayenne_snapshot_file_statistics`, `cayenne_snapshot_sequence`, `cayenne_delete_file`, `cayenne_insert_record`, `cayenne_inlined_data`, `cayenne_inlined_delete`, `cayenne_cold_tier_file`, `cayenne_index_run`. These are row counts, not state — see the section above before reading a large `cayenne_snapshot_file` value as a large table.
 
 ### What is actually on disk
 

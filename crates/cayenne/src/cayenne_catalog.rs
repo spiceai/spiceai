@@ -4659,7 +4659,8 @@ impl MetadataCatalog for CayenneCatalog {
                         (SELECT COUNT(*) FROM cayenne_snapshot_file_statistics WHERE table_id = ?1),
                         (SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?2),
                         idt.n, idt.row_total, idt.bytes,
-                        idl.n, idl.deletes
+                        idl.n, idl.deletes,
+                        (SELECT COUNT(*) FROM cayenne_index_run WHERE table_id = ?1)
                     FROM
                         (SELECT COUNT(*) AS n,
                                 COALESCE(SUM(file_size_bytes), 0) AS bytes,
@@ -4712,6 +4713,7 @@ impl MetadataCatalog for CayenneCatalog {
                         inlined_bytes: row.get_i64(19)?,
                         inlined_delete_entries: row.get_i64(20)?,
                         inlined_delete_rows: row.get_i64(21)?,
+                        index_run_rows: row.get_i64(22)?,
                     })
                 },
             )
@@ -9871,7 +9873,7 @@ mod tests {
     /// the aggregate query joins through `cayenne_table`, and a join that yields
     /// no rows still has to produce one all-zero result row for the gauges.
     #[tokio::test]
-    async fn table_storage_stats_of_an_untouched_table_is_all_zero() {
+    async fn table_storage_stats_tracks_index_run_registration_and_removal() {
         let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_table_storage_stats_empty_{}.db",
@@ -9901,6 +9903,38 @@ mod tests {
             .await
             .expect("sample storage stats for an empty table");
         assert_eq!(stats, crate::metadata::TableStorageStats::default());
+
+        for run_name in ["first.run", "second.run", "third.run"] {
+            catalog
+                .register_index_run(&crate::metadata::IndexRunRecord {
+                    table_id: table_id.clone(),
+                    index_key: "key".to_string(),
+                    run_name: run_name.to_string(),
+                    row_count: 100,
+                    size_bytes: 20,
+                })
+                .await
+                .expect("register an index run");
+        }
+        let stats = catalog
+            .table_storage_stats(&table_id)
+            .await
+            .expect("count registered runs");
+        assert_eq!(stats.index_run_rows, 3);
+        let other_stats = catalog
+            .table_storage_stats(&uuid::Uuid::now_v7().to_string())
+            .await
+            .expect("sample another table");
+        assert_eq!(other_stats.index_run_rows, 0);
+        catalog
+            .remove_index_run(&table_id, "key", "second.run")
+            .await
+            .expect("unregister an index run");
+        let stats = catalog
+            .table_storage_stats(&table_id)
+            .await
+            .expect("count remaining runs");
+        assert_eq!(stats.index_run_rows, 2);
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);

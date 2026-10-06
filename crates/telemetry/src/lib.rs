@@ -2465,6 +2465,8 @@ pub mod cayenne {
         pub file_statistics_rows: u64,
         /// Re-insert records held in the metastore.
         pub insert_records: u64,
+        /// Registered persisted secondary-index runs.
+        pub index_run_rows: u64,
         /// Inline (level-0) data entries not yet checkpointed to Vortex files.
         pub inlined_entries: u64,
         /// Rows held in those inline entries.
@@ -2598,6 +2600,7 @@ pub mod cayenne {
             ("cayenne_snapshot_sequence", storage.snapshot_sequences),
             ("cayenne_delete_file", storage.delete_files),
             ("cayenne_insert_record", storage.insert_records),
+            ("cayenne_index_run", storage.index_run_rows),
             ("cayenne_inlined_data", storage.inlined_entries),
             ("cayenne_inlined_delete", storage.inlined_delete_entries),
             ("cayenne_cold_tier_file", storage.cold_files),

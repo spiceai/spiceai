@@ -11012,6 +11012,7 @@ impl CayenneTableProvider {
                 snapshot_sequences: to_gauge(stats.snapshot_sequences),
                 file_statistics_rows: to_gauge(stats.file_statistics_rows),
                 insert_records: to_gauge(stats.insert_records),
+                index_run_rows: to_gauge(stats.index_run_rows),
                 inlined_entries: to_gauge(stats.inlined_entries),
                 inlined_rows: to_gauge(stats.inlined_rows),
                 inlined_bytes: to_gauge(stats.inlined_bytes),
@@ -11075,6 +11076,7 @@ impl CayenneTableProvider {
                 files = usage.data_files
                     + usage.deletion_vector_files
                     + usage.staging_files
+                    + usage.lookup_index_files
                     + usage.other_files,
                 "Measuring the Cayenne data directory took longer than expected; the file count \
                  is high enough that the walk itself is measurable"
