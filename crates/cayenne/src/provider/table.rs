@@ -810,35 +810,10 @@ struct SnapshotSweepPins {
     grace: Duration,
 }
 
-/// Keeps maintenance from deleting the table's files until dropped, then reruns
-/// the snapshot-directory sweeps it deferred.
+/// Keeps maintenance from deleting the table's files until dropped.
 /// See [`CayenneTableProvider::hold_file_deletions`].
 pub struct FileDeletionHold {
-    guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-    table: CayenneTableProvider,
-}
-
-impl Drop for FileDeletionHold {
-    fn drop(&mut self) {
-        drop(self.guard.take());
-        let rerun = {
-            let mut holds = self.table.file_deletion_holds.lock();
-            holds.held = holds.held.saturating_sub(1);
-            holds.held == 0 && std::mem::take(&mut holds.deferred)
-        };
-        if rerun && tokio::runtime::Handle::try_current().is_ok() {
-            self.table.sweep_retired_snapshot_dirs();
-            self.table.schedule_old_snapshot_cleanup();
-        }
-    }
-}
-
-/// File-deletion holds on a table, and whether a snapshot-directory sweep skipped
-/// its pass for one.
-#[derive(Default)]
-struct FileDeletionHolds {
-    held: usize,
-    deferred: bool,
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 /// What one superseded-snapshot sweep must preserve.
@@ -2609,10 +2584,8 @@ pub struct CayenneTableProvider {
     orphan_dv_sweep_state: Arc<AtomicU8>,
     /// Held shared by a [`FileDeletionHold`] and exclusively by the orphaned-DV
     /// sweep while it unlinks, so the sweep never removes a file being archived.
+    /// The snapshot-directory sweeps skip their pass while it is held.
     file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
-    /// File-deletion holds; the snapshot-directory sweeps skip their pass while any
-    /// is held, and the last hold to drop reruns them.
-    file_deletion_holds: Arc<ParkingMutex<FileDeletionHolds>>,
     /// Admission gate for the footprint sample, throttling it to
     /// [`FOOTPRINT_SAMPLE_MIN_INTERVAL`].
     ///
@@ -6600,7 +6573,7 @@ impl CayenneTableProvider {
             in_use_snapshot_ids,
             grace: Self::SNAPSHOT_CLEANUP_GRACE,
         };
-        if self.defer_for_file_deletion_hold() {
+        if self.file_deletions_held() {
             return;
         }
 
@@ -7271,7 +7244,7 @@ impl CayenneTableProvider {
         // live snapshot references its files in place, or fail the unlink — so an
         // outcome recorded at this point would report a reclaim that never
         // happened. It is emitted once the task knows what it actually removed.
-        if self.defer_for_file_deletion_hold() {
+        if self.file_deletions_held() {
             return;
         }
         let sweep_table_name = self.table_metadata.table_name.clone();
@@ -9472,7 +9445,6 @@ impl CayenneTableProvider {
             post_write_compaction_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
             orphan_dv_sweep_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
             file_deletion_fence: Arc::new(tokio::sync::RwLock::new(())),
-            file_deletion_holds: Arc::new(ParkingMutex::new(FileDeletionHolds::default())),
             footprint_sample_gate: Arc::new(SampleGate::default()),
             data_dir_sample_gate: Arc::new(SampleGate::default()),
             in_memory_sample_gate: Arc::new(SampleGate::default()),
@@ -11550,7 +11522,6 @@ impl CayenneTableProvider {
             post_write_compaction_state: Arc::clone(&self.post_write_compaction_state),
             orphan_dv_sweep_state: Arc::clone(&self.orphan_dv_sweep_state),
             file_deletion_fence: Arc::clone(&self.file_deletion_fence),
-            file_deletion_holds: Arc::clone(&self.file_deletion_holds),
             footprint_sample_gate: Arc::clone(&self.footprint_sample_gate),
             data_dir_sample_gate: Arc::clone(&self.data_dir_sample_gate),
             in_memory_sample_gate: Arc::clone(&self.in_memory_sample_gate),
@@ -19671,22 +19642,17 @@ impl CayenneTableProvider {
     /// it before exporting the metastore slice and hold it until the archive is
     /// written. Waits for an in-flight deletion to finish.
     pub async fn hold_file_deletions(&self) -> FileDeletionHold {
-        let guard = Arc::clone(&self.file_deletion_fence).read_owned().await;
-        self.file_deletion_holds.lock().held += 1;
         FileDeletionHold {
-            guard: Some(guard),
-            table: self.clone_for_write(),
+            _guard: Arc::clone(&self.file_deletion_fence).read_owned().await,
         }
     }
 
-    /// Whether a snapshot-directory sweep must skip its pass for a file-deletion
-    /// hold; the last hold to drop reruns it. Call after reading the current
-    /// snapshot: a slice exported under a later hold cannot reference a directory
-    /// already retired by then.
-    fn defer_for_file_deletion_hold(&self) -> bool {
-        let mut holds = self.file_deletion_holds.lock();
-        holds.deferred |= holds.held > 0;
-        holds.held > 0
+    /// Whether a snapshot-directory sweep must skip its pass because file
+    /// deletions are held; the next commit retries it. Call after reading the
+    /// current snapshot: a slice exported under a later hold cannot reference a
+    /// directory already retired by then.
+    fn file_deletions_held(&self) -> bool {
+        self.file_deletion_fence.try_write().is_err()
     }
 
     /// Signal that orphaned key-based deletion vectors may now exist: a
@@ -39875,7 +39841,8 @@ mod tests {
     }
 
     /// The retired-snapshot sweep keeps a retired directory while file deletions
-    /// are held, because the archive may reference it; dropping the hold reruns it.
+    /// are held, because the archive may reference it; a sweep after the hold
+    /// drops removes it.
     #[tokio::test]
     async fn file_deletion_hold_defers_the_retired_snapshot_sweep() {
         let ctx = SessionContext::new();
@@ -39884,24 +39851,11 @@ mod tests {
         let dir = seed_due_retired_dir(&provider);
 
         let hold = provider.hold_file_deletions().await;
-        provider.clone_for_write().sweep_retired_snapshot_dirs();
+        provider.sweep_retired_snapshot_dirs();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(dir.exists(), "the sweep must keep the dir while held");
 
         drop(hold);
-        wait_until_removed(&dir).await;
-    }
-
-    /// An orphaned-DV sweep in progress does not hold off the retired-snapshot
-    /// sweep; only a file-deletion hold does.
-    #[tokio::test]
-    async fn orphan_dv_sweep_does_not_defer_the_retired_snapshot_sweep() {
-        let ctx = SessionContext::new();
-        let (provider, _tmp, _ids) =
-            build_seq_prefix_fixture("deletion_hold_dv", ctx.runtime_env(), &[10]).await;
-        let dir = seed_due_retired_dir(&provider);
-
-        let _dv_sweep = provider.file_deletion_fence.write().await;
         provider.sweep_retired_snapshot_dirs();
         wait_until_removed(&dir).await;
     }
