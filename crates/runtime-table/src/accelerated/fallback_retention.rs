@@ -637,50 +637,55 @@ mod tests {
         )
         .expect("batch");
 
-        let collect = |period: Duration| async {
-            let keep = FallbackRetentionKeep::from_time(
-                period,
-                "ts".to_string(),
-                Some(TimeFormat::UnixMillis),
-                None,
-                None,
-            );
-            let keep_expr = keep
-                .keep_filters(&schema)
-                .expect("keep")
-                .into_iter()
-                .next()
-                .expect("one keep predicate");
-            let ctx = SessionContext::new();
-            ctx.register_table(
-                "t",
-                Arc::new(
-                    MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]]).expect("mem"),
-                ),
-            )
-            .expect("register");
-            let batches = ctx
-                .table("t")
-                .await
-                .expect("table")
-                .filter(keep_expr)
-                .expect("filter")
-                .collect()
-                .await
-                .expect("collect");
-            batches
-                .iter()
-                .flat_map(|batch| {
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .expect("id")
-                        .values()
-                        .iter()
-                        .copied()
-                })
-                .collect::<Vec<i64>>()
+        let collect = |period: Duration| {
+            let schema = Arc::clone(&schema);
+            let batch = batch.clone();
+            async move {
+                let keep = FallbackRetentionKeep::from_time(
+                    period,
+                    "ts".to_string(),
+                    Some(TimeFormat::UnixMillis),
+                    None,
+                    None,
+                );
+                let keep_expr = keep
+                    .keep_filters(&schema)
+                    .expect("keep")
+                    .into_iter()
+                    .next()
+                    .expect("one keep predicate");
+                let ctx = SessionContext::new();
+                ctx.register_table(
+                    "t",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])
+                            .expect("mem"),
+                    ),
+                )
+                .expect("register");
+                let batches = ctx
+                    .table("t")
+                    .await
+                    .expect("table")
+                    .filter(keep_expr)
+                    .expect("filter")
+                    .collect()
+                    .await
+                    .expect("collect");
+                batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("id")
+                            .values()
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<i64>>()
+            }
         };
 
         assert_eq!(
