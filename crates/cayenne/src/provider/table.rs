@@ -12465,6 +12465,30 @@ impl CayenneTableProvider {
         self.mem_tier.is_empty() && self.inlined_row_count.load(Ordering::Acquire) == 0
     }
 
+    /// Whether this table holds no rows at all, by observing every place a row
+    /// can sit: a staged append's private directory, a registered protected
+    /// snapshot, the in-memory CDC tier, the inline tier, any snapshot's data
+    /// files and the cold tier. The in-flight staged-append check precedes the
+    /// protected-snapshot read for the reason `pk_caches_absent_and_memory_empty`
+    /// gives. Anything that cannot be read answers `false`.
+    pub(crate) async fn holds_no_rows(&self) -> bool {
+        if self.has_inflight_staging_appends()
+            || !self.protected_snapshots.load().is_empty()
+            || !self.mem_tier.is_empty()
+            || self.inlined_row_count.load(Ordering::Acquire) != 0
+        {
+            return false;
+        }
+        let table_id = &self.table_metadata.table_id;
+        matches!(
+            self.catalog.get_all_snapshot_files(table_id).await,
+            Ok(files) if files.is_empty()
+        ) && matches!(
+            self.catalog.list_cold_tier_files(table_id).await,
+            Ok(files) if files.is_empty()
+        )
+    }
+
     pub(crate) fn clear_cached_pk_keyset(&self) {
         {
             let mut guard = self.pk_keyset_cache.lock();
