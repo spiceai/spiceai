@@ -36,6 +36,7 @@ use test_framework::{
     anyhow,
     app::App,
     flight::query_to_batches,
+    git,
     spiced::{SpicedInstance, StartRequest},
     spicepod_utils::from_app,
 };
@@ -76,6 +77,9 @@ impl BinaryResult {
 #[derive(Debug, Serialize)]
 struct ColdStartResults {
     spicepod: PathBuf,
+    /// The candidate's build commit (`SPICED_COMMIT`), which its version string omits.
+    spiced_commit: String,
+    testoperator_commit: String,
     cpu_cores: String,
     candidate: BinaryResult,
     baseline: Option<BinaryResult>,
@@ -127,6 +131,8 @@ pub(crate) async fn run(args: &ColdStartArgs) -> anyhow::Result<()> {
     let failures = evaluate(args, &candidate, baseline.as_ref());
     let results = ColdStartResults {
         spicepod: args.common.spicepod_path.clone(),
+        spiced_commit: std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
+        testoperator_commit: git::get_commit_sha(),
         cpu_cores: args.cpu_cores.clone(),
         candidate,
         baseline,
@@ -333,9 +339,11 @@ fn markdown_summary(results: &ColdStartResults) -> String {
     };
     let _ = writeln!(
         out,
-        "### Cold start {verdict}: `{}` (`--cpu-cores {}`)\n",
+        "### Cold start {verdict}: `{}` (`--cpu-cores {}`)\n\nCandidate commit `{}`, testoperator commit `{}`.\n",
         results.spicepod.display(),
-        results.cpu_cores
+        results.cpu_cores,
+        results.spiced_commit,
+        results.testoperator_commit
     );
     let _ = writeln!(
         out,
