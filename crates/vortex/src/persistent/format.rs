@@ -1228,22 +1228,6 @@ impl FileFormat for VortexFormat {
     }
 }
 
-/// A `Min` or `Max` bound, tagged as the column's own Arrow type.
-///
-/// Bounds are compared against literals of the column's type. `FilterExec` builds
-/// an `Interval` from the pair and asserts both endpoints share one type, taking
-/// whichever end the file does not describe from the column, so a bound tagged
-/// for another type fails planning for every query that projects that column,
-/// rather than only costing pruning.
-///
-/// Vortex has one string dtype and one binary dtype where Arrow has several
-/// representations, so a footer bound on a `LargeUtf8` column surfaces as `Utf8`.
-/// The column's Vortex dtype is tried first because it reconstructs the types
-/// Vortex models directly (dictionaries, temporal extensions); the fallback
-/// converts on the value's own dtype and copies the column's tag onto the
-/// payload. Decimal bounds also use the column's Arrow storage width: Vortex
-/// chooses their width from precision, independently of the Arrow field's width.
-/// A value that cannot carry the column's type is reported as no bound.
 /// Whether a column's min, max and sum can be used as `DataFusion` statistics.
 ///
 /// Vortex leaves NaN out of a float column's min, max and sum, while `DataFusion`
@@ -1261,6 +1245,22 @@ pub fn bounds_account_for_nan(stats: &StatsSet, dtype: &DType) -> bool {
             == Some(0)
 }
 
+/// A `Min` or `Max` bound, tagged as the column's own Arrow type.
+///
+/// Bounds are compared against literals of the column's type. `FilterExec` builds
+/// an `Interval` from the pair and asserts both endpoints share one type, taking
+/// whichever end the file does not describe from the column, so a bound tagged
+/// for another type fails planning for every query that projects that column,
+/// rather than only costing pruning.
+///
+/// Vortex has one string dtype and one binary dtype where Arrow has several
+/// representations, so a footer bound on a `LargeUtf8` column surfaces as `Utf8`.
+/// The column's Vortex dtype is tried first because it reconstructs the types
+/// Vortex models directly (dictionaries, temporal extensions); the fallback
+/// converts on the value's own dtype and copies the column's tag onto the
+/// payload. Decimal bounds also use the column's Arrow storage width: Vortex
+/// chooses their width from precision, independently of the Arrow field's width.
+/// A value that cannot carry the column's type is reported as no bound.
 fn stat_bound_to_df(
     stat: Stat,
     value: stats::Precision<VortexScalarValue>,
