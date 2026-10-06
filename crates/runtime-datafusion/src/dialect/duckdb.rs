@@ -591,13 +591,14 @@ pub(crate) fn encode_to_lowercase_hex(
     }
 }
 
-/// Whether `encoding` is the string literal `hex`, in any ASCII case.
+/// Whether `encoding` is the string literal `hex`.
+///
+/// `DataFusion` matches the format case-sensitively (`"hex"` only), so a
+/// mixed-case or upper-case literal must stay local rather than answering
+/// where the kernel errors.
 fn is_literal_hex_encoding(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(value, _) => value
-            .try_as_str()
-            .flatten()
-            .is_some_and(|encoding| encoding.eq_ignore_ascii_case("hex")),
+        Expr::Literal(value, _) => value.try_as_str().flatten() == Some("hex"),
         _ => false,
     }
 }
@@ -1544,6 +1545,7 @@ mod tests {
 
         for args in [
             vec![column.clone(), lit("base64")],
+            vec![column.clone(), lit("HEX")],
             vec![column.clone(), col("fmt")],
             vec![column.clone()],
             vec![column, lit("hex"), lit("extra")],

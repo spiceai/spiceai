@@ -843,12 +843,16 @@ mod tests {
                 "{expr} is faithful on SQLite and must federate"
             );
         }
-        for expr in [col("bin"), col("s").like(lit("a%")), col("i32").is_null()] {
+        for expr in [col("bin"), col("i32").is_null()] {
             assert!(
                 support.supports(&expr, Some(&scope)),
                 "{expr} must federate"
             );
         }
+        assert!(
+            !support.supports(&col("s").like(lit("a%")), Some(&scope)),
+            "SQLite LIKE folds ASCII case and must stay local"
+        );
     }
 
     /// With no scope a column's type cannot be read, so a cast of it stays
@@ -1244,8 +1248,9 @@ mod tests {
     fn duckdb_federates_hex_encode_and_keeps_other_encodings_local() {
         use datafusion::functions::encoding::expr_fn::encode;
         let hex = plan_projecting(encode(col("s"), lit("hex")));
+        let upper_hex = plan_projecting(encode(col("s"), lit("HEX")));
         let base64 = plan_projecting(encode(col("s"), lit("base64")));
-        assert_duckdb_federation(&[base64], &[hex]);
+        assert_duckdb_federation(&[base64, upper_hex], &[hex]);
     }
 
     /// `SQLite` has no dialect seam, so every built-in it cannot evaluate

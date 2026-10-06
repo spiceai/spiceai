@@ -1213,8 +1213,8 @@ mod tests {
             "encode(x, 'hex') renders as lower(hex(x)) and must federate"
         );
         assert!(
-            duckdb_can_translate(&call_of(encode(col("s"), lit("HEX"))), None),
-            "the encoding name is case-insensitive"
+            !duckdb_can_translate(&call_of(encode(col("s"), lit("HEX"))), None),
+            "DataFusion matches 'hex' case-sensitively; HEX must stay local"
         );
         assert!(
             !duckdb_can_translate(&call_of(encode(col("s"), lit("base64"))), None),
@@ -1259,6 +1259,7 @@ mod tests {
             regexp_count(col("s"), lit("a"), Some(lit(1)), Some(lit("m"))),
             upper(col("s")),
             encode(col("s"), lit("hex")),
+            encode(col("s"), lit("HEX")),
             encode(col("s"), lit("base64")),
         ] {
             let renders = unparser.expr_to_sql(&expr).is_ok();
