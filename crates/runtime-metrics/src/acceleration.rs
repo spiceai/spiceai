@@ -190,7 +190,7 @@ pub static REFRESH_ROWS_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("dataset_acceleration_refresh_rows_written")
         .with_description(
-            "Cumulative number of rows read from the federated source and written to the accelerated table, including rows the table does not keep (dataset_acceleration_rows_superseded).",
+            "Cumulative number of rows read from the federated source and written to the accelerated table, as they are read: rows the table does not keep count here and, once their refresh succeeds, in dataset_acceleration_rows_superseded; a refresh that fails counts here only.",
         )
         .with_unit("rows")
         .build()
