@@ -130,13 +130,22 @@ fn cayenne_unscheduled_time_dataset(dir: &Path, name: &str) -> Dataset {
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("cayenne".to_string()),
-        mode: spicepod::acceleration::Mode::Memory,
+        mode: spicepod::acceleration::Mode::File,
+        refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
         on_zero_results: ZeroResultsAction::UseSource,
         refresh_sql: Some(format!("SELECT * FROM {name} WHERE id != 3")),
         refresh_data_window: Some("10000d".to_string()),
         retention_check_enabled: false,
         retention_check_interval: None,
         retention_period: Some("1h".to_string()),
+        params: Some(Params::from_string_map(
+            [(
+                "cayenne_file_path".to_string(),
+                dir.join("accelerator").to_string_lossy().to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        )),
         ..Acceleration::default()
     });
     dataset
@@ -348,7 +357,6 @@ async fn arrow_write_time_retention_sql_does_not_resurrect_via_fallback() -> any
 async fn cayenne_unscheduled_time_retention_does_not_resurrect_via_fallback() -> anyhow::Result<()>
 {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
     test_request_context()
         .scope(async {
             let dir = tempfile::tempdir()?;
@@ -358,15 +366,15 @@ async fn cayenne_unscheduled_time_retention_does_not_resurrect_via_fallback() ->
                 "id,ts\n1,4102444800\n2,1000000000\n3,4102444800\n",
             )?;
 
+            configure_test_datafusion();
             let app = AppBuilder::new("cayenne_unscheduled_time_fallback")
                 .with_dataset(cayenne_unscheduled_time_dataset(
                     dir.path(),
                     "cayenne_unscheduled_time",
                 ))
                 .build();
-            configure_test_datafusion();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-            load_runtime_datasets(&rt, Duration::from_mins(1)).await?;
+            load_runtime_datasets(&rt, Duration::from_mins(2)).await?;
 
             let ids_in_accel = accelerator_ids(&rt, "cayenne_unscheduled_time").await;
             assert!(
