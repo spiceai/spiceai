@@ -26,7 +26,7 @@ use std::{num::NonZeroU32, path::Path, sync::Arc, time::Duration};
 
 use app::{App, AppBuilder};
 use data_connector_api::ConnectorComponent;
-use data_http_rate_control::{HttpRateControlConfig, RateControlMode};
+use data_http_rate_control::{AdaptiveRateControl, HttpRateControlConfig};
 use runtime::{
     Runtime,
     component::dataset::{Dataset, builder::DatasetBuilder},
@@ -69,7 +69,7 @@ fn rps_config(rps: u32) -> HttpRateControlConfig {
         requests_per_minute: None,
         jitter_min: Duration::ZERO,
         jitter_max: Duration::ZERO,
-        mode: RateControlMode::Static,
+        adaptive: AdaptiveRateControl::default(),
         acquire_timeout: None,
     }
 }
@@ -182,7 +182,7 @@ mod cluster_adaptive {
     use std::{sync::Arc, time::Duration};
 
     use data_connector_api::ConnectorComponent;
-    use data_http_rate_control::{AdaptiveRateControl, HttpRateControlConfig, RateControlMode};
+    use data_http_rate_control::{AdaptiveRateControl, HttpRateControlConfig};
     use runtime::Runtime;
     use runtime_rate_control::{RateController, RequestOutcome};
 
@@ -194,10 +194,8 @@ mod cluster_adaptive {
     /// Throttle above a 50% error rate (`k = 2`), reacting over one window.
     fn adaptive_rps_config(rps: u32) -> HttpRateControlConfig {
         HttpRateControlConfig {
-            mode: RateControlMode::Adaptive(
-                AdaptiveRateControl::new(0.5, Duration::from_secs(1))
-                    .expect("a 50% threshold over a 1s window is valid"),
-            ),
+            adaptive: AdaptiveRateControl::new(0.5, Duration::from_secs(1))
+                .expect("a 50% threshold over a 1s window is valid"),
             ..rps_config(rps)
         }
     }
@@ -321,11 +319,11 @@ mod cluster_adaptive {
         let coefficient_a = a
             .controller
             .admission_coefficient()
-            .expect("cluster adaptive mode reports a coefficient");
+            .expect("a cluster controller reports a coefficient");
         let coefficient_b = b
             .controller
             .admission_coefficient()
-            .expect("cluster adaptive mode reports a coefficient");
+            .expect("a cluster controller reports a coefficient");
 
         // Both replicas throttle. Bit-exact agreement across an unsynchronised
         // pair is proved deterministically in the `runtime-rate-control` unit
@@ -382,7 +380,7 @@ mod cluster_adaptive {
         let combined = failing
             .controller
             .admission_coefficient()
-            .expect("cluster adaptive mode reports a coefficient");
+            .expect("a cluster controller reports a coefficient");
 
         // Both replicas share the budget roughly evenly, so the cluster error
         // rate sits near 50% — the threshold itself. A coefficient derived from
@@ -394,7 +392,7 @@ mod cluster_adaptive {
         let seen_by_healthy = healthy
             .controller
             .admission_coefficient()
-            .expect("cluster adaptive mode reports a coefficient");
+            .expect("a cluster controller reports a coefficient");
         assert!(
             seen_by_healthy > 0.5,
             "the healthy replica reads the same shared counts, got {seen_by_healthy}"
@@ -434,7 +432,7 @@ mod cluster_adaptive {
     }
 }
 
-/// Configuration validation for adaptive HTTP rate control.
+/// Shared-origin rules for adaptive HTTP rate control.
 ///
 /// These tests live here rather than in `data-http-rate-control` because they
 /// need a `ConnectorComponent`, which requires `runtime-component`; that crate
@@ -446,8 +444,7 @@ mod adaptive_config_validation {
 
     use data_connector_api::{ConnectorComponent, DataConnectorError};
     use data_http_rate_control::{
-        AdaptiveRateControl, HttpRateControlConfig, HttpRateControlRegistry, RateControlMode,
-        ensure_adaptive_has_static_limit,
+        AdaptiveRateControl, HttpRateControlConfig, HttpRateControlRegistry,
     };
     use object_store::memory::InMemory;
     use runtime_component::dataset::DatasetSpec;
@@ -458,16 +455,14 @@ mod adaptive_config_validation {
     fn test_component() -> ConnectorComponent {
         ConnectorComponent::Dataset(Arc::new(DatasetSpec::new(
             TEST_ORIGIN,
-            "rate_control_mode_test".into(),
+            "rate_control_test".into(),
         )))
     }
 
-    fn adaptive_control() -> AdaptiveRateControl {
-        AdaptiveRateControl::new(0.5, Duration::from_secs(10))
-            .expect("test control should be valid")
-    }
-
-    fn config(mode: RateControlMode, requests_per_second: Option<u32>) -> HttpRateControlConfig {
+    fn config(
+        adaptive: AdaptiveRateControl,
+        requests_per_second: Option<u32>,
+    ) -> HttpRateControlConfig {
         HttpRateControlConfig {
             max_concurrent_requests: None,
             requests_per_second: requests_per_second
@@ -475,71 +470,36 @@ mod adaptive_config_validation {
             requests_per_minute: None,
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
-            mode,
+            adaptive,
             acquire_timeout: None,
         }
     }
 
-    #[test]
-    fn adaptive_mode_without_a_static_limit_is_a_config_error() {
-        let component = test_component();
-        let error = ensure_adaptive_has_static_limit(
-            &config(RateControlMode::Adaptive(adaptive_control()), None),
-            &component,
-            "https",
-        )
-        .expect_err("adaptive mode with no static rate limit must be rejected");
-
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("`rate_control_mode: adaptive`"),
-                    "message must name the parameter: {message}"
-                );
-                assert!(
-                    message.contains("requests_per_second_limit")
-                        && message.contains("max_concurrent_requests"),
-                    "message must name the fix: {message}"
-                );
-                assert!(
-                    message.contains("`rate_control_mode: static`"),
-                    "message must offer static mode: {message}"
-                );
-                assert!(
-                    message.contains("spiceai.org/docs"),
-                    "message must include a docs link: {message}"
-                );
-            }
-            other => panic!("expected an invalid-configuration error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn adaptive_mode_with_a_static_limit_is_accepted() {
-        let component = test_component();
-        ensure_adaptive_has_static_limit(
-            &config(RateControlMode::Adaptive(adaptive_control()), Some(10)),
-            &component,
-            "https",
-        )
-        .expect("adaptive mode with a static limit is a valid configuration");
-    }
-
-    #[test]
-    fn static_mode_needs_no_static_limit() {
-        ensure_adaptive_has_static_limit(
-            &config(RateControlMode::Static, None),
-            &test_component(),
-            "https",
-        )
-        .expect("static mode requires no static limit");
-    }
-
-    /// Adaptive mode is supported with cluster rate control: every replica
-    /// derives the same coefficient from the shared state and scales the leased
-    /// budget by it, so the whole cluster backs off together.
+    /// With no rate limit there is nothing for adaptive control to scale, so the
+    /// configuration is accepted and no controller is built.
     #[tokio::test]
-    async fn adaptive_mode_with_cluster_rate_control_is_accepted() {
+    async fn no_rate_limit_is_accepted_and_builds_no_controller() {
+        let registry = Arc::new(HttpRateControlRegistry::default());
+        let origin = Url::parse(TEST_ORIGIN).expect("test URL should parse");
+
+        let shared = registry
+            .shared_rate_controller_for_component(
+                &origin,
+                &config(AdaptiveRateControl::default(), None),
+                "spicepod",
+                &test_component(),
+                "https",
+            )
+            .await
+            .expect("no rate limit is a valid configuration");
+        assert!(shared.controller.is_none());
+    }
+
+    /// Cluster rate control adapts: every replica derives the same coefficient
+    /// from the shared state and scales the leased budget by it, so the whole
+    /// cluster backs off together.
+    #[tokio::test]
+    async fn cluster_rate_control_adapts() {
         let registry = Arc::new(HttpRateControlRegistry::with_persisted_governor_state(
             Arc::new(InMemory::new()),
             "",
@@ -550,46 +510,81 @@ mod adaptive_config_validation {
         let reservation = Arc::clone(&registry)
             .reserve_shared_rate_controller_for_component(
                 &origin,
-                &config(RateControlMode::Adaptive(adaptive_control()), Some(10)),
+                &config(AdaptiveRateControl::default(), Some(10)),
                 "spicepod",
                 &test_component(),
                 "https",
             )
             .await
-            .expect("adaptive mode is supported with cluster rate control");
+            .expect("cluster rate control accepts the configuration");
 
         let controller = reservation
             .shared()
             .controller
             .clone()
             .expect("a rate-limited origin builds a controller");
+        // The coefficient is fixed per leased window, so lease the first one.
+        controller
+            .refresh_and_persist_state_snapshot()
+            .await
+            .expect("lease the first window");
         assert_eq!(
             controller.admission_coefficient(),
             Some(1.0),
             "a cluster controller reports a coefficient, and starts at full admission"
         );
+        reservation.rollback().await;
     }
 
-    /// Static mode is unaffected by cluster rate control.
+    /// Components that share an origin share one controller, so they must agree
+    /// on the adaptive tuning as well as on the limits.
     #[tokio::test]
-    async fn static_mode_with_cluster_rate_control_is_accepted() {
-        let registry = Arc::new(HttpRateControlRegistry::with_persisted_governor_state(
-            Arc::new(InMemory::new()),
-            "",
-            Duration::from_secs(1),
-        ));
+    async fn different_adaptive_tuning_on_one_origin_is_a_config_error() {
+        let registry = Arc::new(HttpRateControlRegistry::default());
         let origin = Url::parse(TEST_ORIGIN).expect("test URL should parse");
 
-        Arc::clone(&registry)
-            .reserve_shared_rate_controller_for_component(
+        registry
+            .shared_rate_controller_for_component(
                 &origin,
-                &config(RateControlMode::Static, Some(10)),
+                &config(AdaptiveRateControl::default(), Some(10)),
                 "spicepod",
                 &test_component(),
                 "https",
             )
             .await
-            .expect("static mode is supported with cluster rate control");
+            .expect("the first component sets the origin's config");
+
+        let other_tuning = AdaptiveRateControl::new(0.5, Duration::from_secs(10))
+            .expect("test control should be valid");
+        let error = registry
+            .shared_rate_controller_for_component(
+                &origin,
+                &config(other_tuning, Some(10)),
+                "spicepod",
+                &test_component(),
+                "https",
+            )
+            .await
+            .expect_err("a different failure threshold on the same origin must be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("different rate-control settings"),
+                    "message must name the conflict: {message}"
+                );
+                assert!(
+                    message.contains("rate_control_failure_threshold")
+                        && message.contains("rate_control_window"),
+                    "message must name the adaptive parameters: {message}"
+                );
+                assert!(
+                    !message.contains("rate_control_mode"),
+                    "message must not name a removed parameter: {message}"
+                );
+            }
+            other => panic!("expected an invalid-configuration error, got {other:?}"),
+        }
     }
 }
 

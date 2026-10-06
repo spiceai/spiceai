@@ -929,8 +929,8 @@ pub(crate) struct GraphQLQueryResult {
 }
 
 impl GraphQLClient {
-    /// Feed a request outcome to the origin's adaptive rate controller, if one is
-    /// configured. A no-op in static rate-control mode.
+    /// Feed a request outcome to the origin's adaptive rate controller. A no-op
+    /// when the origin has no rate limit configured.
     fn record_adaptive_outcome(&self, outcome: RequestOutcome) {
         if let Some(rate_controller) = &self.rate_controller {
             rate_controller.record_outcome(outcome);

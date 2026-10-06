@@ -45,11 +45,10 @@ limitations under the License.
 //!                   └                          ┘
 //! ```
 //!
-//! Adaptive control is a *modifier* on statically-configured limits, never a
-//! limiter of its own: the single coefficient scales every configured limit
-//! (per-second, per-minute, and concurrency) uniformly. An origin with no static
-//! limit has nothing to modify, so the caller rejects that configuration before
-//! building a controller.
+//! Adaptive control is a *modifier* on the configured limits, never a limiter
+//! of its own: the single coefficient scales every configured limit
+//! (per-second, per-minute, and concurrency) uniformly. An origin with no
+//! configured limit has nothing to modify, so adaptive control is a no-op there.
 
 use std::time::Duration;
 
@@ -138,9 +137,9 @@ impl AdaptiveRateControl {
         })
     }
 
-    /// Build with the half-life left unset, so each mode applies its own
-    /// default: [`DEFAULT_ADAPTIVE_WINDOW`] for a single node, and the shared
-    /// `refresh_interval` for a cluster.
+    /// Build with the half-life left unset, so single-node and cluster rate
+    /// control each apply their own default: [`DEFAULT_ADAPTIVE_WINDOW`] for a
+    /// single node, and the shared `refresh_interval` for a cluster.
     ///
     /// # Errors
     /// Returns [`AdaptiveRateControlError::FailureThresholdInvalid`] when
@@ -165,7 +164,7 @@ impl AdaptiveRateControl {
     }
 
     /// The half-life the user configured, or `None` when they left it unset and
-    /// the mode should apply its own default.
+    /// single-node or cluster rate control applies its own default.
     #[must_use]
     pub fn configured_window(&self) -> Option<Duration> {
         (!self.window_is_default).then_some(self.window)
@@ -176,6 +175,19 @@ impl AdaptiveRateControl {
     #[must_use]
     pub fn k(&self) -> f64 {
         self.k
+    }
+}
+
+impl Default for AdaptiveRateControl {
+    /// [`DEFAULT_ADAPTIVE_FAILURE_THRESHOLD`] with the window left unset, so
+    /// cluster rate control may retarget it to its `refresh_interval`.
+    fn default() -> Self {
+        Self {
+            failure_threshold: DEFAULT_ADAPTIVE_FAILURE_THRESHOLD,
+            k: 1.0 / (1.0 - DEFAULT_ADAPTIVE_FAILURE_THRESHOLD),
+            window: DEFAULT_ADAPTIVE_WINDOW,
+            window_is_default: true,
+        }
     }
 }
 
@@ -465,6 +477,17 @@ mod tests {
 
     fn enabled(failure_threshold: f64) -> AdaptiveController {
         AdaptiveController::new(control(failure_threshold), "https://origin.example.com")
+    }
+
+    /// The default must be a value `new` accepts, built from the documented
+    /// defaults.
+    #[test]
+    fn default_matches_the_documented_defaults() {
+        assert_eq!(
+            AdaptiveRateControl::default(),
+            AdaptiveRateControl::new(DEFAULT_ADAPTIVE_FAILURE_THRESHOLD, DEFAULT_ADAPTIVE_WINDOW)
+                .expect("the defaults must be valid")
+        );
     }
 
     #[test]

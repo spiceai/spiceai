@@ -345,6 +345,11 @@ impl RateControllerBuilder {
     /// limit by its admission coefficient. `origin` names the upstream in the
     /// controller's throttling and recovery log lines, and becomes the
     /// controller's origin, exactly as [`Self::with_origin`] sets it.
+    ///
+    /// With object-store persistence, the settings go to the leased cluster
+    /// buckets instead: every replica derives one coefficient from the shared
+    /// state and scales the cluster request-rate budget by it. The local
+    /// concurrency semaphore is not scaled in cluster mode.
     #[must_use]
     pub fn with_adaptive(self, control: AdaptiveRateControl, origin: impl Into<String>) -> Self {
         let mut builder = self.with_origin(origin);
@@ -532,6 +537,8 @@ impl RateControllerBuilder {
         // The adaptive controller names the same origin in its log lines, so it
         // takes it from the target. `with_adaptive` always sets an origin, so
         // the fallback is unreachable.
+        // In cluster mode the leased buckets adapt, so no local controller is
+        // built.
         let adaptive = cluster_adaptive
             .is_none()
             .then_some(self.adaptive)
@@ -819,9 +826,9 @@ impl RateController {
             }
         }
         // Cluster leased buckets: each acquire consumes one token, may wait.
-        // Always exactly one token, in both modes: a leased bucket throttles by
-        // leasing against a smaller cluster budget, not by charging a heavier
-        // weight, so the charge never carries the adaptive coefficient.
+        // Always exactly one token: a leased bucket throttles by leasing
+        // against a smaller cluster budget, not by charging a heavier weight,
+        // so the charge never carries the adaptive coefficient.
         for bucket in &self.leased_buckets {
             bucket.acquire().await.map_err(|e| match e {
                 leased::Error::FailClosed { origin } => Error::ClusterBudgetExhausted { origin },
