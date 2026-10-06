@@ -905,6 +905,133 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
     println!("composite lookup-index counters: {composite_before:?} -> {composite_after:?}");
 }
 
+/// Runtime file restriction skips covered non-candidates while preserving
+/// every uncovered file and the rows it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_filter_restricts_files_and_retains_uncovered_files() {
+    use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
+    use datafusion_datasource::file_scan_config::FileScanConfig;
+    use datafusion_datasource::source::DataSourceExec;
+
+    fn planned_files(plan: &dyn ExecutionPlan) -> usize {
+        if let Some(config) = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+        {
+            return config
+                .file_groups
+                .iter()
+                .map(|group| group.iter().count())
+                .sum();
+        }
+        plan.children()
+            .iter()
+            .map(|child| planned_files(child.as_ref()))
+            .sum()
+    }
+
+    fn restricted_opened_files(plan: &dyn ExecutionPlan) -> Vec<usize> {
+        if plan.name() == "RuntimeRestrictedScanExec" {
+            return vec![
+                plan.metrics()
+                    .expect("restricted scan metrics")
+                    .sum_by_name("files_opened")
+                    .expect("opened file metric")
+                    .as_usize(),
+            ];
+        }
+        plan.children()
+            .iter()
+            .flat_map(|child| restricted_opened_files(child.as_ref()))
+            .collect()
+    }
+
+    const TABLE: &str = "svc_runtime_files";
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let indexed = build_table(&fixture, TABLE, &INDEX_KEYS, Arc::clone(&runtime_env)).await;
+    insert(&indexed, TABLE, service_rows(0, ROWS)).await;
+    wait_for_index(&indexed, TABLE).await;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    ctx.register_table(TABLE, Arc::clone(&indexed) as Arc<dyn TableProvider>)
+        .expect("register indexed table");
+    let sql = |keys: &str| {
+        format!(
+            "SELECT s.\"AutoId\" FROM (VALUES {keys}) k(key) \
+             INNER JOIN {TABLE} s ON k.key = s.\"AutoId\" ORDER BY s.\"AutoId\""
+        )
+    };
+    let full_plan = ctx
+        .sql(&sql("(7)"))
+        .await
+        .expect("fully covered join")
+        .create_physical_plan()
+        .await
+        .expect("fully covered physical plan");
+    let covered_files = planned_files(full_plan.as_ref());
+    assert!(
+        covered_files > 1,
+        "fixture must contain non-candidate files"
+    );
+    let rows = collect(Arc::clone(&full_plan), ctx.task_ctx())
+        .await
+        .expect("fully covered execution");
+    assert_eq!(rendered(&rows), vec!["7"]);
+    assert_eq!(restricted_opened_files(full_plan.as_ref()), vec![1]);
+    println!(
+        "full coverage: {covered_files} planned files, 1 opened; rows=7\n{}",
+        displayable(full_plan.as_ref()).indent(true)
+    );
+
+    // A writer without indexes publishes new data files without index runs.
+    // The reader retains its covered files and pins the mixed-coverage view;
+    // a rebuild requested during execution cannot alter that pinned view.
+    let writer = build_table(&fixture, TABLE, &[], runtime_env).await;
+    insert(&writer, TABLE, service_rows(80_000, ROWS)).await;
+    indexed
+        .refresh(&writer)
+        .await
+        .expect("refresh appended files");
+    let partial_plan = ctx
+        .sql(&sql("(7), (80007)"))
+        .await
+        .expect("partially covered join")
+        .create_physical_plan()
+        .await
+        .expect("partially covered physical plan");
+    let all_files = planned_files(partial_plan.as_ref());
+    let uncovered_files = all_files - covered_files;
+    assert!(uncovered_files > 0, "append must produce uncovered files");
+    let before = counters(&indexed);
+    let rows = collect(Arc::clone(&partial_plan), ctx.task_ctx())
+        .await
+        .expect("partially covered execution");
+    let after = counters(&indexed);
+    assert_eq!(rendered(&rows), vec!["7", "80007"]);
+    assert_eq!(
+        after.partial - before.partial,
+        1,
+        "must probe mixed coverage"
+    );
+    assert_eq!(
+        restricted_opened_files(partial_plan.as_ref()),
+        vec![1 + uncovered_files],
+        "open the covered candidate and every uncovered file"
+    );
+    assert!(
+        1 + uncovered_files < all_files,
+        "skip covered non-candidates"
+    );
+    println!(
+        "partial coverage: {covered_files} covered + {uncovered_files} uncovered, {} opened; \
+         rows=7,80007; counters={before:?} -> {after:?}\n{}",
+        1 + uncovered_files,
+        displayable(partial_plan.as_ref()).indent(true)
+    );
+}
+
 /// The write-time index must be indistinguishable from one built by reading the
 /// finished files, and it must be in place the moment the snapshot is visible.
 ///
