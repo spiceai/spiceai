@@ -281,7 +281,7 @@ mod tests {
 
         let native = || {
             Arc::new(NativeVectorIndex::new(
-                datafusion::sql::TableReference::bare("t"),
+                datafusion::common::TableReference::bare("t"),
                 "embedding".to_string(),
                 vec![Field::new("id", arrow_schema::DataType::Int64, false)],
                 4,
