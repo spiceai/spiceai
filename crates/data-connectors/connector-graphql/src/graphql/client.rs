@@ -1179,21 +1179,20 @@ impl GraphQLClient {
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
-        // When close_connection is true (after a gateway error like 502), build a
-        // fresh reqwest::Client so the retry goes out on a new TCP connection instead
-        // of reusing the (possibly broken) pooled connection. Preserve user-agent and
-        // timeouts to match the original client — GitHub requires a User-Agent header.
-        let http_client = if close_connection {
-            reqwest::Client::builder()
-                .user_agent(util::spiceai_user_agent())
-                .pool_max_idle_per_host(0)
-                .build()
-                .context(ReqwestInternalSnafu)?
-        } else {
-            self.client.clone()
-        };
-
-        let mut request = http_client.post(self.endpoint.clone()).body(body);
+        // Keep `self.client` on every attempt. Replacing it with a default
+        // `Client` drops `Content-Type`, timeouts, compression, and proxy/TLS
+        // (GitHub's client sets those at connector-github/src/lib.rs). The
+        // GraphQL body is always JSON, so set that header here rather than
+        // relying on `default_headers`. After a broken stream, `Connection:
+        // close` asks the pool not to reuse this connection.
+        let mut request = self
+            .client
+            .post(self.endpoint.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if close_connection {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
         request = request_with_auth(request, self.auth.as_ref());
 
         // Replace separated semaphore with RateController semaphore: https://github.com/spiceai/spiceai/issues/8636
@@ -4011,7 +4010,7 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         use serde_json::json;
         use url::Url;
-        use wiremock::matchers::method;
+        use wiremock::matchers::{header, method};
         use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
         use crate::graphql::Error;
@@ -4298,10 +4297,13 @@ mod tests {
         }
 
         /// GitHub's GraphQL API intermittently returns an empty HTTP 200; retry then succeed.
+        /// The retry must keep `Content-Type: application/json` (a default
+        /// replacement client would omit it and get HTTP 415).
         #[tokio::test]
         async fn empty_200_retries_then_succeeds() {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
+                .and(header("content-type", "application/json"))
                 .respond_with(FailThenSucceed {
                     remaining_failures: AtomicU32::new(1),
                     failure: ResponseTemplate::new(200)
