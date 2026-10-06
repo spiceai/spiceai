@@ -20,6 +20,7 @@ use datafusion::catalog::TableProvider;
 use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -277,15 +278,17 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
 /// push them down still cannot return rows the query excluded. When retention
 /// has an inverse, the source is scanned unprojected so the keep predicate can
 /// see columns the caller did not ask for, and those keep filters are residuals
-/// too. The result is cast to the accelerated input schema so a projection that
-/// omitted a filter column still matches the caller's output.
+/// too. The source's scan receives only the filters it accepts for pushdown: a
+/// source may reject any other filter it is handed, and the residuals apply it
+/// anyway. The result is cast to the accelerated input schema so a projection
+/// that omitted a filter column still matches the caller's output.
 async fn scan_fallback_plan(
     federated_provider: &dyn TableProvider,
     scan_params: TableScanParams,
-    keep_filters: &[datafusion::logical_expr::Expr],
+    keep_filters: &[Expr],
     output_schema: SchemaRef,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let fallback_scan_params = if keep_filters.is_empty() {
+    let mut fallback_scan_params = if keep_filters.is_empty() {
         scan_params
     } else {
         scan_params
@@ -293,10 +296,29 @@ async fn scan_fallback_plan(
             .with_additional_filters(keep_filters)
     };
     let residual = fallback_scan_params.filters.clone();
+    fallback_scan_params.filters = pushdown_filters(federated_provider, &residual)?;
     let plan = fallback_scan_params
         .scan_and_optimize(federated_provider, &residual)
         .await?;
     Ok(Arc::new(SchemaCastScanExec::new(plan, output_schema)) as Arc<dyn ExecutionPlan>)
+}
+
+/// The filters `provider` accepts for pushdown, in their original order.
+fn pushdown_filters(provider: &dyn TableProvider, filters: &[Expr]) -> Result<Vec<Expr>> {
+    let support = provider.supports_filters_pushdown(&filters.iter().collect::<Vec<_>>())?;
+    if support.len() != filters.len() {
+        return Err(DataFusionError::Internal(format!(
+            "The source answered pushdown support for {} of {} fallback filters",
+            support.len(),
+            filters.len()
+        )));
+    }
+    Ok(filters
+        .iter()
+        .zip(support)
+        .filter(|(_, support)| *support != TableProviderFilterPushDown::Unsupported)
+        .map(|(filter, _)| filter.clone())
+        .collect())
 }
 
 mod metrics {
