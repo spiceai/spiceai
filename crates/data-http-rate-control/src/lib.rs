@@ -947,7 +947,7 @@ fn resolve_adaptive_rate_control<S: BuildHasher>(
             dataconnector: dataconnector.to_string(),
             connector_component: connector_component.clone(),
             message: format!(
-                "The '{display_name}' parameter is invalid: {detail} See: https://spiceai.org/docs/components/data-connectors/http"
+                "The '{display_name}' parameter is invalid: {detail} See: https://spiceai.org/docs/components/data-connectors/https"
             ),
         }
     })

@@ -470,7 +470,7 @@ impl Https {
                     dataconnector: "https".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!(
-                        "Invalid `response_cache_max_size_bytes` value '{value}'. Expected a whole number of bytes, for example '67108864' for 64 MiB. Use '0' to disable the response cache. See: https://spiceai.org/docs/components/data-connectors/http"
+                        "Invalid `response_cache_max_size_bytes` value '{value}'. Expected a whole number of bytes, for example '67108864' for 64 MiB. Use '0' to disable the response cache. See: https://spiceai.org/docs/components/data-connectors/https"
                     ),
                 }
             })?,
@@ -488,7 +488,7 @@ impl Https {
                     dataconnector: "https".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!(
-                        "Invalid `response_cache_fallback_ttl` value '{value}'. Expected a duration, for example '5m' or '30s'. Leave it unset to keep responses from an origin that sends no `Cache-Control` uncached. See: https://spiceai.org/docs/components/data-connectors/http"
+                        "Invalid `response_cache_fallback_ttl` value '{value}'. Expected a duration, for example '5m' or '30s'. Leave it unset to keep responses from an origin that sends no `Cache-Control` uncached. See: https://spiceai.org/docs/components/data-connectors/https"
                     ),
                     source: Box::new(source),
                 }
