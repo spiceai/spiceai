@@ -218,9 +218,8 @@ async fn test_pk_conflict_detection_none_rejects_upsert_impl(
 
 // --- In-batch duplicate primary keys ---
 // A single `INSERT ... VALUES (1,'a'),(1,'b')` is ONE RecordBatch with two rows
-// sharing a PK. It keeps one row: the last under `upsert_by_arrival`, the first
-// under `drop`; plain `upsert` collapses identical copies and fails on different
-// versions.
+// sharing a PK. It keeps one row, the last, whatever `on_conflict` the table was
+// created with.
 
 test_with_backends!(test_upsert_in_batch_versions_keep_last_impl);
 test_with_backends!(test_upsert_in_batch_duplicate_keeps_last_impl);

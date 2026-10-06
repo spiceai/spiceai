@@ -1901,8 +1901,8 @@ pub struct CayenneTableProvider {
     /// set on the clone a write runs on, from its session.
     superseded_rows: Option<Arc<util::session_state::SupersededRows>>,
     /// How a write orders the copies of a key it repeats, when the writer
-    /// supplies row versions (`on_conflict: upsert_by_time`): the copy with the
-    /// greatest version survives instead of the last to arrive. Set on the clone
+    /// supplies row times (a refresh with a `time_column`): the copy with the
+    /// greatest time survives, the last to arrive on a tie. Set on the clone
     /// a write runs on, from its session.
     pub(crate) row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
     /// Write lock to serialize insert operations and prevent concurrent write races.

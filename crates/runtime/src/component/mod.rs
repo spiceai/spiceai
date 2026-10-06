@@ -114,24 +114,6 @@ pub(crate) fn deprecated_ready_state_warning(
     )
 }
 
-/// The warning that a Cayenne-accelerated component sets `on_conflict` to a
-/// deprecated alias, naming the behavior it stands for. Emitted by the load path
-/// (`init::dataset::warn_about_acceleration_block`).
-pub(crate) fn deprecated_on_conflict_warning(
-    component: AcceleratedComponent,
-    name: &str,
-    alias: spicepod::acceleration::OnConflictBehavior,
-    replacement: spicepod::acceleration::OnConflictBehavior,
-) -> String {
-    let name = name.escape_debug();
-    format!(
-        "{titled} '{name}' sets `on_conflict` to `{alias}`, which is deprecated; it behaves as `{replacement}`. Replace it. See: https://spiceai.org/docs/features/data-acceleration/constraints",
-        titled = component.titled_noun(),
-        alias = alias.name(),
-        replacement = replacement.name(),
-    )
-}
-
 /// What to tell an operator whose dataset or view sets `acceleration.enabled:
 /// false` and leaves settings in the block that the runtime will not apply.
 ///
@@ -181,8 +163,7 @@ pub(crate) fn disabled_acceleration_warning(
 #[cfg(test)]
 mod tests {
     use super::{
-        AcceleratedComponent, deprecated_on_conflict_warning, deprecated_ready_state_warning,
-        disabled_acceleration_warning,
+        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
     };
 
     #[test]
@@ -297,29 +278,6 @@ mod tests {
         );
         assert!(!warning.contains("#acceleration"), "{warning}");
         assert!(!warning.contains('\n'), "{warning}");
-    }
-
-    #[test]
-    fn an_on_conflict_alias_names_what_it_behaves_as() {
-        use spicepod::acceleration::OnConflictBehavior;
-        assert_eq!(
-            deprecated_on_conflict_warning(
-                AcceleratedComponent::Dataset,
-                "events",
-                OnConflictBehavior::UpsertDedupByRowId,
-                OnConflictBehavior::UpsertByArrival,
-            ),
-            "Dataset 'events' sets `on_conflict` to `upsert_dedup_by_row_id`, which is deprecated; it behaves as `upsert_by_arrival`. Replace it. See: https://spiceai.org/docs/features/data-acceleration/constraints"
-        );
-        assert_eq!(
-            deprecated_on_conflict_warning(
-                AcceleratedComponent::View,
-                "api\nWARN forged",
-                OnConflictBehavior::UpsertDedup,
-                OnConflictBehavior::Upsert,
-            ),
-            "View 'api\\nWARN forged' sets `on_conflict` to `upsert_dedup`, which is deprecated; it behaves as `upsert`. Replace it. See: https://spiceai.org/docs/features/data-acceleration/constraints"
-        );
     }
 
     #[test]

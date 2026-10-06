@@ -60,8 +60,8 @@ impl ResolveAfterWrite {
         let share = DedupShare::claim();
         let arrival = ArrivalStream::new(data, resolver, &arrival_name);
         let stamped_batches = arrival.stamped_batches();
-        // A writer that supplies row versions (`upsert_by_time`) orders a key's
-        // copies by version instead of arrival.
+        // A writer that supplies row times (a refresh with a `time_column`) orders
+        // a key's copies by time, then arrival.
         let (order, write_schema, data): (_, _, SendableRecordBatchStream) =
             match &table.row_versions {
                 Some(versions) => {

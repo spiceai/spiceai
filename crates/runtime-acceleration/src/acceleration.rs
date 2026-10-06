@@ -59,11 +59,6 @@ pub enum ParseError {
     InvalidAccelerationConfiguration { detail: String },
 
     #[snafu(display(
-        "`on_conflict: {option}` requires `acceleration.engine: cayenne`. Set it, or use `upsert`. See: https://spiceai.org/docs/features/data-acceleration/constraints"
-    ))]
-    OnConflictRequiresCayenne { option: &'static str },
-
-    #[snafu(display(
         "Column for index '{index}' was not found in the schema. Valid columns: {valid_columns}"
     ))]
     IndexColumnNotFound {
@@ -357,9 +352,7 @@ impl From<spicepod_acceleration::OnConflictBehavior> for OnConflictBehavior {
             spicepod_acceleration::OnConflictBehavior::UpsertDedup => {
                 OnConflictBehavior::Upsert(UpsertOptions::default().with_remove_duplicates(true))
             }
-            spicepod_acceleration::OnConflictBehavior::UpsertDedupByRowId
-            | spicepod_acceleration::OnConflictBehavior::UpsertByArrival
-            | spicepod_acceleration::OnConflictBehavior::UpsertByTime => {
+            spicepod_acceleration::OnConflictBehavior::UpsertDedupByRowId => {
                 OnConflictBehavior::Upsert(UpsertOptions::default().with_last_write_wins(true))
             }
         }
@@ -1000,11 +993,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             indexes.insert(try_parse_column_reference(k.as_str())?, IndexType::from(v));
         }
 
-        let cayenne_only = acceleration
-            .on_conflict
-            .values()
-            .copied()
-            .find(|behavior| behavior.requires_cayenne());
         let mut on_conflict = HashMap::new();
         for (k, v) in acceleration.on_conflict {
             on_conflict.insert(
@@ -1024,15 +1012,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             Engine::Arrow if !acceleration.partition_by.is_empty() => Engine::PartitionedArrow,
             engine => engine,
         };
-
-        if engine != Engine::Cayenne
-            && let Some(behavior) = cayenne_only
-        {
-            return OnConflictRequiresCayenneSnafu {
-                option: behavior.name(),
-            }
-            .fail();
-        }
 
         if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
             && let Some(params) = &mut params
@@ -1437,39 +1416,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use spicepod::param::ParamValue;
     use std::sync::Arc;
-
-    /// `upsert_by_arrival` and `upsert_by_time` load only on Cayenne, where the
-    /// engine keeps the last version to arrive; every other engine refuses them by
-    /// name.
-    #[test]
-    fn cayenne_only_upserts_require_cayenne() {
-        use spicepod_acceleration::OnConflictBehavior as B;
-        for behavior in [B::UpsertByArrival, B::UpsertByTime] {
-            let acceleration = |engine: &str| spicepod_acceleration::Acceleration {
-                engine: Some(engine.to_string()),
-                primary_key: Some("id".to_string()),
-                on_conflict: HashMap::from([("id".to_string(), behavior)]),
-                ..Default::default()
-            };
-            let parsed = Acceleration::try_from(acceleration("cayenne")).expect("Cayenne loads it");
-            assert_eq!(
-                parsed.upsert_options(),
-                UpsertOptions::default().with_last_write_wins(true)
-            );
-            for engine in ["arrow", "duckdb", "sqlite"] {
-                let error = Acceleration::try_from(acceleration(engine))
-                    .expect_err("other engines refuse it");
-                assert_eq!(
-                    error.to_string(),
-                    format!(
-                        "`on_conflict: {}` requires `acceleration.engine: cayenne`. Set it, or use `upsert`. See: https://spiceai.org/docs/features/data-acceleration/constraints",
-                        behavior.name()
-                    ),
-                    "{engine}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn only_a_cayenne_acceleration_with_a_datalake_location_uses_the_datalake() {

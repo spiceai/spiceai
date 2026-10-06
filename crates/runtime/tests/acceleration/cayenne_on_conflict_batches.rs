@@ -40,15 +40,11 @@ use crate::configure_test_datafusion;
 use crate::utils::{runtime_ready_check_with_timeout_err, test_request_context};
 
 /// Every `on_conflict` a dataset may set, and none.
-const POLICIES: [(&str, Option<OnConflictBehavior>); 6] = [
+const POLICIES: [(&str, Option<OnConflictBehavior>); 5] = [
     ("none", None),
     ("drop", Some(OnConflictBehavior::Drop)),
     ("upsert", Some(OnConflictBehavior::Upsert)),
     ("upsert_dedup", Some(OnConflictBehavior::UpsertDedup)),
-    (
-        "upsert_by_arrival",
-        Some(OnConflictBehavior::UpsertByArrival),
-    ),
     (
         "upsert_dedup_by_row_id",
         Some(OnConflictBehavior::UpsertDedupByRowId),

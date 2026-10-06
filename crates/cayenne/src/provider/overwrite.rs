@@ -670,8 +670,8 @@ impl CayenneTableProvider {
         // (`overwrite_postpass`): each batch resolves its own repeats and stamps
         // its rows with its arrival sequence, and once the files are written a
         // query finds every copy of a key but its last.
-        // A writer that supplies row versions (`upsert_by_time`) orders the copies
-        // by version instead of arrival.
+        // A writer that supplies row times (a refresh with a `time_column`) orders
+        // the copies by time, then arrival.
         let mut postpass: Option<(CopyOrder, Vec<String>)> = None;
         let mut dedup_share: Option<super::overwrite_postpass::DedupShare> = None;
         let data: SendableRecordBatchStream = match self.key_resolver()? {

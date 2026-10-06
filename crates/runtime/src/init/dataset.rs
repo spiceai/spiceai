@@ -45,12 +45,11 @@ use crate::{
     accelerated::AcceleratedTable,
     component::dataset::{
         Dataset,
-        acceleration::{Acceleration, DurableWriteBackKey, Mode, OnConflictBehavior, RefreshMode},
+        acceleration::{Acceleration, DurableWriteBackKey, Mode, RefreshMode},
         builder::DatasetBuilder,
     },
     component::{
-        AcceleratedComponent, deprecated_on_conflict_warning, deprecated_ready_state_warning,
-        disabled_acceleration_warning,
+        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
     },
     dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
@@ -167,23 +166,6 @@ pub(crate) fn warn_about_acceleration_block(
     let sets_deprecated_ready_state = acceleration.ready_state.is_some();
     if sets_deprecated_ready_state {
         tracing::warn!("{}", deprecated_ready_state_warning(component, name));
-    }
-
-    // Only Cayenne gives the aliases the behavior the warning names; other
-    // engines keep their own meaning for them.
-    if acceleration
-        .engine
-        .as_deref()
-        .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-    {
-        for alias in acceleration.on_conflict.values().copied() {
-            if let Some(replacement) = alias.replacement() {
-                tracing::warn!(
-                    "{}",
-                    deprecated_on_conflict_warning(component, name, alias, replacement)
-                );
-            }
-        }
     }
 }
 
@@ -1245,21 +1227,12 @@ impl Runtime {
             {
                 tracing::warn!(
                     "{}",
-                    upsert_by_time_no_overlap_warning(&ds.name.to_string())
+                    newest_by_time_without_overlap_warning(
+                        &ds.name.to_string(),
+                        ds.time_column.as_deref().unwrap_or_default(),
+                    )
                 );
             }
-        }
-
-        if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled)
-            && acceleration.refresh_append_overlap.is_some()
-            && data_connector.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Append
-            && !acceleration.orders_versions_by_time(ds.time_column.as_deref(), RefreshMode::Append)
-            && let Some(on_conflict) = upsert_overwritten_by_overlap(acceleration)
-        {
-            tracing::warn!(
-                "{}",
-                upsert_with_overlap_warning(&ds.name.to_string(), on_conflict)
-            );
         }
 
         // A `drasi` block only takes effect through the change stream, so a
@@ -2810,45 +2783,11 @@ async fn await_hot_reload_initial_refresh(
     .fail()
 }
 
-const UPSERT_BY_TIME_DOCS: &str =
-    "https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time";
-
-/// Warning for an append refresh under `on_conflict: upsert_by_time` with no
-/// `refresh_append_overlap`.
-fn upsert_by_time_no_overlap_warning(dataset_name: &str) -> String {
+/// Warning for an append that keeps the newest version of each key by `time_column`
+/// but has no `refresh_append_overlap`, so it never re-reads a late row.
+fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str) -> String {
     format!(
-        "Dataset '{dataset_name}' uses 'acceleration.on_conflict: upsert_by_time' on append with no 'acceleration.refresh_append_overlap', so a row older than the newest one loaded is never fetched. Set 'acceleration.refresh_append_overlap' to the most a row can arrive late. See: {UPSERT_BY_TIME_DOCS}"
-    )
-}
-
-/// The `on_conflict` value, as spelled in the Spicepod, of an upsert that lets a late,
-/// older row re-read by `refresh_append_overlap` replace the newer row already loaded,
-/// for an acceleration that does not order versions by time.
-fn upsert_overwritten_by_overlap(acceleration: &Acceleration) -> Option<&'static str> {
-    let cayenne = acceleration.engine == crate::component::dataset::acceleration::Engine::Cayenne;
-    acceleration
-        .on_conflict
-        .values()
-        .find_map(|behavior| match behavior {
-            OnConflictBehavior::Upsert(options) if options.last_write_wins && cayenne => {
-                Some("upsert_by_arrival")
-            }
-            OnConflictBehavior::Upsert(options) if options.last_write_wins => {
-                Some("upsert_dedup_by_row_id")
-            }
-            OnConflictBehavior::Upsert(options) if options.remove_duplicates => {
-                Some("upsert_dedup")
-            }
-            OnConflictBehavior::Upsert(_) => Some("upsert"),
-            OnConflictBehavior::Drop => None,
-        })
-}
-
-/// Warning for an append refresh that re-reads `refresh_append_overlap` under an upsert
-/// that does not order versions by time.
-fn upsert_with_overlap_warning(dataset_name: &str, on_conflict: &str) -> String {
-    format!(
-        "Dataset '{dataset_name}' uses 'acceleration.on_conflict: {on_conflict}' with 'acceleration.refresh_append_overlap', so a late, older row the overlap re-reads replaces the newer one already loaded. Use 'acceleration.on_conflict: upsert_by_time' to keep the newest version by 'time_column'. See: {UPSERT_BY_TIME_DOCS}"
+        "Dataset '{dataset_name}' keeps the newest version of each key by '{time_column}', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
     )
 }
 
@@ -3283,57 +3222,12 @@ fn with_localpod_dependents(
 mod tests {
     use super::*;
 
-    mod upsert_by_time {
-        use super::*;
-        #[test]
-        fn the_upsert_with_overlap_warning_names_the_value_and_the_fix() {
-            assert_eq!(
-                upsert_with_overlap_warning("events", "upsert"),
-                "Dataset 'events' uses 'acceleration.on_conflict: upsert' with 'acceleration.refresh_append_overlap', so a late, older row the overlap re-reads replaces the newer one already loaded. Use 'acceleration.on_conflict: upsert_by_time' to keep the newest version by 'time_column'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
-            );
-        }
-
-        #[test]
-        fn every_upsert_but_by_time_is_overwritten_by_the_overlap() {
-            use spicepod::acceleration::OnConflictBehavior as B;
-            let with = |engine: &str, behavior: B| {
-                let mut spicepod = spicepod::acceleration::Acceleration {
-                    engine: Some(engine.to_string()),
-                    ..Default::default()
-                };
-                spicepod.on_conflict.insert("id".to_string(), behavior);
-                Acceleration::try_from(spicepod).expect("valid acceleration")
-            };
-            for engine in ["cayenne", "duckdb"] {
-                assert_eq!(
-                    upsert_overwritten_by_overlap(&with(engine, B::Upsert)),
-                    Some("upsert")
-                );
-                assert_eq!(
-                    upsert_overwritten_by_overlap(&with(engine, B::UpsertDedup)),
-                    Some("upsert_dedup")
-                );
-                assert_eq!(upsert_overwritten_by_overlap(&with(engine, B::Drop)), None);
-            }
-            assert_eq!(
-                upsert_overwritten_by_overlap(&with("duckdb", B::UpsertDedupByRowId)),
-                Some("upsert_dedup_by_row_id")
-            );
-            for behavior in [B::UpsertDedupByRowId, B::UpsertByArrival] {
-                assert_eq!(
-                    upsert_overwritten_by_overlap(&with("cayenne", behavior)),
-                    Some("upsert_by_arrival")
-                );
-            }
-        }
-
-        #[test]
-        fn the_no_overlap_warning_explains_what_is_never_fetched() {
-            assert_eq!(
-                upsert_by_time_no_overlap_warning("events"),
-                "Dataset 'events' uses 'acceleration.on_conflict: upsert_by_time' on append with no 'acceleration.refresh_append_overlap', so a row older than the newest one loaded is never fetched. Set 'acceleration.refresh_append_overlap' to the most a row can arrive late. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
-            );
-        }
+    #[test]
+    fn the_no_overlap_warning_explains_what_is_never_fetched() {
+        assert_eq!(
+            newest_by_time_without_overlap_warning("events", "updated_at"),
+            "Dataset 'events' keeps the newest version of each key by 'updated_at', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+        );
     }
 
     /// Every retention setting has to be recognised, whichever one the dataset
