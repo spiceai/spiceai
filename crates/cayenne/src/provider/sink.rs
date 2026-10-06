@@ -317,9 +317,12 @@ impl DataSink for CayenneDataSink {
             Err(versioned_append_refused(self.table.table_name()))
         } else if let Some(interval) = self.context.stream_publish_interval()
             && self.table.key_resolver()?.is_none()
+            && !self.is_unkeyed_load_into_empty_table().await
         {
             // A keyed conflict-policy write is one statement: validation must
-            // finish before any part is visible. Other streams may publish in
+            // finish before any part is visible. An unkeyed load into an empty
+            // table is written as one append too (see
+            // `is_unkeyed_load_into_empty_table`). Other streams may publish in
             // segments to bound latency.
             // Append path with bounded publish latency: cut the input stream
             // into age/size-bounded segments and run a complete
@@ -418,6 +421,23 @@ impl CayenneDataSink {
         let row_count = staged.row_count();
         txn.set_staged(table_id, staged);
         Ok(row_count)
+    }
+
+    /// Whether this append loads an unkeyed table that holds no rows, such as a
+    /// refresh's first load after a cold start. Such a load is written as one
+    /// append rather than in publish segments: an unkeyed table compacts its
+    /// current files by rewriting the whole table under the write lock, so
+    /// segments that each add files toward the compaction trigger would stall
+    /// the load behind repeated rewrites of its own rows. Keyed tables keep
+    /// segments, each validated against the rows already published.
+    ///
+    /// The check takes no lock: either path is correct for an unkeyed table, so
+    /// a concurrent write only changes which one this append takes.
+    async fn is_unkeyed_load_into_empty_table(&self) -> bool {
+        let metadata = self.table.metadata();
+        metadata.primary_key.is_empty()
+            && metadata.on_conflict.is_none()
+            && self.table.holds_no_rows().await
     }
 
     /// Append with bounded ingest-to-queryable latency: consume the input in
@@ -972,6 +992,166 @@ mod tests {
             4,
             "all rows visible after stream end"
         );
+    }
+
+    /// Regression test for slow cold starts of an unkeyed, sorted `append`
+    /// acceleration. A load into an empty unkeyed table publishes once, when its
+    /// input ends: if it published in segments, every few segments would trigger a
+    /// compaction that rewrites the whole table under the write lock while the
+    /// load waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unkeyed_load_into_empty_table_publishes_once() {
+        // Each input batch exceeds the minimum segment size (8 MiB), so a
+        // segmented write would cut one segment per batch.
+        const BATCHES: i64 = 5;
+        const ROWS_PER_BATCH: i64 = 600_000;
+        const TAIL_ROWS: i64 = 10;
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int64, false),
+        ]));
+        let vortex_config = VortexConfig {
+            stream_publish_interval_ms: 60_000,
+            target_vortex_file_size_mb: 8,
+            compaction_trigger_files: 4,
+            write_concurrency: Some(2),
+            sort_columns: vec!["k".to_string()],
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "first_load");
+        let sink_context = Arc::clone(&context);
+        let options = CreateTableOptions {
+            table_name: "first_load".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+        let created_snapshot = provider.get_current_snapshot_id();
+
+        let input_consumed = Arc::new(Notify::new());
+        let consumed_for_stream = Arc::clone(&input_consumed);
+        let release_tail = Arc::new(Notify::new());
+        let release_for_stream = Arc::clone(&release_tail);
+        let stream_schema = Arc::clone(&schema);
+        let batches = futures::stream::unfold(0_i64, move |i| {
+            let consumed = Arc::clone(&consumed_for_stream);
+            let release = Arc::clone(&release_for_stream);
+            let schema = Arc::clone(&stream_schema);
+            async move {
+                match i {
+                    i if i < BATCHES => Some((
+                        Ok(id_key_batch(&schema, i * ROWS_PER_BATCH, ROWS_PER_BATCH)),
+                        i + 1,
+                    )),
+                    i if i == BATCHES => {
+                        // Every bulk batch has been read; hold the input open.
+                        consumed.notify_one();
+                        release.notified().await;
+                        Some((
+                            Ok(id_key_batch(&schema, BATCHES * ROWS_PER_BATCH, TAIL_ROWS)),
+                            i + 1,
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), batches));
+        let sink = CayenneDataSink::new(
+            provider.clone_for_write(),
+            InsertOp::Append,
+            Arc::clone(&schema),
+            sink_context,
+        );
+        let task_ctx = ctx.task_ctx();
+        let write = tokio::spawn(async move { sink.write_all(stream, &task_ctx).await });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            input_consumed.notified(),
+        )
+        .await
+        .expect("the sink read every bulk batch");
+        assert_eq!(
+            visible_rows(&ctx, &provider).await,
+            0,
+            "no part of the load is published while its input is open"
+        );
+        assert!(!write.is_finished(), "the load is still reading input");
+
+        release_tail.notify_one();
+        let total_rows = BATCHES * ROWS_PER_BATCH + TAIL_ROWS;
+        let written = write.await.expect("join").expect("write_all");
+        assert_eq!(written, u64::try_from(total_rows).expect("non-negative"));
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain maintenance");
+        assert_eq!(
+            provider.get_current_snapshot_id(),
+            created_snapshot,
+            "the load's files were not rewritten by compaction"
+        );
+
+        ctx.register_table("first_load", Arc::new(provider.clone_for_write()))
+            .expect("register");
+        let got = ctx
+            .sql("SELECT COUNT(*), COUNT(DISTINCT id), SUM(id), MIN(id), MAX(id) FROM first_load")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("query");
+        let row = &got[0];
+        let value = |column: usize| {
+            row.column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64 aggregate")
+                .value(0)
+        };
+        assert_eq!(value(0), total_rows, "row count");
+        assert_eq!(value(1), total_rows, "every row once");
+        assert_eq!(value(2), total_rows * (total_rows - 1) / 2, "id sum");
+        assert_eq!(value(3), 0, "min id");
+        assert_eq!(value(4), total_rows - 1, "max id");
+    }
+
+    /// Rows `start..start + rows` with a scattered sort key, so the encoded files
+    /// are not trivially small.
+    fn id_key_batch(schema: &Arc<Schema>, start: i64, rows: i64) -> RecordBatch {
+        let ids: Vec<i64> = (start..start + rows).collect();
+        let keys: Vec<i64> = ids
+            .iter()
+            .map(|id| id.wrapping_mul(2_654_435_761).rem_euclid(1_000_003))
+            .collect();
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(keys)),
+            ],
+        )
+        .expect("batch")
     }
 
     fn int64_batch(schema: &Arc<Schema>, values: Vec<i64>) -> RecordBatch {
