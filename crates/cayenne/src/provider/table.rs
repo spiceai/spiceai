@@ -35535,6 +35535,9 @@ impl CayenneTableProvider {
             // no statistics at all re-infers on first touch in each process and is then
             // held by `scan_file_statistics`.
             && crate::stats::blob_carries_per_column_byte_sizes(&statistics)
+            // A blob written before NaN was accounted for has its float bounds
+            // ignored; re-inferring from the footer restores them.
+            && crate::stats::blob_accounts_for_nan(&persisted.statistics_blob, &table_schema)
         {
             self.scan_file_statistics.put(
                 &TableScopedPath {

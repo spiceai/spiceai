@@ -459,6 +459,24 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
         }
     }
 
+    // A float column's bounds and sum are only ever produced for a column that
+    // holds no NaN (`ColumnStatsAccumulator::float64_min_max`,
+    // `VortexFormat::infer_stats`), so record that alongside them: the reader
+    // trusts float stats only when the blob says the column holds no NaN, which
+    // a blob written before NaN was accounted for does not.
+    let is_float = |value: &Precision<ScalarValue>| {
+        matches!(
+            value.get_value(),
+            Some(ScalarValue::Float16(_) | ScalarValue::Float32(_) | ScalarValue::Float64(_))
+        )
+    };
+    if is_float(&cs.min_value) || is_float(&cs.max_value) || is_float(&cs.sum_value) {
+        stats.set(
+            Stat::NaNCount,
+            VortexPrecision::Exact(vortex::scalar::ScalarValue::from(0_u64)),
+        );
+    }
+
     if let Some(count) = cs.null_count.get_value() {
         // `usize -> u64` is lossless on all currently supported targets
         // (cayenne requires \u2265 64-bit pointers per project policy), but use
@@ -534,6 +552,15 @@ pub(crate) fn stats_set_to_column_stats(
             .and_then(|size| usize::try_from(size).ok()),
     );
 
+    // A float column's min, max and sum leave its NaNs out, while `DataFusion`
+    // orders a NaN like any other value and sums it to NaN, so they are used
+    // only when the stats record that the column holds no NaN.
+    let (min_value, max_value, sum_value) = if records_no_nan(stats, dtype) {
+        (min_value, max_value, sum_value)
+    } else {
+        (Precision::Absent, Precision::Absent, Precision::Absent)
+    };
+
     ColumnStatistics {
         null_count,
         max_value,
@@ -542,6 +569,34 @@ pub(crate) fn stats_set_to_column_stats(
         distinct_count: Precision::Absent,
         byte_size,
     }
+}
+
+/// Whether a column's bounds and sum can be trusted to account for NaN: it is
+/// not a float column, or its stats record that it holds none.
+fn records_no_nan(stats: &StatsSet, dtype: &DType) -> bool {
+    !dtype.is_float()
+        || stats
+            .get_as::<u64>(Stat::NaNCount, &vortex::dtype::PType::U64.into())
+            .as_exact()
+            == Some(0)
+}
+
+/// Whether a persisted blob accounts for NaN in every float column it bounds.
+///
+/// A blob written before NaN was accounted for carries a float column's
+/// NaN-excluding bounds and no NaN count. Those bounds are never used (see
+/// `stats_set_to_column_stats`), so such a blob is stale: re-inferring the file's
+/// statistics from its footer, which records the NaN count, restores them.
+pub(crate) fn blob_accounts_for_nan(blob: &[u8], schema: &Schema) -> bool {
+    let Ok(file_stats) = deserialize_file_statistics(blob, schema) else {
+        return false;
+    };
+    file_stats.into_iter().all(|(stats, dtype)| {
+        let bounded = [Stat::Min, Stat::Max, Stat::Sum]
+            .into_iter()
+            .any(|stat| !stats.get(stat).is_absent());
+        !bounded || records_no_nan(stats, dtype)
+    })
 }
 
 /// Convert a Vortex [`FileStatistics`] to `DataFusion` [`Statistics`].
@@ -1057,6 +1112,71 @@ mod tests {
             col.max_value,
             DfPrecision::Exact(ScalarValue::Utf8(Some("cherry".into())))
         );
+    }
+
+    /// A float column's bounds leave its NaNs out, so they are used only when the
+    /// blob records that the column holds none; a blob written before that was
+    /// recorded is stale (spiceai/spiceai#14719).
+    #[test]
+    fn float_bounds_are_used_only_when_the_blob_records_no_nan() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Float64, true),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let float_stats = ColumnStatistics {
+            null_count: DfPrecision::Exact(0),
+            min_value: DfPrecision::Exact(ScalarValue::Float64(Some(-2.5))),
+            max_value: DfPrecision::Exact(ScalarValue::Float64(Some(7.5))),
+            sum_value: DfPrecision::Exact(ScalarValue::Float64(Some(5.0))),
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let int_stats = ColumnStatistics {
+            null_count: DfPrecision::Exact(0),
+            min_value: DfPrecision::Exact(ScalarValue::Int64(Some(1))),
+            max_value: DfPrecision::Exact(ScalarValue::Int64(Some(3))),
+            sum_value: DfPrecision::Absent,
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let blob = |float_set: StatsSet| {
+            let file_stats = build_file_statistics(
+                vec![float_set, column_stats_to_stats_set(&int_stats)],
+                &schema,
+            )
+            .expect("statistics types convert");
+            serialize_file_statistics(&file_stats).expect("serialize ok")
+        };
+
+        let current = blob(column_stats_to_stats_set(&float_stats));
+        assert!(blob_accounts_for_nan(&current, &schema));
+        let restored = statistics_from_persisted_blob(&current, &schema, 3).expect("blob restores");
+        assert_eq!(
+            restored.column_statistics[0].min_value,
+            float_stats.min_value
+        );
+        assert_eq!(
+            restored.column_statistics[0].max_value,
+            float_stats.max_value
+        );
+        assert_eq!(
+            restored.column_statistics[0].sum_value,
+            float_stats.sum_value
+        );
+
+        let mut legacy_set = column_stats_to_stats_set(&float_stats);
+        legacy_set.clear(Stat::NaNCount);
+        let legacy = blob(legacy_set);
+        assert!(!blob_accounts_for_nan(&legacy, &schema));
+        let restored = statistics_from_persisted_blob(&legacy, &schema, 3).expect("blob restores");
+        let float_column = &restored.column_statistics[0];
+        assert_eq!(float_column.min_value, DfPrecision::Absent);
+        assert_eq!(float_column.max_value, DfPrecision::Absent);
+        assert_eq!(float_column.sum_value, DfPrecision::Absent);
+        assert_eq!(float_column.null_count, DfPrecision::Exact(0));
+        // A column that cannot hold a NaN keeps its bounds either way.
+        assert_eq!(restored.column_statistics[1].min_value, int_stats.min_value);
+        assert_eq!(restored.column_statistics[1].max_value, int_stats.max_value);
     }
 
     #[test]

@@ -1094,11 +1094,26 @@ impl FileFormat for VortexFormat {
                     None => stats::Precision::Absent,
                 };
 
+                // Vortex leaves NaN out of a float column's min, max and sum, but
+                // `DataFusion` orders a NaN like any other value (`NaN = NaN`, a
+                // positive NaN above `+inf`) and sums it to NaN. Those stats would
+                // let pruning skip a NaN row and answer `MIN`/`MAX`/`SUM` without
+                // it, so they are kept only when the footer proves the file holds
+                // no NaN.
+                let nan_free = !stats_dtype.is_float()
+                    || stats_set
+                        .get_as::<u64>(Stat::NaNCount, &PType::U64.into())
+                        .as_exact()
+                        == Some(0);
+                let unless_nan = |value: Precision<ScalarValue>| {
+                    if nan_free { value } else { Precision::Absent }
+                };
+
                 column_statistics.push(ColumnStatistics {
                     null_count: null_count.to_df(),
-                    min_value: min.to_df(),
-                    max_value: max.to_df(),
-                    sum_value: sum.to_df(),
+                    min_value: unless_nan(min.to_df()),
+                    max_value: unless_nan(max.to_df()),
+                    sum_value: unless_nan(sum.to_df()),
                     distinct_count: distinct_count_from_is_constant(stats_set.get_as::<bool>(
                         Stat::IsConstant,
                         &DType::Bool(Nullability::NonNullable),

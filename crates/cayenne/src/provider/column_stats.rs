@@ -370,7 +370,7 @@ impl ColumnStatsAccumulator {
         col: &dyn arrow::array::Array,
     ) -> (Option<ScalarValue>, Option<ScalarValue>) {
         // O(n) linear scan to find min/max using `ScalarValue` comparison.
-        // NaN values are skipped entirely so stats remain deterministic.
+        // A column holding a NaN reports no bounds: see `float64_min_max`.
         let mut batch_min: Option<datafusion_common::ScalarValue> = None;
         let mut batch_max: Option<datafusion_common::ScalarValue> = None;
 
@@ -382,9 +382,9 @@ impl ColumnStatsAccumulator {
                 continue;
             };
 
-            // Skip NaN: partial_cmp(NaN, x) always returns None
+            // Only a NaN fails to compare equal to itself.
             if value.partial_cmp(&value) != Some(std::cmp::Ordering::Equal) {
-                continue;
+                return (None, None);
             }
 
             batch_min = Some(match batch_min {
@@ -568,13 +568,14 @@ impl ColumnStatsAccumulator {
         }
     }
 
+    /// The column's bounds, or none when it holds a NaN: see `float64_min_max`.
     fn float32_min_max(array: &Float32Array) -> (Option<f32>, Option<f32>) {
         let mut min_value: Option<f32> = None;
         let mut max_value: Option<f32> = None;
 
         for value in array.iter().flatten() {
             if value.is_nan() {
-                continue;
+                return (None, None);
             }
             min_value = Some(match min_value {
                 Some(current) if current <= value => current,
@@ -589,13 +590,20 @@ impl ColumnStatsAccumulator {
         (min_value, max_value)
     }
 
+    /// The column's bounds, or none when it holds a NaN.
+    ///
+    /// `DataFusion` orders floats by IEEE 754 total order, so a NaN is a value
+    /// like any other: `NaN = NaN` holds, and a positive NaN sorts above `+inf`
+    /// (a negative one below `-inf`). Bounds that left it out would let pruning
+    /// skip the rows a NaN probe or an `x > c` matches, and let `MIN`/`MAX` be
+    /// answered from them without the NaN (spiceai/spiceai#14719).
     fn float64_min_max(array: &Float64Array) -> (Option<f64>, Option<f64>) {
         let mut min_value: Option<f64> = None;
         let mut max_value: Option<f64> = None;
 
         for value in array.iter().flatten() {
             if value.is_nan() {
-                continue;
+                return (None, None);
             }
             min_value = Some(match min_value {
                 Some(current) if current <= value => current,
