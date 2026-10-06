@@ -44,8 +44,8 @@ pub enum ChangeOp {
 impl ChangeOp {
     /// Maps a Debezium operation code onto a Drasi operation.
     ///
-    /// A snapshot read (`r`) becomes an insert: it carries a row's initial state,
-    /// which is exactly what Drasi needs to seed the graph.
+    /// Debezium creates (`c`) and snapshot reads (`r`) become updates. Drasi's
+    /// update operation replaces the full node state and creates it when absent.
     ///
     /// # Errors
     ///
@@ -55,8 +55,7 @@ impl ChangeOp {
     /// source no longer has.
     pub fn from_op_code(code: &str) -> std::result::Result<Self, &str> {
         match code {
-            "c" | "r" => Ok(ChangeOp::Insert),
-            "u" => Ok(ChangeOp::Update),
+            "c" | "r" | "u" => Ok(ChangeOp::Update),
             "d" => Ok(ChangeOp::Delete),
             other => Err(other),
         }
@@ -281,11 +280,18 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reads_seed_the_graph_as_inserts() {
-        assert_eq!(ChangeOp::from_op_code("c"), Ok(ChangeOp::Insert));
-        assert_eq!(ChangeOp::from_op_code("r"), Ok(ChangeOp::Insert));
+    fn creates_snapshots_and_updates_use_upsert_semantics() {
+        assert_eq!(ChangeOp::from_op_code("c"), Ok(ChangeOp::Update));
+        assert_eq!(ChangeOp::from_op_code("r"), Ok(ChangeOp::Update));
         assert_eq!(ChangeOp::from_op_code("u"), Ok(ChangeOp::Update));
         assert_eq!(ChangeOp::from_op_code("d"), Ok(ChangeOp::Delete));
+    }
+
+    #[test]
+    fn platform_codes_remain_distinct_for_insert_update_and_delete() {
+        assert_eq!(ChangeOp::Insert.platform_code(), "i");
+        assert_eq!(ChangeOp::Update.platform_code(), "u");
+        assert_eq!(ChangeOp::Delete.platform_code(), "d");
     }
 
     /// Truncate deletes every row without naming any, so it cannot be forwarded

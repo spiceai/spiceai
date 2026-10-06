@@ -346,6 +346,8 @@ Configured as `.vectors.engine` on a column-level embedding.
 
 Configured as `.drasi` on a dataset accelerated with `refresh_mode: changes`. Publishes the dataset's change-data-capture stream to a [Drasi](https://drasi.io) source, so Drasi continuous queries react to the same changes Spice applies to the local accelerator. One row becomes one graph node: the primary key derives the element id, the source table name becomes the node label, and the row's columns become node properties.
 
+CDC creates (`c`), snapshot rows (`r`), and updates (`u`) are forwarded as full-state Drasi updates, which create a node when it does not yet exist. Deletes (`d`) remain deletes. This uses Drasi's upsert behavior for initial rows as well as later changes; runtime-table append inserts are unchanged.
+
 Forwarding runs before the change is acknowledged to the source, so delivery is at-least-once — a change is replayed rather than lost if Drasi is unreachable.
 
 ```yaml

@@ -361,7 +361,7 @@ mod tests {
             .expect("maps rows");
 
         assert_eq!(prepared.len(), 2);
-        assert_eq!(prepared[0].op, ChangeOp::Insert);
+        assert_eq!(prepared[0].op, ChangeOp::Update);
         assert_eq!(prepared[0].node.id, "public.orders:1");
         assert_eq!(prepared[1].op, ChangeOp::Delete);
         assert_eq!(prepared[1].node.id, "public.orders:2");
