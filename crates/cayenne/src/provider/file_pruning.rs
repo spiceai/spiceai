@@ -211,20 +211,23 @@ pub(crate) fn statistics_from_record_batches(
                     continue;
                 }
                 let col = batch.column(col_idx);
-                null_count += col.null_count();
+                let col_nulls = col.null_count();
+                null_count += col_nulls;
+                if unbounded {
+                    continue;
+                }
                 let col_stats = ColumnStatsAccumulator::compute_column_stats(col.as_ref());
-                if col.null_count() < col.len()
+                if col_nulls < col.len()
                     && (col_stats.min_value.get_value().is_none()
                         || col_stats.max_value.get_value().is_none())
                 {
                     unbounded = true;
+                    min_value = datafusion_common::stats::Precision::Absent;
+                    max_value = datafusion_common::stats::Precision::Absent;
+                    continue;
                 }
                 min_value = merge_min(&min_value, &col_stats.min_value);
                 max_value = merge_max(&max_value, &col_stats.max_value);
-            }
-            if unbounded {
-                min_value = datafusion_common::stats::Precision::Absent;
-                max_value = datafusion_common::stats::Precision::Absent;
             }
 
             datafusion_common::ColumnStatistics {

@@ -322,6 +322,25 @@ pub fn env_scale(var: &str) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// The key a per-file statistics row is stored under: the object-store location,
+/// which is the store-relative path. The manifest carries only the bare filename.
+pub fn statistics_row_key(
+    data_path: &std::path::Path,
+    table_id: &str,
+    file: &cayenne::metadata::SnapshotFile,
+) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        data_path
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .trim_end_matches('/'),
+        table_id,
+        file.snapshot_id,
+        file.file_path
+    )
+}
+
 /// Extract the row count from insert result batches.
 fn extract_row_count(results: &[RecordBatch]) -> u64 {
     use arrow::datatypes::DataType;

@@ -465,10 +465,9 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     // trusts float stats only when the blob says the column holds no NaN, which
     // a blob written before NaN was accounted for does not.
     let is_float = |value: &Precision<ScalarValue>| {
-        matches!(
-            value.get_value(),
-            Some(ScalarValue::Float16(_) | ScalarValue::Float32(_) | ScalarValue::Float64(_))
-        )
+        value
+            .get_value()
+            .is_some_and(|v| v.data_type().is_floating())
     };
     if is_float(&cs.min_value) || is_float(&cs.max_value) || is_float(&cs.sum_value) {
         stats.set(
@@ -511,17 +510,20 @@ pub(crate) fn stats_set_to_column_stats(
     dtype: &DType,
     column_type: Option<&DataType>,
 ) -> ColumnStatistics {
-    let min_value = vortex_precision_to_df(
-        stats
-            .get(Stat::Min)
-            .and_then(|v| vortex_stat_to_df(&v, Stat::Min, dtype, column_type)),
-    );
-
-    let max_value = vortex_precision_to_df(
-        stats
-            .get(Stat::Max)
-            .and_then(|v| vortex_stat_to_df(&v, Stat::Max, dtype, column_type)),
-    );
+    // Float bounds and sums leave NaN out; see `bounds_account_for_nan`.
+    let bounds_usable = vortex_datafusion::bounds_account_for_nan(stats, dtype);
+    let bound = |stat: Stat, column_type: Option<&DataType>| {
+        if !bounds_usable {
+            return Precision::Absent;
+        }
+        vortex_precision_to_df(
+            stats
+                .get(stat)
+                .and_then(|v| vortex_stat_to_df(&v, stat, dtype, column_type)),
+        )
+    };
+    let min_value = bound(Stat::Min, column_type);
+    let max_value = bound(Stat::Max, column_type);
 
     let null_count = vortex_precision_to_df(
         stats
@@ -534,11 +536,7 @@ pub(crate) fn stats_set_to_column_stats(
     // `vortex_stat_to_df` reconstructs that via `Stat::Sum.dtype(dtype)`. This
     // lets the metadata-only `SUM`/`AVG` fold (`crate::stats_aggregate`) answer
     // whole-table sums without a scan.
-    let sum_value = vortex_precision_to_df(
-        stats
-            .get(Stat::Sum)
-            .and_then(|v| vortex_stat_to_df(&v, Stat::Sum, dtype, None)),
-    );
+    let sum_value = bound(Stat::Sum, None);
 
     // The uncompressed size the footer reported when this blob was written. A blob
     // written before this stat was persisted has none, which `file_statistics_to_df`
@@ -552,15 +550,6 @@ pub(crate) fn stats_set_to_column_stats(
             .and_then(|size| usize::try_from(size).ok()),
     );
 
-    // A float column's min, max and sum leave its NaNs out, while `DataFusion`
-    // orders a NaN like any other value and sums it to NaN, so they are used
-    // only when the stats record that the column holds no NaN.
-    let (min_value, max_value, sum_value) = if records_no_nan(stats, dtype) {
-        (min_value, max_value, sum_value)
-    } else {
-        (Precision::Absent, Precision::Absent, Precision::Absent)
-    };
-
     ColumnStatistics {
         null_count,
         max_value,
@@ -569,16 +558,6 @@ pub(crate) fn stats_set_to_column_stats(
         distinct_count: Precision::Absent,
         byte_size,
     }
-}
-
-/// Whether a column's bounds and sum can be trusted to account for NaN: it is
-/// not a float column, or its stats record that it holds none.
-fn records_no_nan(stats: &StatsSet, dtype: &DType) -> bool {
-    !dtype.is_float()
-        || stats
-            .get_as::<u64>(Stat::NaNCount, &vortex::dtype::PType::U64.into())
-            .as_exact()
-            == Some(0)
 }
 
 /// Convert a Vortex [`FileStatistics`] to `DataFusion` [`Statistics`].
@@ -731,10 +710,10 @@ pub(crate) fn restore_persisted_statistics(
 ) -> Option<RestoredStatistics> {
     let file_stats = deserialize_file_statistics(blob, schema).ok()?;
     let accounts_for_nan = file_stats.into_iter().all(|(stats, dtype)| {
-        let bounded = [Stat::Min, Stat::Max, Stat::Sum]
-            .into_iter()
-            .any(|stat| !stats.get(stat).is_absent());
-        !bounded || records_no_nan(stats, dtype)
+        let bounded = stats
+            .iter()
+            .any(|(stat, _)| matches!(stat, Stat::Min | Stat::Max | Stat::Sum));
+        !bounded || vortex_datafusion::bounds_account_for_nan(stats, dtype)
     });
     Some(RestoredStatistics {
         statistics: Arc::new(file_statistics_to_df(&file_stats, schema, num_rows)),

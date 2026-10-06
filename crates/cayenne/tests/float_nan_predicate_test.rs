@@ -144,6 +144,18 @@ fn lookups(data_type: &DataType) -> Vec<String> {
     sql
 }
 
+/// The files an `EXPLAIN ANALYZE` plan says its Cayenne scans read.
+fn files_scanned(plan: &[RecordBatch]) -> usize {
+    let plan = arrow::util::pretty::pretty_format_batches(plan)
+        .expect("plan renders")
+        .to_string();
+    assert!(
+        plan.contains(" files_scanned="),
+        "the plan reports no Cayenne file scan:\n{plan}"
+    );
+    explain_total(&plan, "files_scanned")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn float_comparisons_with_nan_keep_the_rows_datafusion_keeps() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
@@ -237,16 +249,6 @@ async fn float_files_without_nan_are_still_pruned() {
     overwrite(&table, vec![batch.clone()]).await;
     let reopened = open_table(&fixture, Arc::clone(&runtime_env), spec()).await;
 
-    let files_scanned = |plan: &[RecordBatch]| {
-        let plan = arrow::util::pretty::pretty_format_batches(plan)
-            .expect("plan renders")
-            .to_string();
-        assert!(
-            plan.contains(" files_scanned="),
-            "the plan reports no Cayenne file scan:\n{plan}"
-        );
-        explain_total(&plan, "files_scanned")
-    };
     for (state, table) in [("written", &table), ("reopened", &reopened)] {
         let pruned = query(
             table,
@@ -277,24 +279,6 @@ async fn float_files_without_nan_are_still_pruned() {
     }
 }
 
-/// The key a per-file statistics row is stored under: the object-store location.
-fn statistics_row_key(
-    data_path: &std::path::Path,
-    table_id: &str,
-    file: &cayenne::metadata::SnapshotFile,
-) -> String {
-    format!(
-        "{}/{}/{}/{}",
-        data_path
-            .to_string_lossy()
-            .trim_start_matches('/')
-            .trim_end_matches('/'),
-        table_id,
-        file.snapshot_id,
-        file.file_path
-    )
-}
-
 /// Rewrites every per-file statistics row of `table` as a build that did not
 /// account for NaN wrote it: the float column's bounds as they are, with the NaN
 /// count that marks them NaN-free removed. Returns the rewritten rows' keys.
@@ -318,7 +302,7 @@ async fn seed_blobs_without_nan_counts(
     assert!(!files.is_empty(), "the write produced no data file");
     let mut seeded = Vec::new();
     for file in &files {
-        let key = statistics_row_key(&fixture.data_path, &table_id, file);
+        let key = common::statistics_row_key(&fixture.data_path, &table_id, file);
         let row = fixture
             .catalog
             .get_snapshot_file_statistics(&table_id, &file.snapshot_id, &key)
@@ -372,16 +356,6 @@ async fn blobs_written_before_nan_was_accounted_for_are_not_trusted() {
         .await
         .expect("fixture");
     let runtime_env = Arc::new(RuntimeEnv::default());
-    let files_scanned = |plan: &[RecordBatch]| {
-        let plan = arrow::util::pretty::pretty_format_batches(plan)
-            .expect("plan renders")
-            .to_string();
-        assert!(
-            plan.contains(" files_scanned="),
-            "the plan reports no Cayenne file scan:\n{plan}"
-        );
-        explain_total(&plan, "files_scanned")
-    };
 
     for (name, has_nan) in [("legacy_blob_nan", true), ("legacy_blob_no_nan", false)] {
         let mut values: Vec<Option<f64>> = (0..ROWS)
@@ -439,14 +413,11 @@ async fn blobs_written_before_nan_was_accounted_for_are_not_trusted() {
             let file_stats =
                 cayenne::stats::deserialize_file_statistics(&row.statistics_blob, &schema)
                     .expect("blob decodes");
-            let (k_stats, _) = file_stats.into_iter().nth(1).expect("K column");
+            let (k_stats, k_dtype) = file_stats.into_iter().nth(1).expect("K column");
             let bounded = !k_stats.get(Stat::Max).is_absent();
-            let nan_count = k_stats
-                .get_as::<u64>(Stat::NaNCount, &vortex::dtype::PType::U64.into())
-                .as_exact();
             assert!(
-                !bounded || nan_count == Some(0),
-                "{name}: row {key} was not rewritten (bounded, nan_count={nan_count:?})"
+                !bounded || vortex_datafusion::bounds_account_for_nan(k_stats, k_dtype),
+                "{name}: row {key} was not rewritten (its float bounds carry no NaN count)"
             );
             if !bounded {
                 unbounded_files += 1;

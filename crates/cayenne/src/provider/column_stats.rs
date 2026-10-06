@@ -594,13 +594,9 @@ impl ColumnStatsAccumulator {
         (min_value, max_value)
     }
 
-    /// The column's bounds, or none when it holds a NaN.
-    ///
-    /// `DataFusion` orders floats by IEEE 754 total order, so a NaN is a value
-    /// like any other: `NaN = NaN` holds, and a positive NaN sorts above `+inf`
-    /// (a negative one below `-inf`). Bounds that left it out would let pruning
-    /// skip the rows a NaN probe or an `x > c` matches, and let `MIN`/`MAX` be
-    /// answered from them without the NaN (spiceai/spiceai#14719).
+    /// The column's bounds, or none when it holds a NaN, which bounds cannot
+    /// leave out (see `vortex_datafusion::bounds_account_for_nan`,
+    /// spiceai/spiceai#14719).
     fn float64_min_max(array: &Float64Array) -> (Option<f64>, Option<f64>) {
         let mut min_value: Option<f64> = None;
         let mut max_value: Option<f64> = None;

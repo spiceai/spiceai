@@ -54,6 +54,7 @@ use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use vortex::VortexSessionDefault;
+use vortex::array::stats::StatsSet;
 use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
@@ -1060,21 +1061,23 @@ impl FileFormat for VortexFormat {
                         field.name()
                     ))
                 })?;
-                let min = stat_bound_to_df(
-                    Stat::Min,
-                    stats_set.get(Stat::Min),
-                    stats_dtype,
-                    &target_dtype,
-                    field.data_type(),
-                );
-
-                let max = stat_bound_to_df(
-                    Stat::Max,
-                    stats_set.get(Stat::Max),
-                    stats_dtype,
-                    &target_dtype,
-                    field.data_type(),
-                );
+                // Float bounds and sums leave NaN out; see `bounds_account_for_nan`.
+                let bounds_usable = bounds_account_for_nan(stats_set, stats_dtype);
+                let bound = |stat: Stat| {
+                    if bounds_usable {
+                        stat_bound_to_df(
+                            stat,
+                            stats_set.get(stat),
+                            stats_dtype,
+                            &target_dtype,
+                            field.data_type(),
+                        )
+                    } else {
+                        stats::Precision::Absent
+                    }
+                };
+                let min = bound(Stat::Min);
+                let max = bound(Stat::Max);
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
@@ -1085,35 +1088,20 @@ impl FileFormat for VortexFormat {
                 // arrow type: the sum of e.g. an `Int32` column is an `Int64` in
                 // DataFusion, and narrowing here would lose width or overflow.
                 let sum = match Stat::Sum.dtype(stats_dtype) {
-                    Some(sum_dtype) => scalar_stat_to_df(
+                    Some(sum_dtype) if bounds_usable => scalar_stat_to_df(
                         Stat::Sum,
                         stats_set.get(Stat::Sum),
                         stats_dtype,
                         &sum_dtype,
                     ),
-                    None => stats::Precision::Absent,
-                };
-
-                // Vortex leaves NaN out of a float column's min, max and sum, but
-                // `DataFusion` orders a NaN like any other value (`NaN = NaN`, a
-                // positive NaN above `+inf`) and sums it to NaN. Those stats would
-                // let pruning skip a NaN row and answer `MIN`/`MAX`/`SUM` without
-                // it, so they are kept only when the footer proves the file holds
-                // no NaN.
-                let nan_free = !stats_dtype.is_float()
-                    || stats_set
-                        .get_as::<u64>(Stat::NaNCount, &PType::U64.into())
-                        .as_exact()
-                        == Some(0);
-                let unless_nan = |value: Precision<ScalarValue>| {
-                    if nan_free { value } else { Precision::Absent }
+                    _ => stats::Precision::Absent,
                 };
 
                 column_statistics.push(ColumnStatistics {
                     null_count: null_count.to_df(),
-                    min_value: unless_nan(min.to_df()),
-                    max_value: unless_nan(max.to_df()),
-                    sum_value: unless_nan(sum.to_df()),
+                    min_value: min.to_df(),
+                    max_value: max.to_df(),
+                    sum_value: sum.to_df(),
                     distinct_count: distinct_count_from_is_constant(stats_set.get_as::<bool>(
                         Stat::IsConstant,
                         &DType::Bool(Nullability::NonNullable),
@@ -1256,6 +1244,23 @@ impl FileFormat for VortexFormat {
 /// payload. Decimal bounds also use the column's Arrow storage width: Vortex
 /// chooses their width from precision, independently of the Arrow field's width.
 /// A value that cannot carry the column's type is reported as no bound.
+/// Whether a column's min, max and sum can be used as `DataFusion` statistics.
+///
+/// Vortex leaves NaN out of a float column's min, max and sum, while `DataFusion`
+/// orders a NaN like any other value (`NaN = NaN`; a positive NaN sorts above
+/// `+inf`, a negative one below `-inf`) and sums it to NaN. Bounds that left a NaN
+/// out would let pruning skip the rows a NaN probe or an `x > c` matches, and let
+/// `MIN`/`MAX`/`SUM` be answered from metadata without them, so a float column's
+/// are usable only when its stats record that it holds no NaN.
+#[must_use]
+pub fn bounds_account_for_nan(stats: &StatsSet, dtype: &DType) -> bool {
+    !dtype.is_float()
+        || stats
+            .get_as::<u64>(Stat::NaNCount, &PType::U64.into())
+            .as_exact()
+            == Some(0)
+}
+
 fn stat_bound_to_df(
     stat: Stat,
     value: stats::Precision<VortexScalarValue>,
