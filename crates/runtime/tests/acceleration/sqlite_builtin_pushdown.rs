@@ -133,6 +133,24 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
                     Some("concat("),
                 ),
                 (
+                    "SELECT id, concat(customer, CAST(NULL AS VARCHAR)) AS c \
+                     FROM {table} ORDER BY id",
+                    Some("concat("),
+                ),
+                (
+                    "SELECT concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) AS c \
+                     FROM {table} WHERE id = 1",
+                    Some("concat("),
+                ),
+                (
+                    "SELECT id, concat(customer, '') AS c FROM {table} ORDER BY id",
+                    Some("concat("),
+                ),
+                (
+                    "SELECT id, concat('', region) AS c FROM {table} ORDER BY id",
+                    Some("concat("),
+                ),
+                (
                     "SELECT id, to_hex(id) AS h FROM {table} ORDER BY id",
                     Some("to_hex("),
                 ),
@@ -162,6 +180,10 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
                 (
                     "SELECT id FROM {table} WHERE customer ILIKE '%alice%' ORDER BY id",
                     Some("ILIKE"),
+                ),
+                (
+                    "SELECT id FROM {table} WHERE customer LIKE '%ALICE%' ORDER BY id",
+                    Some("LIKE"),
                 ),
                 (
                     "SELECT id, regexp_like(customer, 'ali') AS m FROM {table} ORDER BY id",
@@ -231,16 +253,70 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
             );
             assert_batches_eq!(
                 [
-                    "+----+-------+",
-                    "| id | isn   |",
-                    "+----+-------+",
-                    "| 2  | true  |",
-                    "+----+-------+",
+                    "+----+------+",
+                    "| id | isn  |",
+                    "+----+------+",
+                    "| 2  | true |",
+                    "+----+------+",
                 ],
                 &run_query(
                     &rt,
                     "SELECT id, concat(customer, '-', region) IS NULL AS isn \
                      FROM accelerated WHERE id = 2"
+                )
+                .await?
+            );
+            assert_batches_eq!(
+                [
+                    "+------+",
+                    "| isn  |",
+                    "+------+",
+                    "| true |",
+                    "+------+",
+                ],
+                &run_query(
+                    &rt,
+                    "SELECT concat(customer, CAST(NULL AS VARCHAR)) IS NULL AS isn \
+                     FROM accelerated WHERE id = 1"
+                )
+                .await?
+            );
+            assert_batches_eq!(
+                [
+                    "+------+",
+                    "| isn  |",
+                    "+------+",
+                    "| true |",
+                    "+------+",
+                ],
+                &run_query(
+                    &rt,
+                    "SELECT concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) IS NULL AS isn \
+                     FROM accelerated WHERE id = 1"
+                )
+                .await?
+            );
+            assert_batches_eq!(
+                [
+                    "+-------+",
+                    "| c     |",
+                    "+-------+",
+                    "| alice |",
+                    "+-------+",
+                ],
+                &run_query(
+                    &rt,
+                    "SELECT concat(customer, '') AS c FROM accelerated WHERE id = 1"
+                )
+                .await?
+            );
+            // SQLite LIKE folds ASCII case, so a federated
+            // `customer LIKE '%ALICE%'` would have kept the two `alice` rows.
+            assert_batches_eq!(
+                ["+----+", "| id |", "+----+", "+----+",],
+                &run_query(
+                    &rt,
+                    "SELECT id FROM accelerated WHERE customer LIKE '%ALICE%' ORDER BY id"
                 )
                 .await?
             );

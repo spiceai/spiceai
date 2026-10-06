@@ -304,8 +304,8 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
 ///   fails with `no such function` or, for `date_trunc`, a cast of the
 ///   truncated `'2026-01'` text back into a timestamp.
 ///
-/// Aggregates (`median`, `approx_distinct`, `string_agg`) and `ILIKE` are
-/// not names the scalar deny-list can see; they are refused by
+/// Aggregates (`median`, `approx_distinct`, `string_agg`) and `LIKE` /
+/// `ILIKE` are not names the scalar deny-list can see; they are refused by
 /// [`sqlite_can_translate_aggregate`] and [`sqlite_can_evaluate_expression`].
 pub const SQLITE_DENIED_BUILTINS: &[&str] = &[
     crate::dialect::BTRIM_NAME,
@@ -330,7 +330,7 @@ pub const SQLITE_DENIED_BUILTINS: &[&str] = &[
 /// federated scan instead. That costs the pushdown for those plans and returns
 /// the right rows, which is the trade the deny-list exists to make.
 ///
-/// Casts, decimal aggregates and `ILIKE` are gated by
+/// Casts, decimal aggregates and `LIKE`/`ILIKE` are gated by
 /// [`sqlite_can_evaluate_expression`]. Aggregates `SQLite` cannot evaluate
 /// (`median`, `approx_distinct`, `string_agg`) are gated by
 /// [`sqlite_can_translate_aggregate`].
@@ -399,11 +399,11 @@ fn sqlite_untranslatable_aggregate(name: &str) -> bool {
 #[must_use]
 pub fn sqlite_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
     match expr {
-        Expr::TryCast(_) => false,
-        // SQLite has no `ILIKE`. Its `LIKE` is ASCII case-insensitive and a
-        // federated `ILIKE` fails the query with a syntax error, so both the
-        // positive and negated forms stay local.
-        Expr::Like(like) if like.case_insensitive => false,
+        // `TRY_CAST` is not SQLite SQL (issue #14398). `LIKE` folds ASCII
+        // case (`'alice' LIKE '%ALICE%'` is true) and `ILIKE` does not exist,
+        // so both Like forms stay local rather than matching the wrong rows
+        // or failing remotely.
+        Expr::TryCast(_) | Expr::Like(_) => false,
         // SQLite has no decimal type: it stores a decimal as a REAL or an
         // INTEGER and computes `avg` and `sum` over it in floating point or in
         // 64-bit integers. `avg` reads one unit high in the last place against
@@ -1276,16 +1276,17 @@ mod tests {
             );
         }
 
-        for denied in [col("s").ilike(lit("%a%")), col("s").not_ilike(lit("%a%"))] {
+        for denied in [
+            col("s").ilike(lit("%a%")),
+            col("s").not_ilike(lit("%a%")),
+            col("s").like(lit("%A%")),
+            col("s").not_like(lit("%A%")),
+        ] {
             assert!(
                 !pushes(&plan_projecting(denied), &support),
-                "SQLite has no ILIKE operator, including its negated form"
+                "SQLite LIKE folds ASCII case and has no ILIKE, so both stay local"
             );
         }
-        assert!(
-            pushes(&plan_projecting(col("s").like(lit("%a%"))), &support),
-            "ordinary LIKE must keep its SQLite pushdown"
-        );
 
         for refused in [median(col("i")), approx_distinct(col("i"))] {
             assert!(

@@ -1501,11 +1501,11 @@ async fn duckdb_accelerated_ordered_string_agg_stays_local_and_agrees() -> Resul
             let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
             let local = run_query(&rt, &query.replace("{table}", "local")).await?;
             let expected = [
-                "+-------------------+",
-                "| customers         |",
-                "+-------------------+",
-                "| alice|carol|dave  |",
-                "+-------------------+",
+                "+------------------+",
+                "| customers        |",
+                "+------------------+",
+                "| alice|carol|dave |",
+                "+------------------+",
             ];
             assert_batches_eq!(expected, &accelerated);
             assert_eq!(
