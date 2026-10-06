@@ -617,12 +617,12 @@ duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "8ee430737cb6
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b408ee0a21fe9faf9469d8cde01fe7b5323f14e3" } # branch: lukim/table-provider-accessors-0.10.1-df-55 (fork PR #57, TEMPORARY until it merges into spiceai-0.10.1-df-55)
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b408ee0a21fe9faf9469d8cde01fe7b5323f14e3" } # branch: lukim/table-provider-accessors-0.10.1-df-55 (fork PR #57, TEMPORARY until it merges into spiceai-0.10.1-df-55)
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b408ee0a21fe9faf9469d8cde01fe7b5323f14e3" } # branch: lukim/table-provider-accessors-0.10.1-df-55 (fork PR #57, TEMPORARY until it merges into spiceai-0.10.1-df-55)
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b408ee0a21fe9faf9469d8cde01fe7b5323f14e3" } # branch: lukim/table-provider-accessors-0.10.1-df-55 (fork PR #57, TEMPORARY until it merges into spiceai-0.10.1-df-55)
-iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b408ee0a21fe9faf9469d8cde01fe7b5323f14e3" } # branch: lukim/table-provider-accessors-0.10.1-df-55 (fork PR #57, TEMPORARY until it merges into spiceai-0.10.1-df-55)
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "b408ee0a21fe9faf9469d8cde01fe7b5323f14e3" } # branch: lukim/table-provider-accessors-0.10.1-df-55 (fork PR #57, TEMPORARY until it merges into spiceai-0.10.1-df-55)
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bfc1ac79169f2fd5d8760a49d3f9a2afde896f03" } # branch: spiceai-0.10.1-df-55
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bfc1ac79169f2fd5d8760a49d3f9a2afde896f03" } # branch: spiceai-0.10.1-df-55
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bfc1ac79169f2fd5d8760a49d3f9a2afde896f03" } # branch: spiceai-0.10.1-df-55
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bfc1ac79169f2fd5d8760a49d3f9a2afde896f03" } # branch: spiceai-0.10.1-df-55
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bfc1ac79169f2fd5d8760a49d3f9a2afde896f03" } # branch: spiceai-0.10.1-df-55
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bfc1ac79169f2fd5d8760a49d3f9a2afde896f03" } # branch: spiceai-0.10.1-df-55
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be
