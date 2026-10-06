@@ -1157,13 +1157,13 @@ impl Refresher {
                         // Apply jitter on manual refreshes. For periodic refreshes, jitter
                         // is added to the timer, `next_scheduled_refresh_timer`.
                         let override_jitter = overrides_opt.as_ref().and_then(|o| o.max_jitter);
-                        if let Some(max_jitter) = override_jitter.or(max_jitter) {
-                            let delay = Self::compute_delay(Duration::from_secs(0), Some(max_jitter));
-                            // Without an interval, a triggered refresh (a `refresh_cron`
-                            // time) is next due once its jitter has elapsed.
-                            if refresh_check_interval.is_none() && !delay.is_zero() {
-                                refresh_status.record_dataset_next_refresh(&dataset_name, SystemTime::now() + delay);
-                            }
+                        let delay = Self::compute_delay(Duration::ZERO, override_jitter.or(max_jitter));
+                        // Without an interval, retain the triggered refresh's due time
+                        // until completion, including when it has no jitter.
+                        if refresh_check_interval.is_none() {
+                            refresh_status.record_dataset_next_refresh(&dataset_name, SystemTime::now() + delay);
+                        }
+                        if !delay.is_zero() {
                             sleep(delay).await;
                         }
 

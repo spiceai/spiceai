@@ -1130,6 +1130,83 @@ mod served_from_acceleration {
         Ok(())
     }
 
+    /// A cron-triggered refresh retains its due time while waiting for the source
+    /// when jitter is disabled.
+    #[tokio::test]
+    async fn pending_cron_refresh_retains_its_due_time_without_jitter() -> Result<(), anyhow::Error>
+    {
+        assert_pending_cron_deadline("cron-no-jitter", false).await
+    }
+
+    /// A sampled zero jitter also retains the triggered refresh's due time.
+    #[tokio::test]
+    async fn pending_cron_refresh_retains_its_due_time_with_zero_jitter()
+    -> Result<(), anyhow::Error> {
+        assert_pending_cron_deadline("cron-zero-jitter", true).await
+    }
+
+    async fn assert_pending_cron_deadline(
+        prefix: &'static str,
+        jitter_enabled: bool,
+    ) -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some(
+            "integration=debug,scheduler=debug,runtime_table=debug,info",
+        ));
+        let fixture = Fixture::new(prefix).await?;
+        let source = &fixture.source;
+        let spec = || {
+            let mut dataset =
+                with_refresh_cron(fixture.dataset(ReadyState::OnLoad), "*/2 * * * * *");
+            if let Some(acceleration) = dataset.acceleration.as_mut() {
+                acceleration.refresh_jitter_enabled = jitter_enabled;
+                acceleration.refresh_jitter_max = Some("0s".to_string());
+            }
+            dataset
+        };
+        seed(source, spec()).await?;
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
+        assert!(served_from_acceleration(&rt, Duration::from_secs(10)).await);
+        let name = datafusion::common::TableReference::bare("orders");
+        let pending = wait_until_true(Duration::from_secs(8), || async {
+            rt.status()
+                .dataset_freshness(&name)
+                .next_refresh
+                .is_some_and(|due| due <= std::time::SystemTime::now())
+        })
+        .await;
+        let (_, due) = freshness(&rt).await;
+        eprintln!(
+            "jitter_enabled={jitter_enabled} now={} recorded_due={:?} api_due={due:?}",
+            chrono::Utc::now(),
+            rt.status().dataset_freshness(&name).next_refresh
+        );
+        assert!(
+            pending,
+            "a pending cron refresh retains its due time with jitter_enabled={jitter_enabled}"
+        );
+        let due = due.ok_or_else(|| anyhow::anyhow!("the pending cron deadline is present"))?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            freshness(&rt).await.1,
+            Some(due),
+            "the pending deadline is retained across another cron occurrence"
+        );
+        source.bring_up();
+        assert!(
+            refreshed_from_source(&rt).await,
+            "the pending refresh completes after source recovery"
+        );
+        assert!(
+            wait_until_true(Duration::from_secs(5), || async {
+                freshness(&rt).await.1.is_some_and(|next| next > due)
+            })
+            .await,
+            "completion releases the pending deadline"
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
     /// A refresh started while the source cannot be reached waits for the source before
     /// it runs, so the dataset keeps reporting `Error` rather than flipping to
     /// `Refreshing` for as long as the source stays down.
