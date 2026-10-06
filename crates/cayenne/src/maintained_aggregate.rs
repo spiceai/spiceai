@@ -36,14 +36,14 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_expr_common::physical_expr::{is_dynamic_physical_expr, is_volatile};
+use datafusion::physical_expr_common::physical_expr::is_volatile;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_functions_aggregate_common::utils::DecimalAverager;
 use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
 use datafusion_physical_expr::{Distribution, OrderingRequirements};
-use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
+use datafusion_physical_expr::{DynamicFilterTracking, PhysicalExpr, split_conjunction};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use parking_lot::RwLock;
 
@@ -506,7 +506,9 @@ impl PredicateConjuncts {
     /// conjuncts and must be discarded.
     #[must_use]
     pub fn try_add_predicate(&mut self, predicate: &Arc<dyn PhysicalExpr>) -> Option<()> {
-        if is_volatile(predicate) || is_dynamic_physical_expr(predicate) {
+        if is_volatile(predicate)
+            || DynamicFilterTracking::classify(predicate).contains_dynamic_filter()
+        {
             return None;
         }
         for conjunct in split_conjunction(predicate) {
@@ -2591,8 +2593,9 @@ mod tests {
         TimestampMicrosecondArray, UInt64Array,
     };
     use arrow_schema::{Field, Schema, TimeUnit};
+    use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
-    use datafusion::physical_expr::expressions::{cast, col, lit};
+    use datafusion::physical_expr::expressions::{binary, cast, col, lit};
     use datafusion::physical_plan::aggregates::PhysicalGroupBy;
     use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion_common::cast::{
@@ -2602,6 +2605,7 @@ mod tests {
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
     use datafusion_functions_aggregate::sum::sum_udaf;
+    use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -2633,6 +2637,36 @@ mod tests {
             ],
         )
         .expect("test batch should be valid")
+    }
+
+    /// A hash join's runtime filter keeps different rows as the join runs, so a
+    /// predicate that carries one has no conjuncts a maintained view can match.
+    #[test]
+    fn a_predicate_with_a_dynamic_filter_has_no_conjuncts() -> DataFusionResult<()> {
+        let schema = schema();
+        let static_filter = binary(col("i", &schema)?, Operator::Gt, lit(0i64), &schema)?;
+        let static_conjuncts =
+            PredicateConjuncts::try_from_predicate(&static_filter).map(|conjuncts| {
+                conjuncts
+                    .0
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(static_conjuncts, Some(vec!["i@0 > 0".to_string()]));
+
+        // `name` is column 0 already, so the conjunct would pass through
+        // `name_columns_only` unchanged if the dynamic filter were not refused.
+        let dynamic_filter: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![col("name", &schema)?],
+            lit(true),
+        ));
+        let with_dynamic_filter = binary(static_filter, Operator::And, dynamic_filter, &schema)?;
+        assert_eq!(
+            PredicateConjuncts::try_from_predicate(&with_dynamic_filter),
+            None
+        );
+        Ok(())
     }
 
     #[test]
