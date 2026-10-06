@@ -71,12 +71,26 @@ pub struct HttpJsonNesting {
     /// the table schema. Includes the catch-all column in its declared
     /// position.
     pub column_order: Vec<String>,
-    /// Set of declared columns sourced from HTTP request/response
-    /// metadata rather than from the JSON body. Names must match
-    /// fields in [`HttpTableProvider::base_table_schema`].
+    /// Set of columns — declared by the user, or force-added by this
+    /// connector (`response_status`, `_fetched_at`) regardless of
+    /// declaration — sourced from HTTP request/response metadata rather
+    /// than from the JSON body. Names must match fields in
+    /// [`HttpTableProvider::base_table_schema`]. Excludes these columns
+    /// from [`Self::static_fields`] (their value never comes from
+    /// `project_row`'s body parsing), but does **not** by itself remove a
+    /// same-named JSON body key from the catch-all — see
+    /// [`Self::catch_all_exclusions`] for that.
     ///
     /// [`HttpTableProvider::base_table_schema`]: super::provider::HttpTableProvider::base_table_schema
     pub metadata_fields: HashSet<String>,
+    /// The subset of `metadata_fields` the user actually declared in
+    /// `columns:`. `decompose_json_row` strips a JSON body key from the
+    /// catch-all only when it is in this set — never for a field this
+    /// connector force-added the user never asked for (`response_status`,
+    /// `_fetched_at`), since a body that happens to use that name is
+    /// ordinary business data to a user who never declared the column,
+    /// not a collision with metadata they opted into.
+    pub catch_all_exclusions: HashSet<String>,
     /// Connector-agnostic projection (kept fields + catch-all) that performs the
     /// actual object decomposition via [`SchemaProjection::project_row`]. This
     /// is the shared core used by every nesting-capable connector; HTTP only
@@ -88,14 +102,17 @@ pub struct HttpJsonNesting {
 
 impl HttpJsonNesting {
     /// Build a new nesting configuration from the declared column order,
-    /// the name of the catch-all column, and the set of declared columns
-    /// that should be sourced from HTTP metadata rather than the JSON
-    /// body. The catch-all column name must appear in `column_order`.
+    /// the name of the catch-all column, the set of columns (declared or
+    /// force-added) that should be sourced from HTTP metadata rather than
+    /// the JSON body, and the subset of those the user actually declared
+    /// (see [`HttpJsonNesting::catch_all_exclusions`]). The catch-all
+    /// column name must appear in `column_order`.
     #[must_use]
     pub fn new(
         column_order: Vec<String>,
         json_field_name: String,
         metadata_fields: HashSet<String>,
+        catch_all_exclusions: HashSet<String>,
     ) -> Self {
         let static_fields: Vec<String> = column_order
             .iter()
@@ -108,6 +125,7 @@ impl HttpJsonNesting {
         Self {
             column_order,
             metadata_fields,
+            catch_all_exclusions,
             projection,
         }
     }
@@ -174,11 +192,17 @@ pub fn decompose_json_row(json_row: &str, nesting: &HttpJsonNesting) -> Result<D
         return Ok(out);
     };
 
-    // Body keys colliding with HTTP metadata names are dropped here: the
-    // metadata column is populated from the actual HTTP request/response, not
-    // from the body, and must not leak into the catch-all.
+    // Body keys colliding with a *user-declared* HTTP metadata column name
+    // are dropped here: that column is populated from the actual HTTP
+    // request/response, not from the body, and the user asked for it by
+    // declaring it, so a same-named body key must not leak into the
+    // catch-all as an apparent duplicate. A field this connector force-adds
+    // regardless of declaration (`response_status`, `_fetched_at`,
+    // tracked in `metadata_fields` but not `catch_all_exclusions`) is not
+    // included: the user never declared that column, so a same-named body
+    // key is ordinary business data and must be preserved.
     if let serde_json::Value::Object(map) = &mut value {
-        map.retain(|k, _| !nesting.metadata_fields.contains(k));
+        map.retain(|k, _| !nesting.catch_all_exclusions.contains(k));
     }
 
     // Delegate the static/catch-all partition + sorted-JSON serialization to the
@@ -228,14 +252,17 @@ mod tests {
             cols.iter().map(|s| (*s).to_string()).collect(),
             json_field.to_string(),
             HashSet::new(),
+            HashSet::new(),
         )
     }
 
     fn nesting_with_meta(cols: &[&str], json_field: &str, meta: &[&str]) -> HttpJsonNesting {
+        let meta: HashSet<String> = meta.iter().map(|s| (*s).to_string()).collect();
         HttpJsonNesting::new(
             cols.iter().map(|s| (*s).to_string()).collect(),
             json_field.to_string(),
-            meta.iter().map(|s| (*s).to_string()).collect(),
+            meta.clone(),
+            meta,
         )
     }
 
@@ -392,6 +419,45 @@ mod tests {
         assert!(
             parsed.get("request_path").is_none(),
             "metadata field must not leak into catch-all"
+        );
+        assert_eq!(parsed["extra"], 1);
+    }
+
+    /// `response_status`/`_fetched_at` are force-added to `metadata_fields`
+    /// by `https.rs` regardless of whether the user declared them, so their
+    /// *column* is always sourced from HTTP context, not the body — but a
+    /// user who never declared that column never opted into losing a
+    /// same-named body key either. Regression test for the finding that
+    /// treating `metadata_fields` as the catch-all exclusion set (instead of
+    /// `catch_all_exclusions`, the user-declared subset) silently dropped a
+    /// business JSON key just because it collided with a force-injected
+    /// column's name.
+    #[test]
+    fn force_injected_metadata_field_does_not_strip_a_same_named_body_key() {
+        // `response_status` is in `metadata_fields` (as `https.rs` always adds
+        // it) but *not* in `catch_all_exclusions` — the user never declared it.
+        let cols = ["id", "response_status", "data"];
+        let n = HttpJsonNesting::new(
+            cols.iter().map(|s| (*s).to_string()).collect(),
+            "data".to_string(),
+            ["response_status".to_string()].into_iter().collect(),
+            HashSet::new(),
+        );
+        let row = json!({
+            "id": "abc",
+            "response_status": "business-value",
+            "extra": 1
+        })
+        .to_string();
+        let d = decompose_json_row(&row, &n).expect("decompose");
+
+        let catchall = d.get("data").expect("data").as_deref().expect("val");
+        let parsed: serde_json::Value = serde_json::from_str(catchall).expect("parse");
+        assert_eq!(
+            parsed.get("response_status"),
+            Some(&serde_json::Value::String("business-value".to_string())),
+            "a body key colliding with a force-injected (not user-declared) metadata \
+            column name is ordinary business data and must survive in the catch-all"
         );
         assert_eq!(parsed["extra"], 1);
     }

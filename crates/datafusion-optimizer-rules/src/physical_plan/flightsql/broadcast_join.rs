@@ -48,6 +48,7 @@ limitations under the License.
 //! below `broadcast_threshold_rows` — broadcasting a large table would move
 //! `N_executors × dim_size` rows and lose.
 
+use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 use std::fmt;
 use std::sync::Arc;
 
@@ -103,6 +104,9 @@ pub type ExecutorAddressProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 #[derive(Clone)]
 pub struct BroadcastJoinFlightSqlExec {
     sql: String,
+    /// The tables this join reads, for the errors its stream can raise. A broadcast join
+    /// reads two, and either one's connector can be the source of a malformed batch.
+    source_tables: String,
     client: FlightSqlClient,
     cookie_store: Arc<CookieStore>,
     output_schema: SchemaRef,
@@ -114,6 +118,7 @@ pub struct BroadcastJoinFlightSqlExec {
 impl BroadcastJoinFlightSqlExec {
     fn new(
         sql: String,
+        source_tables: String,
         client: FlightSqlClient,
         cookie_store: Arc<CookieStore>,
         output_schema: SchemaRef,
@@ -128,6 +133,7 @@ impl BroadcastJoinFlightSqlExec {
         ));
         Self {
             sql,
+            source_tables,
             client,
             cookie_store,
             output_schema,
@@ -159,6 +165,17 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -185,8 +202,13 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
         // mirroring `FlightSqlExec`'s own schema alignment.
         let target = Arc::clone(&self.output_schema);
         let target_for_map = Arc::clone(&target);
-        let stream = query_to_stream(client, self.sql.clone(), Arc::clone(&self.cookie_store))
-            .map(move |res| res.and_then(|batch| coerce_batch(batch, &target_for_map)));
+        let stream = query_to_stream(
+            client,
+            self.sql.clone(),
+            Arc::clone(&self.cookie_store),
+            self.source_tables.clone(),
+        )
+        .map(move |res| res.and_then(|batch| coerce_batch(batch, &target_for_map)));
         Ok(Box::pin(RecordBatchStreamAdapter::new(target, stream)))
     }
 
@@ -326,9 +348,19 @@ fn try_rewrite(
     let output_schema = join.schema();
     let statistics = Statistics::new_unknown(&output_schema);
     let mut children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(fact.flight_execs.len());
+    // Every scan on a side reads the same table, so either side's first exec names it.
+    let source_tables = match (fact.flight_execs.first(), dim.flight_execs.first()) {
+        (Some(fact_fe), Some(dim_fe)) => format!(
+            "{} (joined with {})",
+            fact_fe.table_reference().to_quoted_string(),
+            dim_fe.table_reference().to_quoted_string()
+        ),
+        _ => return Ok(Transformed::no(plan)),
+    };
     for fe in &fact.flight_execs {
         children.push(Arc::new(BroadcastJoinFlightSqlExec::new(
             sql.clone(),
+            source_tables.clone(),
             fe.client().clone(),
             Arc::clone(fe.cookie_store()),
             Arc::clone(&output_schema),
@@ -375,7 +407,7 @@ fn side_num_rows(side: &FederatedSide) -> Option<usize> {
     let mut total = 0usize;
     let mut any = false;
     for fe in &side.flight_execs {
-        if let Ok(stats) = fe.partition_statistics(None)
+        if let Ok(stats) = StatisticsContext::new().compute(*fe, &StatisticsArgs::new())
             && let Some(n) = stats.num_rows.get_value()
         {
             total += *n;
@@ -412,6 +444,9 @@ fn safe_output_partitioning(part: &Partitioning, out_schema: &SchemaRef) -> Opti
             Some(Partitioning::Hash(mapped, *n))
         }
         Partitioning::RoundRobinBatch(n) => Some(Partitioning::RoundRobinBatch(*n)),
+        // Range keys are not remapped onto `out_schema`; keep the partition count the
+        // same way an unmappable hash key does.
+        Partitioning::Range(range) => Some(Partitioning::RoundRobinBatch(range.partition_count())),
         Partitioning::UnknownPartitioning(_) => None,
     }
 }
@@ -664,11 +699,11 @@ mod tests {
 
     use arrow_flight::sql::client::FlightSqlServiceClient;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::TableReference;
     use datafusion::common::stats::Precision;
     use datafusion::physical_expr::expressions::IsNotNullExpr;
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::joins::PartitionMode;
-    use datafusion::sql::TableReference;
     use tonic::transport::Channel;
 
     fn dummy_client() -> FlightSqlClient {

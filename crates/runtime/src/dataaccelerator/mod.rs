@@ -26,7 +26,6 @@ pub mod arrow;
 pub mod partitioned_arrow;
 
 pub mod spice_sys;
-pub use data_accelerator_api::snapshots::CayenneSnapshotValidationError;
 pub(crate) use data_accelerator_api::snapshots::validate_snapshot_paths;
 
 // The accelerator contract lives in `data-accelerator-api`; re-exported so
@@ -859,7 +858,7 @@ mod accelerator_compat_tests {
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare(format!("test_table_{:?}_{}", engine, mode)),
-                location: location.clone(),
+                locations: vec![location.clone()],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -1010,8 +1009,8 @@ mod accelerator_compat_tests {
                         ..Acceleration::default()
                     });
                     // These compat tests exercise DML (insert / overwrite / delete), so
-                    // the dataset is read-write. Marking it so also drives Cayenne's
-                    // access-derived scan freshness to 0 (read-your-writes), which these
+                    // the dataset is read-write. Writable Cayenne tables invalidate
+                    // the scan-view cache on write (`UntilInvalidated`), which these
                     // tests assert (e.g. test_overwrite_operations reads its own writes).
                     dataset.access = crate::component::access::AccessMode::ReadWrite;
 
@@ -2126,7 +2125,7 @@ mod accelerator_compat_tests {
                 let external_table = CreateExternalTable {
                     schema: df_schema,
                     name: TableReference::bare(format!("test_bool_{:?}", engine)),
-                    location: location.clone(),
+                    locations: vec![location.clone()],
                     file_type: String::new(),
                     table_partition_cols: vec![],
                     if_not_exists: true,

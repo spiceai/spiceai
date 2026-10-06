@@ -96,6 +96,17 @@ impl ExecutionPlan for EmbeddingTableExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.base_plan.apply_expressions(f)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.base_plan.children()
     }
@@ -108,7 +119,12 @@ impl ExecutionPlan for EmbeddingTableExec {
             &Arc::clone(&self.projected_schema),
             &self.filters,
             self.limit,
-            Arc::clone(&self.base_plan).with_new_children(children)?,
+            Arc::clone(&self.base_plan).replace_children(
+                children,
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )?,
             Arc::clone(&self.embedded_columns),
             Arc::clone(&self.embedding_models),
         )) as Arc<dyn ExecutionPlan>)
@@ -419,7 +435,8 @@ pub(super) async fn get_vectors(
         .collect();
 
     tracing::trace!("Sending request to upstream embedding model");
-    let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
+    let embedded_data =
+        std::sync::Arc::unwrap_or_clone(model.embed(EmbeddingInput::StringArray(column)).await?);
     tracing::trace!("Received response from upstream embedding model");
 
     let mut builder = FixedSizeListBuilder::with_capacity(
@@ -516,9 +533,11 @@ pub(super) fn get_vectors_in_process(
                 .collect::<Result<Vec<_>, _>>()
         })?;
 
-        for embed in embeds.iter().flatten() {
-            builder.values().append_slice(embed);
-            builder.append(true);
+        for batch in &embeds {
+            for embed in batch.iter() {
+                builder.values().append_slice(embed);
+                builder.append(true);
+            }
         }
     }
 
@@ -774,7 +793,7 @@ pub(super) async fn get_vectors_per_list_element(
     let embedded: Vec<Vec<f32>> = if flat.is_empty() {
         Vec::new()
     } else {
-        model.embed(EmbeddingInput::StringArray(flat)).await?
+        std::sync::Arc::unwrap_or_clone(model.embed(EmbeddingInput::StringArray(flat)).await?)
     };
 
     build_multi_vector_list_array(&validity, &lengths, &embedded, vector_length)
@@ -799,7 +818,10 @@ pub(super) fn get_vectors_per_list_element_in_process(
                 .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
                 .collect::<Result<Vec<_>, _>>()
         })?;
-        batches.into_iter().flatten().collect()
+        batches
+            .into_iter()
+            .flat_map(std::sync::Arc::unwrap_or_clone)
+            .collect()
     };
 
     build_multi_vector_list_array(&validity, &lengths, &embedded, vector_length)
@@ -866,13 +888,18 @@ async fn get_vectors_with_chunker(
         })
         .await??;
 
-        batches.into_iter().flatten().collect()
+        batches
+            .into_iter()
+            .flat_map(std::sync::Arc::unwrap_or_clone)
+            .collect()
     } else {
         // Move chunks into embed; avoid cloning the full Vec<String>.
-        model
-            .embed(EmbeddingInput::StringArray(chunks))
-            .await
-            .boxed()?
+        std::sync::Arc::unwrap_or_clone(
+            model
+                .embed(EmbeddingInput::StringArray(chunks))
+                .await
+                .boxed()?,
+        )
     };
 
     let vector_length = model.size();
@@ -1010,18 +1037,21 @@ mod tests {
             -1
         }
 
-        async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, embeddings::Error> {
+        async fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> Result<std::sync::Arc<Vec<Vec<f32>>>, embeddings::Error> {
             match input {
                 EmbeddingInput::String(s) => {
                     let v = self.map.get(&s).cloned().unwrap_or_default();
-                    Ok(vec![v])
+                    Ok(std::sync::Arc::new(vec![v]))
                 }
                 EmbeddingInput::StringArray(arr) => {
                     let v = arr
                         .iter()
                         .map(|s| self.map.get(s).cloned().unwrap_or_default())
                         .collect();
-                    Ok(v)
+                    Ok(std::sync::Arc::new(v))
                 }
                 _ => Err(embeddings::Error::FailedToCreateEmbedding {
                     source: Box::<dyn std::error::Error + Send + Sync>::from(

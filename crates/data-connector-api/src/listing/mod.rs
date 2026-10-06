@@ -22,13 +22,14 @@ use runtime_parameters::{ParameterSpec, Parameters};
 mod connector;
 mod infer;
 pub use connector::{
-    ListingTableConnector, ObjectVersionType, build_table_parquet_options,
+    ListingTableConnector, ObjectVersionType, build_table_parquet_options, file_matches_extension,
     object_store_timeout_message,
 };
 
 /// All [`super::DataConnectorFactory`] that create [`ListingTableConnector`]s should have at least these parameters returned from the associated [`super::DataConnectorFactory::parameters`].
 pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::runtime("file_format"),
+    ParameterSpec::runtime("file_format")
+        .description("File format: parquet, csv, tsv, json, jsonl, ndjson, ldjson, soda, socrata, vortex, orc, or auto. Inferred from the path extension when unset."),
     ParameterSpec::runtime("file_extension"),
     ParameterSpec::runtime("schema_infer_max_records")
         .description("Set a limit in terms of records to scan to infer the schema."),

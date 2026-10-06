@@ -42,13 +42,17 @@ use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::DataFusion;
+use crate::datafusion::DeferredRefreshOutcome;
 use crate::datafusion::error::format_datafusion_error;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
 use ::datafusion::error::DataFusionError;
-use ::datafusion::sql::{ResolvedTableReference, TableReference, sqlparser};
+use ::datafusion::{
+    common::{ResolvedTableReference, TableReference},
+    sql::sqlparser,
+};
 use app::App;
 
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
@@ -105,12 +109,15 @@ pub mod extension;
 pub use runtime_table::federated;
 pub mod flight;
 mod http;
+pub use http::v1::datasets::dataset_infos_with_status;
 
 pub mod http_types {
     pub use crate::http::v1::queries::SubmitQueryRequest;
 }
 
 mod init;
+#[doc(hidden)]
+pub use init::snapshot_source::SnapshotRestoreHold;
 pub mod internal_table;
 pub mod jobs;
 mod management;
@@ -183,13 +190,23 @@ pub enum Error {
     UnknownDataSource { data_source: String },
 
     #[snafu(display("Failed to initialize the query engine: {source}"))]
-    UnableToCreateBackend { source: datafusion::Error },
+    UnableToCreateBackend {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
     #[snafu(display("Failed to attach view: {source}"))]
-    UnableToAttachView { source: datafusion::Error },
+    UnableToAttachView {
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
     #[snafu(display("Failed to attach dataset index: {source}"))]
-    UnableToAttachIndex { source: datafusion::Error },
+    UnableToAttachIndex {
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
@@ -246,6 +263,14 @@ pub enum Error {
     ))]
     OdbcNotInstalled,
 
+    #[snafu(display(
+        "This build of Spice.ai does not include the {data_connector} data connector. Build Spice.ai OSS with the `{feature}` feature enabled, or use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise"
+    ))]
+    DataConnectorNotInBuild {
+        data_connector: String,
+        feature: String,
+    },
+
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
     UnableToLoadDataConnectorSecrets { data_connector: String },
 
@@ -274,7 +299,8 @@ pub enum Error {
 
     #[snafu(display("Failed to setup the {connector_component} ({data_connector}). {source}"))]
     UnableToAttachDataConnector {
-        source: datafusion::Error,
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
         connector_component: ConnectorComponent,
         data_connector: String,
     },
@@ -299,12 +325,7 @@ pub enum Error {
     NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
-        "An accelerated table for {dataset_name} cannot be configured with both 'on_conflict' and 'acceleration.write_mode: write_back' without 'refresh_mode: changes'. Without CDC, 'on_conflict' forces writes to the accelerator only and there is no sync path back to the federated source. Add 'refresh_mode: changes' to enable CDC-based sync, or remove 'on_conflict'."
-    ))]
-    AcceleratedWriteBackWithOnConflict { dataset_name: String },
-
-    #[snafu(display(
-        "An accelerated table for {dataset_name} was configured with 'acceleration.write_mode: write_back' but 'replication.enabled' is not set. Write-back commits to the local accelerator first and persists to the federated source asynchronously, so source persistence failures are logged rather than returned to the caller. Set 'replication.enabled: true' to opt in to asynchronous source durability, or use a different write_mode."
+        "An accelerated table for {dataset_name} was configured with 'acceleration.write_mode: write_back' but 'replication.enabled' is not set. Write-back commits to the local accelerator and a delivery worker carries the write to the federated source afterwards, so the source lags the accelerator, and the source's own changes come back over the change stream. Set 'replication.enabled: true' to opt in, or use a different write_mode."
     ))]
     AcceleratedWriteBackWithoutReplication { dataset_name: String },
 
@@ -325,6 +346,41 @@ pub enum Error {
         "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     DurableWriteBackUnsupportedBySource {
+        dataset_name: String,
+        connector: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers every committed row from the accelerator, so the accelerator has to keep each row until it reaches the source, but this dataset also sets '{retention_setting}' to prune rows from the accelerator. A prune can remove a row that has been acknowledged to the writer and not yet delivered, and nothing else holds that value, so the write would be lost. Remove the retention settings from this dataset, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackWithRetention {
+        dataset_name: String,
+        connector: String,
+        retention_setting: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers every committed row from the accelerator, so the accelerator has to keep each row until it reaches the source, but 'acceleration.mode: {mode}' does not keep the accelerator across a restart or a recreate. Recreating it discards both the rows that have not been delivered and the record of what still owes delivery, and nothing else holds those values, so an acknowledged write would be lost. Set 'acceleration.mode: file', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackRecreatingMode {
+        dataset_name: String,
+        connector: String,
+        mode: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): 'acceleration.write_mode: write_back' delivers each committed write to the source from the markers its transactional commit records, which requires {missing}. Without that nothing records a write for delivery, so this dataset would load and then refuse every write it is given. Add the missing setting(s), or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackPrerequisitesUnmet {
+        dataset_name: String,
+        connector: String,
+        missing: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers each committed row to the source keyed on the primary key, but this dataset declares no 'acceleration.primary_key'. Without one the delivery worker has nothing to key a delivery on, so this dataset would accept writes, record them, and never deliver any of them. Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUndeclaredPrimaryKey {
         dataset_name: String,
         connector: String,
     },
@@ -402,7 +458,8 @@ pub enum Error {
     #[snafu(display("Unable to create accelerated table: {dataset}, {source}"))]
     UnableToCreateAcceleratedTable {
         dataset: TableReference,
-        source: datafusion::Error,
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
     },
 
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
@@ -419,6 +476,14 @@ pub enum Error {
         timeout_secs: u64,
     },
 
+    #[snafu(display(
+        "Failed to reload dataset {dataset}: its acceleration's first refresh failed and will not be retried. \
+        Reloading the dataset from scratch instead. \
+        Check that the dataset's source is reachable and that the refresh configuration is valid. \
+        See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    HotReloadRefreshFailed { dataset: TableReference },
+
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
 
@@ -429,7 +494,10 @@ pub enum Error {
     UnableToCreateMetricsTable { source: DataFusionError },
 
     #[snafu(display("Unable to register metrics table: {source}"))]
-    UnableToRegisterMetricsTable { source: datafusion::Error },
+    UnableToRegisterMetricsTable {
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
     #[snafu(display("Invalid dataset defined in Spicepod: {source}"))]
     InvalidSpicepodDataset {
@@ -626,6 +694,10 @@ pub struct Runtime {
     rerankers: Arc<RwLock<RerankerModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
+    /// Sync MCP schemas + epoch. Streamable HTTP rebuilds when this bumps
+    /// so rmcp cannot keep a cached `get_tool == None` after a tool appears.
+    #[cfg(feature = "mcp")]
+    mcp_schemas: Arc<runtime_tools::mcp::server::McpSchemaSnapshot>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
@@ -660,11 +732,19 @@ pub struct Runtime {
     /// honor `runtime.dataset_load_parallelism`.
     dataset_load_semaphore: Arc<tokio::sync::Semaphore>,
 
+    /// The dataset loads still retrying, so a Spicepod change can stop the load
+    /// of a configuration it replaces or removes.
+    dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
+
     /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
     /// telemetry. For executors this is set after the app definition is
     /// fetched from the scheduler; for all other modes it is set before
     /// the runtime starts.
     telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
+
+    /// The engines found to have created the snapshots of datasets that read snapshots
+    /// (`file_format: snapshot`), which building those datasets needs.
+    snapshot_sources: Arc<component::dataset::snapshot_source::SnapshotSourceRegistry>,
 }
 
 impl Debug for Runtime {
@@ -705,6 +785,11 @@ impl Runtime {
         Arc::clone(&self.secrets)
     }
 
+    #[cfg(feature = "mcp")]
+    pub(crate) fn refresh_mcp_tool_schemas(&self, tools: &HashMap<String, Tooling>) {
+        self.mcp_schemas.replace_from_map(tools);
+    }
+
     #[must_use]
     pub fn secrets_weak(&self) -> Weak<RwLock<secrets::Secrets>> {
         Arc::downgrade(&self.secrets)
@@ -726,8 +811,22 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn evaluate_models(&self) -> Arc<RwLock<crate::model::EvaluateModelStore>> {
+        self.llm_runtime_stores.evaluate_models()
+    }
+
+    #[must_use]
     pub fn rerankers(&self) -> Arc<RwLock<RerankerModelStore>> {
         Arc::clone(&self.rerankers)
+    }
+
+    /// How each loaded model supports the Responses API, including which models are
+    /// evaluation-only.
+    #[must_use]
+    pub fn responses_api_support(
+        &self,
+    ) -> Arc<RwLock<HashMap<String, crate::model::ResponsesApiSupport>>> {
+        self.llm_runtime_stores.responses_api_support()
     }
 
     pub async fn responses_api_support_for_model(
@@ -789,6 +888,13 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// The engines of the snapshot sources this runtime has resolved.
+    pub(crate) fn snapshot_sources(
+        &self,
+    ) -> &Arc<component::dataset::snapshot_source::SnapshotSourceRegistry> {
+        &self.snapshot_sources
     }
 
     #[must_use]
@@ -1012,6 +1118,13 @@ impl Runtime {
             assignments,
         ));
 
+        // The ack below reports that *this* table instance loaded these
+        // partitions, so the identity has to be the one the assignments are
+        // about — captured ahead of the update that installs them, not after.
+        // Capturing later would tie the ack to whatever the name resolves to by
+        // then, which is a different table if a rebuild has landed in between.
+        let instance = self.datafusion().capture_table_instance(&table_ref).await;
+
         // Propagate the filter-update error so the caller (and the executor's
         // ack to the scheduler) sees the failure rather than just logging it.
         self.datafusion()
@@ -1057,9 +1170,39 @@ impl Runtime {
             // `is_table_loaded`/`updated_at` shortcut. Suppressing the empty
             // case here would leave the dataset stuck in `Refreshing`.
             let table_name = table.to_string();
+            let df = self.datafusion();
             tokio::spawn(async move {
-                if let Some(n) = notifier {
-                    n.notified().await;
+                // Acking readiness for a table that did not load this partition
+                // set tells the scheduler a lie it then caches, so wait for the
+                // refresh *and* re-resolve the table before broadcasting.
+                match df.await_refresh_completion(instance, notifier).await {
+                    DeferredRefreshOutcome::Apply => {}
+                    DeferredRefreshOutcome::Abandoned => {
+                        // The table was removed before the refresh we triggered
+                        // landed, so the partition set was never loaded.
+                        tracing::debug!(
+                            "{table_name} was removed before its partition refresh completed; not broadcasting PartitionsLoaded."
+                        );
+                        return;
+                    }
+                    DeferredRefreshOutcome::Failed => {
+                        // A one-shot refresh failed. Advertising those
+                        // partitions as queryable would tell the scheduler a
+                        // lie it then caches.
+                        tracing::debug!(
+                            "{table_name} partition refresh failed terminally; not broadcasting PartitionsLoaded."
+                        );
+                        return;
+                    }
+                    DeferredRefreshOutcome::TableChanged => {
+                        // A refresh did land, but not on the table this ack is
+                        // about — the name has since been removed or rebuilt,
+                        // and a rebuild carries its own partition set.
+                        tracing::debug!(
+                            "{table_name} was removed or rebuilt after its partition refresh completed; not broadcasting PartitionsLoaded."
+                        );
+                        return;
+                    }
                 }
                 // Statistics flow via the periodic ExecutorStatistics reporter, not
                 // this readiness ack.
@@ -1093,6 +1236,7 @@ impl Runtime {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+
             caching.run_pending_maintenance().await;
         }
     }
@@ -1299,6 +1443,12 @@ impl Runtime {
         }
         if caching.embeddings.is_some() {
             CachedEmbeddingResult::init();
+        }
+
+        // Every value these pools share is held by a cache entry, so a runtime
+        // with no cache configured has nothing to report.
+        if caching.results.is_some() || caching.search.is_some() {
+            cache::metrics::init_interner_metrics();
         }
     }
 
@@ -1842,6 +1992,14 @@ impl Runtime {
 
         self.secrets_preflight().await;
 
+        let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();
+        if hold_ready_for_warmup {
+            tracing::info!(
+                "SQL results cache warmup will run after the first full or append refresh, so datasets stay not ready until warmup completes"
+            );
+            self.status.hold_dataset_ready();
+        }
+
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;
@@ -1960,9 +2118,15 @@ impl Runtime {
             if !matches!(err, Error::ComponentsInitializationCancelled) {
                 tracing::error!("Could not start the Spice runtime: {err}");
             }
+            self.status.release_dataset_ready();
         } else {
-            // Create a background task to report once all components are marked as `Ready`
             let status = self.status();
+            if hold_ready_for_warmup {
+                let app = self.read_app().await;
+                self.df.spawn_results_cache_warmup(Arc::clone(&status), app);
+            }
+
+            // Create a background task to report once all components are marked as `Ready`
             tokio::spawn({
                 async move {
                     loop {
@@ -2180,7 +2344,6 @@ impl Runtime {
 // below `runtime` can resolve it; re-exported here for path compatibility.
 pub use data_accelerator_api::spice_data_base_path;
 
-#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {
     let mut base_folder = PathBuf::from(spice_data_base_path());
     base_folder.extend(directory);

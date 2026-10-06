@@ -618,6 +618,49 @@ mod tests {
     use yaml;
 
     #[test]
+    fn a_disabled_acceleration_block_reports_what_the_dataset_will_ignore() {
+        // The shape the runtime reads this through: the whole dataset as
+        // written, its acceleration block still optional. Asserted here so the
+        // caller's expression is exercised against the same types it uses.
+        let yaml = r"
+            name: api_data
+            from: https://api.example.com
+            acceleration:
+              enabled: false
+              engine: duckdb
+              refresh_mode: caching
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let ignored = dataset
+            .acceleration
+            .as_ref()
+            .map(Acceleration::fields_ignored_when_disabled)
+            .unwrap_or_default();
+        assert_eq!(
+            ignored.join(", "),
+            "engine, refresh_mode",
+            "a dataset that turns acceleration off has to say what it dropped"
+        );
+    }
+
+    #[test]
+    fn a_dataset_with_no_acceleration_block_reports_nothing() {
+        let yaml = r"
+            name: api_data
+            from: https://api.example.com
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert!(
+            dataset
+                .acceleration
+                .as_ref()
+                .map(Acceleration::fields_ignored_when_disabled)
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn test_invalid_type_action_migration() {
         // Test when only invalid_type_action is present
         let yaml = r"

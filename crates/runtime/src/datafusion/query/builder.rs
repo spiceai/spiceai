@@ -25,7 +25,16 @@ use uuid::Uuid;
 
 use crate::datafusion::{DataFusion, query::QueryMethod};
 
-use super::{Query, ResultsCacheMode, tracker::QueryTracker};
+use super::{Query, QueryRuntimeBinding, ResultsCacheMode, tracker::QueryTracker};
+
+/// A random (version 4) query id drawn from the thread-local generator.
+///
+/// `Uuid::new_v4` reads the operating system's entropy source, a system call on
+/// every query. The thread-local generator is a cryptographic generator seeded from
+/// that same source, so ids stay unpredictable without a system call each.
+pub(crate) fn new_query_id() -> Uuid {
+    uuid::Builder::from_random_bytes(rand::random()).into_uuid()
+}
 
 enum SqlOrPlan {
     Sql(Arc<str>),
@@ -42,6 +51,8 @@ pub struct QueryBuilder {
     cancellation_token: Option<CancellationToken>,
     read_only: bool,
     results_cache_mode: ResultsCacheMode,
+    runtime_binding: QueryRuntimeBinding,
+    emit_tracker: bool,
 }
 
 impl QueryBuilder {
@@ -50,11 +61,13 @@ impl QueryBuilder {
             df,
             method: SqlOrPlan::Sql(Arc::from(sql)),
             parameters: None,
-            query_id: Uuid::new_v4(),
+            query_id: new_query_id(),
             table_allowlist: None,
             cancellation_token: None,
             read_only: false,
             results_cache_mode: ResultsCacheMode::default(),
+            runtime_binding: QueryRuntimeBinding::QueryRuntime,
+            emit_tracker: true,
         }
     }
 
@@ -68,11 +81,13 @@ impl QueryBuilder {
             df,
             method: SqlOrPlan::Sql(sql),
             parameters: None,
-            query_id: Uuid::new_v4(),
+            query_id: new_query_id(),
             table_allowlist: None,
             cancellation_token: None,
             read_only: false,
             results_cache_mode: ResultsCacheMode::default(),
+            runtime_binding: QueryRuntimeBinding::QueryRuntime,
+            emit_tracker: true,
         }
     }
 
@@ -89,11 +104,13 @@ impl QueryBuilder {
             df,
             method: SqlOrPlan::Plan(Box::new(plan), sql.into()),
             parameters: None,
-            query_id: Uuid::new_v4(),
+            query_id: new_query_id(),
             table_allowlist: None,
             read_only: false,
             cancellation_token: None,
             results_cache_mode: ResultsCacheMode::default(),
+            runtime_binding: QueryRuntimeBinding::QueryRuntime,
+            emit_tracker: true,
         }
     }
 
@@ -153,12 +170,28 @@ impl QueryBuilder {
         self
     }
 
+    /// Run this query on the current Tokio runtime without taking a query
+    /// admission permit or emitting query metrics / task-history rows.
+    ///
+    /// Used by SQL results-cache warming so replay stays on the refresh
+    /// runtime and cannot stall user queries. Also enforces read-only SQL so
+    /// a corrupted or tampered warmup catalog cannot run DDL/DML at startup.
+    #[must_use]
+    pub(crate) fn for_results_cache_warming(mut self) -> Self {
+        self.runtime_binding = QueryRuntimeBinding::CurrentRuntimeUngated;
+        self.emit_tracker = false;
+        self.read_only = true;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> Query {
-        // The tracker is the only emitter of the query metrics, so it is always
-        // built — `runtime.task_history.enabled` only controls what it reports.
-        let tracker = Some(QueryTracker {
+        // The tracker is the only emitter of the query metrics. Background
+        // cache warming skips it so replay does not inflate query_count.
+        // `runtime.task_history.enabled` only controls what a built tracker reports.
+        let tracker = self.emit_tracker.then(|| QueryTracker {
             task_history_enabled: self.df.task_history_enabled,
+            captured_output_enabled: self.df.task_history_captured_output,
             schema: None,
             query_duration_secs: None,
             query_execution_duration_secs: None,
@@ -195,6 +228,7 @@ impl QueryBuilder {
             cancellation_token: self.cancellation_token,
             read_only: self.read_only,
             results_cache_mode: self.results_cache_mode,
+            runtime_binding: self.runtime_binding,
         }
     }
 }
@@ -247,5 +281,22 @@ mod tests {
             .tracker
             .expect("tracker must be built when task history is enabled");
         assert!(tracker.task_history_enabled);
+    }
+
+    /// Query ids come from the thread-local generator rather than a system call per
+    /// query, and must still be distinct random (version 4) UUIDs.
+    #[test]
+    fn query_ids_are_distinct_version_4_uuids() {
+        let ids: std::collections::HashSet<uuid::Uuid> =
+            (0..10_000).map(|_| super::new_query_id()).collect();
+        assert_eq!(ids.len(), 10_000, "query ids must not repeat");
+        for id in &ids {
+            assert_eq!(id.get_version_num(), 4, "{id} is not a version 4 UUID");
+            assert_eq!(
+                id.get_variant(),
+                uuid::Variant::RFC4122,
+                "{id} is not an RFC 4122 UUID"
+            );
+        }
     }
 }

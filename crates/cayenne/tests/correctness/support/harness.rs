@@ -16,14 +16,17 @@
 //! actual returned batches with the shipped validation path.
 //!
 //! Callers (integration tests) must not re-implement comparison or eyeball
-//! logs. The only content check is
-//! [`test_framework::queries::validation::compare_query_result_batches`] via
-//! [`super::compare_results`].
+//! logs. The only check is
+//! [`test_framework::queries::validation::compare_query_result_batches_with_sort_check`]
+//! via [`super::compare_results`], which compares content *and* verifies each
+//! side honors the query's own `ORDER BY`.
 
 use arrow::array::RecordBatch;
 use test_framework::queries::Query;
 
-use super::{CayenneHarness, ParityOutcome, compare_results};
+use super::{
+    CayenneHarness, ComparedResults, ParityOutcome, compare_results, compare_results_detailed,
+};
 
 /// Execute `sql` on Cayenne and return the collected result batches.
 pub async fn execute_cayenne(
@@ -43,6 +46,17 @@ pub fn compare_actual_results(
     right: &[RecordBatch],
 ) -> ParityOutcome {
     compare_results(query, left, right)
+}
+
+/// [`compare_actual_results`] keeping the typed reason and the coverage holes,
+/// so a caller can branch on the kind of failure without parsing its rendered
+/// detail, and cannot lose an unverified order while recovering from one.
+pub fn compare_actual_results_detailed(
+    query: &Query,
+    left: &[RecordBatch],
+    right: &[RecordBatch],
+) -> ComparedResults {
+    compare_results_detailed(query, left, right)
 }
 
 /// Run `sql` on Cayenne and on a reference batch producer, then compare.
@@ -79,6 +93,10 @@ where
 
 /// Assert that every `ParityOutcome` is Pass or justified Excluded; panic with
 /// detail otherwise. Integration tests call this so a human never “grades” logs.
+///
+/// An empty agreement fails here. A review accepts one only on the fixture it
+/// names, which these labels do not carry; a lane with reviewed-empty queries
+/// reports through [`super::report::unexplained`] instead.
 pub fn assert_all_pass_or_excluded(results: &[(String, ParityOutcome)], context: &str) {
     let fails: Vec<_> = results
         .iter()
@@ -103,7 +121,9 @@ pub fn assert_modes_agree_on_actual_results(
     let (ref_mode, ref_batches) = mode_batches[0];
     for (mode, batches) in mode_batches.iter().skip(1) {
         let outcome = compare_actual_results(query, ref_batches, batches);
-        if !matches!(outcome, ParityOutcome::Pass) {
+        // Two modes that both returned nothing agree; whether nothing was the
+        // right answer is the per-mode comparison's to report.
+        if !matches!(outcome, ParityOutcome::Pass | ParityOutcome::Vacuous { .. }) {
             return ParityOutcome::Fail {
                 detail: format!(
                     "load modes disagree on actual results for {}: {ref_mode} vs {mode}: {outcome:?}",

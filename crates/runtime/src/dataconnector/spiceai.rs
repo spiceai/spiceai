@@ -26,8 +26,8 @@ use std::sync::Arc;
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDialect};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::Credentials;
@@ -53,6 +53,7 @@ use super::{
     ParameterSpec,
 };
 use crate::component::dataset::DatasetSpec;
+use arrow_tools::map_entries::StreamNormalizer;
 use data_components::cdc::{
     self, AccelerationContents, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange,
     CommitError,
@@ -67,6 +68,11 @@ pub enum Error {
         "Missing required parameter: {parameter}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
     ))]
     MissingRequiredParameter { parameter: String },
+
+    #[snafu(display(
+        "Missing required parameter `{parameter}`. Set it to the region of the Spice Cloud app the dataset reads from, for example `{parameter}: us-east-1`. To list available regions, run `spice cloud regions`. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
+    ))]
+    MissingRegion { parameter: String },
 
     #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}". {source} Ensure the endpoint is valid and reachable"#))]
     UnableToVerifyEndpointConnection {
@@ -296,23 +302,16 @@ fn ensure_supported_endpoint_scheme(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-fn get_region(params: &ConnectorParams) -> Option<&str> {
-    params.parameters.get("region").expose().ok()
-}
-
-fn require_valid_region(region: Option<&str>) -> Result<&str> {
-    let region = region.ok_or_else(|| {
-        MissingRequiredParameterSnafu {
-            parameter: "region".to_string(),
-        }
-        .build()
-    })?;
-    ensure!(
-        !region.is_empty(),
-        MissingRequiredParameterSnafu {
-            parameter: "region".to_string()
-        }
-    );
+fn require_valid_region(params: &ConnectorParams) -> Result<&str> {
+    let region = params
+        .parameters
+        .get("region")
+        .expose()
+        .ok()
+        .filter(|region| !region.is_empty())
+        .with_context(|| MissingRegionSnafu {
+            parameter: params.parameters.user_param("region").to_string(),
+        })?;
     ensure!(
         is_valid_region(region),
         InvalidRegionSnafu {
@@ -324,22 +323,20 @@ fn require_valid_region(region: Option<&str>) -> Result<&str> {
 }
 
 fn get_endpoint(params: &ConnectorParams) -> Result<Arc<str>> {
-    let region = get_region(params);
-
     let Some(endpoint) = get_explicit_endpoint(params).or_else(|| get_from_endpoint(params)) else {
-        let region = require_valid_region(region)?;
+        let region = require_valid_region(params)?;
         return Ok(spice_cloud_flight_endpoint(region).into());
     };
 
     ensure_supported_endpoint_scheme(endpoint)?;
 
     if is_legacy_spice_cloud_endpoint(endpoint) {
-        let region = require_valid_region(region)?;
+        let region = require_valid_region(params)?;
         return Ok(spice_cloud_flight_endpoint(region).into());
     }
 
     if let Some(endpoint_region) = spice_cloud_endpoint_region(endpoint) {
-        let region = require_valid_region(region)?;
+        let region = require_valid_region(params)?;
         ensure!(
             endpoint_region == region,
             CloudEndpointRegionMismatchSnafu {
@@ -371,7 +368,11 @@ fn get_credentials(params: &ConnectorParams, endpoint: &str) -> Result<Credentia
 
     if is_spice_cloud_endpoint(endpoint) {
         return MissingRequiredParameterSnafu {
-            parameter: "api_key or token".to_string(),
+            parameter: format!(
+                "`{}` or `{}`",
+                params.parameters.user_param("api_key"),
+                params.parameters.user_param("token")
+            ),
         }
         .fail();
     }
@@ -659,6 +660,10 @@ pub fn subscribe_to_append_stream(
     table_reference: String,
 ) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
     stream! {
+        // The subscription carries one schema per stream, so the normalizer is resolved from the
+        // first batch and reused for the rest. Without it an accelerated dataset that started on
+        // the conformed scan schema would ingest the producer's non-conforming MAP declaration.
+        let mut normalizer = StreamNormalizer::new();
         match client.subscribe(&table_reference).await {
             Ok(mut stream) => {
                 while let Some(decoded_data) = stream.next().await {
@@ -666,6 +671,20 @@ pub fn subscribe_to_append_stream(
                         Ok(decoded_data) => match decoded_data.payload {
                             DecodedPayload::None | DecodedPayload::Schema(_) => {},
                             DecodedPayload::RecordBatch(batch) => {
+                                let batch = match normalizer.normalize(batch) {
+                                    Ok(batch) => batch,
+                                    Err(source) => {
+                                        yield Err(cdc::StreamError::Arrow(format!(
+                                            "Failed to read the change stream from Arrow Flight for dataset '{table_reference}' ({source}), so the dataset stops receiving updates. Remove the null map entries at the source, or expose the column as a string with `to_json(<column>)`. See: https://spiceai.org/docs/components/data-connectors"
+                                        )));
+                                        // End the subscription rather than resuming it. The CDC
+                                        // apply loop keeps running after a fatal stream error, so
+                                        // a resumed subscription would apply every later envelope
+                                        // on top of the change this one dropped and leave the
+                                        // acceleration permanently diverged from its source.
+                                        break;
+                                    }
+                                };
                                 match ChangeBatch::try_new(batch).map(|rb| {
                                     ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb, true)
                                 }) {
@@ -709,6 +728,8 @@ mod tests {
     use secrecy::SecretString;
     use tokio::runtime::Handle;
     use tokio::sync::RwLock;
+
+    const MISSING_REGION_MESSAGE: &str = "Missing required parameter `spiceai_region`. Set it to the region of the Spice Cloud app the dataset reads from, for example `spiceai_region: us-east-1`. To list available regions, run `spice cloud regions`. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration";
 
     async fn make_params(params: Vec<(String, SecretString)>) -> ConnectorParams {
         make_params_for_from("spice.ai/test.table", params).await
@@ -953,11 +974,10 @@ mod tests {
         let endpoint = spice_cloud_flight_endpoint("us-east-1");
         let error = get_credentials(&params, &endpoint)
             .expect_err("missing cloud credentials should return an error");
-        assert!(matches!(
-            error,
-            Error::MissingRequiredParameter { parameter }
-            if parameter == "api_key or token"
-        ));
+        assert_eq!(
+            error.to_string(),
+            "Missing required parameter: `spiceai_api_key` or `spiceai_token`. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
+        );
     }
 
     #[tokio::test]
@@ -1066,11 +1086,15 @@ mod tests {
         let params = make_params(vec![]).await;
 
         let error = get_endpoint(&params).expect_err("missing cloud region should error");
-        assert!(matches!(
-            error,
-            Error::MissingRequiredParameter { parameter }
-            if parameter == "region"
-        ));
+        assert_eq!(error.to_string(), MISSING_REGION_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_requires_a_non_empty_region() {
+        let params = make_params(vec![("spiceai_region".to_string(), String::new().into())]).await;
+
+        let error = get_endpoint(&params).expect_err("an empty cloud region should error");
+        assert_eq!(error.to_string(), MISSING_REGION_MESSAGE);
     }
 
     #[tokio::test]
@@ -1103,11 +1127,7 @@ mod tests {
         .await;
 
         let error = get_endpoint(&params).expect_err("cloud endpoint should require region");
-        assert!(matches!(
-            error,
-            Error::MissingRequiredParameter { parameter }
-            if parameter == "region"
-        ));
+        assert_eq!(error.to_string(), MISSING_REGION_MESSAGE);
     }
 
     #[tokio::test]

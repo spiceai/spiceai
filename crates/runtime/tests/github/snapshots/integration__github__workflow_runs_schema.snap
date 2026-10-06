@@ -18,4 +18,6 @@ expression: batches_to_string(&result_batches)
 | run_started_at | Timestamp(ms)                                                                    | YES         |
 | jobs_url       | Utf8                                                                             | NO          |
 | logs           | Map("entries": non-null Struct("keys": non-null Utf8, "values": Utf8), unsorted) | YES         |
+| owner          | Utf8                                                                             | NO          |
+| repo           | Utf8                                                                             | NO          |
 +----------------+----------------------------------------------------------------------------------+-------------+

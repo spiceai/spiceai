@@ -4,16 +4,13 @@ inputs:
   data_directory:
     description: path to load data and spicepods into
     required: true
-    type: string
   queryset_name:
     description: name of the queryset to load
     required: true
-    type: string
   use_evidence:
     description: whether to include evidence in the question
     required: false
     default: 'false'
-    type: string
 
 outputs:
   spicepod_dependency:

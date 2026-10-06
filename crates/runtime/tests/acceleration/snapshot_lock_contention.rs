@@ -45,9 +45,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
 use futures::future::join_all;
 use runtime::Runtime;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -89,6 +89,13 @@ impl DatasetCheckpointer for DelayedMockCheckpointer {
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<arrow::datatypes::SchemaRef>> {
         Ok(None)
+    }
+
+    async fn set_schema(
+        &self,
+        _schema: &arrow::datatypes::SchemaRef,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        Ok(())
     }
 
     async fn last_checkpoint_time(
@@ -733,7 +740,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
             let cmd = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_table"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -763,7 +770,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
             let cmd = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_table"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,

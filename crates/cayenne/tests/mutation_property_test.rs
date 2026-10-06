@@ -160,6 +160,10 @@ struct OpWeights {
     upsert: u32,
     delete: u32,
     delete_all: u32,
+    /// Delete by a predicate over a non-PK column: the scan-and-match path,
+    /// which `delete` (PK index) and `delete_all` (no matching) never reach.
+    /// A `retention_sql` DELETE has this shape.
+    delete_predicate: u32,
     overwrite: u32,
     compact: u32,
     restart: u32,
@@ -239,7 +243,7 @@ fn config(
             // `MoveToColdTier` op in the same serialization order production uses.
             cold_tier_background_interval_ms: 0,
             cold_tier_gc_interval_ms: COLD_GC_GRACE_MS,
-            cold_clustering_columns: vec!["id".to_string()],
+            cluster_by: vec!["id".to_string()],
             cold_target_file_size_mb: 1,
             ..base
         },
@@ -426,6 +430,23 @@ async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> Te
         .await?;
     datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(())
+}
+
+/// Delete rows whose non-PK `value` is in `[lo, hi)`.
+///
+/// Weighted into the memory configs as well as the file ones, because a filtered
+/// client DELETE materializes the mem-tier before it captures its scan sources:
+/// a row that is still RAM-resident is matched and removed like a durable one.
+/// Those walks are the randomized coverage for that path — take the checkpoint
+/// away and every memory workload fails with rows the model deleted still served
+/// (regression coverage for spiceai/spiceai#12008 under `cdc_durability: memory`;
+/// `mode: memory`, which never checkpoints, is still uncovered).
+async fn delete_predicate(table: &Arc<CayenneTableProvider>, lo: i64, hi: i64) -> TestResult<()> {
+    delete_filter(
+        table,
+        col("value").gt_eq(lit(lo)).and(col("value").lt(lit(hi))),
+    )
+    .await
 }
 
 /// One "settle" pass. File compacts small files; memory additionally checkpoints
@@ -630,14 +651,40 @@ async fn verify_aggregate_queries(
 
 #[derive(Clone, Debug)]
 enum Op {
-    Upsert { rows: Vec<(i64, i64)> },
-    Delete { key: i64 },
+    Upsert {
+        rows: Vec<(i64, i64)>,
+    },
+    Delete {
+        key: i64,
+    },
     DeleteAll,
-    Overwrite { rows: Vec<(i64, i64)> },
+    /// Delete every row whose non-PK `value` falls in `[lo, hi)`.
+    DeletePredicate {
+        lo: i64,
+        hi: i64,
+    },
+    Overwrite {
+        rows: Vec<(i64, i64)>,
+    },
     Compact,
     Restart,
     MoveToColdTier,
 }
+
+/// One live value to anchor a predicate window on; `None` when the table is
+/// empty.
+fn sample_live_value(model: &Model, rng: &mut Rng) -> Option<i64> {
+    if model.is_empty() {
+        return None;
+    }
+    let len = u64::try_from(model.len()).expect("model len fits u64");
+    let idx = usize::try_from(rng.below(len)).expect("index below len fits usize");
+    model.values().nth(idx).copied()
+}
+
+/// Value domain for the non-PK `value` column; `DeletePredicate` sizes its
+/// window against it.
+const VALUE_SPACE: i64 = 1_000_000;
 
 fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)> {
     debug_assert!(
@@ -650,7 +697,7 @@ fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)
     // debug_assert above catches the misconfiguration in tests.
     for _ in 0..batch_size.max(1) {
         let k = rng.below_i64(key_space);
-        let v = rng.below_i64(1_000_000);
+        let v = rng.below_i64(VALUE_SPACE);
         // last-writer-wins within the batch (a batch may not repeat a PK)
         if let Some(slot) = rows.iter_mut().find(|(ek, _): &&mut (i64, i64)| *ek == k) {
             slot.1 = v;
@@ -661,10 +708,17 @@ fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)
     rows
 }
 
-fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
+fn gen_op(
+    rng: &mut Rng,
+    w: &OpWeights,
+    key_space: i64,
+    batch_size: i64,
+    live_value: Option<i64>,
+) -> Op {
     let total = w.upsert
         + w.delete
         + w.delete_all
+        + w.delete_predicate
         + w.overwrite
         + w.compact
         + w.restart
@@ -679,6 +733,7 @@ fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
         (w.upsert, 0u8),
         (w.delete, 1),
         (w.delete_all, 2),
+        (w.delete_predicate, 7),
         (w.overwrite, 3),
         (w.compact, 4),
         (w.restart, 5),
@@ -693,6 +748,18 @@ fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
                     key: rng.below_i64(key_space),
                 },
                 2 => Op::DeleteAll,
+                7 => {
+                    // A window narrower than `VALUE_SPACE` matches nothing, and a
+                    // blind one rarely intersects a table holding a few rows.
+                    // Anchoring half on a live value reaches deletion-vector
+                    // writing rather than only the scan-and-match plan.
+                    let width = 1 + rng.below_i64(VALUE_SPACE / 2);
+                    let lo = match live_value {
+                        Some(v) if rng.below(2) == 0 => (v - rng.below_i64(width)).max(0),
+                        _ => rng.below_i64(VALUE_SPACE),
+                    };
+                    Op::DeletePredicate { lo, hi: lo + width }
+                }
                 3 => Op::Overwrite {
                     rows: random_rows(rng, key_space, batch_size),
                 },
@@ -717,6 +784,7 @@ fn apply_model(model: &mut Model, op: &Op) {
             model.remove(key);
         }
         Op::DeleteAll => model.clear(),
+        Op::DeletePredicate { lo, hi } => model.retain(|_, v| !(*v >= *lo && *v < *hi)),
         Op::Overwrite { rows } => {
             model.clear();
             for (k, v) in rows {
@@ -745,9 +813,9 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
     let mut history: Vec<Op> = Vec::with_capacity(w.ops);
-
     for step in 0..w.ops {
-        let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size);
+        let live_value = sample_live_value(&model, &mut rng);
+        let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
         history.push(op.clone());
         match &op {
             Op::Upsert { rows } => upsert(&table, rows, w.durability).await?,
@@ -757,6 +825,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 let live_keys: Vec<i64> = model.keys().copied().collect();
                 delete_all(&table, &live_keys, w.durability).await?;
             }
+            Op::DeletePredicate { lo, hi } => delete_predicate(&table, *lo, *hi).await?,
             Op::Overwrite { rows } => overwrite(&table, rows).await?,
             Op::Compact => {
                 settle(&table, w.durability).await?;
@@ -792,16 +861,24 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 table.run_cold_tier_gc_tick().await;
             }
         }
+        let rows_before_op = model.len();
         apply_model(&mut model, &op);
+        let retired_rows = model.len() < rows_before_op;
         let live = read_rows(&ctx, &name).await?;
-        assert_converged(
-            &live,
-            &model,
-            &format!(
-                "seq diverged after step {step} ({op:?}) mode={:?} durability={:?} seed={seed}\nhistory={history:?}",
-                w.mode, w.durability,
-            ),
+        let step_msg = format!(
+            "seq diverged after step {step} ({op:?}) mode={:?} durability={:?} seed={seed}\nhistory={history:?}",
+            w.mode, w.durability,
         );
+        assert_converged(&live, &model, &step_msg);
+
+        // Retiring rows is when a maintained count drifts and when deletion
+        // vectors leave holes for a stale min/max to prune around. The
+        // coordinator can fold `COUNT(*)` from an `Exact` count at any time, so
+        // the contract has to hold here, not only after the final settle.
+        if retired_rows {
+            verify_aggregate_queries(&ctx, table.as_ref(), &name, &model, w.population, &step_msg)
+                .await?;
+        }
     }
 
     // Final settle (memory: checkpoint RAM + bake; both: compact) so the reopened
@@ -885,7 +962,8 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     // Compact op is a no-op here); `restart` reopens under the write lock.
     let mut history: Vec<Op> = Vec::with_capacity(w.ops);
     for _ in 0..w.ops {
-        let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size);
+        let live_value = sample_live_value(&model, &mut rng);
+        let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
         history.push(op.clone());
         match &op {
             Op::Upsert { rows } => {
@@ -900,6 +978,10 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 let live_keys: Vec<i64> = model.keys().copied().collect();
                 let t = handle.read().await;
                 delete_all(&t, &live_keys, w.durability).await?;
+            }
+            Op::DeletePredicate { lo, hi } => {
+                let t = handle.read().await;
+                delete_predicate(&t, *lo, *hi).await?;
             }
             Op::Overwrite { rows } => {
                 let t = handle.read().await;
@@ -1037,6 +1119,7 @@ const SEQUENTIAL_MIXED: OpWeights = OpWeights {
     upsert: 40,
     delete: 25,
     delete_all: 8,
+    delete_predicate: 10,
     overwrite: 12,
     compact: 8,
     restart: 7,
@@ -1046,6 +1129,7 @@ const CONCURRENT_MIXED: OpWeights = OpWeights {
     upsert: 40,
     delete: 60,
     delete_all: 0,
+    delete_predicate: 10,
     overwrite: 0,
     // Compaction is driven by the background loop (foreground `compact` is a
     // no-op here); `restart` reopens the table from the catalog mid-stream, under
@@ -1059,6 +1143,7 @@ const CONCURRENT_UPSERT_ONLY: OpWeights = OpWeights {
     upsert: 100,
     delete: 0,
     delete_all: 0,
+    delete_predicate: 0,
     overwrite: 0,
     compact: 0,
     restart: 0,
@@ -1073,6 +1158,7 @@ const MEMORY_MIXED: OpWeights = OpWeights {
     upsert: 45,
     delete: 25,
     delete_all: 0,
+    delete_predicate: 10,
     overwrite: 0,
     compact: 25,
     restart: 5,
@@ -1194,6 +1280,7 @@ fn sequential_cold() -> Workload {
             upsert: 40,
             delete: 25,
             delete_all: 5,
+            delete_predicate: 10,
             overwrite: 10,
             compact: 5,
             restart: 5,
@@ -1218,6 +1305,7 @@ fn concurrent_cold() -> Workload {
             upsert: 40,
             delete: 55,
             delete_all: 0,
+            delete_predicate: 10,
             overwrite: 0,
             compact: 0,
             restart: 3,
@@ -1291,6 +1379,89 @@ async fn prop_sequential_memory_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_memory()).await
 }
 test_with_backends!(prop_sequential_memory_impl);
+
+/// [`assert_converged`] plus a physical row count, which catches a duplicate
+/// row that `read_rows` would fold into the key/value map.
+async fn assert_converged_no_duplicates(
+    ctx: &SessionContext,
+    name: &str,
+    model: &Model,
+    message: &str,
+) -> TestResult<()> {
+    assert_converged(&read_rows(ctx, name).await?, model, message);
+    let count = scalar_i64(ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
+    assert_eq!(
+        count,
+        i64::try_from(model.len()).expect("model size fits i64"),
+        "{message}: duplicate physical rows"
+    );
+    Ok(())
+}
+
+// A memory-durable table can receive a durable write when CDC cannot use the
+// mem tier. Walk both write paths against one model after every write.
+async fn prop_mixed_memory_and_durable_upserts_impl(f: TestFixture) -> TestResult<()> {
+    let name = "mixed_memory_and_durable_upserts";
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
+    let mut model = Model::new();
+    let initial: Vec<(i64, i64)> = (0..8).map(|id| (id, 0)).collect();
+    upsert(&table, &initial, Durability::Memory).await?;
+    model.extend(initial);
+
+    let mut rng = Rng::new(14413);
+    for step in 0..24 {
+        let rows = random_rows(&mut rng, 8, 4);
+        let durability = if step % 2 == 0 {
+            Durability::File
+        } else {
+            Durability::Memory
+        };
+        upsert(&table, &rows, durability).await?;
+        model.extend(rows);
+        let message = format!("mixed upsert step {step} ({durability:?})");
+        assert_converged_no_duplicates(&ctx, name, &model, &message).await?;
+    }
+    Ok(())
+}
+test_with_backends!(prop_mixed_memory_and_durable_upserts_impl);
+
+// A durable upsert of keys first written through the mem tier must hide the
+// old rows whether a checkpoint moves them into a file before the upsert or
+// after it.
+async fn durable_upsert_of_mem_tier_keys(
+    f: TestFixture,
+    name: &str,
+    checkpoint_first: bool,
+) -> TestResult<()> {
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
+    let old: Vec<(i64, i64)> = (1..=100).map(|id| (id, 1)).collect();
+    upsert(&table, &old, Durability::Memory).await?;
+    if checkpoint_first {
+        assert_eq!(
+            table.checkpoint_mem_tier().await?,
+            100,
+            "{name}: the checkpoint must move every key to files"
+        );
+    }
+    let new: Vec<(i64, i64)> = (1..=100).map(|id| (id, 2)).collect();
+    upsert(&table, &new, Durability::File).await?;
+    let model: Model = new.into_iter().collect();
+    assert_converged_no_duplicates(&ctx, name, &model, name).await?;
+    if !checkpoint_first {
+        table.checkpoint_mem_tier().await?;
+        assert_converged_no_duplicates(&ctx, name, &model, &format!("{name} after checkpoint"))
+            .await?;
+    }
+    Ok(())
+}
+async fn durable_upsert_after_mem_tier_checkpoint_impl(f: TestFixture) -> TestResult<()> {
+    durable_upsert_of_mem_tier_keys(f, "durable_upsert_after_mem_tier_checkpoint", true).await
+}
+async fn mem_tier_checkpoint_after_durable_upsert_impl(f: TestFixture) -> TestResult<()> {
+    durable_upsert_of_mem_tier_keys(f, "mem_tier_checkpoint_after_durable_upsert", false).await
+}
+test_with_backends!(durable_upsert_after_mem_tier_checkpoint_impl);
+test_with_backends!(mem_tier_checkpoint_after_durable_upsert_impl);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_memory_sqlite() -> TestResult<()> {

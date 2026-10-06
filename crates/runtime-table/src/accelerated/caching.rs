@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
@@ -27,36 +28,395 @@ use arrow_tools::format::SchemaDisplay;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
+use datafusion::execution::context::SessionState;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{Expr, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
-use datafusion::physical_plan::execution_plan::EmissionType;
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
     stream::RecordBatchStreamAdapter,
 };
 use datafusion::physical_plan::{Distribution, Partitioning, PlanProperties};
-use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::expr::ExprListDisplay;
 use futures::{StreamExt, TryStreamExt};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 
+use runtime_acceleration::acceleration::StaleIfError;
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
+use runtime_datafusion::execution_plan::TableScanParams;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_request_context::CacheNamespace;
 use runtime_status::{ComponentStatus, RuntimeStatus};
 use util::expr::combine_exprs_balanced;
 
-/// Type alias for tracking in-flight revalidation requests.
-/// The key is a cache key derived from the filter expressions (`request_path`, `request_query`, `request_body`).
-/// When a revalidation is in progress for a cache key, other requests for the same key will skip
-/// triggering a new revalidation to avoid duplicate upstream requests during the SWR window.
-pub type InFlightRevalidations = Arc<Mutex<HashSet<String>>>;
+/// One entry per cache key with a fetch in flight, mapping the key to the
+/// [`InFlightFetch`] whose outcome ([`FetchState`]) followers wait on.
+///
+/// The entry plays two coordinating roles at once. It is the write-ownership
+/// claim — one key, one writer, so two concurrent writers cannot each append
+/// their response and leave the key holding it twice (a duplicated source row
+/// is a wrong query result). It is also the single-flight rendezvous: the one
+/// caller that inserts the entry (the *leader*) fetches the origin, and every
+/// caller that finds an entry already present (a *follower*) replays the
+/// leader's published batches instead of asking the origin again — provided
+/// the leader's fetch can answer it (see [`InFlightFetch::serves`]). Claims are
+/// taken and released through [`CacheKeyClaim`] / [`ClaimOutcome`] rather than
+/// by touching this directly.
+///
+/// The key is derived from the filter expressions (`request_path`,
+/// `request_query`, `request_body`) and the namespace
+/// ([`compute_cache_key_from_filters_and_namespace`]), so two callers that
+/// coalesce onto the same entry already share one namespace.
+///
+/// A synchronous lock: every critical section is one `HashMap` operation, never
+/// held across an `.await`. A follower clones the [`InFlightFetch`] while
+/// holding the guard, drops the guard, then awaits; [`CacheKeyClaim`]'s `Drop`
+/// must be able to release without one.
+pub type InFlightRevalidations = Arc<parking_lot::Mutex<HashMap<String, InFlightFetch>>>;
+
+/// A fetch in flight for a cache key: what the leader asked the origin for, and
+/// the [`watch`] channel its outcome arrives on. Followers get a clone from
+/// [`CacheKeyClaim::acquire`].
+#[derive(Debug, Clone)]
+pub struct InFlightFetch {
+    /// The row limit the leader passed to the origin; `None` is unbounded.
+    limit: Option<usize>,
+    /// The leader's published [`FetchState`].
+    state: watch::Receiver<FetchState>,
+}
+
+impl InFlightFetch {
+    /// Whether this fetch can answer a request that asked the origin for `limit`
+    /// rows.
+    ///
+    /// The origin truncates a bounded fetch to its limit, so replaying a fetch
+    /// bounded *below* the request would hand it fewer rows than the origin
+    /// holds for the same filters — a wrong result, not a slower one. An
+    /// unbounded fetch answers any request; a bounded one only a request bounded
+    /// at or below it. Replaying *more* rows than requested is safe: `DataFusion`
+    /// keeps its own `Limit` above the scan and trims the surplus.
+    fn serves(&self, limit: Option<usize>) -> bool {
+        match (self.limit, limit) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(fetched), Some(wanted)) => wanted <= fetched,
+        }
+    }
+}
+
+/// The outcome of a leader's fetch, published to followers over a [`watch`]
+/// channel held in [`InFlightRevalidations`].
+///
+/// `RecordBatch` clones are cheap — they clone `Arc` buffer pointers, not the
+/// underlying data — so followers replay the leader's already-collected batches
+/// without re-scanning the accelerator and without a second origin call.
+#[derive(Debug, Clone)]
+pub enum FetchState {
+    /// The leader is still fetching; no result yet.
+    Pending,
+    /// The leader collected these batches from the origin — none at all when
+    /// the origin had no rows for the key. Followers replay them.
+    Ready(Arc<Vec<RecordBatch>>),
+    /// The leader could not publish a result — it failed, was cancelled, or its
+    /// response was not cacheable — so followers stop waiting and fetch the
+    /// origin themselves.
+    Failed,
+}
+
+/// The result of trying to claim a cache key with [`CacheKeyClaim::acquire`].
+pub enum ClaimOutcome {
+    /// No entry existed: this caller inserted it and owns the fetch and write.
+    Leader(CacheKeyClaim),
+    /// An entry already existed: another caller owns the fetch and the write
+    /// for this key. This caller replays that fetch when it
+    /// [serves](InFlightFetch::serves) its request, and otherwise fetches for
+    /// itself without writing.
+    Follower(InFlightFetch),
+}
+
+/// A cache key claimed for single-flight fetching and writing, released when
+/// this is dropped.
+///
+/// One key, one writer. Two writers for the same key each append their
+/// response, leaving the key holding it twice — which queries return as
+/// duplicated source rows. The same entry also makes the leader the only caller
+/// that reaches the origin: [`ClaimOutcome::Follower`]s wait on the batches the
+/// leader publishes through [`Self::publish_ready`].
+///
+/// The claim deliberately spans the whole window in which a writer's view of
+/// the key can go stale, so it is taken *before* the origin is asked rather
+/// than after. Replacing an entry is a delete followed by an append, and a
+/// reader scanning in between sees no rows and reads a miss. By the time that
+/// reader's own fetch returns, the replacement may have landed and released;
+/// claiming only then would let it append beside a response it never saw.
+///
+/// Dropping releases the claim, so a fetch that never returns or a query
+/// cancelled while waiting for write-channel capacity cannot leave a key
+/// claimed for the life of the process — which would refuse every later write
+/// *and* revalidation for it, making one transient failure permanent. A drop
+/// before a result is published also publishes [`FetchState::Failed`], so
+/// followers fall through to their own fetch instead of waiting forever.
+pub struct CacheKeyClaim {
+    key: String,
+    in_flight: InFlightRevalidations,
+    /// Publishes the fetch outcome to followers waiting on this key. `watch`
+    /// retains the last value, so a follower that clones the receiver after the
+    /// leader has published still observes the result.
+    sender: watch::Sender<FetchState>,
+    /// Set once a terminal [`FetchState`] (`Ready` or `Failed`) has been
+    /// published, so `Drop` does not overwrite a real result with `Failed`.
+    published: bool,
+    /// Set once a queued write owns the claim; that write removes the map entry
+    /// after it has landed, so dropping this must not.
+    queued: bool,
+}
+
+impl CacheKeyClaim {
+    /// Claims `key` for fetching and writing, or returns the fetch already in
+    /// flight for it. `limit` is the row limit this caller will pass to the
+    /// origin; it is recorded on the entry so followers can tell whether the
+    /// leader's fetch serves them ([`InFlightFetch::serves`]).
+    ///
+    /// The map is locked for exactly one operation: the follower branch clones
+    /// the entry and drops the guard before its caller awaits, so the lock is
+    /// never held across an `.await` (see [`InFlightRevalidations`]).
+    #[must_use]
+    pub fn acquire(
+        in_flight: &InFlightRevalidations,
+        key: String,
+        limit: Option<usize>,
+    ) -> ClaimOutcome {
+        let mut guard = in_flight.lock();
+        if let Some(fetch) = guard.get(&key) {
+            let fetch = fetch.clone();
+            drop(guard);
+            return ClaimOutcome::Follower(fetch);
+        }
+        let (sender, state) = watch::channel(FetchState::Pending);
+        guard.insert(key.clone(), InFlightFetch { limit, state });
+        drop(guard);
+        ClaimOutcome::Leader(Self {
+            key,
+            in_flight: Arc::clone(in_flight),
+            sender,
+            published: false,
+            queued: false,
+        })
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Publishes the leader's collected batches — possibly none — to any
+    /// followers waiting on this key. Call once the fetch has returned a result
+    /// followers may replay, before any write is enqueued, so they can proceed
+    /// without waiting for the write to land.
+    fn publish_ready(&mut self, batches: Arc<Vec<RecordBatch>>) {
+        // `send_replace` never fails on a closed channel and updates the value
+        // that every receiver — including one cloned later — observes.
+        self.sender.send_replace(FetchState::Ready(batches));
+        self.published = true;
+    }
+
+    /// Publishes an unbounded origin fetch to followers when it is a response
+    /// the cache would store — including an empty one — so every claim holder
+    /// that fetches the origin, not only a cache miss, serves the callers that
+    /// coalesced onto it. A transient-failure response (429 or 5xx) is left
+    /// unpublished: dropping the claim then publishes [`FetchState::Failed`] and
+    /// each follower applies its own `caching_stale_if_error`.
+    fn publish_if_cacheable(&mut self, batches: &[RecordBatch]) {
+        if cache::batches_cacheable(batches) {
+            self.publish_ready(Arc::new(batches.to_vec()));
+        }
+    }
+
+    /// Hands the claim to a write that has been queued, which removes the map
+    /// entry once the write has landed. Call only after the send has succeeded:
+    /// a claim given to a request that never reaches the flush is never released.
+    fn into_queued(mut self) {
+        self.queued = true;
+    }
+}
+
+impl Drop for CacheKeyClaim {
+    fn drop(&mut self) {
+        // A leader that never published a result — dropped mid-fetch, cancelled,
+        // or holding a non-cacheable response — must release its followers, or
+        // they wait on a `Pending` that never resolves. Publish before the map
+        // entry is removed so a follower that already cloned the receiver is
+        // woken.
+        if !self.published {
+            self.sender.send_replace(FetchState::Failed);
+        }
+        if self.queued {
+            return;
+        }
+        self.in_flight.lock().remove(&self.key);
+    }
+}
+
+/// How long a follower waits on the leader's in-flight fetch before giving up
+/// and querying the origin itself. A backstop for a leader whose fetch hangs
+/// without returning or being cancelled (a cancelled leader publishes
+/// [`FetchState::Failed`] on drop, waking followers at once); timing out only
+/// costs the extra origin call the follower would have made anyway.
+const FOLLOWER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The terminal outcome a follower observes while waiting on a leader's fetch.
+enum FollowerResult {
+    /// The leader published batches for the follower to replay.
+    Ready(Arc<Vec<RecordBatch>>),
+    /// The leader published no usable result; the follower fetches for itself.
+    Failed,
+}
+
+/// A cache miss served by its own origin fetch, outside the single-flight
+/// coalescing on its key: a follower whose leader published no usable result
+/// or did not answer in time, or a miss the in-flight fetch cannot serve
+/// because it asked the origin for fewer rows ([`InFlightFetch::serves`]).
+///
+/// It holds no claim, so it never writes — the leader owns the write — but it
+/// applies the same `caching_stale_if_error` / empty / error handling the
+/// leader path applies on the arms that do not write.
+struct UncoalescedFetch<'a> {
+    federated: Arc<dyn TableProvider>,
+    session_state: &'a SessionState,
+    dataset_name: &'a str,
+    filters: &'a [Expr],
+    limit: Option<usize>,
+    /// The schema an empty or error stream is given.
+    schema: SchemaRef,
+    stale_if_error: StaleIfError,
+    /// The `caching_ttl` the expired batches are measured past, so a finite
+    /// `caching_stale_if_error` window is applied here the way the leader
+    /// applies it.
+    max_age: Duration,
+    expired_batches: Option<CacheFallback>,
+}
+
+impl UncoalescedFetch<'_> {
+    /// Fetches the origin and streams the outcome to the caller.
+    async fn run(self) -> SendableRecordBatchStream {
+        let Self {
+            federated,
+            session_state,
+            dataset_name,
+            filters,
+            limit,
+            schema,
+            stale_if_error,
+            max_age,
+            expired_batches,
+        } = self;
+
+        let fetch_started_at = SystemTime::now();
+        match CacheRefreshHelper::fetch_from_source(
+            &federated,
+            session_state,
+            dataset_name,
+            filters,
+            limit,
+        )
+        .await
+        {
+            Ok(batches) if !batches.is_empty() => {
+                let batch_schema = batches[0].schema();
+
+                // The guard for a 429 or 5xx status reaching here on a
+                // *successful* fetch; serve the expired cached response instead
+                // when `caching_stale_if_error` allows it. The HTTP connector
+                // refuses such a status itself, so its own failures take the
+                // `Err` arm.
+                if !cache::batches_cacheable(&batches)
+                    && let Some(stale) = match expired_batches {
+                        Some(fallback) => fallback.read().await,
+                        None => None,
+                    }
+                {
+                    let staleness = staleness_past_max_age(&stale, max_age, fetch_started_at);
+                    if stale_if_error.within_error_window(staleness) {
+                        tracing::warn!(
+                            "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` allows it."
+                        );
+                        let stale_schema = stale[0].schema();
+                        return Box::pin(RecordBatchStreamAdapter::new(
+                            stale_schema,
+                            futures::stream::iter(stale.into_iter().map(Ok)),
+                        ));
+                    }
+                    tracing::debug!(
+                        "Stale entry for dataset '{dataset_name}' is {staleness:?} past the stale-if-error window ({stale_if_error}), returning the origin's transient response."
+                    );
+                }
+
+                Box::pin(RecordBatchStreamAdapter::new(
+                    batch_schema,
+                    futures::stream::iter(batches.into_iter().map(Ok)),
+                ))
+            }
+            Ok(_) => Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::empty(),
+            )),
+            Err(e) => {
+                if let Some(batches) = match expired_batches {
+                    Some(fallback) => fallback.read().await,
+                    None => None,
+                } {
+                    let staleness = staleness_past_max_age(&batches, max_age, fetch_started_at);
+                    if stale_if_error.within_error_window(staleness) {
+                        tracing::warn!(
+                            "Origin fetch for dataset '{dataset_name}' failed, so the expired cached response is being served instead because `caching_stale_if_error` allows it. Cause: {e}"
+                        );
+                        let stale_schema = batches[0].schema();
+                        return Box::pin(RecordBatchStreamAdapter::new(
+                            stale_schema,
+                            futures::stream::iter(batches.into_iter().map(Ok)),
+                        ));
+                    }
+                    tracing::debug!(
+                        "Stale entry for dataset '{dataset_name}' is {staleness:?} past the stale-if-error window ({stale_if_error}), propagating the origin error."
+                    );
+                }
+
+                tracing::error!("Cache miss fetch failed for dataset {dataset_name}: {e}");
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::once(async move { Err(e) }),
+                ))
+            }
+        }
+    }
+}
 
 pub const CACHE_REFRESHED_AT_COLUMN: &str = "_fetched_at";
+
+/// How long a cached entry stays fresh when the dataset sets no `caching_ttl`.
+///
+/// Read by the scan that decides whether a row may be served, the sweep that
+/// decides whether it may be kept, and the Spicepod parser that checks the
+/// caching windows fit a `Duration`. One constant, because a sweep with a
+/// shorter default than the scan would delete rows the scan still calls fresh.
+pub use runtime_acceleration::acceleration::DEFAULT_CACHING_TTL;
+
+/// The TTL a caching scan actually applies, filling in [`DEFAULT_CACHING_TTL`]
+/// for a dataset that configured none.
+///
+/// Named rather than inlined so the eviction sweep's fallback can be asserted
+/// against the same value the read path uses: a sweep with the shorter of the
+/// two would delete rows the scan still calls fresh.
+#[must_use]
+pub fn effective_max_age(configured: Option<Duration>) -> Duration {
+    configured.unwrap_or(DEFAULT_CACHING_TTL)
+}
 
 /// Reserved column name added to caching-mode accelerator storage to scope
 /// cached rows by [`runtime_request_context::CacheNamespace`]. The column is
@@ -78,37 +438,46 @@ pub fn is_reserved_caching_column(name: &str) -> bool {
 }
 
 /// Returns a copy of `batch` with [`CACHE_NAMESPACE_COLUMN`] appended,
-/// populated with `namespace_id` for every row. Idempotent: if the column
-/// is already present the batch is returned unchanged.
+/// populated with `namespace_id` for every row. Idempotent: if the column is
+/// already present the batch is returned unchanged, and if `storage_schema`
+/// does not declare the column the batch is returned unchanged too — a
+/// unit-test mock with an unextended schema opts out that way.
 ///
-/// Called immediately before a [`CacheWriteRequest`] is enqueued so that
-/// every persisted row carries its originating namespace tag, which is
-/// what `__spice_cache_namespace = $current_ns` filtering keys off of on
-/// read.
+/// Called immediately before a [`CacheWriteRequest`]'s batches are handed to
+/// the accelerator, so that every persisted row carries the tag the read path
+/// filters on (`__spice_cache_namespace = $current_ns`).
 ///
 /// # Errors
 ///
-/// Returns a `DataFusionError` if the tagged column cannot be appended to the
-/// batch — the namespace array and the batch disagree on row count, or the
-/// resulting schema is rejected.
+/// Returns a `DataFusionError` if the stamped batch is rejected — the tag array
+/// and the batch disagree on row count, or the resulting schema is invalid.
 pub fn stamp_namespace_column(
     batch: RecordBatch,
+    storage_schema: &arrow::datatypes::Schema,
     namespace_id: &str,
 ) -> DataFusionResult<RecordBatch> {
-    use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
+
     let schema = batch.schema();
-    if schema.column_with_name(CACHE_NAMESPACE_COLUMN).is_some() {
+    if storage_schema
+        .column_with_name(CACHE_NAMESPACE_COLUMN)
+        .is_none()
+        || schema.column_with_name(CACHE_NAMESPACE_COLUMN).is_some()
+    {
         return Ok(batch);
     }
-    let n = batch.num_rows();
+
     let mut fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
     fields.push(Field::new(CACHE_NAMESPACE_COLUMN, DataType::Utf8, false));
+
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+        namespace_id,
+        batch.num_rows(),
+    ))) as ArrayRef);
+
     let new_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-    let ns_array: ArrayRef = Arc::new(StringArray::from(vec![namespace_id; n]));
-    let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
-    cols.push(ns_array);
-    RecordBatch::try_new(new_schema, cols).map_err(|e| {
+    RecordBatch::try_new(new_schema, columns).map_err(|e| {
         DataFusionError::Execution(format!("failed to stamp {CACHE_NAMESPACE_COLUMN}: {e}"))
     })
 }
@@ -167,6 +536,10 @@ pub fn extend_schema_with_cache_namespace(
     ))
 }
 
+/// The request columns that together identify one cache entry — the key a
+/// refresh is rebuilt from and the key eviction removes an entry by.
+pub const REQUEST_KEY_COLUMNS: [&str; 3] = ["request_path", "request_query", "request_body"];
+
 /// Maximum number of concurrent refresh requests
 const MAX_CONCURRENT_REFRESHES: usize = 10;
 
@@ -188,10 +561,17 @@ pub struct CacheWriteRequest {
     pub batches: Vec<RecordBatch>,
     /// Filter expressions to identify the cache key (for upsert operations)
     pub filters: Vec<Expr>,
-    /// If true, this is an upsert (expired data exists), otherwise insert (new data)
-    pub is_upsert: bool,
     /// Cache key computed from filters, used to track in-flight writes
     pub cache_key: String,
+    /// Whether rows for this key are already stored, so the write must remove
+    /// them before appending.
+    ///
+    /// A key nothing holds yet is appended with no delete. That matters more
+    /// than it looks: on Cayenne a `delete_from` first checkpoints the inline
+    /// memtable to a file, so deleting on every write — including the
+    /// overwhelming majority that cannot collide with anything — collapsed
+    /// measured ingest from thousands of entries per second to about ten.
+    pub replaces_existing: bool,
     /// Stable storage id of the originating namespace (see
     /// [`runtime_request_context::CacheNamespace::storage_id`]). Stamped into
     /// `__spice_cache_namespace` on every row at flush time and added to the
@@ -431,124 +811,145 @@ async fn flush_cache_writes(
 
     let flush_start = std::time::Instant::now();
 
-    let request_count = buffer.len();
-    let total_rows: usize = buffer
+    let queued = buffer.len();
+
+    // One key, one write. Two requests for the same key in a single flush would
+    // share one OR'd delete and then each append their batches, leaving the key
+    // holding the response twice — and a duplicated source row is a wrong query
+    // result, not a housekeeping problem. Walking newest-first keeps the latest
+    // write for each key; an older one is a response that key no longer holds.
+    //
+    // The in-flight key set makes this unreachable from the two paths that
+    // enqueue today. It is enforced here as well so the flush does not depend
+    // on its callers for it.
+    let mut seen: HashSet<String> = HashSet::with_capacity(queued);
+    let mut requests: Vec<CacheWriteRequest> = buffer
+        .drain(..)
+        .rev()
+        .filter(|req| seen.insert(req.cache_key.clone()))
+        .collect();
+    requests.reverse();
+
+    if requests.len() < queued {
+        tracing::debug!(
+            "Dropping {superseded} superseded cache write(s) for dataset={dataset_name}: a later write for the same key is in this flush",
+            superseded = queued - requests.len()
+        );
+    }
+
+    let request_count = requests.len();
+    let total_rows: usize = requests
         .iter()
         .flat_map(|r| r.batches.iter())
         .map(RecordBatch::num_rows)
         .sum();
 
-    // Collect cache keys to remove after flushing
-    let cache_keys: Vec<String> = buffer.iter().map(|r| r.cache_key.clone()).collect();
+    // Every key claimed for this flush, including the superseded writes, whose
+    // claim is the same string and is released with it.
+    let cache_keys = seen;
 
     tracing::trace!(
         "Flushing {request_count} cache write requests ({total_rows} total rows) for dataset={dataset_name}"
     );
 
-    // Separate inserts from upserts. Stamp the namespace column on every
-    // batch and add a `__spice_cache_namespace = $ns_id` predicate to each
-    // upsert filter set so concurrent writers from different namespaces
-    // never overwrite each other's rows for the same logical key. We do
-    // this here (not at the send-site) so unit-test mocks with a non-
-    // extended schema can opt out by simply not adding the column.
-    let needs_namespace_stamp = accelerator
-        .schema()
+    // Separate inserts from upserts. Stamp the caching accelerator's reserved
+    // columns on every batch and add a `__spice_cache_namespace = $ns_id`
+    // predicate to each upsert filter set so concurrent writers from different
+    // namespaces never overwrite each other's rows for the same logical key.
+    // We do this here (not at the send-site) so unit-test mocks with a non-
+    // extended schema can opt out by simply not declaring the columns.
+    let storage_schema = accelerator.schema();
+    let needs_namespace_stamp = storage_schema
         .column_with_name(CACHE_NAMESPACE_COLUMN)
         .is_some();
 
-    let mut insert_batches: Vec<RecordBatch> = Vec::new();
-    let mut upsert_batches: Vec<RecordBatch> = Vec::new();
-    let mut upsert_filters: Vec<Vec<Expr>> = Vec::new();
+    let mut all_batches: Vec<RecordBatch> = Vec::new();
+    let mut replace_filters: Vec<Vec<Expr>> = Vec::new();
 
-    for req in buffer.drain(..) {
-        let mut batches = req.batches;
+    for req in requests {
+        let ns_id: &str = &req.namespace_id;
+        let batches = match req
+            .batches
+            .into_iter()
+            .map(|b| stamp_namespace_column(b, &storage_schema, ns_id))
+            .collect::<DataFusionResult<Vec<_>>>()
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to stamp {CACHE_NAMESPACE_COLUMN} for dataset={dataset_name}: {e}; dropping write"
+                );
+                continue;
+            }
+        };
         let mut filters = req.filters;
         if needs_namespace_stamp {
-            let ns_id: &str = &req.namespace_id;
-            batches = match batches
-                .into_iter()
-                .map(|b| stamp_namespace_column(b, ns_id))
-                .collect::<DataFusionResult<Vec<_>>>()
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to stamp {CACHE_NAMESPACE_COLUMN} for dataset={dataset_name}: {e}; dropping write"
-                    );
-                    continue;
-                }
-            };
-            if req.is_upsert {
-                filters.push(namespace_filter_expr(ns_id));
-            }
+            filters.push(namespace_filter_expr(ns_id));
         }
-        if req.is_upsert {
-            upsert_batches.extend(batches);
-            upsert_filters.push(filters);
-        } else {
-            insert_batches.extend(batches);
+
+        all_batches.extend(batches);
+
+        // Only a write that replaces stored rows deletes first: a delete for a
+        // key nothing holds matches nothing and is not free. Two writes racing
+        // to insert the same fresh key are prevented where the miss is
+        // enqueued, by the in-flight key set, rather than by deleting here.
+        if req.replaces_existing && !filters.is_empty() {
+            replace_filters.push(filters);
         }
     }
 
-    let insert_rows: usize = insert_batches.iter().map(RecordBatch::num_rows).sum();
-    let upsert_rows: usize = upsert_batches.iter().map(RecordBatch::num_rows).sum();
-    let upsert_count = upsert_filters.len();
-
-    // Combine all batches for writing
-    let mut all_batches = insert_batches;
-    all_batches.extend(upsert_batches);
+    let write_rows: usize = all_batches.iter().map(RecordBatch::num_rows).sum();
+    let replace_count = replace_filters.len();
 
     let write_start = std::time::Instant::now();
-
-    // Check if the accelerator has constraints configured (primary key, unique, etc.).
-    // If it does, we can use native upsert (append_to_accelerator) which is more efficient
-    // than the read-filter-write pattern (batched_upsert_into_accelerator).
-    let has_constraints = accelerator.constraints().is_some_and(|c| !c.is_empty());
 
     // Acquire the mutex once for the entire batch
     let lock_wait_start = std::time::Instant::now();
     let lock_guard = accelerator_write_mutex.lock().await;
     let lock_wait_ms = lock_wait_start.elapsed().as_millis();
 
+    // A declared constraint gets no write path of its own. Replacing an entry
+    // means the rows the cache key now maps to are exactly the ones the response
+    // carried, so the superseded rows are deleted before the new ones are
+    // appended -- a native upsert keyed on the constraint would append and
+    // update in place, leaving behind any row that the response no longer
+    // returns for that key.
     let result = if all_batches.is_empty() {
         Ok(())
-    } else if has_constraints {
-        // Use native upsert via append - the accelerator's OnConflict::Upsert handles deduplication
-        CacheRefreshHelper::append_to_accelerator(accelerator, dataset_name, all_batches).await
-    } else if !upsert_filters.is_empty() {
-        // No constraints - fall back to read-filter-write pattern for upserts
+    } else if replace_filters.is_empty() {
+        CacheRefreshHelper::insert_into_accelerator(accelerator, dataset_name, all_batches).await
+    } else {
         CacheRefreshHelper::batched_upsert_into_accelerator(
             accelerator,
             dataset_name,
-            &upsert_filters,
+            &replace_filters,
             all_batches,
         )
         .await
-    } else {
-        // No upserts needed - use insert path
-        CacheRefreshHelper::insert_into_accelerator(accelerator, dataset_name, all_batches).await
     };
 
     drop(lock_guard);
 
     let write_ms = write_start.elapsed().as_millis();
     if let Err(e) = result {
-        tracing::warn!("Failed to flush cache updates for dataset {dataset_name}: {e}");
+        tracing::warn!(
+            "Failed to write cached responses for dataset '{dataset_name}', so those entries are not cached and the next query for them will be answered from the origin. Cause: {e}"
+        );
         health.record_failure(&e);
-    } else if insert_rows > 0 || upsert_rows > 0 {
+    } else if write_rows > 0 {
         health.record_success();
 
         // Update last_updated_at for snapshots_creation_policy: on_change support
         super::AcceleratedTable::set_timestamp_to_now(last_updated_at);
 
         tracing::trace!(
-            "Cache write completed for dataset={dataset_name}: inserts={insert_rows} rows, upserts={upsert_count}, {upsert_rows} rows in {write_ms}ms"
+            "Cache write completed for dataset={dataset_name}: {write_rows} rows across {replace_count} keys in {write_ms}ms"
         );
     }
 
     // Remove cache keys from in-flight tracking now that writes are persisted
     {
-        let mut in_flight = in_flight_revalidations.lock().await;
+        let mut in_flight = in_flight_revalidations.lock();
         for key in &cache_keys {
             in_flight.remove(key);
         }
@@ -571,6 +972,58 @@ fn get_first_fetched_at_timestamp(batch: &RecordBatch) -> Option<i64> {
         return None;
     }
     Some(ts_array.value(0))
+}
+
+/// The oldest `_fetched_at` value across every row of every batch, as
+/// nanoseconds since the epoch, normalizing the column's stored precision
+/// first — an accelerator may store it at a coarser resolution (Cayenne keeps
+/// microseconds), which a bare nanosecond downcast would silently miss.
+/// `None` when any batch is missing the column or any row's value is null —
+/// the same fail-closed contract `check_cache_freshness` applies when scanning
+/// the same column, so the two agree on how stale the worst row is.
+fn oldest_fetched_at_nanos(batches: &[RecordBatch]) -> Option<i64> {
+    let mut oldest: Option<i64> = None;
+    for batch in batches {
+        let (idx, _) = batch.schema().column_with_name(CACHE_REFRESHED_AT_COLUMN)?;
+        let ns_array = as_timestamp_nanosecond_array(batch.column(idx)).ok()?;
+        let ts_array = ns_array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()?;
+        for i in 0..ts_array.len() {
+            if ts_array.is_null(i) {
+                return None;
+            }
+            let ts = ts_array.value(i);
+            oldest = Some(oldest.map_or(ts, |o: i64| o.min(ts)));
+        }
+    }
+    oldest
+}
+
+/// How stale a cached entry is *past the point it went stale* at `at` — `at -
+/// fetched_at - max_age`, saturating at zero — or `None` when the entry carries
+/// no usable fetch time (missing/null `_fetched_at`), computed from the oldest
+/// row across every batch so a single stale row in a multi-batch response
+/// cannot be masked by fresher rows ahead of it.
+///
+/// This is the staleness `StaleIfError::within_error_window` gates on: a `For(N)`
+/// window is measured from the stale point (past `caching_ttl`), not from the
+/// fetch. `None` makes a finite window fail closed and leaves `Enabled`
+/// unaffected, exactly the read-path decision the caller needs.
+fn staleness_past_max_age(
+    batches: &[RecordBatch],
+    max_age: Duration,
+    at: SystemTime,
+) -> Option<Duration> {
+    let fetched_at = oldest_fetched_at_nanos(batches)?;
+    let now_nanos =
+        i64::try_from(at.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos()).ok()?;
+    let max_age_nanos = i64::try_from(max_age.as_nanos()).ok()?;
+    let past = now_nanos
+        .saturating_sub(fetched_at)
+        .saturating_sub(max_age_nanos)
+        .max(0);
+    Some(Duration::from_nanos(u64::try_from(past).ok()?))
 }
 
 /// Represents the freshness state of cached data
@@ -722,7 +1175,84 @@ fn as_timestamp_nanosecond_array(array: &ArrayRef) -> DataFusionResult<ArrayRef>
     })
 }
 
-/// Helper functions for cache refresh operations
+/// One cache entry found stale in the accelerator: the request to replay
+/// against the source, and the namespace its rows belong to.
+struct StaleCacheEntry {
+    filters: Vec<Expr>,
+    namespace: Option<String>,
+}
+
+/// What a revalidation learned about the source.
+///
+/// The distinction matters because a failing origin need not arrive as an
+/// error: a fetch can succeed and carry a 429 or 5xx in its rows, so a caller
+/// that only inspects `Result` sees "the source answered" and cannot tell that
+/// it answered with a failure. That is precisely when `caching_stale_if_error`
+/// is supposed to act. The HTTP connector refuses such a status itself — see
+/// its `on_error_response` — so this outcome is what covers a row that reaches
+/// the cache by any other route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevalidationOutcome {
+    /// The source answered, and its rows were queued to replace the entry.
+    Refreshed { rows: usize },
+    /// The source answered and had nothing to cache. The origin is healthy.
+    Empty,
+    /// The source could not be revalidated: it answered with a transient
+    /// failure after its own retries were exhausted. Nothing was written, and
+    /// whatever is cached is the best answer available.
+    OriginUnavailable,
+}
+
+impl RevalidationOutcome {
+    /// Rows queued for write; zero unless the entry was refreshed.
+    #[must_use]
+    pub fn rows(self) -> usize {
+        match self {
+            Self::Refreshed { rows } => rows,
+            Self::Empty | Self::OriginUnavailable => 0,
+        }
+    }
+}
+
+/// An expired response is read only when a failing origin needs a fallback.
+enum CacheFallback {
+    Loaded(Vec<RecordBatch>),
+    Deferred {
+        input: CachingScanInput,
+        partition: usize,
+        context: Arc<TaskContext>,
+    },
+}
+
+impl CacheFallback {
+    async fn read(self) -> Option<Vec<RecordBatch>> {
+        let batches = match self {
+            Self::Loaded(batches) => batches,
+            Self::Deferred {
+                input,
+                partition,
+                context,
+            } => input
+                .into_plan()
+                .await
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback planning failed"))
+                .ok()?
+                .execute(partition, context)
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback execution failed"))
+                .ok()?
+                .try_collect()
+                .await
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback collection failed"))
+                .ok()?,
+        };
+        let batches: Vec<RecordBatch> = batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .collect();
+        (!batches.is_empty()).then_some(batches)
+    }
+}
+
 pub struct CacheRefreshHelper;
 
 impl CacheRefreshHelper {
@@ -740,13 +1270,12 @@ impl CacheRefreshHelper {
     pub async fn refresh_all_stale_rows(
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
+        session_state: Arc<SessionState>,
         dataset_name: &str,
         ttl: Duration,
         accelerator_write_mutex: Arc<Mutex<()>>,
+        in_flight_revalidations: InFlightRevalidations,
     ) -> DataFusionResult<usize> {
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
         // Data fetched before this threshold is considered stale
         #[expect(clippy::cast_possible_truncation)] // Safe: nanoseconds won't exceed i64::MAX
         let stale_threshold = (SystemTime::now() - ttl)
@@ -768,56 +1297,130 @@ impl CacheRefreshHelper {
                 ))),
             ];
 
-        let plan = accelerator.scan(&state, None, &filters, None).await?;
-        let task_ctx = Arc::new(TaskContext::default());
+        let plan = accelerator
+            .scan(session_state.as_ref(), None, &filters, None)
+            .await?;
+        let task_ctx = Arc::new(util::session_state::task_context());
 
         // Collect all stale rows from accelerator
         let stale_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
 
-        // Extract unique filter sets from stale rows
-        let filter_sets = Self::extract_unique_filter_sets(&stale_batches)?;
+        // Extract unique entries from stale rows
+        let stale_entries = Self::extract_unique_stale_entries(&stale_batches)?;
 
         let total_stale_rows: usize = stale_batches.iter().map(RecordBatch::num_rows).sum();
         tracing::debug!(
             "Found {total_stale_rows} stale rows ({} unique filter sets) to refresh for dataset {dataset_name}",
-            filter_sets.len()
+            stale_entries.len()
         );
 
-        if filter_sets.is_empty() {
+        if stale_entries.is_empty() {
             return Ok(0);
         }
 
         // Create futures for all refresh operations and run them with limited concurrency.
         // Each refresh fetches from the source and then upserts into the accelerator,
         // which preserves data for other cache entries (different request paths/queries).
-        let refresh_futures = filter_sets.into_iter().map(|row_filters| {
+        let refresh_futures = stale_entries.into_iter().map(|entry| {
             let federated = Arc::clone(&federated);
             let accelerator = Arc::clone(&accelerator);
+            let session_state = Arc::clone(&session_state);
             let dataset_name = dataset_name.to_string();
             let accelerator_write_mutex = Arc::clone(&accelerator_write_mutex);
+            let in_flight_revalidations = Arc::clone(&in_flight_revalidations);
+            let StaleCacheEntry {
+                filters: row_filters,
+                namespace,
+            } = entry;
 
             async move {
+                // This path replaces the entry it refreshes, so it opens the
+                // same delete-then-append gap every other writer does and must
+                // hold the key for it. Without the claim a reader scanning in
+                // that gap reads a miss and appends its own copy beside this
+                // one. Held until the write below has landed; dropped with this
+                // future on any early return.
+                let namespace_id = namespace
+                    .as_deref()
+                    .unwrap_or_else(|| CacheNamespace::Public.storage_id());
+                let ClaimOutcome::Leader(mut claim) = CacheKeyClaim::acquire(
+                    &in_flight_revalidations,
+                    compute_cache_key_from_filters_and_namespace(&row_filters, namespace_id),
+                    None,
+                ) else {
+                    tracing::debug!(
+                        "Skipping stale refresh for dataset {dataset_name}: a write for this entry is already pending"
+                    );
+                    return Ok::<usize, datafusion::error::DataFusionError>(0);
+                };
+
                 tracing::debug!(
                     "Refreshing stale data for dataset {} with {} filters",
                     dataset_name,
                     row_filters.len()
                 );
 
-                let batches =
-                    Self::fetch_from_source(&federated, &dataset_name, &row_filters, None).await?;
+                let batches = Self::fetch_from_source(
+                    &federated,
+                    &session_state,
+                    &dataset_name,
+                    &row_filters,
+                    None,
+                )
+                .await?;
+
+                // A miss for this entry that arrives while the claim is held
+                // follows it; hand it these rows now rather than after the
+                // write below, so it neither waits for the write nor asks the
+                // origin again.
+                claim.publish_if_cacheable(&batches);
 
                 if batches.is_empty() {
                     return Ok::<usize, datafusion::error::DataFusionError>(0);
                 }
 
+                // This path overwrites the entry it refreshes, so a fetch
+                // that succeeded while carrying a 429 or 5xx would replace the
+                // last good response with the origin's error body and serve it
+                // as a cache hit until it expires — keep what is cached, which
+                // is also what `caching_stale_if_error` exists to do. The HTTP
+                // connector refuses such a status itself; this covers a row
+                // reaching here by any other route.
+                if !cache::batches_cacheable(&batches) {
+                    tracing::debug!(
+                        "Background refresh for dataset '{dataset_name}' found the origin failing (transient HTTP error response); keeping what is cached"
+                    );
+                    return Ok(0);
+                }
+
                 let refreshed_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+                // Source rows arrive with the connector's columns only, so they
+                // must be stamped with the caching accelerator's own before they
+                // can replace what is stored. Skipping this would write rows with
+                // no namespace and no expiry — the latter reading as "no deadline
+                // to hold this to", which the eviction sweep removes on its next
+                // pass, so a refresh would undo itself.
+                let storage_schema = accelerator.schema();
+                let batches = batches
+                    .into_iter()
+                    .map(|batch| stamp_namespace_column(batch, &storage_schema, namespace_id))
+                    .collect::<DataFusionResult<Vec<_>>>()?;
+
+                // Scope the replacement to the namespace the stale rows came
+                // from, so refreshing one principal's copy does not delete
+                // another's.
+                let mut write_filters = row_filters.clone();
+                if namespace.is_some() {
+                    write_filters.push(namespace_filter_expr(namespace_id));
+                }
 
                 // Acquire the mutex to protect accelerator operations
                 let lock_guard = accelerator_write_mutex.lock().await;
 
                 // Upsert this specific cache entry - removes rows matching the filters
                 // and adds the new data, preserving other cache entries.
-                Self::upsert_into_accelerator(&accelerator, &dataset_name, &row_filters, batches)
+                Self::upsert_into_accelerator(&accelerator, &dataset_name, &write_filters, batches)
                     .await?;
 
                 drop(lock_guard); // Release the mutex
@@ -860,39 +1463,39 @@ impl CacheRefreshHelper {
     /// this entry, or if the refreshed rows cannot be queued for write.
     pub async fn refresh_entry(
         federated: Arc<dyn TableProvider>,
+        session_state: &SessionState,
         dataset_name: &str,
         filters: &[Expr],
         namespace: CacheNamespace,
         batch_write_tx: CacheWriteSender,
-        in_flight_revalidations: InFlightRevalidations,
-    ) -> DataFusionResult<usize> {
-        let cache_key =
-            compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
-
+        mut claim: CacheKeyClaim,
+    ) -> DataFusionResult<RevalidationOutcome> {
         tracing::trace!(
             "Refreshing single cache entry for dataset {dataset_name} with {} filters",
             filters.len()
         );
 
         // Fetch fresh data for this specific entry
-        let batches = Self::fetch_from_source(&federated, dataset_name, filters, None).await?;
+        let batches =
+            Self::fetch_from_source(&federated, session_state, dataset_name, filters, None).await?;
 
-        // Skip cache writes if the source response contains transient HTTP errors.
+        // A miss for this key that arrives while the claim is held follows it;
+        // hand it these rows now rather than after the write is queued, so it
+        // neither waits for the write nor asks the origin again.
+        claim.publish_if_cacheable(&batches);
+
+        // Skip cache writes if the source response contains transient HTTP
+        // errors. Returning here drops `claim`, releasing the key.
         if !cache::batches_cacheable(&batches) {
             tracing::debug!(
-                "No cacheable data for dataset={dataset_name} (source returned transient HTTP error responses)"
+                "Revalidation for dataset={dataset_name} found the origin failing (transient HTTP error response); keeping what is cached"
             );
-            // Remove from in-flight since no data to write
-            let mut in_flight = in_flight_revalidations.lock().await;
-            in_flight.remove(&cache_key);
-            return Ok(0);
+            return Ok(RevalidationOutcome::OriginUnavailable);
         }
 
         if batches.is_empty() {
             tracing::debug!("No cacheable data for dataset={dataset_name} (source returned empty)");
-            let mut in_flight = in_flight_revalidations.lock().await;
-            in_flight.remove(&cache_key);
-            return Ok(0);
+            return Ok(RevalidationOutcome::Empty);
         }
 
         // Stamping and namespace-scoped upsert filters are applied by the
@@ -904,19 +1507,24 @@ impl CacheRefreshHelper {
         let request = CacheWriteRequest {
             batches,
             filters: filters.to_vec(),
-            is_upsert: true,
-            cache_key: cache_key.clone(),
+            cache_key: claim.key().to_string(),
             namespace_id: namespace.storage_id().into(),
+            replaces_existing: true,
         };
 
+        // The claim passes to the queued write only once the send has
+        // succeeded; on the error path it drops and releases here.
         batch_write_tx
             .send(request)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        claim.into_queued();
 
         tracing::trace!("Queued refresh for dataset={dataset_name}, {refreshed_rows} rows");
 
-        Ok(refreshed_rows)
+        Ok(RevalidationOutcome::Refreshed {
+            rows: refreshed_rows,
+        })
     }
 
     /// Extract filter expressions from a row containing `request_path`, `request_query`, `request_body`
@@ -927,7 +1535,7 @@ impl CacheRefreshHelper {
         let schema = batch.schema();
         let mut filters = Vec::new();
 
-        let filter_columns = ["request_path", "request_query", "request_body"];
+        let filter_columns = REQUEST_KEY_COLUMNS;
 
         for column_name in filter_columns {
             if let Some((idx, _)) = schema.column_with_name(column_name) {
@@ -959,27 +1567,51 @@ impl CacheRefreshHelper {
         Ok(filters)
     }
 
-    /// Extract unique filter sets from batches, deduplicating rows with identical
-    /// `(request_path, request_query, request_body)` values.
+    /// Extract the unique cache entries represented by `batches`, deduplicating
+    /// rows with identical `(request_path, request_query, request_body)` and
+    /// namespace.
     ///
-    /// This is needed because HTTP connector JSON array responses are stored as multiple rows
-    /// with identical request parameters. Without deduplication, refreshing N rows from the
-    /// same JSON array would trigger N identical HTTP requests.
-    fn extract_unique_filter_sets(batches: &[RecordBatch]) -> DataFusionResult<Vec<Vec<Expr>>> {
+    /// Deduplication is needed because HTTP connector JSON array responses are
+    /// stored as multiple rows with identical request parameters. Without it,
+    /// refreshing N rows from the same JSON array would trigger N identical HTTP
+    /// requests.
+    ///
+    /// The namespace tag is carried beside the filters rather than folded into
+    /// them, because the filters are replayed against the *source* — a connector
+    /// has no `__spice_cache_namespace` column to match on — while the namespace
+    /// is needed to write the refreshed rows back into the same principal's scope
+    /// they came from. Deduplication keys on both, so two principals holding the
+    /// same request each get their own refresh.
+    fn extract_unique_stale_entries(
+        batches: &[RecordBatch],
+    ) -> DataFusionResult<Vec<StaleCacheEntry>> {
         let mut seen_filter_keys = std::collections::HashSet::new();
-        let mut filter_sets: Vec<Vec<Expr>> = Vec::new();
+        let mut entries: Vec<StaleCacheEntry> = Vec::new();
 
         for batch in batches {
+            let namespaces = batch
+                .schema()
+                .column_with_name(CACHE_NAMESPACE_COLUMN)
+                .and_then(|(idx, _)| batch.column(idx).as_any().downcast_ref::<StringArray>());
+
             for row_idx in 0..batch.num_rows() {
-                let row_filters = Self::extract_filters_from_row(batch, row_idx)?;
-                let cache_key = compute_cache_key_from_filters(&row_filters);
+                let filters = Self::extract_filters_from_row(batch, row_idx)?;
+                let namespace = namespaces
+                    .filter(|array| array.is_valid(row_idx))
+                    .map(|array| array.value(row_idx).to_string());
+                let cache_key = match &namespace {
+                    Some(namespace) => {
+                        compute_cache_key_from_filters_and_namespace(&filters, namespace)
+                    }
+                    None => compute_cache_key_from_filters(&filters),
+                };
                 if seen_filter_keys.insert(cache_key) {
-                    filter_sets.push(row_filters);
+                    entries.push(StaleCacheEntry { filters, namespace });
                 }
             }
         }
 
-        Ok(filter_sets)
+        Ok(entries)
     }
 
     /// Overwrite the data in the accelerator with the provided batches
@@ -1005,7 +1637,7 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
         let schema = batches[0].schema();
         let total_rows: usize = batches
@@ -1059,7 +1691,7 @@ impl CacheRefreshHelper {
 
         // Execute the insertion
         tracing::debug!("overwrite_accelerator executing insert plan for dataset={dataset_name}",);
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let _ = datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
         tracing::debug!(
             "overwrite_accelerator COMPLETED - successfully inserted {total_rows} rows into accelerator for dataset={dataset_name}",
@@ -1085,128 +1717,129 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-        let new_rows: usize = new_batches.iter().map(RecordBatch::num_rows).sum();
-
-        tracing::debug!(
-            "insert_into_accelerator - reading existing data from accelerator for dataset={}",
-            dataset_name
-        );
-
-        // Scan all existing data from the accelerator
-        let plan = accelerator.scan(&state, None, &[], None).await?;
-        let task_ctx = Arc::new(TaskContext::default());
-        let existing_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
-
-        let existing_rows: usize = existing_batches.iter().map(RecordBatch::num_rows).sum();
-        tracing::debug!(
-            "insert_into_accelerator - found {} existing rows, adding {} new rows for dataset={}",
-            existing_rows,
-            new_rows,
-            dataset_name
-        );
-
-        // Combine existing data with new data
-        let mut combined_batches = existing_batches;
-        combined_batches.extend(new_batches);
-
-        // Overwrite the accelerator with the combined data
-        Self::overwrite_accelerator(Arc::clone(accelerator), dataset_name, combined_batches).await
+        // Nothing is being replaced, so there is nothing to read first: append
+        // the new rows and leave the rest of the table alone. Reading the whole
+        // table back only to write it out again made the cost of caching one
+        // response grow with everything already cached.
+        Self::append_to_accelerator(accelerator, dataset_name, new_batches).await
     }
 
-    /// Upsert data into the accelerator by removing rows matching the filters and inserting new data.
-    /// This is used when cached data exists but is expired.
+    /// Upsert data into the accelerator by removing rows matching the filters
+    /// and inserting new data. Used when cached data exists but is expired.
     ///
-    /// The process:
-    /// 1. Scan all data from the accelerator
-    /// 2. Filter out rows that match the provided filters (these are the expired rows to replace)
-    /// 3. Combine remaining rows with new data
-    /// 4. Overwrite the accelerator with the combined data
+    /// One cache entry is just the single-entry case of
+    /// [`Self::batched_upsert_into_accelerator`], so it defers to it rather
+    /// than keeping a second copy of the same delete-and-append and
+    /// read-filter-write logic.
     async fn upsert_into_accelerator(
         accelerator: &Arc<dyn TableProvider>,
         dataset_name: &str,
         filters: &[Expr],
         new_batches: Vec<RecordBatch>,
     ) -> DataFusionResult<()> {
-        if new_batches.is_empty() {
-            tracing::debug!(
-                "upsert_into_accelerator called with empty batches for dataset={dataset_name}"
-            );
-            return Ok(());
+        Self::batched_upsert_into_accelerator(
+            accelerator,
+            dataset_name,
+            &[filters.to_vec()],
+            new_batches,
+        )
+        .await
+    }
+
+    /// Replaces the rows matching `filter_sets` with `new_batches` by issuing a
+    /// `DELETE` against the accelerator and appending, instead of reading the
+    /// whole table back, filtering it in memory and overwriting it.
+    ///
+    /// `DuckDB` and Cayenne — and `SQLite`, Turso and the in-memory accelerator —
+    /// implement `TableProvider::delete_from`, so the engine removes the
+    /// superseded rows itself and the cost of replacing one cache entry is
+    /// proportional to that entry rather than to everything cached.
+    ///
+    /// Returns `Ok(false)`, having changed nothing, when the accelerator does
+    /// not implement deletes; the caller falls back to the read-filter-write
+    /// path. A provider without `delete_from` reports that while *planning*, so
+    /// this cannot leave a half-applied replacement behind.
+    ///
+    /// The delete and the append are two statements, not one transaction, so a
+    /// concurrent reader can see the entry briefly absent. That reads as a
+    /// cache miss and refetches — it costs a request, and never serves a
+    /// partial entry, because the append that follows carries every row. Such a
+    /// reader cannot write what it fetched: the key is claimed for the whole
+    /// replacement, including this gap (see [`CacheKeyClaim`]).
+    ///
+    /// **Deleting first is deliberate, and it is the order that fails safely.**
+    /// Without a transaction one of the two statements can land alone. If the
+    /// append fails after the delete, the entry is gone and the next read
+    /// re-fetches it — a cache miss, which is always a correct answer. Appending
+    /// first would instead leave the key holding both responses if the delete
+    /// failed, and a duplicated source row is a *wrong* answer that queries go
+    /// on returning until something else removes it. A cache may lose an entry;
+    /// it may not invent rows.
+    ///
+    /// What the deletion costs is the `caching_stale_if_error` fallback for that
+    /// entry: there is no longer an expired copy to serve if the origin is down
+    /// when the next read arrives. The failure is logged and recorded against
+    /// the dataset's health rather than passed over.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusionError` if the delete fails for any reason other
+    /// than being unimplemented, or if the append fails.
+    async fn delete_and_append(
+        accelerator: &Arc<dyn TableProvider>,
+        dataset_name: &str,
+        filter_sets: &[Vec<Expr>],
+        new_batches: Vec<RecordBatch>,
+    ) -> DataFusionResult<bool> {
+        // Rows to remove: those matching ANY filter set, i.e. OR of AND-of-set.
+        // An empty set would delete everything, so it disqualifies the whole
+        // delete rather than being skipped.
+        if filter_sets.iter().any(Vec::is_empty) {
+            return Ok(false);
         }
-
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
-        tracing::debug!(
-            "upsert_into_accelerator - reading existing data from accelerator for dataset={}",
-            dataset_name
-        );
-
-        // Scan all data from the accelerator (no filters to get everything)
-        let plan = accelerator.scan(&state, None, &[], None).await?;
-        let task_ctx = Arc::new(TaskContext::default());
-        let existing_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
-
-        let existing_rows: usize = existing_batches.iter().map(RecordBatch::num_rows).sum();
-        tracing::debug!(
-            "upsert_into_accelerator - found {} existing rows in accelerator for dataset={}",
-            existing_rows,
-            dataset_name
-        );
-
-        // If there's no existing data, just insert the new data
-        if existing_batches.is_empty() || existing_rows == 0 {
-            tracing::debug!(
-                "upsert_into_accelerator - no existing data, performing simple insert for dataset={}",
-                dataset_name
-            );
-            return Self::insert_into_accelerator(accelerator, dataset_name, new_batches).await;
-        }
-
-        // Build a filter to exclude rows that match the provided filters
-        // We need to keep rows that DON'T match the filters
-        let exclusion_filter = Self::build_combined_exclusion_filter(&[filters.to_vec()]);
-
-        tracing::debug!(
-            "upsert_into_accelerator - filtering out matching rows with {} filters for dataset={}",
-            filters.len(),
-            dataset_name
-        );
-
-        // Filter existing data to keep only non-matching rows
-        let df = ctx.read_batches(existing_batches)?;
-        let filtered_df = if let Some(filter) = exclusion_filter {
-            df.filter(filter)?
-        } else {
-            // No filters means replace everything
-            tracing::debug!(
-                "upsert_into_accelerator - no filters provided, will replace all data for dataset={}",
-                dataset_name
-            );
-            // Return early with just the new batches
-            return Self::overwrite_accelerator(Arc::clone(accelerator), dataset_name, new_batches)
-                .await;
+        // Balanced rather than left-nested: this ORs one predicate per entry, and
+        // a flush can carry many, which `simplify_expr` then walks recursively.
+        let per_entry: Vec<Expr> = filter_sets
+            .iter()
+            .filter_map(|filters| combine_exprs_balanced(filters.clone(), Expr::and))
+            .collect();
+        let Some(delete_expr) = combine_exprs_balanced(per_entry, Expr::or) else {
+            return Ok(false);
         };
 
-        let kept_batches = filtered_df.collect().await?;
-        let kept_rows: usize = kept_batches.iter().map(RecordBatch::num_rows).sum();
-        let new_rows: usize = new_batches.iter().map(RecordBatch::num_rows).sum();
+        let ctx = util::session_state::session_context();
+        let state = ctx.state();
+
+        let plan = match accelerator.delete_from(&state, vec![delete_expr]).await {
+            Ok(plan) => plan,
+            Err(DataFusionError::NotImplemented(_)) => {
+                tracing::debug!(
+                    "Accelerator for dataset={dataset_name} does not support deletes; falling back to read-filter-write for cache replacement"
+                );
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let deleted = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await?
+            .first()
+            .map_or(0, |batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+                    .filter(|a| !a.is_empty())
+                    .map_or(0, |a| a.value(0))
+            });
 
         tracing::debug!(
-            "upsert_into_accelerator - keeping {} rows, adding {} new rows for dataset={}",
-            kept_rows,
-            new_rows,
-            dataset_name
+            "delete_and_append - removed {deleted} superseded rows across {} cache entries for dataset={dataset_name}",
+            filter_sets.len()
         );
 
-        // Combine kept rows with new rows
-        let mut combined_batches = kept_batches;
-        combined_batches.extend(new_batches);
-
-        // Overwrite the accelerator with the combined data
-        Self::overwrite_accelerator(Arc::clone(accelerator), dataset_name, combined_batches).await
+        Self::append_to_accelerator(accelerator, dataset_name, new_batches).await?;
+        Ok(true)
     }
 
     /// Append data to the accelerator using native upsert.
@@ -1240,7 +1873,7 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
         let schema = batches[0].schema();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1270,7 +1903,7 @@ impl CacheRefreshHelper {
 
         let insert_plan = accelerator.insert_into(&state, plan, insert_op).await?;
 
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let _ = datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
 
         tracing::debug!(
@@ -1281,7 +1914,7 @@ impl CacheRefreshHelper {
     }
 
     /// Batched upsert: replace multiple cache entries in a single read-filter-write operation.
-    async fn batched_upsert_into_accelerator(
+    pub(crate) async fn batched_upsert_into_accelerator(
         accelerator: &Arc<dyn TableProvider>,
         dataset_name: &str,
         filter_sets: &[Vec<Expr>],
@@ -1294,7 +1927,15 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = SessionContext::new();
+        // Prefer letting the engine remove the superseded rows itself.
+        if !filter_sets.is_empty()
+            && Self::delete_and_append(accelerator, dataset_name, filter_sets, new_batches.clone())
+                .await?
+        {
+            return Ok(());
+        }
+
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
 
         tracing::trace!(
@@ -1304,7 +1945,7 @@ impl CacheRefreshHelper {
 
         // Scan all data from the accelerator (no filters to get everything)
         let plan = accelerator.scan(&state, None, &[], None).await?;
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let existing_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
 
         let existing_rows: usize = existing_batches.iter().map(RecordBatch::num_rows).sum();
@@ -1409,35 +2050,29 @@ impl CacheRefreshHelper {
         );
 
         for (idx, child) in children.iter().enumerate() {
-            let stamped: Vec<RecordBatch> = if child
-                .schema()
-                .column_with_name(CACHE_NAMESPACE_COLUMN)
-                .is_some()
-            {
-                let mut out = Vec::with_capacity(batches.len());
-                let mut stamp_err = None;
-                for b in batches {
-                    match stamp_namespace_column(b.clone(), namespace_id) {
-                        Ok(b) => out.push(b),
-                        Err(e) => {
-                            stamp_err = Some(e);
-                            break;
-                        }
+            let child_schema = child.schema();
+            let mut out = Vec::with_capacity(batches.len());
+            let mut stamp_err = None;
+            for b in batches {
+                match stamp_namespace_column(b.clone(), &child_schema, namespace_id) {
+                    Ok(b) => out.push(b),
+                    Err(e) => {
+                        stamp_err = Some(e);
+                        break;
                     }
                 }
-                if let Some(e) = stamp_err {
-                    tracing::warn!(
-                        "Failed to stamp namespace on synchronized child {} for dataset {}: {}",
-                        idx,
-                        dataset_name,
-                        e
-                    );
-                    continue;
-                }
-                out
-            } else {
-                batches.to_vec()
-            };
+            }
+            if let Some(e) = stamp_err {
+                tracing::warn!(
+                    "Failed to stamp {} on synchronized child {} for dataset {}: {}",
+                    CACHE_NAMESPACE_COLUMN,
+                    idx,
+                    dataset_name,
+                    e
+                );
+                continue;
+            }
+            let stamped: Vec<RecordBatch> = out;
 
             let result = if is_expired {
                 Self::upsert_into_accelerator(child, dataset_name, filters, stamped).await
@@ -1484,7 +2119,7 @@ impl CacheRefreshHelper {
         child_accelerator: &Arc<dyn TableProvider>,
         dataset_name: &str,
     ) -> DataFusionResult<usize> {
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
 
         tracing::debug!(
@@ -1494,7 +2129,7 @@ impl CacheRefreshHelper {
 
         // Scan all existing data from the parent accelerator
         let plan = parent_accelerator.scan(&state, None, &[], None).await?;
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1522,6 +2157,7 @@ impl CacheRefreshHelper {
     /// Fetch data from federated source for given filters
     async fn fetch_from_source(
         federated: &Arc<dyn TableProvider>,
+        session_state: &SessionState,
         dataset_name: &str,
         filters: &[Expr],
         limit: Option<usize>,
@@ -1534,17 +2170,14 @@ impl CacheRefreshHelper {
             tracing::debug!("Source fetch filter {i}: {}", filter.human_display());
         }
 
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
         // Query source with same filters/limit but all columns
         tracing::debug!("About to scan federated source for dataset={dataset_name}");
-        let plan = federated.scan(&state, None, filters, limit).await?;
+        let plan = federated.scan(session_state, None, filters, limit).await?;
         tracing::debug!(
             "Federated source SCAN successful for dataset={dataset_name}, plan has {} partitions",
             plan.properties().output_partitioning().partition_count()
         );
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = Arc::new(util::session_state::task_context());
 
         // Execute and collect all batches
         let all_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
@@ -1564,29 +2197,79 @@ impl CacheRefreshHelper {
     /// # Arguments
     /// * `is_expired` - If `true`, data exists in the cache but is expired, so we use upsert.
     ///   If `false`, no data exists in the cache, so we use insert (append).
-    /// * `stale_if_error` - If `true` and `expired_batches` is provided, serve the expired cached data
-    ///   when the upstream source returns an error instead of propagating the error.
-    /// * `expired_batches` - The expired cached data to serve if `stale_if_error` is enabled and
+    /// * `stale_if_error` - `Disabled` never serves stale; `Enabled` serves it with no bound;
+    ///   `For(duration)` serves it only while its measured staleness is within `duration` of
+    ///   going stale, and propagates the origin's failure once past that window.
+    /// * `expired_batches` - The expired cached data to serve if `stale_if_error` allows it and
     ///   the source returns an error.
     /// * `io_runtime` - Tokio runtime handle for spawning background write tasks.
     /// * `synchronized_children` - Child accelerators that should also receive the cached data.
     /// * `batch_write_tx` - Channel sender for batched writes to the caching consumer.
+    /// * `in_flight_revalidations` - The keys a write is already pending for. A
+    ///   claim on this key is taken *before* the source is asked and held until
+    ///   the write lands, so a reader whose observation of the cache is made
+    ///   stale by a concurrent replacement cannot append beside it. See
+    ///   [`CacheKeyClaim`].
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
         federated: Arc<dyn TableProvider>,
+        session_state: &SessionState,
         dataset_name: &str,
         filters: &[Expr],
         limit: Option<usize>,
         fallback_schema: SchemaRef,
         is_expired: bool,
-        stale_if_error: bool,
-        expired_batches: Option<Vec<RecordBatch>>,
+        stale_if_error: StaleIfError,
+        max_age: Duration,
+        expired_batches: Option<CacheFallback>,
         io_runtime: &Handle,
         synchronized_children: SynchronizedChildren,
         batch_write_tx: CacheWriteSender,
         namespace: CacheNamespace,
+        in_flight_revalidations: InFlightRevalidations,
     ) -> SendableRecordBatchStream {
-        match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
+        // Claimed before the origin is asked, not after: see [`CacheKeyClaim`]
+        // for why the window this covers has to include the fetch. A caller that
+        // finds a fetch already in flight for this key becomes a follower and
+        // replays the leader's batches instead of asking the origin again —
+        // unless that fetch asked the origin for fewer rows than this caller
+        // needs, in which case it fetches for itself and, holding no claim,
+        // does not write.
+        let mut claim = match CacheKeyClaim::acquire(
+            &in_flight_revalidations,
+            compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id()),
+            limit,
+        ) {
+            ClaimOutcome::Leader(claim) => claim,
+            ClaimOutcome::Follower(in_flight) => {
+                let own_fetch = UncoalescedFetch {
+                    federated,
+                    session_state,
+                    dataset_name,
+                    filters,
+                    limit,
+                    schema: fallback_schema,
+                    stale_if_error,
+                    max_age,
+                    expired_batches,
+                };
+                if in_flight.serves(limit) {
+                    return Self::follow_cache_miss(in_flight.state, own_fetch).await;
+                }
+                tracing::debug!(
+                    "Cache miss for dataset {dataset_name} found an in-flight fetch for the same key bounded at {fetched:?} rows, below this request's limit {limit:?}; fetching for itself",
+                    fetched = in_flight.limit
+                );
+                return own_fetch.run().await;
+            }
+        };
+
+        // Capture time before the origin fetch while leaving the cached rows
+        // unread until a failed fetch actually needs them.
+        let fetch_started_at = SystemTime::now();
+
+        match Self::fetch_from_source(&federated, session_state, dataset_name, filters, limit).await
+        {
             Ok(batches) if !batches.is_empty() => {
                 let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
                 tracing::debug!(
@@ -1601,71 +2284,102 @@ impl CacheRefreshHelper {
                 tracing::trace!("Fetched batch schema:\n{}", SchemaDisplay(&batch_schema));
 
                 // Skip cache writes if the source response contains transient HTTP
-                // errors. User still receives all fetched data.
+                // errors.
                 let batches_cacheable = cache::batches_cacheable(&batches);
 
-                // Clone batches for propagation to children.
-                // RecordBatch::clone() is cheap - only clones Arc pointers, not the underlying data.
-                let batches_for_propagate = if batches_cacheable {
-                    batches.clone()
-                } else {
-                    Vec::new()
-                };
-                let filters_clone: Vec<Expr> = filters.to_vec();
-                let cache_key =
-                    compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
+                // A failing origin usually takes the `Err` arm below: the HTTP
+                // connector refuses a 429 or 5xx that outlives its retries
+                // whatever `on_error_response` says. This arm is the guard for
+                // such a row reaching here by some other route, because an
+                // operator who asked for
+                // `caching_stale_if_error` would otherwise be served the
+                // origin's error body instead of the cached response.
+                if !batches_cacheable
+                    && let Some(stale) = match expired_batches {
+                        Some(fallback) => fallback.read().await,
+                        None => None,
+                    }
+                {
+                    let staleness = staleness_past_max_age(&stale, max_age, fetch_started_at);
+                    if stale_if_error.within_error_window(staleness) {
+                        tracing::warn!(
+                            "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` allows it."
+                        );
+                        let batch_schema = stale[0].schema();
+                        let batch_stream = futures::stream::iter(stale.into_iter().map(Ok));
+                        return Box::pin(RecordBatchStreamAdapter::new(batch_schema, batch_stream));
+                    }
+                    // Past the `caching_stale_if_error` window, or its age is
+                    // unknown and the window is finite (fail closed): hand the
+                    // caller the origin's transient response rather than a copy
+                    // too stale to promise.
+                    tracing::debug!(
+                        "Stale entry for dataset '{dataset_name}' is {staleness:?} past the stale-if-error window ({stale_if_error}), returning the origin's transient response."
+                    );
+                }
 
+                // Each arm that does not enqueue drops the claim, which releases
+                // the key for the next writer and publishes `Failed` so any
+                // follower waiting on it falls through to its own fetch.
                 if batches_cacheable {
-                    if batches.is_empty() {
-                        tracing::debug!(
-                            "Fetch returned no rows, skipping cache write for dataset={dataset_name}"
+                    // Share the collected batches with any followers before the
+                    // write is enqueued, so they replay these rows without a
+                    // second origin call or a re-scan of the accelerator.
+                    // `RecordBatch::clone` is cheap: it clones Arc pointers,
+                    // not the underlying data.
+                    claim.publish_ready(Arc::new(batches.clone()));
+
+                    let batches_for_propagate = batches.clone();
+                    let filters_clone: Vec<Expr> = filters.to_vec();
+                    let cache_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+                    // Send write request to batched consumer. The flush
+                    // task is the one that stamps `__spice_cache_namespace`
+                    // and adds the namespace filter to upsert keys, so it
+                    // can do the right thing based on the accelerator's
+                    // actual storage schema (extended in real deployments,
+                    // unextended in unit-test mocks).
+                    let write_request = CacheWriteRequest {
+                        batches: batches.clone(),
+                        filters: filters.to_vec(),
+                        cache_key: claim.key().to_string(),
+                        namespace_id: namespace.storage_id().into(),
+                        replaces_existing: is_expired,
+                    };
+                    // The claim passes to the queued write only once the send
+                    // has succeeded. A failed send — or a cancellation while
+                    // waiting for capacity — drops it instead, so no flush is
+                    // owed a release that will never come.
+                    if let Err(e) = batch_write_tx.send(write_request).await {
+                        tracing::warn!(
+                            "Failed to enqueue cache write for dataset {dataset_name}: {e} (channel closed)"
                         );
                     } else {
-                        let cache_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-
-                        // Send write request to batched consumer. The flush
-                        // task is the one that stamps `__spice_cache_namespace`
-                        // and adds the namespace filter to upsert keys, so it
-                        // can do the right thing based on the accelerator's
-                        // actual storage schema (extended in real deployments,
-                        // unextended in unit-test mocks).
-                        let write_request = CacheWriteRequest {
-                            batches: batches.clone(),
-                            filters: filters.to_vec(),
-                            is_upsert: is_expired,
-                            cache_key,
-                            namespace_id: namespace.storage_id().into(),
-                        };
-                        if let Err(e) = batch_write_tx.send(write_request).await {
-                            tracing::warn!(
-                                "Failed to enqueue cache write for dataset {dataset_name}: {e} (channel closed)"
-                            );
-                        } else {
-                            tracing::trace!(
-                                "Enqueued cache write for dataset={dataset_name}, {cache_rows} rows, is_upsert={is_expired}",
-                            );
-                        }
-
-                        // Propagate cacheable data to children.
-                        let synchronized_children_clone = Arc::clone(&synchronized_children);
-                        let dataset_name_clone = dataset_name.to_string();
-                        let namespace_id_clone: Arc<str> = namespace.storage_id().into();
-                        io_runtime.spawn(async move {
-                            Self::propagate_to_synchronized_children(
-                                &synchronized_children_clone,
-                                &dataset_name_clone,
-                                &filters_clone,
-                                &batches_for_propagate,
-                                is_expired,
-                                &namespace_id_clone,
-                            )
-                            .await;
-                        });
-
-                        tracing::debug!(
-                            "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
+                        claim.into_queued();
+                        tracing::trace!(
+                            "Enqueued cache write for dataset={dataset_name}, {cache_rows} rows",
                         );
                     }
+
+                    // Propagate cacheable data to children.
+                    let synchronized_children_clone = Arc::clone(&synchronized_children);
+                    let dataset_name_clone = dataset_name.to_string();
+                    let namespace_id_clone: Arc<str> = namespace.storage_id().into();
+                    io_runtime.spawn(async move {
+                        Self::propagate_to_synchronized_children(
+                            &synchronized_children_clone,
+                            &dataset_name_clone,
+                            &filters_clone,
+                            &batches_for_propagate,
+                            is_expired,
+                            &namespace_id_clone,
+                        )
+                        .await;
+                    });
+
+                    tracing::debug!(
+                        "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
+                    );
                 } else {
                     tracing::debug!(
                         "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
@@ -1678,30 +2392,40 @@ impl CacheRefreshHelper {
                 Box::pin(adapter)
             }
             Ok(_) => {
-                // Source returned empty data (no error, just no rows)
+                // Source returned empty data (no error, just no rows). Nothing
+                // is written, but the empty result is still what every follower
+                // would get from the origin, so publish it rather than letting
+                // the claim's drop send them to the origin one by one.
                 tracing::debug!(
                     "Cache miss - source also has no data for dataset {}",
                     dataset_name
                 );
+                claim.publish_ready(Arc::new(Vec::new()));
                 let empty_stream =
                     RecordBatchStreamAdapter::new(fallback_schema, futures::stream::empty());
                 Box::pin(empty_stream)
             }
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
-                if stale_if_error
-                    && let Some(batches) = expired_batches
-                    && !batches.is_empty()
-                {
-                    tracing::warn!(
-                        "Cache miss fetch failed for dataset {}, serving stale data due to stale_if_error: {}",
-                        dataset_name,
-                        e
+                if let Some(batches) = match expired_batches {
+                    Some(fallback) => fallback.read().await,
+                    None => None,
+                } {
+                    let staleness = staleness_past_max_age(&batches, max_age, fetch_started_at);
+                    if stale_if_error.within_error_window(staleness) {
+                        tracing::warn!(
+                            "Origin fetch for dataset '{dataset_name}' failed, so the expired cached response is being served instead because `caching_stale_if_error` allows it. Cause: {e}"
+                        );
+                        let batch_schema = batches[0].schema();
+                        let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+                        let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
+                        return Box::pin(adapter);
+                    }
+                    // Outside the finite window, or its age is unknown (fail
+                    // closed): fall through and propagate the origin error.
+                    tracing::debug!(
+                        "Stale entry for dataset '{dataset_name}' is {staleness:?} past the stale-if-error window ({stale_if_error}), propagating the origin error."
                     );
-                    let batch_schema = batches[0].schema();
-                    let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
-                    let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
-                    return Box::pin(adapter);
                 }
 
                 tracing::error!(
@@ -1718,6 +2442,94 @@ impl CacheRefreshHelper {
         }
     }
 
+    /// Serve a cache miss that coalesced onto a fetch already in flight for the
+    /// same key: wait for the leader's result and replay its batches.
+    ///
+    /// On [`FetchState::Ready`] the leader's already-collected batches are
+    /// streamed to the caller with no re-scan of the accelerator and no second
+    /// origin call, and the follower never writes — the leader owns the write.
+    /// On [`FetchState::Failed`] (the leader failed, was cancelled, or its
+    /// response was not cacheable) or a wait that exceeds
+    /// [`FOLLOWER_WAIT_TIMEOUT`], the follower runs `own_fetch` instead,
+    /// degrading to the behaviour it would have had without coalescing.
+    async fn follow_cache_miss(
+        mut receiver: watch::Receiver<FetchState>,
+        own_fetch: UncoalescedFetch<'_>,
+    ) -> SendableRecordBatchStream {
+        let dataset_name = own_fetch.dataset_name;
+        tracing::debug!(
+            "Cache miss for dataset {dataset_name} is coalescing onto an in-flight fetch for the same key"
+        );
+
+        match tokio::time::timeout(
+            FOLLOWER_WAIT_TIMEOUT,
+            Self::await_fetch_state(&mut receiver),
+        )
+        .await
+        {
+            Ok(FollowerResult::Ready(batches)) => {
+                if batches.is_empty() {
+                    return Box::pin(RecordBatchStreamAdapter::new(
+                        own_fetch.schema,
+                        futures::stream::empty(),
+                    ));
+                }
+                let batch_schema = batches[0].schema();
+                // `RecordBatch::clone` clones Arc buffer pointers, not data.
+                let replay: Vec<RecordBatch> = batches.iter().cloned().collect();
+                tracing::debug!(
+                    "Cache miss for dataset {dataset_name} replayed {} shared batch(es) from the in-flight fetch without a second origin call",
+                    replay.len()
+                );
+                Box::pin(RecordBatchStreamAdapter::new(
+                    batch_schema,
+                    futures::stream::iter(replay.into_iter().map(Ok)),
+                ))
+            }
+            Ok(FollowerResult::Failed) => {
+                tracing::debug!(
+                    "The in-flight fetch for dataset {dataset_name} published no result; querying the origin directly"
+                );
+                own_fetch.run().await
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    "Cache miss for dataset {dataset_name} waited longer than {timeout}s on an in-flight fetch for the same key; querying the origin directly",
+                    timeout = FOLLOWER_WAIT_TIMEOUT.as_secs()
+                );
+                own_fetch.run().await
+            }
+        }
+    }
+
+    /// Waits until the leader publishes a terminal [`FetchState`].
+    ///
+    /// The current value is inspected first, so a follower that clones the
+    /// receiver after the leader has already published observes the result
+    /// immediately. The `watch::Ref` is dropped before every `.await`, so no
+    /// internal lock is held across a suspension point.
+    async fn await_fetch_state(receiver: &mut watch::Receiver<FetchState>) -> FollowerResult {
+        loop {
+            {
+                let state = receiver.borrow_and_update();
+                match &*state {
+                    FetchState::Ready(batches) => {
+                        return FollowerResult::Ready(Arc::clone(batches));
+                    }
+                    FetchState::Failed => return FollowerResult::Failed,
+                    FetchState::Pending => {}
+                }
+            }
+
+            if receiver.changed().await.is_err() {
+                // The sender dropped without a terminal state. `CacheKeyClaim`'s
+                // `Drop` publishes `Failed` before the sender goes away, so this
+                // is a belt-and-braces fall-through rather than an expected path.
+                return FollowerResult::Failed;
+            }
+        }
+    }
+
     /// Handle a cache hit by returning cached data and optionally triggering background refresh.
     /// Returns a `SendableRecordBatchStream` containing the cached data.
     ///
@@ -1726,9 +2538,10 @@ impl CacheRefreshHelper {
     /// - `Stale`: Return cached data immediately, trigger background refresh (if not already in-flight)
     /// - `Expired`: This should not be called for expired data (handled as cache miss)
     #[expect(clippy::too_many_arguments)]
-    async fn handle_cache_hit(
+    fn handle_cache_hit(
         cached_batches: Vec<RecordBatch>,
         federated: &Arc<dyn TableProvider>,
+        session_state: &Arc<SessionState>,
         dataset_name: &str,
         max_age: Option<Duration>,
         stale_while_revalidate: Option<Duration>,
@@ -1762,81 +2575,83 @@ impl CacheRefreshHelper {
                     );
                 }
                 CacheFreshness::Stale => {
-                    // Compute cache key to check for in-flight revalidation
-                    let cache_key = compute_cache_key_from_filters_and_namespace(
-                        filters,
-                        namespace.storage_id(),
-                    );
-
-                    // Try to acquire the revalidation slot for this cache key
-                    // Use async lock since we're in an async context
-                    let should_revalidate = {
-                        let mut in_flight = in_flight_revalidations.lock().await;
-                        if in_flight.contains(&cache_key) {
+                    // One revalidation per key: the claim is held for the
+                    // whole refresh and released by the write that lands it. A
+                    // follower here means another caller already owns the
+                    // revalidation, so this path simply skips.
+                    match CacheKeyClaim::acquire(
+                        in_flight_revalidations,
+                        compute_cache_key_from_filters_and_namespace(
+                            filters,
+                            namespace.storage_id(),
+                        ),
+                        None,
+                    ) {
+                        ClaimOutcome::Leader(claim) => {
                             tracing::debug!(
-                                "Skipping background refresh for dataset={dataset_name}, cache_key={cache_key} - revalidation already in progress"
+                                "Data is stale for dataset={dataset_name}, triggering background refresh"
                             );
-                            false
-                        } else {
-                            in_flight.insert(cache_key.clone());
-                            true
-                        }
-                    };
 
-                    if should_revalidate {
-                        tracing::debug!(
-                            "Data is stale for dataset={dataset_name}, triggering background refresh"
-                        );
+                            // Log current fetched_at for debugging
+                            if let Some(timestamp) =
+                                get_first_fetched_at_timestamp(&cached_batches[0])
+                            {
+                                tracing::debug!(
+                                    "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
+                                );
+                            }
 
-                        // Log current fetched_at for debugging
-                        if let Some(timestamp) = get_first_fetched_at_timestamp(&cached_batches[0])
-                        {
-                            tracing::debug!(
-                                "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
-                            );
-                        }
+                            let federated_clone = Arc::clone(federated);
+                            let session_state_clone = Arc::clone(session_state);
+                            let dataset_name_clone = dataset_name.to_string();
+                            let filters_for_refresh: Vec<Expr> = filters.to_vec();
+                            let batch_write_tx_clone = batch_write_tx;
+                            let namespace_clone = namespace;
 
-                        let federated_clone = Arc::clone(federated);
-                        let dataset_name_clone = dataset_name.to_string();
-                        let in_flight_clone = Arc::clone(in_flight_revalidations);
-                        let filters_for_refresh: Vec<Expr> = filters.to_vec();
-                        let batch_write_tx_clone = batch_write_tx.clone();
-                        let cache_key_clone = cache_key.clone();
-                        let namespace_clone = namespace.clone();
-
-                        io_runtime.spawn(async move {
+                            io_runtime.spawn(async move {
                             tracing::debug!(
                                 "SWR: Background refresh for single entry started for dataset={dataset_name_clone}"
                             );
                             let result = Self::refresh_entry(
                                 federated_clone,
+                                &session_state_clone,
                                 &dataset_name_clone,
                                 &filters_for_refresh,
                                 namespace_clone,
                                 batch_write_tx_clone,
-                                Arc::clone(&in_flight_clone),
+                                claim,
                             )
                             .await;
 
                             match result {
-                                Ok(rows) => {
-                                    tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows");
+                                Ok(RevalidationOutcome::OriginUnavailable) => {
+                                    // Not an error to the caller: the entry is
+                                    // still inside its stale-while-revalidate
+                                    // window and keeps being served. Said out
+                                    // loud because "refreshed 0 rows" would
+                                    // read as an origin with nothing to give.
+                                    tracing::warn!(
+                                        "Background revalidation for dataset '{dataset_name_clone}' could not reach a healthy origin, so the cached response is being served past its `caching_ttl` until the origin recovers or the entry falls out of its `caching_stale_while_revalidate_ttl` window."
+                                    );
+                                }
+                                Ok(outcome) => {
+                                    tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows", rows = outcome.rows());
                                 }
                                 Err(e) => {
+                                    // The claim was dropped with the failed
+                                    // refresh, so the key is already released.
                                     tracing::error!(
                                         "Background refresh task failed for dataset={dataset_name_clone}: {e}"
                                     );
-                                    // Remove from in-flight only on failure
-                                    // On success, cache_key is removed by flush_cache_writes after write completes
-                                    let mut in_flight = in_flight_clone.lock().await;
-                                    in_flight.remove(&cache_key_clone);
                                 }
                             }
                         });
-                    } else {
-                        tracing::debug!(
-                            "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
-                        );
+                        }
+                        ClaimOutcome::Follower(_) => {
+                            tracing::debug!(
+                                "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
+                            );
+                        }
                     }
                 }
                 CacheFreshness::Expired => {
@@ -1862,16 +2677,100 @@ impl CacheRefreshHelper {
 /// Type alias for synchronized child accelerators
 pub type SynchronizedChildren = Arc<RwLock<Vec<Arc<dyn TableProvider>>>>;
 
+/// Shared across every `CachingAccelerationScanExec`: the filters passed into `scan()` are
+/// arbitrary caller `Expr`s, so full default features are kept rather than a stripped-down
+/// set, but the registry itself never varies by dataset or query, so it's built once for the
+/// process instead of once per exec.
+pub(crate) static SHARED_SESSION_STATE: LazyLock<Arc<SessionState>> = LazyLock::new(|| {
+    Arc::new(
+        SessionStateBuilder::new()
+            .with_config(util::session_state::session_config())
+            .with_default_features()
+            .build(),
+    )
+});
+
+/// Whether a filtered cache read must ask the origin before it may serve stored rows.
+pub(super) fn uses_source_first(
+    filters: &[Expr],
+    max_age: Option<Duration>,
+    stale_while_revalidate: Option<Duration>,
+    stale_if_error: StaleIfError,
+) -> bool {
+    !filters.is_empty()
+        && effective_max_age(max_age).is_zero()
+        && stale_while_revalidate.unwrap_or_default().is_zero()
+        && stale_if_error.serves_stale_on_error()
+}
+
+/// The accelerator read input. A deferred input owns query-specific scan arguments,
+/// not a storage snapshot; its read view is selected only if the origin fails.
+#[derive(Clone)]
+pub(super) enum CachingScanInput {
+    Planned(Arc<dyn ExecutionPlan>),
+    Deferred {
+        accelerator: Arc<dyn TableProvider>,
+        scan_params: TableScanParams,
+        filters_to_reapply: Vec<Expr>,
+        schema: SchemaRef,
+    },
+}
+
+impl From<Arc<dyn ExecutionPlan>> for CachingScanInput {
+    fn from(input: Arc<dyn ExecutionPlan>) -> Self {
+        Self::Planned(input)
+    }
+}
+
+impl CachingScanInput {
+    fn schema(&self) -> SchemaRef {
+        match self {
+            Self::Planned(input) => input.schema(),
+            Self::Deferred { schema, .. } => Arc::clone(schema),
+        }
+    }
+
+    async fn into_plan(self) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        match self {
+            Self::Planned(input) => Ok(input),
+            Self::Deferred {
+                accelerator,
+                scan_params,
+                filters_to_reapply,
+                schema,
+            } => {
+                let input = scan_params
+                    .scan_and_optimize(accelerator.as_ref(), &filters_to_reapply)
+                    .await?;
+                if input.schema().fields() != schema.fields() {
+                    tracing::debug!(expected = ?schema, actual = ?input.schema(), "Cache fallback schema mismatch");
+                    return Err(DataFusionError::Execution(
+                        "The cached response schema changed while fetching the origin".to_string(),
+                    ));
+                }
+                // Physical scans may omit schema-level table metadata. Keep the
+                // deferred node's output schema without accepting changed fields.
+                if input.schema() == schema {
+                    Ok(input)
+                } else {
+                    Ok(Arc::new(SchemaCastScanExec::new(input, schema)))
+                }
+            }
+        }
+    }
+}
+
 /// Caching acceleration execution plan that checks staleness and triggers background refresh
 pub struct CachingAccelerationScanExec {
-    input: Arc<dyn ExecutionPlan>,
+    input: CachingScanInput,
     plan_properties: Arc<PlanProperties>,
     /// Maximum time data is considered "fresh" - can be served without refresh
     max_age: Option<Duration>,
     /// Time window after `max_age` during which stale data can be served while revalidating
     stale_while_revalidate: Option<Duration>,
-    /// If true, serve expired cached data when upstream source returns an error
-    stale_if_error: bool,
+    /// How expired cached data is served when the upstream source fails: never,
+    /// always, or within a finite staleness window.
+    stale_if_error: StaleIfError,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
     dataset_name: String,
@@ -1887,15 +2786,17 @@ pub struct CachingAccelerationScanExec {
     synchronized_children: SynchronizedChildren,
     /// Sender for batched cache writes
     batch_write_tx: CacheWriteSender,
+    /// Built once instead of a fresh `SessionContext` per fetch.
+    session_state: Arc<SessionState>,
 }
 
 impl CachingAccelerationScanExec {
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
-        input: Arc<dyn ExecutionPlan>,
+    pub(super) fn new(
+        input: impl Into<CachingScanInput>,
         max_age: Option<Duration>,
         stale_while_revalidate: Option<Duration>,
-        stale_if_error: bool,
+        stale_if_error: StaleIfError,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         dataset_name: String,
@@ -1908,17 +2809,25 @@ impl CachingAccelerationScanExec {
         synchronized_children: SynchronizedChildren,
         batch_write_tx: CacheWriteSender,
     ) -> Self {
-        // Default max_age (TTL) to 30 seconds if not specified
-        let max_age = max_age.or(Some(Duration::from_secs(30)));
+        let max_age = Some(effective_max_age(max_age));
+        let input = input.into();
 
-        let plan_properties = Arc::new(
-            input
+        let plan_properties = Arc::new(match &input {
+            CachingScanInput::Planned(input) => input
                 .properties()
                 .as_ref()
                 .clone()
                 .with_emission_type(EmissionType::Final)
                 .with_partitioning(Partitioning::UnknownPartitioning(1)),
-        );
+            CachingScanInput::Deferred { schema, .. } => PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(schema)),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ),
+        });
+
+        let session_state = Arc::clone(&SHARED_SESSION_STATE);
 
         Self {
             input,
@@ -1937,6 +2846,7 @@ impl CachingAccelerationScanExec {
             in_flight_revalidations,
             synchronized_children,
             batch_write_tx,
+            session_state,
         }
     }
 }
@@ -1949,7 +2859,12 @@ impl std::fmt::Debug for CachingAccelerationScanExec {
 
 impl DisplayAs for CachingAccelerationScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "CachingAccelerationScanExec")
+        match &self.input {
+            CachingScanInput::Planned(_) => write!(f, "CachingAccelerationScanExec"),
+            CachingScanInput::Deferred { .. } => {
+                write!(f, "CachingAccelerationScanExec: cache_scan=deferred")
+            }
+        }
     }
 }
 
@@ -1967,19 +2882,43 @@ impl ExecutionPlan for CachingAccelerationScanExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition; 1]
+        vec![Distribution::SinglePartition; self.children().len()]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
+        match &self.input {
+            CachingScanInput::Planned(input) => vec![input],
+            CachingScanInput::Deferred { .. } => vec![],
+        }
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let input = match (&self.input, children.as_slice()) {
+            (CachingScanInput::Planned(_), [input]) => Arc::clone(input),
+            (CachingScanInput::Deferred { .. }, []) => return Ok(self),
+            _ => {
+                return Err(DataFusionError::Internal(
+                    "CachingAccelerationScanExec received an invalid number of children"
+                        .to_string(),
+                ));
+            }
+        };
         Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
+            input,
             self.max_age,
             self.stale_while_revalidate,
             self.stale_if_error,
@@ -2007,6 +2946,12 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             self.dataset_name
         );
 
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "CachingAccelerationScanExec only supports partition 0, got {partition}"
+            )));
+        }
+
         // The originating request context is attached to the session as
         // an extension by `Query::run_internal`. We read it from the
         // `TaskContext` here and NOT from `RequestContext::current()`,
@@ -2019,8 +2964,66 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             .session_config()
             .get_extension::<runtime_request_context::RequestContext>();
 
-        // Execute the accelerator scan
-        let accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
+        // With neither a fresh nor an SWR window, a stale-if-error entry can
+        // only be served after a failing fetch. Do not execute its scan until
+        // that failure; successful fetches replace any stored response for the key.
+        if uses_source_first(
+            &self.filters,
+            self.max_age,
+            self.stale_while_revalidate,
+            self.stale_if_error,
+        ) {
+            let schema = self.input.schema();
+            let stream_schema = Arc::clone(&schema);
+            let input = self.input.clone();
+            let federated = Arc::clone(&self.federated);
+            let session_state = Arc::clone(&self.session_state);
+            let dataset_name = self.dataset_name.clone();
+            let filters = self.filters.clone();
+            let limit = self.limit;
+            let stale_if_error = self.stale_if_error;
+            let io_runtime = self.io_runtime.clone();
+            let synchronized_children = Arc::clone(&self.synchronized_children);
+            let batch_write_tx = self.batch_write_tx.clone();
+            let in_flight_revalidations = Arc::clone(&self.in_flight_revalidations);
+            let stream = futures::stream::once(async move {
+                let namespace = request_context.as_deref().map_or(
+                    runtime_request_context::CacheNamespace::System,
+                    runtime_request_context::RequestContext::cache_namespace,
+                );
+                CacheRefreshHelper::handle_cache_miss(
+                    federated,
+                    &session_state,
+                    &dataset_name,
+                    &filters,
+                    limit,
+                    stream_schema,
+                    true, // replace any stored response without a preliminary lookup
+                    stale_if_error,
+                    Duration::ZERO,
+                    Some(CacheFallback::Deferred {
+                        input,
+                        partition,
+                        context,
+                    }),
+                    &io_runtime,
+                    synchronized_children,
+                    batch_write_tx,
+                    namespace,
+                    in_flight_revalidations,
+                )
+                .await
+            })
+            .flatten();
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)));
+        }
+
+        let CachingScanInput::Planned(input) = &self.input else {
+            return Err(DataFusionError::Internal(
+                "A cache-first read requires a planned accelerator input".to_string(),
+            ));
+        };
+        let accelerator_stream = input.execute(partition, Arc::clone(&context))?;
 
         // When no filters are provided (e.g., SELECT *), return cached data directly
         // without triggering HTTP requests to the federated source or staleness checks.
@@ -2036,6 +3039,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let schema_clone = Arc::clone(&schema);
 
         let federated = Arc::clone(&self.federated);
+        let session_state = Arc::clone(&self.session_state);
         let dataset_name = self.dataset_name.clone();
         let filters = self.filters.clone();
         let limit = self.limit;
@@ -2106,25 +3110,32 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         tracing::debug!(
                             "Data is expired for dataset={dataset_name}, treating as cache miss (upsert)"
                         );
-                        // Pass the expired batches for stale_if_error fallback
-                        let expired_batches = if stale_if_error {
-                            Some(cached_batches)
+                        // Keep the expired batches to fall back to unless the
+                        // fallback is off entirely. Whether the entry is still
+                        // *inside* the window is decided at error time, against
+                        // its `_fetched_at` — collecting them here does not
+                        // commit to serving them.
+                        let expired_batches = if stale_if_error.serves_stale_on_error() {
+                            Some(CacheFallback::Loaded(cached_batches))
                         } else {
                             None
                         };
                         return CacheRefreshHelper::handle_cache_miss(
                             federated,
+                            &session_state,
                             &dataset_name,
                             &filters,
                             limit,
                             Arc::clone(&schema_clone),
                             true, // is_expired = true, will upsert
                             stale_if_error,
+                            max_age,
                             expired_batches,
                             &io_runtime,
                             Arc::clone(&synchronized_children),
                             batch_write_tx.clone(),
                             namespace,
+                            Arc::clone(&in_flight_revalidations),
                         )
                         .await;
                     }
@@ -2134,6 +3145,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 CacheRefreshHelper::handle_cache_hit(
                     cached_batches,
                     &federated,
+                    &session_state,
                     &dataset_name,
                     max_age,
                     stale_while_revalidate,
@@ -2144,7 +3156,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     batch_write_tx.clone(),
                     namespace,
                 )
-                .await
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
                 tracing::debug!(
@@ -2152,17 +3163,20 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 );
                 CacheRefreshHelper::handle_cache_miss(
                     federated,
+                    &session_state,
                     &dataset_name,
                     &filters,
                     limit,
                     Arc::clone(&schema_clone),
-                    false, // is_expired = false, will insert (append)
-                    false, // stale_if_error = false, no expired data to fall back to
-                    None,  // no expired batches
+                    false,                  // is_expired = false, will insert (append)
+                    StaleIfError::Disabled, // no cached entry to fall back to
+                    max_age.unwrap_or_default(), // unused: no expired batches
+                    None,                   // no expired batches
                     &io_runtime,
                     synchronized_children,
                     batch_write_tx,
                     namespace,
+                    Arc::clone(&in_flight_revalidations),
                 )
                 .await
             }
@@ -2246,14 +3260,15 @@ mod cache_namespace_column_tests {
     #[test]
     fn stamp_namespace_column_appends_constant_string_array() {
         use arrow::array::{Int32Array, StringArray};
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let payload = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let storage = extend_schema_with_cache_namespace("ds", &payload).expect("extend");
         let batch = arrow::array::RecordBatch::try_new(
-            Arc::clone(&schema),
+            Arc::new(payload),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
         )
         .expect("batch");
 
-        let stamped = stamp_namespace_column(batch, "apikey:abc").expect("ok");
+        let stamped = stamp_namespace_column(batch, &storage, "apikey:abc").expect("ok");
         assert_eq!(stamped.num_columns(), 2);
         assert_eq!(stamped.schema().field(1).name(), CACHE_NAMESPACE_COLUMN);
         let ns_col = stamped
@@ -2265,6 +3280,22 @@ mod cache_namespace_column_tests {
         for i in 0..ns_col.len() {
             assert_eq!(ns_col.value(i), "apikey:abc");
         }
+    }
+
+    #[test]
+    fn stamp_namespace_column_skips_storage_that_does_not_declare_it() {
+        use arrow::array::StringArray;
+        // A mock accelerator with an unextended schema must be written exactly
+        // as it is, or the insert would fail on arity.
+        let payload = Schema::new(vec![Field::new("content", DataType::Utf8, false)]);
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::new(payload.clone()),
+            vec![Arc::new(StringArray::from(vec!["x"])) as ArrayRef],
+        )
+        .expect("batch");
+
+        let stamped = stamp_namespace_column(batch, &payload, "public").expect("ok");
+        assert_eq!(stamped.num_columns(), 1);
     }
 
     #[test]
@@ -2283,7 +3314,7 @@ mod cache_namespace_column_tests {
         )
         .expect("batch");
 
-        let stamped = stamp_namespace_column(batch, "public").expect("ok");
+        let stamped = stamp_namespace_column(batch, &schema, "public").expect("ok");
         // Existing column wins; we must not silently rewrite a row's tag
         // because doing so could mask a bug in upstream stamping.
         let ns_col = stamped
@@ -2303,6 +3334,7 @@ mod tests {
         Int32Array, RecordBatch, StringArray, TimestampNanosecondArray, UInt16Array,
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow_tools::metadata_keys::HTTP_RESPONSE_STATUS_METADATA_KEY;
     use async_trait::async_trait;
     use cache::utils::RESPONSE_STATUS_COLUMN;
     use datafusion::catalog::Session;
@@ -2310,9 +3342,16 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+    use datafusion::prelude::SessionContext;
     use parking_lot::RwLock;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+
+    /// Test-only stand-in for the shared `Arc<SessionState>`.
+    fn test_session_state() -> Arc<SessionState> {
+        Arc::new(SessionStateBuilder::new().with_default_features().build())
+    }
 
     /// Mock `TableProvider` that records filters passed to `scan()` for verification.
     #[derive(Debug)]
@@ -2624,22 +3663,32 @@ mod tests {
         schema: SchemaRef,
         /// Data to return from scan (should include `response_status` column)
         data: Vec<RecordBatch>,
+        delay: Duration,
     }
 
     impl MockHttpTableProvider {
         /// Create a mock HTTP provider that returns data with the specified response status code.
         fn with_status(status_code: u16, content: &str) -> Self {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("request_path", DataType::Utf8, true),
-                Field::new("request_query", DataType::Utf8, true),
-                Field::new("content", DataType::Utf8, true),
-                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
-                Field::new(
-                    CACHE_REFRESHED_AT_COLUMN,
-                    DataType::Timestamp(TimeUnit::Nanosecond, None),
-                    true,
-                ),
-            ]));
+            let schema = Arc::new(
+                Schema::new(vec![
+                    Field::new("request_path", DataType::Utf8, true),
+                    Field::new("request_query", DataType::Utf8, true),
+                    Field::new("content", DataType::Utf8, true),
+                    Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                    Field::new(
+                        CACHE_REFRESHED_AT_COLUMN,
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        true,
+                    ),
+                ])
+                // Tagged the way the real HTTP connector's `base_table_schema`
+                // tags it, so `cache::http_fetch_status` recognizes it —
+                // see `HTTP_RESPONSE_STATUS_METADATA_KEY`.
+                .with_metadata(std::collections::HashMap::from([(
+                    HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                    "1".to_string(),
+                )])),
+            );
 
             #[expect(clippy::cast_possible_truncation)]
             let now = SystemTime::now()
@@ -2662,7 +3711,13 @@ mod tests {
             Self {
                 schema,
                 data: vec![batch],
+                delay: Duration::ZERO,
             }
+        }
+
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
         }
     }
 
@@ -2683,6 +3738,9 @@ mod tests {
             _filters: &[Expr],
             _limit: Option<usize>,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             Ok(Arc::new(DataSourceExec::new(Arc::new(
                 MemorySourceConfig::try_new(
                     std::slice::from_ref(&self.data),
@@ -2691,6 +3749,169 @@ mod tests {
                 )?,
             ))))
         }
+    }
+
+    /// A source that counts every scan and can delay before answering, so a test
+    /// can prove single-flight: N concurrent cache misses for one key must reach
+    /// the origin exactly once, the rest replaying the leader's batches.
+    ///
+    /// Holds `rows` identical rows and, like the HTTP connector, truncates a
+    /// scan to its `limit`; with no rows it yields no batches at all.
+    #[derive(Debug)]
+    struct CountingHttpTableProvider {
+        schema: SchemaRef,
+        content: String,
+        status_code: u16,
+        rows: usize,
+        scans: Arc<std::sync::atomic::AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl CountingHttpTableProvider {
+        fn new(status_code: u16, content: &str, delay: Duration) -> Self {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("request_path", DataType::Utf8, true),
+                Field::new("request_query", DataType::Utf8, true),
+                Field::new("content", DataType::Utf8, true),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                Field::new(
+                    CACHE_REFRESHED_AT_COLUMN,
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ]));
+            Self {
+                schema,
+                content: content.to_string(),
+                status_code,
+                rows: 1,
+                scans: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                delay,
+            }
+        }
+
+        /// The number of rows the origin holds for any filters (default 1).
+        fn with_rows(mut self, rows: usize) -> Self {
+            self.rows = rows;
+            self
+        }
+
+        fn scan_count(&self) -> usize {
+            self.scans.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for CountingHttpTableProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+
+            // The HTTP connector truncates its response to the scan's limit,
+            // so a bounded scan returns at most that many of the origin's rows.
+            let rows = limit.map_or(self.rows, |limit| limit.min(self.rows));
+            if rows == 0 {
+                return Ok(Arc::new(DataSourceExec::new(Arc::new(
+                    MemorySourceConfig::try_new(&[vec![]], Arc::clone(&self.schema), None)?,
+                ))));
+            }
+
+            #[expect(clippy::cast_possible_truncation)]
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos() as i64;
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&self.schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["/api/test"; rows])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["q=test"; rows])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![self.content.as_str(); rows])) as ArrayRef,
+                    Arc::new(UInt16Array::from(vec![self.status_code; rows])) as ArrayRef,
+                    Arc::new(TimestampNanosecondArray::from(vec![Some(now); rows])) as ArrayRef,
+                ],
+            )?;
+
+            Ok(Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)?,
+            ))))
+        }
+    }
+
+    /// Acquires a key as the leader of an unbounded fetch, or panics if a fetch
+    /// for it is already in flight. Test-only convenience for the many
+    /// claim/refresh tests.
+    fn leader_claim(in_flight: &InFlightRevalidations, key: &str) -> CacheKeyClaim {
+        match CacheKeyClaim::acquire(in_flight, key.to_string(), None) {
+            ClaimOutcome::Leader(claim) => claim,
+            ClaimOutcome::Follower(_) => panic!("expected to lead the claim for key {key}"),
+        }
+    }
+
+    /// Counts the rows a stream yields.
+    async fn drain_rows(stream: SendableRecordBatchStream) -> usize {
+        drain(stream).await.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// Waits until `origin` has been scanned `scans` times, so a test can start a
+    /// second caller only once the first holds its claim and is inside its fetch.
+    async fn wait_for_scans(origin: &CountingHttpTableProvider, scans: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while origin.scan_count() < scans {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the origin was scanned {} time(s) within 5s, expected {scans}",
+                origin.scan_count()
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// An in-flight fetch serves a request only when it asked the origin for at
+    /// least as many rows: unbounded serves anything, bounded serves a request
+    /// bounded at or below it, and nothing bounded serves an unbounded request.
+    #[test]
+    fn an_in_flight_fetch_serves_requests_bounded_at_or_below_its_limit() {
+        let fetch = |limit| InFlightFetch {
+            limit,
+            state: watch::channel(FetchState::Pending).1,
+        };
+
+        assert!(fetch(None).serves(None));
+        assert!(fetch(None).serves(Some(3)));
+        assert!(fetch(Some(3)).serves(Some(3)));
+        assert!(fetch(Some(3)).serves(Some(1)));
+        assert!(
+            !fetch(Some(1)).serves(Some(3)),
+            "a fetch truncated to 1 row cannot answer a request for 3"
+        );
+        assert!(
+            !fetch(Some(3)).serves(None),
+            "a bounded fetch cannot answer an unbounded request"
+        );
+        assert!(
+            !fetch(Some(0)).serves(Some(1)),
+            "a fetch bounded at zero rows answers nothing but another zero-row request"
+        );
+        assert!(fetch(Some(0)).serves(Some(0)));
     }
 
     fn create_test_schema_with_refresh_timestamp() -> SchemaRef {
@@ -3276,7 +4497,7 @@ mod tests {
         assert_eq!(batch.num_rows(), 6, "Should have 6 rows total");
 
         // Extract unique filter sets
-        let filter_sets = CacheRefreshHelper::extract_unique_filter_sets(&[batch])
+        let filter_sets = CacheRefreshHelper::extract_unique_stale_entries(&[batch])
             .expect("Should extract filter sets");
 
         // Should only have 2 unique filter sets (5 duplicates + 1 unique)
@@ -3455,7 +4676,7 @@ mod tests {
         let max_age = Some(Duration::from_mins(1)); // 60 second TTL
         let stale_while_revalidate = Some(Duration::from_mins(5)); // 5 minute SWR window
         let in_flight_revalidations: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
         let (batch_write_tx, _consumer_handle) =
             spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
@@ -3469,6 +4690,7 @@ mod tests {
         let _stream = CacheRefreshHelper::handle_cache_hit(
             vec![stale_cached_data],
             &(Arc::clone(&federated) as Arc<dyn TableProvider>),
+            &test_session_state(),
             "test_dataset",
             max_age,
             stale_while_revalidate,
@@ -3478,8 +4700,7 @@ mod tests {
             &in_flight_revalidations,
             batch_write_tx,
             CacheNamespace::Public,
-        )
-        .await;
+        );
 
         // Wait for flush interval `CACHE_WRITE_FLUSH_INTERVAL_MS` + buffer 100ms
         tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
@@ -3522,7 +4743,7 @@ mod tests {
         );
 
         // Verify in-flight tracking was cleaned up
-        let in_flight = in_flight_revalidations.lock().await;
+        let in_flight = in_flight_revalidations.lock();
         assert!(
             in_flight.is_empty(),
             "In-flight revalidation set should be empty after refresh completes"
@@ -3575,7 +4796,7 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
         let (tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
@@ -3589,9 +4810,9 @@ mod tests {
             tx.send(CacheWriteRequest {
                 batches: vec![batch],
                 filters: vec![],
-                is_upsert: false,
                 cache_key: format!("key_{i}"),
                 namespace_id: "public".into(),
+                replaces_existing: false,
             })
             .await
             .expect("to send write request");
@@ -3629,24 +4850,27 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         // --- 500 request ---
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source_500) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
             Arc::clone(&schema),
             false,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx.clone(),
             CacheNamespace::Public,
+            Arc::clone(&in_flight),
         )
         .await;
 
@@ -3674,17 +4898,20 @@ mod tests {
 
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source_429) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
             Arc::clone(&schema),
             false,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx,
             CacheNamespace::Public,
+            Arc::clone(&in_flight),
         )
         .await;
 
@@ -3717,6 +4944,1393 @@ mod tests {
         );
     }
 
+    /// A stale cached response, in the shape `MockHttpTableProvider` produces.
+    fn stale_cached_batch(schema: &SchemaRef, content: &str) -> RecordBatch {
+        use arrow::array::{StringArray, TimestampNanosecondArray, UInt16Array};
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec![content])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(1_i64)])) as ArrayRef,
+            ],
+        )
+        .expect("batch")
+    }
+
+    async fn drain(mut stream: SendableRecordBatchStream) -> Vec<RecordBatch> {
+        use futures::StreamExt;
+        let mut out = Vec::new();
+        while let Some(result) = stream.next().await {
+            out.push(result.expect("stream should not error"));
+        }
+        out
+    }
+
+    /// A failing origin reaches us as a *successful* fetch carrying a 5xx row,
+    /// so `stale_if_error` has to act on the response's status, not just on a
+    /// transport error. Without this an operator who asked to fall back to the
+    /// cache gets the origin's error body instead.
+    #[tokio::test]
+    async fn stale_if_error_serves_the_cached_response_when_the_origin_answers_5xx() {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let stale = stale_cached_batch(&schema, "last good response");
+
+        let stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            None,
+            Arc::clone(&schema),
+            true,                                     // is_expired
+            StaleIfError::Enabled,                    // stale_if_error enabled (∞)
+            Duration::ZERO,                           // max_age (ignored by Enabled)
+            Some(CacheFallback::Loaded(vec![stale])), // expired entry
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        let served = drain(stream).await;
+        assert_eq!(served.len(), 1);
+        let content = served[0]
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+            .expect("content column");
+        assert_eq!(
+            content.value(0),
+            "last good response",
+            "the cached response must be served, not the origin's 5xx body"
+        );
+    }
+
+    /// The same origin failure with `stale_if_error` disabled must still hand
+    /// the caller what the origin said — the fallback is opt-in.
+    #[tokio::test]
+    async fn a_failing_origin_is_returned_to_the_caller_when_stale_if_error_is_off() {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let stale = stale_cached_batch(&schema, "last good response");
+
+        let stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            None,
+            Arc::clone(&schema),
+            true,
+            StaleIfError::Disabled, // stale_if_error disabled
+            Duration::ZERO,         // max_age (ignored by Disabled)
+            Some(CacheFallback::Loaded(vec![stale])),
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        let served = drain(stream).await;
+        assert_eq!(served.len(), 1);
+        let content = served[0]
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+            .expect("content column");
+        assert_eq!(content.value(0), "upstream down");
+    }
+
+    /// Nanoseconds since the epoch, for placing a cached entry a known distance
+    /// in the past.
+    fn now_nanos() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos(),
+        )
+        .expect("nanoseconds fit i64")
+    }
+
+    /// A whole number of seconds as nanoseconds, as an `i64` timestamp offset.
+    fn secs_nanos(secs: u64) -> i64 {
+        i64::try_from(Duration::from_secs(secs).as_nanos()).expect("nanoseconds fit i64")
+    }
+
+    /// A stale cached response in the `MockHttpTableProvider` shape, with an
+    /// explicit `_fetched_at` (or a null one when `fetched_at` is `None`).
+    fn stale_batch_with_fetched_at(
+        schema: &SchemaRef,
+        content: &str,
+        fetched_at: Option<i64>,
+    ) -> RecordBatch {
+        use arrow::array::{StringArray, TimestampNanosecondArray, UInt16Array};
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec![content])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![fetched_at])) as ArrayRef,
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// Read the single `content` cell of a served batch.
+    fn served_content(batch: &RecordBatch) -> String {
+        batch
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+            .map(|c| c.value(0).to_string())
+            .expect("content column")
+    }
+
+    /// Drive `handle_cache_miss` through the transient-5xx arm: a 503 origin plus
+    /// the given expired entry and `stale_if_error`/`max_age`. Returns the one
+    /// served content cell — the stale copy when served, the origin body when not.
+    async fn transient_5xx_outcome(
+        stale: RecordBatch,
+        stale_if_error: StaleIfError,
+        max_age: Duration,
+    ) -> String {
+        transient_5xx_outcome_with_delay(stale, stale_if_error, max_age, Duration::ZERO).await
+    }
+
+    async fn transient_5xx_outcome_with_delay(
+        stale: RecordBatch,
+        stale_if_error: StaleIfError,
+        max_age: Duration,
+        delay: Duration,
+    ) -> String {
+        let http_source =
+            Arc::new(MockHttpTableProvider::with_status(503, "upstream down").with_delay(delay));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let stale_schema = stale.schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![stale]], stale_schema, None).expect("cache input"),
+        )));
+        let input = input.into();
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            None,
+            Arc::clone(&schema),
+            true,
+            stale_if_error,
+            max_age,
+            Some(CacheFallback::Deferred {
+                input,
+                partition: 0,
+                context: Arc::new(TaskContext::default()),
+            }),
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        let served = drain(stream).await;
+        assert_eq!(served.len(), 1, "exactly one batch is served");
+        served_content(&served[0])
+    }
+
+    /// A finite `caching_stale_if_error` window serves an entry whose staleness is
+    /// inside it and refuses one past it — the RFC 5861 `stale-if-error=N` core.
+    #[tokio::test]
+    async fn a_finite_window_serves_inside_and_propagates_outside() {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let max_age = Duration::from_secs(10);
+        let window = StaleIfError::For(Duration::from_mins(1));
+
+        // Staleness = now - fetched_at - max_age. 30s past the stale point is
+        // inside a 60s window: the cached copy is served.
+        let inside = stale_batch_with_fetched_at(
+            &schema,
+            "cached response",
+            Some(now_nanos() - secs_nanos(10 + 30)),
+        );
+        assert_eq!(
+            transient_5xx_outcome(inside, window, max_age).await,
+            "cached response",
+            "an entry 30s past the stale point is inside a 60s window"
+        );
+
+        // 90s past the stale point is outside a 60s window: the origin's
+        // transient response is returned instead of a copy too stale to promise.
+        let outside = stale_batch_with_fetched_at(
+            &schema,
+            "cached response",
+            Some(now_nanos() - secs_nanos(10 + 90)),
+        );
+        assert_eq!(
+            transient_5xx_outcome(outside, window, max_age).await,
+            "upstream down",
+            "an entry 90s past the stale point is outside a 60s window"
+        );
+    }
+
+    /// `For(N)` fails closed when the entry's age cannot be proven — a missing or
+    /// null `_fetched_at` — so it cannot serve a copy of unknown staleness.
+    #[tokio::test]
+    async fn a_finite_window_fails_closed_on_unknown_staleness() {
+        use arrow::array::{StringArray, UInt16Array};
+
+        let window = StaleIfError::For(Duration::from_mins(1));
+        let max_age = Duration::from_secs(10);
+
+        // A null `_fetched_at` value.
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let null_ts = stale_batch_with_fetched_at(&schema, "cached response", None);
+        assert_eq!(
+            transient_5xx_outcome(null_ts, window, max_age).await,
+            "upstream down",
+            "a null fetch time cannot prove the entry is inside the window"
+        );
+
+        // A batch with no `_fetched_at` column at all.
+        let schema_no_ts: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+        ]));
+        let no_column = RecordBatch::try_new(
+            Arc::clone(&schema_no_ts),
+            vec![
+                Arc::new(StringArray::from(vec!["/api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["cached response"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        assert_eq!(
+            transient_5xx_outcome(no_column, window, max_age).await,
+            "upstream down",
+            "a missing fetch-time column cannot prove the entry is inside the window"
+        );
+    }
+
+    /// A source that always fails, after sleeping `delay` first. Stands in for
+    /// a real network timeout/connection failure that takes real time to be
+    /// detected, so a test can prove staleness is measured before that delay,
+    /// not after it.
+    #[derive(Debug)]
+    struct SlowFailingProvider {
+        schema: SchemaRef,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl TableProvider for SlowFailingProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            tokio::time::sleep(self.delay).await;
+            Err(DataFusionError::Execution(
+                "connection refused (test)".to_string(),
+            ))
+        }
+    }
+
+    /// Drive `handle_cache_miss` through the `Err(e)` (transport-failure) arm
+    /// against a source that takes `delay` to fail, and report whether the
+    /// stale entry was served or the error was propagated instead.
+    async fn slow_failure_outcome(
+        stale: RecordBatch,
+        stale_if_error: StaleIfError,
+        max_age: Duration,
+        delay: Duration,
+    ) -> Result<String, String> {
+        use futures::StreamExt;
+
+        let schema = stale.schema();
+        let failing_source = Arc::new(SlowFailingProvider {
+            schema: Arc::clone(&schema),
+            delay,
+        });
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![stale]], Arc::clone(&schema), None)
+                .expect("cache input"),
+        )));
+        let input = input.into();
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            failing_source as Arc<dyn TableProvider>,
+            &test_session_state(),
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            None,
+            Arc::clone(&schema),
+            true,
+            stale_if_error,
+            max_age,
+            Some(CacheFallback::Deferred {
+                input,
+                partition: 0,
+                context: Arc::new(TaskContext::default()),
+            }),
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        match stream.next().await {
+            Some(Ok(batch)) => Ok(served_content(&batch)),
+            Some(Err(e)) => Err(e.to_string()),
+            None => Err("stream ended with no batches".to_string()),
+        }
+    }
+
+    /// Regression test for staleness being measured before the (possibly
+    /// slow) source-fetch attempt, not after it. An entry whose staleness is
+    /// inside the configured window at the moment the fetch is attempted must
+    /// still be served stale even if the failing fetch itself takes longer
+    /// than the remaining slack in that window -- the fetch's own latency
+    /// must not count against the window.
+    #[tokio::test]
+    async fn a_finite_window_is_measured_before_the_slow_fetch_not_after() {
+        let max_age = Duration::from_millis(100);
+        let window = StaleIfError::For(Duration::from_millis(150));
+        // Staleness at the moment the fetch is attempted: 50ms past the stale
+        // point, comfortably inside the 150ms window.
+        let stale_at_attempt_ms = 50;
+        // The fetch itself takes 200ms to fail. Measured after the fetch,
+        // staleness would appear to be 50ms + 200ms = 250ms, past the 150ms
+        // window -- exactly the bug this test guards against.
+        let fetch_delay = Duration::from_millis(200);
+
+        #[expect(clippy::cast_possible_truncation)]
+        let max_age_nanos = max_age.as_nanos() as i64;
+        let stale_at_attempt_nanos = i64::from(stale_at_attempt_ms) * 1_000_000;
+        let schema = MockHttpTableProvider::with_status(200, "unused").schema();
+        let stale = stale_batch_with_fetched_at(
+            &schema,
+            "cached response",
+            Some(now_nanos() - stale_at_attempt_nanos - max_age_nanos),
+        );
+
+        let outcome = slow_failure_outcome(stale, window, max_age, fetch_delay).await;
+        assert_eq!(
+            outcome,
+            Ok("cached response".to_string()),
+            "an entry inside the window when the fetch was attempted must be served \
+             stale, even though the fetch's own {fetch_delay:?} delay would have pushed \
+             a post-fetch staleness measurement past the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finite_window_is_measured_before_a_delayed_http_503() {
+        let max_age = Duration::from_millis(100);
+        let window = StaleIfError::For(Duration::from_millis(150));
+        let fetch_delay = Duration::from_millis(200);
+        let schema = MockHttpTableProvider::with_status(503, "upstream down").schema();
+        assert_eq!(
+            schema
+                .metadata()
+                .get(HTTP_RESPONSE_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "the origin batch must take the HTTP transient-status path"
+        );
+        let stale = stale_batch_with_fetched_at(
+            &schema,
+            "cached response",
+            Some(
+                now_nanos()
+                    - i64::try_from((max_age + Duration::from_millis(50)).as_nanos())
+                        .expect("age fits in nanoseconds"),
+            ),
+        );
+
+        let outcome = transient_5xx_outcome_with_delay(stale, window, max_age, fetch_delay).await;
+        assert_eq!(
+            outcome, "cached response",
+            "the delayed 503 must use staleness at fetch start, before its delay expires the window"
+        );
+    }
+
+    /// `Enabled` has no bound to check, so it serves even when the entry's age is
+    /// unknown — the fail-open behavior a finite window deliberately drops.
+    #[tokio::test]
+    async fn enabled_serves_even_when_staleness_is_unknown() {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let null_ts = stale_batch_with_fetched_at(&schema, "cached response", None);
+        assert_eq!(
+            transient_5xx_outcome(null_ts, StaleIfError::Enabled, Duration::ZERO).await,
+            "cached response",
+            "Enabled fails open on an unknown fetch time"
+        );
+    }
+
+    /// Cayenne stores `_fetched_at` in microseconds. The read path must
+    /// normalize its precision, or a finite window could never prove an entry is
+    /// inside `N` and would always fail closed on such an accelerator.
+    #[tokio::test]
+    async fn a_finite_window_reads_a_microsecond_fetched_at() {
+        use arrow::array::{StringArray, TimestampMicrosecondArray, UInt16Array};
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+
+        // 30s past a 10s stale point is inside a 60s window. Stored in micros,
+        // as Cayenne would.
+        let fetched_at_micros = (now_nanos() - secs_nanos(10 + 30)) / 1_000;
+        let stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["cached response"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(
+                    fetched_at_micros,
+                )])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        assert_eq!(
+            transient_5xx_outcome(
+                stale,
+                StaleIfError::For(Duration::from_mins(1)),
+                Duration::from_secs(10)
+            )
+            .await,
+            "cached response",
+            "a microsecond fetch time must be normalized and read as inside the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revalidation_reports_a_failing_origin_rather_than_zero_rows() {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(429, "slow down"));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            http_source.schema(),
+            vec![],
+        ));
+        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let outcome = CacheRefreshHelper::refresh_entry(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            CacheNamespace::Public,
+            batch_write_tx,
+            leader_claim(&in_flight, "key"),
+        )
+        .await
+        .expect("revalidation should not error");
+
+        assert_eq!(
+            outcome,
+            RevalidationOutcome::OriginUnavailable,
+            "a 429 is a failing origin, not an origin with nothing to give"
+        );
+        assert_eq!(outcome.rows(), 0);
+    }
+
+    /// A reader that coalesces onto a fetch already in flight (a follower)
+    /// replays the leader's published batches and never writes — so a key can
+    /// never hold two copies of the same response.
+    #[tokio::test]
+    async fn a_follower_replays_the_leaders_batches_and_does_not_write() {
+        use futures::StreamExt;
+
+        let http_source = Arc::new(MockHttpTableProvider::with_status(200, "body"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        // Stand in for the leader: it holds the claim for this key and has
+        // already published its fetched batches, exactly as the miss path does
+        // before it enqueues the write.
+        let filters = vec![col("content").eq(lit("test"))];
+        let key = compute_cache_key_from_filters_and_namespace(
+            &filters,
+            CacheNamespace::Public.storage_id(),
+        );
+        let mut leader = leader_claim(&in_flight, &key);
+        let published = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/leader"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["leader-body"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(0_i64)])) as ArrayRef,
+            ],
+        )
+        .expect("leader batch");
+        leader.publish_ready(Arc::new(vec![published]));
+
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
+            "test_dataset",
+            &filters,
+            None,
+            Arc::clone(&schema),
+            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
+            None,
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        // The follower is served the leader's published row, not the origin's.
+        let mut served = Vec::new();
+        while let Some(batch) = stream.next().await {
+            served.push(batch.expect("stream"));
+        }
+        let rows: usize = served.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "the follower replays the leader's one row");
+        let content = served[0]
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("content column");
+        assert_eq!(
+            content.value(0),
+            "leader-body",
+            "the follower must replay the leader's batches, not fetch its own"
+        );
+
+        drop(stream);
+        drop(leader);
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+
+        assert!(
+            accelerator.get_data().is_empty(),
+            "the follower must not write a second copy of the response"
+        );
+    }
+
+    /// Single-flight: N concurrent cache misses for one key reach the origin
+    /// exactly once. The leader fetches; every other caller replays its batches.
+    ///
+    /// This fails on the pre-single-flight code, where each miss fetches the
+    /// origin unconditionally (the in-flight set only suppressed the second
+    /// *write*, not the second *fetch*), so the counter would read the number of
+    /// callers rather than one.
+    #[tokio::test]
+    async fn concurrent_cache_misses_for_one_key_fetch_the_origin_once() {
+        // A delay long enough that the followers reach `acquire` and coalesce
+        // while the leader is still inside its single scan.
+        let origin = Arc::new(CountingHttpTableProvider::new(
+            200,
+            "shared-body",
+            Duration::from_millis(200),
+        ));
+        let schema = origin.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let filters = vec![col("content").eq(lit("test"))];
+        let io = tokio::runtime::Handle::current();
+        let session_state = test_session_state();
+
+        let make = || {
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&origin) as Arc<dyn TableProvider>,
+                &session_state,
+                "test_dataset",
+                &filters,
+                None,
+                Arc::clone(&schema),
+                false,
+                StaleIfError::Disabled,
+                Duration::ZERO,
+                None,
+                &io,
+                Arc::new(vec![].into()),
+                batch_write_tx.clone(),
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+            )
+        };
+
+        // Driven on one task, `join!` interleaves the five futures: the first to
+        // be polled inserts the claim and enters its scan (which then awaits),
+        // so the other four find the claim present and become followers.
+        let (s0, s1, s2, s3, s4) = tokio::join!(make(), make(), make(), make(), make());
+
+        let all = [
+            drain(s0).await,
+            drain(s1).await,
+            drain(s2).await,
+            drain(s3).await,
+            drain(s4).await,
+        ];
+
+        assert_eq!(
+            origin.scan_count(),
+            1,
+            "five concurrent misses for one key must reach the origin exactly once"
+        );
+
+        for batches in &all {
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(rows, 1, "every caller is served the one shared row");
+            let content = batches[0]
+                .column_by_name("content")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .expect("content column");
+            assert_eq!(
+                content.value(0),
+                "shared-body",
+                "every caller sees the leader's fetched batches"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+    }
+
+    /// Single-flight applies to an empty origin too: N concurrent misses for a
+    /// key the origin has no rows for reach it exactly once, and every caller is
+    /// served the same empty result.
+    #[tokio::test]
+    async fn concurrent_cache_misses_for_an_empty_origin_fetch_it_once() {
+        let origin = Arc::new(
+            CountingHttpTableProvider::new(200, "unused", Duration::from_millis(200)).with_rows(0),
+        );
+        let schema = origin.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let filters = vec![col("content").eq(lit("test"))];
+        let io = tokio::runtime::Handle::current();
+        let session_state = test_session_state();
+
+        let make = || {
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&origin) as Arc<dyn TableProvider>,
+                &session_state,
+                "test_dataset",
+                &filters,
+                None,
+                Arc::clone(&schema),
+                false,
+                StaleIfError::Disabled,
+                Duration::ZERO,
+                None,
+                &io,
+                Arc::new(vec![].into()),
+                batch_write_tx.clone(),
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+            )
+        };
+
+        let (s0, s1, s2, s3, s4) = tokio::join!(make(), make(), make(), make(), make());
+
+        let served = [
+            drain_rows(s0).await,
+            drain_rows(s1).await,
+            drain_rows(s2).await,
+            drain_rows(s3).await,
+            drain_rows(s4).await,
+        ];
+
+        assert_eq!(
+            origin.scan_count(),
+            1,
+            "five concurrent misses for a key the origin is empty for must reach it exactly once"
+        );
+        assert_eq!(
+            served, [0; 5],
+            "every caller is served the shared empty result"
+        );
+
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+        assert!(
+            accelerator.get_data().is_empty(),
+            "an empty result is not written to the cache"
+        );
+    }
+
+    /// A miss that asks for more rows than the fetch already in flight for its
+    /// key must not replay that fetch. The origin truncates a bounded fetch to
+    /// its limit, so replaying a `LIMIT 1` fetch would hand a `LIMIT 3` caller
+    /// one row where the origin holds three — a wrong result, not a slower one.
+    /// The caller fetches for itself instead and, holding no claim, does not
+    /// write.
+    #[tokio::test]
+    async fn a_miss_bounded_above_the_in_flight_fetch_does_not_replay_it() {
+        let origin = Arc::new(
+            CountingHttpTableProvider::new(200, "row", Duration::from_millis(200)).with_rows(5),
+        );
+        let schema = origin.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let filters = vec![col("content").eq(lit("test"))];
+        let io = tokio::runtime::Handle::current();
+        let session_state = test_session_state();
+
+        let make = |limit| {
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&origin) as Arc<dyn TableProvider>,
+                &session_state,
+                "test_dataset",
+                &filters,
+                limit,
+                Arc::clone(&schema),
+                false,
+                StaleIfError::Disabled,
+                Duration::ZERO,
+                None,
+                &io,
+                Arc::new(vec![].into()),
+                batch_write_tx.clone(),
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+            )
+        };
+
+        // Polled first, the `LIMIT 1` miss leads and is inside its scan when the
+        // `LIMIT 3` miss reaches `acquire` for the same key.
+        let (leader, follower) = tokio::join!(make(Some(1)), make(Some(3)));
+
+        assert_eq!(
+            drain_rows(leader).await,
+            1,
+            "the leader gets the one row it asked for"
+        );
+        assert_eq!(
+            drain_rows(follower).await,
+            3,
+            "a miss asking for more rows than the in-flight fetch must fetch for itself"
+        );
+        assert_eq!(
+            origin.scan_count(),
+            2,
+            "the bounded-below fetch cannot be shared, so the origin is asked twice"
+        );
+
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+        let written: usize = accelerator
+            .get_data()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            written, 1,
+            "only the leader writes; the caller that fetched for itself holds no claim"
+        );
+    }
+
+    /// A stale-while-revalidate refresh holds the claim for its key across its
+    /// origin fetch, so a miss for the same key arriving meanwhile coalesces onto
+    /// it. The refresh must publish what it fetched: otherwise the miss waits out
+    /// the whole refresh and then asks the origin a second time.
+    #[tokio::test]
+    async fn a_miss_during_a_revalidation_replays_the_revalidations_fetch() {
+        let origin = Arc::new(CountingHttpTableProvider::new(
+            200,
+            "revalidated-body",
+            Duration::from_millis(200),
+        ));
+        let schema = origin.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let filters = vec![col("content").eq(lit("test"))];
+
+        // The revalidation claims the key the way `handle_cache_hit` does, then
+        // enters its fetch.
+        let claim = leader_claim(
+            &in_flight,
+            &compute_cache_key_from_filters_and_namespace(
+                &filters,
+                CacheNamespace::Public.storage_id(),
+            ),
+        );
+        let revalidation = tokio::spawn({
+            let origin = Arc::clone(&origin) as Arc<dyn TableProvider>;
+            let filters = filters.clone();
+            let batch_write_tx = batch_write_tx.clone();
+            async move {
+                CacheRefreshHelper::refresh_entry(
+                    origin,
+                    &test_session_state(),
+                    "test_dataset",
+                    &filters,
+                    CacheNamespace::Public,
+                    batch_write_tx,
+                    claim,
+                )
+                .await
+            }
+        });
+        wait_for_scans(&origin, 1).await;
+
+        // The entry has expired past its stale window, so this reader misses.
+        let served = drain(
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&origin) as Arc<dyn TableProvider>,
+                &test_session_state(),
+                "test_dataset",
+                &filters,
+                None,
+                Arc::clone(&schema),
+                true,
+                StaleIfError::Disabled,
+                Duration::ZERO,
+                None,
+                &tokio::runtime::Handle::current(),
+                Arc::new(vec![].into()),
+                batch_write_tx.clone(),
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+            )
+            .await,
+        )
+        .await;
+
+        let outcome = revalidation
+            .await
+            .expect("revalidation task")
+            .expect("revalidation");
+        assert_eq!(outcome.rows(), 1, "the revalidation refreshed its one row");
+        assert_eq!(
+            origin.scan_count(),
+            1,
+            "a miss that coalesced onto a revalidation must not ask the origin again"
+        );
+        let rows: usize = served.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "the miss is served the revalidation's row");
+        let content = served[0]
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("content column");
+        assert_eq!(content.value(0), "revalidated-body");
+
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+    }
+
+    /// The periodic stale-row refresh holds the claim for each entry across its
+    /// origin fetch too, so a miss for that entry arriving meanwhile must replay
+    /// the refresh's fetch rather than wait for it and then ask the origin again.
+    #[tokio::test]
+    async fn a_miss_during_the_periodic_refresh_replays_the_refreshs_fetch() {
+        let origin = Arc::new(CountingHttpTableProvider::new(
+            200,
+            "refreshed-body",
+            Duration::from_millis(200),
+        ));
+        let schema = origin.schema();
+
+        #[expect(clippy::cast_possible_truncation)]
+        let fetched_long_ago = (SystemTime::now() - Duration::from_hours(1))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as i64;
+        let stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["old-body"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(fetched_long_ago)])) as ArrayRef,
+            ],
+        )
+        .expect("stale row");
+
+        // The miss asks for the entry under exactly the filters the refresh
+        // derives from the stale row, so both land on one key.
+        let entries =
+            CacheRefreshHelper::extract_unique_stale_entries(std::slice::from_ref(&stale))
+                .expect("stale entries");
+        let entry_filters = entries.first().expect("one stale entry").filters.clone();
+
+        let stored = Arc::new(
+            data_components::arrow::write::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![stale]],
+            )
+            .expect("mem table"),
+        ) as Arc<dyn TableProvider>;
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let refresh = tokio::spawn({
+            let origin = Arc::clone(&origin) as Arc<dyn TableProvider>;
+            let stored = Arc::clone(&stored);
+            let in_flight = Arc::clone(&in_flight);
+            async move {
+                CacheRefreshHelper::refresh_all_stale_rows(
+                    origin,
+                    stored,
+                    test_session_state(),
+                    "test_dataset",
+                    Duration::from_secs(1),
+                    Arc::new(Mutex::new(())),
+                    in_flight,
+                )
+                .await
+            }
+        });
+        wait_for_scans(&origin, 1).await;
+
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let served = drain_rows(
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&origin) as Arc<dyn TableProvider>,
+                &test_session_state(),
+                "test_dataset",
+                &entry_filters,
+                None,
+                Arc::clone(&schema),
+                true,
+                StaleIfError::Disabled,
+                Duration::ZERO,
+                None,
+                &tokio::runtime::Handle::current(),
+                Arc::new(vec![].into()),
+                batch_write_tx,
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+            )
+            .await,
+        )
+        .await;
+
+        let refreshed = refresh.await.expect("refresh task").expect("refresh");
+        assert_eq!(refreshed, 1, "the periodic refresh refreshed its one row");
+        assert_eq!(
+            origin.scan_count(),
+            1,
+            "a miss that coalesced onto the periodic refresh must not ask the origin again"
+        );
+        assert_eq!(served, 1, "the miss is served the refresh's row");
+
+        handle.abort();
+    }
+
+    /// A leader that drops before publishing a result (cancelled, failed, or
+    /// holding a non-cacheable response) publishes `Failed`, so a follower
+    /// waiting on it falls through to its own fetch instead of hanging forever.
+    #[tokio::test]
+    async fn a_follower_falls_through_when_the_leader_publishes_failed() {
+        use futures::StreamExt;
+
+        let origin = Arc::new(MockHttpTableProvider::with_status(200, "fell-through-body"));
+        let schema = origin.schema();
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        // A leader holds the claim; a follower clones its receiver before the
+        // leader gives up.
+        let leader = leader_claim(&in_flight, "k");
+        let ClaimOutcome::Follower(in_flight_fetch) =
+            CacheKeyClaim::acquire(&in_flight, "k".to_string(), None)
+        else {
+            panic!("second caller must be a follower");
+        };
+
+        // The leader is dropped without publishing a result: `Drop` publishes
+        // `Failed`, which the follower's cloned receiver observes.
+        drop(leader);
+
+        let filters = [col("content").eq(lit("test"))];
+        let session_state = test_session_state();
+        let mut stream = CacheRefreshHelper::follow_cache_miss(
+            in_flight_fetch.state,
+            UncoalescedFetch {
+                federated: Arc::clone(&origin) as Arc<dyn TableProvider>,
+                session_state: &session_state,
+                dataset_name: "test_dataset",
+                filters: &filters,
+                limit: None,
+                schema: Arc::clone(&schema),
+                stale_if_error: StaleIfError::Disabled,
+                max_age: Duration::ZERO,
+                expired_batches: None,
+            },
+        )
+        .await;
+
+        let mut served = Vec::new();
+        while let Some(b) = stream.next().await {
+            served.push(b.expect("stream"));
+        }
+        let rows: usize = served.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            rows, 1,
+            "a follower whose leader failed must fetch the origin itself"
+        );
+        let content = served[0]
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("content column");
+        assert_eq!(content.value(0), "fell-through-body");
+    }
+
+    /// A claim that is never handed to a write releases its key when dropped.
+    #[tokio::test]
+    async fn a_dropped_claim_releases_its_key() {
+        // This is what makes a cancelled query safe. The miss path holds the
+        // claim across the fetch and across the enqueue, so a client that
+        // disconnects, or a send that blocks on a full write channel, drops the
+        // future somewhere in the middle. Without release-on-drop that key
+        // stays claimed for the life of the process and every later write and
+        // revalidation for it is refused.
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        {
+            let claim = leader_claim(&in_flight, "k");
+            assert_eq!(claim.key(), "k");
+            assert!(
+                matches!(
+                    CacheKeyClaim::acquire(&in_flight, "k".to_string(), None),
+                    ClaimOutcome::Follower(_)
+                ),
+                "a claimed key must make the next caller a follower, not a second leader"
+            );
+        }
+
+        assert!(
+            in_flight.lock().is_empty(),
+            "dropping a claim must release its key"
+        );
+        assert!(
+            matches!(
+                CacheKeyClaim::acquire(&in_flight, "k".to_string(), None),
+                ClaimOutcome::Leader(_)
+            ),
+            "the key is claimable again"
+        );
+    }
+
+    /// A claim handed to a queued write is released by that write, not by the
+    /// scope that raised it.
+    #[tokio::test]
+    async fn a_queued_claim_outlives_the_scope_that_raised_it() {
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        {
+            let claim = leader_claim(&in_flight, "k");
+            claim.into_queued();
+        }
+
+        assert!(
+            in_flight.lock().contains_key("k"),
+            "the flush that writes this key is the one that releases it"
+        );
+    }
+
+    /// The periodic refresh replaces the entries it refreshes, so it opens the
+    /// same delete-then-append gap as every other writer and must hold the key.
+    #[tokio::test]
+    async fn the_periodic_refresh_skips_an_entry_whose_key_is_already_claimed() {
+        // Without the claim, a reader scanning that gap sees no rows, reads a
+        // miss, and appends its own copy beside this one — leaving the key
+        // holding the response twice.
+        let origin = Arc::new(MockHttpTableProvider::with_status(200, "fresh-body"));
+        let schema = origin.schema();
+
+        #[expect(clippy::cast_possible_truncation)]
+        let fetched_long_ago = (SystemTime::now() - Duration::from_hours(1))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as i64;
+
+        let stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["good-body"])) as ArrayRef,
+                Arc::new(arrow::array::UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(fetched_long_ago)])) as ArrayRef,
+            ],
+        )
+        .expect("stale row");
+
+        // Claim the key exactly as the refresh will compute it.
+        let entries =
+            CacheRefreshHelper::extract_unique_stale_entries(std::slice::from_ref(&stale))
+                .expect("stale entries");
+        let entry = entries.first().expect("one stale entry");
+        let namespace_id = entry
+            .namespace
+            .as_deref()
+            .unwrap_or_else(|| CacheNamespace::Public.storage_id());
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let _held = leader_claim(
+            &in_flight,
+            &compute_cache_key_from_filters_and_namespace(&entry.filters, namespace_id),
+        );
+
+        let accelerator = Arc::new(
+            data_components::arrow::write::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![stale]],
+            )
+            .expect("mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        let refreshed = CacheRefreshHelper::refresh_all_stale_rows(
+            Arc::clone(&origin) as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator),
+            test_session_state(),
+            "test_dataset",
+            Duration::from_secs(1),
+            Arc::new(Mutex::new(())),
+            Arc::clone(&in_flight),
+        )
+        .await
+        .expect("refresh");
+
+        assert_eq!(
+            refreshed, 0,
+            "an entry another writer already holds must be left to them"
+        );
+    }
+
+    /// The claim a miss takes is released by the flush that writes it, so a
+    /// response that is never enqueued must never claim.
+    #[tokio::test]
+    async fn a_failing_origin_does_not_leave_the_key_claimed() {
+        use futures::StreamExt;
+
+        // A held claim refuses every later write *and* revalidation for that
+        // key, for the life of the process — so one 5xx would make the key
+        // permanently uncacheable, which is the opposite of what an operator
+        // asking for a cache expects from a transient origin failure.
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            None,
+            Arc::clone(&schema),
+            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
+            None,
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        while let Some(batch) = stream.next().await {
+            batch.expect("stream");
+        }
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+
+        assert!(
+            in_flight.lock().is_empty(),
+            "a key whose response was never enqueued must not stay claimed"
+        );
+    }
+
+    /// The periodic refresh replaces the entry it refreshes, so it must not
+    /// write a failing origin's error body over the last good response.
+    #[tokio::test]
+    async fn a_failing_origin_does_not_overwrite_a_stale_entry_with_its_error_body() {
+        // A 429 or 5xx arrives as a *successful* fetch whose rows carry that
+        // status. Writing it would serve the origin's error body as a cache hit
+        // until it expired, and would defeat `caching_stale_if_error` outright.
+        let origin = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = origin.schema();
+
+        #[expect(clippy::cast_possible_truncation)]
+        let fetched_long_ago = (SystemTime::now() - Duration::from_hours(1))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as i64;
+
+        let stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["good-body"])) as ArrayRef,
+                Arc::new(arrow::array::UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(fetched_long_ago)])) as ArrayRef,
+            ],
+        )
+        .expect("stale row");
+
+        let accelerator = Arc::new(
+            data_components::arrow::write::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![stale]],
+            )
+            .expect("mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        let refreshed = CacheRefreshHelper::refresh_all_stale_rows(
+            Arc::clone(&origin) as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator),
+            test_session_state(),
+            "test_dataset",
+            Duration::from_secs(1),
+            Arc::new(Mutex::new(())),
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        )
+        .await
+        .expect("refresh");
+
+        assert_eq!(refreshed, 0, "a failing origin refreshes nothing");
+
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .read_table(Arc::clone(&accelerator))
+            .expect("read")
+            .collect()
+            .await
+            .expect("collect");
+        let bodies: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let content = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("utf8");
+                (0..batch.num_rows())
+                    .map(|r| content.value(r).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["good-body".to_string()],
+            "the cached response must survive a failing origin"
+        );
+    }
+
     /// Test that 404 responses are cached.
     ///
     /// Simulates cache miss flow:
@@ -3737,24 +6351,27 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         // 2. Call handle_cache_miss - this is what happens when user queries and cache is empty
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))], // filters
             None,                              // limit
             Arc::clone(&schema),
-            false, // is_expired
-            false, // stale_if_error
-            None,  // expired_batches
+            false,                  // is_expired
+            StaleIfError::Disabled, // stale_if_error
+            Duration::ZERO,         // max_age (ignored: no expired batches)
+            None,                   // expired_batches
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()), // synchronized_children
             batch_write_tx,
             CacheNamespace::Public,
+            Arc::clone(&in_flight),
         )
         .await;
 
@@ -3811,12 +6428,559 @@ mod tests {
         );
     }
 
-    /// Helper to create a schema with `response_status` column for `filter_5xx` tests
-    fn create_http_response_schema() -> SchemaRef {
+    /// Mock source that records the `DataFusion` session id each `scan()` is planned under, so a
+    /// test can tell one shared `SessionState` from a fresh one per fetch.
+    #[derive(Debug)]
+    struct SessionTrackingTableProvider {
+        schema: SchemaRef,
+        data: Vec<RecordBatch>,
+        session_ids: Arc<RwLock<Vec<String>>>,
+    }
+
+    impl SessionTrackingTableProvider {
+        fn new(schema: SchemaRef, data: Vec<RecordBatch>) -> Self {
+            Self {
+                schema,
+                data,
+                session_ids: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+
+        fn recorded_session_ids(&self) -> Vec<String> {
+            self.session_ids.read().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for SessionTrackingTableProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.session_ids
+                .write()
+                .push(state.session_id().to_string());
+            Ok(Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(
+                    std::slice::from_ref(&self.data),
+                    Arc::clone(&self.schema),
+                    None,
+                )?,
+            ))))
+        }
+    }
+
+    /// The columns a cached HTTP response carries, `cache_refreshed_at` included.
+    fn http_cache_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("content", DataType::Utf8, false),
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
             Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
         ]))
+    }
+
+    /// One 200 response row whose `cache_refreshed_at` is `refreshed_at` (Unix nanoseconds).
+    fn http_row(schema: &SchemaRef, refreshed_at: i64, content: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api/test"])),
+                Arc::new(StringArray::from(vec!["q=test"])),
+                Arc::new(StringArray::from(vec![content])),
+                Arc::new(UInt16Array::from(vec![200_u16])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(refreshed_at)])),
+            ],
+        )
+        .expect("http response row")
+    }
+
+    /// Unix nanoseconds for `ago` before `now_nanos`.
+    fn nanos_ago(now_nanos: i64, ago: Duration) -> i64 {
+        now_nanos - i64::try_from(ago.as_nanos()).expect("duration fits in i64 nanoseconds")
+    }
+
+    #[derive(Debug)]
+    struct CountingCacheScan {
+        inner: Arc<dyn ExecutionPlan>,
+        scans: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DisplayAs for CountingCacheScan {
+        fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            self.inner.fmt_as(t, f)
+        }
+    }
+
+    impl ExecutionPlan for CountingCacheScan {
+        fn name(&self) -> &'static str {
+            "CountingCacheScan"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                inner: Arc::clone(&children[0]),
+                scans: Arc::clone(&self.scans),
+            }))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.execute(partition, context)
+        }
+    }
+
+    /// Counts accelerator executions through the actual caching scan plan.
+    /// A backend-first success must not execute its child, whereas an origin
+    /// failure reads it once, and the disabled and nonzero-TTL paths retain
+    /// their normal cache-first scan.
+    #[tokio::test]
+    async fn zero_ttl_backend_first_only_scans_on_failure() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos(),
+        )
+        .expect("timestamp");
+        let old_row = http_row(&schema, nanos_ago(now, Duration::from_secs(2)), "cached");
+        let filters = vec![col("request_path").eq(lit("/api/test"))];
+
+        for (ttl, swr, sie, status, expected_scans, expected_content) in [
+            (
+                Duration::ZERO,
+                None,
+                StaleIfError::For(Duration::from_mins(1)),
+                200,
+                0,
+                "origin",
+            ),
+            (
+                Duration::ZERO,
+                None,
+                StaleIfError::For(Duration::from_mins(1)),
+                503,
+                1,
+                "cached",
+            ),
+            (
+                Duration::ZERO,
+                None,
+                StaleIfError::Disabled,
+                503,
+                1,
+                "error",
+            ),
+            (
+                Duration::from_mins(1),
+                None,
+                StaleIfError::Enabled,
+                200,
+                1,
+                "cached",
+            ),
+            (
+                Duration::ZERO,
+                Some(Duration::from_mins(1)),
+                StaleIfError::Enabled,
+                200,
+                1,
+                "cached",
+            ),
+        ] {
+            let source = Arc::new(MockHttpTableProvider::with_status(
+                status,
+                if status == 200 { "origin" } else { "error" },
+            ));
+            let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+                Arc::clone(&schema),
+                vec![old_row.clone()],
+            ));
+            let inner: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![old_row.clone()]], Arc::clone(&schema), None)
+                    .expect("cache input"),
+            )));
+            let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let input: Arc<dyn ExecutionPlan> = Arc::new(CountingCacheScan {
+                inner,
+                scans: Arc::clone(&scans),
+            });
+            let in_flight: InFlightRevalidations =
+                Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let (tx, _consumer) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+            let exec = CachingAccelerationScanExec::new(
+                input,
+                Some(ttl),
+                swr,
+                sie,
+                source,
+                accelerator,
+                "http_data".to_string(),
+                Handle::current(),
+                filters.clone(),
+                None,
+                None,
+                Arc::new(Mutex::new(())),
+                in_flight,
+                Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                tx,
+            );
+            let batches: Vec<RecordBatch> = exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("execute")
+                .try_collect()
+                .await
+                .expect("collect");
+            let content = batches[0]
+                .column_by_name("content")
+                .expect("content")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string content")
+                .value(0);
+            assert_eq!(
+                content, expected_content,
+                "ttl={ttl:?} swr={swr:?} sie={sie:?}"
+            );
+            assert_eq!(
+                scans.load(std::sync::atomic::Ordering::SeqCst),
+                expected_scans,
+                "ttl={ttl:?} swr={swr:?} sie={sie:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn follower_reads_deferred_cache_fallback_after_origin_failure() {
+        let origin = Arc::new(MockHttpTableProvider::with_status(503, "origin error"));
+        let schema = origin.schema();
+        let stale = http_row(&schema, 0, "cached");
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![stale]], Arc::clone(&schema), None)
+                .expect("cache input"),
+        )));
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(CountingCacheScan {
+            inner,
+            scans: Arc::clone(&scans),
+        });
+        let in_flight: InFlightRevalidations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let leader = leader_claim(&in_flight, "request");
+        let ClaimOutcome::Follower(in_flight_fetch) =
+            CacheKeyClaim::acquire(&in_flight, "request".to_string(), None)
+        else {
+            panic!("second caller must be a follower");
+        };
+        drop(leader);
+
+        let session_state = test_session_state();
+        let filters = [col("request_path").eq(lit("/api/test"))];
+        let stream = CacheRefreshHelper::follow_cache_miss(
+            in_flight_fetch.state,
+            UncoalescedFetch {
+                federated: Arc::clone(&origin) as Arc<dyn TableProvider>,
+                session_state: &session_state,
+                dataset_name: "http_data",
+                filters: &filters,
+                limit: None,
+                schema: Arc::clone(&schema),
+                stale_if_error: StaleIfError::Enabled,
+                max_age: Duration::ZERO,
+                expired_batches: Some(CacheFallback::Deferred {
+                    input: input.into(),
+                    partition: 0,
+                    context: Arc::new(TaskContext::default()),
+                }),
+            },
+        )
+        .await;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect fallback");
+
+        assert_eq!(batches.len(), 1);
+        let content = batches[0]
+            .column_by_name("content")
+            .expect("content")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string content");
+        assert_eq!(content.value(0), "cached");
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the deferred accelerator scan runs when the origin fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn follower_does_not_serve_zero_row_deferred_fallback() {
+        let origin = Arc::new(MockHttpTableProvider::with_status(503, "origin error"));
+        let schema = origin.schema();
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![empty]], Arc::clone(&schema), None)
+                .expect("empty cache input"),
+        )));
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(CountingCacheScan {
+            inner,
+            scans: Arc::clone(&scans),
+        });
+        let in_flight: InFlightRevalidations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let leader = leader_claim(&in_flight, "request");
+        let ClaimOutcome::Follower(in_flight_fetch) =
+            CacheKeyClaim::acquire(&in_flight, "request".to_string(), None)
+        else {
+            panic!("second caller must be a follower");
+        };
+        drop(leader);
+
+        let session_state = test_session_state();
+        let filters = [col("request_path").eq(lit("/api/test"))];
+        let stream = CacheRefreshHelper::follow_cache_miss(
+            in_flight_fetch.state,
+            UncoalescedFetch {
+                federated: Arc::clone(&origin) as Arc<dyn TableProvider>,
+                session_state: &session_state,
+                dataset_name: "http_data",
+                filters: &filters,
+                limit: None,
+                schema: Arc::clone(&schema),
+                stale_if_error: StaleIfError::Enabled,
+                max_age: Duration::ZERO,
+                expired_batches: Some(CacheFallback::Deferred {
+                    input: input.into(),
+                    partition: 0,
+                    context: Arc::new(TaskContext::default()),
+                }),
+            },
+        )
+        .await;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect origin failure");
+
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1,
+            "an empty cache batch cannot suppress the origin's transient response"
+        );
+        let status = batches[0]
+            .column_by_name(RESPONSE_STATUS_COLUMN)
+            .expect("response_status")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("UInt16 response_status");
+        assert_eq!(status.value(0), 503);
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the deferred accelerator scan runs once after origin failure"
+        );
+    }
+
+    /// Regression guard for the shared `SessionState`.  Every query plans its own
+    /// `CachingAccelerationScanExec` (through `scan_plan`, and again through
+    /// `with_new_children` on a plan rewrite), and each source fetch that exec issues — a cache
+    /// miss, an expired entry re-fetched inline, and a stale-while-revalidate refresh in the
+    /// background — must plan under the one process-wide session. A fresh `SessionContext` per
+    /// fetch, or a fresh `SessionState` per exec, gives every `scan()` its own session id; this
+    /// asserts on the ids rather than on timings, so it holds on a loaded CI runner.
+    #[tokio::test]
+    async fn source_fetches_across_execs_and_paths_share_one_session_state() {
+        let schema = http_cache_schema();
+        let now_nanos = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let max_age = Duration::from_mins(1);
+        let stale_while_revalidate = Duration::from_mins(5);
+
+        let source = Arc::new(SessionTrackingTableProvider::new(
+            Arc::clone(&schema),
+            vec![http_row(&schema, now_nanos, "from source")],
+        ));
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight_revalidations: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let (batch_write_tx, _consumer_handle) =
+            spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
+
+        let build_exec = |input: Arc<dyn ExecutionPlan>, filters: Vec<Expr>| {
+            Arc::new(CachingAccelerationScanExec::new(
+                input,
+                Some(max_age),
+                Some(stale_while_revalidate),
+                StaleIfError::Disabled,
+                Arc::clone(&source) as Arc<dyn TableProvider>,
+                Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+                "test_dataset".to_string(),
+                Handle::current(),
+                filters,
+                None,
+                None,
+                Arc::new(Mutex::new(())),
+                Arc::clone(&in_flight_revalidations),
+                Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                batch_write_tx.clone(),
+            ))
+        };
+        let cached_input = |rows: Vec<RecordBatch>| -> Arc<dyn ExecutionPlan> {
+            Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[rows], Arc::clone(&schema), None)
+                    .expect("cached rows as a memory source"),
+            )))
+        };
+
+        // What the accelerator holds for each query: nothing (miss, twice), a row past
+        // `max_age + stale_while_revalidate` (expired: re-fetched inline), and a row past
+        // `max_age` but inside the window (stale: served, refreshed in the background).
+        let expired_at = nanos_ago(
+            now_nanos,
+            max_age + stale_while_revalidate + Duration::from_mins(1),
+        );
+        let stale_at = nanos_ago(now_nanos, max_age + Duration::from_mins(1));
+        let cases: Vec<(&str, Vec<RecordBatch>)> = vec![
+            ("miss", vec![]),
+            ("second miss", vec![]),
+            ("expired", vec![http_row(&schema, expired_at, "expired")]),
+            ("stale", vec![http_row(&schema, stale_at, "stale")]),
+        ];
+
+        for (i, (case, cached_rows)) in cases.into_iter().enumerate() {
+            // One key per case, so no case is skipped for a write another case still has pending.
+            let filters = vec![col("request_path").eq(lit(format!("/api/{i}")))];
+            let exec = build_exec(cached_input(cached_rows), filters);
+            let rows: Vec<RecordBatch> = exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("execute")
+                .try_collect()
+                .await
+                .expect("collect");
+            assert!(!rows.is_empty(), "{case}: the scan must return rows");
+        }
+
+        // A plan rewrite rebuilds the exec through `with_new_children`; that copy fetches too.
+        let rewritten = build_exec(
+            cached_input(vec![]),
+            vec![col("request_path").eq(lit("/api/rewritten"))],
+        )
+        .replace_children(
+            vec![cached_input(vec![])],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .expect("with_new_children");
+        let rows: Vec<RecordBatch> = rewritten
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute rewritten exec")
+            .try_collect()
+            .await
+            .expect("collect rewritten exec");
+        assert!(
+            !rows.is_empty(),
+            "rewritten exec: the scan must return rows"
+        );
+
+        // Four fetches happen inline before their streams end; the stale case's refresh runs on
+        // the io runtime, so wait for it — bounded, and naming what was seen if it never lands.
+        let expected_fetches = 5;
+        let refresh_landed = tokio::time::timeout(Duration::from_secs(10), async {
+            while source.recorded_session_ids().len() < expected_fetches {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            refresh_landed.is_ok(),
+            "the stale-while-revalidate refresh never reached the source: saw {} of {expected_fetches} fetches",
+            source.recorded_session_ids().len()
+        );
+
+        let session_ids = source.recorded_session_ids();
+        assert_eq!(
+            session_ids.len(),
+            expected_fetches,
+            "one source fetch per case, got {session_ids:?}"
+        );
+        let distinct: HashSet<&str> = session_ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "every fetch must plan under one shared session state; saw {distinct:?}"
+        );
+        assert_eq!(
+            session_ids[0],
+            SHARED_SESSION_STATE.session_id(),
+            "fetches must use the process-wide state, not a copy built per exec"
+        );
+    }
+
+    /// Helper to create a schema with `response_status` column for `filter_5xx` tests.
+    /// Carries the HTTP-connector provenance marker so
+    /// `filter_transient_error_responses` treats it as a real HTTP-connector
+    /// batch rather than passing it through unfiltered (see
+    /// `cache::utils::http_fetch_status`).
+    fn create_http_response_schema() -> SchemaRef {
+        Arc::new(
+            Schema::new(vec![
+                Field::new("content", DataType::Utf8, false),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            ])
+            .with_metadata(std::collections::HashMap::from([(
+                HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        )
     }
 
     #[test]
@@ -4041,5 +7205,418 @@ mod tests {
             .expect("status column");
         assert_eq!(status.value(0), 200);
         assert_eq!(status.value(1), 404);
+    }
+}
+
+/// The caching write path must replace a cache entry by telling the engine to
+/// delete the superseded rows, not by reading the whole acceleration back,
+/// filtering it in memory and overwriting it. These tests watch the calls the
+/// accelerator actually receives, because "the right rows ended up stored" is
+/// true of both strategies and would not distinguish them.
+#[cfg(test)]
+mod write_path_tests {
+    use super::*;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{Field, Schema};
+    use async_trait::async_trait;
+    use datafusion::catalog::{Session, TableProvider};
+    use datafusion::common::Constraints;
+    use datafusion::datasource::TableType;
+    use datafusion::prelude::SessionContext;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Wraps a real accelerator and records which operations it was asked for.
+    /// `can_delete` models an engine without `delete_from` — the caller must
+    /// fall back rather than fail.
+    #[derive(Debug)]
+    struct CountingAccelerator {
+        inner: Arc<dyn TableProvider>,
+        scans: AtomicUsize,
+        deletes: AtomicUsize,
+        overwrites: AtomicUsize,
+        appends: AtomicUsize,
+        can_delete: bool,
+    }
+
+    impl CountingAccelerator {
+        fn new(inner: Arc<dyn TableProvider>, can_delete: bool) -> Self {
+            Self {
+                inner,
+                scans: AtomicUsize::new(0),
+                deletes: AtomicUsize::new(0),
+                overwrites: AtomicUsize::new(0),
+                appends: AtomicUsize::new(0),
+                can_delete,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for CountingAccelerator {
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+
+        fn constraints(&self) -> Option<&Constraints> {
+            self.inner.constraints()
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.scans.fetch_add(1, Ordering::Relaxed);
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            match op {
+                InsertOp::Overwrite => self.overwrites.fetch_add(1, Ordering::Relaxed),
+                _ => self.appends.fetch_add(1, Ordering::Relaxed),
+            };
+            self.inner.insert_into(state, input, op).await
+        }
+
+        async fn delete_from(
+            &self,
+            state: &dyn Session,
+            filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if !self.can_delete {
+                return Err(DataFusionError::NotImplemented(
+                    "Delete not implemented for this table".to_string(),
+                ));
+            }
+            self.deletes.fetch_add(1, Ordering::Relaxed);
+            self.inner.delete_from(state, filters).await
+        }
+    }
+
+    fn cache_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
+        ]))
+    }
+
+    fn entry(path: &str, content: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            cache_schema(),
+            vec![
+                Arc::new(StringArray::from(vec![path])) as ArrayRef,
+                Arc::new(StringArray::from(vec![content])) as ArrayRef,
+            ],
+        )
+        .expect("batch")
+    }
+
+    fn accelerator_with(
+        rows: Vec<RecordBatch>,
+        can_delete: bool,
+    ) -> (Arc<CountingAccelerator>, Arc<dyn TableProvider>) {
+        let inner = data_components::arrow::write::MemTable::try_new(cache_schema(), vec![rows])
+            .expect("mem table");
+        let counting = Arc::new(CountingAccelerator::new(
+            Arc::new(inner) as Arc<dyn TableProvider>,
+            can_delete,
+        ));
+        let as_provider = Arc::clone(&counting) as Arc<dyn TableProvider>;
+        (counting, as_provider)
+    }
+
+    async fn stored(accelerator: &Arc<dyn TableProvider>) -> Vec<(String, String)> {
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .read_table(Arc::clone(accelerator))
+            .expect("read")
+            .collect()
+            .await
+            .expect("collect");
+        let mut out = Vec::new();
+        for batch in &batches {
+            let paths = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8");
+            let contents = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8");
+            for r in 0..batch.num_rows() {
+                out.push((paths.value(r).to_string(), contents.value(r).to_string()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Runs the real batched writer over `accelerator` until the sender drops.
+    fn spawn_test_writer(
+        accelerator: &Arc<dyn TableProvider>,
+    ) -> (CacheWriteSender, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = create_cache_write_channel();
+        let handle = spawn_batched_cache_write_task(
+            rx,
+            Arc::clone(accelerator),
+            TableReference::bare("test_dataset"),
+            Arc::new(Mutex::new(())),
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            Arc::new(AtomicI64::new(0)),
+            RuntimeStatus::new(),
+        );
+        (tx, handle)
+    }
+
+    #[tokio::test]
+    async fn a_fresh_insert_appends_without_deleting() {
+        // A key nothing holds yet cannot collide, so the delete would match
+        // nothing — and on Cayenne a delete first checkpoints the inline
+        // memtable to a file, which collapsed measured ingest from thousands of
+        // entries per second to about ten when every write did one.
+        let (counting, accelerator) = accelerator_with(vec![], /* can_delete */ true);
+
+        let (tx, handle) = spawn_test_writer(&accelerator);
+        tx.send(CacheWriteRequest {
+            batches: vec![entry("/new", "first")],
+            filters: vec![col("request_path").eq(lit("/new"))],
+            cache_key: "key".to_string(),
+            namespace_id: "public".into(),
+            replaces_existing: false,
+        })
+        .await
+        .expect("send");
+        drop(tx);
+        handle.await.expect("writer");
+
+        assert_eq!(
+            counting.deletes.load(Ordering::Relaxed),
+            0,
+            "a fresh key must not pay for a delete"
+        );
+        assert_eq!(counting.appends.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stored(&accelerator).await,
+            vec![("/new".to_string(), "first".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn two_writes_for_one_key_in_a_flush_store_the_newest_only() {
+        // Both are raised as fresh inserts, so neither deletes. Appending both
+        // would leave the key holding the response twice, which queries return
+        // as duplicated source rows.
+        let (_counting, accelerator) = accelerator_with(vec![], /* can_delete */ true);
+
+        let (tx, handle) = spawn_test_writer(&accelerator);
+        for content in ["older", "newer"] {
+            tx.send(CacheWriteRequest {
+                batches: vec![entry("/a", content)],
+                filters: vec![col("request_path").eq(lit("/a"))],
+                cache_key: "same-key".to_string(),
+                namespace_id: "public".into(),
+                replaces_existing: false,
+            })
+            .await
+            .expect("send");
+        }
+        drop(tx);
+        handle.await.expect("writer");
+
+        assert_eq!(
+            stored(&accelerator).await,
+            vec![("/a".to_string(), "newer".to_string())],
+            "the key must hold one response, and it must be the newest"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_an_entry_deletes_first() {
+        let (counting, accelerator) =
+            accelerator_with(vec![entry("/a", "old-a"), entry("/b", "b")], true);
+
+        let (tx, handle) = spawn_test_writer(&accelerator);
+        tx.send(CacheWriteRequest {
+            batches: vec![entry("/a", "new-a")],
+            filters: vec![col("request_path").eq(lit("/a"))],
+            cache_key: "key".to_string(),
+            namespace_id: "public".into(),
+            replaces_existing: true,
+        })
+        .await
+        .expect("send");
+        drop(tx);
+        handle.await.expect("writer");
+
+        assert_eq!(counting.deletes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stored(&accelerator).await,
+            vec![
+                ("/a".to_string(), "new-a".to_string()),
+                ("/b".to_string(), "b".to_string()),
+            ],
+            "the key holds the new response only"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_an_entry_deletes_and_appends_without_reading_the_table() {
+        let (counting, accelerator) = accelerator_with(
+            vec![entry("/a", "old-a"), entry("/b", "b")],
+            /* can_delete */ true,
+        );
+
+        CacheRefreshHelper::batched_upsert_into_accelerator(
+            &accelerator,
+            "test_dataset",
+            &[vec![col("request_path").eq(lit("/a"))]],
+            vec![entry("/a", "new-a")],
+        )
+        .await
+        .expect("upsert");
+
+        assert_eq!(
+            counting.deletes.load(Ordering::Relaxed),
+            1,
+            "the superseded rows must be removed by the engine"
+        );
+        assert_eq!(
+            counting.appends.load(Ordering::Relaxed),
+            1,
+            "the replacement rows must be appended"
+        );
+        assert_eq!(
+            counting.overwrites.load(Ordering::Relaxed),
+            0,
+            "replacing one entry must not rewrite the whole acceleration"
+        );
+        assert_eq!(
+            counting.scans.load(Ordering::Relaxed),
+            0,
+            "replacing one entry must not read every cached row back first"
+        );
+
+        assert_eq!(
+            stored(&accelerator).await,
+            vec![
+                ("/a".to_string(), "new-a".to_string()),
+                ("/b".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_engine_without_deletes_still_replaces_the_entry_correctly() {
+        // Negative control for the test above: an accelerator that cannot
+        // delete must fall back to read-filter-write and reach the same stored
+        // state, so the assertions above are measuring the strategy and not
+        // just the outcome.
+        let (counting, accelerator) = accelerator_with(
+            vec![entry("/a", "old-a"), entry("/b", "b")],
+            /* can_delete */ false,
+        );
+
+        CacheRefreshHelper::batched_upsert_into_accelerator(
+            &accelerator,
+            "test_dataset",
+            &[vec![col("request_path").eq(lit("/a"))]],
+            vec![entry("/a", "new-a")],
+        )
+        .await
+        .expect("upsert");
+
+        assert_eq!(counting.deletes.load(Ordering::Relaxed), 0);
+        assert!(
+            counting.scans.load(Ordering::Relaxed) > 0,
+            "the fallback path reads the table back"
+        );
+        assert_eq!(
+            counting.overwrites.load(Ordering::Relaxed),
+            1,
+            "the fallback path rewrites the whole acceleration"
+        );
+
+        assert_eq!(
+            stored(&accelerator).await,
+            vec![
+                ("/a".to_string(), "new-a".to_string()),
+                ("/b".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn caching_a_new_entry_appends_rather_than_rewriting_the_table() {
+        let (counting, accelerator) = accelerator_with(vec![entry("/a", "a")], true);
+
+        CacheRefreshHelper::insert_into_accelerator(
+            &accelerator,
+            "test_dataset",
+            vec![entry("/b", "b")],
+        )
+        .await
+        .expect("insert");
+
+        assert_eq!(counting.appends.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counting.overwrites.load(Ordering::Relaxed),
+            0,
+            "caching one response must not rewrite everything already cached"
+        );
+        assert_eq!(
+            counting.scans.load(Ordering::Relaxed),
+            0,
+            "caching one response must not read everything already cached"
+        );
+
+        assert_eq!(
+            stored(&accelerator).await,
+            vec![
+                ("/a".to_string(), "a".to_string()),
+                ("/b".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_filter_set_never_becomes_an_unconstrained_delete() {
+        // An empty filter set reduces to no predicate, which as a DELETE would
+        // remove the entire cache. It must disqualify the delete path instead.
+        let (counting, accelerator) = accelerator_with(
+            vec![entry("/a", "a"), entry("/b", "b")],
+            /* can_delete */ true,
+        );
+
+        let replaced = CacheRefreshHelper::delete_and_append(
+            &accelerator,
+            "test_dataset",
+            &[vec![]],
+            vec![entry("/c", "c")],
+        )
+        .await
+        .expect("must not error");
+
+        assert!(!replaced, "an unconstrained delete must be refused");
+        assert_eq!(counting.deletes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stored(&accelerator).await,
+            vec![
+                ("/a".to_string(), "a".to_string()),
+                ("/b".to_string(), "b".to_string()),
+            ]
+        );
     }
 }

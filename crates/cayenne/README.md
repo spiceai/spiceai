@@ -172,7 +172,7 @@ pub trait MetastoreTransaction: Send + Sync {
 }
 ```
 
-Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Null`) to and from native column types. The starting BEGIN statement is sent by the backend itself: `BEGIN IMMEDIATE` for SQLite (takes the reserved write lock up front so a subsequent `UPDATE`/`INSERT` cannot upgrade-deadlock against a concurrent writer), and `BEGIN CONCURRENT` for Turso (MVCC writers serialize at commit time on actual conflicts).
+Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Null`) to and from native column types. The starting BEGIN statement is sent by the backend itself: `BEGIN IMMEDIATE` for SQLite (takes the reserved write lock up front so a subsequent `UPDATE`/`INSERT` cannot upgrade-deadlock against a concurrent writer), and `BEGIN CONCURRENT` for Turso (MVCC writers proceed optimistically and conflict on the statement that writes a row another transaction has changed, or on `COMMIT`).
 
 **Schema validation.** `metastore::EXPECTED_TABLES` is the canonical list of expected metadata tables and their ordered column names; `validate_existing_schema` is invoked after `init_schema` and returns `CatalogError::SchemaMismatch` (with an actionable "clear your acceleration data" message) when the on-disk schema does not match. Types and constraints are not compared — SQLite/libSQL type affinity makes exact type matching unreliable — but column names and ordering are.
 
@@ -218,8 +218,11 @@ pub trait MetadataCatalog: Send + Sync {
     async fn get_all_snapshot_sequences(&self, table_id: &str) -> CatalogResult<HashMap<String, i64>>;
     async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
 
-    // Atomic snapshot pointer flips (compaction and overwrite share retry-on-conflict logic)
-    async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    // Atomic snapshot pointer flips (compaction and overwrite share retry-on-conflict logic).
+    // A compaction commits only while the table still points at the snapshot it
+    // was built from (`SnapshotReplaced` otherwise).
+    async fn commit_compaction(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    async fn set_current_snapshot(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
     async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
 
     // Partitions
@@ -375,7 +378,8 @@ pub struct CayenneTableProvider {
 
     // Per-table locks
     write_lock: Arc<tokio::sync::Mutex<()>>,
-    compaction_lock: Arc<tokio::sync::Mutex<()>>,
+    compaction_lock: Arc<tokio::sync::RwLock<()>>,
+    protected_merge_claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
 
     // Object store
     object_store_config: Option<ObjectStoreConfig>,
@@ -392,7 +396,7 @@ pub struct CayenneTableProvider {
     new_files_since_last_compaction: Arc<AtomicUsize>,
     staging_wal_present: Arc<AtomicBool>,
     staging_may_have_files: Arc<AtomicBool>,
-    post_write_compaction_scheduled: Arc<AtomicBool>,
+    post_write_compaction_state: Arc<AtomicU8>,
     post_write_maintenance: Arc<PostWriteMaintenance>,
     background_compactor: Arc<OnceLock<BackgroundCompactor>>,
 }
@@ -465,7 +469,7 @@ Snapshots of a Cayenne dataset are taken using a **per-dataset metastore slice**
 
 `import_dataset` runs inside a single `BEGIN IMMEDIATE` transaction; FK `ON DELETE CASCADE` clears any prior dependent rows when the existing `cayenne_table` row is deleted.
 
-The runtime engine (`CayenneSnapshotEngine`) excludes `cayenne.db`, `cayenne.db-wal`, and `cayenne.db-shm` from the tar; it inserts the slice at the well-known archive path `metadata/<dataset_name>.slice.json`. This avoids the path-portability, multi-dataset clobbering, and init-race / sidecar problems that motivated the design.
+The runtime engine (`CayenneSnapshotEngine`) excludes `cayenne.db`, `cayenne.db-wal`, and `cayenne.db-shm` from the tar; it inserts the slice at the well-known archive path `metadata/<dataset_name>.slice.json`. This avoids the path-portability, multi-dataset clobbering, and init-race / sidecar problems that motivated the design. Of the data directory it archives only what the slice references — the current and protected snapshot directories and the `deletions/` directories they use. Retired snapshot directories, staging state, and the `deletions/` directories of unreferenced snapshots are skipped: maintenance removes them while the archive is being written, and the reader never needs them.
 
 ### 9. Catalog provider (`catalog_provider.rs`)
 
@@ -490,7 +494,7 @@ Cayenne ships several optimizer rules that work together to keep multi-way HTAP 
 - **`CayennePushDownSemiJoin`** (logical) — pushes a `LeftSemi`/`RightSemi` join down through inner joins (and identity-preserving `Projection`/`Filter` wrappers) so it prunes the base Cayenne scan sourcing its key *before* the multi-way joins build their non-spillable hash tables. TPC-H q18 is the motivating shape; soundness rests on the reordering law `(R ⋈ T) ⋉ₖ S ≡ (R ⋉ₖ S) ⋈ T`, valid when every semi-join key is sourced solely from one side. Skips scans it can *prove* are below `MIN_SEMI_JOIN_PUSHDOWN_SCAN_ROWS` (100K) rows.
 - **Inner-join probe filtering** is normally handled by DataFusion's *native* hash-join dynamic-filter pushdown (no Cayenne rule). For inner joins (the only shape DataFusion pushes join-derived dynamic filters through), `HashJoinExec` plants an `Arc<DynamicFilterPhysicalExpr>` into the right-side scan during the filter-pushdown phase, and the build side populates it at execute-time with a combined predicate: min/max **bounds** (for statistics-based file/row-group/segment pruning) plus a **membership** check — an `InList` for build sides within `datafusion.optimizer.hash_join_inlist_pushdown_max_size` (sized from `runtime.query.memory_limit` per partition by the Spice session builder) or a hash-table lookup for larger ones. This natively supersedes the forked `ExactLeftAccumulator` seam. The optional **`CayenneJoinRewriter`** (physical) re-introduces the `ExactLeftAccumulator` probe for Cayenne probe sides, but is *off by default* — registered only when `cayenne_optimizer_rules.exact_join_filter` is enabled.
 - **`CayenneDynamicFilterSharing`** (physical) — when a dynamic filter has been pushed into one `CayenneAccelerationExec`, installs the same `Arc<DynamicFilterPhysicalExpr>` on sibling `CayenneAccelerationExec`s backed by the same underlying table and equi-joined column set. Applies to `Inner`, `LeftSemi`, and `RightSemi` parent joins (anti joins excluded — sharing would drop rows they're meant to preserve).
-- **`CayenneAntiJoinSortMergeRewriter`** (physical) — DataFusion's `HashJoinExec` build side is non-spillable. For same-source Cayenne semi/anti joins, the rule rewrites the hash join into a `SortMergeJoinExec` with explicit spillable `SortExec` inputs when the build side is too large to materialize. The **memory-pool-fraction gate is primary**: when a memory pool is wired through config, the rule fires once the estimated build-side bytes exceed `cayenne.sort_merge_memory_pool_fraction` of `runtime.query.memory_limit` (default 0.125) — catching wide-row builds whose row count is modest but whose hash table would still exhaust the pool. When no memory pool is wired (e.g. direct DataFusion users), it **falls back** to the `cayenne.sort_merge_min_rows` exact build-side row count (default 10M). Inner/outer joins keep `HashJoinExec`.
+- **`CayenneAntiJoinSortMergeRewriter`** (physical) — DataFusion's `HashJoinExec` build side is non-spillable, so a build side too big for the pool fails the query outright; the rule rewrites such a join into a `SortMergeJoinExec` with explicit spillable `SortExec` inputs. The **memory gate is primary**: the gate is active when a memory pool is wired through config (the runtime always wires one) *and* `cayenne.sort_merge_memory_pool_fraction` resolves to a positive number — setting it to `0` turns the gate off outright even though a pool is still wired. While the gate is active, any join type sort-merge supports — inner, left/right/full outer, and semi/anti — with a Cayenne scan on either side is eligible, and the rule fires once the estimated build-side bytes exceed that join's share of the pool. The share is the smaller of `cayenne.sort_merge_memory_pool_fraction` of `runtime.query.memory_limit` (default 0.125, clamped to at most the whole pool) and an even split of the pool across every hash join in the plan. Exceeding the *fraction* rewrites whatever the row count — catching wide-row builds whose row count is modest but whose hash table would still exhaust the pool — whereas exceeding only the *even split* additionally requires `cayenne.sort_merge_min_rows` (default 10M), so a query holding many joins open does not push mid-size ones onto the slower plan. With no active gate — no memory pool wired (e.g. direct DataFusion users), or the fraction set to zero, negative, or `NaN` — the rule narrows to same-source semi/anti joins gated on that same row count, which there must be `Precision::Exact`.
 - **`CayenneMaintainedAggregateRewriter`** (physical, default-on) — when a query matches a Cayenne-maintained aggregate view (`group_by` + `Count`/`Sum`/`Avg`/`Min`/`Max`), serves the incrementally-maintained aggregate state in place of re-scanning and re-aggregating — but only when the maintained state's freshness epoch matches the scan's snapshot epoch (a DBSP-style incremental-view-maintenance fast path for append-heavy CDC streams; see *Maintained aggregates and NDV sketches* below).
 
 Together these rules turn q18/q21-style multi-way joins from OOM-prone hash-join chains into spillable shapes whose probe sides see propagated filters and shared dynamic filters from the start. The `cayenne` config extension surfaces the row-count and memory thresholds (`CayenneOptimizerConfig`).
@@ -642,7 +646,7 @@ These are runtime-global `runtime.params` (not per-dataset). They tune the SQLit
 | `cayenne_metastore_busy_timeout_ms`           | `busy_timeout` — how long a writer waits for the lock before erroring.                                                                          | `30000`          |
 | `cayenne_metastore_wal_autocheckpoint_pages`  | Inline WAL auto-checkpoint threshold in pages; `0` disables the inline checkpoint so it never fires inside a hot commit (the background maintenance tick drains the WAL instead). | `0`              |
 | `cayenne_metastore_wal_truncate_threshold_mb` | WAL size above which the background-tick checkpoint escalates PASSIVE→TRUNCATE to reclaim the `-wal` file (never on the hot write path).         | `160`            |
-| `cayenne_metastore_auto_vacuum`               | `none`, `incremental`, or `full`. Takes effect only on a fresh DB.                                                                              | `none`           |
+| `cayenne_metastore_auto_vacuum`               | `none`, `incremental`, or `full`. Takes effect only on a fresh DB.                                                                              | `incremental`    |
 
 The metastore always runs in WAL journal mode with `synchronous = NORMAL`.
 
@@ -881,10 +885,11 @@ Some Arrow data types cannot be stored in the Vortex format, and are rejected at
 - `Duration`
 - `FixedSizeBinary`
 - `Union`
-- `RunEndEncoded`
+- `RunEndEncoded` (Vortex can store it, but Cayenne does not accept it yet)
 
-`Map` is storable: Vortex has no map type but stores one as `List<Struct<keys, values>>` and
-restores it on read, so a map column round-trips.
+`Map` is storable and restored on read from the table's schema: Vortex stores a map under a type
+of its own that carries no Arrow field names (and an older file stores it as
+`List<Struct<keys, values>>`).
 
 One type is rewritten rather than rejected:
 
@@ -903,7 +908,9 @@ The `cayenne_unsupported_type_action` parameter controls handling:
 
 #### Indexes
 
-Secondary indexes are not supported. Primary keys drive efficient upserts and deletions.
+Cayenne honors dataset `indexes` as in-memory point-lookup accelerators in both file and memory modes. A planned lookup uses an index when equality predicates on bare columns pin every column in one index entry. File mode can also batch-probe a published index from a completed collect-left hash join's exact scalar or correlated composite key set. Partitioned or oversized runtime key sets scan normally. Every predicate and join still runs on the candidate rows. `unique` builds the same lookup index and emits a warning because it does not constrain writes—use `primary_key` plus `on_conflict` for write-time uniqueness.
+
+Floating-point columns (`Float16`, `Float32`, and `Float64`) can be index columns: `-0.0` and `0.0` share an index entry, as does every NaN, so a lookup never misses a row the predicate would select. `EXPLAIN` names the index that served a lookup on `CayenneAccelerationExec` (`lookup_index`), with candidate counts and `uncovered_files` (candidate files read in full because the index does not cover them yet; `uncovered_batches` in memory mode); unsupported predicate shapes and runtime-only lookups report `lookup_index=none`, with `lookup_index_reason` saying why an indexed table's lookup scanned. `cayenne_lookup_index_files` reports how many data files each index covers. Actual runtime index probes are reported by the lookup-index probe metrics. See [Secondary indexes](../../docs/cayenne/cayenne.md#secondary-indexes-indexes) for the design and lifecycle details.
 
 #### Concurrency / MVCC
 
@@ -1017,7 +1024,7 @@ Cayenne synthesizes several established database/storage techniques. The list be
 - **SQLite WAL mode** for the metastore. Allows concurrent readers and a single writer at the engine level; combined with Cayenne's connection pool this lifts the read-side concurrency ceiling.
   - SQLite WAL documentation: <https://www.sqlite.org/wal.html>
 
-- **libSQL `BEGIN CONCURRENT`** (MVCC writers) on Turso. Lets multiple writers run in parallel and serialize at commit time on actual conflicts, rather than at BEGIN time.
+- **libSQL `BEGIN CONCURRENT`** (MVCC writers) on Turso. Lets multiple writers run in parallel and conflict on the statement that writes a row another transaction has changed, or on `COMMIT`, rather than at `BEGIN` time.
   - Turso `BEGIN CONCURRENT`: <https://github.com/tursodatabase/libsql/blob/main/docs/BEGIN_CONCURRENT.md>
 
 - **UUIDv7** for `table_id`, `delete_file_id`, snapshot ids, and other catalog IDs. Time-ordered UUIDs keep newly-created rows clustered in B-tree-ordered SQLite primary indexes, reducing page splits on insert-heavy workloads.

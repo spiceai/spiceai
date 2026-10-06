@@ -4,8 +4,11 @@
 //! Persistent implementation of a Vortex table provider.
 mod access_plan;
 mod cache;
+mod write_observer;
 pub use cache::synthetic_object_meta;
+mod deferred_projection;
 mod format;
+mod key_blocks;
 pub mod metrics;
 mod opener;
 mod reader;
@@ -14,7 +17,10 @@ mod sink;
 mod source;
 mod stream;
 
-pub use access_plan::{VortexAccessPlan, VortexAccessPlanProvider};
+pub use access_plan::{
+    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider, exclude_by_index,
+    include_by_index,
+};
 pub use format::ProjectionPushdown;
 pub use format::ScanConcurrency;
 pub use format::VortexFormat;
@@ -26,6 +32,7 @@ pub use segment_cache::{
     register_segment_cache_metrics,
 };
 pub use source::VortexSource;
+pub use write_observer::VortexWriteObserver;
 
 #[cfg(test)]
 mod tests {
@@ -453,6 +460,143 @@ mod tests {
         Ok(())
     }
 
+    /// `array_length` / `array_length(_, 1)` / `list_length` over a list column is rewritten
+    /// to Vortex `list_length` and pushed into the scan. Port of spiraldb/vortex#8600.
+    ///
+    /// Semantics that must hold: `UInt64` length, `0` for a non-null empty list, `NULL` for
+    /// a null list. The two-argument form with `dim > 1` must stay above the scan.
+    #[tokio::test]
+    async fn test_array_length_pushes_down_and_handles_empty_and_null() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::with_nested_functions(true);
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE list_test (id INT NOT NULL, a INT[], b INT[]) \
+                STORED AS vortex LOCATION '/list_test/'",
+            )
+            .await?;
+        ctx.session
+            .sql(
+                "INSERT INTO list_test VALUES \
+                    (1, [10, 20, 30], [1]), \
+                    (2, [40, 50, 60, 70], [2, 3]), \
+                    (3, [80], [4, 5, 6]), \
+                    (4, [90, 100, 110, 120, 130], [7, 8, 9, 10]), \
+                    (5, [140, 150], []), \
+                    (6, NULL, [1, 2])",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        // Projection: `array_length` on both list columns must be handed to the Vortex
+        // scan (on the DataSourceExec line, not a ProjectionExec above it) and return
+        // exact lengths — including 0 for the empty `b` on row 5 and NULL for the
+        // null `a` on row 6.
+        let proj_query = "SELECT id, array_length(a) AS len_a, array_length(b) AS len_b FROM list_test ORDER BY id";
+        let proj_plan = physical_plan_display(&ctx.session, proj_query).await?;
+        let scan_line = proj_plan
+            .lines()
+            .find(|line| line.contains("DataSourceExec") && line.contains("file_type=vortex"));
+        assert!(
+            scan_line.is_some_and(|line| line.contains("array_length("))
+                && !proj_plan.contains("ProjectionExec"),
+            "array_length must appear on the Vortex scan itself, with no ProjectionExec above it, got plan:\n{proj_plan}"
+        );
+        let proj_result = ctx.session.sql(proj_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_pushdown_result",
+            pretty_format_batches(&proj_result)?
+        );
+
+        // `array_length(a, 1)` is equivalent and must return the same `a` lengths.
+        let dim1_result = ctx
+            .session
+            .sql("SELECT id, array_length(a, 1) AS len_a, array_length(b) AS len_b FROM list_test ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            pretty_format_batches(&proj_result)?.to_string(),
+            pretty_format_batches(&dim1_result)?.to_string(),
+            "array_length(a, 1) must match array_length(a)"
+        );
+
+        // `list_length` is the registered SQL alias of `array_length`. Executing it
+        // (not only `array_length`) is what fails if `register_all` drops the alias.
+        let alias_result = ctx
+            .session
+            .sql("SELECT id, list_length(a) AS len_a, list_length(b) AS len_b FROM list_test ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            pretty_format_batches(&proj_result)?.to_string(),
+            pretty_format_batches(&alias_result)?.to_string(),
+            "list_length must match array_length"
+        );
+
+        // Filter: `array_length(a) >= 4` must push into the scan and drop the empty
+        // and null lists (NULL comparisons are not kept).
+        let filter_query = "SELECT id FROM list_test WHERE array_length(a) >= 4 ORDER BY id";
+        let filter_plan = physical_plan_display(&ctx.session, filter_query).await?;
+        assert!(
+            filter_plan.contains("predicate:") && !filter_plan.contains("FilterExec"),
+            "array_length filter should push into the Vortex scan, got plan:\n{filter_plan}"
+        );
+        let filter_result = ctx.session.sql(filter_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_filter_pushdown_result",
+            pretty_format_batches(&filter_result)?
+        );
+
+        // A CASE whose branches are list literals is list-typed, but those literals
+        // cannot convert to Vortex scalars. The query must still plan and run by
+        // keeping `array_length` above the scan rather than failing at convert time.
+        let case_query = "SELECT id FROM list_test \
+            WHERE array_length(CASE WHEN id = 1 THEN [10, 20] ELSE a END) >= 2 \
+            ORDER BY id";
+        let case_plan = physical_plan_display(&ctx.session, case_query).await?;
+        assert!(
+            case_plan.contains("FilterExec"),
+            "array_length(CASE of list literals) must stay above the scan, got plan:\n{case_plan}"
+        );
+        let case_result = ctx.session.sql(case_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_case_list_literals_result",
+            pretty_format_batches(&case_result)?
+        );
+
+        // A CASE whose WHEN uses `~` (RegexMatch) is list-typed when both branches
+        // are lists, but convert() rejects RegexMatch. Use a pattern DataFusion
+        // does not fold to `id = …`, so the physical plan still carries RegexMatch.
+        // The query must still plan and run by keeping `array_length` above the scan.
+        let regex_query = "SELECT id FROM list_test \
+            WHERE array_length(CASE WHEN CAST(id AS VARCHAR) ~ '^[0-9]+$' THEN a ELSE b END) >= 2 \
+            ORDER BY id";
+        let regex_plan = physical_plan_display(&ctx.session, regex_query).await?;
+        assert!(
+            regex_plan.contains("FilterExec"),
+            "array_length(CASE with RegexMatch WHEN) must stay above the scan, got plan:\n{regex_plan}"
+        );
+        let regex_result = ctx.session.sql(regex_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_case_regex_when_result",
+            pretty_format_batches(&regex_result)?
+        );
+
+        // `array_length(a, 2)` has multidimensional semantics that `list_length` does
+        // not model, so it must stay in a FilterExec above the scan.
+        let dim2_query = "SELECT id FROM list_test WHERE array_length(a, 2) >= 4 ORDER BY id";
+        let dim2_plan = physical_plan_display(&ctx.session, dim2_query).await?;
+        assert!(
+            dim2_plan.contains("FilterExec") && !dim2_plan.contains("predicate:"),
+            "array_length(arr, 2) must stay in a FilterExec above the scan, got plan:\n{dim2_plan}"
+        );
+
+        Ok(())
+    }
+
     /// Doc example: demonstrates creating, writing, reading, and filtering a Vortex table.
     #[tokio::test]
     async fn doc_example() -> anyhow::Result<()> {
@@ -598,31 +742,34 @@ mod tests {
     /// it takes no build with it — the plan still pushes the filter down and the
     /// scan then fails on a cast Vortex no longer knows how to do.
     ///
-    /// This asserts the kernel directly rather than through a SQL filter, because
-    /// the two are not the same question: the kernel is registered on
-    /// `ExtensionArray`, and the scan also evaluates the pushed-down predicate
-    /// against *constant* arrays built from chunk statistics, which reach a
-    /// different cast path the fork does not patch. That second path fails today
-    /// (`No CastReduce to cast constant array from vortex.date[days] to
-    /// vortex.timestamp[ns]`), so a SQL-level assertion would be pinning a bug
-    /// rather than the patch.
+    /// This asserts the kernel directly rather than through a SQL filter, because the
+    /// two are not the same question: the kernel converts the rows of a chunk, and a
+    /// scan casts a file's `max` statistic — a scalar — through the same expression
+    /// to decide whether to read the chunk at all.
+    /// [`a_pushed_down_date_to_timestamp_cast_returns_the_matching_rows`] covers that
+    /// second path.
     #[test]
     fn test_date_to_timestamp_extension_cast() -> anyhow::Result<()> {
-        use datafusion::arrow::array::{Array as _, AsArray as _, Date32Array};
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::{Array as _, ArrayRef, AsArray as _, Date32Array};
         use datafusion::arrow::datatypes::{DataType, Field, TimeUnit, TimestampMillisecondType};
-        use vortex::array::ArrayRef as VortexArrayRef;
         use vortex::array::VortexSessionExecute;
         use vortex::array::builtins::ArrayBuiltins;
-        use vortex::arrow::{ArrowSessionExt, FromArrowArray, FromArrowType};
-        use vortex::dtype::{DType, Nullability};
+        use vortex::arrow::ArrowSessionExt;
+        use vortex::dtype::Nullability;
+
+        let session = VortexSession::default();
 
         // 1970-01-01, 2024-01-15, and a NULL, so the cast has to carry validity as
         // well as values.
-        let dates = Date32Array::from(vec![Some(0), Some(19_737), None]);
-        let source = VortexArrayRef::from_arrow(&dates, true)?;
+        let dates: ArrayRef = Arc::new(Date32Array::from(vec![Some(0), Some(19_737), None]));
+        let source = session.arrow().from_arrow_array(dates, true)?;
 
         let millis = DataType::Timestamp(TimeUnit::Millisecond, None);
-        let target = DType::from_arrow((&millis, Nullability::Nullable));
+        let target = session
+            .arrow()
+            .from_arrow_datatype(&millis, Nullability::Nullable)?;
         let cast = source.cast(target.clone())?;
         assert_eq!(
             cast.dtype(),
@@ -633,7 +780,6 @@ mod tests {
         // Read the values back rather than stopping at the type: a cast that lands
         // on `vortex.timestamp` and puts the wrong instants in it is the failure
         // this guard is for, and it would pass a type-and-length assertion.
-        let session = VortexSession::default();
         let arrow = session.arrow().execute_arrow(
             cast,
             Some(&Field::new("event_ts", millis, true)),
@@ -654,6 +800,212 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Assert that `sql`'s `CAST(event_date AS TIMESTAMP)` is evaluated inside the Vortex
+    /// scan.
+    ///
+    /// Both date-cast guards below assert a row count, and `DataFusion` returns the same
+    /// count when it evaluates the filter itself in a `FilterExec` above the scan. Without
+    /// this, a pushdown that stopped happening would leave them green and guarding nothing.
+    async fn assert_cast_pushes_into_the_scan(
+        ctx: &TestSessionContext,
+        sql: &str,
+    ) -> anyhow::Result<()> {
+        let plan = ctx
+            .session
+            .state()
+            .create_physical_plan(ctx.session.sql(sql).await?.logical_plan())
+            .await?;
+        let plan_display = DisplayableExecutionPlan::new(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            plan_display.contains("predicate: CAST(event_date"),
+            "the cast has to push into the Vortex scan, got plan:\n{plan_display}"
+        );
+        Ok(())
+    }
+
+    /// A pushed-down `CAST(date_col AS TIMESTAMP)` has to return the matching rows.
+    ///
+    /// The filter goes into the Vortex scan whole, and the scan uses it twice: it
+    /// falsifies `cast(col as timestamp) > lit` into `cast(max(col) as timestamp) <= lit`
+    /// and casts the file's `max` **statistic** to decide whether to read the file, then
+    /// casts the column's rows to filter the ones it read. The first of those is a scalar
+    /// cast, which `Extension`'s array kernel does not cover, and it failed the scan
+    /// outright: `No CastReduce to cast constant array from vortex.date[days](i32?) to
+    /// vortex.timestamp[ns](i64?)` ([#13624](https://github.com/spiceai/spiceai/issues/13624)).
+    ///
+    /// The literal carries a time of day so `unwrap_cast_in_comparison` cannot rewrite the
+    /// comparison back to a bare `DATE` and drop the cast — without that the filter never
+    /// reaches Vortex as a cast at all, and the test guards nothing.
+    #[tokio::test]
+    async fn a_pushed_down_date_to_timestamp_cast_returns_the_matching_rows() -> anyhow::Result<()>
+    {
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE events (event_date DATE) \
+                STORED AS vortex LOCATION '/date_cast/'",
+            )
+            .await?;
+
+        // One row before the bound, one on the same day as it but before the time of day,
+        // a NULL, and one after: a filter that was dropped rather than evaluated would
+        // return more than the one match.
+        ctx.session
+            .sql(
+                "INSERT INTO events VALUES \
+                    (DATE '1999-12-31'), (DATE '2024-01-15'), (NULL), (DATE '2024-03-01')",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        let sql = "SELECT count(*) FROM events \
+                   WHERE CAST(event_date AS TIMESTAMP) > TIMESTAMP '2024-01-15 12:00:00'";
+
+        assert_cast_pushes_into_the_scan(&ctx, sql).await?;
+        assert_eq!(
+            scalar_count(&ctx, sql).await?,
+            1,
+            "only 2024-03-01 is after the bound"
+        );
+
+        Ok(())
+    }
+
+    /// The same filter over a `Date64` column has to return the same row.
+    ///
+    /// `Date64` is stored as `vortex.date[ms]`, which shares its `i64` storage with
+    /// `vortex.timestamp[ns]`. A scalar cast that re-labelled the storage value instead of
+    /// converting it therefore did not fail here — it returned the millisecond count as a
+    /// nanosecond one, an instant 10^6 too small, so the falsifier concluded the file held
+    /// no matching row and the scan skipped it. The query returned zero rows and no error,
+    /// which is why this is a separate guard from the `Date32` one above and asserts a row
+    /// count rather than that the query succeeds.
+    ///
+    /// The file is written directly because `CREATE EXTERNAL TABLE … DATE` is `Date32`;
+    /// `Date64` has no SQL spelling to declare a column with.
+    #[tokio::test]
+    async fn a_pushed_down_date64_to_timestamp_cast_does_not_prune_the_matching_file()
+    -> anyhow::Result<()> {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::{ArrayRef, Date64Array};
+        use vortex::arrow::ArrowSessionExt;
+
+        let ctx = TestSessionContext::default();
+        let session = VortexSession::default();
+
+        // 1999-12-31, 2024-01-15, NULL, 2024-03-01 as milliseconds since the epoch.
+        let dates: ArrayRef = Arc::new(Date64Array::from(vec![
+            Some(946_598_400_000i64),
+            Some(1_705_276_800_000),
+            None,
+            Some(1_709_251_200_000),
+        ]));
+        let events = StructArray::try_new(
+            ["event_date"].into(),
+            vec![session.arrow().from_arrow_array(dates, true)?],
+            4,
+            Validity::NonNullable,
+        )?;
+
+        let mut writer = ObjectStoreWrite::new(ctx.store.clone(), &"date64.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut writer, events.into_array().to_array_stream())
+            .await?;
+        writer.shutdown().await?;
+
+        let sql = "SELECT count(*) FROM '/date64.vortex' \
+                   WHERE CAST(event_date AS TIMESTAMP) > TIMESTAMP '2024-01-15 12:00:00'";
+
+        assert_cast_pushes_into_the_scan(&ctx, sql).await?;
+        assert_eq!(
+            scalar_count(&ctx, sql).await?,
+            1,
+            "2024-03-01 matches, so the file cannot be pruned"
+        );
+
+        Ok(())
+    }
+
+    /// Every `i64` is a nanosecond instant a timestamp scalar can carry, its floor included.
+    ///
+    /// The two guards above cover the fork's date-to-timestamp conversion; this one covers the
+    /// range the converted value has to land inside. The fork validates a timestamp scalar
+    /// against the timestamp's own range. Validating it by building a Jiff span instead — the
+    /// span's nanosecond floor is one above `i64::MIN` — refuses 1677-09-21, an instant a
+    /// `timestamp[ns]` column holds, so a file whose `min` statistic is that value fails to
+    /// bind and the scan errors on data it can read. Losing only that half of the fork patch
+    /// would leave both guards above passing.
+    #[test]
+    fn a_nanosecond_timestamp_scalar_spans_the_whole_i64_range() {
+        use vortex::dtype::{DType, Nullability};
+        use vortex::extension::datetime::{TimeUnit, Timestamp};
+        use vortex::scalar::Scalar;
+
+        let dtype =
+            DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, Nullability::Nullable).erased());
+
+        for value in [i64::MIN, i64::MIN + 1, 0, i64::MAX] {
+            let scalar = Scalar::try_new(dtype.clone(), Some(value.into())).unwrap_or_else(|err| {
+                panic!("{value} nanoseconds is an instant a timestamp can represent: {err}")
+            });
+            // Rendering reaches the same value through a second path, which the fork also
+            // keeps off Jiff spans. A `Display` impl cannot report a failure, so building one
+            // on them turns this value into an abort rather than an error.
+            assert!(
+                !scalar.to_string().is_empty(),
+                "{value} nanoseconds has to render"
+            );
+        }
+    }
+
+    /// A timestamp count that denotes no instant renders instead of taking the process down.
+    ///
+    /// The guard above covers nanoseconds, where the fix is that the whole `i64` is admitted.
+    /// The other three units keep a Jiff span, so what the fork patch changes for them is that
+    /// the span is built with the *checked* constructors and added with `checked_add`. Both of
+    /// the unchecked forms abort, and a `Display` impl has no way to report a failure, so a
+    /// re-cut that restored either one would panic on these — while the nanosecond guard above
+    /// stayed green. `TimestampValue` is public, so these are reachable without a scalar.
+    #[test]
+    fn a_timestamp_count_that_is_not_an_instant_renders_instead_of_aborting() {
+        use vortex::extension::datetime::TimestampValue;
+
+        // Past the span range: the unchecked `Span` constructors abort here.
+        assert_eq!(
+            TimestampValue::Seconds(i64::MAX, None).to_string(),
+            "9223372036854775807s"
+        );
+        assert_eq!(
+            TimestampValue::Seconds(i64::MIN, None).to_string(),
+            "-9223372036854775808s"
+        );
+        assert_eq!(
+            TimestampValue::Milliseconds(i64::MAX, None).to_string(),
+            "9223372036854775807ms"
+        );
+        assert_eq!(
+            TimestampValue::Microseconds(i64::MAX, None).to_string(),
+            "9223372036854775807\u{b5}s"
+        );
+        // Inside the span range but past the last instant: `Timestamp + Span` aborts here, so
+        // this pins the second of the two abort paths.
+        assert_eq!(
+            TimestampValue::Seconds(253_402_300_800, None).to_string(),
+            "253402300800s"
+        );
+        // An instant still renders as one rather than falling back.
+        assert_eq!(
+            TimestampValue::Seconds(1_709_251_200, None).to_string(),
+            "2024-03-01T00:00:00Z"
+        );
     }
 
     /// A large `IN` list has to stay evaluable.
@@ -715,6 +1067,230 @@ mod tests {
             matched,
             i64::from(ROWS / 2),
             "the IN list covers the upper half of the rows and nothing else"
+        );
+
+        // The same depth against a DECIMAL column, which is what still reaches
+        // the OR tree this test exists for. A primitive list this long is
+        // answered by a set probe, and the probe does not cover decimals, so the
+        // whole list goes back to OR-ing one equality per element — the form
+        // whose right-leaning shape blew the stack. Without this arm the
+        // assertion above passes on a build that never constructs the tree.
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE amounts \
+                    (amount DECIMAL(12, 2) NOT NULL) \
+                STORED AS vortex \
+                LOCATION '/large_in_list_decimal/'",
+            )
+            .await?;
+
+        let decimal_values = (0..ROWS)
+            .map(|id| format!("({id}.00)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ctx.session
+            .sql(&format!("INSERT INTO amounts VALUES {decimal_values}"))
+            .await?
+            .collect()
+            .await?;
+
+        let decimal_in_list = (0..IN_LIST_LEN)
+            .map(|offset| format!("{}.00", ROWS / 2 + offset))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let matched_decimal = scalar_count(
+            &ctx,
+            &format!("SELECT count(*) FROM amounts WHERE amount IN ({decimal_in_list})"),
+        )
+        .await?;
+
+        assert_eq!(
+            matched_decimal,
+            i64::from(ROWS / 2),
+            "the decimal IN list covers the upper half of the rows and nothing else"
+        );
+
+        Ok(())
+    }
+
+    /// Create a one-column Vortex table at its own location and fill it, one row
+    /// per value, in the order given.
+    async fn one_column_table(
+        ctx: &TestSessionContext,
+        table: &str,
+        sql_type: &str,
+        rows: &[&str],
+    ) -> anyhow::Result<()> {
+        ctx.session
+            .sql(&format!(
+                "CREATE EXTERNAL TABLE {table} (v {sql_type} NOT NULL) \
+                 STORED AS vortex \
+                 LOCATION '/{table}/'"
+            ))
+            .await?;
+        insert_rows(ctx, table, rows).await
+    }
+
+    /// Append `rows` to `table` in one statement, which the sink writes as one file.
+    async fn insert_rows(
+        ctx: &TestSessionContext,
+        table: &str,
+        rows: &[&str],
+    ) -> anyhow::Result<()> {
+        let values = rows
+            .iter()
+            .map(|value| format!("({value})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ctx.session
+            .sql(&format!("INSERT INTO {table} VALUES {values}"))
+            .await?
+            .collect()
+            .await?;
+        Ok(())
+    }
+
+    /// Count the rows of `table` whose only column is in `elements`, and assert on
+    /// the way that the filter reached the Vortex scan rather than a `FilterExec`
+    /// above it.
+    ///
+    /// The assertion is what keeps the guards below honest: an `IN` list DataFusion
+    /// answers for itself exercises none of the fork's code, and would leave them
+    /// passing on a pin that had lost the patch entirely.
+    async fn pushed_down_in_list_count(
+        ctx: &TestSessionContext,
+        table: &str,
+        elements: &[&str],
+    ) -> anyhow::Result<i64> {
+        let sql = format!(
+            "SELECT count(*) FROM {table} WHERE v IN ({})",
+            elements.join(", ")
+        );
+        let plan = physical_plan_display(&ctx.session, &sql).await?;
+        assert!(
+            plan.contains("predicate:"),
+            "the IN list has to be pushed into the Vortex scan for this to guard \
+             anything, but the plan left it above the scan:\n{plan}"
+        );
+        scalar_count(ctx, &sql).await
+    }
+
+    /// A null in an `IN` list must not cost the list its other elements.
+    ///
+    /// This is a regression test first and a fork guard second, because writing the
+    /// fork guard is what found the regression. `WHERE v IN (NULL, 10, 30, 50)`
+    /// against a Vortex-backed column panicked the scan on the pin this was written
+    /// against:
+    ///
+    /// ```text
+    /// vortex-array/src/scalar/constructor.rs:151:
+    ///   Other error: tried to create list of i64? with values of type i64
+    /// ```
+    ///
+    /// `Scalar::list` compares each element's dtype against the list's element
+    /// dtype including nullability and panics on a mismatch, and the converter
+    /// declared that dtype from the *first* element. DataFusion types a NULL in an
+    /// `IN` list as a nullable value of the list's type and the elements that carry
+    /// a value as non-nullable, so any list holding both disagreed with its own
+    /// declared type — whichever came first — and the panic surfaced as a panicked
+    /// task, not an error the query could report. Each placement below is its own
+    /// case for that reason.
+    ///
+    /// The fork's half is what the list falls back to once it is built. A null is
+    /// not a key on any probe path, so fork PR #95 sends a list holding one back to
+    /// the OR-of-equalities form before anything is decoded or keyed; a probe that
+    /// keyed such a list anyway would be a key short and would answer `false` for
+    /// rows matching a later element, which is rows silently dropped.
+    ///
+    /// SQL's own answer is the assertion: a null element makes a non-match UNKNOWN
+    /// rather than false, which `WHERE` discards either way, so the count is of the
+    /// rows matching the list's other elements — the same count the list gives
+    /// without the null at all, which is the comparison each case makes.
+    #[tokio::test]
+    async fn an_in_list_holding_a_null_still_answers_its_other_elements() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+
+        one_column_table(
+            &ctx,
+            "null_element_i64",
+            "BIGINT",
+            &["10", "20", "30", "40", "50"],
+        )
+        .await?;
+        one_column_table(
+            &ctx,
+            "null_element_timestamp",
+            "TIMESTAMP",
+            &[
+                "TIMESTAMP '2024-01-01 00:00:00'",
+                "TIMESTAMP '2024-01-02 00:00:00'",
+                "TIMESTAMP '2024-01-03 00:00:00'",
+                "TIMESTAMP '2024-01-04 00:00:00'",
+                "TIMESTAMP '2024-01-05 00:00:00'",
+            ],
+        )
+        .await?;
+
+        let without_null =
+            pushed_down_in_list_count(&ctx, "null_element_i64", &["10", "30", "50"]).await?;
+        assert_eq!(
+            without_null, 3,
+            "the list selects the first, third and fifth row"
+        );
+
+        // Where the null sits decides which element disagrees with the dtype the
+        // list is built with, so each placement is its own case. Four elements
+        // once the null is counted, which also puts the list past the probe's
+        // threshold and so exercises the null fallback rather than missing it.
+        for elements in [
+            ["NULL", "10", "30", "50"],
+            ["10", "NULL", "30", "50"],
+            ["10", "30", "50", "NULL"],
+        ] {
+            let with_null = pushed_down_in_list_count(&ctx, "null_element_i64", &elements).await?;
+            assert_eq!(
+                with_null, without_null,
+                "a null element selects no row of its own and takes none away, \
+                 wherever it sits in the list: {elements:?}"
+            );
+        }
+
+        // A `TIMESTAMP` column is the `vortex.timestamp` extension type, whose
+        // elements are unwrapped to their storage values before the list is keyed,
+        // so it reaches the null through one more layer than the arms above.
+        let timestamps_with_null = pushed_down_in_list_count(
+            &ctx,
+            "null_element_timestamp",
+            &[
+                "NULL",
+                "TIMESTAMP '2024-01-01 00:00:00'",
+                "TIMESTAMP '2024-01-03 00:00:00'",
+                "TIMESTAMP '2024-01-05 00:00:00'",
+            ],
+        )
+        .await?;
+        assert_eq!(
+            timestamps_with_null, 3,
+            "a null element leaves a timestamp list selecting its other three"
+        );
+
+        // And a `Utf8` column, which is keyed as bytes rather than as a primitive.
+        one_column_table(
+            &ctx,
+            "null_element_utf8",
+            "VARCHAR",
+            &["'alpha'", "'bravo'", "'charlie'", "'delta'", "'echo'"],
+        )
+        .await?;
+        let text_with_null = pushed_down_in_list_count(
+            &ctx,
+            "null_element_utf8",
+            &["'alpha'", "'charlie'", "NULL", "'echo'"],
+        )
+        .await?;
+        assert_eq!(
+            text_with_null, 3,
+            "a null element leaves a text list selecting its other three"
         );
 
         Ok(())

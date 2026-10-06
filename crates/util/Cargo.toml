@@ -10,8 +10,9 @@ version.workspace = true
 
 [dependencies]
 ansi_colors = { path = "../ansi_colors" }
-backoff = { version = "0.4.0", features = ["futures", "tokio"] }
+backoff.workspace = true
 chrono.workspace = true
+cpu-budget = { path = "../cpu-budget", optional = true }
 ctrlc = "3.5"
 futures.workspace = true
 http-body = { version = "1.0.1", optional = true }
@@ -19,6 +20,7 @@ humantime.workspace = true
 pin-project = { workspace = true, optional = true }
 rand.workspace = true
 serde_json.workspace = true
+snafu.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true }
@@ -26,11 +28,14 @@ tracing-subscriber.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 datafusion = { workspace = true, optional = true }
+# `ExecutionPlan::try_to_proto` exists only with datafusion-physical-plan's `proto`
+# feature, which datafusion-proto enables.
+datafusion-proto = { workspace = true, optional = true }
 parking_lot.workspace = true
 
 [features]
 default = ["datafusion"]
-datafusion = ["dep:datafusion"]
+datafusion = ["dep:cpu-budget", "dep:datafusion", "dep:datafusion-proto"]
 http = ["dep:http-body", "dep:pin-project", "dep:tokio-util"]
 
 [lints]

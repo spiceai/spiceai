@@ -366,6 +366,42 @@ async fn create_table(
     Ok(())
 }
 
+/// Drives one non-blocking poll past the bootstrap boundary, so the
+/// `bootstrap_finished` link runs.
+///
+/// The stream a member yields is `snapshot.chain(boundary).chain(bootstrap_finished)`
+/// chained onto the live receiver. `bootstrap_finished` is the link that calls
+/// `snapshot_finished` and marks the member live, and it is only reached on the
+/// poll *after* the boundary: committing the boundary envelope does not reach it,
+/// because that poll returned as soon as `boundary` yielded. A caller that drops
+/// the stream there leaves the member `SNAPSHOTTING`, so its detach tears the
+/// table back out of the publication and the next start re-snapshots instead of
+/// resuming on the position it recorded. For a case whose whole subject is what
+/// the *rejoin* decides, that silently substitutes a different fixture.
+///
+/// One poll is enough and one poll is all this does. `Chain` consumes
+/// `boundary`'s `None` and polls `bootstrap_finished` within the same call, so
+/// the hook has fired by the time this returns. It must not `await` the stream's
+/// next item: past the hook the chain continues into the live receiver, which
+/// stays open and yields `Pending` until WAL traffic or a keepalive arrives.
+/// Anything the receiver could produce — `Pending`, a heartbeat, an envelope —
+/// happens strictly after the hook, so all of them mean "the hook ran". Only a
+/// stream error is worth failing on, since it says the member did not survive its
+/// own bootstrap.
+async fn finish_bootstrap(stream: &mut ChangesStream, what: &str) -> Result<(), anyhow::Error> {
+    let polled =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(stream.poll_next_unpin(cx))).await;
+
+    if let std::task::Poll::Ready(Some(Err(e))) = polled {
+        anyhow::bail!(
+            "the bootstrap stream for {what} errored on the poll that runs its \
+             snapshot-finished hook: {e}"
+        );
+    }
+
+    Ok(())
+}
+
 async fn next_envelope(
     stream: &mut ChangesStream,
     what: &str,
@@ -521,6 +557,28 @@ async fn wait_for_walsender_count(
     ))
 }
 
+/// Poll until the store holds a recorded position.
+///
+/// The watermark is published by the snapshot-boundary envelope's committer
+/// (`SnapshotWatermarkCommitter`), which hands it to the store to write rather
+/// than writing it inline — so the position lands shortly after that commit
+/// returns, not within it. Reading once races that write.
+async fn wait_for_recorded_position(
+    store: &Arc<InMemoryAppliedLsnStore>,
+    what: &str,
+) -> Result<(), anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if matches!(store.load().await, Ok(RecordedPosition::At(_))) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(anyhow::anyhow!(
+        "{what} recorded no position, so this case would not exercise a surviving one"
+    ))
+}
+
 async fn drop_replication_slot_when_inactive(
     source: &tokio_postgres::Client,
     slot: &str,
@@ -552,8 +610,8 @@ async fn drop_replication_slot_when_inactive(
 async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -972,8 +1030,8 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
 async fn shared_slot_partitioned_source_table_streams_changes() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1067,8 +1125,8 @@ async fn shared_slot_partitioned_source_table_streams_changes() -> Result<(), an
 async fn shared_and_independent_slots_coexist() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1186,6 +1244,56 @@ async fn slot_acked_past(
     Ok((row.get(0), row.get(1)))
 }
 
+/// Write to `mate_table` and commit `mate`'s envelopes (idle heartbeats included,
+/// which is what carries the slot's acknowledgement forward) until the slot is
+/// acknowledged past `lsn`, for up to a minute. Returns whether it got there and
+/// the last `confirmed_flush_lsn` seen.
+async fn churn_until_acked_past(
+    source: &tokio_postgres::Client,
+    mate: &mut ChangesStream,
+    mate_table: &str,
+    lsn: &str,
+) -> Result<(bool, String), anyhow::Error> {
+    let insert = format!("INSERT INTO public.{mate_table} (id, name) VALUES ($1, 'mate-churn')");
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let mut confirmed = String::new();
+    let mut churn_id = 100;
+    while std::time::Instant::now() < deadline {
+        churn_id += 1;
+        source.execute(&insert, &[&churn_id]).await?;
+        if let Ok(envelope) = next_envelope(mate, "mate churn").await {
+            envelope.commit().await?;
+        }
+        let (past, at) = slot_acked_past(source, lsn).await?;
+        confirmed = at;
+        if past {
+            return Ok((true, confirmed));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Ok((false, confirmed))
+}
+
+/// Commit `stream`'s envelopes for up to 45s until one either carries row
+/// `missed_id` or reports that the history needed to replay it is gone — the two
+/// correct outcomes for a dataset rejoining over a gap. Idle heartbeats carry no
+/// rows and are not an answer either way.
+async fn replays_or_rebuilds(
+    stream: &mut ChangesStream,
+    missed_id: i32,
+) -> Result<bool, anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    while std::time::Instant::now() < deadline {
+        let envelope = next_envelope(stream, "re-added dataset envelope").await?;
+        let recovered = envelope.history_unavailable() || ids_of(&envelope).contains(&missed_id);
+        envelope.commit().await?;
+        if recovered {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Regression for #11896: a durable acceleration whose CDC bootstrap was lost to
 /// a crash before it became durable must be re-loaded, not resumed over.
 ///
@@ -1207,8 +1315,8 @@ async fn a_bootstrap_lost_before_it_was_durable_is_reloaded_not_resumed()
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1324,8 +1432,8 @@ async fn drop_slot_underneath_a_running_stream(
 async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1471,8 +1579,8 @@ async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<()
 async fn an_empty_acceleration_bootstraps_rather_than_rebuilding() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1542,8 +1650,8 @@ async fn an_empty_acceleration_is_still_loaded_when_no_snapshot_runs() -> Result
 {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1602,6 +1710,200 @@ async fn an_empty_acceleration_is_still_loaded_when_no_snapshot_runs() -> Result
     Ok(())
 }
 
+/// An acceleration that comes back **empty while its recorded position survived**
+/// must be loaded, not resumed — the shape a `mode: file_update` recreate leaves
+/// behind (#13546).
+///
+/// The recreate drops the accelerated table because the source schema changed
+/// incompatibly, while the watermark sidecar lives in the same accelerator and is
+/// not dropped with it. So the next start finds no rows and a position the slot
+/// can still stream from, and every arm of the resume decision is individually
+/// satisfied: the slot is valid, retention is intact, the position is this
+/// source's. Resuming on it succeeds and the rows committed before that position
+/// are never loaded by anything.
+///
+/// Distinct from [`an_empty_acceleration_is_still_loaded_when_no_snapshot_runs`],
+/// which reaches the same "must be loaded" conclusion from a *missing* record. Here
+/// the record is present and usable, which is the reason a resume looks safe.
+///
+/// The two rows written before the first start are what the assertion is about:
+/// they precede the recorded position, so no reachable WAL carries them and only a
+/// rebuild or a snapshot can put them back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "recreated", &[(1, "alice"), (2, "bob")]).await?;
+
+    // First start: creates the slot and publication, and commits so a real
+    // position is recorded in the store.
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut first = start_replication_stream(input_with_contents(
+        port,
+        "recreated",
+        &store,
+        AccelerationContents::Empty,
+    ));
+    next_envelope(&mut first, "first-start bootstrap")
+        .await?
+        .commit()
+        .await?;
+    // The bootstrap stream is `snapshot.chain(boundary).chain(bootstrap_finished)`,
+    // and it is the zero-row boundary — not the data envelope above — whose
+    // committer publishes the watermark. Both rows fit one batch, so without
+    // polling this second envelope the stream is dropped before any position is
+    // recorded.
+    next_envelope(&mut first, "first-start snapshot boundary")
+        .await?
+        .commit()
+        .await?;
+    // And one poll further, so the member is left live rather than snapshotting —
+    // see `finish_bootstrap`. Without it the rejoin below re-snapshots and never
+    // reaches the arm this case is about.
+    finish_bootstrap(&mut first, "the first start").await?;
+    drop(first);
+    wait_for_walsender_count(&source, 0).await?;
+
+    // The recorded position is the whole point of this case: without it the
+    // rejoin below is the already-covered missing-record case.
+    wait_for_recorded_position(&store, "the first start").await?;
+
+    // Rejoin on the SAME store — the position survived — while the acceleration
+    // is observed empty, which is what the recreate left behind.
+    let input = input_with_contents(port, "recreated", &store, AccelerationContents::Empty);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut rejoined = start_replication_stream(input);
+
+    let envelope = next_envelope(&mut rejoined, "first envelope after the recreate").await?;
+    let loaded = envelope.history_unavailable() || metrics.bootstrap_rows_total() > 0;
+    anyhow::ensure!(
+        loaded,
+        "an emptied acceleration resumed from the position it recorded before it was emptied, so \
+         every row committed below that position is missing from it for good. A recorded position \
+         means those changes will never be resent — it does not mean the rows are here"
+    );
+    // Being loaded does not say *this* arm decided it. Every other rebuild cause
+    // loads too, so a fixture that drifted into an `acknowledged_past` or
+    // `retention_lost` shape — the slot advancing or trimming under the pause
+    // above — would keep this case green with the arm it exists for removed.
+    // `RebuildCause::label` is documented as the stable identifier, so pinning it
+    // here is not a wording dependency.
+    let cause = metrics.rebuild_cause();
+    anyhow::ensure!(
+        cause == Some("empty_with_usable_position"),
+        "the emptied acceleration was loaded, but not by the arm this case covers: the rebuild \
+         cause was {cause:?}, and only \"empty_with_usable_position\" is the recreate shape — \
+         another cause means the fixture stopped reaching the decision under test"
+    );
+    envelope.commit().await?;
+
+    drop(rejoined);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// The same surviving position as
+/// [`an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed`], but
+/// reached with the acceleration's contents **unproven** rather than observed
+/// empty — the shape a failed probe leaves behind.
+///
+/// `probe_acceleration_contents` never fails the start: a scan it cannot run
+/// returns [`AccelerationContents::Unknown`]. That is not evidence the table
+/// holds rows, so it cannot license the resume — if the probe failed on a table a
+/// recreate had just emptied, resuming on the surviving position would leave every
+/// row below it missing exactly as it would in the case above, and the probe
+/// failure would be the only trace.
+///
+/// Covering it end-to-end is what stops the unsafe mapping from coming back
+/// silently. The decision is a `match` on all three states, so restoring
+/// `Unknown => resume` is a visible edit — and this case proves the live attach
+/// path honours `Unknown` across a real slot, publication and rejoin, which no
+/// unit test on the decision function alone can show.
+///
+/// It does *not* cover the seam above it. The contents are handed to
+/// `ReplicationStreamInput` directly, so nothing here exercises
+/// `datafusion::handle_schema_difference` calling `probe_acceleration_contents`
+/// and forwarding that answer into the connector; a regression in the forwarding
+/// would leave this case green. Tracked in #13752.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unprovable_acceleration_with_a_surviving_position_is_loaded_not_resumed()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "unprobed", &[(1, "alice"), (2, "bob")]).await?;
+
+    // First start: records a real position, exactly as the empty-contents case
+    // does — the two differ only in what the rejoin below knows about the table.
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut first = start_replication_stream(input_with_contents(
+        port,
+        "unprobed",
+        &store,
+        AccelerationContents::Empty,
+    ));
+    next_envelope(&mut first, "first-start bootstrap")
+        .await?
+        .commit()
+        .await?;
+    next_envelope(&mut first, "first-start snapshot boundary")
+        .await?
+        .commit()
+        .await?;
+    finish_bootstrap(&mut first, "the first start").await?;
+    drop(first);
+    wait_for_walsender_count(&source, 0).await?;
+
+    wait_for_recorded_position(&store, "the first start").await?;
+
+    // Rejoin on the SAME store with the probe's failure answer.
+    let input = input_with_contents(port, "unprobed", &store, AccelerationContents::Unknown);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut rejoined = start_replication_stream(input);
+
+    let envelope = next_envelope(&mut rejoined, "first envelope after the failed probe").await?;
+    let loaded = envelope.history_unavailable() || metrics.bootstrap_rows_total() > 0;
+    anyhow::ensure!(
+        loaded,
+        "an acceleration whose contents could not be read resumed from a position recorded before \
+         it may have been emptied. An unanswered probe is not proof the rows are still here, and \
+         the changes below that position will never be resent"
+    );
+    // Pinned to its own cause, not merely to "some rebuild happened": reporting
+    // this as `empty_with_usable_position` would attribute the rebuild to an
+    // observation nobody made and hide the probe failure worth investigating.
+    let cause = metrics.rebuild_cause();
+    anyhow::ensure!(
+        cause == Some("unproven_contents_with_usable_position"),
+        "the unreadable acceleration was loaded, but not by the arm this case covers: the rebuild \
+         cause was {cause:?}. Only \"unproven_contents_with_usable_position\" says the probe \
+         failed — \"empty_with_usable_position\" would claim the table was seen to be empty"
+    );
+    envelope.commit().await?;
+
+    drop(rejoined);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
 /// The other side of [`an_empty_acceleration_bootstraps_rather_than_rebuilding`]:
 /// an acceleration that holds rows it cannot place must still be rebuilt.
 ///
@@ -1618,8 +1920,8 @@ async fn an_empty_acceleration_is_still_loaded_when_no_snapshot_runs() -> Result
 async fn an_unplaceable_acceleration_still_rebuilds() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1723,8 +2025,8 @@ async fn a_slow_position_store_does_not_slow_the_commit_path() -> Result<(), any
 
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1798,8 +2100,8 @@ async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -1905,7 +2207,19 @@ async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
          every idle member of every shared slot"
     );
 
-    let mut restarted = start_replication_stream(input_with_watermark(port, "quiet", &store));
+    // The first load left rows in the acceleration. Production probes before
+    // rebuild_cause (`probe_acceleration_contents` in datafusion) and would
+    // pass NonEmpty here. The default Unknown is "probe failed, or nobody
+    // asked" — feeding it on a path that never probed is not a failed probe,
+    // and would fire UnprovenContentsWithUsablePosition on every quiet restart.
+    // The dedicated Unknown case is
+    // `an_unprovable_acceleration_with_a_surviving_position_is_loaded_not_resumed`.
+    let mut restarted = start_replication_stream(input_with_contents(
+        port,
+        "quiet",
+        &store,
+        AccelerationContents::NonEmpty,
+    ));
     let envelope = next_envelope(&mut restarted, "first envelope after the restart").await?;
     anyhow::ensure!(
         !envelope.history_unavailable(),
@@ -1950,8 +2264,8 @@ async fn a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -2017,27 +2331,8 @@ async fn a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_
     // Committing the mate's envelopes — including its idle heartbeats — is what
     // carries the slot's acknowledgement forward; the reservation for the absent
     // table has to lapse first, which is why the grace is shortened above.
-    let deadline = std::time::Instant::now() + Duration::from_mins(1);
-    let mut acked_past = false;
-    let mut churn_id = 100;
-    while std::time::Instant::now() < deadline {
-        churn_id += 1;
-        source
-            .execute(
-                "INSERT INTO public.lapsed_mate (id, name) VALUES ($1, 'mate-churn')",
-                &[&churn_id],
-            )
-            .await?;
-        if let Ok(envelope) = next_envelope(&mut mate, "mate churn").await {
-            envelope.commit().await?;
-        }
-        let (past, _) = slot_acked_past(&source, &missed_lsn).await?;
-        if past {
-            acked_past = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let (acked_past, _) =
+        churn_until_acked_past(&source, &mut mate, "lapsed_mate", &missed_lsn).await?;
     anyhow::ensure!(
         acked_past,
         "the test could not reach the state it exists to cover: the slot never acknowledged past \
@@ -2068,21 +2363,139 @@ async fn a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_
     // Idle heartbeats carry no rows and are not an answer either way, so commit
     // past them and wait for one of the two acceptable outcomes: the missed change
     // replayed, or a report that the history needed to replay it is gone.
-    let deadline = std::time::Instant::now() + Duration::from_secs(45);
-    let mut recovered = false;
-    while std::time::Instant::now() < deadline {
-        let envelope = next_envelope(&mut re_added, "re-added dataset envelope").await?;
-        recovered = envelope.history_unavailable() || ids_of(&envelope).contains(&2);
-        envelope.commit().await?;
-        if recovered {
-            break;
-        }
-    }
+    let recovered = replays_or_rebuilds(&mut re_added, 2).await?;
     anyhow::ensure!(
         recovered,
         "a dataset re-added after its reservation lapsed neither received the change committed \
          while it was gone (id=2) nor asked to be rebuilt — it resumed as if nothing were missing \
          (#11289)"
+    );
+
+    drop(mate);
+    drop(re_added);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// Regression for #13032: on a shared slot whose publication is `FOR ALL TABLES`,
+/// a published table no dataset subscribes to must not pin the slot's
+/// acknowledgement forever.
+///
+/// On a resuming slot the first member to attach holds the floor for every
+/// published table with no member, and a hold nothing claims within the grace is
+/// retired by dropping its table from the publication. A `FOR ALL TABLES`
+/// publication refuses that drop, so the hold used to be re-armed on every sweep
+/// and `confirmed_flush_lsn` never moved past the resume point while WAL grew.
+///
+/// The hold is now released with the table still published, so this also checks
+/// the other half: the dataset coming back for that table, carrying the position
+/// it recorded before it left, is either replayed the change it missed or told to
+/// rebuild — never resumed as if nothing were missing. The setup mirrors
+/// `a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_changes`,
+/// minus its re-add step: nothing can take the table out of this publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unclaimed_table_in_a_for_all_tables_publication_does_not_pin_the_slot()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "all_tables_mate", &[(1, "mate1")]).await?;
+    create_table(&source, "all_tables_absent", &[(1, "absent1")]).await?;
+    source
+        .simple_query(&format!("CREATE PUBLICATION {PUBLICATION} FOR ALL TABLES"))
+        .await?;
+
+    let brief_grace = Duration::from_secs(2);
+    let short_grace = |mut input: ReplicationStreamInput| {
+        input.params.unclaimed_reservation_grace = brief_grace;
+        input
+    };
+
+    // --- 1. Both tables join and record positions on the slot. ---
+    let absent_store = InMemoryAppliedLsnStore::shared();
+    let mut mate = start_replication_stream(short_grace(input_for(port, "all_tables_mate")));
+    next_envelope(&mut mate, "bootstrap mate")
+        .await?
+        .commit()
+        .await?;
+    let mut absent = start_replication_stream(short_grace(input_with_watermark(
+        port,
+        "all_tables_absent",
+        &absent_store,
+    )));
+    next_envelope(&mut absent, "bootstrap absent")
+        .await?
+        .commit()
+        .await?;
+    wait_for_ready(&mut absent, "absent readiness")
+        .await?
+        .commit()
+        .await?;
+    let recorded = absent_store
+        .recorded_lsn()
+        .ok_or_else(|| anyhow::anyhow!("the member must record a position while attached"))?;
+
+    // --- 2. A restart: the source and its held floors are discarded; the slot
+    // and the publication persist. ---
+    drop(mate);
+    drop(absent);
+    wait_for_walsender_count(&source, 0).await?;
+    assert_eq!(slot_count(&source).await?, 1, "the slot must persist");
+
+    // --- 3. The unsubscribed table changes while nothing consumes it. ---
+    source
+        .simple_query("INSERT INTO public.all_tables_absent VALUES (2, 'missed-while-removed')")
+        .await?;
+    let missed_lsn: String = source
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await?
+        .get(0);
+
+    // --- 4. Only the surviving dataset comes back. Once the hold for the other
+    // table lapses, the survivor's own traffic must carry the acknowledgement
+    // past that table's change. ---
+    let mut mate = start_replication_stream(short_grace(input_for(port, "all_tables_mate")));
+    let (acked_past, confirmed) =
+        churn_until_acked_past(&source, &mut mate, "all_tables_mate", &missed_lsn).await?;
+    anyhow::ensure!(
+        acked_past,
+        "the slot's confirmed_flush_lsn stayed at {confirmed}, below {missed_lsn}, for a minute of \
+         acknowledged traffic: a table the FOR ALL TABLES publication cannot drop is pinning WAL \
+         retention for the whole slot (#13032)"
+    );
+    let publishes_all_tables: bool = source
+        .query_one(
+            "SELECT puballtables FROM pg_publication WHERE pubname = $1",
+            &[&PUBLICATION],
+        )
+        .await?
+        .get(0);
+    anyhow::ensure!(
+        publishes_all_tables,
+        "releasing the hold must leave the user's FOR ALL TABLES publication as it was"
+    );
+
+    // --- 5. The dataset is re-added with the position it recorded. The table was
+    // never unpublished, so `table_added` is false and recovery must come from
+    // that position: replay the missed change, or report the history gone. ---
+    let mut re_added = start_replication_stream(short_grace(input_with_watermark(
+        port,
+        "all_tables_absent",
+        &InMemoryAppliedLsnStore::seeded(recorded),
+    )));
+    let recovered = replays_or_rebuilds(&mut re_added, 2).await?;
+    anyhow::ensure!(
+        recovered,
+        "a dataset re-added after its FOR ALL TABLES hold was released neither received the \
+         change committed while it was gone (id=2) nor asked to be rebuilt"
     );
 
     drop(mate);
@@ -2121,8 +2534,8 @@ async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner() -> Resul
 {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
@@ -2248,8 +2661,8 @@ async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner() -> Resul
 async fn drop_slot_after_shutdown_releases_an_inactive_slot() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 

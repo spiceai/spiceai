@@ -175,20 +175,47 @@ impl DataSink for CayenneDataSink {
         // interleaves with a concurrent append.
         if self.table.is_memory_resident_mode() {
             let overwrite = self.overwrite == InsertOp::Overwrite;
-            let mut data = normalized;
             let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
-            let mut incoming_bytes: u64 = 0;
+            let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
             // Acquire the write lock BEFORE draining so memory-mode writes are
             // serialized during buffering: two concurrent writes must not each buffer
             // a large payload while both pass `enforce_memory_limit` against the same
             // resident bytes, letting their combined footprint blow the RAM bound (and
             // OOM) before either appends. Reads use `ArcSwap` (lock-free), so this only
             // serializes writers.
-            let _write_guard = self.table.write_lock().lock().await;
+            //
+            // Taken before the stream is prepared, too: preparation snapshots the
+            // primary-key index the validation below decides conflicts against, and
+            // memory-mode writers are serialized on exactly this lock, so taking it
+            // first is what makes that snapshot current rather than one write stale.
+            // Nothing under `prepare_stream_for_insert` takes `write_lock`.
+            let write_guard = self.table.write_lock().lock().await;
+
+            // An APPEND must run primary-key conflict detection, so `on_conflict`
+            // is honoured: the validation records which resident rows the incoming
+            // batch supersedes, and those become the appended segment's own
+            // tombstones — one pass over the data, superseding as it appends,
+            // rather than a separate delete. Without it a re-INSERT of an existing
+            // key left BOTH versions live under a declared primary key.
+            //
+            // An OVERWRITE (full refresh) replaces the tier wholesale, so there is
+            // nothing to supersede and no index to consult.
+            let (mut data, post_validation) = if overwrite {
+                (normalized as SendableRecordBatchStream, None)
+            } else {
+                let prepared = self
+                    .table
+                    .prepare_stream_for_insert(normalized)
+                    .await
+                    .map_err(datafusion_common::DataFusionError::from)?;
+                let post_validation = prepared.post_validation();
+                (prepared.stream, Some(post_validation))
+            };
+
             while let Some(batch) = data.next().await {
                 let batch = batch?;
-                incoming_bytes =
-                    incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+                incoming.add(&batch);
+                let incoming_bytes = incoming.total();
                 // Enforce the hard RAM bound while buffering so an oversized refresh
                 // fails fast with a structured error instead of OOMing during
                 // collection (memory mode never spills). Always count resident +
@@ -200,11 +227,36 @@ impl DataSink for CayenneDataSink {
                     .map_err(datafusion_common::DataFusionError::from)?;
                 batches.push(batch);
             }
-            return self
+            // Draining the prepared stream is what RAN the validation, so the
+            // conflict state is only complete now.
+            let (deletions, validated_keys) = post_validation
+                .map(|state| {
+                    let super::on_conflict::PostValidationState {
+                        on_conflict_deletions,
+                        validated_keys,
+                    } = super::mutation_writer::take_post_validation(&state);
+                    (on_conflict_deletions, Some(validated_keys))
+                })
+                .unwrap_or_default();
+
+            let rows = self
                 .table
-                .write_batches_memory_mode(batches, incoming_bytes, overwrite)
+                .write_batches_memory_mode(batches, incoming.total(), overwrite, &deletions)
                 .await
-                .map_err(Into::into);
+                .map_err(datafusion_common::DataFusionError::from)?;
+
+            // Record this write's keys as resident so a LATER write to the same
+            // table sees them as present and supersedes them in turn — the same
+            // bookkeeping the in-memory CDC append does after its append.
+            if let Some(keys) = validated_keys {
+                let record_seq = self.table.sequence_high_water().await;
+                self.table.record_mem_tier_pk_keys(&keys, record_seq);
+            }
+            drop(write_guard);
+            // Memory mode arms retention here — see the method's own doc for why nowhere
+            // else can (#14045).
+            self.table.arm_retention_after_memory_resident_write();
+            return Ok(rows);
         }
 
         if self.overwrite == InsertOp::Overwrite {
@@ -473,11 +525,21 @@ impl CayenneDataSink {
     ) -> super::Result<u64> {
         let target_partitions = context.session_config().target_partitions();
         let prepared = self.table.begin_overwrite(data, target_partitions).await?;
-        prepared
-            .apply_owned_txn()
-            .await
-            .map_err(super::Error::from)?;
-        prepared.finish().await
+        // The durable commit and the publish run on one task that owns the
+        // prepared overwrite. A caller dropped while `COMMIT` is in flight drops
+        // only this handle: the metastore may still commit, and the task still
+        // publishes the snapshot the catalog then points at, instead of leaving the
+        // in-memory state, the in-memory CDC tier included, on the replaced one.
+        let table = self.table.table_name().to_string();
+        tokio::spawn(async move {
+            prepared
+                .apply_owned_txn()
+                .await
+                .map_err(super::Error::from)?;
+            prepared.finish().await
+        })
+        .await
+        .map_err(|source| super::Error::TaskPanicked { table, source })?
     }
 }
 

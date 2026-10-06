@@ -81,6 +81,11 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    // Unlike the other `UnableToConnect*` variants, this is a transient (retriable)
+    // condition: connectors report a source that is down or still starting (the
+    // connection refused or timed out) this way, and the dataset load must keep
+    // retrying until it is reachable rather than failing permanently. See
+    // `is_retriable`.
     #[snafu(display(
         "Cannot connect to the {connector_component} ({dataconnector}) on {host}:{port}. Ensure that the host and port are correctly configured in the spicepod, and that the host is reachable."
     ))]
@@ -278,6 +283,15 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
+        "Failed to initialize the {connector_component} ({dataconnector}). This build of Spice.ai does not include the {dataconnector} data connector. Build Spice.ai OSS with the `{feature}` feature enabled, or use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise"
+    ))]
+    ConnectorNotInBuild {
+        dataconnector: String,
+        feature: String,
+        connector_component: ConnectorComponent,
+    },
+
+    #[snafu(display(
         "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled. Verify if the remote table schema update is expected and rebuild the acceleration if necessary."
     ))]
     SchemaMismatch {
@@ -318,12 +332,12 @@ impl DataConnectorError {
                 | Self::InvalidGlobPattern { .. }
                 | Self::InvalidTableName { .. }
                 | Self::InsufficientPermissions { .. }
-                | Self::UnableToConnectInvalidHostOrPort { .. }
                 | Self::UnableToConnectInvalidUsernameOrPassword { .. }
                 | Self::UnableToConnectTlsError { .. }
                 | Self::UnsupportedTypeAction { .. }
                 | Self::UnsupportedDataType { .. }
                 | Self::OdbcNotInstalled { .. }
+                | Self::ConnectorNotInBuild { .. }
                 | Self::UseOfProtectedKeyword { .. }
         )
     }

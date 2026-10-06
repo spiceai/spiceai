@@ -22,7 +22,7 @@ use std::{
 
 use crate::embeddings::{
     Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
-    candle::util::link_files_into_tmp_dir, encode_embedding,
+    candle::util::link_files_into_tmp_dir_blocking, encode_embedding,
 };
 use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
@@ -41,7 +41,9 @@ use tei_core::{
 };
 use tokenizers::{Tokenizer, TruncationDirection};
 
-use super::util::{download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str};
+use super::util::{
+    LoadedTokenization, download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str,
+};
 
 #[derive(Debug)]
 pub struct TeiEmbed {
@@ -85,7 +87,7 @@ impl TeiEmbed {
         .into_iter()
         .collect();
 
-        let model_root = link_files_into_tmp_dir(files)?;
+        let model_root = link_files_into_tmp_dir_blocking(files).await?;
         tracing::trace!(
             "Embedding model has files linked at location={:?}",
             model_root
@@ -149,7 +151,13 @@ impl TeiEmbed {
         max_seq_length_overwrite: Option<usize>,
         truncation: Option<TruncationDirection>,
     ) -> Result<Self> {
-        let (tokenizer, config, token) = load_tokenization(root, max_seq_length_overwrite)?;
+        // Reads config.json / the sentence-transformers config and parses
+        // tokenizer.json on a blocking thread (see `load_tokenization`).
+        let LoadedTokenization {
+            tokenizer,
+            config,
+            tokenization: token,
+        } = load_tokenization(root, max_seq_length_overwrite).await?;
 
         // Load [`Backend`]
         // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174
@@ -256,7 +264,7 @@ impl Embed for TeiEmbed {
         self.cache_model_id.as_deref()
     }
 
-    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+    async fn embed(&self, input: EmbeddingInput) -> Result<Arc<Vec<Vec<f32>>>> {
         let cache_key = self.embedding_input_cache_key(&input);
 
         let cached_response = if let Some(key) = cache_key {
@@ -265,8 +273,10 @@ impl Embed for TeiEmbed {
             None
         };
 
-        if let Some(CachedEmbeddingResult::Vector(cached)) = cached_response {
-            return Ok(cached);
+        if let Some(cached) = cached_response
+            && let CachedEmbeddingResult::Vector(vectors) = cached.as_ref()
+        {
+            return Ok(std::sync::Arc::clone(vectors));
         }
 
         let inputs = inputs_from_openai(&input);
@@ -279,20 +289,27 @@ impl Embed for TeiEmbed {
 
         let results: Vec<Vec<f32>> = resp.into_iter().map(|r| r.results).collect();
 
+        let results = std::sync::Arc::new(results);
         if let Some(key) = cache_key {
-            self.put_cached_embed(key, CachedEmbeddingResult::Vector(results.clone()))
-                .await;
+            self.put_cached_embed(
+                key,
+                CachedEmbeddingResult::Vector(std::sync::Arc::clone(&results)),
+            )
+            .await;
         }
 
         Ok(results)
     }
 
     #[expect(clippy::cast_possible_truncation)]
-    async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
-        if let Some(CachedEmbeddingResult::Response(cached)) =
-            self.get_cached_embed((&req).into()).await
+    async fn embed_request(
+        &self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<Arc<CreateEmbeddingResponse>> {
+        if let Some(cached) = self.get_cached_embed((&req).into()).await
+            && let CachedEmbeddingResult::Response(response) = cached.as_ref()
         {
-            return Ok(cached);
+            return Ok(std::sync::Arc::clone(response));
         }
 
         let model_name = req.model.clone();
@@ -327,8 +344,12 @@ impl Embed for TeiEmbed {
             },
         };
 
-        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
-            .await;
+        let resp = std::sync::Arc::new(resp);
+        self.put_cached_embed(
+            (&req).into(),
+            CachedEmbeddingResult::Response(std::sync::Arc::clone(&resp)),
+        )
+        .await;
 
         Ok(resp)
     }

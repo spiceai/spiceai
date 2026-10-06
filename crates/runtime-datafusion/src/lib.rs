@@ -22,6 +22,8 @@ pub mod dml_guard;
 pub mod error;
 pub mod execution_plan;
 pub mod extension;
+#[cfg(test)]
+mod fork_backport_guards;
 pub mod function_support;
 pub mod join_accumulator;
 pub mod managed_runtime;
@@ -64,7 +66,7 @@ pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
 /// Whether `dataset` names a table in one of Spice's reserved schemas. A
 /// reference with no catalog is resolved against [`SPICE_DEFAULT_CATALOG`].
 #[must_use]
-pub fn is_spice_internal_dataset(dataset: &datafusion::sql::TableReference) -> bool {
+pub fn is_spice_internal_dataset(dataset: &datafusion::common::TableReference) -> bool {
     match (dataset.catalog(), dataset.schema()) {
         (Some(catalog), Some(schema)) => is_spice_internal_schema(catalog, schema),
         (None, Some(schema)) => is_spice_internal_schema(SPICE_DEFAULT_CATALOG, schema),

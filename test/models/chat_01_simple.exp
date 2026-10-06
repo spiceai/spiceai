@@ -2,8 +2,12 @@
 
 source [file join [file dirname [info script]] repl_helpers.exp]
 
-# Runtime response timeout
-set timeout 30
+# Local Hugging Face / Metal inference can stream well past 30s after the model
+# is already loaded: merge-queue job 103597842965 spent the whole 30s budget on
+# one long Qwen2.5-3B answer and never reached `chat>`. 120s is the default so a
+# slow generation still finishes; override with SPICE_CHAT_EXPECT_TIMEOUT
+# (seconds) for CI or a local run. Search stays on its own 5s timeout.
+set timeout [repl_timeout_seconds 120]
 
 spawn spice chat {*}[repl_endpoint_args]
 
@@ -48,9 +52,9 @@ expect {
     }
 }
 
-chat "What datasets you have access to?"
+chat "Reply in one short sentence: what datasets do you have access to?"
 
-chat "How many issues stored in database?"
+chat "Reply in one short sentence: how many issues are stored in the database?"
 
 # Every verification passed, so the REPL must still be sitting at its prompt.
 repl_assert_running "Checking the chat REPL is still running"

@@ -25,13 +25,14 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::Read;
+use data_components::duckdb::with_utc_session_timezone;
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
     DataConnectorFactory, DataConnectorResult,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
@@ -50,7 +51,7 @@ use std::sync::Arc;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: open. Specify a DuckDB file with the `open` parameter"
+        "Missing required parameter `duckdb_open`. Set it to the DuckDB database file to read, for example `duckdb_open: ./data.duckdb`. For details, visit: https://spiceai.org/docs/components/data-connectors/duckdb"
     ))]
     MissingDuckDBFile,
 }
@@ -97,7 +98,7 @@ impl DuckDB {
     ///
     /// Returns an error if the in-memory `DuckDB` connection cannot be established.
     pub fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
-        let pool = Arc::new(
+        let pool = Arc::new(with_utc_session_timezone(
             DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
@@ -109,7 +110,7 @@ impl DuckDB {
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
                 ),
-        );
+        ));
 
         Ok(Self::with_spice_deny_list(
             DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()),
@@ -122,7 +123,7 @@ impl DuckDB {
     ///
     /// Returns an error if the file-based `DuckDB` connection cannot be established.
     pub fn create_file(path: &str, params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
-        let pool = Arc::new(
+        let pool = Arc::new(with_utc_session_timezone(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
@@ -134,7 +135,7 @@ impl DuckDB {
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
                 ),
-        );
+        ));
 
         Ok(Self::with_spice_deny_list(
             DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()),
@@ -276,3 +277,16 @@ data_connector_api::register_data_connector!(
     CONNECTOR_NAME,
     DuckDBFactory
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_error_names_the_spicepod_key() {
+        assert_eq!(
+            Error::MissingDuckDBFile.to_string(),
+            "Missing required parameter `duckdb_open`. Set it to the DuckDB database file to read, for example `duckdb_open: ./data.duckdb`. For details, visit: https://spiceai.org/docs/components/data-connectors/duckdb"
+        );
+    }
+}

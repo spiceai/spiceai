@@ -28,39 +28,83 @@ limitations under the License.
 //! imprecisions:
 //!
 //! * An allocation reached through an `Arc` from two entries is charged to
-//!   both. Sharing is not observable from a weigher, and over-charging evicts
-//!   sooner, which is the safe direction for a budget.
+//!   both. Sharing is generally not observable from a weigher, and
+//!   over-charging evicts sooner, which is the safe direction for a budget.
+//!   Schemas are the deliberate exception, in the other direction: they are
+//!   interned, so one allocation backs every entry of the same shape, and
+//!   charging it per entry would bill a wide schema once for every entry that
+//!   merely points at it. A schema unique to a single entry is not charged
+//!   either — the same deliberate choice, accepting that such a workload can
+//!   exceed `max_size` by the size of its schemas.
+//!   [`crate::intern::schema`] counts those bytes once and publishes them,
+//!   so the residual is reported rather than enforced. See
+//!   [`crate::result::query::CachedQueryResult::memory_size`].
 //! * Collection slots are charged as `len`- or `capacity`-times-entry-size,
 //!   which omits a hash table's control bytes and a `Vec`'s spare capacity.
-//!   This matches how `arrow_schema::Field::size` charges its own metadata map,
-//!   so a schema is sized the same way whoever asks.
-//! * [`ENTRY_OVERHEAD_BYTES`] is a flat allowance, not a measurement.
+//! * [`ENTRY_OVERHEAD_BYTES`] is one flat per-entry allowance calibrated
+//!   against a measurement, not a model of any particular store.
 //!
 //! Exactness is not what `max_size` needs. What it needs — and what the
 //! pre-fix accounting did not give it — is a figure *proportional to what the
 //! entry holds*, so that a budget expressed in bytes constrains how many
 //! entries fit under it.
 
-use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasher;
 use std::mem::size_of;
-use std::sync::Arc;
-
-use arrow::datatypes::Schema;
-use datafusion::sql::TableReference;
 
 /// Bytes charged to every cache entry for the store's own per-entry bookkeeping.
 ///
-/// A weigher cannot see what the store allocates around the value it is
-/// weighing — moka's entry record and its two LRU deque nodes, or the Pingora
-/// engine's node and metadata shard slot — so this is an *allowance* covering
-/// them, not a measurement of either store's internals. It is deliberately one
-/// documented constant rather than a per-engine figure with false precision.
+/// A weigher is handed only the value, so nothing the store allocates *around*
+/// that value is reachable from it: moka's entry record, the two intrusive
+/// lists an entry sits on, its key handle, its hash-table slot, and the
+/// allocator's rounding on each. It still has to be charged, or a stream of
+/// individually tiny entries is free and `max_size` cannot bound a
+/// high-cardinality workload of 0-row results at all.
 ///
-/// Its job is to keep a stream of individually tiny entries from being free:
-/// without it, `max_size` cannot bound a workload of high-cardinality 0-row
-/// results at all, however accurately the rest of this module counts.
-pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 256;
+/// **Measured, and scale-dependent.** A `spiced` was filled to 1.4M cached
+/// 0-row results — a shape that holds no arrays and no buffers, so what is left
+/// is exactly this — sampled every 100k, against an identical cache-disabled
+/// run (`phys_footprint`, macOS/arm64, snmalloc):
+///
+/// | entries | per entry |
+/// |---|---|
+/// | 100k | 712 B |
+/// | 200k | 517 B |
+/// | 300k | 342 B |
+/// | 400k – 1.4M | 348–375 B, flat |
+///
+/// Small caches sit higher still: `results_cache_growth` measures ~820 B an
+/// entry at 3,000. So the true figure spans roughly 820 B down to 355 B, and no
+/// single constant is right everywhere.
+///
+/// This one is chosen to minimise the *worst* error across that span rather
+/// than to fit either end. Against the four measured points — 3k, 100k, 200k
+/// and the plateau — 500 is never more than 1.50x out, where anchoring on the
+/// plateau (360) is 1.93x out at 3k and anchoring on 100k (700) is 1.70x out at
+/// 1.4M. Erring high at scale is also the safer half of that: it evicts early
+/// rather than letting the cache outgrow `max_size`.
+///
+/// The *marginal* cost per 100k interval swings from −9 B to 712 B — negative
+/// meaning the allocator handed slabs back while the cache grew — so the
+/// cumulative figures above are what to calibrate against; a marginal reading
+/// would be fitting noise.
+pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 500;
+
+/// Bytes charged per Arrow buffer a cached entry holds, on top of the bytes the
+/// buffer reports.
+///
+/// `get_array_memory_size` counts what each buffer asked the allocator for. It
+/// does not count what the allocator actually set aside — every buffer is its
+/// own allocation, rounded up to a size class — nor the `ArrayData` around it.
+/// A five-column row is eight or more separate buffers, so on the small results
+/// worth caching this is not a rounding error: it was the whole of the residual
+/// once the shared schema and table set stopped being charged.
+///
+/// **Fitted on `DuckDB` and Parquet, validated on Flight**, which contributed
+/// nothing to the fit: 1M cached one-row results per source, cache-enabled
+/// minus cache-disabled. The two-term model — this per buffer, plus
+/// [`ENTRY_OVERHEAD_BYTES`] per entry — predicted Flight's held memory to within
+/// 1.0% on a one-row result and 2.9% on an empty one.
+pub(crate) const BUFFER_OVERHEAD_BYTES: usize = 150;
 
 /// Bytes an `Arc<T>` allocation costs beyond `T` itself: the strong and weak
 /// counts that sit in front of the value.
@@ -72,55 +116,6 @@ pub(crate) const ARC_HEADER_BYTES: usize = 2 * size_of::<usize>();
 /// already covers.
 pub(crate) const fn arc_heap_size<T>() -> usize {
     ARC_HEADER_BYTES + size_of::<T>()
-}
-
-/// Deep size of an Arrow [`Schema`], including the fields it owns and its
-/// key-value metadata.
-///
-/// `arrow-schema` exposes `Fields::size` and `Field::size` but no `Schema::size`,
-/// so the metadata map is charged here the same way `Field::size` charges its own.
-pub(crate) fn schema_size(schema: &Schema) -> usize {
-    size_of::<Schema>() + schema.fields().size() + string_map_size(&schema.metadata)
-}
-
-/// Deep size of a `HashMap<String, String>`: its slots plus the bytes each
-/// string owns.
-pub(crate) fn string_map_size<S: BuildHasher>(map: &HashMap<String, String, S>) -> usize {
-    map.capacity() * size_of::<(String, String)>()
-        + map
-            .iter()
-            .map(|(key, value)| key.capacity() + value.capacity())
-            .sum::<usize>()
-}
-
-/// The bytes a [`TableReference`]'s name parts own on the heap, excluding the
-/// enum itself — the caller charges that through its containing collection.
-///
-/// Each part is its own `Arc<str>` allocation, so each carries a header as well
-/// as its characters.
-pub(crate) fn table_reference_heap_size(table_ref: &TableReference) -> usize {
-    let parts: &[&Arc<str>] = match table_ref {
-        TableReference::Bare { table } => &[table],
-        TableReference::Partial { schema, table } => &[schema, table],
-        TableReference::Full {
-            catalog,
-            schema,
-            table,
-        } => &[catalog, schema, table],
-    };
-
-    parts.iter().map(|part| ARC_HEADER_BYTES + part.len()).sum()
-}
-
-/// Deep size of the input-table set every cached result carries for invalidation.
-///
-/// A fresh set is allocated per query by
-/// [`crate::get_logical_plan_input_tables`], so this is per-entry cost rather
-/// than something amortised across the cache.
-pub(crate) fn table_refs_size<S: BuildHasher>(tables: &HashSet<TableReference, S>) -> usize {
-    size_of::<HashSet<TableReference, S>>()
-        + tables.capacity() * size_of::<TableReference>()
-        + tables.iter().map(table_reference_heap_size).sum::<usize>()
 }
 
 /// The heap a `Vec<String>` owns — its slots plus the bytes each string owns —
@@ -145,66 +140,6 @@ pub(crate) fn f32_vectors_heap_size(vectors: &[Vec<f32>]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field};
-
-    #[test]
-    fn a_wider_schema_is_charged_more_than_a_narrow_one() {
-        let narrow = Schema::new(
-            (0..4)
-                .map(|i| Field::new(format!("col_{i}"), DataType::Int64, true))
-                .collect::<Vec<_>>(),
-        );
-        let wide = Schema::new(
-            (0..200)
-                .map(|i| Field::new(format!("col_{i}"), DataType::Int64, true))
-                .collect::<Vec<_>>(),
-        );
-
-        assert!(
-            schema_size(&wide) > 20 * schema_size(&narrow),
-            "a 200-column schema must be charged far more than a 4-column one, got {} vs {}",
-            schema_size(&wide),
-            schema_size(&narrow)
-        );
-    }
-
-    #[test]
-    fn a_schema_is_charged_for_its_metadata() {
-        let bare = Schema::new(vec![Field::new("col", DataType::Int64, true)]);
-        let annotated = bare.clone().with_metadata(HashMap::from([(
-            "spice.origin".to_string(),
-            "x".repeat(4_096),
-        )]));
-
-        assert!(
-            schema_size(&annotated) >= schema_size(&bare) + 4_096,
-            "schema metadata must be charged, got {} vs {}",
-            schema_size(&annotated),
-            schema_size(&bare)
-        );
-    }
-
-    #[test]
-    fn a_table_reference_is_charged_for_every_name_part() {
-        let bare = TableReference::bare("t".repeat(32));
-        let full = TableReference::full("c".repeat(32), "s".repeat(32), "t".repeat(32));
-
-        assert!(
-            table_reference_heap_size(&full) >= table_reference_heap_size(&bare) + 64,
-            "a catalog- and schema-qualified name must cost more than a bare one, got {} vs {}",
-            table_reference_heap_size(&full),
-            table_reference_heap_size(&bare)
-        );
-    }
-
-    #[test]
-    fn an_empty_table_set_still_costs_its_container() {
-        let empty: HashSet<TableReference> = HashSet::new();
-        assert!(
-            table_refs_size(&empty) >= size_of::<HashSet<TableReference>>(),
-            "an empty set is still an allocation the entry holds"
-        );
-    }
 
     /// The pre-fix accounting read `vectors.len() * first.len()`, which is wrong
     /// for a ragged batch — the shape a base64/float mix or a failed embedding

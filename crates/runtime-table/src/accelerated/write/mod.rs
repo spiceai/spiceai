@@ -28,11 +28,12 @@ limitations under the License.
 //!   default and matches the user-facing `write_mode: write_through` contract.
 //! - [`WriteMode::AcceleratorOnly`]: writes go only to the local accelerator
 //!   (used when `on_conflict` upserts into the accelerator without CDC).
-//! - [`WriteMode::WriteBack`]: writes commit to the local accelerator first,
-//!   then asynchronously persist the same mutation to the federated source.
-//!   Source persistence failures are logged rather than returned to the caller,
-//!   and `replication.enabled` is required as the caller's opt-in to those
-//!   asynchronous durability semantics.
+//! - [`WriteMode::WriteBack`]: writes commit to the local accelerator inside a
+//!   transaction and are carried to the federated source by the delivery worker,
+//!   from the dirty-key markers that commit writes. Writes outside a
+//!   transaction, and `DELETE` in any form, are refused — neither can be
+//!   recorded for delivery. `replication.enabled` is required as the caller's
+//!   opt-in, since the source's own changes return over CDC.
 //! - [`WriteMode::DualWrite`]: writes go to both the Cayenne accelerator and
 //!   the federated source simultaneously with staged commit/rollback. This is
 //!   *not* exposed via spicepod `write_mode` — it is reserved for the Iceberg
@@ -42,6 +43,7 @@ limitations under the License.
 //! [`AcceleratedTable`]: super::AcceleratedTable
 
 pub mod dual_write;
+pub(crate) mod lock;
 pub(crate) mod write_back;
 
 use std::sync::Arc;
@@ -63,8 +65,10 @@ pub(crate) enum WriteMode {
     /// Writes go only to the local accelerator (not replicated to the source).
     /// Used when `on_conflict` is configured or for internal tables.
     AcceleratorOnly,
-    /// Writes commit to the local accelerator first, then asynchronously persist
-    /// the same mutation to the federated source.
+    /// Writes commit to the local accelerator inside a transaction and are
+    /// carried to the federated source by the delivery worker, from the
+    /// dirty-key markers that commit writes. Writes outside a transaction, and
+    /// `DELETE` in any form, are refused.
     WriteBack,
     /// Writes go simultaneously to both the federated source and the local Cayenne
     /// accelerator using staged append/commit/rollback semantics. Reserved for
@@ -76,6 +80,20 @@ pub(crate) enum WriteMode {
 }
 
 impl WriteMode {
+    /// Whether a write in this mode reaches the local accelerator, and so has
+    /// to run under `lock::AcceleratorWriteLockExec` to serialize against
+    /// acceleration snapshot creation (#13548).
+    ///
+    /// This one predicate answers both halves of that: a guarded write also
+    /// gets its freshness marker stamped by the wrapper when it finishes, so
+    /// only an *unguarded* write stamps where its plan is built.
+    /// `WriteThrough` is the unguarded one — it writes to the federated source
+    /// alone, and the accelerator learns of the change through refresh or CDC,
+    /// both of which take that lock themselves.
+    pub(crate) fn reaches_accelerator(&self) -> bool {
+        !matches!(self, Self::WriteThrough)
+    }
+
     /// Returns `true` if this is the dual-write mode (Iceberg catalog cache path).
     #[must_use]
     pub fn is_dual_write(&self) -> bool {
@@ -119,4 +137,30 @@ impl WriteMode {
             federated_provider,
         })
     }
+}
+
+/// A plan yielding one `count: UInt64` row, the shape `DataFusion`'s DML plans
+/// report an affected-row count in.
+#[cfg(test)]
+pub(crate) fn count_exec(n: u64) -> std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+    use arrow::array::UInt64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_datasource::source::DataSourceExec;
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(UInt64Array::from(vec![n]))],
+    )
+    .expect("valid schema and array");
+    let memory =
+        MemorySourceConfig::try_new(&[vec![batch]], schema, None).expect("valid memory source");
+    Arc::new(DataSourceExec::new(Arc::new(memory)))
 }

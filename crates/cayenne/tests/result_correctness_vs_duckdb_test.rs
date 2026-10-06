@@ -27,23 +27,30 @@
 //! Scale defaults SF1 (`CAYENNE_PARITY_*_SF`). ClickBench: `CLICKBENCH_HITS_PARQUET`
 //! or ranking-deterministic fixture + env-failure log under `CAYENNE_PARITY_SCRATCH`.
 
+// Same set the sibling `..._vs_sqlite_test.rs` carries. These went unenforced
+// while the binary's `required-features` were unmet — clippy never built the
+// target, so it never linted it either.
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::too_many_lines)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::format_push_string)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::clone_on_ref_ptr)]
+#![allow(clippy::used_underscore_binding)]
 
 #[path = "correctness/support/mod.rs"]
 mod support;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use arrow::array::{Int64Array, RecordBatch, StringArray, UInt32Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::RecordBatch;
 use duckdb::Connection;
-use support::inventory::build_inventory;
+use support::inventory::{build_inventory, fixture};
 use support::report::{RunResult, summary_line, write_coverage_report};
 use support::{
     CayenneHarness, ParityOutcome, TPCH_TABLES, assert_all_pass_or_excluded,
@@ -78,34 +85,13 @@ fn duckdb_query_batches(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>
     Ok(batches)
 }
 
-fn generate_tpch_parquet(out_dir: &Path, sf: f64) -> PathBuf {
-    std::fs::create_dir_all(out_dir).expect("tpch out dir");
-    let gen_db = out_dir.join("gen.duckdb");
-    let conn = Connection::open(&gen_db).expect("duckdb open for tpch gen");
-    conn.execute_batch(&format!(
-        "INSTALL tpch;
-         LOAD tpch;
-         CALL dbgen(sf={sf});"
-    ))
-    .expect("dbgen");
-    for table in TPCH_TABLES {
-        let path = out_dir.join(format!("{table}.parquet"));
-        conn.execute_batch(&format!(
-            "COPY {table} TO '{}' (FORMAT PARQUET);",
-            path.display()
-        ))
-        .unwrap_or_else(|e| panic!("copy {table}: {e}"));
-    }
-    out_dir.to_path_buf()
-}
-
 fn load_duckdb_from_parquet(
     parquet_dir: &Path,
     tables: &[&str],
 ) -> (tempfile::TempDir, Connection) {
     let temp = tempfile::tempdir().expect("duckdb temp");
     let db_path = temp.path().join("parity.duckdb");
-    let conn = Connection::open(&db_path).expect("duckdb open");
+    let conn = support::standalone_engines::open_duckdb_oracle(&db_path);
     for table in tables {
         let path = parquet_dir.join(format!("{table}.parquet"));
         conn.execute_batch(&format!(
@@ -150,8 +136,12 @@ async fn run_pair(
 /// via the shared harness (shipped `compare_query_result_batches` only).
 ///
 /// When Cayenne and DuckDB disagree, the harness also executes the same SQL on
-/// a DataFusion parquet baseline so dialect mismatches are classified in code
-/// (not by a human reading logs).
+/// a DataFusion parquet baseline and names the result in the failure, as triage
+/// context. It never turns the disagreement into a pass: Cayenne is built on
+/// DataFusion, so matching DataFusion cannot clear it — a DataFusion bug Cayenne
+/// inherits agrees with DataFusion too (spiceai/spiceai#13277's bounded `EXISTS`
+/// is one). The SQLite and chDB lanes run the same suites against engines that
+/// share no code with DataFusion, and are where such a cell is decided.
 async fn run_pair_with_df_baseline(
     _suite: &str,
     query: &Query,
@@ -171,45 +161,27 @@ async fn run_pair_with_df_baseline(
         (Ok(c), Ok(d)) => {
             // --- Harness compares actual result batches ---
             let direct = compare_actual_results(query, &c, &d);
-            if matches!(direct, ParityOutcome::Pass) {
+            if matches!(
+                direct,
+                ParityOutcome::Pass
+                    | ParityOutcome::OrderUnchecked { .. }
+                    | ParityOutcome::Vacuous { .. }
+            ) {
                 return direct;
             }
-            if let ParityOutcome::Fail { ref detail } = direct
-                && is_timestamp_padding_mismatch(detail)
-            {
-                return ParityOutcome::Pass;
+            let Some(dir) = parquet_dir else {
+                return direct;
+            };
+            let baseline = match datafusion_query_parquet(dir, cayenne.tables.keys(), sql_c).await {
+                Ok(df_batches) => format!("{:?}", compare_actual_results(query, &c, &df_batches)),
+                Err(e) => format!("could not run: {e}"),
+            };
+            ParityOutcome::Fail {
+                detail: format!(
+                    "harness: Cayenne vs DuckDB actual results {direct:?}; \
+                     Cayenne vs DataFusion baseline (triage context only) {baseline}"
+                ),
             }
-            if let Some(dir) = parquet_dir {
-                match datafusion_query_parquet(dir, cayenne.tables.keys(), sql_c).await {
-                    Ok(df_batches) => {
-                        // Again: harness compares actual batches only.
-                        let vs_df = compare_actual_results(query, &c, &df_batches);
-                        if matches!(vs_df, ParityOutcome::Pass) {
-                            return ParityOutcome::Excluded {
-                                reason: format!(
-                                    "harness: Cayenne actual results match DataFusion baseline; \
-                                     DuckDB differs (SQL dialect/arithmetic): {direct:?}"
-                                ),
-                            };
-                        }
-                        return ParityOutcome::Fail {
-                            detail: format!(
-                                "harness: Cayenne vs DuckDB actual results {direct:?}; \
-                                 Cayenne vs DataFusion actual results {vs_df:?}"
-                            ),
-                        };
-                    }
-                    Err(e) => {
-                        return ParityOutcome::Fail {
-                            detail: format!(
-                                "harness: Cayenne vs DuckDB mismatch ({direct:?}); \
-                                 DataFusion baseline execute failed: {e}"
-                            ),
-                        };
-                    }
-                }
-            }
-            direct
         }
         (Err(e), Ok(_)) => ParityOutcome::EngineError {
             side: "cayenne",
@@ -227,56 +199,60 @@ async fn run_pair_with_df_baseline(
                 }
             }
         }
-        (Err(ce), Err(de)) => ParityOutcome::Excluded {
-            reason: format!("both engines error: cayenne={ce}; duckdb={de}"),
+        // DuckDB failing too does not make Cayenne's error an answer: a suite
+        // query Cayenne cannot run is excluded in the inventory, with its reason,
+        // or it fails here.
+        (Err(ce), Err(de)) => ParityOutcome::EngineError {
+            side: "cayenne",
+            detail: format!("{ce}; DuckDB failed as well: {de}"),
         },
     }
 }
 
-/// True when the only mismatch is fractional-second padding on an otherwise
-/// identical timestamp string (e.g. `.000000000` vs `.000000`).
-fn is_timestamp_padding_mismatch(detail: &str) -> bool {
-    // Detail from Debug of DataMismatch embeds expected/actual as quoted strings,
-    // possibly escaped (`\"2013-07-10 00:00:00.000000000\"`).
-    let exp = extract_debug_field(detail, "expected:");
-    let act = extract_debug_field(detail, "actual:");
-    if exp.is_empty() || act.is_empty() {
-        return false;
-    }
-    normalize_ts(&exp) == normalize_ts(&act)
-}
-
-fn extract_debug_field(detail: &str, key: &str) -> String {
-    let Some(rest) = detail.split(key).nth(1) else {
-        return String::new();
-    };
-    // Take through the next comma or closing brace, then unquote.
-    let token = rest
-        .split([',', '}'])
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_matches('"')
-        .replace("\\\"", "")
-        .replace('\\', "");
-    token.trim_matches('"').to_string()
-}
-
-fn normalize_ts(s: &str) -> String {
-    // Strip trailing zeros in fractional seconds and a trailing dot.
-    if let Some((date, frac)) = s.rsplit_once('.') {
-        let frac = frac.trim_end_matches('0');
-        if frac.is_empty() {
-            date.to_string()
-        } else {
-            format!("{date}.{frac}")
-        }
-    } else {
-        s.to_string()
-    }
-}
-
 /// Run SQL against parquet files via plain DataFusion (no Cayenne) as a baseline.
+/// Verify Cayenne on its own when DuckDB is the side that cannot run the query.
+///
+/// A DuckDB binder rejection is a fact about DuckDB, not about Cayenne. The
+/// DataFusion baseline resolves the same SQL over the same parquet, so Cayenne's
+/// rows — and, through the shared compare path, the order it returned them in —
+/// can still be checked. Recording the exclusion without doing that left these
+/// queries with no verification of Cayenne at all, in the lane whose job is to
+/// provide it.
+async fn verify_cayenne_against_baseline(
+    query: &Query,
+    cayenne: &CayenneHarness,
+    parquet_dir: &Path,
+    duckdb_reason: &str,
+) -> ParityOutcome {
+    let rows = match execute_cayenne(cayenne, query.sql.as_ref()).await {
+        Ok(rows) => rows,
+        Err(detail) => {
+            return ParityOutcome::EngineError {
+                side: "cayenne",
+                detail,
+            };
+        }
+    };
+    match datafusion_query_parquet(parquet_dir, cayenne.tables.keys(), query.sql.as_ref()).await {
+        // A pass here is still an exclusion from the *DuckDB* comparison, and is
+        // recorded as one so the inventory and the census keep agreeing; what
+        // changes is that Cayenne was actually checked before it was recorded.
+        Ok(baseline) => match compare_actual_results(query, &rows, &baseline) {
+            ParityOutcome::Pass => ParityOutcome::Excluded {
+                reason: format!(
+                    "{duckdb_reason}; Cayenne verified against the DataFusion baseline instead"
+                ),
+            },
+            judged => judged,
+        },
+        Err(e) => ParityOutcome::Excluded {
+            reason: format!(
+                "{duckdb_reason}; the DataFusion baseline could not run it either: {e}"
+            ),
+        },
+    }
+}
+
 async fn datafusion_query_parquet(
     parquet_dir: &Path,
     table_names: impl Iterator<Item = &String>,
@@ -333,10 +309,7 @@ async fn micro_bench_shapes_full_result_parity_vs_duckdb() {
         });
     }
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let fails = support::report::unexplained(&results, &build_inventory(), &[]);
     let report_path = scratch.join("cayenne_duckdb_micro_parity.log");
     let mut log = String::new();
     for r in &results {
@@ -353,6 +326,12 @@ async fn micro_bench_shapes_full_result_parity_vs_duckdb() {
     );
 }
 
+/// Make sure the TPC-H fixture is on disk. Shared by the TPC-H and SpiceBench
+/// lanes, which load the same generated tables.
+fn ensure_tpch_fixture(dir: &Path, sf: f64) {
+    support::tpch_data::ensure_tpch_fixture(dir, sf);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_full_result_parity_vs_duckdb() {
     let scratch = scratch_dir();
@@ -361,9 +340,7 @@ async fn tpch_full_result_parity_vs_duckdb() {
     eprintln!("TPC-H parity at SF={sf}");
 
     let parquet_dir = scratch.join(format!("tpch_sf{sf}"));
-    if !parquet_dir.join("lineitem.parquet").exists() {
-        generate_tpch_parquet(&parquet_dir, sf);
-    }
+    ensure_tpch_fixture(&parquet_dir, sf);
 
     let cayenne = load_cayenne_from_parquet(&parquet_dir, TPCH_TABLES).await;
     let (duck_temp, duck) = load_duckdb_from_parquet(&parquet_dir, TPCH_TABLES);
@@ -409,10 +386,7 @@ async fn tpch_full_result_parity_vs_duckdb() {
     std::fs::write(&log_path, &log).expect("write tpch log");
     eprintln!("{}", summary_line(&results));
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let fails = support::report::unexplained(&results, &build_inventory(), &[]);
     assert!(
         fails.is_empty(),
         "TPC-H full-result parity failures (SF={sf}): {fails:#?}\nsee {}",
@@ -448,16 +422,38 @@ const TPCDS_TABLES: &[&str] = &[
     "web_site",
 ];
 
-fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> PathBuf {
+/// Needs network for `INSTALL tpcds`, unlike the TPC-H fixture `support::tpch_data`
+/// generates in-process.
+fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
+    // The generation database is temporary and fresh per run. `dsdgen` populates
+    // a schema and cannot be run twice against the same database — a reused one
+    // fails with `Table with name "call_center" already exists` the moment
+    // regeneration actually happens, which it never did while any leftover
+    // fixture was trusted.
+    let gen_home = tempfile::tempdir().expect("tpcds gen dir");
+    let conn =
+        Connection::open(gen_home.path().join("gen.duckdb")).expect("duckdb open for tpcds gen");
+    // Only `INSTALL` reaches DuckDB's extension repository, so only it can fail
+    // for want of a network and be reported as an environment that cannot supply
+    // the fixture. Everything after it is local: a `LOAD` that fails means the
+    // installed extension is unusable, and a `dsdgen` that fails means the
+    // generator is broken. Running the three as one batch made either of those
+    // indistinguishable from having no network, which turns a regression in the
+    // fixture into a passing exclusion.
+    if let Err(e) = conn.execute_batch("INSTALL tpcds;") {
+        eprintln!("TPC-DS fixture unavailable: {e}");
+        return None;
+    }
+    conn.execute_batch("LOAD tpcds;")
+        .expect("load DuckDB's tpcds extension, which installed successfully");
+    conn.execute_batch(&format!("CALL dsdgen(sf={sf});"))
+        .expect("generate the TPC-DS fixture with dsdgen");
+
+    // Replace what is on disk only now that generation has succeeded, so a
+    // machine that could not reach the extension repository keeps the fixture it
+    // already had instead of losing it to a run that was never going to finish.
+    let _ = std::fs::remove_dir_all(out_dir);
     std::fs::create_dir_all(out_dir).expect("tpcds out dir");
-    let gen_db = out_dir.join("gen.duckdb");
-    let conn = Connection::open(&gen_db).expect("duckdb open for tpcds gen");
-    conn.execute_batch(&format!(
-        "INSTALL tpcds;
-         LOAD tpcds;
-         CALL dsdgen(sf={sf});"
-    ))
-    .expect("dsdgen");
 
     // Export every base table that exists after dsdgen.
     let mut stmt = conn
@@ -473,15 +469,53 @@ fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> PathBuf {
         .collect();
     for table in names {
         let path = out_dir.join(format!("{table}.parquet"));
-        if let Err(e) = conn.execute_batch(&format!(
+        // Skipping a failed export would leave a partial fixture behind, which
+        // the next run reads as a complete one because the directory is not
+        // empty. Every name here came from `information_schema` a moment ago.
+        conn.execute_batch(&format!(
             "COPY {table} TO '{}' (FORMAT PARQUET);",
             path.display()
-        )) {
-            eprintln!("skip copy {table}: {e}");
-        }
+        ))
+        .unwrap_or_else(|e| panic!("export TPC-DS table {table}: {e}"));
     }
-    out_dir.to_path_buf()
+    // The stamp says a run finished; this says it finished with the tables the
+    // suite expects. They catch different things: an interrupted export, and a
+    // `dsdgen` that quietly stops emitting one — which would otherwise surface
+    // as queries failing on both engines, far from the cause.
+    let exported: std::collections::BTreeSet<String> = std::fs::read_dir(out_dir)
+        .expect("read tpcds fixture dir")
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .strip_suffix(".parquet")
+                .map(str::to_string)
+        })
+        .collect();
+    let missing: Vec<&str> = TPCDS_TABLES
+        .iter()
+        .copied()
+        .filter(|t| !exported.contains(*t))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "dsdgen produced no parquet for TPC-DS tables {missing:?} in {}",
+        out_dir.display()
+    );
+
+    // Stamped only now, with every table exported. A run killed part-way leaves
+    // the directory populated but unstamped, so the next one regenerates instead
+    // of reading a fixture that is missing tables — where the queries against
+    // those tables fail on both engines, far from the cause.
+    support::mark_fixture_complete(out_dir, TPCDS_FIXTURE_REVISION);
+    Some(out_dir.to_path_buf())
 }
+
+/// Revision for the TPC-DS fixture. Unlike SSB and TPC-H the generator is
+/// DuckDB's `dsdgen`, not code in this repo, so there is no source to digest;
+/// the stamp is carried for its completeness half, and this bumps only if the
+/// export set or the extension pin changes.
+const TPCDS_FIXTURE_REVISION: &str = "duckdb-dsdgen-1";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tpcds_and_clickbench_parity_vs_duckdb() {
@@ -493,11 +527,11 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     let sf = env_f64("CAYENNE_PARITY_TPCDS_SF", 1.0);
     eprintln!("TPC-DS parity at SF={sf}");
     let tpcds_dir = scratch.join(format!("tpcds_sf{sf}"));
-    if !tpcds_dir.join("store_sales.parquet").exists()
-        && !tpcds_dir.join("date_dim.parquet").exists()
-    {
-        generate_tpcds_parquet(&tpcds_dir, sf);
-    }
+    // Reuse only a stamped fixture. Two sentinel files said nothing about the
+    // other twenty-two, so a directory left behind by an interrupted dsdgen was
+    // read as complete and its missing tables became `Excluded` — a pass.
+    let tpcds_fixture_missing = !support::fixture_is_current(&tpcds_dir, TPCDS_FIXTURE_REVISION)
+        && generate_tpcds_parquet(&tpcds_dir, sf).is_none();
 
     // Discover exported tables.
     let exported: Vec<String> = std::fs::read_dir(&tpcds_dir)
@@ -513,24 +547,43 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
         .unwrap_or_default();
     let table_refs: Vec<&str> = exported.iter().map(String::as_str).collect();
 
-    if table_refs.is_empty() {
+    if tpcds_fixture_missing {
         results.push(RunResult {
             suite: "tpcds".into(),
             name: "*".into(),
             engine_pair: "cayenne-duckdb",
             outcome: ParityOutcome::Excluded {
-                reason: "TPC-DS parquet generation produced no tables in this environment".into(),
+                reason: "TPC-DS fixture unavailable: DuckDB's tpcds extension could not be \
+                         installed in this environment (needs network)"
+                    .into(),
             },
         });
     } else {
+        // Generation succeeded, so tables must exist. Treating their absence as
+        // another environmental exclusion would let a silent generator failure
+        // count as a pass.
+        assert!(
+            !table_refs.is_empty(),
+            "TPC-DS generation reported success but exported no tables into {}",
+            tpcds_dir.display()
+        );
         let cayenne = load_cayenne_from_parquet(&tpcds_dir, &table_refs).await;
         let (duck_temp, duck) = load_duckdb_from_parquet(&tpcds_dir, &table_refs);
         let _keep = duck_temp;
 
+        let inventory = build_inventory();
         for q in get_tpcds_test_queries(None, Some(1.0)) {
-            let outcome =
+            // Reviewed exclusions live in the inventory, so the census counts them.
+            let outcome = if let Some(reason) = inventory
+                .iter()
+                .find(|e| e.suite == "tpcds" && e.name == q.name.as_ref())
+                .and_then(|e| e.duckdb_exclusion)
+            {
+                verify_cayenne_against_baseline(&q, &cayenne, &tpcds_dir, reason).await
+            } else {
                 run_pair_with_df_baseline("tpcds", &q, &cayenne, &duck, None, Some(&tpcds_dir))
-                    .await;
+                    .await
+            };
             eprintln!("tpcds/{} -> {outcome:?}", q.name);
             results.push(RunResult {
                 suite: "tpcds".into(),
@@ -561,11 +614,11 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
             )
         }
         None => {
-            let note = format!(
+            let note =
                 "CLICKBENCH_HITS_PARQUET unset; S3 spicepod clickbench/sf1 requires credentials \
                  not available in this environment. Using ranking-deterministic local fixture \
                  (power-law group counts, unique top-K ORDER BY keys) for full-content parity."
-            );
+                    .to_string();
             let capture = scratch.join("clickbench_sf1_env_failure.log");
             std::fs::write(
                 &capture,
@@ -577,7 +630,9 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
             )
             .expect("write clickbench env failure");
             eprintln!("{note}");
-            let hits = make_reduced_hits(50_000);
+            let hits = support::clickbench_data::make_reduced_hits(
+                support::clickbench_data::REDUCED_HITS_ROWS,
+            );
             let path = hits_dir.path().join("hits.parquet");
             write_parquet(&hits, &path);
             (path, note)
@@ -589,7 +644,7 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
 
     let duck_temp = tempfile::tempdir().expect("duck hits");
     let duck_path = duck_temp.path().join("hits.duckdb");
-    let duck = Connection::open(&duck_path).expect("duck open");
+    let duck = support::standalone_engines::open_duckdb_oracle(&duck_path);
     duck.execute_batch(&format!(
         "CREATE TABLE hits AS SELECT * FROM read_parquet('{}');",
         hits_path.display()
@@ -611,20 +666,28 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
 
     eprintln!("clickbench fixture: {clickbench_fixture_note}");
 
+    let inventory = build_inventory();
     for q in get_clickbench_test_queries(None) {
-        let outcome = run_pair_with_df_baseline(
-            "clickbench",
-            &q,
-            &cayenne_hits,
-            &duck,
-            None,
-            Some(&hits_baseline_dir),
-        )
-        .await;
-        let outcome = reclassify_schema_exclusion(outcome);
-        // Only bare LIMIT (no ORDER BY) is nondeterministic. ORDER BY+LIMIT must
-        // match because the fixture assigns unique group counts for ranking keys.
-        let outcome = reclassify_limit_rank_nondeterminism(&q, outcome);
+        let exclusion = inventory
+            .iter()
+            .find(|e| e.suite == "clickbench" && e.name == q.name.as_ref())
+            .and_then(|e| e.duckdb_exclusion);
+        let outcome = match exclusion {
+            Some(reason) => ParityOutcome::Excluded {
+                reason: reason.to_string(),
+            },
+            None => {
+                run_pair_with_df_baseline(
+                    "clickbench",
+                    &q,
+                    &cayenne_hits,
+                    &duck,
+                    None,
+                    Some(&hits_baseline_dir),
+                )
+                .await
+            }
+        };
         eprintln!("clickbench/{} -> {outcome:?}", q.name);
         results.push(RunResult {
             suite: "clickbench".into(),
@@ -650,10 +713,15 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     eprintln!("{}", summary_line(&results));
     eprintln!("coverage report: {}", coverage_path.display());
 
-    let unexplained: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let tpcds_fixture = fixture::tpcds_dsdgen(sf);
+    let unexplained = support::report::unexplained(
+        &results,
+        &build_inventory(),
+        &[
+            ("tpcds", &tpcds_fixture),
+            ("clickbench", fixture::clickbench_hits()),
+        ],
+    );
     assert!(
         unexplained.is_empty(),
         "unexplained TPC-DS/ClickBench parity failures: {unexplained:#?}\nsee {}",
@@ -661,363 +729,9 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     );
 }
 
-/// Reclassify only true missing-column errors on the reduced hits fixture.
-/// Optimizer / duplicate-field / planning errors are left as EngineError or
-/// remapped to an accurate dialect/SQL-surface exclusion — never "lacks column".
-fn reclassify_schema_exclusion(outcome: ParityOutcome) -> ParityOutcome {
-    match outcome {
-        ParityOutcome::EngineError { side, detail } if is_missing_column_error(&detail) => {
-            ParityOutcome::Excluded {
-                reason: format!(
-                    "reduced hits fixture missing column required by query ({side}): {detail}"
-                ),
-            }
-        }
-        ParityOutcome::EngineError { side, detail }
-            if detail.contains("duplicate unqualified field")
-                || detail.contains("Optimizer rule") =>
-        {
-            // e.g. clickbench_q30: many SUM(col+N) without aliases — DataFusion
-            // rejects the plan. Not a Cayenne storage bug and not a missing column.
-            ParityOutcome::Excluded {
-                reason: format!(
-                    "Spice/DataFusion SQL surface rejects this query shape ({side}): {detail}"
-                ),
-            }
-        }
-        ParityOutcome::Excluded { reason } if reason.contains("both engines error") => {
-            ParityOutcome::Excluded {
-                reason: format!(
-                    "both engines reject query on hits fixture (schema/dialect): {reason}"
-                ),
-            }
-        }
-        other => other,
-    }
-}
-
-fn is_missing_column_error(detail: &str) -> bool {
-    let d = detail.to_ascii_lowercase();
-    // Tight: only messages that clearly name an unresolved column/field.
-    (d.contains("no field named")
-        || d.contains("column not found")
-        || d.contains("does not exist")
-        || d.contains("unknown column")
-        || d.contains("failed to resolve")
-        || d.contains("schema error: no field"))
-        && !d.contains("duplicate")
-}
-
-/// Bare `LIMIT` / `OFFSET` without `ORDER BY` is nondeterministic — exclude only
-/// that case. `ORDER BY … LIMIT` failures are **not** auto-excluded: the hits
-/// fixture is built with unique ranking keys so top-K must match; remaining
-/// mismatches are real failures (or already dialect-excluded when Cayenne
-/// matches the DataFusion baseline).
-fn reclassify_limit_rank_nondeterminism(query: &Query, outcome: ParityOutcome) -> ParityOutcome {
-    let sql_upper = query.sql.to_ascii_uppercase();
-    let has_limit = sql_upper.contains("LIMIT") || sql_upper.contains("OFFSET");
-    let has_order = sql_upper.contains("ORDER BY");
-    match outcome {
-        ParityOutcome::Fail { detail }
-            if has_limit && !has_order && detail.contains("DataMismatch") =>
-        {
-            ParityOutcome::Excluded {
-                reason: format!(
-                    "LIMIT/OFFSET without ORDER BY is nondeterministic across engines: {detail}"
-                ),
-            }
-        }
-        // RowCountMismatch under LIMIT without ORDER BY can also be nondet.
-        ParityOutcome::Fail { detail }
-            if has_limit && !has_order && detail.contains("RowCountMismatch") =>
-        {
-            ParityOutcome::Excluded {
-                reason: format!(
-                    "LIMIT/OFFSET without ORDER BY is nondeterministic across engines: {detail}"
-                ),
-            }
-        }
-        other => other,
-    }
-}
-
-/// ClickBench-like hits table with **unique top-K ranking keys**.
-///
-/// Group-by dimensions used in `ORDER BY count DESC LIMIT N` queries
-/// (`RegionID`, `SearchPhrase`, `URL`, `Title`, `ClientIP`, `WatchID`) are
-/// assigned power-law frequencies so every group has a distinct count. That
-/// makes top-K order deterministic across Cayenne / DataFusion / DuckDB —
-/// content equality is a real correctness check, not tie-break noise.
-fn make_reduced_hits(rows: usize) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("WatchID", DataType::Int64, false),
-        Field::new("UserID", DataType::Int64, false),
-        Field::new("CounterID", DataType::Int64, false),
-        Field::new("AdvEngineID", DataType::Int64, false),
-        Field::new("RegionID", DataType::Int64, false),
-        Field::new("ResolutionWidth", DataType::UInt32, false),
-        Field::new("EventDate", DataType::Int64, false),
-        Field::new("EventTime", DataType::Int64, false),
-        Field::new("IsRefresh", DataType::Int64, false),
-        Field::new("DontCountHits", DataType::Int64, false),
-        Field::new("SearchPhrase", DataType::Utf8, false),
-        Field::new("URL", DataType::Utf8, false),
-        Field::new("Title", DataType::Utf8, false),
-        Field::new("Referer", DataType::Utf8, false),
-        Field::new("TraficSourceID", DataType::Int64, false),
-        Field::new("SearchEngineID", DataType::Int64, false),
-        Field::new("IsLink", DataType::Int64, false),
-        Field::new("IsDownload", DataType::Int64, false),
-        Field::new("ClientIP", DataType::Int64, false),
-        Field::new("MobilePhone", DataType::Int64, false),
-        Field::new("MobilePhoneModel", DataType::Utf8, false),
-        Field::new("URLHash", DataType::Int64, false),
-        Field::new("RefererHash", DataType::Int64, false),
-        Field::new("WindowClientWidth", DataType::UInt32, false),
-        Field::new("WindowClientHeight", DataType::UInt32, false),
-    ]));
-
-    // Power-law: group `g` has `row_count[g]` rows and `distinct_users[g]`
-    // distinct UserIDs — both strictly decreasing in g so:
-    //   ORDER BY COUNT(*) DESC          and
-    //   ORDER BY COUNT(DISTINCT UserID) DESC
-    // yield a unique top-K with no ties.
-    let n_groups = 40usize;
-    let mut row_count: Vec<usize> = (0..n_groups).map(|g| n_groups - g).collect();
-    let base_sum: usize = row_count.iter().sum();
-    let scale = (rows / base_sum).max(1);
-    for c in &mut row_count {
-        *c *= scale;
-    }
-    let assigned: usize = row_count.iter().sum();
-    if assigned < rows {
-        row_count[0] += rows - assigned;
-    }
-    // Distinct users per group: unique COUNT(DISTINCT UserID) per group key.
-    // Group g has (n_groups - g) distinct users.
-    let distinct_users: Vec<usize> = (0..n_groups).map(|g| n_groups - g).collect();
-
-    // Per-user row multiplicity must also be unique for q19-style
-    // GROUP BY (UserID, minute, phrase) ORDER BY COUNT(*) — assign each
-    // (group, local_user) a unique global weight so no COUNT(*) ties in top-K.
-    // Weight for (g, u) = (n_groups - g) * 100 + (distinct_users[g] - u) ensures
-    // uniqueness; we then emit min(weight, remaining_in_group) rows carefully.
-    // Simpler: one primary user per group gets ALL of that group's rows (so
-    // COUNT(*) by UserID equals row_count[g] — unique), and additional distinct
-    // users appear once each for COUNT(DISTINCT) without disturbing the primary
-    // user's dominant count.
-    let mut group_of_row = Vec::with_capacity(rows);
-    let mut user_in_group = Vec::with_capacity(rows); // 0..distinct_users[g]
-    for (g, &count) in row_count.iter().enumerate() {
-        let du = distinct_users[g].max(1);
-        // Reserve (du - 1) singleton rows for secondary users; primary user 0
-        // gets the rest (strictly more rows than any other user in any group
-        // with smaller g because row_count is strictly decreasing and
-        // secondary users only get 1 row).
-        let secondary = du.saturating_sub(1).min(count.saturating_sub(1));
-        let primary_rows = count - secondary;
-        for _ in 0..primary_rows {
-            if group_of_row.len() >= rows {
-                break;
-            }
-            group_of_row.push(g);
-            user_in_group.push(0); // primary user
-        }
-        for u in 1..=secondary {
-            if group_of_row.len() >= rows {
-                break;
-            }
-            group_of_row.push(g);
-            user_in_group.push(u);
-        }
-    }
-    group_of_row.truncate(rows);
-    user_in_group.truncate(rows);
-    while group_of_row.len() < rows {
-        group_of_row.push(0);
-        user_in_group.push(0);
-    }
-
-    let mut watch = Vec::with_capacity(rows);
-    let mut user = Vec::with_capacity(rows);
-    let mut counter = Vec::with_capacity(rows);
-    let mut adv = Vec::with_capacity(rows);
-    let mut region = Vec::with_capacity(rows);
-    let mut res_w = Vec::with_capacity(rows);
-    let mut event_date = Vec::with_capacity(rows);
-    let mut event_time = Vec::with_capacity(rows);
-    let mut is_refresh = Vec::with_capacity(rows);
-    let mut dont_count = Vec::with_capacity(rows);
-    let mut phrase = Vec::with_capacity(rows);
-    let mut url = Vec::with_capacity(rows);
-    let mut title = Vec::with_capacity(rows);
-    let mut referer = Vec::with_capacity(rows);
-    let mut traffic = Vec::with_capacity(rows);
-    let mut search_eng = Vec::with_capacity(rows);
-    let mut is_link = Vec::with_capacity(rows);
-    let mut is_dl = Vec::with_capacity(rows);
-    let mut client_ip = Vec::with_capacity(rows);
-    let mut mobile = Vec::with_capacity(rows);
-    let mut mobile_model = Vec::with_capacity(rows);
-    let mut url_hash = Vec::with_capacity(rows);
-    let mut ref_hash = Vec::with_capacity(rows);
-    let mut win_w = Vec::with_capacity(rows);
-    let mut win_h = Vec::with_capacity(rows);
-
-    // EventDate as days since epoch around mid-2013 for ClickBench-like filters.
-    let base_day = 15_896i64; // ~2013-07-01
-    // Fixed EventTime base so extract(minute) is stable per (user, phrase) group
-    // for q19-style rankings (COUNT(*) over UserID, minute, SearchPhrase).
-    let base_event_time = 1_373_000_000i64;
-    for (i, (&g, &u_local)) in group_of_row.iter().zip(user_in_group.iter()).enumerate() {
-        let i64 = i as i64;
-        let g64 = g as i64;
-        // WatchID shared per group → unique COUNT(*) by WatchID.
-        watch.push(g64);
-        // UserID unique per (group, local user index) → unique COUNT(DISTINCT UserID)
-        // per RegionID / SearchPhrase (which equal group).
-        user.push(100_000 + g64 * 1_000 + u_local as i64);
-        counter.push(if g == 0 { 62 } else { 1 + (g64 % 5) });
-        adv.push(g64 % 3);
-        region.push(g64);
-        res_w.push(800 + (g % 400) as u32);
-        event_date.push(base_day + (g64 % 30));
-        // Minute = g % 60 so (UserID, minute, phrase) groups get power-law counts
-        // when UserID is also group-scoped: use one EventTime per group for the
-        // primary ranking path, then light variation that stays in the same minute.
-        let minute = (g % 60) as i64;
-        event_time.push(base_event_time + minute * 60 + (i64 % 50));
-        is_refresh.push(if g == 0 { 0 } else { g64 % 20 });
-        dont_count.push(0);
-        phrase.push(format!("phrase_{g:02}"));
-        url.push(format!("https://example.com/page_{g:02}"));
-        title.push(format!("title_{g:02}"));
-        referer.push(format!("https://ref.example/r_{g:02}"));
-        traffic.push(g64 % 10);
-        search_eng.push(g64 % 5);
-        is_link.push(g64 % 2);
-        is_dl.push(0);
-        client_ip.push(1000 + g64);
-        mobile.push(g64 % 3);
-        mobile_model.push(if g % 3 == 0 {
-            "Android".into()
-        } else {
-            String::new()
-        });
-        url_hash.push(g64.wrapping_mul(31));
-        ref_hash.push(g64.wrapping_mul(17));
-        win_w.push(1024);
-        win_h.push(768);
-    }
-
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from(watch)),
-            Arc::new(Int64Array::from(user)),
-            Arc::new(Int64Array::from(counter)),
-            Arc::new(Int64Array::from(adv)),
-            Arc::new(Int64Array::from(region)),
-            Arc::new(UInt32Array::from(res_w)),
-            Arc::new(Int64Array::from(event_date)),
-            Arc::new(Int64Array::from(event_time)),
-            Arc::new(Int64Array::from(is_refresh)),
-            Arc::new(Int64Array::from(dont_count)),
-            Arc::new(StringArray::from(phrase)),
-            Arc::new(StringArray::from(url)),
-            Arc::new(StringArray::from(title)),
-            Arc::new(StringArray::from(referer)),
-            Arc::new(Int64Array::from(traffic)),
-            Arc::new(Int64Array::from(search_eng)),
-            Arc::new(Int64Array::from(is_link)),
-            Arc::new(Int64Array::from(is_dl)),
-            Arc::new(Int64Array::from(client_ip)),
-            Arc::new(Int64Array::from(mobile)),
-            Arc::new(StringArray::from(mobile_model)),
-            Arc::new(Int64Array::from(url_hash)),
-            Arc::new(Int64Array::from(ref_hash)),
-            Arc::new(UInt32Array::from(win_w)),
-            Arc::new(UInt32Array::from(win_h)),
-        ],
-    )
-    .expect("hits batch")
-}
-
 // Silence unused constant warning when tables list is for documentation only.
-#[allow(dead_code)]
 fn _tpcds_tables_doc() -> &'static [&'static str] {
     TPCDS_TABLES
-}
-
-/// Rewrite CH-benCH SQL for DataFusion: `mod(a, b)` → `(a % b)`.
-fn chbench_sql_for_datafusion(sql: &str) -> String {
-    // Simple token rewrite: mod(x, y) appears with nested arithmetic in CH-benCH.
-    // Use a conservative approach: replace "mod(" with temporary and parse pairs.
-    let mut out = String::with_capacity(sql.len() + 16);
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 4 <= bytes.len()
-            && bytes[i].eq_ignore_ascii_case(&b'm')
-            && bytes[i + 1].eq_ignore_ascii_case(&b'o')
-            && bytes[i + 2].eq_ignore_ascii_case(&b'd')
-            && bytes[i + 3] == b'('
-        {
-            // Find matching close paren for mod( ... )
-            let mut depth = 1usize;
-            let mut j = i + 4;
-            let start_args = j;
-            while j < bytes.len() && depth > 0 {
-                match bytes[j] {
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    _ => {}
-                }
-                j += 1;
-            }
-            let args = &sql[start_args..j - 1];
-            // Split on top-level comma.
-            let mut comma = None;
-            let mut d = 0i32;
-            for (k, ch) in args.char_indices() {
-                match ch {
-                    '(' => d += 1,
-                    ')' => d -= 1,
-                    ',' if d == 0 => {
-                        comma = Some(k);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(c) = comma {
-                let left = args[..c].trim();
-                let right = args[c + 1..].trim();
-                out.push('(');
-                out.push_str(left);
-                out.push_str(" % ");
-                out.push_str(right);
-                out.push(')');
-            } else {
-                out.push_str(&sql[i..j]);
-            }
-            i = j;
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn generate_chbench_parquet(out_dir: &Path, warehouses: i64) {
-    use support::chbench_data::generate_chbench_duckdb_sql;
-    std::fs::create_dir_all(out_dir).expect("chbench out dir");
-    let gen_db = out_dir.join("gen.duckdb");
-    let conn = Connection::open(&gen_db).expect("duckdb open for chbench gen");
-    let sql = generate_chbench_duckdb_sql(out_dir, warehouses);
-    conn.execute_batch(&sql)
-        .unwrap_or_else(|e| panic!("chbench generate: {e}"));
 }
 
 /// CH-benCHmark SF1: harness executes each query on Cayenne (full/append/changes)
@@ -1037,9 +751,7 @@ async fn chbench_sf1_load_mode_matrix_vs_duckdb() {
     );
 
     let chbench_dir = scratch.join(format!("chbench_sf{warehouses}"));
-    if !chbench_dir.join("order_line.parquet").exists() {
-        generate_chbench_parquet(&chbench_dir, warehouses);
-    }
+    support::chbench_data::ensure_chbench_fixture(&chbench_dir, warehouses);
 
     let (duck_temp, duck) = load_duckdb_from_parquet(&chbench_dir, CHBENCH_TABLES);
     let _keep = duck_temp;
@@ -1056,7 +768,7 @@ async fn chbench_sf1_load_mode_matrix_vs_duckdb() {
     let mut labeled: Vec<(String, ParityOutcome)> = Vec::new();
 
     for q in get_chbench_test_queries(None) {
-        let cayenne_sql = chbench_sql_for_datafusion(&q.sql);
+        let cayenne_sql = support::chbench_data::chbench_sql_for_datafusion(&q.sql);
         let duck_sql = q.sql.as_ref();
         let q_c = Query::new(q.name.clone(), cayenne_sql.clone().into(), false);
 
@@ -1165,7 +877,7 @@ async fn chbench_sf1_load_mode_matrix_vs_duckdb() {
 /// Star Schema Benchmark: classic Q1.1–Q4.3 on deterministic reduced-scale data.
 #[tokio::test(flavor = "multi_thread")]
 async fn ssb_full_result_parity_vs_duckdb() {
-    use support::ssb_data::{SSB_TABLES, ssb_queries, write_ssb_parquet};
+    use support::ssb_data::{SSB_TABLES, ensure_ssb_fixture, ssb_queries};
 
     let scratch = scratch_dir();
     std::fs::create_dir_all(&scratch).ok();
@@ -1173,9 +885,7 @@ async fn ssb_full_result_parity_vs_duckdb() {
     eprintln!("SSB parity vs DuckDB at scale={scale}");
 
     let ssb_dir = scratch.join(format!("ssb_scale{scale}"));
-    if !ssb_dir.join("lineorder.parquet").exists() {
-        write_ssb_parquet(&ssb_dir, scale);
-    }
+    ensure_ssb_fixture(&ssb_dir, scale);
 
     let cayenne = load_cayenne_from_parquet(&ssb_dir, SSB_TABLES).await;
     let (duck_temp, duck) = load_duckdb_from_parquet(&ssb_dir, SSB_TABLES);
@@ -1204,10 +914,7 @@ async fn ssb_full_result_parity_vs_duckdb() {
     std::fs::write(&log_path, &log).expect("write ssb log");
     eprintln!("{}", summary_line(&results));
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let fails = support::report::unexplained(&results, &build_inventory(), &[]);
     assert!(
         fails.is_empty(),
         "SSB full-result parity failures: {fails:#?}\nsee {}",
@@ -1225,9 +932,7 @@ async fn spicebench_sf1_tpch_scenario_parity_vs_duckdb() {
     eprintln!("SpiceBench SF1 (TPC-H scenario) parity at SF={sf}");
 
     let parquet_dir = scratch.join(format!("tpch_sf{sf}"));
-    if !parquet_dir.join("lineitem.parquet").exists() {
-        generate_tpch_parquet(&parquet_dir, sf);
-    }
+    ensure_tpch_fixture(&parquet_dir, sf);
 
     let cayenne = load_cayenne_from_parquet(&parquet_dir, TPCH_TABLES).await;
     let (duck_temp, duck) = load_duckdb_from_parquet(&parquet_dir, TPCH_TABLES);
@@ -1279,10 +984,7 @@ async fn spicebench_sf1_tpch_scenario_parity_vs_duckdb() {
     std::fs::write(&log_path, &log).expect("write spicebench log");
     eprintln!("{}", summary_line(&results));
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let fails = support::report::unexplained(&results, &build_inventory(), &[]);
     assert!(
         fails.is_empty(),
         "SpiceBench SF1 parity failures: {fails:#?}\nsee {}",
@@ -1348,10 +1050,7 @@ async fn sqllancer_corpus_parity_vs_duckdb() {
     write_coverage_report(&scratch.join("parity_coverage.md"), &results).ok();
     eprintln!("{}", summary_line(&results));
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let fails = support::report::unexplained(&results, &build_inventory(), &[]);
     assert!(
         fails.is_empty(),
         "SQLLancer corpus parity failures: {fails:#?}\nsee {}",

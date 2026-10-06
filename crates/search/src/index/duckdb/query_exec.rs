@@ -59,12 +59,12 @@ pub(super) struct DuckDBVectorQueryExec {
 
 impl DuckDBVectorQueryExec {
     async fn query_vector(&self) -> DataFusionResult<Vec<f32>> {
-        let mut vectors = self
+        let vectors = self
             .compute_query
             .embed(EmbeddingInput::String(self.query_text.clone()))
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let vector = vectors.pop().ok_or_else(|| {
+        let vector = vectors.first().cloned().ok_or_else(|| {
             DataFusionError::Execution("No embedding vector computed for query".to_string())
         })?;
         validate_vector(&vector, self.dims, "query")?;
@@ -149,6 +149,17 @@ impl ExecutionPlan for DuckDBVectorQueryExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -314,8 +325,11 @@ mod tests {
 
     #[async_trait]
     impl Embed for NoopEmbed {
-        async fn embed(&self, _input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
-            Ok(vec![])
+        async fn embed(
+            &self,
+            _input: EmbeddingInput,
+        ) -> llms::embeddings::Result<std::sync::Arc<Vec<Vec<f32>>>> {
+            Ok(std::sync::Arc::new(vec![]))
         }
 
         fn size(&self) -> i32 {
@@ -383,8 +397,8 @@ mod tests {
             "a timezone-aware column must not be rendered through whole milliseconds: {sql}"
         );
         assert!(
-            sql.contains(".000999"),
-            "the comparison must keep its sub-millisecond digits: {sql}"
+            sql.contains(r#""ts" > make_timestamptz(1767225600000999)"#),
+            "the comparison must name the microsecond the literal holds: {sql}"
         );
     }
 }

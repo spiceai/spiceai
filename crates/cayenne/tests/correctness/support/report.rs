@@ -29,6 +29,62 @@ pub struct RunResult {
     pub outcome: ParityOutcome,
 }
 
+/// The results a lane must not accept.
+///
+/// A `Pass` needs no explanation and an `Excluded` carries its own. An
+/// `OrderUnchecked` is accepted only where the inventory names why that query's
+/// `ORDER BY` cannot be verified against its own result columns — otherwise it
+/// lands here, because an order nothing verified and nobody reviewed is exactly
+/// what the sort check was added to stop passing quietly.
+///
+/// A `Vacuous` agreement — both sides answered with no value — is accepted only
+/// where the inventory reviews that query as empty on the fixture `fixtures`
+/// names for its suite, as `("tpcds", fixture::TPCDS_DSDGEN_SF1)`. A suite the
+/// lane names no fixture for accepts no empty answer.
+///
+/// A reviewed name does not blanket the query: it accepts an unverified order,
+/// not a violation or a content mismatch, both of which stay failures.
+#[must_use]
+pub fn unexplained<'a>(
+    results: &'a [RunResult],
+    inventory: &[InventoryEntry],
+    fixtures: &[(&str, &str)],
+) -> Vec<&'a RunResult> {
+    results
+        .iter()
+        .filter(|r| {
+            if r.outcome.is_pass_or_excluded() {
+                return false;
+            }
+            // `chbench[append]` reviews as `chbench`.
+            let suite = r.suite.split('[').next().unwrap_or(&r.suite);
+            let entries = || {
+                inventory
+                    .iter()
+                    .filter(|e| e.suite == suite && e.name == r.name)
+            };
+            match r.outcome {
+                ParityOutcome::OrderUnchecked { .. } => {
+                    !entries().any(|e| e.order_unchecked_review.is_some())
+                }
+                ParityOutcome::Vacuous { .. } => {
+                    let fixture = fixtures
+                        .iter()
+                        .find(|(fixture_suite, _)| *fixture_suite == suite)
+                        .map(|(_, fixture)| *fixture);
+                    !fixture.is_some_and(|fixture| {
+                        entries().any(|e| {
+                            e.empty_result_review
+                                .is_some_and(|review| review.covers(fixture))
+                        })
+                    })
+                }
+                _ => true,
+            }
+        })
+        .collect()
+}
+
 /// Write a machine-readable + human coverage report.
 pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -79,15 +135,25 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
     writeln!(md, "|-------|-------|-------------|--------|--------|").ok();
 
     let mut pass = 0usize;
+    let mut vacuous = 0usize;
     let mut excluded = 0usize;
     let mut fail = 0usize;
     let mut engine_err = 0usize;
+    let mut order_unchecked = 0usize;
 
     for r in results {
         let (status, detail) = match &r.outcome {
             ParityOutcome::Pass => {
                 pass += 1;
                 ("PASS", String::new())
+            }
+            ParityOutcome::OrderUnchecked { reasons } => {
+                order_unchecked += 1;
+                ("ORDER_UNCHECKED", reasons.join("; "))
+            }
+            ParityOutcome::Vacuous { detail } => {
+                vacuous += 1;
+                ("VACUOUS", detail.clone())
             }
             ParityOutcome::Excluded { reason } => {
                 excluded += 1;
@@ -115,13 +181,23 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
     writeln!(md, "## Summary").ok();
     writeln!(md).ok();
     writeln!(md, "- pass: {pass}").ok();
+    writeln!(
+        md,
+        "- vacuous (both sides empty, nothing compared): {vacuous}"
+    )
+    .ok();
     writeln!(md, "- excluded (justified): {excluded}").ok();
+    writeln!(
+        md,
+        "- order unchecked (content compared, sort not): {order_unchecked}"
+    )
+    .ok();
     writeln!(md, "- fail: {fail}").ok();
     writeln!(md, "- engine_error: {engine_err}").ok();
     writeln!(
         md,
         "- total reported: {}",
-        pass + excluded + fail + engine_err
+        pass + vacuous + excluded + order_unchecked + fail + engine_err
     )
     .ok();
     writeln!(md, "- inventory size: {}", inventory.len()).ok();
@@ -156,6 +232,27 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
     std::fs::write(path, md)
 }
 
+/// Write a lane's log under the scratch dir, print its summary, and fail on any
+/// result [`unexplained`] does not accept. `fixtures` names the rows the lane
+/// loaded for each suite, as [`unexplained`] takes them.
+pub fn finish_lane(results: &[RunResult], fixtures: &[(&str, &str)], log_name: &str, header: &str) {
+    let log_path = super::scratch_dir().join(log_name);
+    let mut log = format!("{header}\n");
+    for r in results {
+        writeln!(log, "{}/{}: {:?}", r.suite, r.name, r.outcome).ok();
+    }
+    writeln!(log, "{}", summary_line(results)).ok();
+    std::fs::write(&log_path, &log).unwrap_or_else(|e| panic!("write {}: {e}", log_path.display()));
+    eprintln!("{header}: {}", summary_line(results));
+    let failures = unexplained(results, &build_inventory(), fixtures);
+    assert!(
+        failures.is_empty(),
+        "{header}: {} unexplained result(s): {failures:#?}\nsee {}",
+        failures.len(),
+        log_path.display()
+    );
+}
+
 /// Format a short console summary.
 #[must_use]
 pub fn summary_line(results: &[RunResult]) -> String {
@@ -163,9 +260,17 @@ pub fn summary_line(results: &[RunResult]) -> String {
         .iter()
         .filter(|r| matches!(r.outcome, ParityOutcome::Pass))
         .count();
+    let vacuous = results
+        .iter()
+        .filter(|r| matches!(r.outcome, ParityOutcome::Vacuous { .. }))
+        .count();
     let excluded = results
         .iter()
         .filter(|r| matches!(r.outcome, ParityOutcome::Excluded { .. }))
+        .count();
+    let order_unchecked = results
+        .iter()
+        .filter(|r| matches!(r.outcome, ParityOutcome::OrderUnchecked { .. }))
         .count();
     let fail = results
         .iter()
@@ -177,7 +282,8 @@ pub fn summary_line(results: &[RunResult]) -> String {
         })
         .count();
     format!(
-        "correctness summary: pass={pass} excluded={excluded} fail={fail} total={}",
+        "correctness summary: pass={pass} vacuous={vacuous} excluded={excluded} \
+         order_unchecked={order_unchecked} fail={fail} total={}",
         results.len()
     )
 }

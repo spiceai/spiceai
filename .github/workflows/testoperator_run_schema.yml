@@ -124,12 +124,19 @@ jobs:
       - name: Start local MinIO for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') }}
         run: |
-          docker run -d --name minio \
+          # MinIO no longer publishes images or binaries: quay.io/minio/minio and minio/minio refuse
+          # anonymous pulls and dl.min.io answers 410. Chainguard builds the same server from the
+          # upstream source; it runs as a non-root user that cannot create /data, hence --user.
+          image=cgr.dev/chainguard/minio:latest
+          if ! docker run -d --name minio --user 0:0 \
             -p 9000:9000 \
             -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data --console-address ':9001'
+            "$image" server /data --console-address ':9001'; then
+            echo "::error::Could not start MinIO from $image. If the pull was refused, the image is no longer published there; point this step at a registry that still serves MinIO."
+            exit 1
+          fi
 
       - name: Wait for local MinIO
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') }}
@@ -147,7 +154,12 @@ jobs:
       - name: Bootstrap DuckLake TPCH SF1 catalog
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') }}
         run: |
-          python3 -m pip install --upgrade duckdb minio
+          # DuckLake stamps its catalog with the version of the extension that wrote it, and spiced reads it
+          # with the DuckDB version the `duckdb` crate pins in Cargo.toml. A newer duckdb writes a catalog the
+          # runtime's extension rejects: "Only DuckLake versions 0.1, 0.2, 0.3-dev1 and 0.3 are supported".
+          duckdb_version=$(awk -F'"' '/^duckdb = "/ { print $2; exit }' Cargo.toml)
+          [ -n "$duckdb_version" ] || { echo 'could not read the duckdb version from Cargo.toml'; exit 1; }
+          python3 -m pip install --upgrade "duckdb==$duckdb_version" minio
 
           python3 <<'PY'
           import duckdb
@@ -232,6 +244,17 @@ jobs:
 
       - name: Run the schema test - ${{ github.event.inputs.spicepod_path }}
         run: |
+          # A variable set to "" is not unset. `AWS_ENDPOINT_URL=""` is an endpoint
+          # override the AWS SDK rejects by panicking, which aborts the whole
+          # runtime, and `DUCKLAKE_CONNECTION_STRING=""` is a connection the
+          # DuckLake extension tries to open. These are only meaningful for
+          # `ducklake[postgres+s3]`.
+          for name in AWS_ENDPOINT_URL AWS_ALLOW_HTTP DUCKLAKE_CONNECTION_STRING; do
+            if [ -z "${!name:-}" ]; then
+              unset "$name"
+            fi
+          done
+
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run schema \
             -s /usr/local/bin/spiced \
@@ -327,8 +350,12 @@ jobs:
           git commit -m "fix: Update schema snapshots for: ${{ github.event.inputs.spicepod_path }}"
           # The checkout persists no credentials, so authenticate the push
           # itself rather than leaving a token in the local git config for the
-          # rest of the job.
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}"
+          # rest of the job. Disable any credential helper configured on the
+          # (self-hosted) runner as well, so git uses the URL-embedded token only:
+          # otherwise a helper (osxkeychain / git-credential-manager) can intercept
+          # the push and block on an interactive credential prompt, hanging the job.
+          git -c credential.helper='' -c credential.interactive=false \
+            push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}"
 
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
           if [[ -n "${PR_URL}" ]]; then
@@ -345,3 +372,6 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'

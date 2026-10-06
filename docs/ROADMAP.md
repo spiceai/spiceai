@@ -15,25 +15,14 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v2.2.1](https://github.com/spiceai/spiceai/milestone/111) (August 2026)
-
-**Focus:** Patch release — write-back durability, Cayenne, and accelerator stability fixes.
-
-### [v2.3](https://github.com/spiceai/spiceai/milestone/100) (September 2026)
-
-**Focus:** Schema Registry & Write-Back Acceleration.
-
-**DataFusion:** v55
-
-- **Schema Registry (Initial)**: Versioning and backward compatibility checks.
-- **Write-Back Acceleration DML**: Full UPDATE/DELETE DML on write-through accelerated tables.
-
 ### [v2.4](https://github.com/spiceai/spiceai/milestone/101) (October 2026)
 
-**Focus:** Distributed Search, Enterprise Security, Compliance, & Governance.
+**Focus:** Schema Registry, Write-Back Acceleration, Distributed Search, Enterprise Security, Compliance, & Governance.
 
 **DataFusion:** v56
 
+- **Schema Registry (Initial)**: Versioning and backward compatibility checks.
+- **Write-Back Acceleration DML**: Full UPDATE/DELETE DML on write-through accelerated tables.
 - **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes, with FTS indexes available in distributed query mode.
 - **Distributed Search Scale-Out**: Search query partitioning and relative score fusion across distributed nodes.
 - **Distributed Cayenne Catalog**: Cayenne catalog with full distributed query and acceleration support.

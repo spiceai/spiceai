@@ -67,24 +67,24 @@ fn make_catalog(path: &str, name: &str) -> Catalog {
 #[expect(clippy::expect_used)]
 fn get_params() -> Params {
     // Verify that the environment variables are set
-    let _ = std::env::var("TEST_DATABRICKS_HOST").expect("TEST_DATABRICKS_HOST is not set");
-    let _ = std::env::var("TEST_DATABRICKS_TOKEN").expect("TEST_DATABRICKS_TOKEN is not set");
+    let _ = std::env::var("NEW_DATABRICKS_HOST").expect("NEW_DATABRICKS_HOST is not set");
+    let _ = std::env::var("NEW_DATABRICKS_TOKEN").expect("NEW_DATABRICKS_TOKEN is not set");
     let _ =
-        std::env::var("TEST_DATABRICKS_CLUSTER_ID").expect("TEST_DATABRICKS_CLUSTER_ID is not set");
+        std::env::var("NEW_DATABRICKS_CLUSTER_ID").expect("NEW_DATABRICKS_CLUSTER_ID is not set");
 
     Params::from_string_map(
         vec![
             (
                 "databricks_endpoint".to_string(),
-                "${ env:TEST_DATABRICKS_HOST }".to_string(),
+                "${ env:NEW_DATABRICKS_HOST }".to_string(),
             ),
             (
                 "databricks_token".to_string(),
-                "${ env:TEST_DATABRICKS_TOKEN }".to_string(),
+                "${ env:NEW_DATABRICKS_TOKEN }".to_string(),
             ),
             (
                 "databricks_cluster_id".to_string(),
-                "${ env:TEST_DATABRICKS_CLUSTER_ID }".to_string(),
+                "${ env:NEW_DATABRICKS_CLUSTER_ID }".to_string(),
             ),
             ("mode".to_string(), "spark_connect".to_string()),
         ]
@@ -109,18 +109,11 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_spark_connector")
-                .with_catalog(make_catalog(
-                    "catalog-dash-test",
-                    "db_uc",
-                ))
+                .with_catalog(make_catalog("catalog-dash-test", "db_uc"))
                 .build();
 
             configure_test_datafusion();
-            let mut rt =
-                Runtime::builder()
-                    .with_app(app)
-                    .build()
-                    .await;
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
             // Set a timeout for the test
@@ -144,11 +137,11 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks (mode: spark_connect) Integration Test Results"),
+                        description => "Databricks (mode: spark_connect) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("databricks_spark_connect_select"), results);
+                        insta::assert_snapshot!("databricks_spark_connect_select", results);
                     });
                 })),
             )];

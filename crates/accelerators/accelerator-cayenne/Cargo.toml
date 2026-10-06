@@ -37,6 +37,7 @@ runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-table-partition = { path = "../../runtime-table-partition" }
 async-trait.workspace = true
+parking_lot.workspace = true
 datafusion.workspace = true
 linkme.workspace = true
 paste.workspace = true
@@ -72,7 +73,7 @@ rusqlite.workspace = true
 turso-shared.workspace = true
 itertools.workspace = true
 snafu.workspace = true
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "fs"] }
 
 [dev-dependencies]
 # Test-only, and deliberately dev-only: these sit in the `runtime` tier, so a normal

@@ -1,9 +1,12 @@
+# Spice Cloud is a hosted service, so this runs on the weekly schedule instead of daily.
+schedule: weekly
 tests:
   bench:
     spicepod_path: federated/spicecloud.yaml
     query_set: tpcds
     query_overrides: spicecloud
     runner_type: spiceai-dev-runners
+    validate_results: true
   throughput:
     spicepod_path: federated/spicecloud.yaml
     query_set: tpcds

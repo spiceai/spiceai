@@ -33,6 +33,7 @@ use arrow_flight::{
     sql::{self, CommandPreparedStatementQuery, DoPutPreparedStatementResult, ProstMessageExt},
 };
 use arrow_schema::SchemaRef;
+use arrow_tools::map_entries;
 use arrow_tools::record_batch::record_to_param_values;
 use datafusion::common::ParamValues;
 use datafusion::prelude::SessionContext;
@@ -314,7 +315,7 @@ pub(crate) async fn do_get(
         parameter_schema,
     } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
 
-    let param_values = decode_param_values(&parameters).map_err(error_to_status)?;
+    let param_values = decode_param_values(&parameters).map_err(param_error_to_status)?;
 
     // Rewrite SQL with explicit type casts when parameter schema is available.
     let sql_to_execute = if let Some(schema_bytes) = &parameter_schema {
@@ -341,10 +342,25 @@ pub(crate) async fn do_put_query(
 ) -> Result<Response<<FlightSqlService as FlightService>::DoPutStream>, Status> {
     tracing::debug!("do_put_query: binding parameters");
 
-    let streaming = streaming_flight.map(|r| r.map_err(|s| FlightError::Tonic(Box::new(s))));
+    let decodable = super::DecodableSchema::default();
+    let streaming = streaming_flight.map({
+        let decodable = decodable.clone();
+        move |r| {
+            r.map_err(|s| FlightError::Tonic(Box::new(s)))
+                .map(|message| decodable.repair(message))
+        }
+    });
     let mut decoder = FlightDataDecoder::new(streaming);
 
-    let schema = decode_schema(&mut decoder).await?;
+    let schema = decodable.declared(decode_schema(&mut decoder).await?);
+
+    // The parameters are stored as bytes and read back at execution time, so what is written
+    // here is what the query binds. A `MAP` whose `entries` the client declared nullable is
+    // brought into line before it is written, not after: the stored stream is the one the Arrow
+    // map layout allows, and a client that sent an entries array holding nulls is told so now,
+    // while the column can still be named.
+    let normalizer = map_entries::MapEntriesNormalizer::for_schema(&schema);
+    let schema = Arc::clone(normalizer.schema());
 
     let mut parameters = Vec::new();
     let mut encoder = StreamWriter::try_new(&mut parameters, &schema).map_err(error_to_status)?;
@@ -360,6 +376,9 @@ pub(crate) async fn do_put_query(
             }
             DecodedPayload::RecordBatch(batch) => {
                 total_rows += batch.num_rows();
+                let batch = normalizer
+                    .normalize(batch)
+                    .map_err(|error| map_entries_to_status(&error))?;
                 encoder.write(&batch).map_err(error_to_status)?;
             }
         }
@@ -421,13 +440,230 @@ pub(super) fn decode_param_values(
     if parameters.is_empty() {
         return Ok(None);
     }
-    let decoder = StreamReader::try_new(parameters, None)?;
-    let schema = decoder.schema();
-    let batches = decoder.into_iter().collect::<Result<Vec<_>, _>>()?;
-    let batch = concat_batches(&schema, batches.iter())?;
+    let declared = StreamReader::try_new(parameters, None)?.schema();
+    // A client is free to declare a MAP's `entries` field nullable, which the Arrow map layout
+    // forbids — and which the decode itself now refuses, over the one part of the column that
+    // holds no data, naming neither the column nor which of the two map rules was broken.
+    // Reading through `arrow_tools` decodes those buffers as the list they are laid out as and
+    // brings the parameter into line where the column can still be named.
+    let batches = map_entries::read_ipc_stream(parameters).map_err(param_decode_error)?;
+    let batch = concat_batches(&map_entries::conforming_schema(declared), batches.iter())?;
     Ok(Some(record_to_param_values(&batch)?))
+}
+
+/// Reports a failure to read the Arrow IPC stream a client sent its parameters in.
+///
+/// Only the map failures carry the map remediation. A stream that does not decode at all fails
+/// for a reason of its own — truncated bytes, a header that will not parse — and telling its
+/// sender to check a MAP `entries` declaration names a column they may not even have sent.
+fn param_decode_error(error: map_entries::Error) -> datafusion::error::DataFusionError {
+    match error {
+        map_entries::Error::UndecodableStream { source } => source.into(),
+        named => datafusion::error::DataFusionError::Execution(format!(
+            "Failed to read the query parameters sent to the Flight SQL server ({named}), so the query cannot run. \
+             Send the MAP parameter with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+             See: https://spiceai.org/docs/api/arrow-flight-sql"
+        )),
+    }
+}
+
+/// Reports a `MAP` parameter the Arrow map layout has no way to carry.
+///
+/// The client's own bytes are what is wrong, and no retry of them will succeed, so this is an
+/// argument error rather than the `Internal` a client would be entitled to retry.
+fn map_entries_to_status(error: &map_entries::Error) -> Status {
+    Status::invalid_argument(format!(
+        "Failed to bind the query parameters sent to the Flight SQL server ({error}), so the query cannot run. \
+         Send the MAP parameter with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+         See: https://spiceai.org/docs/api/arrow-flight-sql"
+    ))
 }
 
 pub(super) fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
     Status::internal(format!("{err:?}"))
+}
+
+/// Reports a failure to decode the parameters a client sent with a prepared statement.
+///
+/// Every way [`decode_param_values`] can fail describes the client's own bytes — an IPC stream that
+/// does not parse, batches whose schemas disagree, a `MAP` declaration the Arrow layout forbids, or
+/// a value that is not representable as a scalar. None of them is a server fault, so none of them
+/// becomes more likely to succeed on a retry, which is what `Internal` would invite the client to do.
+pub(super) fn param_error_to_status<E: std::fmt::Display>(err: E) -> Status {
+    Status::invalid_argument(format!("{err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_param_values;
+
+    /// Builds a `MapArray` the way an Arrow IPC reader does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a producer's non-conforming
+    /// declaration survives the decode.
+    fn nullable_entries_map_batch() -> arrow::array::RecordBatch {
+        use arrow::array::{
+            Array, ArrayData, ArrayRef, MapArray, RecordBatch, StringArray, StructArray,
+        };
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        use std::sync::Arc;
+
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0")])) as ArrayRef,
+            ],
+            None,
+        )
+        .expect("entries struct");
+
+        let builder = ArrayData::builder(data_type.clone())
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    /// Serializes `batch` as an Arrow IPC stream, byte for byte what a client sends.
+    fn ipc_stream(batch: &arrow::array::RecordBatch) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
+                .expect("ipc writer");
+            writer.write(batch).expect("write batch");
+            writer.finish().expect("finish stream");
+        }
+        buf
+    }
+
+    /// Regression test for #13495: a client declaring a `MAP` parameter's `entries` nullable —
+    /// which the Arrow map layout forbids — is brought into line at the decode point instead of
+    /// failing later in whichever kernel first rebuilds the column.
+    #[test]
+    fn a_nullable_entries_map_parameter_decodes() {
+        use arrow::array::Array;
+
+        let bytes = ipc_stream(&nullable_entries_map_batch());
+        let values = decode_param_values(&bytes)
+            .expect("a nullable entries declaration is relabelled, not refused")
+            .expect("parameters were sent");
+
+        let datafusion::common::ParamValues::Map(named) = values else {
+            panic!("a named parameter batch decodes to a map of parameters");
+        };
+        let value = named.get("m").expect("the map parameter is present");
+        match &value.value {
+            datafusion::scalar::ScalarValue::Map(map) => match map.data_type() {
+                arrow::datatypes::DataType::Map(entries, _) => assert!(
+                    !entries.is_nullable(),
+                    "the decoded parameter must carry the corrected declaration"
+                ),
+                other => panic!("expected a Map parameter, got {other:?}"),
+            },
+            other => panic!("expected a Map parameter, got {other:?}"),
+        }
+    }
+
+    /// Builds the one `MAP` shape relabelling cannot repair: `entries` declared nullable *and*
+    /// carrying an actual null, which the Arrow map layout has no valid representation for.
+    fn entries_with_nulls_map_batch() -> arrow::array::RecordBatch {
+        use arrow::array::{
+            Array, ArrayData, ArrayRef, MapArray, RecordBatch, StringArray, StructArray,
+        };
+        use arrow::buffer::{Buffer, NullBuffer};
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        use std::sync::Arc;
+
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0", "k1"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0"), Some("v1")])) as ArrayRef,
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .expect("entries struct");
+        let builder = ArrayData::builder(data_type.clone())
+            .len(2)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1, 2]))
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    /// The one shape relabelling cannot fix is refused where the column can still be named,
+    /// rather than surfacing as `MapArray entries cannot contain nulls` from an unrelated kernel.
+    #[test]
+    fn a_map_parameter_whose_entries_carry_nulls_is_refused_by_name() {
+        let err = decode_param_values(&ipc_stream(&entries_with_nulls_map_batch()))
+            .expect_err("entries carrying nulls have no representation to relabel to");
+        let message = err.to_string();
+        assert!(
+            message.contains("'m'") && message.contains("arrow-flight-sql"),
+            "the refusal must name the column and point at the docs: {message}"
+        );
+    }
+
+    /// The query path and the update path both decode parameters with `decode_param_values` and
+    /// report a failure with `param_error_to_status`. Every failure that decode can produce
+    /// describes the client's own bytes, so it must reach the client as `InvalidArgument` — never
+    /// as an `Internal` the client would be entitled to retry — and must still name the column.
+    #[test]
+    fn a_malformed_map_parameter_is_reported_as_invalid_argument() {
+        let err = decode_param_values(&ipc_stream(&entries_with_nulls_map_batch()))
+            .expect_err("entries carrying nulls have no representation to relabel to");
+        let status = super::param_error_to_status(err);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("'m'"),
+            "the status must still name the column: {}",
+            status.message()
+        );
+    }
 }

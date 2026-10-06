@@ -1,0 +1,4 @@
+==> Linting /Users/lukim/dev/spice-k8s-operator/deploy/chart
+[INFO] Chart.yaml: icon is recommended
+
+1 chart(s) linted, 0 chart(s) failed

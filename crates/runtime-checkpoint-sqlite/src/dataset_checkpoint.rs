@@ -105,27 +105,33 @@ impl SqliteDatasetCheckpointer {
 
         conn.conn
             .call(move |conn| {
-                // Check if schema_json column exists
-                let columns: Vec<String> = conn
+                // Several datasets can share one database file, each migrating it over its
+                // own connection at the same time. `BEGIN IMMEDIATE` takes the write lock
+                // before the columns are read, so a second migrator waits (up to the busy
+                // timeout) and then sees the columns the first one added, instead of
+                // adding them again and failing with "duplicate column name".
+                let txn =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let columns: Vec<String> = txn
                     .prepare(&format!("PRAGMA table_info({CHECKPOINT_TABLE_NAME})"))?
                     .query_map([], |row| row.get::<_, String>(1))?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
 
                 if !columns.contains(&"schema_json".to_string()) {
-                    conn.execute(
+                    txn.execute(
                         &format!("ALTER TABLE {CHECKPOINT_TABLE_NAME} ADD COLUMN schema_json TEXT"),
                         [],
                     )?;
                 }
 
                 if !columns.contains(&"refresh_sql".to_string()) {
-                    conn.execute(
+                    txn.execute(
                         &format!("ALTER TABLE {CHECKPOINT_TABLE_NAME} ADD COLUMN refresh_sql TEXT"),
                         [],
                     )?;
                 }
 
-                Ok::<(), rusqlite::Error>(())
+                txn.commit()
             })
             .await
             .map_err(store_error)
@@ -206,6 +212,31 @@ impl SqliteDatasetCheckpointer {
                      SET schema_json = ?2, refresh_sql = ?3, updated_at = CURRENT_TIMESTAMP"
                 );
                 conn.execute(&upsert, rusqlite::params![&dataset_name, &schema_json, &refresh_sql_owned])?;
+
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .map_err(store_error)
+    }
+
+    async fn set_schema_inner(&self, schema: &SchemaRef) -> Result<(), CheckpointError> {
+        let pool = &self.pool;
+        let dataset_name = self.dataset_name.clone();
+        let schema_json = serialize_schema(schema).map_err(store_error)?;
+
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(downcast_failed());
+        };
+
+        conn.conn
+            .call(move |conn| {
+                // Not an upsert: an absent row must stay absent rather than gain a fresh
+                // `updated_at`, which is the deferral this exists to avoid.
+                let update = format!(
+                    "UPDATE {CHECKPOINT_TABLE_NAME} SET schema_json = ?2 WHERE dataset_name = ?1"
+                );
+                conn.execute(&update, rusqlite::params![&dataset_name, &schema_json])?;
 
                 Ok::<(), rusqlite::Error>(())
             })
@@ -325,6 +356,13 @@ impl DatasetCheckpointer for SqliteDatasetCheckpointer {
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         self.get_refresh_sql_inner().await.map_err(Into::into)
+    }
+
+    async fn set_schema(
+        &self,
+        schema: &SchemaRef,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        self.set_schema_inner(schema).await.map_err(Into::into)
     }
 
     async fn delete(&self) -> runtime_acceleration::dataset_checkpoint::Result<()> {
@@ -676,5 +714,173 @@ mod tests {
             new_checkpoint_time > checkpoint_time,
             "New checkpoint time should be more recent"
         );
+    }
+
+    /// A schema repair must correct the recorded schema without telling the refresh
+    /// scheduler the data was just refreshed. Regression test for #13817.
+    #[tokio::test]
+    async fn set_schema_rewrites_the_schema_without_touching_the_freshness_clock() {
+        let checkpoint = create_in_memory_sqlite_checkpoint().await;
+
+        let original = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        // What a repair writes back: the same columns, `name` no longer nullable.
+        let repaired = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        checkpoint
+            .checkpoint(&original, Some("SELECT 1"))
+            .await
+            .expect("seed checkpoint");
+
+        backdate_checkpoint_by_seven_days(&checkpoint).await;
+
+        let before = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("read checkpoint time")
+            .expect("checkpoint time present");
+
+        checkpoint
+            .set_schema(&repaired)
+            .await
+            .expect("schema-only write");
+
+        // Read back through a fresh checkpointer over the same store: acceptance is what
+        // the row holds, not what the call returned.
+        let reader = SqliteDatasetCheckpointer::new(
+            Arc::clone(&checkpoint.pool),
+            checkpoint.dataset_name.clone(),
+        );
+
+        let after = reader
+            .last_checkpoint_time()
+            .await
+            .expect("read checkpoint time")
+            .expect("checkpoint time present");
+        assert_eq!(
+            after, before,
+            "a schema-only write must leave the freshness clock alone"
+        );
+
+        assert_eq!(
+            reader
+                .get_schema()
+                .await
+                .expect("read schema")
+                .expect("schema present"),
+            repaired,
+            "the repaired schema must be the one stored"
+        );
+
+        assert_eq!(
+            reader.get_refresh_sql().await.expect("read refresh sql"),
+            Some("SELECT 1".to_string()),
+            "a schema-only write must preserve the stored refresh SQL"
+        );
+    }
+
+    /// A dataset with no checkpoint must not gain one — a row created here would carry a
+    /// fresh `updated_at`, which is the deferral the schema-only write exists to avoid.
+    #[tokio::test]
+    async fn set_schema_leaves_an_absent_checkpoint_absent() {
+        let checkpoint = create_in_memory_sqlite_checkpoint().await;
+
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        checkpoint
+            .set_schema(&schema)
+            .await
+            .expect("schema-only write on an absent checkpoint");
+
+        assert!(
+            !checkpoint.exists().await,
+            "a schema-only write must not create a checkpoint row"
+        );
+        assert!(
+            checkpoint
+                .last_checkpoint_time()
+                .await
+                .expect("read checkpoint time")
+                .is_none(),
+            "an absent checkpoint must not gain a freshness timestamp"
+        );
+    }
+
+    /// Backdates the checkpoint's recorded refresh by seven days, as a dataset
+    /// bootstrapping from a legacy snapshot would be.
+    async fn backdate_checkpoint_by_seven_days(checkpoint: &SqliteDatasetCheckpointer) {
+        let conn_sync = checkpoint.pool.connect_sync();
+        let conn = conn_sync
+            .as_any()
+            .downcast_ref::<SqliteConnection>()
+            .expect("sqlite connection");
+        conn.conn
+            .call(move |conn| {
+                conn.execute(
+                    &format!(
+                        "UPDATE {CHECKPOINT_TABLE_NAME} SET updated_at = datetime('now', '-7 days')"
+                    ),
+                    [],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .expect("backdate updated_at");
+    }
+
+    /// Datasets sharing one database file (Cayenne's metastore) each open the checkpoint
+    /// table over their own connection, and they do so concurrently when they bootstrap
+    /// from snapshots together. Every one of them must come up, not only the first to
+    /// add the migrated columns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_migrations_of_one_file_all_succeed() {
+        const CONNECTIONS: usize = 8;
+        const ROUNDS: usize = 20;
+
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path: Arc<str> = Arc::from(dir.path().join("cayenne.db").to_string_lossy());
+
+            let mut pools = Vec::with_capacity(CONNECTIONS);
+            for _ in 0..CONNECTIONS {
+                pools.push(Arc::new(
+                    SqliteConnectionPoolFactory::new(
+                        &path,
+                        Mode::File,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .build()
+                    .await
+                    .expect("to build file sqlite connection pool"),
+                ));
+            }
+
+            let mut migrations = tokio::task::JoinSet::new();
+            for (i, pool) in pools.into_iter().enumerate() {
+                migrations.spawn(async move {
+                    SqliteDatasetCheckpointer::try_new(pool, format!("dataset_{i}"))
+                        .await
+                        .map(|_| ())
+                });
+            }
+            let failures = migrations
+                .join_all()
+                .await
+                .into_iter()
+                .filter_map(Result::err)
+                .map(|err| err.to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                failures.is_empty(),
+                "round {round}: {} of {CONNECTIONS} concurrent checkpoint openings failed: {failures:?}",
+                failures.len()
+            );
+        }
     }
 }

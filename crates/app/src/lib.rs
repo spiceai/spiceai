@@ -23,6 +23,7 @@ use snafu::prelude::*;
 pub use spicepod;
 use spicepod::{
     Spicepod,
+    acceleration::Mode as AccelerationMode,
     component::{
         caching::{CacheConfig, SQLResultsCacheConfig},
         catalog::Catalog,
@@ -119,9 +120,15 @@ impl Default for App {
 pub enum Error {
     #[snafu(display("Unable to load spicepod {}: {source}", path.display()))]
     UnableToLoadSpicepod {
-        source: spicepod::Error,
+        #[snafu(source(from(spicepod::Error, Box::new)))]
+        source: Box<spicepod::Error>,
         path: PathBuf,
     },
+
+    #[snafu(display(
+        "Invalid Cayenne configuration: datasets use different `cayenne_file_path` values without a shared `cayenne_metadata_dir`: {datasets}. Set the same `cayenne_metadata_dir` on every Cayenne dataset. See: https://spiceai.org/docs/components/data-accelerators/cayenne#metastore-location"
+    ))]
+    InvalidCayenneConfiguration { datasets: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -133,8 +140,84 @@ impl Error {
     pub fn is_spicepod_missing(&self) -> bool {
         match self {
             Self::UnableToLoadSpicepod { source, .. } => source.is_spicepod_missing(),
+            Self::InvalidCayenneConfiguration { .. } => false,
         }
     }
+}
+
+/// Whether `dataset` reads published snapshots (`file_format: snapshot`).
+fn reads_snapshots(dataset: &Dataset) -> bool {
+    dataset
+        .params
+        .as_ref()
+        .and_then(|params| params.data.get("file_format"))
+        .is_some_and(|format| format.as_string().trim().eq_ignore_ascii_case("snapshot"))
+}
+
+fn cayenne_file_path_conflict(datasets: &[Dataset]) -> Option<String> {
+    let cayenne_datasets: Vec<(String, String, Option<String>)> = datasets
+        .iter()
+        .filter_map(|dataset| {
+            let acceleration = dataset.acceleration.as_ref()?;
+            let declared_cayenne_file = acceleration.engine.as_deref().is_some_and(|engine| {
+                engine.eq_ignore_ascii_case("cayenne") || engine.eq_ignore_ascii_case("vortex")
+            }) && matches!(
+                acceleration.mode,
+                AccelerationMode::File
+                    | AccelerationMode::FileCreate
+                    | AccelerationMode::FileUpdate
+            );
+            // A snapshot dataset names neither: its engine comes from the snapshots and
+            // its mode is always file, so a `cayenne_file_path` on it is a Cayenne file path.
+            if !acceleration.enabled || !(declared_cayenne_file || reads_snapshots(dataset)) {
+                return None;
+            }
+
+            let params = acceleration.params.as_ref()?;
+            let file_path = params.data.get("cayenne_file_path")?.as_string();
+            let metadata_dir = params
+                .data
+                .get("cayenne_metadata_dir")
+                .map(spicepod::param::ParamValue::as_string);
+            Some((dataset.name.clone(), file_path, metadata_dir))
+        })
+        .collect();
+
+    let first_file_path = cayenne_datasets
+        .first()
+        .map(|(_, file_path, _)| file_path.trim_end_matches('/'));
+    if cayenne_datasets
+        .iter()
+        .all(|(_, file_path, _)| Some(file_path.trim_end_matches('/')) == first_file_path)
+    {
+        return None;
+    }
+
+    let first_metadata_dir = cayenne_datasets.first().and_then(|(_, _, metadata_dir)| {
+        metadata_dir
+            .as_deref()
+            .map(|path| path.trim_end_matches('/'))
+    });
+    if first_metadata_dir.is_some()
+        && cayenne_datasets.iter().all(|(_, _, metadata_dir)| {
+            metadata_dir
+                .as_deref()
+                .map(|path| path.trim_end_matches('/'))
+                == first_metadata_dir
+        })
+    {
+        return None;
+    }
+
+    Some(
+        cayenne_datasets
+            .iter()
+            .map(|(name, file_path, _)| {
+                format!("`{}` (`{}`)", name.escape_debug(), file_path.escape_debug())
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 pub struct AppBuilder {
@@ -509,6 +592,9 @@ impl AppBuilder {
         }
 
         spicepods.push(spicepod);
+        if let Some(datasets) = cayenne_file_path_conflict(&datasets) {
+            return InvalidCayenneConfigurationSnafu { datasets }.fail();
+        }
 
         Ok(App {
             name: root_spicepod_name,
@@ -528,5 +614,115 @@ impl AppBuilder {
             management,
             snapshots: snapshots.map(Arc::new),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AccelerationMode, Error, cayenne_file_path_conflict};
+    use spicepod::{acceleration::Acceleration, component::dataset::Dataset, param::Params};
+    use std::collections::HashMap;
+
+    fn cayenne_dataset(name: &str, file_path: &str, metadata_dir: Option<&str>) -> Dataset {
+        let mut params = HashMap::from([("cayenne_file_path".to_string(), file_path.to_string())]);
+        if let Some(metadata_dir) = metadata_dir {
+            params.insert("cayenne_metadata_dir".to_string(), metadata_dir.to_string());
+        }
+
+        let mut dataset = Dataset::new("file:data.parquet", name);
+        dataset.acceleration = Some(Acceleration {
+            engine: Some("cayenne".to_string()),
+            mode: AccelerationMode::File,
+            params: Some(Params::from_string_map(params)),
+            ..Default::default()
+        });
+        dataset
+    }
+
+    #[test]
+    fn cayenne_rejects_multiple_data_roots_without_shared_metadata() {
+        let datasets = vec![
+            cayenne_dataset("orders", "/mnt/a/cayenne", None),
+            cayenne_dataset("customers", "/mnt/b/cayenne", None),
+        ];
+
+        let datasets = cayenne_file_path_conflict(&datasets).expect("paths must conflict");
+        let error = Error::InvalidCayenneConfiguration { datasets };
+        assert_eq!(
+            error.to_string(),
+            "Invalid Cayenne configuration: datasets use different `cayenne_file_path` values without a shared `cayenne_metadata_dir`: `orders` (`/mnt/a/cayenne`), `customers` (`/mnt/b/cayenne`). Set the same `cayenne_metadata_dir` on every Cayenne dataset. See: https://spiceai.org/docs/components/data-accelerators/cayenne#metastore-location"
+        );
+    }
+
+    #[test]
+    fn cayenne_accepts_multiple_data_roots_with_shared_metadata() {
+        let datasets = vec![
+            cayenne_dataset("orders", "/mnt/a/cayenne", Some("/data/cayenne/metadata")),
+            cayenne_dataset(
+                "customers",
+                "/mnt/b/cayenne",
+                Some("/data/cayenne/metadata"),
+            ),
+        ];
+
+        assert!(cayenne_file_path_conflict(&datasets).is_none());
+    }
+
+    #[test]
+    fn cayenne_accepts_one_shared_data_root_without_explicit_metadata() {
+        let datasets = vec![
+            cayenne_dataset("orders", "/data/cayenne", None),
+            cayenne_dataset("customers", "/data/cayenne/", None),
+        ];
+
+        assert!(cayenne_file_path_conflict(&datasets).is_none());
+    }
+
+    #[test]
+    fn cayenne_rejects_conflicts_for_runtime_engine_spellings() {
+        let mut datasets = vec![
+            cayenne_dataset("orders", "/mnt/a/cayenne", None),
+            cayenne_dataset("customers", "/mnt/b/cayenne", None),
+        ];
+        datasets[0]
+            .acceleration
+            .as_mut()
+            .expect("acceleration")
+            .engine = Some("Cayenne".into());
+        datasets[1]
+            .acceleration
+            .as_mut()
+            .expect("acceleration")
+            .engine = Some("vortex".into());
+
+        assert!(cayenne_file_path_conflict(&datasets).is_some());
+    }
+
+    #[test]
+    fn cayenne_rejects_conflicts_for_snapshot_datasets() {
+        let snapshot_dataset = |name: &str, file_path: &str, metadata_dir: Option<&str>| {
+            let mut dataset = cayenne_dataset(name, file_path, metadata_dir);
+            dataset.from = "s3://bucket/snapshots/".to_string();
+            dataset.params = Some(Params::from_string_map(HashMap::from([(
+                "file_format".to_string(),
+                "snapshot".to_string(),
+            )])));
+            let acceleration = dataset.acceleration.as_mut().expect("acceleration");
+            acceleration.engine = None;
+            acceleration.mode = AccelerationMode::default();
+            dataset
+        };
+
+        let datasets = vec![
+            snapshot_dataset("orders", "/data/orders", None),
+            snapshot_dataset("customers", "/data/customers", None),
+        ];
+        assert!(cayenne_file_path_conflict(&datasets).is_some());
+
+        let datasets = vec![
+            snapshot_dataset("orders", "/data/orders", Some("/data/metadata")),
+            snapshot_dataset("customers", "/data/customers", Some("/data/metadata")),
+        ];
+        assert!(cayenne_file_path_conflict(&datasets).is_none());
     }
 }

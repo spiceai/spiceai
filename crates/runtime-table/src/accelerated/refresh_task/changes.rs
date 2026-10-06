@@ -17,9 +17,12 @@ use super::DatasetMetricLabels;
 use super::RefreshTask;
 use super::{collect_all_indexes, indexes_from_federated};
 use crate::accelerated::refresh::Refresh;
+use crate::accelerated::refresh_completion::RefreshCompletion;
 use crate::accelerated::refresh_task::deletion::{
     build_batch_delete_expr_from_change_batch, build_pk_only_batch_from_change_batch,
 };
+#[cfg(not(windows))]
+use crate::accelerated::write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
@@ -37,6 +40,7 @@ use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
@@ -46,10 +50,11 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
-use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
+use runtime_acceleration::dataupdate::{
+    StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
+};
 use runtime_component::dataset::OnSchemaChange;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_component::schema_evolution::{
@@ -69,8 +74,9 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
-use tokio::sync::{Notify, RwLock};
+use std::time::{Duration, Instant, SystemTime};
+use telemetry::timing::MultiTimeMeasurement;
+use tokio::sync::RwLock;
 
 type PendingApplyFinalize = tokio::task::JoinHandle<crate::accelerated::Result<()>>;
 
@@ -397,7 +403,7 @@ struct ApplyContext<'a> {
     /// (see [`DatasetMetricLabels`]).
     metric_labels: &'a DatasetMetricLabels,
     caching: Option<&'a Weak<Caching>>,
-    ready_sender: Option<&'a Arc<Notify>>,
+    refresh_completion: Option<&'a RefreshCompletion>,
     initial_load_completed: &'a Arc<AtomicBool>,
     write_ctx: &'a SessionContext,
     write_session_state: &'a SessionState,
@@ -640,6 +646,79 @@ pub struct CdcSchemaEvolution {
     /// Column names referenced by the dataset's primary key / unique / index
     /// constraints — the classifier's constraint guard.
     pub constraint_columns: Vec<String>,
+}
+
+/// The apply-time refusal a partitioned Cayenne acceleration gets when the CDC stream
+/// widens under it. Pure so the wording — which is the operator's only account of why
+/// the dataset stopped — is asserted in a test rather than only read in review.
+///
+/// `mode: file` is the one configuration a restart does not repair: it reopens the stored
+/// table with its partition children intact, so registration re-classifies and refuses
+/// again — pointing it at a restart would send an operator round a loop that cannot
+/// terminate. The other three modes each come back rebuilt against the new schema, by
+/// different routes: `file_update` because `recreates_on_schema_mismatch` is true for it
+/// whatever the engine or the partitioning, so registration drops the acceleration and
+/// recreates it instead of asking the engine to evolve in place; `file_create` because the
+/// accelerator deletes the data directory and its metastore slice at bootstrap; and
+/// `memory` because nothing was persisted to reopen. Sending those three to the manual
+/// remedy would cost an operator a needless drop and recreate.
+///
+/// That rebuild restores the *schema* under all three, but none of them restores the *rows*
+/// unconditionally, and the two reasons differ. `file_create` and `memory` are ephemeral to
+/// replication, but only `connector-postgres` acts on that: `accelerator_is_ephemeral` matches
+/// Cayenne on `Memory | FileCreate` and forces a resume snapshot, and only when the connector's
+/// initial snapshot is already enabled — `disabled` is preserved as an explicit opt-out. No other
+/// connector consults the acceleration mode. `connector-mysql` discards a resumable position under
+/// `always` and no other value (#13021), and `connector-dynamodb` `auto` reuses a persisted
+/// checkpoint the same way — so on those two an ephemeral acceleration comes back holding only
+/// later changes even under `auto`, which is why `always` is the portable answer below.
+/// `file_update` is classified *persistent*, so
+/// no resume snapshot is forced for it at all, while its recreate still empties the table: under
+/// `auto` it comes back holding only later changes (#13546). `always` is therefore the one
+/// setting that makes the restart row-safe under every mode *where the connector has it*, which
+/// is why the message names the setting rather than a mode carve-out. Saying this is load-bearing
+/// because the sentence two earlier promises the acceleration still holds every row it held
+/// before.
+///
+/// That qualification is not pedantry: the setting exists on only half the sources that reach
+/// here, which is why the message names both arms rather than the parameter alone. The refusal is
+/// connector-blind by construction —
+/// `install_cdc_schema_evolution` keys on `RefreshMode::Changes` alone, and the refusal itself on
+/// `CayenneWriteTarget::Partitioned`, a property of the acceleration — so every changes-capable
+/// source reaches this string. Of the six, `connector-postgres`, `connector-mysql` and
+/// `connector-dynamodb` declare `replication_initial_snapshot`; Debezium, `MongoDB` and `cdc_ingest`
+/// declare no initial-snapshot parameter at all. Naming the setting without that second arm would
+/// send half of them to a key their connector does not have, having promised their history back.
+// Only reachable from the `#[cfg(not(windows))]` CDC guard below, so gated with it —
+// otherwise this is dead code on Windows and `-D warnings` fails the build there.
+#[cfg(not(windows))]
+#[must_use]
+fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
+    format!(
+        "widening schema change detected on the CDC stream for '{dataset}' ({change}), \
+         but a partitioned Cayenne acceleration cannot evolve its schema in place, so the change was refused \
+         rather than applied lossily. No part of the batch was applied and the source keeps its position, \
+         so the acceleration still holds every row it held before it. \
+         Under `mode: file_update`, `mode: file_create` and `mode: memory`, restart Spice to apply it: the acceleration comes back \
+         rebuilt against the new schema — dropped and recreated, started from an empty directory, or never persisted at all. \
+         Under all three that restart rebuilds the schema, but it reloads the rows only where the source can replay them. \
+         Where the connector takes an initial-snapshot setting — `pg_replication_initial_snapshot`, \
+         `mysql_replication_initial_snapshot` and `dynamodb_replication_initial_snapshot` — \
+         set it to `always` before restarting if the acceleration has to come back with its history — it is the only value \
+         that snapshots under every mode on every one of them. `auto` skips the snapshot under `mode: file_update` on \
+         PostgreSQL, and skips it under every mode on MySQL and DynamoDB, which resume from their recorded position \
+         without consulting the acceleration mode; `disabled` skips it under every mode on all three. \
+         Where it does not — Debezium, MongoDB \
+         and `cdc_ingest` have no such setting — the acceleration comes back holding only what the change stream delivers \
+         from its resume position onward, and restoring its history means replaying the source from an earlier position or \
+         reloading the dataset with a full refresh. \
+         Under `mode: file` a restart reopens the stored table and refuses again — drop and recreate the dataset against the \
+         new source schema, dropping `partition_by` in the same change if partitioning is no longer wanted. \
+         Removing `partition_by` on its own does not recover it: the unpartitioned table is a different Cayenne table from \
+         the partition children the rows were written to, and changing that setting recreates nothing, so the acceleration \
+         would come back holding none of them. \
+         See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
 }
 
 static CDC_SCHEMA_EVOLUTION: std::sync::LazyLock<
@@ -1041,7 +1120,7 @@ impl RefreshTask {
         refresh: Arc<RwLock<Refresh>>,
         changes_stream: ChangesStream,
         caching: Option<Weak<Caching>>,
-        ready_sender: Option<Arc<Notify>>,
+        refresh_completion: Option<RefreshCompletion>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated::Result<()> {
         // Effective CDC config = global (already env+default folded) with any
@@ -1055,7 +1134,7 @@ impl RefreshTask {
             refresh,
             changes_stream,
             caching,
-            ready_sender,
+            refresh_completion,
             initial_load_completed,
         )
         .await
@@ -1069,7 +1148,7 @@ impl RefreshTask {
         refresh: Arc<RwLock<Refresh>>,
         changes_stream: ChangesStream,
         caching: Option<Weak<Caching>>,
-        ready_sender: Option<Arc<Notify>>,
+        refresh_completion: Option<RefreshCompletion>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated::Result<()> {
         let dataset_name = self.dataset_name.clone();
@@ -1199,7 +1278,7 @@ impl RefreshTask {
         let mut carried_received_ms: Option<i64> = None;
         let mut carried_received_at: Option<Instant> = None;
         let mut last_cycle_start = Instant::now();
-        let write_ctx = SessionContext::new();
+        let write_ctx = util::session_state::session_context();
         let write_session_state = write_ctx.state();
         let recv_wait_labels = metric_labels.dataset();
 
@@ -1298,7 +1377,7 @@ impl RefreshTask {
                                 refresh: &refresh,
                                 metric_labels: &metric_labels,
                                 caching: caching.as_ref(),
-                                ready_sender: ready_sender.as_ref(),
+                                refresh_completion: refresh_completion.as_ref(),
                                 initial_load_completed: &initial_load_completed,
                                 write_ctx: &write_ctx,
                                 write_session_state: &write_session_state,
@@ -1551,7 +1630,7 @@ impl RefreshTask {
                 refresh: &refresh,
                 metric_labels: &metric_labels,
                 caching: caching.as_ref(),
-                ready_sender: ready_sender.as_ref(),
+                refresh_completion: refresh_completion.as_ref(),
                 initial_load_completed: &initial_load_completed,
                 write_ctx: &write_ctx,
                 write_session_state: &write_session_state,
@@ -1610,7 +1689,7 @@ impl RefreshTask {
                     refresh: &refresh,
                     metric_labels: &metric_labels,
                     caching: caching.as_ref(),
-                    ready_sender: ready_sender.as_ref(),
+                    refresh_completion: refresh_completion.as_ref(),
                     initial_load_completed: &initial_load_completed,
                     write_ctx: &write_ctx,
                     write_session_state: &write_session_state,
@@ -1817,15 +1896,18 @@ impl RefreshTask {
     /// a fatal commit error was surfaced and the stream should stop.
     /// Signal the dataset Ready: flip `initial_load_completed`, wake readiness
     /// waiters, then publish the `Ready` component status — in that order, so a
-    /// waiter woken by the notify observes the completed flag. The single
+    /// waiter woken by the completion observes the completed flag. The single
     /// definition of the readiness side effect for every apply path (write,
     /// post-finalize, and readiness-only heartbeat runs).
     async fn signal_dataset_ready(&self, context: &ApplyContext<'_>) {
         context
             .initial_load_completed
             .store(true, Ordering::Relaxed);
-        if let Some(sender) = context.ready_sender {
-            sender.notify_waiters();
+        if let Some(refresh_completion) = context.refresh_completion {
+            // A CDC apply answers no trigger, so it is recorded without a
+            // request id: it releases every waiter taken before it and none
+            // taken after.
+            refresh_completion.record_untriggered();
         }
         self.update_component_status(status::ComponentStatus::Ready)
             .await;
@@ -1875,6 +1957,54 @@ impl RefreshTask {
 
         tracing::info!(
             "Dataset {}: rebuilt the acceleration from the source; resuming change streaming.",
+            context.dataset_name,
+        );
+        true
+    }
+
+    /// Replace the accelerator from a [`cdc::ChangeBatch::rebuild_from_this_batch`]
+    /// snapshot already carried on the `history_unavailable` envelope. This is
+    /// the same atomic `InsertOp::Overwrite` a full refresh uses, but it does
+    /// not list the source again — so the replacement rows and the envelope's
+    /// applied-key / position commit stay on one snapshot.
+    async fn rebuild_from_batches(
+        &self,
+        context: &ApplyContext<'_>,
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+    ) -> bool {
+        let label_sets = self.get_dataset_label_sets(&RefreshMode::Full).await;
+        let _timer = MultiTimeMeasurement::new(&metrics::REFRESH_DURATION_MS, &label_sets);
+
+        tracing::warn!(
+            "Dataset {}: the source can no longer supply the changes needed to continue, so the acceleration is being replaced from the rebuild signal's snapshot. This does not re-read the source.",
+            context.dataset_name,
+        );
+
+        let stream = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream::iter(batches.into_iter().map(Ok)),
+        );
+        let update = StreamingDataUpdate::new(Box::pin(stream), UpdateType::Overwrite);
+        if let Err(e) = self
+            .write_streaming_data_update(Some(SystemTime::now()), update, context.refresh_sql, None)
+            .await
+        {
+            let error_message = format!(
+                "Failed to replace the acceleration for {} from the rebuild signal's snapshot: {e}",
+                context.dataset_name,
+            );
+            tracing::error!("{error_message}");
+            self.set_refresh_status(
+                context.refresh_sql,
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
+            return false;
+        }
+
+        tracing::info!(
+            "Dataset {}: replaced the acceleration from the rebuild signal's snapshot; resuming change streaming.",
             context.dataset_name,
         );
         true
@@ -2008,19 +2138,14 @@ impl RefreshTask {
         // under that predicate and keep durability-then-commit ordering.
         envelopes.retain(|env| !env.is_no_op_heartbeat());
 
-        // The source has lost the history that explains what changed while it was
-        // away, so nothing in this burst — or after it — can be applied on top of
-        // the accelerator's current contents. Re-read the source into the
-        // accelerator as one atomic replacement first; the changes that follow
-        // then converge on top of it (see `rebuild_from_source`).
-        if history_unavailable && !self.rebuild_from_source(context).await {
-            return false;
-        }
-
-        // Readiness-only run: every envelope was a heartbeat. Honor the ready
-        // flag and stop — there is nothing to write and nothing to commit, so
-        // the run must not touch the write path or force a checkpoint.
+        // Readiness-only run: every envelope was a heartbeat. A classic
+        // `history_unavailable` signal is itself a no-op heartbeat, so it is
+        // gone here and the replacement is a federated re-read. A listing
+        // snapshot rides a real committer and survives into `into_parts`.
         if envelopes.is_empty() {
+            if history_unavailable && !self.rebuild_from_source(context).await {
+                return false;
+            }
             if any_ready {
                 if let Some(pending) = context.pending_finalize.as_mut() {
                     // A previous durable burst's Stage-B publish is still
@@ -2062,15 +2187,69 @@ impl RefreshTask {
         };
         record_cdc_fixed_cost(context.metric_labels, "decode", decode_start);
 
+        // The source has lost the history that explains what changed while it was
+        // away. Prefer the snapshot already on the signal (`rebuild_from_this_batch`)
+        // so replacement rows and the applied-key commit are the same listing; a
+        // later federated scan can invent extras the listing did not mark applied.
+        if history_unavailable {
+            let listing_rebuild = parts
+                .iter()
+                .any(|(_, batch, _, _)| batch.rebuild_from_this_batch());
+            if listing_rebuild {
+                let rebuild_batches: Vec<RecordBatch> = parts
+                    .iter()
+                    .filter(|(_, batch, _, _)| batch.rebuild_from_this_batch())
+                    .map(|(_, batch, _, _)| batch.data_batch())
+                    .collect();
+                let schema = rebuild_batches
+                    .first()
+                    .map_or_else(|| self.accelerator.schema(), RecordBatch::schema);
+                let nonempty: Vec<RecordBatch> = rebuild_batches
+                    .into_iter()
+                    .filter(|batch| batch.num_rows() > 0)
+                    .collect();
+                if !self.rebuild_from_batches(context, nonempty, schema).await {
+                    return false;
+                }
+            } else if !self.rebuild_from_source(context).await {
+                return false;
+            }
+        }
+
         // Readiness and the history-unavailable signal were both folded in before
         // the heartbeat retain, so their per-envelope flags are spent here.
-        let (committers, batches): (
-            Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
-            Vec<ChangeBatch>,
-        ) = parts
-            .into_iter()
-            .map(|(committer, batch, _is_ready, _history_unavailable)| (committer, batch))
-            .unzip();
+        // Listing-rebuild rows were the overwrite payload and must not also upsert.
+        let mut rebuild_committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = Vec::new();
+        let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = Vec::new();
+        let mut batches: Vec<ChangeBatch> = Vec::new();
+        for (committer, batch, _is_ready, _history_unavailable) in parts {
+            if batch.rebuild_from_this_batch() {
+                rebuild_committers.push(committer);
+            } else {
+                committers.push(committer);
+                batches.push(batch);
+            }
+        }
+
+        if batches.is_empty() {
+            rebuild_committers.append(&mut committers);
+            return self
+                .run_finalize_side_effects(context, rebuild_committers, any_ready)
+                .await;
+        }
+
+        // The rebuild overwrite has already succeeded. Finalize its committer
+        // now, independently of later CDC groups: if a later group fails to
+        // coalesce/write, `apply_coalesced_run` drops those committers unacked,
+        // and an `AppliedKeysCommitter::drop` would otherwise release keys whose
+        // rows are already present — making the next backfill append them again.
+        if !rebuild_committers.is_empty()
+            && !self
+                .run_finalize_side_effects(context, rebuild_committers, false)
+                .await
+        {
+            return false;
+        }
 
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
         // requires equal schemas. When the dataset's policy allows evolution,
@@ -2397,6 +2576,45 @@ impl RefreshTask {
             sub_batches.len()
         );
 
+        // Mid-stream schema evolution (policy != block) is a whole-burst
+        // decision, and it has to be settled before any sub-batch is applied.
+        // `group_into_sub_batches` emits a `Delete` ahead of the `Upsert` that
+        // recreates the same key and flushes a `Truncate` as a barrier, so a
+        // refusal raised from inside the upsert would arrive after those
+        // destructive halves had committed. Nothing recovers from that: the
+        // refusal stops the run without acknowledging, the source redelivers the
+        // same burst, the same split re-applies the same destructive half, and
+        // the refusal fires again, so the rows the burst was replacing never
+        // come back however many times it is retried. Deciding here leaves the
+        // acceleration untouched, which is what makes redelivery a safe outcome
+        // and lets the operator's recovery run against an intact table.
+        //
+        // The burst is a *coalesced* batch of source envelopes
+        // (`concat_change_batches`), so this one decision covers every envelope
+        // in the run and none of their committers ack.
+        //
+        // Gated on the burst carrying an upsert. A delete-only or truncate-only
+        // burst never reads the incoming data schema (`process_delete_batch` and
+        // `process_truncate` work from the primary keys alone), so a widening it
+        // does not carry into the acceleration is not its refusal to raise —
+        // classifying it would stall replication for a burst that applies
+        // cleanly and whose ack covers a burst applied in full.
+        //
+        // The input is `change_batch.data_schema()`, a burst-wide value that does
+        // not vary with the sub-batch, and the target it is compared against is
+        // only changed by an upsert — so classifying once per burst reaches the
+        // same verdict as classifying per upsert sub-batch. It reads the schema
+        // off the data column rather than through `data_batch()`, so classifying
+        // a burst no longer builds a `RecordBatch` that `process_upsert_batch`
+        // immediately builds again.
+        if sub_batches
+            .iter()
+            .any(|(op_type, _)| matches!(op_type, ChangeOperationType::Upsert))
+        {
+            self.maybe_evolve_schema_for_cdc(&change_batch.data_schema())
+                .await?;
+        }
+
         let mut had_change = false;
         let mut pending_finalize: Option<PendingApplyFinalize> = None;
         // Highest in-memory CDC tier epoch across this coalesced write's upsert
@@ -2506,12 +2724,11 @@ impl RefreshTask {
     ) -> crate::accelerated::Result<UpsertOutcome> {
         let data_batch = change_batch.data_batch();
 
-        // Mid-stream schema evolution (policy != block): evolve Cayenne live,
-        // or surface the detected change loudly for engines that need a
-        // restart, BEFORE the narrowing cast below silently drops the change.
-        self.maybe_evolve_schema_for_cdc(&data_batch.schema())
-            .await?;
-
+        // Schema evolution for this burst — evolving Cayenne live, or surfacing
+        // the detected change loudly for engines that need a restart — has
+        // already run in `write_change_with_context`, ahead of every sub-batch,
+        // so it is settled before the narrowing cast below can silently drop the
+        // change and before any destructive sub-batch of the same burst commits.
         let target_schema = self.accelerator.schema();
 
         let selected_batch = select_rows(&data_batch, row_indices)?;
@@ -2641,11 +2858,16 @@ impl RefreshTask {
     /// and the accelerator schema and act per the dataset's installed
     /// `on_schema_change` policy:
     ///
+    /// Called once per upsert-bearing burst from `write_change_with_context`,
+    /// before any of the burst's sub-batches is applied, so a refusal here leaves
+    /// the acceleration untouched.
+    ///
     /// - Cayenne + allowed widening ⇒ evolve LIVE via the provider's
     ///   `evolve_schema_live` (fence + flush + metastore update + in-memory
-    ///   schema swap, idempotent) and continue — the cast below becomes a
-    ///   pass-through to the evolved schema. A failed evolve stops the stream;
-    ///   the source redelivers and the idempotent evolve self-heals.
+    ///   schema swap, idempotent) and continue — the narrowing cast in
+    ///   `process_upsert_batch` becomes a pass-through to the evolved schema. A
+    ///   failed evolve stops the stream; the source redelivers and the
+    ///   idempotent evolve self-heals.
     /// - Other engines ⇒ NO mid-life engine DDL: keep today's narrowing cast,
     ///   warn once, count the failure — restart-time evolution applies it.
     /// - `fail` policy ⇒ terminal actionable error.
@@ -2670,7 +2892,7 @@ impl RefreshTask {
         // that never changed.
         //
         // The match test is rule-aware rather than rebuilding the schema up front: this
-        // runs per upsert sub-batch and almost always matches, and rewriting one
+        // runs once per upsert-bearing burst and almost always matches, and rewriting one
         // `DataType` for the few columns that differ is cheaper than allocating a whole
         // `Schema` that is then discarded.
         if cdc_data_schema_matches(
@@ -2743,6 +2965,43 @@ impl RefreshTask {
                     );
                     emit_schema_evolution_event(&dataset, "cdc_live", &change, false);
                     return Ok(());
+                }
+                // A partitioned Cayenne acceleration reaches here because
+                // `cayenne_accelerator()` cannot resolve a provider through the
+                // partition fan-out, not because the engine cannot evolve. The
+                // "cast and carry on" fallback below is only safe when a restart
+                // repairs the divergence, and for this target a restart that
+                // *reopens* the stored table does not: the accelerator pins the
+                // partitioned provider to `SchemaEvolutionMode::Disabled` when it
+                // builds it, so registration re-classifies and refuses again
+                // (#12999). Only `mode: file` reopens. The other three come back
+                // rebuilt against the new schema — `file_update` because
+                // `recreates_on_schema_mismatch` holds for it whatever the engine,
+                // so registration calls `evolve_accelerated_table_schema` first and
+                // reaches the drop-and-recreate once the partitioned accelerator
+                // refuses in-place evolution; `file_create` because the accelerator
+                // deletes the data directory and its metastore slice at bootstrap;
+                // `memory` because nothing was persisted to reopen. The refusal
+                // itself is not mode-conditional — the guard below returns the error
+                // for every mode, because the apply cannot widen a partitioned
+                // target under any of them. The mode gates *recovery*, which is why
+                // the message names modes rather than the write target: the mode is
+                // what the operator can read off their own spicepod.
+                #[cfg(not(windows))]
+                if matches!(
+                    extract_cayenne_write_target(&self.accelerator),
+                    Some(CayenneWriteTarget::Partitioned(_))
+                ) {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset, kind, "partitioned_unsupported"),
+                    );
+                    emit_schema_evolution_event(&dataset, "partitioned_unsupported", &change, true);
+                    return Err(crate::accelerated::Error::FailedToWriteData {
+                        source: DataFusionError::Execution(partitioned_widening_refusal(
+                            &dataset, &change,
+                        )),
+                    });
                 }
                 SCHEMA_EVOLUTION_FAILED.add(
                     1,
@@ -3206,14 +3465,27 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<
     let records: Vec<&RecordBatch> = batches.iter().map(|b| &b.record).collect();
     let combined = arrow::compute::concat_batches(&schema, records)
         .context(crate::accelerated::FailedToBuildRecordBatchSnafu)?;
-    ChangeBatch::try_new(combined).map_err(|e| {
-        // ChangeBatchError isn't part of the AcceleratedTable Error enum;
-        // wrap it in FailedToBuildRecordBatch so the caller's status path
-        // doesn't have to learn about a new variant.
-        crate::accelerated::Error::FailedToBuildRecordBatch {
-            source: arrow::error::ArrowError::ExternalError(Box::new(e)),
-        }
-    })
+    // The coalesced batch keeps the newest constituent commit timestamp: it rides
+    // the batch into the accelerator (`write_cdc_append_stream_with_source_commit_ts`),
+    // where it feeds the replication-lag and freshness signals the adaptive tuner's
+    // goals are stated against. Same rule as the burst frontier in `apply_burst`:
+    // the max is the most recent, and zero-row envelopes are excluded because their
+    // timestamp is not evidence that data up to that point was received.
+    let source_commit_ts_ms = batches
+        .iter()
+        .filter(|batch| !batch.is_heartbeat())
+        .filter_map(ChangeBatch::source_commit_ts_ms)
+        .max();
+    ChangeBatch::try_new(combined)
+        .map(|batch| batch.with_source_commit_ts_ms(source_commit_ts_ms))
+        .map_err(|e| {
+            // ChangeBatchError isn't part of the AcceleratedTable Error enum;
+            // wrap it in FailedToBuildRecordBatch so the caller's status path
+            // doesn't have to learn about a new variant.
+            crate::accelerated::Error::FailedToBuildRecordBatch {
+                source: arrow::error::ArrowError::ExternalError(Box::new(e)),
+            }
+        })
 }
 
 fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
@@ -4246,6 +4518,125 @@ mod tests {
         assert!(extracted.is_none(), "no recognized keys must return None");
     }
 
+    // The refusal stops a CDC dataset dead, so its wording is the operator's only account
+    // of what happened and what to do. Assert the load-bearing parts rather than the shape:
+    // the dataset name (quoted — it is the user's string), the reason, and BOTH recovery
+    // arms. Dropping the `file_update` arm was a real defect: `recreates_on_schema_mismatch`
+    // makes a restart rebuild the table in that mode, and telling those operators a restart
+    // will not help sends them to unnecessary manual recovery.
+    #[cfg(not(windows))]
+    #[test]
+    fn partitioned_widening_refusal_names_both_recovery_arms() {
+        let msg = partitioned_widening_refusal("sales.orders", "column `total` widened i32 -> i64");
+
+        assert!(
+            msg.contains("'sales.orders'"),
+            "the dataset must be named and quoted: {msg}"
+        );
+        assert!(
+            msg.contains("column `total` widened i32 -> i64"),
+            "the refused change must be described: {msg}"
+        );
+        assert!(
+            msg.contains("the source keeps its position"),
+            "the operator has to know the change was not lost: {msg}"
+        );
+        // Load-bearing, not reassurance: the refusal is preflighted over the whole
+        // burst, so an operator reading this can act on an intact table. While it was
+        // raised from the first upsert instead, a `DELETE k, INSERT k` burst had already
+        // committed its delete by the time the message appeared, and this sentence would
+        // have been false exactly when it mattered most (#13455).
+        assert!(
+            msg.contains("No part of the batch was applied")
+                && msg.contains("still holds every row it held before it"),
+            "the operator has to know the acceleration was left intact, which is what makes \
+             'the source keeps its position' a safe outcome rather than a partial mutation: {msg}"
+        );
+        assert!(
+            msg.contains("`mode: file_update`")
+                && msg.contains("`mode: file_create`")
+                && msg.contains("`mode: memory`")
+                && msg.contains("restart Spice to apply it"),
+            "restart is the cheapest remedy in every mode that does not reopen a stored table, and \
+             all three must be offered it — `file_update` recreates, `file_create` starts from an \
+             empty directory, `memory` never persisted one: {msg}"
+        );
+        // The restart arm sits two sentences after "still holds every row it held before it".
+        // Under the two modes that are ephemeral to replication that promise and that remedy
+        // disagree whenever the source's initial snapshot is disabled: the acceleration boots
+        // empty and no snapshot replays the history. Naming the cost is what keeps the
+        // reassurance honest, so it is asserted rather than left to review.
+        assert!(
+            msg.contains("reloads the rows only where the source can replay them")
+                && msg.contains("set it to `always` before restarting"),
+            "a restart rebuilds the schema but not necessarily the rows, so the message must name \
+             that cost and the setting that fixes it rather than let the 'still holds every row' \
+             reassurance imply the rows return unconditionally: {msg}"
+        );
+        // Both arms, because this formatter serves the generic `refresh_mode: changes` apply path
+        // and the refusal is connector-blind: it keys on `CayenneWriteTarget::Partitioned`, a
+        // property of the acceleration, so every changes-capable source reaches this one string.
+        // Only half of them declare the setting — `connector-postgres`, `connector-mysql` and
+        // `connector-dynamodb` do; Debezium, MongoDB and `cdc_ingest` declare no initial-snapshot
+        // parameter at all. Naming the setting alone sent that second half to a key their
+        // connector does not have, having just promised their history would come back.
+        assert!(
+            msg.contains("`pg_replication_initial_snapshot`")
+                && msg.contains("`mysql_replication_initial_snapshot`")
+                && msg.contains("`dynamodb_replication_initial_snapshot`"),
+            "the setting must be named for exactly the connectors that declare it, and spelled out \
+             — a shared-suffix abbreviation reads as though `pg_` and `mysql_` were whole keys: \
+             {msg}"
+        );
+        assert!(
+            msg.contains("Debezium, MongoDB and `cdc_ingest` have no such setting"),
+            "the sources with no initial-snapshot setting must be told so, and told what restoring \
+             their history actually takes, rather than left to look for a key they do not have: \
+             {msg}"
+        );
+        assert!(
+            msg.contains("replaying the source from an earlier position or")
+                && msg.contains("reloading the dataset with a full refresh"),
+            "the no-setting arm needs a remedy, not just the bad news: {msg}"
+        );
+        // No mode may be advertised as row-safe without the snapshot, and the carve-out is not the
+        // same on every connector. `file_update` is classified persistent, so `auto` forces no
+        // resume snapshot for it while its recreate still empties the table (#13546) — and only
+        // `connector-postgres` forces one for the ephemeral modes at all, so on MySQL and DynamoDB
+        // `auto` leaves every mode holding later changes only. Asserting one arm alone let the
+        // message read as though `auto` were row-safe for `memory` and `file_create` everywhere.
+        assert!(
+            msg.contains("skips the snapshot under `mode: file_update` on PostgreSQL")
+                && msg.contains("skips it under every mode on MySQL and DynamoDB"),
+            "`file_update` is not row-safe under `auto` on PostgreSQL, and no mode is on MySQL or \
+             DynamoDB, so the message must carve out neither: {msg}"
+        );
+        assert!(
+            msg.contains("Under `mode: file` a restart reopens the stored table and refuses again"),
+            "`mode: file` is the only mode a restart does not repair, and it must be told so or the \
+             operator loops; naming the others here instead would send them to a needless drop and \
+             recreate: {msg}"
+        );
+        assert!(
+            msg.contains("drop and recreate the dataset"),
+            "the manual remedy must survive alongside the restart one: {msg}"
+        );
+        assert!(
+            msg.contains("Removing `partition_by` on its own does not recover it"),
+            "removing the setting alone opens the unpartitioned parent table while the rows stay in \
+             the partition children, and nothing recreates the acceleration, so the message must not \
+             offer it as a remedy by itself: {msg}"
+        );
+        assert!(
+            msg.contains("https://spiceai.org/docs/components/data-accelerators/cayenne"),
+            "user-facing errors carry a docs link: {msg}"
+        );
+        assert!(
+            !msg.contains('\n'),
+            "log/error messages stay on one line: {msg}"
+        );
+    }
+
     #[test]
     fn bounded_warning_keys_eviction_allows_rewarning_old_keys() {
         let mut warning_keys = BoundedWarningKeys::default();
@@ -4334,6 +4725,63 @@ mod tests {
             .expect("Failed to create RecordBatch");
 
         ChangeBatch::try_new(record).expect("Failed to create ChangeBatch")
+    }
+
+    /// A coalesced burst keeps the newest source-commit timestamp of its
+    /// constituents. Without it every multi-envelope burst reached the
+    /// accelerator with `None`, so Cayenne's replication-lag goal read nothing
+    /// (`cayenne_ingest_replication_lag_seconds` had no series in eight 3-node
+    /// SF-1 lab arms on 2026-09-27, while the runtime's own
+    /// `dataset_acceleration_cdc_received_commit_unix_time_ms`, computed from
+    /// the envelopes before concatenation, was populated) and its freshness goal
+    /// fell back to a wall-clock age.
+    #[test]
+    fn concat_change_batches_keeps_the_newest_source_commit_ts() {
+        let older = create_test_change_batch(vec!["c"], &[vec!["1"]], vec![1], vec![Some("a")])
+            .with_source_commit_ts_ms(Some(1_700_000_000_000));
+        let newest = create_test_change_batch(vec!["u"], &[vec!["2"]], vec![2], vec![Some("b")])
+            .with_source_commit_ts_ms(Some(1_700_000_005_000));
+        let unstamped = create_test_change_batch(vec!["d"], &[vec!["3"]], vec![3], vec![None]);
+        // A zero-row envelope that survived the no-op-heartbeat retain (it rides a
+        // real committer) is not evidence of received data, so its newer stamp
+        // must not advance the coalesced batch's timestamp — the same exclusion
+        // the runtime's received/applied frontier applies.
+        let zero_row = create_test_change_batch(vec![], &[], vec![], vec![])
+            .with_source_commit_ts_ms(Some(1_700_000_099_000));
+        assert!(zero_row.is_heartbeat());
+        // Arrival order is not commit order: the last row-bearing constituent
+        // carries an OLDER stamp than an earlier one, so taking the last stamp
+        // (rather than the max) would be wrong.
+        let oldest_last =
+            create_test_change_batch(vec!["c"], &[vec!["4"]], vec![4], vec![Some("d")])
+                .with_source_commit_ts_ms(Some(1_699_999_000_000));
+
+        let combined = concat_change_batches(&[older, newest, unstamped, zero_row, oldest_last])
+            .expect("concat");
+        assert_eq!(combined.record.num_rows(), 4, "every row is carried");
+        let data = combined.data_batch();
+        let ids = data
+            .column_by_name("id")
+            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+            .expect("id column is Int32")
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![1, 2, 3, 4], "rows keep their arrival order");
+        assert_eq!(
+            combined.source_commit_ts_ms(),
+            Some(1_700_000_005_000),
+            "the coalesced batch carries the newest row-bearing constituent commit timestamp"
+        );
+
+        // A burst with no stamped constituent stays unstamped: no lag information.
+        let a = create_test_change_batch(vec!["c"], &[vec!["1"]], vec![1], vec![Some("a")]);
+        let b = create_test_change_batch(vec!["c"], &[vec!["2"]], vec![2], vec![Some("b")]);
+        assert_eq!(
+            concat_change_batches(&[a, b])
+                .expect("concat")
+                .source_commit_ts_ms(),
+            None
+        );
     }
 
     #[test]
@@ -4821,7 +5269,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare(name.to_string()),
+            datafusion::common::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -4829,6 +5277,65 @@ mod tests {
             Arc::new(Mutex::new(())),
         )
         .build()
+    }
+
+    fn make_refresh_task_with_source(
+        name: &str,
+        federated: Arc<dyn TableProvider>,
+        accelerator: Arc<dyn TableProvider>,
+    ) -> RefreshTask {
+        use crate::accelerated::refresh_task::RefreshTaskBuilder;
+        use crate::federated::FederatedTable;
+        use tokio::runtime::Handle;
+        use tokio::sync::Mutex;
+
+        let federated = Arc::new(FederatedTable::new_unchecked(federated));
+        RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            datafusion::common::TableReference::bare(name.to_string()),
+            federated,
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build()
+    }
+
+    fn id_name_batch(ids: &[i32], names: &[&str]) -> RecordBatch {
+        let schema = Arc::new(create_test_data_schema());
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(
+                    names.iter().map(|name| Some(*name)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("id/name batch should build")
+    }
+
+    async fn names_in_table(table: Arc<dyn TableProvider>) -> Vec<String> {
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .read_table(table)
+            .expect("read table")
+            .collect()
+            .await
+            .expect("collect table");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let names = batch
+                    .column_by_name("name")
+                    .expect("name")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("name is Utf8");
+                (0..names.len()).map(|i| names.value(i).to_string())
+            })
+            .collect()
     }
 
     /// `make_refresh_task` with per-dataset `cdc_*` param overrides applied, so
@@ -4846,7 +5353,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare("test".to_string()),
+            datafusion::common::TableReference::bare("test".to_string()),
             federated,
             None,
             accelerator,
@@ -4898,7 +5405,7 @@ mod tests {
                 MemTable::try_new(Arc::clone(&stored), vec![vec![]])
                     .expect("mem table should be created"),
             );
-            let dataset = datafusion::sql::TableReference::bare(name.to_string());
+            let dataset = datafusion::common::TableReference::bare(name.to_string());
             install_cdc_schema_evolution(
                 &dataset,
                 CdcSchemaEvolution {
@@ -4948,6 +5455,55 @@ mod tests {
             e.to_string().contains("incompatible schema change"),
             "unexpected error: {e}"
         );
+    }
+
+    /// Regression test for #13549, CDC leg. A source that declares a `MAP`'s `entries` field
+    /// nullable — which the Arrow map layout forbids — is not reporting a schema change, so
+    /// `on_schema_change: fail` must not reject the batch. The surrounding `Map` pair is
+    /// otherwise identical, so the entries flag is the only thing under test.
+    #[tokio::test]
+    async fn cdc_schema_evolution_accepts_a_nonconforming_map_entries_declaration() {
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+        let schema_with = |entries_nullable: bool| {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("headers", map_of(entries_nullable), true),
+            ]))
+        };
+
+        let dataset = "cdc_map_entries_accepted";
+        install_cdc_schema_evolution(
+            &datafusion::common::TableReference::bare(dataset.to_string()),
+            CdcSchemaEvolution {
+                policy: OnSchemaChange::Fail,
+                constraint_columns: vec![],
+            },
+        );
+        let task = make_refresh_task_named(
+            dataset,
+            Arc::new(MemTable::try_new(schema_with(false), vec![vec![]]).expect("mem table")),
+        );
+
+        task.maybe_evolve_schema_for_cdc(&schema_with(true))
+            .await
+            .expect(
+                "an entries declaration the Arrow map layout forbids is not a schema change and must not fail the write",
+            );
     }
 
     #[tokio::test]
@@ -6110,12 +6666,18 @@ mod tests {
     async fn run_changes_stream(
         task: &RefreshTask,
         stream: ChangesStream,
-        ready_sender: Option<Arc<Notify>>,
+        refresh_completion: Option<RefreshCompletion>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated::Result<()> {
         let refresh = Arc::new(RwLock::new(crate::accelerated::refresh::Refresh::default()));
-        task.start_changes_stream(refresh, stream, None, ready_sender, initial_load_completed)
-            .await
+        task.start_changes_stream(
+            refresh,
+            stream,
+            None,
+            refresh_completion,
+            initial_load_completed,
+        )
+        .await
     }
 
     // -- Correctness: ordering ------------------------------------------------
@@ -6213,6 +6775,17 @@ mod tests {
         fn properties(&self) -> &Arc<PlanProperties> {
             self.inner.properties()
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
         }
@@ -6492,6 +7065,51 @@ mod tests {
         );
     }
 
+    /// Succeeds for the first `allow` writes, then fails. Used to let a listing
+    /// rebuild overwrite land and then fail a later CDC upsert in the same run.
+    #[derive(Debug)]
+    struct FailAfterNWrites {
+        inner: Arc<dyn TableProvider>,
+        writes_seen: Arc<AtomicUsize>,
+        allow: usize,
+    }
+
+    #[async_trait]
+    impl TableProvider for FailAfterNWrites {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let seen = self.writes_seen.fetch_add(1, AtomicOrdering::SeqCst);
+            if seen >= self.allow {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "synthetic write failure after allowed writes".to_string(),
+                ));
+            }
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
     #[tokio::test]
     async fn test_apply_envelope_run_skips_commits_after_coalesced_write_failure() {
         let failures_remaining = Arc::new(AtomicUsize::new(1));
@@ -6518,7 +7136,7 @@ mod tests {
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
-            ready_sender: None,
+            refresh_completion: None,
             initial_load_completed: &initial_load_completed,
             write_ctx: &write_ctx,
             write_session_state: &write_session_state,
@@ -6569,19 +7187,34 @@ mod tests {
     /// shape the `postgres_replication` source emits after adopting a mid-stream
     /// ADD COLUMN.
     fn create_widened_change_batch(id: i32, age: i32) -> ChangeBatch {
+        create_widened_change_batch_ops(&["c"], &[id], age)
+    }
+
+    /// A CDC burst under the `age`-widened data schema carrying one row per entry
+    /// of `ops` (Debezium op codes: `c` create, `d` delete, `t` truncate).
+    ///
+    /// The widening is a property of the burst's schema, not of any one row, so
+    /// every op in the burst arrives under it — which is what makes a mixed burst
+    /// able to commit its destructive half before the widening is ever judged.
+    fn create_widened_change_batch_ops(ops: &[&str], ids: &[i32], age: i32) -> ChangeBatch {
+        assert_eq!(ops.len(), ids.len(), "ops and ids must have same length");
+
         let data_schema = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("age", DataType::Int32, true),
         ]);
         let schema = changes_schema(&data_schema);
-        let op_array: ArrayRef = Arc::new(StringArray::from(vec!["c"]));
+        let op_array: ArrayRef = Arc::new(StringArray::from(ops.to_vec()));
         let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
+        // One primary-key entry (`id`) per row.
+        let pk_offsets: Vec<i32> =
+            (0..=i32::try_from(ops.len()).expect("op count fits in i32")).collect();
         let pk_array: ArrayRef = Arc::new(
             ListArray::try_new(
                 pk_field,
-                arrow::buffer::OffsetBuffer::new(vec![0i32, 1].into()),
-                Arc::new(StringArray::from(vec!["id"])),
+                arrow::buffer::OffsetBuffer::new(pk_offsets.into()),
+                Arc::new(StringArray::from(vec!["id"; ops.len()])),
                 None,
             )
             .expect("pk list"),
@@ -6589,15 +7222,15 @@ mod tests {
         let data_fields = vec![
             (
                 Arc::new(Field::new("id", DataType::Int32, false)),
-                Arc::new(Int32Array::from(vec![id])) as ArrayRef,
+                Arc::new(Int32Array::from(ids.to_vec())) as ArrayRef,
             ),
             (
                 Arc::new(Field::new("name", DataType::Utf8, true)),
-                Arc::new(StringArray::from(vec![Some("row")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("row"); ops.len()])) as ArrayRef,
             ),
             (
                 Arc::new(Field::new("age", DataType::Int32, true)),
-                Arc::new(Int32Array::from(vec![age])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![age; ops.len()])) as ArrayRef,
             ),
         ];
         let data_array: ArrayRef = Arc::new(StructArray::from(data_fields));
@@ -6771,7 +7404,7 @@ mod tests {
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
-            ready_sender: None,
+            refresh_completion: None,
             initial_load_completed: &initial_load_completed,
             write_ctx: &write_ctx,
             write_session_state: &write_session_state,
@@ -6835,7 +7468,7 @@ mod tests {
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
-            ready_sender: None,
+            refresh_completion: None,
             initial_load_completed: &initial_load_completed,
             write_ctx: &write_ctx,
             write_session_state: &write_session_state,
@@ -6871,6 +7504,434 @@ mod tests {
                 .is_error(),
             "mixed-schema concat failure under block must mark the dataset status as error"
         );
+    }
+
+    // -- Partitioned Cayenne: a widened CDC batch is refused, never acked -----
+
+    #[cfg(not(windows))]
+    use data_accelerator_api::upsert_dedup::wrap_with_upsert_dedup_if_needed;
+    #[cfg(not(windows))]
+    use data_components::poly::PolyTableProvider;
+    #[cfg(not(windows))]
+    use datafusion::common::Constraints;
+    #[cfg(not(windows))]
+    use datafusion::logical_expr::TableProviderFilterPushDown;
+    #[cfg(not(windows))]
+    use datafusion::scalar::ScalarValue;
+    #[cfg(not(windows))]
+    use runtime_table_partition::creator::{Error as PartitionCreatorError, PartitionCreator};
+    #[cfg(not(windows))]
+    use runtime_table_partition::{Partition, expression::PartitionedBy};
+
+    /// A [`PartitionCreator`] that starts empty and backs each new partition
+    /// with a writable in-memory table.
+    ///
+    /// Writable on purpose: with the refusal removed, the widened batch is cast
+    /// down and lands here, which is the reported defect. A creator that
+    /// refused the write would make the regression tests below pass for the
+    /// wrong reason — the run would abort on the failed write rather than on
+    /// the refusal.
+    ///
+    /// `direct_writes` mirrors what the accelerator opts into: the Cayenne
+    /// *accelerator* builds its creator `.with_direct_partition_writes()`, while
+    /// a `CREATE TABLE … PARTITIONED BY` one does not — and that flag is what
+    /// [`extract_cayenne_write_target`] reads to tell a Cayenne partitioned
+    /// write target from any other partitioned provider.
+    #[cfg(not(windows))]
+    #[derive(Debug)]
+    struct MemPartitionCreator {
+        direct_writes: bool,
+    }
+
+    #[cfg(not(windows))]
+    #[async_trait]
+    impl PartitionCreator for MemPartitionCreator {
+        fn accepts_direct_partition_writes(&self) -> bool {
+            self.direct_writes
+        }
+
+        async fn create_partition(
+            &self,
+            partition_values: Vec<ScalarValue>,
+        ) -> Result<Partition, PartitionCreatorError> {
+            Ok(Partition {
+                partition_values,
+                table_provider: Arc::new(
+                    MemTable::try_new(Arc::new(create_test_data_schema()), vec![vec![]])
+                        .expect("partition mem table should be created"),
+                ),
+            })
+        }
+
+        async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, PartitionCreatorError> {
+            Ok(Vec::new())
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+            Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        }
+    }
+
+    /// A partitioned accelerator stack, built the way the Cayenne accelerator
+    /// builds one: the partition provider, optionally behind the upsert-dedup
+    /// wrapper, under a `PolyTableProvider` and then an index layer.
+    ///
+    /// Every layer here is load-bearing for the resolution under test —
+    /// [`extract_cayenne_write_target`] crosses the index layer to find the
+    /// poly layer, follows its *writer* rather than the layer below it, and
+    /// unwraps the dedup wrapper. A fixture that skipped the poly layer would
+    /// resolve to `None` and quietly stop testing the refusal.
+    ///
+    /// `direct_writes` picks whether the partitions are a Cayenne
+    /// accelerator's (see [`MemPartitionCreator`]).
+    #[cfg(not(windows))]
+    async fn partitioned_accelerator(dedup: bool, direct_writes: bool) -> Arc<dyn TableProvider> {
+        let partitioned = Arc::new(
+            PartitionTableProvider::new(
+                Arc::new(MemPartitionCreator { direct_writes }),
+                vec![PartitionedBy {
+                    name: "name".to_string(),
+                    expression: datafusion::prelude::col("name"),
+                }],
+                Arc::new(create_test_data_schema()),
+            )
+            .await
+            .expect("partition provider should be created"),
+        );
+        let write_provider: Arc<dyn TableProvider> = if dedup {
+            wrap_with_upsert_dedup_if_needed(
+                partitioned,
+                &HashMap::from([("upsert_remove_duplicates".to_string(), "true".to_string())]),
+                Constraints::default(),
+            )
+        } else {
+            partitioned
+        };
+        let poly = Arc::new(PolyTableProvider::new(
+            Arc::clone(&write_provider),
+            write_provider,
+        ))
+        .into_table() as Arc<dyn TableProvider>;
+        SpiceTable::over(Arc::new(IndexLayer::new()), poly) as Arc<dyn TableProvider>
+    }
+
+    /// The `id` values the acceleration currently holds, ascending.
+    ///
+    /// Reads through the whole provider stack the CDC apply writes to, so it sees
+    /// what a query against the dataset would see.
+    #[cfg(not(windows))]
+    async fn accelerator_row_ids(accelerator: &Arc<dyn TableProvider>) -> Vec<i32> {
+        let ctx = SessionContext::new();
+        let scan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scanning the acceleration should succeed");
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("collecting the acceleration should succeed");
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("id")
+                    .expect("the acceleration carries an id column");
+                column
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<i32>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Apply one widened single-upsert CDC envelope under `on_schema_change:
+    /// append_new_columns`, and report `(run applied, committed envelope ids,
+    /// dataset status is error)`.
+    #[cfg(not(windows))]
+    async fn apply_widened_envelope(
+        name: &str,
+        accelerator: Arc<dyn TableProvider>,
+    ) -> (bool, Vec<i32>, bool) {
+        apply_widened_burst(name, accelerator, create_widened_change_batch(1, 30), None).await
+    }
+
+    /// Apply one widened CDC burst under `on_schema_change: append_new_columns`,
+    /// optionally seeding the acceleration with `seed` first, and report
+    /// `(run applied, committed envelope ids, dataset status is error)`.
+    ///
+    /// `seed` is applied through the ordinary CDC write path rather than written
+    /// behind it, so a test asserting the acceleration is unmutated is asserting
+    /// against rows the apply loop itself put there.
+    #[cfg(not(windows))]
+    async fn apply_widened_burst(
+        name: &str,
+        accelerator: Arc<dyn TableProvider>,
+        burst: ChangeBatch,
+        seed: Option<ChangeBatch>,
+    ) -> (bool, Vec<i32>, bool) {
+        let dataset_name = TableReference::bare(name.to_string());
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        install_cdc_schema_evolution(
+            &dataset_name,
+            CdcSchemaEvolution {
+                policy: OnSchemaChange::AppendNewColumns,
+                constraint_columns: vec!["id".to_string()],
+            },
+        );
+
+        let task = make_refresh_task_named(name, accelerator);
+
+        // Seeded through the same apply path the burst under test uses, and before
+        // the widening policy can refuse anything: a seed that silently failed to
+        // land would leave the "acceleration is unmutated" assertion vacuously
+        // true, so it is applied here where its own error still surfaces.
+        if let Some(seed) = seed {
+            task.write_change(seed)
+                .await
+                .expect("seeding the acceleration must succeed");
+            assert!(
+                !accelerator_row_ids(&task.accelerator).await.is_empty(),
+                "the seed must be readable before the burst runs, or an assertion that the \
+                 acceleration is unmutated holds for the wrong reason"
+            );
+        }
+
+        let log = CommitLog::new();
+        let initial_load_completed = Arc::new(AtomicBool::new(false));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh::default()));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let applied = task
+            .apply_envelope_run(
+                &mut context,
+                vec![ChangeEnvelope::new(
+                    Box::new(TrackingCommitter {
+                        id: 1,
+                        log: Arc::clone(&log),
+                        outcome: Ok(()),
+                    }),
+                    burst,
+                    false,
+                )],
+            )
+            .await;
+
+        // Reset the process-global registry entry.
+        remove_cdc_schema_evolution(&dataset_name);
+
+        if let Some(handle) = context.pending_commit.take() {
+            handle
+                .await
+                .expect("commit task join")
+                .expect("commit task should succeed");
+        }
+        let status_is_error = task
+            .runtime_status
+            .get_component_status(&format!("dataset:{name}"))
+            .is_some_and(|status| status.is_error());
+        (applied, log.ids().await, status_is_error)
+    }
+
+    /// Regression test for #13051. A partitioned Cayenne acceleration cannot
+    /// evolve in place and a restart will not repair it either, so a widening
+    /// CDC batch must fail the apply rather than be cast down to the old
+    /// schema and reported as applied — the acknowledgement is what makes the
+    /// dropped values unrecoverable.
+    ///
+    /// Run for both stack shapes: the upsert-dedup wrapper must not hide the
+    /// partition provider from the refusal.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_widened_cdc_batch_on_partitioned_cayenne_is_never_acked() {
+        for dedup in [false, true] {
+            let (applied, committed, status_is_error) = apply_widened_envelope(
+                &format!("schema_evo_partitioned_cayenne_dedup_{dedup}"),
+                partitioned_accelerator(dedup, true).await,
+            )
+            .await;
+
+            assert_eq!(
+                committed,
+                Vec::<i32>::new(),
+                "dedup={dedup}: the source position must not advance past a widening the acceleration cannot apply"
+            );
+            assert!(
+                !applied,
+                "dedup={dedup}: the run must stop rather than continue past an uncommitted gap"
+            );
+            assert!(
+                status_is_error,
+                "dedup={dedup}: refusing the widening must surface as a dataset error, not a silent skip"
+            );
+        }
+    }
+
+    /// Regression test for #13455. A refused widening must leave the acceleration
+    /// exactly as it found it.
+    ///
+    /// `group_into_sub_batches` splits a burst by operation and dispatches the
+    /// pieces in order, putting a `Delete` ahead of the `Upsert` that recreates
+    /// the same key and flushing a `Truncate` as a barrier. While the refusal was
+    /// raised from inside `process_upsert_batch`, both of those destructive halves
+    /// had already committed by the time it fired — and because the refusal stops
+    /// the run without acknowledging, the source redelivered the same burst, which
+    /// re-applied the same destructive half and was refused again. The rows the
+    /// burst was replacing were gone for good while the acceleration stayed
+    /// queryable, so queries returned wrong results indefinitely.
+    ///
+    /// Both burst shapes come off real sources: `DELETE k, INSERT k` is how
+    /// Debezium/Postgres reports an ordinary primary-key update, and `TRUNCATE,
+    /// INSERT` is a reload.
+    ///
+    /// The non-acknowledgement assertions alone do not catch this — they were
+    /// satisfied by the broken behavior, since a burst that refuses mid-way
+    /// acknowledges nothing either. The row-level assertion is the one that fails
+    /// without the preflight.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_refused_widening_burst_leaves_the_partitioned_acceleration_intact() {
+        for (case, ops) in [
+            ("delete_then_insert", ["d", "c"]),
+            ("truncate_then_insert", ["t", "c"]),
+        ] {
+            let accelerator = partitioned_accelerator(false, true).await;
+            let (applied, committed, status_is_error) = apply_widened_burst(
+                &format!("schema_evo_partitioned_burst_{case}"),
+                Arc::clone(&accelerator),
+                create_widened_change_batch_ops(&ops, &[7, 7], 30),
+                // Seeded under the pre-widening schema, in the partition the
+                // burst's own rows land in, so the destructive half of the burst
+                // has something of the operator's to destroy.
+                Some(create_test_change_batch(
+                    vec!["c"],
+                    &[vec!["id"]],
+                    vec![7],
+                    vec![Some("row")],
+                )),
+            )
+            .await;
+
+            assert_eq!(
+                accelerator_row_ids(&accelerator).await,
+                vec![7],
+                "{case}: a refused burst must not have applied its destructive half — the source \
+                 redelivers this burst unchanged, so anything it committed here is re-committed \
+                 on every retry and the rows it deleted never come back"
+            );
+            assert_eq!(
+                committed,
+                Vec::<i32>::new(),
+                "{case}: the source position must not advance past a widening the acceleration \
+                 cannot apply"
+            );
+            assert!(
+                !applied,
+                "{case}: the run must stop rather than continue past an uncommitted gap"
+            );
+            assert!(
+                status_is_error,
+                "{case}: refusing the widening must surface as a dataset error, not a silent skip"
+            );
+        }
+    }
+
+    /// A widened burst carrying no upsert keeps applying: `process_delete_batch`
+    /// and `process_truncate` work from the primary keys alone and never write the
+    /// incoming data schema into the acceleration, so there is nothing for the
+    /// widening to be refused over — and refusing anyway would stall replication
+    /// on a burst that applies cleanly.
+    ///
+    /// This is the boundary of the preflight above rather than incidental: the
+    /// preflight is reached by every burst, so without the upsert gate a
+    /// delete-only burst would start classifying, which no burst shape did before.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_widened_delete_only_burst_still_applies_to_a_partitioned_cayenne() {
+        for (case, ops) in [("delete_only", ["d"]), ("truncate_only", ["t"])] {
+            let accelerator = partitioned_accelerator(false, true).await;
+            let (applied, committed, status_is_error) = apply_widened_burst(
+                &format!("schema_evo_partitioned_destructive_only_{case}"),
+                Arc::clone(&accelerator),
+                create_widened_change_batch_ops(&ops, &[7], 30),
+                Some(create_test_change_batch(
+                    vec!["c"],
+                    &[vec!["id"]],
+                    vec![7],
+                    vec![Some("row")],
+                )),
+            )
+            .await;
+
+            assert_eq!(
+                accelerator_row_ids(&accelerator).await,
+                Vec::<i32>::new(),
+                "{case}: the burst applies, so the seeded row is removed"
+            );
+            assert_eq!(
+                committed,
+                vec![1],
+                "{case}: a burst that applied in full must acknowledge its source"
+            );
+            assert!(applied, "{case}: the run must continue");
+            assert!(!status_is_error, "{case}: the dataset must not be errored");
+        }
+    }
+
+    /// Control: the refusal is specific to a Cayenne partitioned write target.
+    ///
+    /// An unpartitioned accelerator keeps the documented cast-and-warn
+    /// behavior, which a restart repairs, so its envelope still commits — and
+    /// so does a partitioned provider whose creator does not accept direct
+    /// partition writes, which is what distinguishes a Cayenne accelerator's
+    /// partitions from any other engine's. Without these, the test above would
+    /// also pass if the refusal fired for every dataset, or for every
+    /// partitioned one.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_widened_cdc_batch_outside_a_partitioned_cayenne_still_commits() {
+        for (case, accelerator) in [
+            ("unpartitioned", make_mem_table() as Arc<dyn TableProvider>),
+            (
+                "partitioned_non_cayenne",
+                partitioned_accelerator(false, false).await,
+            ),
+        ] {
+            let (applied, committed, status_is_error) =
+                apply_widened_envelope(&format!("schema_evo_{case}"), accelerator).await;
+
+            assert_eq!(
+                committed,
+                vec![1],
+                "{case}: must keep committing under the restart-repaired fallback"
+            );
+            assert!(applied, "{case}: the run must continue");
+            assert!(!status_is_error, "{case}: the dataset must not be errored");
+        }
     }
 
     // -- Correctness: clean termination on stream end -------------------------
@@ -6933,21 +7994,12 @@ mod tests {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let log = CommitLog::new();
         let initial_load = Arc::new(AtomicBool::new(false));
-        let notify = Arc::new(Notify::new());
+        let refresh_completion = RefreshCompletion::new();
 
-        // Subscribe BEFORE running so we don't miss the notify_waiters signal.
-        let notified = {
-            let n = Arc::clone(&notify);
-            tokio::spawn(async move {
-                let waiter = n.notified();
-                tokio::pin!(waiter);
-                tokio::time::timeout(Duration::from_secs(5), &mut waiter)
-                    .await
-                    .is_ok()
-            })
-        };
-        // Yield so the subscriber registers before we proceed.
-        tokio::task::yield_now().await;
+        // Take the waiter before the stream runs, and await it only after the
+        // stream has finished — the ordering that loses an edge-triggered
+        // wakeup entirely (#13086).
+        let waiter = refresh_completion.next();
 
         let stream = make_changes_stream(vec![
             Ok(make_tracked_envelope(1, Arc::clone(&log), false)),
@@ -6957,7 +8009,7 @@ mod tests {
         run_changes_stream(
             &task,
             stream,
-            Some(Arc::clone(&notify)),
+            Some(refresh_completion.clone()),
             Arc::clone(&initial_load),
         )
         .await
@@ -6967,10 +8019,9 @@ mod tests {
             initial_load.load(Ordering::Relaxed),
             "initial_load_completed must flip to true once a ready envelope is processed"
         );
-        assert!(
-            notified.await.expect("ready notifier task must finish"),
-            "ready_sender.notify_waiters() must fire when a ready envelope is processed"
-        );
+        tokio::time::timeout(Duration::from_secs(5), waiter.wait())
+            .await
+            .expect("a ready envelope must release a waiter taken before the stream ran");
     }
 
     // -- Correctness: readiness heartbeats bypass the write/durability path ---
@@ -6982,6 +8033,403 @@ mod tests {
         let schema = Arc::new(create_test_data_schema());
         cdc::build_heartbeat_envelope(&schema, cdc::now_unix_ms(), is_ready)
             .expect("heartbeat envelope builds")
+    }
+
+    /// Observations recorded on `dataset_acceleration_refresh_duration_ms` for
+    /// one dataset at one `mode`. The histogram's sample count is what says a
+    /// re-read happened; its buckets are what say how long it took.
+    fn refresh_duration_samples(registry: &prometheus::Registry, dataset: &str, mode: &str) -> u64 {
+        for family in registry.gather() {
+            if family.name() != "dataset_acceleration_refresh_duration_ms"
+                || family.get_field_type() != prometheus::proto::MetricType::HISTOGRAM
+            {
+                continue;
+            }
+            for series in family.get_metric() {
+                let labels = series.get_label();
+                let matches = |key: &str, value: &str| {
+                    labels
+                        .iter()
+                        .any(|label| label.name() == key && label.value() == value)
+                };
+                if matches("dataset", dataset)
+                    && matches("mode", mode)
+                    && let Some(histogram) = series.get_histogram().as_ref()
+                {
+                    return histogram.get_sample_count();
+                }
+            }
+        }
+        0
+    }
+
+    /// A rebuild is the `refresh_mode: changes` equivalent of a refresh, and is
+    /// reported as one: it runs through `RefreshTask::run` at `RefreshMode::Full`,
+    /// so it lands on `dataset_acceleration_refresh_duration_ms{mode="full"}` with
+    /// the duration of the re-read. That is the whole alerting story for a
+    /// changes-mode dataset, because nothing else it does emits a `full` point —
+    /// so the assertion is on the labelled series, not just on the metric.
+    ///
+    /// Guards the coupling rather than the arithmetic: `rebuild_from_source`
+    /// re-entering the refresh path is what puts a re-read on an operator's
+    /// dashboard at all, and it is only two lines from being a bespoke reload
+    /// that reports nothing.
+    #[tokio::test]
+    async fn a_rebuild_is_reported_as_a_full_refresh_of_the_changes_dataset() {
+        let registry = crate::accelerated::refresh_task::test_prometheus_registry().clone();
+        let dataset = "rebuild_reported_as_full_refresh";
+        let task = make_refresh_task_named(dataset, make_mem_table() as Arc<dyn TableProvider>);
+
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        // Seated at `Changes`, the mode a dataset on this path actually carries.
+        // `Refresh::default()` is `Full`, and starting there would leave the test
+        // green even with `rebuild_from_source`'s `Changes` -> `Full` override
+        // deleted — while production would reach `run_once`'s
+        // `RefreshMode::Changes => unreachable!` instead. The override is the link
+        // under test, so the fixture has to make its absence observable.
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        assert_eq!(
+            refresh_duration_samples(&registry, dataset, "full"),
+            0,
+            "control: nothing has re-read the source yet"
+        );
+
+        let schema = Arc::new(create_test_data_schema());
+        let signal =
+            cdc::build_history_unavailable_envelope(&schema).expect("rebuild signal builds");
+        assert!(
+            task.apply_envelope_run(&mut context, vec![signal]).await,
+            "the rebuild must succeed, so the sample below is of a re-read that landed"
+        );
+
+        assert_eq!(
+            refresh_duration_samples(&registry, dataset, "full"),
+            1,
+            "a rebuild must be timed as one full refresh of '{dataset}', or a changes-mode \
+             dataset re-reads its whole source with nothing to show for it"
+        );
+    }
+
+    /// Coverage for a `refresh_sql` dataset, whose accelerator is created with
+    /// the projected schema while the rebuild signal still carries source rows:
+    /// the accelerator write narrows to the accelerated schema by name, so the
+    /// replacement lands with the projected columns.
+    #[tokio::test]
+    async fn listing_rebuild_lands_on_a_projected_accelerator_schema() {
+        let dataset = "listing_rebuild_projected_schema";
+        let source_schema = Arc::new(create_test_data_schema());
+        let projected_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&source_schema),
+                vec![vec![id_name_batch(&[99], &["stale-federated"])]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&projected_schema),
+                vec![vec![
+                    RecordBatch::try_new(
+                        Arc::clone(&projected_schema),
+                        vec![Arc::new(Int32Array::from(vec![0]))],
+                    )
+                    .expect("projected accelerator batch"),
+                ]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let task = make_refresh_task_with_source(
+            dataset,
+            Arc::clone(&federated) as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+        );
+
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: Some("SELECT id FROM listing_rebuild_projected_schema"),
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let listing = id_name_batch(&[1], &["existing"]);
+        let signal = cdc::ChangeEnvelope::from_parts(
+            Box::new(cdc::NoOpCommitter),
+            cdc::wrap_data_as_change_batch(&source_schema, &listing)
+                .expect("listing snapshot wraps")
+                .with_rebuild_from_this_batch(true),
+            false,
+            true,
+        );
+        assert!(
+            task.apply_envelope_run(&mut context, vec![signal]).await,
+            "a listing rebuild must land on a dataset whose accelerator is a refresh_sql projection"
+        );
+
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .read_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>)
+            .expect("read accelerator")
+            .collect()
+            .await
+            .expect("collect accelerator");
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .expect("id")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1],
+            "the replacement must be the snapshot's rows, narrowed to the accelerated columns"
+        );
+    }
+
+    /// Copilot harness dual: a later federated scan seeing `b` after the
+    /// captured listing `{a}` would write `b` and then backfill `b` again.
+    /// Listing-driven overwrite must use the envelope rows, not the federated table.
+    #[tokio::test]
+    async fn listing_rebuild_overwrites_from_envelope_not_federated_scan() {
+        // Before anything records: the acceleration meter binds whichever global
+        // provider is installed the first time one of its metrics is touched, so
+        // a sample taken before this call never reaches this registry.
+        let registry = crate::accelerated::refresh_task::test_prometheus_registry().clone();
+        let dataset = "listing_rebuild_same_snapshot";
+        let schema = Arc::new(create_test_data_schema());
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[99], &["stale-federated"])]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[0], &["old"])]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let task = make_refresh_task_with_source(
+            dataset,
+            Arc::clone(&federated) as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+        );
+
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        assert_eq!(
+            refresh_duration_samples(&registry, dataset, "full"),
+            0,
+            "control: nothing has replaced the acceleration yet"
+        );
+
+        let listing = id_name_batch(&[1], &["existing"]);
+        let signal = cdc::ChangeEnvelope::from_parts(
+            Box::new(cdc::NoOpCommitter),
+            cdc::wrap_data_as_change_batch(&schema, &listing)
+                .expect("listing snapshot wraps")
+                .with_rebuild_from_this_batch(true),
+            false,
+            true,
+        );
+        assert!(
+            task.apply_envelope_run(&mut context, vec![signal]).await,
+            "listing-driven rebuild must succeed"
+        );
+
+        let names = names_in_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>).await;
+        assert_eq!(
+            names,
+            vec!["existing".to_string()],
+            "overwrite must use the listing snapshot, not the federated table or prior accelerator rows, got {names:?}"
+        );
+        assert_eq!(
+            refresh_duration_samples(&registry, dataset, "full"),
+            1,
+            "a listing-driven replace is still one full refresh of '{dataset}'"
+        );
+    }
+
+    /// Copilot: after a listing rebuild overwrite succeeds, its committer must
+    /// finalize independently of later envelopes. Otherwise a later write failure
+    /// drops the rebuild committer unacked and `AppliedKeysCommitter::drop`
+    /// releases keys whose rows are already present.
+    #[tokio::test]
+    async fn listing_rebuild_commits_before_a_later_write_failure() {
+        let dataset = "listing_rebuild_commits_before_later_fail";
+        let schema = Arc::new(create_test_data_schema());
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[99], &["stale-federated"])]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[0], &["old"])]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let writes_seen = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(FailAfterNWrites {
+            inner: Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+            writes_seen: Arc::clone(&writes_seen),
+            allow: 1, // rebuild overwrite lands; the later upsert fails
+        });
+        let task = make_refresh_task_with_source(
+            dataset,
+            Arc::clone(&federated) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
+        );
+
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let log = CommitLog::new();
+        let listing = id_name_batch(&[1], &["existing"]);
+        let rebuild = cdc::ChangeEnvelope::from_parts(
+            Box::new(TrackingCommitter {
+                id: 1,
+                log: Arc::clone(&log),
+                outcome: Ok(()),
+            }),
+            cdc::wrap_data_as_change_batch(&schema, &listing)
+                .expect("listing snapshot wraps")
+                .with_rebuild_from_this_batch(true),
+            false,
+            true,
+        );
+        let later = make_tracked_envelope(2, Arc::clone(&log), false);
+
+        assert!(
+            !task
+                .apply_envelope_run(&mut context, vec![rebuild, later])
+                .await,
+            "the later upsert must fail the run after the rebuild overwrite"
+        );
+
+        // Drain the rebuild's deferred commit (spawned before the later failure).
+        if let Some(handle) = context.pending_commit.take() {
+            handle
+                .await
+                .expect("rebuild commit task join")
+                .expect("rebuild commit must succeed");
+        }
+        assert_eq!(
+            log.ids().await,
+            vec![1],
+            "rebuild committer must finalize after overwrite even when a later write fails"
+        );
+        assert_eq!(
+            writes_seen.load(AtomicOrdering::SeqCst),
+            2,
+            "rebuild overwrite + failed later upsert = two insert_into attempts"
+        );
     }
 
     /// A rebuild signal is an ordering barrier, not a jump to the front of the
@@ -7058,7 +8506,7 @@ mod tests {
         });
         let task = make_refresh_task(provider as Arc<dyn TableProvider>);
         let initial_load = Arc::new(AtomicBool::new(false));
-        let notify = Arc::new(Notify::new());
+        let refresh_completion = RefreshCompletion::new();
 
         let stream = make_changes_stream(vec![
             Ok(make_heartbeat_envelope(false)),
@@ -7068,7 +8516,7 @@ mod tests {
         run_changes_stream(
             &task,
             stream,
-            Some(Arc::clone(&notify)),
+            Some(refresh_completion.clone()),
             Arc::clone(&initial_load),
         )
         .await
@@ -7098,7 +8546,7 @@ mod tests {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let log = CommitLog::new();
         let initial_load = Arc::new(AtomicBool::new(false));
-        let notify = Arc::new(Notify::new());
+        let refresh_completion = RefreshCompletion::new();
 
         let stream = make_changes_stream(vec![
             Ok(make_tracked_envelope(1, Arc::clone(&log), false)),
@@ -7110,7 +8558,7 @@ mod tests {
         run_changes_stream(
             &task,
             stream,
-            Some(Arc::clone(&notify)),
+            Some(refresh_completion.clone()),
             Arc::clone(&initial_load),
         )
         .await

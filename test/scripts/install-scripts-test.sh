@@ -12,7 +12,7 @@
 #   ./test/scripts/install-scripts-test.sh [--live] [--verbose]
 #
 # Options:
-#   --live      Run live download tests (requires network, slower)
+#   --live      Run live download tests (requires network and Python 3, slower)
 #   --verbose   Show detailed output for each test
 #
 # Exit codes:
@@ -29,6 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL_SCRIPT="$PROJECT_ROOT/install/install.sh"
 INSTALL_SPICED_SCRIPT="$PROJECT_ROOT/install/install-spiced.sh"
+INSTALL_NIGHTLY_SCRIPT="$PROJECT_ROOT/install/install-nightly.sh"
 
 # Test configuration
 LIVE_TESTS=false
@@ -48,6 +49,14 @@ NC='\033[0m' # No Color
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
+github_api() {
+    local headers=(-H "Accept: application/vnd.github+json")
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        headers+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    fi
+    curl --fail --silent --show-error "${headers[@]}" "$@"
+}
 
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $*"
@@ -300,7 +309,8 @@ test_artifacts_exist_in_latest_release() {
     fi
     
     local release_assets
-    release_assets=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"name":' | grep -E "spice.*\.tar\.gz" || true)
+    release_assets=$(github_api "https://api.github.com/repos/spiceai/spiceai/releases/latest" |
+        python3 -c 'import json, sys; print(json.dumps([asset["name"] for asset in json.load(sys.stdin)["assets"]]))') || return 1
     
     if [[ -z "$release_assets" ]]; then
         log_verbose "Could not fetch release assets"
@@ -312,15 +322,16 @@ test_artifacts_exist_in_latest_release() {
         "spice_linux_x86_64.tar.gz"
         "spice_linux_aarch64.tar.gz"
         "spice_darwin_aarch64.tar.gz"
+        "spice.exe_windows_x86_64.tar.gz"
         "spiced_linux_x86_64.tar.gz"
         "spiced_linux_aarch64.tar.gz"
         "spiced_darwin_aarch64.tar.gz"
-        "spiced_models_linux_x86_64.tar.gz"
-        "spiced_models_linux_aarch64.tar.gz"
-        "spiced_models_darwin_aarch64.tar.gz"
         "spiced_metal_darwin_aarch64.tar.gz"
-        "spiced.exe_windows_x86_64.tar.gz"
-        "spiced.exe_models_windows_x86_64.tar.gz"
+        "spiced_cuda_80_linux_x86_64.tar.gz"
+        "spiced_cuda_86_linux_x86_64.tar.gz"
+        "spiced_cuda_87_linux_x86_64.tar.gz"
+        "spiced_cuda_89_linux_x86_64.tar.gz"
+        "spiced_cuda_90_linux_x86_64.tar.gz"
     )
     
     local missing=0
@@ -592,36 +603,35 @@ test_cuda_version_invalid() {
 # Default Value Tests
 # =============================================================================
 
-test_default_variant_is_models() {
-    # Source the script in a subshell and check VARIANT default
+read_spiced_variant() {
+    local installer_preamble
+    installer_preamble=$(awk '
+        /^# main$/ { found = 1; exit }
+        { print }
+        END { if (!found) exit 1 }
+    ' "$INSTALL_SPICED_SCRIPT") || return 1
+    bash -c "$installer_preamble"$'\nprintf "%s" "$VARIANT"\n'
+}
+
+test_default_variant_is_empty() {
     local variant
-    variant=$(bash -c 'source /dev/stdin <<< "
-        : \${VARIANT:=\"models\"}
-        echo \$VARIANT
-    "')
-    [[ "$variant" == "models" ]]
+    variant=$(
+        unset VARIANT
+        read_spiced_variant
+    ) || return 1
+    [[ -z "$variant" ]]
 }
 
 test_variant_can_be_overridden() {
     local variant
-    variant=$(VARIANT="metal" bash -c '
-        : ${VARIANT:="models"}
-        echo $VARIANT
-    ')
+    variant=$(VARIANT="metal" read_spiced_variant) || return 1
     [[ "$variant" == "metal" ]]
 }
 
 test_variant_can_be_empty() {
     local variant
-    variant=$(VARIANT="" bash -c '
-        : ${VARIANT:="models"}
-        echo $VARIANT
-    ')
-    # When VARIANT is set to empty, :="models" will still set it to models
-    # because := checks for unset OR empty. To allow empty, use := vs :-
-    # The current script uses := so empty becomes "models"
-    # This test validates the current behavior
-    [[ "$variant" == "models" ]]
+    variant=$(VARIANT="" read_spiced_variant) || return 1
+    [[ -z "$variant" ]]
 }
 
 # =============================================================================
@@ -658,7 +668,8 @@ test_live_latest_release_accessible() {
     fi
     
     local response
-    response=$(curl -sS -o /dev/null -w "%{http_code}" "https://api.github.com/repos/spiceai/spiceai/releases/latest")
+    response=$(github_api -o /dev/null -w "%{http_code}" "https://api.github.com/repos/spiceai/spiceai/releases/latest") || return 1
+    log_verbose "Latest release HTTP status: $response"
     [[ "$response" == "200" ]]
 }
 
@@ -669,14 +680,15 @@ test_live_download_url_resolves() {
     
     # Get latest release tag
     local tag
-    tag=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "\(.*\)",/\1/')
+    tag=$(github_api "https://api.github.com/repos/spiceai/spiceai/releases/latest" |
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') || return 1
     
     if [[ -z "$tag" ]]; then
         log_verbose "Could not get latest tag"
         return 1
     fi
     
-    # Check if a known artifact URL returns 302 (redirect to download)
+    # Follow the asset redirect and require a successful download.
     local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spice_linux_x86_64.tar.gz"
     local response
     response=$(curl -sS -o /dev/null -w "%{http_code}" -L "$url" 2>/dev/null || echo "000")
@@ -684,19 +696,20 @@ test_live_download_url_resolves() {
     [[ "$response" == "200" ]]
 }
 
-test_live_spiced_models_linux_downloadable() {
+test_live_spiced_linux_downloadable() {
     if [[ "$LIVE_TESTS" != "true" ]]; then
         return 0
     fi
     
     local tag
-    tag=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "\(.*\)",/\1/')
+    tag=$(github_api "https://api.github.com/repos/spiceai/spiceai/releases/latest" |
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') || return 1
     
     if [[ -z "$tag" ]]; then
         return 1
     fi
     
-    local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spiced_models_linux_x86_64.tar.gz"
+    local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spiced_linux_x86_64.tar.gz"
     local response
     response=$(curl -sS -o /dev/null -w "%{http_code}" -L "$url" 2>/dev/null || echo "000")
     
@@ -766,6 +779,85 @@ test_spiced_variant_metal_documented() {
 
 test_spiced_variant_cuda_documented() {
     grep -q 'CUDA.*VARIANT="cuda"' "$INSTALL_SPICED_SCRIPT"
+}
+
+# =============================================================================
+# Sudo Decision Tests
+# =============================================================================
+
+# Runs install.sh end to end, piped into bash as the README one-liner does, with no
+# network and no TTY: `curl` serves a local archive holding a stub `spice`, and `sudo`
+# records its arguments to $home.sudo and refuses, as sudo does without a terminal.
+# Extra arguments are VAR=value pairs passed to the installer's environment.
+run_install_offline() {
+    local home="$1"
+    shift
+    local stubs="$home.stubs"
+    mkdir -p "$stubs/pkg"
+    printf '#!/bin/sh\necho "CLI version: v0.0.0"\n' > "$stubs/pkg/spice"
+    chmod +x "$stubs/pkg/spice"
+    tar czf "$stubs/spice.tar.gz" -C "$stubs/pkg" spice
+    cat > "$stubs/curl" <<STUB
+#!/bin/sh
+while [ \$# -gt 0 ]; do
+    if [ "\$1" = "-o" ]; then cp "$stubs/spice.tar.gz" "\$2"; exit 0; fi
+    shift
+done
+exit 1
+STUB
+    cat > "$stubs/sudo" <<STUB
+#!/bin/sh
+echo "\$*" >> "$home.sudo"
+echo "sudo: a terminal is required to read the password" >&2
+exit 1
+STUB
+    chmod +x "$stubs/curl" "$stubs/sudo"
+    : > "$home.sudo"
+    env -i HOME="$home" PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin" SHELL=/bin/bash "$@" \
+        /bin/bash -c "cat '$INSTALL_SCRIPT' | /bin/bash -s -- 0.0.0" > "$home.log" 2>&1 < /dev/null
+}
+
+# regression test for #14445: a first install, with no ~/.spice yet, must not ask for sudo
+test_install_sh_fresh_home_needs_no_sudo() {
+    local home="$TEST_TMP_DIR/fresh-home"
+    mkdir -p "$home"
+    run_install_offline "$home" || { cat "$home.log"; return 1; }
+    [[ ! -s "$home.sudo" ]] || { echo "sudo was called: $(cat "$home.sudo")"; return 1; }
+    [[ -x "$home/.spice/bin/spice" && -O "$home/.spice/bin/spice" ]]
+}
+
+test_install_sh_unwritable_dir_uses_sudo() {
+    local home="$TEST_TMP_DIR/locked-home"
+    mkdir -p "$home/locked"
+    chmod 555 "$home/locked"
+    run_install_offline "$home" SPICE_CLI_INSTALL_DIR="$home/locked/new/bin" || true
+    chmod 755 "$home/locked"
+    grep -q "^mkdir -p $home/locked/new/bin" "$home.sudo"
+}
+
+test_install_sh_explicit_use_sudo_is_honored() {
+    local home="$TEST_TMP_DIR/explicit-sudo-home"
+    mkdir -p "$home"
+    run_install_offline "$home" USE_SUDO=true || true
+    grep -q "^cp .* $home/.spice/bin$" "$home.sudo"
+}
+
+# Evaluates install-nightly.sh's getSystemInfo for one SPICED_INSTALL_DIR
+nightly_use_sudo_for() {
+    bash -c "USE_SUDO=false; SPICED_INSTALL_DIR='$1'
+        $(sed -n '/^getSystemInfo() {/,/^}/p' "$INSTALL_NIGHTLY_SCRIPT")
+        getSystemInfo; echo \"\$USE_SUDO\""
+}
+
+test_install_nightly_sh_missing_parent_needs_no_sudo() {
+    local home="$TEST_TMP_DIR/nightly-home"
+    mkdir -p "$home/locked"
+    chmod 555 "$home/locked"
+    local writable locked
+    writable=$(nightly_use_sudo_for "$home/new/bin")
+    locked=$(nightly_use_sudo_for "$home/locked/new/bin")
+    chmod 755 "$home/locked"
+    [[ "$writable" == "false" && "$locked" == "true" ]]
 }
 
 # =============================================================================
@@ -848,7 +940,7 @@ run_all_tests() {
     # Artifact Naming - Linux x86_64
     echo "--- Artifact Naming: Linux x86_64 ---"
     run_test "Linux x86_64 default artifact name" test_artifact_name_linux_x86_64_default
-    run_test "Linux x86_64 models artifact name" test_artifact_name_linux_x86_64_models
+    run_test "Legacy Linux x86_64 models artifact name" test_artifact_name_linux_x86_64_models
     run_test "Linux x86_64 CUDA 90 artifact name" test_artifact_name_linux_x86_64_cuda_90
     run_test "Linux x86_64 CUDA 89 artifact name" test_artifact_name_linux_x86_64_cuda_89
     run_test "Linux x86_64 CUDA 87 artifact name" test_artifact_name_linux_x86_64_cuda_87
@@ -859,20 +951,20 @@ run_all_tests() {
     # Artifact Naming - Linux aarch64
     echo "--- Artifact Naming: Linux aarch64 ---"
     run_test "Linux aarch64 default artifact name" test_artifact_name_linux_aarch64_default
-    run_test "Linux aarch64 models artifact name" test_artifact_name_linux_aarch64_models
+    run_test "Legacy Linux aarch64 models artifact name" test_artifact_name_linux_aarch64_models
     echo ""
     
     # Artifact Naming - macOS
     echo "--- Artifact Naming: macOS (darwin) ---"
     run_test "Darwin aarch64 default artifact name" test_artifact_name_darwin_aarch64_default
-    run_test "Darwin aarch64 models artifact name" test_artifact_name_darwin_aarch64_models
+    run_test "Legacy Darwin aarch64 models artifact name" test_artifact_name_darwin_aarch64_models
     run_test "Darwin aarch64 metal artifact name" test_artifact_name_darwin_aarch64_metal
     echo ""
     
     # Artifact Naming - Windows
     echo "--- Artifact Naming: Windows ---"
-    run_test "Windows x86_64 default artifact name" test_artifact_name_windows_x86_64_default
-    run_test "Windows x86_64 models artifact name" test_artifact_name_windows_x86_64_models
+    run_test "Legacy Windows x86_64 runtime artifact name" test_artifact_name_windows_x86_64_default
+    run_test "Legacy Windows x86_64 models artifact name" test_artifact_name_windows_x86_64_models
     echo ""
     
     # Artifact Naming - Spice CLI
@@ -935,7 +1027,7 @@ run_all_tests() {
     
     # Default Values
     echo "--- Default Values ---"
-    run_test "Default variant is models" test_default_variant_is_models
+    run_test "Default variant has no archive suffix" test_default_variant_is_empty
     run_test "Variant can be overridden" test_variant_can_be_overridden
     run_test "Empty variant behavior" test_variant_can_be_empty
     echo ""
@@ -964,11 +1056,23 @@ run_all_tests() {
     echo "--- Documentation ---"
     run_test "Naming convention documented" test_spiced_naming_convention_documented
     run_test "Empty variant documented" test_spiced_variant_empty_documented
-    run_test "Models variant documented" test_spiced_variant_models_documented
+    run_test "Model support documented" test_spiced_variant_models_documented
     run_test "Metal variant documented" test_spiced_variant_metal_documented
     run_test "CUDA variant documented" test_spiced_variant_cuda_documented
     echo ""
     
+    # Sudo decision (a root user never runs sudo, so these only run unprivileged)
+    echo "--- Sudo Decision ---"
+    if [[ $EUID -ne 0 ]]; then
+        run_test "install.sh: first install into a fresh HOME needs no sudo" test_install_sh_fresh_home_needs_no_sudo
+        run_test "install.sh: unwritable install dir uses sudo" test_install_sh_unwritable_dir_uses_sudo
+        run_test "install.sh: explicit USE_SUDO=true is honored" test_install_sh_explicit_use_sudo_is_honored
+        run_test "install-nightly.sh: missing parent dir needs no sudo" test_install_nightly_sh_missing_parent_needs_no_sudo
+    else
+        skip_test "Sudo decision tests" "running as root"
+    fi
+    echo ""
+
     # Error Handling
     echo "--- Error Handling ---"
     run_test "install.sh has error handling" test_script_has_error_handling
@@ -982,7 +1086,7 @@ run_all_tests() {
         echo "--- Live Network Tests ---"
         run_test "Latest release accessible" test_live_latest_release_accessible
         run_test "Download URL resolves" test_live_download_url_resolves
-        run_test "spiced_models_linux downloadable" test_live_spiced_models_linux_downloadable
+        run_test "spiced_linux downloadable" test_live_spiced_linux_downloadable
         run_test "All expected artifacts exist" test_artifacts_exist_in_latest_release
         echo ""
     fi

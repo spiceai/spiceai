@@ -52,6 +52,9 @@ pub mod localpod;
 pub mod memory;
 
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
+pub const SCYLLADB_DATACONNECTOR: &str = "scylladb"; // const needs to be accessible when ScyllaDB isn't built
+/// The cargo feature that builds the `ScyllaDB` data connector into `spiced`.
+pub const SCYLLADB_FEATURE: &str = "scylladb";
 pub mod deferred;
 // ducklake: moved to crates/data-connectors/connector-ducklake
 // gcs: moved to crates/data-connectors/connector-gcs
@@ -66,6 +69,7 @@ pub mod s3;
 // connector outside the runtime depends on that crate directly.
 pub(crate) mod schema_projection;
 pub mod sink;
+pub(crate) mod snapshot_source;
 // spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
 pub mod spiceai;
 

@@ -1453,6 +1453,13 @@ fn update_preauth_hash(hash: &mut [u8; 64], message: &[u8]) {
 }
 
 fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
+    // The share root is addressed by the empty path; name it rather than
+    // leaving the message to trail off after "for ".
+    let path = if path.is_empty() {
+        "<share root>"
+    } else {
+        path
+    };
     tracing::warn!(target: "smb", "error 0x{status:08X}: {path}");
     match status {
         0xC000_000F // STATUS_NO_SUCH_FILE
@@ -1892,6 +1899,16 @@ mod tests {
         let result = client.tree_connect("data").await;
         let client_sig_ok = server.await.expect("mock server task");
         (result, client_sig_ok)
+    }
+
+    #[test]
+    fn status_error_names_the_share_root_for_an_empty_path() {
+        let err = smb_status_to_io_error(0xC000_000D, "");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "SMB error 0xC000000D for <share root>");
+
+        let err = smb_status_to_io_error(0xC000_000D, "sub");
+        assert_eq!(err.to_string(), "SMB error 0xC000000D for sub");
     }
 
     /// Regression test for #11148: the signing key must be derived from a

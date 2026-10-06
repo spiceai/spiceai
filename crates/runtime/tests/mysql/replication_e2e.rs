@@ -55,18 +55,6 @@ use crate::utils::{
 };
 use crate::{configure_test_datafusion, init_tracing};
 
-const MYSQL_E2E_PORT: u16 = 13322;
-#[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_CAYENNE_PORT: u16 = 13323;
-#[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_RESTART_PORT: u16 = 13321;
-#[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_GTID_PORT: u16 = 13330;
-#[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_RECONNECT_PORT: u16 = 13331;
-#[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_TYPES_PORT: u16 = 13332;
-
 /// The accelerator engine a run of the e2e exercises.
 struct EngineConfig {
     engine: &'static str,
@@ -225,7 +213,7 @@ async fn wait_for_scalar_i64(
     }
 }
 
-async fn run_replication_e2e(port: u16, engine: EngineConfig) -> Result<(), anyhow::Error> {
+async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,runtime=debug,data_components::mysql_replication=debug,info",
     ));
@@ -233,9 +221,10 @@ async fn run_replication_e2e(port: u16, engine: EngineConfig) -> Result<(), anyh
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(port)
+            let container = common::start_mysql_docker_container()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = container.host_port(3306)?;
 
             // ------------------------------------------------------------
             // 1. Create schema + seed on the source.
@@ -377,14 +366,11 @@ async fn run_replication_e2e(port: u16, engine: EngineConfig) -> Result<(), anyh
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
-    run_replication_e2e(
-        MYSQL_E2E_PORT,
-        EngineConfig {
-            engine: "duckdb",
-            mode: spicepod::acceleration::Mode::Memory,
-            accel_params: HashMap::new(),
-        },
-    )
+    run_replication_e2e(EngineConfig {
+        engine: "duckdb",
+        mode: spicepod::acceleration::Mode::Memory,
+        accel_params: HashMap::new(),
+    })
     .await
 }
 
@@ -406,14 +392,11 @@ async fn mysql_binlog_replication_end_to_end_cayenne() -> Result<(), anyhow::Err
             temp_dir.path().join("metadata.db").display().to_string(),
         ),
     ]);
-    run_replication_e2e(
-        MYSQL_E2E_CAYENNE_PORT,
-        EngineConfig {
-            engine: "cayenne",
-            mode: spicepod::acceleration::Mode::File,
-            accel_params,
-        },
-    )
+    run_replication_e2e(EngineConfig {
+        engine: "cayenne",
+        mode: spicepod::acceleration::Mode::File,
+        accel_params,
+    })
     .await
 }
 
@@ -433,10 +416,10 @@ async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow:
 
     test_request_context()
         .scope(async {
-            let port = MYSQL_E2E_RESTART_PORT;
-            let _container = common::start_mysql_docker_container(port)
+            let container = common::start_mysql_docker_container()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = container.host_port(3306)?;
 
             // Seed just the orders table on the source.
             let pool = common::get_mysql_conn(port)?;
@@ -562,10 +545,10 @@ async fn mysql_binlog_replication_gtid_resume_cayenne() -> Result<(), anyhow::Er
 
     test_request_context()
         .scope(async {
-            let port = MYSQL_E2E_GTID_PORT;
-            let _container = common::start_mysql_gtid_docker_container(port)
+            let container = common::start_mysql_gtid_docker_container()
                 .await
                 .map_err(|e| anyhow!("start gtid container: {e}"))?;
+            let port = container.host_port(3306)?;
 
             let pool = common::get_mysql_conn(port)?;
             exec(&pool, DDL_STATEMENTS[1]).await?; // repl_orders
@@ -723,6 +706,53 @@ async fn wait_for_binlog_dump_thread(pool: &mysql_async::Pool) -> Result<u64, an
         .ok_or_else(|| anyhow!("the `Binlog Dump` thread vanished between polls"))
 }
 
+/// The floor the pump raises the dump session's `net_write_timeout` to, mirroring
+/// `data_components::mysql_replication::binlog::DUMP_NET_WRITE_TIMEOUT_SECS`
+/// (private to that crate). The server default is 60s, so anything at or above
+/// this proves the raise was accepted and applied.
+const EXPECTED_DUMP_NET_WRITE_TIMEOUT_SECS: u64 = 180;
+
+/// The `net_write_timeout` in force on another session, read back from the
+/// server rather than inferred from the statement Spice sent.
+///
+/// `Ok(None)` when `performance_schema` cannot answer — the instrumentation is
+/// on by default but can be built out or turned off, and a suite that fails for
+/// that reason would be reporting on the image rather than on the runtime.
+async fn session_net_write_timeout(
+    pool: &mysql_async::Pool,
+    processlist_id: u64,
+) -> Result<Option<u64>, anyhow::Error> {
+    let mut conn = pool.get_conn().await?;
+    let sql = format!(
+        "SELECT v.VARIABLE_VALUE FROM performance_schema.variables_by_thread v \
+         JOIN performance_schema.threads t ON t.THREAD_ID = v.THREAD_ID \
+         WHERE t.PROCESSLIST_ID = {processlist_id} \
+           AND v.VARIABLE_NAME = 'net_write_timeout'"
+    );
+    let value: Option<String> = match conn.query_first(sql.as_str()).await {
+        Ok(value) => value,
+        Err(e) => {
+            // Said out loud: a silent `None` here would turn the assertion below
+            // into one that can never fail.
+            eprintln!("performance_schema could not answer `{sql}`: {e}");
+            return Ok(None);
+        }
+    };
+    // No row is "cannot answer" — the dump session is not instrumented — and
+    // skips the assertion. A row whose value is not a number is a different
+    // thing entirely, and folding it into the same `None` would let this test
+    // pass without ever reading the session it exists to read.
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let seconds = value.parse::<u64>().map_err(|e| {
+        anyhow!(
+            "performance_schema reported net_write_timeout = `{value}`, which is not a number: {e}"
+        )
+    })?;
+    Ok(Some(seconds))
+}
+
 /// Wait for the dump thread id to change, i.e. the pump has reconnected.
 async fn wait_for_dump_thread_change(
     pool: &mysql_async::Pool,
@@ -789,11 +819,12 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_E2E_RECONNECT_PORT)
+            let container = common::start_mysql_docker_container_retrying_startup()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = container.host_port(3306)?;
 
-            let pool = common::get_mysql_conn(MYSQL_E2E_RECONNECT_PORT)?;
+            let pool = common::get_mysql_conn(port)?;
             exec(&pool, RECONNECT_DDL).await?;
             for id in 1..=RECONNECT_ROWS {
                 exec(
@@ -835,11 +866,7 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
                 accel_params,
             };
             let app = AppBuilder::new("mysql_replication_reconnect")
-                .with_dataset(make_dataset(
-                    &dataset,
-                    &mysql_params(MYSQL_E2E_RECONNECT_PORT),
-                    &engine,
-                ))
+                .with_dataset(make_dataset(&dataset, &mysql_params(port), &engine))
                 .build();
 
             configure_test_datafusion();
@@ -861,6 +888,25 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
             // The dump thread may register a moment after the first rows land,
             // so wait for it rather than racing it.
             let dump_thread = wait_for_binlog_dump_thread(&pool).await?;
+
+            // Regression test for #13307, and the reason it is here rather than
+            // in a unit test: the floor was expressed as an expression MySQL
+            // refuses for a system variable, and every unit test asserted the
+            // SQL Spice generated rather than what the server did with it, so
+            // they passed while the session kept the 60s default. Read the value
+            // back off the dump session itself.
+            match session_net_write_timeout(&pool, dump_thread).await? {
+                Some(seconds) => assert!(
+                    seconds >= EXPECTED_DUMP_NET_WRITE_TIMEOUT_SECS,
+                    "the dump session must carry the raised net_write_timeout, \
+                     got {seconds}s (the server default is 60s, so this means the \
+                     source rejected or ignored the statement that raises it)"
+                ),
+                None => eprintln!(
+                    "skipped the net_write_timeout assertion: performance_schema \
+                     did not report the dump session's value"
+                ),
+            }
 
             let half = RECONNECT_UPDATES_PER_ROW / 2;
             bump_counter_rows(&pool, half).await?;
@@ -1181,11 +1227,12 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_E2E_TYPES_PORT)
+            let container = common::start_mysql_docker_container_retrying_startup()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = container.host_port(3306)?;
 
-            let pool = common::get_mysql_conn(MYSQL_E2E_TYPES_PORT)?;
+            let pool = common::get_mysql_conn(port)?;
             exec(&pool, TYPES_DDL).await?;
             for seed in TYPES_SEED {
                 exec(&pool, seed).await?;
@@ -1213,7 +1260,7 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
             let app = AppBuilder::new("mysql_replication_types")
                 .with_dataset(make_dataset(
                     &dataset,
-                    &mysql_params(MYSQL_E2E_TYPES_PORT),
+                    &mysql_params(port),
                     &EngineConfig {
                         engine: "cayenne",
                         mode: spicepod::acceleration::Mode::File,

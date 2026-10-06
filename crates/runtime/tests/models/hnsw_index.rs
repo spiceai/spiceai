@@ -26,7 +26,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use app::AppBuilder;
 use arrow::array::{RecordBatch, StringArray};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
@@ -140,7 +140,7 @@ async fn refresh_table(rt: &Arc<Runtime>, table_name: &str) -> Result<(), anyhow
         .await?;
     notifier
         .ok_or_else(|| anyhow::anyhow!("No refresh notifier returned for {table_name}"))?
-        .notified()
+        .wait()
         .await;
     Ok(())
 }

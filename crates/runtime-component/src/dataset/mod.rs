@@ -18,14 +18,11 @@ use arrow_schema::SchemaRef;
 
 use crate::{access::AccessMode, find_first_delimiter};
 use acceleration::Engine;
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        dialect::{Dialect, GenericDialect},
-        parser::{Parser, ParserError},
-    },
+use datafusion::common::TableReference;
+use datafusion::sql::sqlparser::{
+    dialect::{Dialect, GenericDialect},
+    parser::{Parser, ParserError},
 };
-use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
@@ -84,10 +81,10 @@ pub enum Error {
     ))]
     OnConflictTargetMismatch { extra_detail: String },
 
-    #[snafu(display("Error parsing column reference {column_ref}: {source}"))]
+    #[snafu(display("Failed to parse the column reference '{column_ref}': {source}"))]
     UnableToParseColumnReference {
         column_ref: String,
-        source: column_reference::Error,
+        source: util::column_reference::Error,
     },
 
     #[snafu(display("Error parsing {field} as duration: {source}"))]

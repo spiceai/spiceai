@@ -469,15 +469,14 @@ impl From<&(&'static str, u32)> for TableWithRowCount {
 }
 
 impl QuerySet {
-    #[expect(clippy::unused_async)]
-    pub async fn get_queries(
+    pub fn get_queries(
         &self,
         overrides: Option<QueryOverrides>,
         _instance: Option<&SpicedInstance>,
         _random_param_set_count: Option<usize>,
         scale_factor: Option<f64>,
-    ) -> anyhow::Result<Vec<Query>> {
-        match self {
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<Query>>> + Send {
+        std::future::ready(match self {
             QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
             QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides, scale_factor)),
             QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
@@ -509,7 +508,7 @@ impl QuerySet {
 
                 Ok(add_tpch_parameters(queries))
             }
-        }
+        })
     }
 
     /// At scale factor 1, how many rows should be present in each table for the query set
@@ -1187,6 +1186,25 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
     }
 }
 
+/// TPC-DS query ids the `SQLite` override drops before adding its FLOAT-cast
+/// Q49, Q75 and Q90. Q14 uses `ROLLUP`, so it belongs with that group once —
+/// listing it again with `EXCEPT` / `INTERSECT` hid accidental additions.
+const SQLITE_TPCDS_REMOVED_QUERY_IDS: &[u32] = &[
+    17, 29, 35, 74, // SQLite does not support `stddev`
+    5, 14, 18, 22, 27, 36, 67, 70, 77, 80, 86, // ROLLUP and GROUPING
+    8, 38, 87, // EXCEPT and INTERSECT
+    49, 75, 90, // overridden below
+];
+
+#[must_use]
+fn without_tpcds_queries(queries: Vec<Query>, ids: &[u32]) -> Vec<Query> {
+    let names: BTreeSet<Arc<str>> = ids.iter().map(|id| format!("tpcds_q{id}").into()).collect();
+    queries
+        .into_iter()
+        .filter(|query| !names.contains(&query.name))
+        .collect()
+}
+
 #[must_use]
 pub fn get_tpcds_test_queries(
     overrides: Option<QueryOverrides>,
@@ -1242,12 +1260,11 @@ pub fn get_tpcds_test_queries(
             32, 92, // https://github.com/spiceai/spiceai/issues/8150
             29, 37, 41, 44, 54, 58 // empty results
         ),
-        Some(QueryOverrides::SQLite) => remove_tpcds_query!(
-            queries, 17, 29, 35, 74, // SQLite does not support `stddev`
-            5, 14, 18, 22, 27, 36, 67, 70, 77, 80,
-            86, // SQLite does not support `ROLLUP` and `GROUPING`
-            8, 14, 38, 87 // EXCEPT and INTERSECT aren't supported
-        ),
+        Some(QueryOverrides::SQLite) => {
+            let queries: Vec<Query> =
+                without_tpcds_queries(queries, SQLITE_TPCDS_REMOVED_QUERY_IDS);
+            add_tpcds_query_overrides!(queries, "sqlite", 49, 75, 90)
+        }
         Some(QueryOverrides::Spark) => remove_tpcds_query!(
             queries, 8, // https://github.com/spiceai/spiceai/issues/5250
             36, 44, 47, 49, 57, 67, 70, 86, // https://github.com/spiceai/spiceai/issues/5249
@@ -1363,6 +1380,35 @@ pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_tpcds_removed_query_ids_are_unique() {
+        let mut seen = BTreeSet::new();
+        for &id in SQLITE_TPCDS_REMOVED_QUERY_IDS {
+            assert!(
+                seen.insert(id),
+                "SQLite TPC-DS removal list lists {id} twice"
+            );
+        }
+        assert!(
+            seen.contains(&14),
+            "Q14 uses ROLLUP, so it stays on the SQLite removal list once"
+        );
+        let queries = get_tpcds_test_queries(Some(QueryOverrides::SQLite), None);
+        let q14 = queries
+            .iter()
+            .filter(|query| &*query.name == "tpcds_q14")
+            .count();
+        assert_eq!(q14, 0, "Q14 is not generated, then not re-added");
+        let mut names = BTreeSet::new();
+        for query in &queries {
+            assert!(
+                names.insert(query.name.as_ref()),
+                "SQLite TPC-DS query set lists '{}' twice",
+                query.name
+            );
+        }
+    }
 
     #[test]
     fn test_to_sql_with_inlined_params_named_format() {

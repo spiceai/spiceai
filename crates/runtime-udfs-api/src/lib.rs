@@ -17,8 +17,7 @@ limitations under the License.
 //! Which functions a remote backend must not be asked to evaluate.
 //!
 //! Federating a filter to a data source is only safe if that source can evaluate
-//! every function in it. Two independent sets of names are unsafe to push down,
-//! and they have opposite defaults:
+//! every function in it. Four sets of names are unsafe to push down:
 //!
 //! 1. **Spice functions** — the UDFs Spice defines (`bucket`, `cosine_distance`,
 //!    `rerank`, …) plus any the user registers. No remote source knows them, so
@@ -29,6 +28,15 @@ limitations under the License.
 //!    nested array/list/map functions relative to `PostgreSQL`. These are
 //!    allowed by default; only the backend knows which subset it lacks, so it
 //!    supplies them via [`FunctionSupportBuilder::deny_also`].
+//! 3. **The `DataFusion` cast built-ins** — [`DATAFUSION_CAST_BUILTINS`]
+//!    (`arrow_cast`, `cast_to_type`, …). The exception to set 2's default: they
+//!    are denied for every backend, because no source can be assumed to answer
+//!    them as `DataFusion` does. A source that is itself `DataFusion` (a
+//!    `FlightSQL` server, say) could, but nothing tells the connector that it is
+//!    talking to one, so these are kept local there too.
+//! 4. **`DataFusion` built-ins that describe the plan** — the
+//!    [`PLAN_INTROSPECTION_BUILTINS`] (`arrow_typeof`, …). No backend can
+//!    answer them, so every policy denies them and no carve-out re-admits them.
 //!
 //! Set 1 lives here because Spice owns it: every Spice function registers its
 //! name at its definition site with [`register_spice_function!`], collected into
@@ -39,8 +47,10 @@ limitations under the License.
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use datafusion::prelude::SessionContext;
-use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
+use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion_table_providers::util::supported_functions::{
+    FunctionRestriction, FunctionSupport, ScalarCallSupport,
+};
 use linkme::distributed_slice;
 
 /// Re-exported so a crate invoking [`register_spice_function!`] can bring
@@ -140,6 +150,17 @@ pub fn user_function_names() -> Vec<String> {
     USER_FUNCTION_NAMES.read().clone()
 }
 
+/// Whether `name` is a user-registered function **right now**.
+///
+/// Read at the moment a plan is checked rather than when a provider was built,
+/// which is what [`FunctionSupportBuilder::build`] needs: the name list it
+/// freezes into a [`FunctionRestriction::Deny`] is a snapshot, and a function
+/// registered after that provider exists is absent from it.
+#[must_use]
+pub fn is_user_function(name: &str) -> bool {
+    USER_FUNCTION_NAMES.read().iter().any(|n| n == name)
+}
+
 /// The link-time set of Spice function names, plus the JSON functions
 /// `datafusion-functions-json` contributes.
 #[must_use]
@@ -157,7 +178,7 @@ pub fn spice_function_names() -> Vec<String> {
 #[must_use]
 pub fn json_function_names() -> &'static [String] {
     static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
-        let mut ctx = SessionContext::new();
+        let mut ctx = util::session_state::session_context();
         let existing: HashSet<_> = ctx.state().scalar_functions().keys().cloned().collect();
         // A failure here would yield an incomplete list, and this list is a
         // *deny*-list: a missing name federates instead of being blocked, so the
@@ -199,6 +220,43 @@ pub fn datafusion_nested_function_names() -> &'static [String] {
     &NAMES
 }
 
+/// `DataFusion`'s own cast built-ins: `arrow_cast(expr, 'LargeUtf8')` and
+/// `arrow_try_cast` cast to an Arrow type named by a string, `cast_to_type` and
+/// `try_cast_to_type` to the type of their second argument, and the `try_`
+/// forms answer NULL where the cast fails. Every [`FunctionSupportBuilder`]
+/// denies them, and no backend's native carve-out re-admits them, so they are
+/// evaluated above the federated scan by `DataFusion`'s cast kernel.
+///
+/// Most SQL engines define none of these names, so a federated call failed
+/// remotely as an unknown function (issue #14444). `DuckDB` does define a
+/// `cast_to_type`, but it casts by `DuckDB`'s rules rather than Arrow's —
+/// `cast_to_type(1.5, 1)` is `2` there and `1` locally — so federating it is not
+/// faithful either.
+pub const DATAFUSION_CAST_BUILTINS: &[&str] = &[
+    "arrow_cast",
+    "arrow_try_cast",
+    "cast_to_type",
+    "try_cast_to_type",
+];
+
+/// `DataFusion` built-ins that describe the *plan* rather than the data, so no
+/// backend can evaluate them faithfully and every [`FunctionSupportBuilder`]
+/// denies them: `arrow_typeof` answers with the plan's Arrow type, `arrow_field`
+/// and `arrow_metadata` with the plan's field and its metadata, and
+/// `with_metadata` attaches metadata to a plan field. A backend cannot be
+/// assumed to define functions of these names — most SQL engines do not, so a
+/// federated call fails remotely as an unknown function (issue #14334) — and a
+/// backend that does define them, such as a `DataFusion`-based source, would
+/// answer about or modify its own plan, not this one. Evaluating them locally,
+/// above the federated scan, is the only reading that answers the question
+/// asked.
+pub const PLAN_INTROSPECTION_BUILTINS: &[&str] = &[
+    "arrow_typeof",
+    "arrow_field",
+    "arrow_metadata",
+    "with_metadata",
+];
+
 /// Removes from `names` everything the backend declares native.
 fn excluding_native(names: impl IntoIterator<Item = String>, native: &[&str]) -> Vec<String> {
     if native.is_empty() {
@@ -214,11 +272,14 @@ fn excluding_native(names: impl IntoIterator<Item = String>, native: &[&str]) ->
 /// Builds the [`FunctionSupport`] for one backend.
 ///
 /// Defaults to denying every Spice function (link-time set plus user-registered)
-/// and nothing else — correct for a source whose dialect rewrites none of them.
+/// the [`DATAFUSION_CAST_BUILTINS`] and the [`PLAN_INTROSPECTION_BUILTINS`], and
+/// nothing else — correct for a source whose dialect rewrites none of the Spice
+/// functions.
 #[derive(Default)]
 pub struct FunctionSupportBuilder<'a> {
     native: &'a [&'a str],
     deny_also: Vec<String>,
+    scalar_call: Option<ScalarCallSupport>,
 }
 
 impl<'a> FunctionSupportBuilder<'a> {
@@ -247,41 +308,95 @@ impl<'a> FunctionSupportBuilder<'a> {
         self
     }
 
+    /// A per-call check refusing the *call shapes* this backend's dialect cannot
+    /// translate, for a function whose name it carved out with [`Self::native`].
+    ///
+    /// Supply it here rather than through
+    /// `FunctionSupport::with_scalar_call_support` after [`Self::build`]: that
+    /// setter *replaces* the per-call check, and [`Self::build`] installs one of
+    /// its own for the live user-function registry. Both are consulted, and a
+    /// call has to satisfy both to federate.
+    #[must_use]
+    pub fn scalar_call(mut self, scalar_call: ScalarCallSupport) -> Self {
+        self.scalar_call = Some(scalar_call);
+        self
+    }
+
     /// The denied scalar-function names, in the order the deny-list is built:
     /// Spice functions minus the native carve-out, then user functions, then
-    /// any backend-specific additions.
+    /// any backend-specific additions, then the [`DATAFUSION_CAST_BUILTINS`] and
+    /// the [`PLAN_INTROSPECTION_BUILTINS`], which no carve-out reaches because no
+    /// backend can evaluate them.
     #[must_use]
     pub fn denied_names(self) -> Vec<String> {
         let spice = excluding_native(spice_function_names(), self.native);
         let user = user_function_names();
-        let mut denied = Vec::with_capacity(spice.len() + user.len() + self.deny_also.len());
-        denied.extend(spice);
-        denied.extend(user);
-        denied.extend(self.deny_also);
-        denied
+        spice
+            .into_iter()
+            .chain(user)
+            .chain(self.deny_also)
+            .chain(
+                DATAFUSION_CAST_BUILTINS
+                    .iter()
+                    .chain(PLAN_INTROSPECTION_BUILTINS)
+                    .map(|name| (*name).to_string()),
+            )
+            .collect()
     }
 
     /// The [`FunctionSupport`] to hand a federated provider or table-provider
     /// factory.
+    ///
+    /// The denied *names* are a snapshot, so they cannot answer for a user
+    /// function registered after this call — and providers are built once while
+    /// [`add_user_function`] runs for the life of the process. Every accelerator
+    /// engine is constructed in `RuntimeBuilder::build` before that same `build`
+    /// registers the spicepod's `functions:` entries, so a SQL accelerator's
+    /// snapshot names no user function at all; a tool-backed SQL UDF registers
+    /// while datasets and catalogs load; and a hot reload applies its function
+    /// diff after the components, without rebuilding a component that did not
+    /// itself change. A name absent from the snapshot federates, so the remote
+    /// is asked to evaluate a function it does not have — or, where it happens
+    /// to have one of that name, answers from a different function.
+    ///
+    /// So the per-call check reads the registry live. It only ever narrows what
+    /// the name list allows, which is why the snapshot is left as it is rather
+    /// than removed: it already denies everything registered before this call,
+    /// and this closes the rest.
     #[must_use]
-    pub fn build(self) -> FunctionSupport {
+    pub fn build(mut self) -> FunctionSupport {
+        let backend_call = self.scalar_call.take();
         FunctionSupport::new(
             Some(FunctionRestriction::Deny(self.denied_names())),
             None,
             None,
         )
+        .with_scalar_call_support(std::sync::Arc::new(
+            move |call: &ScalarFunction, scope: Option<&datafusion::common::DFSchema>| {
+                // The scope is the backend's to interpret, so it is passed
+                // through untouched: a rendering whose correctness depends on an
+                // operand's declared type reads it, and the user-function check
+                // here does not.
+                !is_user_function(call.func.name())
+                    && backend_call
+                        .as_ref()
+                        .is_none_or(|supports| supports(call, scope))
+            },
+        ))
     }
 }
 
 /// The [`FunctionSupport`] for a backend that evaluates no Spice function and
-/// every `DataFusion` built-in — the conservative default.
+/// every `DataFusion` built-in except the [`DATAFUSION_CAST_BUILTINS`] and the
+/// [`PLAN_INTROSPECTION_BUILTINS`] — the conservative default.
 #[must_use]
 pub fn function_support() -> FunctionSupport {
     FunctionSupportBuilder::new().build()
 }
 
 /// The functions no remote source may be asked to evaluate: every Spice
-/// function plus every user-registered one. Safe to call from per-query filter
+/// function, every user-registered one, the [`DATAFUSION_CAST_BUILTINS`], and
+/// the [`PLAN_INTROSPECTION_BUILTINS`]. Safe to call from per-query filter
 /// pushdown paths.
 #[must_use]
 pub fn deny_spice_specific_functions() -> std::sync::Arc<FunctionSupport> {
@@ -289,7 +404,8 @@ pub fn deny_spice_specific_functions() -> std::sync::Arc<FunctionSupport> {
 }
 
 /// As [`deny_spice_specific_functions`], but allowing the functions the target
-/// backend evaluates itself.
+/// backend evaluates itself. The [`DATAFUSION_CAST_BUILTINS`] and the
+/// [`PLAN_INTROSPECTION_BUILTINS`] stay denied.
 ///
 /// `native` is normally that backend's unparser dialect's native-function names,
 /// which is how the deny-list becomes backend-aware: a Spice function the
@@ -301,9 +417,199 @@ pub fn deny_spice_specific_functions_excluding(native: &[&str]) -> std::sync::Ar
     std::sync::Arc::new(FunctionSupportBuilder::new().native(native).build())
 }
 
-/// Full deny-list as a value, for any SQL connector whose unparser dialect has
-/// no Spice-function carve-out. See issue #10703.
+/// Full deny-list as a value — every Spice function, every user-registered one,
+/// the [`DATAFUSION_CAST_BUILTINS`] and the [`PLAN_INTROSPECTION_BUILTINS`] — for
+/// any SQL connector whose unparser dialect has no Spice-function carve-out. See
+/// issue #10703.
 #[must_use]
 pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new().build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::{
+        ColumnarValue, Expr, ScalarUDF, Volatility, create_udf, expr::ScalarFunction,
+    };
+    use datafusion::scalar::ScalarValue;
+    use std::sync::Arc;
+
+    /// `USER_FUNCTION_NAMES` is process-global, so every test here uses a name
+    /// of its own and drops it again; the assertions never depend on the
+    /// registry being empty.
+    struct Registered(&'static str);
+
+    impl Registered {
+        fn new(name: &'static str) -> Self {
+            add_user_function(name);
+            Self(name)
+        }
+    }
+
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            remove_user_function(self.0);
+        }
+    }
+
+    fn udf(name: &str, arity: usize) -> Arc<ScalarUDF> {
+        Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8; arity],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ))
+    }
+
+    fn call(name: &str, arity: usize) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            udf(name, arity),
+            vec![Expr::Literal(ScalarValue::from("v"), None); arity],
+        ))
+    }
+
+    /// The name list is a snapshot, so this is the case it already covered.
+    #[test]
+    fn a_user_function_registered_before_the_support_was_built_is_refused() {
+        let _registered = Registered::new("early_user_fn_udfs_api");
+
+        let support = FunctionSupportBuilder::new().build();
+
+        assert!(
+            !support.supports(&call("early_user_fn_udfs_api", 1), None),
+            "a user function in the deny-list snapshot must not federate"
+        );
+    }
+
+    /// The case the snapshot cannot answer: every provider is built once, and
+    /// registrations keep arriving for the life of the process (#13726).
+    #[test]
+    fn a_user_function_registered_after_the_support_was_built_is_refused() {
+        let support = FunctionSupportBuilder::new().build();
+        let _registered = Registered::new("late_user_fn_udfs_api");
+
+        assert!(
+            !support.supports(&call("late_user_fn_udfs_api", 1), None),
+            "a user function registered after the support was built must not federate"
+        );
+    }
+
+    /// Dropping a registration must not leave the name refused for ever: the
+    /// live read is the point, in both directions.
+    #[test]
+    fn a_name_that_is_no_longer_a_user_function_federates_again() {
+        let support = FunctionSupportBuilder::new().build();
+        drop(Registered::new("transient_user_fn_udfs_api"));
+
+        assert!(
+            support.supports(&call("transient_user_fn_udfs_api", 1), None),
+            "an unregistered name is not a user function and has nothing to refuse it"
+        );
+    }
+
+    #[test]
+    fn a_function_nobody_registered_still_federates() {
+        let support = FunctionSupportBuilder::new().build();
+
+        assert!(
+            support.supports(&call("some_remote_fn_udfs_api", 1), None),
+            "the deny-list must not refuse a name it has no reason to"
+        );
+    }
+
+    /// Regression test for #14444: each name in [`DATAFUSION_CAST_BUILTINS`] is
+    /// the canonical name of a `DataFusion` built-in whose every alias is listed
+    /// too — so a rename cannot leave the real function federating — and a call
+    /// of it is refused even by a backend that claims the name as native.
+    #[test]
+    fn a_datafusion_cast_builtin_is_denied_whatever_the_backend_carves_out() {
+        let state = util::session_state::session_context().state();
+        let support = FunctionSupportBuilder::new()
+            .native(DATAFUSION_CAST_BUILTINS)
+            .build();
+
+        for name in DATAFUSION_CAST_BUILTINS {
+            let builtin = state
+                .scalar_functions()
+                .get(*name)
+                .unwrap_or_else(|| panic!("{name} must be a DataFusion built-in"));
+            for alias in builtin.aliases() {
+                assert!(
+                    DATAFUSION_CAST_BUILTINS.contains(&alias.as_str()),
+                    "{name}'s alias {alias} must be denied alongside it"
+                );
+            }
+            let cast = Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::clone(builtin),
+                vec![
+                    Expr::Literal(ScalarValue::from(1_i64), None),
+                    Expr::Literal(ScalarValue::from("LargeUtf8"), None),
+                ],
+            ));
+            assert!(
+                !support.supports(&cast, None),
+                "{name} must not federate, whatever the backend carves out"
+            );
+        }
+    }
+
+    /// A built-in that describes the plan is denied by every builder, and a
+    /// backend's native carve-out cannot re-admit it (#14334).
+    #[test]
+    fn a_plan_introspection_builtin_is_denied_whatever_the_backend_carves_out() {
+        let support = FunctionSupportBuilder::new()
+            .native(PLAN_INTROSPECTION_BUILTINS)
+            .build();
+
+        for name in PLAN_INTROSPECTION_BUILTINS {
+            assert!(
+                !support.supports(&call(name, 1), None),
+                "{name} answers about the DataFusion plan, so no remote may be asked to evaluate it"
+            );
+        }
+    }
+
+    /// A backend's own per-call check and the live user-function check are both
+    /// consulted, so neither can mask the other. `build` installs the second,
+    /// which is why the first has to be supplied through the builder rather
+    /// than by `with_scalar_call_support` afterwards.
+    #[test]
+    fn a_backend_per_call_check_composes_with_the_live_user_function_check() {
+        let one_argument_only: ScalarCallSupport = Arc::new(
+            // The scope is the backend's to read; this check answers by arity
+            // alone, which is what makes it a clean probe of composition.
+            |call: &ScalarFunction, _scope: Option<&datafusion::common::DFSchema>| {
+                call.args.len() == 1
+            },
+        );
+        let support = FunctionSupportBuilder::new()
+            .scalar_call(Arc::clone(&one_argument_only))
+            .build();
+        let _registered = Registered::new("composed_user_fn_udfs_api");
+
+        assert!(
+            support.supports(&call("translatable_fn_udfs_api", 1), None),
+            "a call shape the backend declared it can translate must still federate"
+        );
+        assert!(
+            !support.supports(&call("translatable_fn_udfs_api", 2), None),
+            "the backend's own per-call check must survive the one `build` installs"
+        );
+        assert!(
+            !support.supports(&call("composed_user_fn_udfs_api", 1), None),
+            "a late-registered user function must be refused even in a shape the backend accepts"
+        );
+    }
+
+    #[test]
+    fn is_user_function_reads_the_registry_live() {
+        assert!(!is_user_function("probe_user_fn_udfs_api"));
+        let registered = Registered::new("probe_user_fn_udfs_api");
+        assert!(is_user_function("probe_user_fn_udfs_api"));
+        drop(registered);
+        assert!(!is_user_function("probe_user_fn_udfs_api"));
+    }
 }

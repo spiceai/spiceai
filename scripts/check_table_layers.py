@@ -59,9 +59,12 @@ ALLOWED: dict[str, str] = {
     "CountingInsertProvider": "test double",
     "CountingDeleteProvider": "test double",
     "FailFirstWriteProvider": "test double",
+    "FailAfterNWrites": "test double",
     "SlowProvider": "test double",
     "WriteOrderRecordingProvider": "test double",
     "DelayedNativeTableProvider": "test double",
+    "CountingAccelerator": "test double",
+    "GatedSource": "test double",
 }
 
 STRUCT = re.compile(r"(?:pub(?:\([^)]*\))? )?struct (\w+)\s*\{([^}]*)\}")

@@ -557,15 +557,25 @@ fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec
 ///
 /// This is kept outside clap's `requires = "cloud"` relationship so the CLI
 /// can explain what the region selects and how to correct the invocation.
+/// `spice connect` never takes `--cloud`: it only retains the deprecated
+/// `spice connect <org>/<pod>` alias of `spice add`, which adds a Spicepod to
+/// this directory rather than querying a runtime, so advising `--cloud` there
+/// would send the user to a flag that does nothing for them.
 fn validate_cloud_region_usage(cli: &Cli) -> Result<()> {
     if cli.cloud_region.is_none() || cli.cloud {
         return Ok(());
     }
+    let message = if matches!(cli.command, Commands::Connect(_)) {
+        "--cloud-region does not apply to spice connect: it selects the Spice.ai Cloud region \
+         that --cloud queries, and spice connect only retains the deprecated <org>/<pod> alias \
+         of spice add, which adds a Spicepod to this directory rather than querying a runtime. \
+         Drop it."
+    } else {
+        "--cloud-region requires --cloud: it selects which Spice.ai Cloud region to query. Pass \
+         --cloud alongside it to target Spice.ai Cloud, or drop it to use the local runtime."
+    };
     Err(spice::error::Error::InvalidArgument {
-        message: "--cloud-region requires --cloud: it selects which Spice.ai Cloud region to \
-                  query. Pass --cloud alongside it to target Spice.ai Cloud, or drop it to use \
-                  the local runtime."
-            .to_string(),
+        message: message.to_string(),
     })
 }
 
@@ -800,6 +810,10 @@ fn write_machine_error(error: &spice::error::Error) {
 fn machine_error_code(error: &spice::error::Error) -> &'static str {
     match error {
         spice::error::Error::RuntimeNotInstalled => "runtime_not_installed",
+        spice::error::Error::SpicedPathOverrideNotRunnable { .. } => {
+            "spiced_path_override_not_runnable"
+        }
+        spice::error::Error::SpicedPathNotAnchorable { .. } => "spiced_path_not_anchorable",
         spice::error::Error::WindowsNativeRuntimeUnsupported => {
             "windows_native_runtime_unsupported"
         }
@@ -842,7 +856,13 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
 
 /// Returns true if the command will output JSON, so the banner should be suppressed.
 fn is_json_output(cmd: &mut Commands) -> bool {
+    // Explicit for the same reason `apply_machine_mode` is: the two answer for
+    // the same command tree, and a wildcard here lets them disagree silently.
+    // `version` is where that bit us: it reports a runtime it cannot resolve, and
+    // a command absent from this list writes that report into the document its
+    // caller is parsing.
     match cmd {
+        Commands::Version(a) => a.output == OutputFormat::Json,
         Commands::Status(a) => a.output == OutputFormat::Json,
         Commands::Datasets(a) => a.output == OutputFormat::Json,
         Commands::Catalogs(a) => a.output == OutputFormat::Json,
@@ -867,7 +887,34 @@ fn is_json_output(cmd: &mut Commands) -> bool {
         // Cloud commands answer for themselves, from the one match in cloud::mod.
         Commands::Cloud(a) => a.command.produces_json(),
         Commands::Login(a) => a.output == login::LoginOutput::Json,
-        _ => false,
+        // The commands with no structured output to reserve stdout for; the
+        // same set `apply_machine_mode` has nothing to apply to.
+        Commands::Nsql(_)
+        | Commands::Init(_)
+        | Commands::Install(_)
+        | Commands::Upgrade(_)
+        | Commands::Run(_)
+        | Commands::Add(_)
+        | Commands::Connect(_)
+        | Commands::Validate(_)
+        | Commands::Dataset(_)
+        | Commands::Catalog(_)
+        | Commands::Model(_)
+        | Commands::View(_)
+        | Commands::Embedding(_)
+        | Commands::Reranker(_)
+        | Commands::Tool(_)
+        | Commands::Worker(_)
+        | Commands::Function(_)
+        | Commands::Secret(_)
+        | Commands::Runtime(_)
+        | Commands::Management(_)
+        | Commands::Snapshots(_)
+        | Commands::Extension(_)
+        | Commands::Metadata(_)
+        | Commands::Cluster(_)
+        | Commands::Completions(_)
+        | Commands::Feedback(_) => false,
     }
 }
 
@@ -922,8 +969,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(add::execute(&ctx, args))?;
         }
-        Commands::Connect(mut args) => {
-            args.cloud_region.clone_from(&cli.cloud_region);
+        Commands::Connect(args) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(connect::execute(&ctx, args))?;
@@ -1343,17 +1389,21 @@ mod tests {
         assert!(message.contains("--cloud-region"), "{message}");
     }
 
-    /// `connect` is exempt from the `--cloud` requirement here so it can
-    /// diagnose the flag itself: clap's "missing --cloud" would be the wrong
-    /// answer for what is really a confusion with `--region`/`--endpoint`. The
-    /// command's own refusal is covered in `cli_integration`.
+    /// `connect` has no `--cloud` to add, so its refusal names the command
+    /// and tells the user to drop the flag instead of advising `--cloud`.
     #[test]
-    fn cloud_region_is_left_to_connect_to_diagnose() {
-        let cli = parse_normalized(&["spice", "connect", "status", "--cloud-region", "us-west-2"]);
+    fn cloud_region_on_connect_is_refused_without_cloud_advice() {
+        let cli = parse_normalized(&["spice", "connect", "org/pod", "--cloud-region", "us-west-2"]);
         assert!(!cli.cloud);
         assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
-        validate_cloud_region_usage(&cli)
-            .expect("connect refuses the flag itself, with a better message");
+        let Err(error) = validate_cloud_region_usage(&cli) else {
+            panic!("cloud-region on connect should be rejected");
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("spice connect"), "{message}");
+        assert!(message.contains("Drop it"), "{message}");
+        assert!(!message.contains("Pass --cloud"), "{message}");
     }
 
     #[test]
@@ -1812,5 +1862,19 @@ mod tests {
         assert!(is_json(&["spice", "datasets", "--output", "json"]));
         assert!(is_json(&["spice", "pods", "--output", "json"]));
         assert!(is_json(&["spice", "status", "--output", "json"]));
+    }
+
+    /// `version` reserves stdout like any other JSON producer, which is what
+    /// sends a runtime it cannot resolve to stderr rather than into the
+    /// document being parsed.
+    #[test]
+    fn json_version_reserves_stdout() {
+        assert!(is_json(&["spice", "version", "--output", "json"]));
+        assert!(is_json(&["spice", "version", "-o", "json"]));
+
+        assert!(
+            !is_json(&["spice", "version"]),
+            "the table form still writes its report to stdout"
+        );
     }
 }

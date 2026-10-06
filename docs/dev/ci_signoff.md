@@ -184,7 +184,8 @@ files the gate itself reads**:
 - `.config/nextest.toml` — retries, slow-test timeouts, test groups
 - `layers.toml`, `scripts/check_crate_layers.py`,
   `scripts/check_rust_gate_paths.py`, and
-  `scripts/check_module_reachability.py` — the no-compile guards it runs
+  `scripts/check_module_reachability.py` — the no-compile guards it runs — and
+  `scripts/rust_guard_common.py`, the helpers those guards import
 - the root `Makefile` — it holds every `-Dclippy::…` flag the gate enforces
 
 The merge queue still runs the full suite on the merged result — its
@@ -197,9 +198,10 @@ paths), and the `code_changes` filter in `.github/actions/check-code-changes`
 also gates integration and E2E, and it only has to *cover* the set). A path
 missing from all three lands on trunk having never been linted, built, or
 tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
-what must be gated from what the `lint-rust` recipe reads, from the tracked
-config-file names, and from every tracked `.rs` file — rather than from a list
-someone has to remember — and fails when the three drift. Change them together.
+what must be gated from what the `lint-rust` recipe reads (including the
+`scripts/` modules its guards import), from the tracked config-file names, and
+from every tracked `.rs` file — rather than from a list someone has to remember
+— and fails when the three drift. Change them together.
 
 Deriving from the tracked sources is what catches a whole source *tree* going
 ungated, which the config-file derivation cannot see: top-level `vendor/` holds
@@ -561,6 +563,57 @@ failure", which blamed the branch for the volume.
 Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally both checks only warn and
 the output is not watched — your own disk is yours to manage.
 
+
+### "Cargo.lock does not match the manifests"
+
+Sign-off asks cargo, before it compiles anything, whether `Cargo.lock` still
+describes the workspace manifests — `cargo metadata --locked`, which is cargo's own
+resolution with permission to write the lockfile withheld. If it would have to write
+one, the branch is not evaluated and the status says so.
+
+**Run `cargo update --workspace`, commit the regenerated `Cargo.lock`, and push.**
+Not "run any cargo command": `cargo fmt` and `cargo --version` resolve nothing, and
+anything run under `--locked` is refused for this very reason.
+
+`pr.yml`'s `Build and Test` runs the same check, as
+`scripts/signoff preflight-lockfile`, immediately after the toolchain setup — one
+implementation rather than two, for the reason two copies of a guard always drift.
+It answers there in about ten seconds, against the same question that job otherwise
+asks in its *last* step, after the whole suite has run. On 2026-08-26 that cost 13
+merge-queue branches the better part of an hour each, and the report was the single
+line `Update Cargo.lock`
+([#13598](https://github.com/spiceai/spiceai/issues/13598)).
+
+The queue is also where this shape of staleness is born: one PR changes a version in
+`[workspace.package]` while another adds or renames a member, git merges both
+cleanly because they touch different regions of the lockfile, and the combination is
+stale. Neither author can see it on their own PR, where `Attestation` is the only
+job that runs — so the sign-off gate is the first place anyone can be told.
+
+A missing lockfile reports the same way. That is cargo's own reading of `--locked`,
+and it matters here because `git diff` cannot see one: a branch that deletes
+`Cargo.lock` and lets the first cargo command recreate it has an *untracked* file,
+which a diff-based check passes.
+
+Two deliberate asymmetries:
+
+- **An unrecognised cargo failure is not a verdict.** An unreachable registry or a
+  manifest cargo cannot parse warns and passes; reporting it as a stale lockfile
+  would send you to regenerate a file that was never the problem. The full gate
+  reports the real cause minutes later with better context.
+- **Because of that, the lockfile is re-checked after the gate runs.** `lint-rust`
+  and `nextest` invoke cargo *without* `--locked`, so on a failure the preflight
+  could not read, cargo brings the lockfile up to date on its way past. Without the
+  second look, the run would post `signoff=success` for a HEAD whose committed
+  lockfile does not describe it. The comparison is against a snapshot taken before
+  the checks, so `scripts/signoff -f` on a tree already carrying lockfile edits is
+  judged on what *this run* changed.
+
+The guard's own wording is checked against the pinned toolchain rather than assumed:
+`scripts/test_signoff_disk_guard.sh` builds a one-crate fixture whose lockfile
+really is stale and asserts that cargo's refusal is still recognised, so a reworded
+diagnostic after a channel bump fails a test instead of silently retiring the check.
+
 ### "Compiler cache unreachable — checks did not complete"
 
 The pool's runners compile through `sccache` (`RUSTC_WRAPPER`, configured by
@@ -587,6 +640,51 @@ cache when both appear — a volume at zero can break the cache endpoint too, an
 reclaiming space is then the remedy that fixes both. Unlike disk there is no
 after-the-fact backstop: the endpoint may well be answering again by the time the
 run ends, so the only evidence is what the build said while it was failing.
+
+### "Compiler subprocess crashed — checks did not complete"
+
+The compiler driver can lose a subprocess to a signal — a crash in `ld` itself,
+the kernel killing it for memory, or the driver's own frontend going down the
+same way — and reports it in its own words, with a crash snapshot beside them;
+cargo then stops the build at that crate:
+
+```
+clang: error: unable to execute command: Segmentation fault: 11
+clang: error: linker command failed due to signal (use -v to see invocation)
+clang: note: diagnostic msg: /var/folders/…/T/linker-crash-122a1e
+error: could not compile `cayenne` (test "result_correctness_vs_sqlite_test") due to 1 previous error
+```
+
+The driver words a crash in its own frontend the same way, so the status names
+the class rather than the tool:
+
+```
+clang: error: unable to execute command: Segmentation fault: 11
+clang: error: clang frontend command failed due to signal (use -v to see invocation)
+error: could not compile `spiced` (lib) due to 1 previous error
+```
+
+**Re-dispatch it.** The artifact being produced never appeared, so the sign-off
+stopped there: whatever passed before it stands (the run above had already cleared
+lint), and nothing after it ran. None of that is a statement about your branch.
+The hedge is the same as for an unloadable test binary: if it recurs on this
+branch alone, or names a crate whose build this branch changes — a new build
+script, a dependency whose objects the linker cannot digest — the diff is worth
+suspecting.
+
+The same watcher reads this signature, and both halves are required: the
+compiler driver reporting a signal under its own `<driver>: error:` prefix at the
+start of the line (`clang`, `cc`, `gcc`, `g++`, `collect2` and their C++ spellings;
+`collect2` says `fatal error:`),
+*and* cargo's `could not compile` line. This repo's own suites assert on error
+strings, so a test that quotes the driver's wording and then fails stays a
+verdict about the branch; a `compile_error!` or build script whose text reads
+like a crash — prefix included — lands behind rustc's own `error:` rather than at
+the start of the line, and stays one too; and cargo's line alone is every
+ordinary compile error. Disk,
+cache, and an unloadable artifact all outrank it when they appear alongside,
+because each of those names a cause with its own remedy where this one only
+names the symptom.
 
 ### External contributors (forks)
 
@@ -624,9 +722,17 @@ Required checks in the merge queue (the `trunk` ruleset):
 - `Build (release profile)`
 - `Integration Tests (part 1/2/3)`
 - `ADBC Integration Tests`
-- `Features Check`
 - `Check Rust Licenses`
 - `E2E Test CI` (a summary "gate" job over the whole E2E matrix)
+- `Verify Verus proofs` (one context for every crate that carries Verus proofs —
+  `crates/hash-index` and `crates/cache` today; a normal `cargo build` erases the
+  specifications, so no other check would notice a postcondition that stopped
+  holding. Crate-agnostic on purpose: a crate opting in changes the verify loop
+  in `verus_verify.yml`, not the required-check name)
+
+`Features Check` (features.yml) is **not** required: that workflow is disabled,
+and a required check nothing reports blocks every pull request instead of
+passing it. Re-enable the workflow before adding it back to `REQUIRED_CHECKS`.
 
 Advisory checks that also run on `merge_group` but don't block (they can be
 promoted to required with a gate job later): `integration tests (llms)`,

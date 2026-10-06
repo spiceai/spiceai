@@ -100,9 +100,22 @@ pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>
 /// An acceleration that holds no rows escapes the assumption outright, and it is
 /// the one case that can be settled by observation rather than inference: no row
 /// is present, so no row can be stale and no deletion can be missing. Only
-/// [`Self::Empty`] carries that proof. [`Self::Unknown`] is deliberately not a
-/// third answer callers may reason about — it means the question was not
-/// answered, and must be treated exactly like [`Self::NonEmpty`].
+/// [`Self::Empty`] carries that proof.
+///
+/// [`Self::Unknown`] means the question was not answered, so it is never proof of
+/// anything and never licenses skipping work. It is deliberately *not* a synonym
+/// for any other variant: which observed state it has to behave like depends on
+/// which way the caller reads emptiness, and the two readings disagree. Where
+/// emptiness licenses skipping a rebuild, an unanswered probe has to behave like
+/// [`Self::NonEmpty`] and keep it; where emptiness is instead *evidence of a gap*
+/// — a recorded position asserting rows are applied that are not there — it has
+/// to behave like [`Self::Empty`] and cause one. Both readings resolve the same
+/// way, toward the rebuild; only the variant they coincide with differs.
+///
+/// So callers match on the variant rather than collapsing it to a bool: see
+/// [`Self::is_provably_empty`] for the licensing direction, and
+/// `postgres_replication::rebuild_cause` for the gap direction, which
+/// distinguishes the two states in the cause it reports rather than merging them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AccelerationContents {
     /// Observed to hold no rows, so there is nothing that could be stale.
@@ -117,10 +130,19 @@ pub enum AccelerationContents {
 impl AccelerationContents {
     /// Whether the acceleration is *proven* to hold no rows.
     ///
-    /// The only safe direction to read this type in: everything that is not a
-    /// positive proof of emptiness — including [`Self::Unknown`] — answers
-    /// `false`, so a failed probe degrades to the conservative behavior instead
-    /// of silently skipping work that protects correctness.
+    /// The safe direction for a caller that reads emptiness as licence to skip
+    /// work: everything that is not a positive proof of emptiness — including
+    /// [`Self::Unknown`] — answers `false`, so a failed probe degrades to the
+    /// conservative behavior instead of silently skipping work that protects
+    /// correctness.
+    ///
+    /// Deliberately not offered as a pair with an inverted `may_be_empty`. A
+    /// caller reading emptiness as *evidence of a gap* needs the opposite answer
+    /// for [`Self::Unknown`], and a second bool accessor makes the two directions
+    /// look interchangeable at the call site — swapping one for the other still
+    /// compiles and still passes a test suite that checks each in isolation,
+    /// while silently restoring the unsafe resume. That caller matches on the
+    /// variant instead, so the compiler holds it to all three states.
     #[must_use]
     pub fn is_provably_empty(self) -> bool {
         matches!(self, Self::Empty)
@@ -345,7 +367,7 @@ impl ChangeRows for ChangeBatch {
 /// `get`/`into_built` runs [`ChangeRows::build`] and caches the result. A build
 /// failure is terminal for the batch (the source is consumed); a retry reports
 /// the consumed source as an error rather than silently yielding no data.
-struct LazyChangeBatch {
+pub struct LazyChangeBatch {
     built: OnceLock<ChangeBatch>,
     /// `Some` until consumed by the first (successful or failed) build. The
     /// mutex guards only the take/build handoff and is never held across an
@@ -355,15 +377,26 @@ struct LazyChangeBatch {
     source: Mutex<Option<Box<dyn ChangeRows>>>,
 }
 
+impl std::fmt::Debug for LazyChangeBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyChangeBatch")
+            .field("materialized", &self.is_materialized())
+            .field("encoded_len", &self.encoded_len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl LazyChangeBatch {
-    fn from_rows(source: Box<dyn ChangeRows>) -> Self {
+    #[must_use]
+    pub fn from_rows(source: Box<dyn ChangeRows>) -> Self {
         Self {
             built: OnceLock::new(),
             source: Mutex::new(Some(source)),
         }
     }
 
-    fn ready(batch: ChangeBatch) -> Self {
+    #[must_use]
+    pub fn ready(batch: ChangeBatch) -> Self {
         // Pre-populate `built` so an eagerly-built envelope (every non-deferred
         // connector — Kafka/MongoDB/DynamoDB/Debezium/MySQL, ready signals) reads
         // metadata and the batch itself lock-free via `built.get()`, never boxing
@@ -400,12 +433,20 @@ impl LazyChangeBatch {
     /// metadata accessors resolve without running a (possibly expensive)
     /// deferred build. Lets callers skip a `spawn_blocking` offload they'd
     /// only pay overhead for.
-    fn is_materialized(&self) -> bool {
+    #[must_use]
+    pub fn is_materialized(&self) -> bool {
         self.built.get().is_some()
     }
 
+    /// Borrow a materialized batch without triggering a deferred build.
+    #[must_use]
+    pub fn as_built(&self) -> Option<&ChangeBatch> {
+        self.built.get()
+    }
+
     /// Consume into the owned built batch, building if needed.
-    fn into_built(self) -> Result<ChangeBatch, ChangeBatchError> {
+    /// Deferred builds are CPU work and must be offloaded by async callers.
+    pub fn into_built(self) -> Result<ChangeBatch, ChangeBatchError> {
         if let Some(batch) = self.built.into_inner() {
             return Ok(batch);
         }
@@ -422,7 +463,8 @@ impl LazyChangeBatch {
     // higher-order helper — the built and source branches borrow at different
     // lifetimes, which a single `FnOnce(&dyn ChangeRows)` helper can't satisfy.
 
-    fn is_empty(&self) -> bool {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
         if let Some(b) = self.built.get() {
             return b.record.num_rows() == 0;
         }
@@ -437,7 +479,8 @@ impl LazyChangeBatch {
             .is_some_and(ChangeRows::is_empty)
     }
 
-    fn num_rows_hint(&self) -> usize {
+    #[must_use]
+    pub fn num_rows_hint(&self) -> usize {
         if let Some(b) = self.built.get() {
             return b.record.num_rows();
         }
@@ -447,7 +490,8 @@ impl LazyChangeBatch {
             .map_or(0, ChangeRows::num_rows_hint)
     }
 
-    fn encoded_len(&self) -> usize {
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
         if let Some(b) = self.built.get() {
             return b.record.get_array_memory_size();
         }
@@ -457,7 +501,8 @@ impl LazyChangeBatch {
             .map_or(0, ChangeRows::encoded_len)
     }
 
-    fn source_commit_ts_ms(&self) -> Option<i64> {
+    #[must_use]
+    pub fn source_commit_ts_ms(&self) -> Option<i64> {
         if let Some(b) = self.built.get() {
             return b.source_commit_ts_ms();
         }
@@ -467,7 +512,8 @@ impl LazyChangeBatch {
             .and_then(ChangeRows::source_commit_ts_ms)
     }
 
-    fn is_heartbeat(&self) -> bool {
+    #[must_use]
+    pub fn is_heartbeat(&self) -> bool {
         if let Some(b) = self.built.get() {
             return b.is_heartbeat();
         }
@@ -587,6 +633,18 @@ impl ChangeEnvelope {
         self.change_batch.get()
     }
 
+    /// Separate source acknowledgement and control from row storage without
+    /// decoding. The source retains the committer and both control flags.
+    #[must_use]
+    pub fn into_lazy_parts(self) -> LazyChangeEnvelopeParts {
+        (
+            self.change_committer,
+            self.change_batch,
+            self.is_dataset_ready,
+            self.history_unavailable,
+        )
+    }
+
     /// Consume the envelope into its parts, building a deferred batch if needed.
     ///
     /// The build is synchronous CPU work — for a deferred envelope under a
@@ -665,9 +723,25 @@ impl ChangeEnvelope {
     /// the signal must be safely droppable (they are dropped unacked), and the
     /// position it resumes from afterwards must be at or after them, so the
     /// re-read genuinely subsumes what was discarded.
+    ///
+    /// A source that already holds the replacement snapshot (the same listing
+    /// it will record as applied) sets [`ChangeBatch::rebuild_from_this_batch`]
+    /// so the consumer overwrites from those rows instead of scanning the
+    /// source a second time. A later scan can see objects the captured listing
+    /// did not, which would duplicate on the next backfill; an earlier scan can
+    /// miss objects the listing then marks applied, which would drop them
+    /// forever if their notification is missed.
     #[must_use]
     pub fn history_unavailable(&self) -> bool {
         self.history_unavailable
+    }
+
+    /// Whether the consumer should overwrite from this envelope's batch instead
+    /// of re-reading the federated table. See [`ChangeBatch::rebuild_from_this_batch`].
+    #[must_use]
+    pub fn rebuild_from_this_batch(&self) -> bool {
+        self.change_batch()
+            .is_ok_and(ChangeBatch::rebuild_from_this_batch)
     }
 
     /// Returns `true` if processing this envelope means the dataset can be
@@ -690,6 +764,14 @@ impl ChangeEnvelope {
 /// correctness bug rather than a compile error if the tuple hides it. See
 /// [`ChangeEnvelope::history_unavailable`].
 pub type ChangeEnvelopeParts = (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool, bool);
+
+/// Source acknowledgement, lazy row payload, readiness, and rebuild control.
+pub type LazyChangeEnvelopeParts = (
+    Box<dyn CommitChange + Send + Sync>,
+    LazyChangeBatch,
+    bool,
+    bool,
+);
 
 /// Run a CDC batch build off the async worker, but only when it would actually
 /// block: an already-materialized build is a no-op, and `spawn_blocking`
@@ -1020,6 +1102,12 @@ pub struct ChangeBatch {
     /// connectors that carry a source timestamp (Debezium, Postgres logical
     /// replication, `MongoDB` change streams); left `None` by sources that don't.
     source_commit_ts_ms: Option<i64>,
+    /// When set with [`ChangeEnvelope::history_unavailable`], the consumer must
+    /// replace the accelerator from this batch's `data` (atomic overwrite) rather
+    /// than re-reading the federated table. That keeps the replacement rows and
+    /// the source's applied-key / position commit on the same snapshot. Copied
+    /// by [`replace_change_batch_data`] so wrappers cannot drop it.
+    rebuild_from_this_batch: bool,
 }
 
 pub enum ChangeOperation {
@@ -1081,6 +1169,7 @@ impl ChangeBatch {
             data_idx,
             before_idx,
             source_commit_ts_ms: None,
+            rebuild_from_this_batch: false,
         })
     }
 
@@ -1099,6 +1188,22 @@ impl ChangeBatch {
     #[must_use]
     pub fn source_commit_ts_ms(&self) -> Option<i64> {
         self.source_commit_ts_ms
+    }
+
+    /// Mark this batch as the replacement snapshot for a
+    /// [`ChangeEnvelope::history_unavailable`] signal. The consumer overwrites
+    /// the accelerator from [`Self::data_batch`] instead of scanning the source.
+    #[must_use]
+    pub fn with_rebuild_from_this_batch(mut self, rebuild_from_this_batch: bool) -> Self {
+        self.rebuild_from_this_batch = rebuild_from_this_batch;
+        self
+    }
+
+    /// Whether [`ChangeEnvelope::history_unavailable`] should overwrite from
+    /// this batch rather than re-read the federated table.
+    #[must_use]
+    pub fn rebuild_from_this_batch(&self) -> bool {
+        self.rebuild_from_this_batch
     }
 
     /// Whether this is a zero-row envelope — a keepalive/heartbeat carrying only a
@@ -1196,16 +1301,32 @@ impl ChangeBatch {
         let Some(data_array) = data_col.as_any().downcast_ref::<StructArray>() else {
             unreachable!("The schema is validated to have a 'data' field which is a StructArray");
         };
-        let DataType::Struct(fields) = data_array.data_type() else {
-            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
-        };
-        let Ok(record_batch) = RecordBatch::try_new(
-            Arc::new(Schema::new(fields.clone())),
-            data_array.columns().to_vec(),
-        ) else {
+        let Ok(record_batch) =
+            RecordBatch::try_new(self.data_schema(), data_array.columns().to_vec())
+        else {
             unreachable!("The schema is validated to have a 'data' field which is a StructArray");
         };
         record_batch
+    }
+
+    /// The schema of the row data this batch carries, without building the batch.
+    ///
+    /// [`Self::data_batch`] allocates a `Schema`, a `Vec` of column `Arc`s and a
+    /// `RecordBatch` on every call. A caller that only reads the schema — the CDC
+    /// write path compares it against the acceleration's before applying a burst
+    /// — should use this instead, so a burst that is only being classified costs
+    /// no batch. The two can never disagree: [`Self::data_batch`] builds its
+    /// batch from this value.
+    #[must_use]
+    pub fn data_schema(&self) -> SchemaRef {
+        let data_col = self.record.column(self.data_idx);
+        let Some(data_array) = data_col.as_any().downcast_ref::<StructArray>() else {
+            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
+        };
+        let DataType::Struct(fields) = data_array.data_type() else {
+            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
+        };
+        Arc::new(Schema::new(fields.clone()))
     }
 
     /// Whether this batch carries a before-image column
@@ -1417,6 +1538,11 @@ pub fn replace_change_batch_data(
     RecordBatch::try_new(schema.into(), cols)
         .map_err(|source| ChangeBatchError::Arrow { source })
         .and_then(ChangeBatch::try_new)
+        .map(|batch| {
+            batch
+                .with_source_commit_ts_ms(change.source_commit_ts_ms())
+                .with_rebuild_from_this_batch(change.rebuild_from_this_batch())
+        })
 }
 
 #[cfg(test)]
@@ -1556,6 +1682,61 @@ mod tests {
             before.schema().fields().len(),
             "before-image and data share the table schema"
         );
+    }
+
+    /// `data_schema` lets a caller that only reads the schema — the CDC write
+    /// path's per-burst schema-evolution preflight — skip building a
+    /// `RecordBatch` it never uses. That is only sound while it reports exactly
+    /// the fields the data column holds: a preflight that classified a burst
+    /// against invented or reordered fields would admit a widening the write then
+    /// applies under a different schema.
+    ///
+    /// Both accessors are checked against the `data` column read straight off the
+    /// record, not against each other — `data_batch` derives its schema from
+    /// `data_schema`, so comparing the two only ever compares a value with
+    /// itself. Pinned across both wrapper shapes, which place `data` at different
+    /// column indices.
+    #[test]
+    fn data_schema_reports_the_data_columns_own_fields() {
+        let table = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&table),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("data batch should match the table schema");
+
+        for (shape, batch) in [
+            ("changes_schema_with_before", before_image_batch()),
+            (
+                "changes_schema",
+                wrap_data_as_change_batch(&table, &rows).expect("to create change batch"),
+            ),
+        ] {
+            let data_col = batch
+                .record
+                .column_by_name("data")
+                .expect("the wrapper schema has a 'data' column");
+            let DataType::Struct(fields) = data_col.data_type() else {
+                panic!("{shape}: 'data' is validated to be a StructArray");
+            };
+
+            assert_eq!(
+                batch.data_schema().fields(),
+                fields,
+                "{shape}: data_schema must report the 'data' column's own fields"
+            );
+            assert_eq!(
+                batch.data_batch().schema().fields(),
+                fields,
+                "{shape}: data_batch must carry the 'data' column's own fields"
+            );
+        }
     }
 
     /// A null struct slot means "this row has no prior values", but Arrow lets the
@@ -2250,5 +2431,26 @@ mod deferred_tests {
             "the default must be the conservative answer, so a caller that never probes cannot \
              accidentally opt out of the rebuild"
         );
+    }
+
+    #[test]
+    fn replace_change_batch_data_preserves_rebuild_from_this_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .expect("data batch");
+        let original = wrap_data_as_change_batch(&schema, &data)
+            .expect("wrap")
+            .with_source_commit_ts_ms(Some(1_700_000_000_000))
+            .with_rebuild_from_this_batch(true);
+        let replaced =
+            replace_change_batch_data(&data, &original).expect("replace should copy batch flags");
+        assert!(
+            replaced.rebuild_from_this_batch(),
+            "wrappers that rewrite `data` must keep the listing-rebuild flag"
+        );
+        assert_eq!(replaced.source_commit_ts_ms(), Some(1_700_000_000_000));
     }
 }

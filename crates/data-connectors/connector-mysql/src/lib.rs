@@ -34,9 +34,9 @@ use mysql_async::{Metrics, prelude::Queryable};
 use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
 use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::function_support::deny_spice_functions_for_mysql_table_providers;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use secrecy::{ExposeSecret, SecretBox};
 use snafu::prelude::*;
 use std::any::Any;
@@ -364,7 +364,7 @@ impl DataConnectorFactory for MySQLFactory {
             // those functions don't exist and the query would fail with an
             // "unknown function" error. See issue #10703.
             let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool))
-                .with_function_support(deny_spice_functions_for_table_providers());
+                .with_function_support(deny_spice_functions_for_mysql_table_providers());
 
             Ok(Arc::new(MySQL {
                 mysql_factory,
@@ -390,7 +390,7 @@ impl DataConnectorFactory for MySQLFactory {
 
 async fn mysql_comment_metadata(
     pool: &Arc<MySQLConnectionPool>,
-    table_reference: &datafusion::sql::TableReference,
+    table_reference: &datafusion::common::TableReference,
 ) -> std::result::Result<
     (HashMap<String, String>, data_components::FieldMetadata),
     Box<dyn std::error::Error + Send + Sync>,
@@ -434,7 +434,7 @@ async fn mysql_comment_metadata(
 /// the row-count/byte estimates the adaptive tuner warm-starts from.
 async fn mysql_inferred_schema_metadata(
     pool: &Arc<MySQLConnectionPool>,
-    table_reference: &datafusion::sql::TableReference,
+    table_reference: &datafusion::common::TableReference,
 ) -> std::result::Result<InferredSchema, Box<dyn std::error::Error + Send + Sync>> {
     let connection = pool.connect_direct().await?;
     let mut conn = connection.conn.lock().await;
@@ -504,7 +504,7 @@ async fn mysql_inferred_schema_metadata(
 async fn enrich_with_mysql_metadata(
     pool: &Arc<MySQLConnectionPool>,
     dataset: &DatasetSpec,
-    table_reference: &datafusion::sql::TableReference,
+    table_reference: &datafusion::common::TableReference,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
     let (mut table_metadata, field_metadata) =

@@ -39,13 +39,13 @@ use datafusion::logical_expr::{ColumnarValue, DocSection, Documentation, Signatu
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
+    common::TableReference,
     datasource::{DefaultTableSource, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{Operator, SortExpr, expr::ScalarFunction},
     physical_plan::ExecutionPlan,
     prelude::{Expr, lit},
     scalar::ScalarValue,
-    sql::TableReference,
 };
 
 use datafusion_expr::{
@@ -710,11 +710,11 @@ impl VectorSearchUDTFProvider {
                 self.args.tbl, cfg.model_name
             )));
         };
-        let mut resp = embedding_model
+        let resp = embedding_model
             .embed(EmbeddingInput::String(self.args.query.clone()))
             .await
             .boxed()?;
-        let Some(v) = resp.pop() else {
+        let Some(v) = resp.first().cloned() else {
             return Err(Box::from(format!(
                 "Embedding model '{}' produced no embedding for the query '{}'.",
                 cfg.model_name,
@@ -1160,11 +1160,11 @@ mod tests {
     use crate::model::EmbeddingModelStore;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::TableProvider;
+    use datafusion::common::TableReference;
     use datafusion::datasource::MemTable;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
-    use datafusion::sql::TableReference;
     use datafusion_expr::TableProviderFilterPushDown;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{col, lit};

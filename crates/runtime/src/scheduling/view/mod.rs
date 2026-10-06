@@ -40,9 +40,14 @@ impl ScheduledTask for ViewRefreshTask {
             let runtime = Arc::clone(&view.runtime);
 
             match runtime.datafusion().refresh_table(&view.name, None).await {
-                Ok(notifier) => {
-                    if let Some(notifier) = notifier {
-                        notifier.notified().await;
+                Ok(completion) => {
+                    // Abandoned (removal/shutdown) stays Ok. A terminal
+                    // one-shot failure must fail the scheduled task.
+                    if let Some(completion) = completion {
+                        return super::scheduled_refresh_wait_result(
+                            completion.wait().await,
+                            &view.name,
+                        );
                     }
                     Ok(())
                 }

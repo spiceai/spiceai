@@ -84,6 +84,23 @@ mod tests {
                 name: name.to_string(),
             }))
         }
+
+        fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            Some(Arc::new(MockTool {
+                name: name.to_string(),
+            }))
+        }
+
+        fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            ["foo", "bar", "baz"]
+                .iter()
+                .map(|name| {
+                    Arc::new(MockTool {
+                        name: (*name).to_string(),
+                    }) as Arc<dyn SpiceModelTool>
+                })
+                .collect()
+        }
     }
 
     #[tokio::test]

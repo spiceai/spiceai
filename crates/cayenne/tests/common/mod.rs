@@ -21,6 +21,8 @@ limitations under the License.
     reason = "Shared test helper module compiled into multiple test crates; not every item is used by every crate"
 )]
 
+pub mod lookup_index;
+
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
@@ -227,6 +229,18 @@ pub async fn insert_batches(
     provider: &CayenneTableProvider,
     batches: Vec<RecordBatch>,
 ) -> DFResult<u64> {
+    write_batches(provider, batches, InsertOp::Append).await
+}
+
+/// Write record batches through the `insert_into()` API with `op`, in one
+/// write; returns the row count the write reports.
+///
+/// Creates a temporary `SessionContext` internally.
+pub async fn write_batches(
+    provider: &CayenneTableProvider,
+    batches: Vec<RecordBatch>,
+    op: InsertOp,
+) -> DFResult<u64> {
     use datafusion::physical_plan::collect;
 
     if batches.is_empty() {
@@ -238,9 +252,7 @@ pub async fn insert_batches(
     let ctx = SessionContext::new();
     let schema = Arc::clone(batches[0].schema_ref());
     let input_exec = MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
-    let insert_plan = provider
-        .insert_into(&ctx.state(), input_exec, InsertOp::Append)
-        .await?;
+    let insert_plan = provider.insert_into(&ctx.state(), input_exec, op).await?;
     let results = collect(insert_plan, ctx.task_ctx()).await?;
 
     Ok(extract_row_count(&results))
@@ -263,6 +275,33 @@ pub async fn poll_inlined_data_count_zero(
     loop {
         let count = catalog.get_inlined_data_count(table_id).await?;
         if count == 0 || started.elapsed() >= TIMEOUT {
+            return Ok(count);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll `catalog.get_inlined_data_stats(table_id).tombstone_entry_count` until it
+/// is at or below `limit`, or the timeout elapses; returns the last count seen.
+///
+/// The tombstone sibling of [`poll_inlined_data_count_zero`], and it races the
+/// same background task: the reclamation that drains `cayenne_inlined_delete`
+/// runs in a `tokio::spawn` scheduled from the write path.
+pub async fn poll_inlined_delete_count_at_most(
+    catalog: &Arc<CayenneCatalog>,
+    table_id: &str,
+    limit: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    use cayenne::MetadataCatalog;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    loop {
+        let count = catalog
+            .get_inlined_data_stats(table_id)
+            .await?
+            .tombstone_entry_count;
+        if count <= limit || started.elapsed() >= TIMEOUT {
             return Ok(count);
         }
         tokio::time::sleep(POLL_INTERVAL).await;

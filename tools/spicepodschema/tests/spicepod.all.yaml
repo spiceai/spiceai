@@ -120,10 +120,8 @@ runtime:
     api_key:
       enabled: true
       keys:
-        - ReadOnly:
-            key: read-only-api-key-12345
-        - ReadWrite:
-            key: read-write-api-key-67890
+        - read-only-api-key-12345
+        - read-write-api-key-67890:rw
 
   # CORS configuration
   cors:
@@ -623,6 +621,11 @@ datasets:
       json_format: jsonl # json, jsonl
       flatten_json: 'true'
       refresh_skip: enabled # enabled, disabled
+      s3_changes_queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/s3-events
+      s3_changes_region: us-east-1
+      s3_changes_key_prefix: data/
+      s3_changes_backfill_interval: 1h
+      s3_on_object_removed: ignore # ignore, rebuild (full listing rebuild, not a row-level delete)
       # CSV params
       csv_has_header: 'true'
       csv_quote: '"'
@@ -1319,7 +1322,7 @@ models:
     from: huggingface:mistralai/Mistral-7B-Instruct-v0.2
     params:
       model_type: mistral
-      huggingface_token: hf_xxx
+      hf_token: hf_xxx
       tools: auto
       system_prompt: You are a helpful assistant.
 
@@ -1374,7 +1377,7 @@ embeddings:
   - name: hf_embeddings
     from: huggingface:sentence-transformers/all-MiniLM-L6-v2
     params:
-      huggingface_token: hf_xxx
+      hf_token: hf_xxx
 
   # File-based embeddings
   - name: file_embeddings

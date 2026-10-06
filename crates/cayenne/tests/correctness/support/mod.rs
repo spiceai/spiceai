@@ -40,18 +40,25 @@
 #![allow(clippy::needless_raw_string_hashes)]
 
 pub mod chbench_data;
+#[cfg(feature = "result-correctness-chdb")]
+pub mod chdb_engine;
+pub mod clickbench_data;
+pub mod dialect;
 pub mod harness;
 pub mod inventory;
+pub mod oracle_lane;
 pub mod report;
 pub mod sqlite_engine;
 pub mod sqllancer;
 pub mod ssb_data;
 pub mod standalone_engines;
+pub mod tpcds_data;
+pub mod tpch_data;
 
 #[expect(unused_imports)] // re-exported for integration test crates
 pub use harness::{
     assert_all_pass_or_excluded, assert_modes_agree_on_actual_results, compare_actual_results,
-    execute_and_compare_cayenne_to_batches, execute_cayenne,
+    compare_actual_results_detailed, execute_and_compare_cayenne_to_batches, execute_cayenne,
 };
 
 use std::collections::BTreeMap;
@@ -68,24 +75,101 @@ use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_plan::collect;
 use test_framework::queries::validation::{
-    QueryValidationResult, RowOrder, compare_query_result_batches, row_order_from_sql,
+    QueryValidationFailReason, QueryValidationResult, RowOrder,
+    compare_query_result_batches_with_sort_check, has_top_level_limit, has_top_level_order_by,
+    row_order_from_sql,
 };
 use test_framework::queries::{
     Query, get_chbench_test_queries, get_clickbench_test_queries, get_tpcds_test_queries,
     get_tpch_test_queries,
 };
 
+/// Whether `dir` already holds a fixture that *this* generator finished writing.
+///
+/// The scratch tree (`target/cayenne_parity_scratch` by default) outlives
+/// builds, branch switches and self-hosted CI jobs, so "some parquet is here"
+/// says nothing about which generator produced it. Reusing on that alone lets a
+/// fixture written before a generator change quietly revert whatever the change
+/// was for — and a suite comparing two engines against the same stale rows still
+/// agrees with itself, so nothing turns red.
+///
+/// The stamp closes both halves. It is written only after every file lands, so
+/// an interrupted run leaves no stamp and is regenerated rather than reused
+/// half-written; and it records `revision`, so a fixture from an older generator
+/// no longer matches.
+#[must_use]
+pub fn fixture_is_current(dir: &Path, revision: &str) -> bool {
+    std::fs::read_to_string(dir.join(FIXTURE_STAMP)).is_ok_and(|stamp| stamp.trim() == revision)
+}
+
+/// Record that `dir` now holds a complete fixture built by `revision`.
+///
+/// Call only once every file is written: the stamp is what a later run trusts.
+pub fn mark_fixture_complete(dir: &Path, revision: &str) {
+    std::fs::write(dir.join(FIXTURE_STAMP), revision).expect("write fixture stamp");
+}
+
+/// Digest of a generator's own source, used as its fixture revision.
+///
+/// Derived from the source rather than a hand-maintained constant because the
+/// constant is what gets forgotten: the edit that changes the generated rows is
+/// exactly the moment someone is thinking about the data, not the version.
+#[must_use]
+pub fn generator_revision(source: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Name of the stamp file. Dotted so directory scans that collect `*.parquet`
+/// table names never pick it up.
+const FIXTURE_STAMP: &str = ".fixture-complete";
+
 /// Outcome for one inventory query on one engine pair.
 /// Outcome of the **harness** after executing SQL and comparing actual batches.
 #[derive(Debug, Clone)]
 pub enum ParityOutcome {
     Pass,
-    Fail { detail: String },
-    Excluded { reason: String },
-    EngineError { side: &'static str, detail: String },
+    /// The two results matched and held nothing to compare: no rows, or rows
+    /// holding only NULL. An empty agreement proves something only when empty is
+    /// the query's intended answer on the fixture; when the fixture merely fails
+    /// to reach the query's filters — the usual cause — it is a comparison that
+    /// never happened. Not a `Pass`: accepted only where the inventory reviews
+    /// why the answer is empty.
+    Vacuous {
+        detail: String,
+    },
+    /// Content matched, but the query's `ORDER BY` was not fully verified —
+    /// a term that maps to no output column, an unparseable statement, or a key
+    /// type with no comparator. Not a failure, and deliberately not a `Pass`:
+    /// the whole point of the sort check is that unverified order must not read
+    /// as verified.
+    OrderUnchecked {
+        reasons: Vec<String>,
+    },
+    Fail {
+        detail: String,
+    },
+    Excluded {
+        reason: String,
+    },
+    EngineError {
+        side: &'static str,
+        detail: String,
+    },
 }
 
 impl ParityOutcome {
+    /// Whether this outcome needs no explanation.
+    ///
+    /// `OrderUnchecked` is deliberately absent. It means the rows matched and
+    /// the order they came back in was never verified, which is the outcome the
+    /// sort check exists to surface — counting it here would let a resolver
+    /// regression, or an `ORDER BY` the projection stops carrying, settle into a
+    /// summary bucket instead of turning a lane red. A hole that has been looked
+    /// at is named in the inventory and accepted by [`report::unexplained`]; one
+    /// that has not fails.
     #[must_use]
     pub fn is_pass_or_excluded(&self) -> bool {
         matches!(self, Self::Pass | Self::Excluded { .. })
@@ -405,6 +489,69 @@ impl CayenneHarness {
     }
 }
 
+impl CayenneHarness {
+    /// A harness holding `{table}.parquet` from `parquet_dir` for each table,
+    /// loaded the given way.
+    pub async fn from_parquet_dir(parquet_dir: &Path, tables: &[&str], mode: LoadMode) -> Self {
+        let mut harness = Self::new().await;
+        for table in tables {
+            harness
+                .load_parquet_table_with_mode(
+                    table,
+                    &parquet_dir.join(format!("{table}.parquet")),
+                    mode,
+                )
+                .await;
+        }
+        harness
+    }
+}
+
+/// The column kinds of `{table}.parquet` in `parquet_dir` for each table — what
+/// [`dialect::translate`] needs to rewrite a suite's SQL for an oracle.
+#[must_use]
+pub fn fixture_column_kinds(parquet_dir: &Path, tables: &[&str]) -> dialect::ColumnKinds {
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let schemas: Vec<Schema> = tables
+        .iter()
+        .map(|table| {
+            let path = parquet_dir.join(format!("{table}.parquet"));
+            let file = std::fs::File::open(&path)
+                .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+            ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap_or_else(|e| panic!("read schema of {}: {e}", path.display()))
+                .schema()
+                .as_ref()
+                .clone()
+        })
+        .collect();
+    dialect::ColumnKinds::from_schemas(schemas.iter())
+}
+
+/// Where the lanes keep fixtures and logs between runs:
+/// `CAYENNE_PARITY_SCRATCH`, or `target/cayenne_parity_scratch`.
+#[must_use]
+pub fn scratch_dir() -> PathBuf {
+    let dir = std::env::var_os("CAYENNE_PARITY_SCRATCH").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/cayenne_parity_scratch"),
+        PathBuf::from,
+    );
+    std::fs::create_dir_all(&dir).expect("create the parity scratch dir");
+    dir
+}
+
+/// A scale factor or size from the environment, or `default`. A value that is
+/// set and does not parse fails rather than silently running the default.
+#[must_use]
+pub fn env_f64(name: &str, default: f64) -> f64 {
+    match std::env::var(name) {
+        Ok(text) => text
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}={text} is not a number: {e}")),
+        Err(_) => default,
+    }
+}
+
 /// Split batches into up to `n_chunks` non-empty groups for append-mode loads.
 fn split_batches_into_chunks(batches: &[RecordBatch], n_chunks: usize) -> Vec<Vec<RecordBatch>> {
     let n_chunks = n_chunks.max(1);
@@ -515,25 +662,134 @@ pub fn compare_results(
     cayenne: &[RecordBatch],
     reference: &[RecordBatch],
 ) -> ParityOutcome {
-    let sql_upper = query.sql.to_ascii_uppercase();
-    let has_order = sql_upper.contains("ORDER BY");
-    let has_limit = sql_upper.contains("LIMIT") || sql_upper.contains("OFFSET");
-    let order = if has_order && has_limit {
+    compare_results_detailed(query, cayenne, reference).outcome
+}
+
+/// A comparison together with what it could not establish.
+///
+/// Two callers need more than the outcome. `reason` tells one kind of failure
+/// from another — `Fail::detail` renders it for a human, and branching on that
+/// string would make control flow depend on a `Debug` format. `unchecked`
+/// carries the order the sort check could not verify, and is populated even when
+/// the content comparison failed: a caller that recovers from that failure would
+/// otherwise report an order nothing verified as a clean pass.
+pub struct ComparedResults {
+    pub outcome: ParityOutcome,
+    pub reason: Option<QueryValidationFailReason>,
+    pub unchecked: Vec<String>,
+}
+
+/// Downgrade a content-only recovery that passed, when the sort check had
+/// already declined to verify the order.
+///
+/// A lane that recovers from a failed comparison by comparing content another
+/// way — the chDB lane retries a schema mismatch as sorted string rows —
+/// establishes the rows and nothing about the order they came back in. Returning
+/// its `Pass` unqualified would report an unverified order as verified, which is
+/// the outcome the sort check exists to make impossible.
+#[must_use]
+pub fn keep_unverified_order(recovered: ParityOutcome, unchecked: Vec<String>) -> ParityOutcome {
+    match recovered {
+        ParityOutcome::Pass if !unchecked.is_empty() => {
+            ParityOutcome::OrderUnchecked { reasons: unchecked }
+        }
+        settled => settled,
+    }
+}
+
+/// [`compare_results`] with the reason and the coverage holes kept.
+pub fn compare_results_detailed(
+    query: &Query,
+    cayenne: &[RecordBatch],
+    reference: &[RecordBatch],
+) -> ComparedResults {
+    // Positional equality only where the row set itself depends on order. Elsewhere
+    // multiset, so an `ORDER BY` on a non-unique key does not fail on the
+    // engine-dependent order of tied rows. `compare_query_result_batches_with_sort_check`
+    // then verifies each side against its own `ORDER BY`, which ties never violate —
+    // so absorbing tie order here no longer costs the sort check with it.
+    //
+    // Both predicates are parser-backed: a `LIMIT` or `ORDER BY` inside a subquery
+    // does not make the outer result order-dependent, and a substring search cannot
+    // tell that apart from a top-level one.
+    let order = if has_top_level_order_by(&query.sql) && has_top_level_limit(&query.sql) {
         RowOrder::Preserved
     } else {
-        // Full result or unordered: multiset (handles non-unique ORDER BY ties).
         RowOrder::Multiset
     };
-    let _ = row_order_from_sql; // still used by sql_has_order_by
-    match compare_query_result_batches(&query.name, cayenne, reference, order) {
-        Ok(QueryValidationResult::Pass) => ParityOutcome::Pass,
-        Ok(QueryValidationResult::Fail(reason)) => ParityOutcome::Fail {
-            detail: format!("{reason:?}"),
-        },
-        Err(e) => ParityOutcome::Fail {
-            detail: format!("compare error: {e}"),
+    match compare_query_result_batches_with_sort_check(
+        &query.name,
+        &query.sql,
+        cayenne,
+        reference,
+        order,
+    ) {
+        Ok(comparison) => {
+            let unchecked = comparison.unchecked;
+            if comparison.result == QueryValidationResult::Pass
+                && holds_no_value(cayenne)
+                && holds_no_value(reference)
+            {
+                return ComparedResults {
+                    outcome: ParityOutcome::Vacuous {
+                        detail: format!(
+                            "both sides returned no non-NULL value ({} and {} rows)",
+                            row_count(cayenne),
+                            row_count(reference)
+                        ),
+                    },
+                    reason: None,
+                    unchecked,
+                };
+            }
+            match comparison.result {
+                QueryValidationResult::Pass if unchecked.is_empty() => ComparedResults {
+                    outcome: ParityOutcome::Pass,
+                    reason: None,
+                    unchecked,
+                },
+                // Rows matched, but part of the ORDER BY went unverified. That is
+                // a coverage hole, reported as one rather than as a clean pass.
+                QueryValidationResult::Pass => ComparedResults {
+                    outcome: ParityOutcome::OrderUnchecked {
+                        reasons: unchecked.clone(),
+                    },
+                    reason: None,
+                    unchecked,
+                },
+                QueryValidationResult::Fail(reason) => ComparedResults {
+                    outcome: ParityOutcome::Fail {
+                        detail: format!("{reason:?}"),
+                    },
+                    reason: Some(reason),
+                    unchecked,
+                },
+            }
+        }
+        Err(e) => ComparedResults {
+            outcome: ParityOutcome::Fail {
+                detail: format!("compare error: {e}"),
+            },
+            reason: None,
+            unchecked: Vec::new(),
         },
     }
+}
+
+/// Whether `batches` hold no value a comparison could check: no rows, or only
+/// NULL cells — what `SUM` over an empty input returns.
+#[must_use]
+pub fn holds_no_value(batches: &[RecordBatch]) -> bool {
+    batches.iter().all(|batch| {
+        batch
+            .columns()
+            .iter()
+            .all(|column| column.null_count() == column.len())
+    })
+}
+
+fn row_count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
 }
 
 /// All suite queries that form the parity inventory (no exclusions applied).

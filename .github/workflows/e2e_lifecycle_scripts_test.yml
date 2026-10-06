@@ -16,6 +16,7 @@ on:
       - feature-*
     paths:
       - '.github/actions/allocate-spice-ports/**'
+      - '.github/actions/check-spice-log/**'
       - '.github/actions/stop-spice/**'
       - '.github/actions/wait-for-spice-ready/**'
       - 'scripts/test_e2e_spice_lifecycle.sh'
@@ -27,6 +28,7 @@ on:
       - trunk
     paths:
       - '.github/actions/allocate-spice-ports/**'
+      - '.github/actions/check-spice-log/**'
       - '.github/actions/stop-spice/**'
       - '.github/actions/wait-for-spice-ready/**'
       - 'scripts/test_e2e_spice_lifecycle.sh'
@@ -93,3 +95,30 @@ jobs:
 
       - name: Run REPL script tests
         run: bash test/models/expect_test.sh
+
+      # Cleanup runs under `if: always()`, so it most often runs after a job
+      # failed before creating the directory the runtime would have started
+      # from. The runner refuses to start a step whose `working-directory` does
+      # not exist, so these go through `uses:` against a directory this job never
+      # creates. stop-spice must succeed there; check-spice-log must still fail
+      # closed, since a missing spice.log is never a pass.
+      - name: Stop spice from a directory that was never created
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: never-created-by-this-job
+
+      - name: Check spice.log in a directory that was never created
+        id: check_missing_dir
+        continue-on-error: true
+        uses: ./.github/actions/check-spice-log
+        with:
+          working-directory: never-created-by-this-job
+
+      - name: Require the missing-directory log check to have failed
+        env:
+          OUTCOME: ${{ steps.check_missing_dir.outcome }}
+        run: |
+          if [[ "$OUTCOME" != "failure" ]]; then
+            echo "::error::check-spice-log reported '$OUTCOME' for a directory with no spice.log; it must fail closed."
+            exit 1
+          fi

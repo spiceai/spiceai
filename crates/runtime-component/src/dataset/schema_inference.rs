@@ -26,7 +26,7 @@ limitations under the License.
 
 use std::collections::BTreeSet;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, SchemaRef};
 use data_components::inferred_schema::InferredSchema;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
@@ -44,7 +44,8 @@ use super::acceleration::{Acceleration, Engine, IndexType, OnConflictBehavior, R
 ///   inferring one would silently reroute `write_mode: write_through` DML away
 ///   from the federated source.
 /// - **indexes**: applied when none are configured (skipping any that merely
-///   duplicate the primary key).
+///   duplicate the primary key, and any the engine cannot build — see
+///   `unindexable_column`).
 /// - **sort columns**: applied when no engine sort param is configured, routed to
 ///   the engine-appropriate `acceleration.params` key. Never applied for `DuckDB`
 ///   when the acceleration carries a primary key, indexes, or `on_conflict`:
@@ -154,9 +155,24 @@ pub fn apply_inferred_schema(
         .as_ref()
         .map(|pk| pk.iter().map(ToString::to_string).collect());
 
-    // 2) Secondary indexes — only when the user configured none.
+    // 2) Secondary indexes — only when the user configured none, and never for
+    // DuckDB. A DuckDB upsert sets every non-key column, and an update that sets an
+    // indexed column is executed as a delete plus an insert, so each change to a row
+    // gives it a new row id. DuckDB's primary-key index holds at most two row ids per
+    // key, so the third version of a key written while a query that began before the
+    // second is still running fails to commit ("write-write conflict on key"), and
+    // for a change stream that stops replication of the dataset (#13929). Without a
+    // secondary index the upsert updates the row in place and never adds a row id.
     let mut applied_indexes = 0usize;
-    if constraints_applicable && acceleration.indexes.is_empty() {
+    let infer_indexes = constraints_applicable && acceleration.indexes.is_empty();
+    if infer_indexes && engine == Engine::DuckDB {
+        if !inferred.indexes.is_empty() {
+            tracing::debug!(
+                dataset = %dataset_name,
+                "Skipping inferred secondary indexes; a DuckDB upsert that sets an indexed column rewrites the row, which fails to commit while an older query is still reading it"
+            );
+        }
+    } else if infer_indexes {
         for index in &inferred.indexes {
             if !index.columns.iter().all(|c| has_column(c)) {
                 continue;
@@ -164,6 +180,15 @@ pub fn apply_inferred_schema(
             let index_set: BTreeSet<String> = index.columns.iter().cloned().collect();
             if pk_set.as_ref() == Some(&index_set) {
                 continue; // duplicates the primary key
+            }
+            // An index the engine would refuse at registration is dropped here
+            // instead: the user never declared it, so it must not become a
+            // configuration error that keeps the whole dataset from loading.
+            if let Some(field) = unindexable_column(engine, effective_schema, &index.columns) {
+                let warning =
+                    inferred_index_skip_warning(dataset_name, engine, &index.columns, field);
+                tracing::warn!("{warning}");
+                continue;
             }
             let index_type = if index.unique {
                 IndexType::Unique
@@ -203,6 +228,48 @@ pub fn apply_inferred_schema(
     );
 }
 
+/// The first column of an inferred index that `engine` cannot key, or `None` when
+/// the engine accepts every column of the index.
+///
+/// Cayenne keys a column by its value with `key_index`, and refuses a column
+/// type that cannot be encoded, such as a list or a struct, at registration. A
+/// *declared* index still reaches Cayenne and fails with that actionable error;
+/// an *inferred* one is skipped by the caller, because the user never asked for
+/// it. The other engines index any column type.
+///
+/// Columns absent from `schema` are ignored here; the caller has already skipped
+/// an index naming one.
+fn unindexable_column<'a>(
+    engine: Engine,
+    schema: &'a SchemaRef,
+    columns: &[String],
+) -> Option<&'a Field> {
+    if engine != Engine::Cayenne {
+        return None;
+    }
+    columns
+        .iter()
+        .filter_map(|column| schema.field_with_name(column).ok())
+        .find(|field| !key_index::can_key(field.data_type()))
+}
+
+/// The warning logged when an inferred secondary index is skipped because
+/// `engine` cannot key `field`: names the dataset and the index, says what the
+/// user will observe, and gives the cause and the fix.
+fn inferred_index_skip_warning(
+    dataset_name: &str,
+    engine: Engine,
+    index_columns: &[String],
+    field: &Field,
+) -> String {
+    format!(
+        "Dataset '{dataset_name}' ({engine}): skipped the secondary index on ({}) inferred from the source, so equality lookups on those columns scan the table instead. Cause: column '{}' has type {}, which the {engine} accelerator cannot index; to index it, declare an index on columns of a scalar type such as an integer, decimal, float, string or timestamp. See: https://spiceai.org/docs/features/data-acceleration/indexes",
+        index_columns.join(", "),
+        field.name(),
+        field.data_type()
+    )
+}
+
 /// Inject the inferred sort order into the engine-appropriate `acceleration.params`
 /// key, unless the user already configured one. Returns whether a value was set.
 fn apply_inferred_sort(
@@ -225,17 +292,23 @@ fn apply_inferred_sort(
         return false;
     }
 
+    // Each key is the *external* spelling the engine's parameter validation
+    // accepts: a `ParameterSpec::component` param must carry the engine prefix
+    // (`arrow_sort_columns`, `cayenne_sort_columns`), while DuckDB's
+    // `on_refresh_sort_columns` is a `ParameterSpec::runtime` param and takes
+    // none. An unprefixed component key is dropped by `runtime_parameters` with a
+    // user-facing warning about a parameter the user never wrote (#14023).
     let engine = acceleration.engine.to_unpartitioned();
     let key = match engine {
         Engine::DuckDB => "on_refresh_sort_columns",
-        Engine::Arrow => "sort_columns",
+        Engine::Arrow => "arrow_sort_columns",
         Engine::Cayenne => "cayenne_sort_columns",
         // Sqlite / Turso / PostgreSQL accelerators have no sort param.
         _ => return false,
     };
 
     // For `refresh_mode: changes`, skip engines whose sort param drives the
-    // refresh itself (DuckDB `on_refresh_sort_columns`, Arrow `sort_columns`): a
+    // refresh itself (DuckDB `on_refresh_sort_columns`, Arrow `arrow_sort_columns`): a
     // refresh-time sort is a no-op for a change stream and risks perturbing the
     // initial snapshot. Cayenne is the exception — `cayenne_sort_columns` sorts
     // the background compaction rewrite, not the change stream (which stays
@@ -245,11 +318,15 @@ fn apply_inferred_sort(
         return false;
     }
 
-    // Respect any user-configured sort param (Cayenne also accepts `sort_columns`).
-    // Checked before the DuckDB constraint guard below so an explicitly-sorted
-    // dataset is reported as user-configured, not as a constraint-preservation skip.
+    // Respect any user-configured sort param. Cayenne and Arrow also read the
+    // unprefixed `sort_columns` straight from the acceleration params, so a user
+    // who wrote that spelling has configured a sort even though validation warns
+    // about the missing prefix. Checked before the DuckDB constraint guard below
+    // so an explicitly-sorted dataset is reported as user-configured, not as a
+    // constraint-preservation skip.
     let user_configured = acceleration.params.contains_key(key)
-        || (engine == Engine::Cayenne && acceleration.params.contains_key("sort_columns"));
+        || (matches!(engine, Engine::Cayenne | Engine::Arrow)
+            && acceleration.params.contains_key("sort_columns"));
     if user_configured {
         return false;
     }
@@ -391,7 +468,7 @@ fn apply_inferred_shard_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Schema};
     use data_components::inferred_schema::{InferredIndex, InferredSortColumn};
     use std::sync::Arc;
 
@@ -399,6 +476,14 @@ mod tests {
         Arc::new(Schema::new(
             cols.iter()
                 .map(|c| Field::new(*c, DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn typed_schema(cols: &[(&str, DataType)]) -> SchemaRef {
+        Arc::new(Schema::new(
+            cols.iter()
+                .map(|(name, data_type)| Field::new(*name, data_type.clone(), true))
                 .collect::<Vec<_>>(),
         ))
     }
@@ -597,6 +682,72 @@ mod tests {
         ));
     }
 
+    // Regression test for #13929: an inferred secondary index turned every DuckDB CDC
+    // upsert into a delete plus an insert, which fails to commit under concurrent reads.
+    #[test]
+    fn duckdb_skips_inferred_secondary_indexes_for_changes() {
+        let mut acc = accel(Engine::DuckDB);
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            indexes: vec![
+                InferredIndex {
+                    columns: vec!["last".to_string(), "first".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                },
+            ],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(
+            &mut acc,
+            &inferred,
+            &schema(&["id", "first", "last", "email"]),
+            "ds",
+            RefreshMode::Changes,
+        );
+
+        assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
+        assert!(matches!(
+            acc.on_conflict.get(&col_ref(&["id"])),
+            Some(OnConflictBehavior::Upsert(_))
+        ));
+        assert!(
+            acc.indexes.is_empty(),
+            "no inferred secondary index may reach a DuckDB acceleration: {:?}",
+            acc.indexes
+        );
+    }
+
+    #[test]
+    fn duckdb_keeps_user_configured_indexes_for_changes() {
+        let mut acc = accel(Engine::DuckDB);
+        acc.indexes.insert(col_ref(&["email"]), IndexType::Unique);
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            indexes: vec![InferredIndex {
+                columns: vec!["last".to_string()],
+                unique: false,
+            }],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(
+            &mut acc,
+            &inferred,
+            &schema(&["id", "last", "email"]),
+            "ds",
+            RefreshMode::Changes,
+        );
+
+        assert_eq!(acc.indexes.len(), 1);
+        assert_eq!(
+            acc.indexes.get(&col_ref(&["email"])),
+            Some(&IndexType::Unique)
+        );
+    }
+
     #[test]
     fn duckdb_skips_inferred_sort_when_user_primary_key_configured() {
         // DuckDB's on-refresh sort rewrites the table without preserving
@@ -764,6 +915,146 @@ mod tests {
         assert!(acc.indexes.contains_key(&col_ref(&["existing"])));
     }
 
+    /// The issue's table: a source with b-tree indexes on `(a, b)` and on the
+    /// `double precision` column `v`, and no `indexes` declared.
+    fn float_indexed_source() -> (InferredSchema, SchemaRef) {
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            indexes: vec![
+                InferredIndex {
+                    columns: vec!["a".to_string(), "b".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["v".to_string()],
+                    unique: false,
+                },
+            ],
+            ..InferredSchema::default()
+        };
+        let schema = typed_schema(&[
+            ("id", DataType::Int64),
+            ("a", DataType::Int32),
+            ("b", DataType::Int32),
+            ("v", DataType::Float64),
+        ]);
+        (inferred, schema)
+    }
+
+    /// Applies the issue's table to `acc`.
+    fn apply_float_indexed_source(acc: &mut Acceleration, refresh_mode: RefreshMode) {
+        let (inferred, schema) = float_indexed_source();
+        apply_inferred_schema(acc, &inferred, &schema, "t", refresh_mode);
+    }
+
+    // regression test for #14590
+    #[test]
+    fn cayenne_applies_inferred_index_on_float_column() {
+        // Cayenne indexes a floating-point key, so an index the source holds on
+        // one is applied like any other, alone or within a composite key.
+        for refresh_mode in [RefreshMode::Full, RefreshMode::Changes] {
+            let mut acc = accel(Engine::Cayenne);
+            apply_float_indexed_source(&mut acc, refresh_mode);
+
+            assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
+            assert_eq!(
+                acc.indexes.len(),
+                2,
+                "{refresh_mode:?}: both inferred indexes apply"
+            );
+            assert!(acc.indexes.contains_key(&col_ref(&["a", "b"])));
+            assert!(acc.indexes.contains_key(&col_ref(&["v"])));
+        }
+        for float in [DataType::Float16, DataType::Float32, DataType::Float64] {
+            let mut acc = accel(Engine::Cayenne);
+            let inferred = InferredSchema {
+                indexes: vec![InferredIndex {
+                    columns: vec!["a".to_string(), "score".to_string()],
+                    unique: true,
+                }],
+                ..InferredSchema::default()
+            };
+            let schema = typed_schema(&[("a", DataType::Int32), ("score", float.clone())]);
+            apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+
+            assert_eq!(
+                acc.indexes.get(&col_ref(&["a", "score"])),
+                Some(&IndexType::Unique),
+                "{float}: composite key with a float column applies"
+            );
+        }
+    }
+
+    #[test]
+    fn cayenne_skips_inferred_index_on_a_column_it_cannot_key() {
+        // Cayenne refuses a key column it cannot encode, such as an array, at
+        // registration. An index the source holds on one is skipped instead, so
+        // a dataset that never declared it still loads with its other indexes.
+        let inferred = InferredSchema {
+            indexes: vec![
+                InferredIndex {
+                    columns: vec!["a".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["tags".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["a".to_string(), "tags".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["status".to_string()],
+                    unique: false,
+                },
+            ],
+            ..InferredSchema::default()
+        };
+        let tags = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
+        let status = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = typed_schema(&[("a", DataType::Int32), ("tags", tags), ("status", status)]);
+
+        let mut acc = accel(Engine::Cayenne);
+        apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+        assert_eq!(acc.indexes.len(), 2, "{:?}", acc.indexes.keys());
+        assert!(acc.indexes.contains_key(&col_ref(&["a"])));
+        assert!(
+            acc.indexes.contains_key(&col_ref(&["status"])),
+            "a dictionary column is keyed by its values"
+        );
+
+        let mut acc = accel(Engine::Sqlite);
+        apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+        assert_eq!(acc.indexes.len(), 4, "other engines index any column type");
+    }
+
+    #[test]
+    fn inferred_index_skip_warning_names_the_dataset_index_and_cause() {
+        let columns = vec!["a".to_string(), "tags".to_string()];
+        let tags = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
+        let message = inferred_index_skip_warning(
+            "orders",
+            Engine::Cayenne,
+            &columns,
+            &Field::new("tags", tags, true),
+        );
+        assert!(
+            message.starts_with("Dataset 'orders' (cayenne): "),
+            "{message}"
+        );
+        assert!(
+            message.contains("secondary index on (a, tags)"),
+            "{message}"
+        );
+        assert!(message.contains("scan the table instead"), "{message}");
+        assert!(
+            message.contains("column 'tags' has type List("),
+            "{message}"
+        );
+        assert!(message.contains("https://spiceai.org/docs/"), "{message}");
+    }
+
     #[test]
     fn duckdb_sort_param_carries_direction() {
         let mut acc = accel(Engine::DuckDB);
@@ -801,9 +1092,41 @@ mod tests {
             RefreshMode::Full,
         );
         assert_eq!(
-            acc.params.get("sort_columns").map(String::as_str),
+            acc.params.get("arrow_sort_columns").map(String::as_str),
             Some("created_at DESC, id ASC")
         );
+        // The unprefixed spelling is what Arrow's parameter validation rejects
+        // with a warning; inference must never write it (#14023).
+        assert!(!acc.params.contains_key("sort_columns"));
+    }
+
+    #[test]
+    fn arrow_respects_user_sort_param_in_either_spelling() {
+        // `arrow_sort_columns` is the validated spelling; the Arrow accelerator
+        // also reads a bare `sort_columns` from the acceleration params, so both
+        // count as user-configured and neither is overridden by inference.
+        for user_key in ["arrow_sort_columns", "sort_columns"] {
+            let mut acc = accel(Engine::Arrow);
+            acc.params
+                .insert(user_key.to_string(), "custom".to_string());
+            let inferred = InferredSchema {
+                sort_columns: vec![sort("created_at", true)],
+                ..InferredSchema::default()
+            };
+            apply_inferred_schema(
+                &mut acc,
+                &inferred,
+                &schema(&["created_at"]),
+                "ds",
+                RefreshMode::Full,
+            );
+            assert_eq!(acc.params.len(), 1, "user key {user_key}");
+            assert_eq!(
+                acc.params.get(user_key).map(String::as_str),
+                Some("custom"),
+                "user key {user_key}"
+            );
+        }
     }
 
     #[test]

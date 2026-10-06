@@ -16,14 +16,12 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        ast::Ident,
-        dialect::GenericDialect,
-        parser::{Parser, ParserError},
-        tokenizer::Token,
-    },
+use datafusion::common::TableReference;
+use datafusion::sql::sqlparser::{
+    ast::Ident,
+    dialect::GenericDialect,
+    parser::{Parser, ParserError},
+    tokenizer::Token,
 };
 use globset::{Glob, GlobSet};
 
@@ -125,12 +123,12 @@ impl ResolvedTableAwareAllowlist {
             Token::EOF => {
                 return Err(ParserError::ParserError(
                     "Empty input when parsing identifier".to_string(),
-                ))?;
+                ));
             }
             token => {
                 return Err(ParserError::ParserError(format!(
                     "Unexpected token in identifier: {token}"
-                )))?;
+                )));
             }
         }
 
@@ -143,19 +141,19 @@ impl ResolvedTableAwareAllowlist {
                     Token::EOF => {
                         return Err(ParserError::ParserError(
                             "Trailing period in identifier".to_string(),
-                        ))?;
+                        ));
                     }
                     token => {
                         return Err(ParserError::ParserError(format!(
                             "Unexpected token following period in identifier: {token}"
-                        )))?;
+                        )));
                     }
                 },
                 Token::EOF => break,
                 token => {
                     return Err(ParserError::ParserError(format!(
                         "Unexpected token in identifier: {token}"
-                    )))?;
+                    )));
                 }
             }
         }
@@ -173,7 +171,7 @@ impl ResolvedTableAwareAllowlist {
 #[cfg(test)]
 mod tests {
 
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     use super::ResolvedTableAwareAllowlist;
 

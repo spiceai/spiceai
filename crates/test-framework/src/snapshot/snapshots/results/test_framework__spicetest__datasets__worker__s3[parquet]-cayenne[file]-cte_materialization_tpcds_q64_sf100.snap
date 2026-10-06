@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q64"
+---
++----------------------------+------------+-----------+-----------------+-----------------+-------------+-------+-----------------+------------------+---------------+-------+-------+-----+-------+--------+--------+-------+--------+---------+-------+-----+
+| product_name               | store_name | store_zip | b_street_number | b_street_name   | b_city      | b_zip | c_street_number | c_street_name    | c_city        | c_zip | syear | cnt | s11   | s21    | s31    | s12   | s22    | s32     | syear | cnt |
++----------------------------+------------+-----------+-----------------+-----------------+-------------+-------+-----------------+------------------+---------------+-------+-------+-----+-------+--------+--------+-------+--------+---------+-------+-----+
+| antiablecallycally         | able       | 29431     | 847             | Laurel 5th      | Greenville  | 71387 | 236             | 3rd West         | Oak Hill      | 08438 | 2001  | 1   | 46.16 | 66.47  | 0.00   | 80.30 | 130.88 | 0.00    | 2002  | 1   |
+| antiablecallycally         | bar        | 43604     | 850             | Jefferson       | Highland    | 59454 | 842             | 5th Lee          | Liberty       | 93451 | 2001  | 1   | 40.92 | 74.47  | 0.00   | 52.03 | 67.11  | 0.00    | 2002  | 1   |
+| antiablecallycally         | eing       | 38721     | 219             | Washington Main | Pierce      | 33360 | 680             | 4th              | Bridgeport    | 55817 | 2001  | 1   | 52.58 | 63.62  | 0.00   | 76.49 | 118.55 | 0.00    | 2002  | 1   |
+| antiablecallycally         | ese        | 49431     | 869             | Main Railroad   |             |       | 598             | Adams Adams      | Stringtown    | 90162 | 2001  | 1   | 32.77 | 63.90  | 0.00   | 43.39 | 59.01  | 0.00    | 2002  | 1   |
+| antiablecallycally         | ese        | 49431     | 798             | 5th Cherry      | Lakeside    | 59532 | 119             | Park North       | Riverview     | 89003 | 2001  | 1   | 69.06 | 136.04 | 0.00   | 43.39 | 59.01  | 0.00    | 2002  | 1   |
+| antiablecallycally         | ese        | 32477     | 435             | Railroad        | Shady Grove | 52812 | 122             | 11th Central     | Enterprise    | 31757 | 2001  | 1   | 83.66 | 92.02  | 0.00   | 69.11 | 106.42 | 0.00    | 2002  | 1   |
+| antiablecallycally         | n st       | 29843     | 991             | Jackson 11th    | Riley       | 21692 | 835             | Cherry           | Oakwood       | 60169 | 2001  | 1   | 99.02 | 172.29 | 0.00   | 31.09 | 55.02  | 0.00    | 2002  | 1   |
+| antiablecallycally         | pri        | 38828     | 627             | Church Lee      | Greenwood   | 38828 | 246             | Jackson Franklin | White Oak     | 76668 | 2001  | 1   | 51.30 | 53.86  | 632.10 | 20.40 | 26.72  | 0.00    | 2002  | 1   |
+| antiationablecallybarought | bar        | 44136     | 387             | West Pine       | Woodville   | 54289 | 460             | Spring           | Spring Valley | 56060 | 2001  | 1   | 38.42 | 49.17  | 0.00   | 36.21 | 65.90  | 3794.60 | 2002  | 1   |
+| antiationablecallybarought | bar        | 44136     | 387             | West Pine       | Woodville   | 54289 | 460             | Spring           | Spring Valley | 56060 | 2001  | 1   | 38.42 | 49.17  | 0.00   | 69.83 | 87.28  | 0.00    | 2002  | 1   |
++----------------------------+------------+-----------+-----------------+-----------------+-------------+-------+-----------------+------------------+---------------+-------+-------+-----+-------+--------+--------+-------+--------+---------+-------+-----+

@@ -138,6 +138,17 @@ impl ExecutionPlan for CayenneCreateTableExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -158,6 +169,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let arrow_schema = Arc::clone(&self.params.arrow_schema);
         let primary_key = self.params.primary_key.clone();
         let partition_expr_sql = self.params.partition_expr_sql.clone();
+        let cluster_by = self.params.cluster_by.clone();
         let if_not_exists = self.params.if_not_exists;
         let like_source_table = self.params.like_source_table.clone();
         let ctx = self.params.ctx.clone();
@@ -182,6 +194,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 arrow_schema,
                 primary_key,
                 partition_expr_sql,
+                cluster_by,
                 if_not_exists,
                 like_source_table,
                 ctx,
@@ -262,6 +275,17 @@ impl ExecutionPlan for CayenneDropTableExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -375,6 +399,17 @@ impl ExecutionPlan for CayenneCreateSchemaExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -497,6 +532,17 @@ impl ExecutionPlan for CayenneMergeExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

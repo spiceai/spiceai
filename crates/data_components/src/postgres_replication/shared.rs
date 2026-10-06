@@ -129,7 +129,10 @@ limitations under the License.
 //!   the configured unclaimed-reservation grace (a table left in the publication by a
 //!   removed dataset) would pin WAL forever, so the table is dropped from the
 //!   publication — which is what makes releasing its floor safe — and logged at
-//!   ERROR.
+//!   ERROR. A publication that cannot drop it (`FOR ALL TABLES`, `FOR TABLES IN
+//!   SCHEMA`) has its hold released anyway, logged at WARN: a dataset that joins
+//!   the table later is rebuilt from the source, since the slot has acknowledged
+//!   past anything it recorded.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -1977,17 +1980,24 @@ impl SharedSource {
             let (schema_name, table_name) = key.clone();
             let slot_name = self.key.slot_name.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    slot::remove_table_from_publication(&params, &schema_name, &table_name).await
-                {
-                    tracing::warn!(
-                        table = %format!("{schema_name}.{table_name}"),
-                        slot = %slot_name,
-                        "failed to remove mid-snapshot table from the shared publication; \
-                         re-adding the dataset will resume WITHOUT a fresh snapshot — drop \
-                         the table from the publication manually before re-adding: {e}"
-                    );
-                }
+                let removal =
+                    slot::remove_table_from_publication(&params, &schema_name, &table_name).await;
+                let cause = match removal {
+                    Ok(slot::PublicationRemoval::Removed) => return,
+                    Ok(slot::PublicationRemoval::StillPublished) => {
+                        "the publication includes it through FOR ALL TABLES or FOR TABLES IN \
+                         SCHEMA, which cannot drop a single table"
+                            .to_string()
+                    }
+                    Err(e) => e.to_string(),
+                };
+                tracing::warn!(
+                    table = %format!("{schema_name}.{table_name}"),
+                    slot = %slot_name,
+                    "failed to remove mid-snapshot table from the shared publication; \
+                     re-adding the dataset will resume WITHOUT a fresh snapshot — drop \
+                     the table from the publication manually before re-adding: {cause}"
+                );
             });
         }
     }
@@ -2081,6 +2091,14 @@ impl SharedSource {
     /// second silent-loss path: an unpublished table produces no more changes,
     /// and if the dataset ever comes back, `table_added` sends it through the
     /// initial-snapshot path instead of a resume.
+    ///
+    /// A publication that includes the table without naming it (`FOR ALL
+    /// TABLES`, `FOR TABLES IN SCHEMA`) cannot drop it, and a hold kept until it
+    /// does would pin WAL for the life of the slot (#13032). There the floor is
+    /// released with the table still published, which is safe for a different
+    /// reason: the slot then acknowledges past anything a returning dataset
+    /// recorded, and `super::rebuild_cause` rebuilds it from the source rather
+    /// than resuming across the changes nobody consumed.
     fn release_unclaimed_reservations(self: &Arc<Self>, grace: std::time::Duration) {
         for key in self.take_expired_reservations(grace) {
             let params = self.params.clone();
@@ -2100,17 +2118,6 @@ impl SharedSource {
                 if source.member(&key).is_some() {
                     return;
                 }
-                tracing::error!(
-                    table = %format_member(&key),
-                    slot = %slot_name,
-                    publication = %publication,
-                    grace_secs,
-                    "no dataset subscribed to a published table on this shared slot within the \
-                     grace period; it was pinning WAL retention for every dataset on the slot, \
-                     so it is being dropped from the publication and the slot's acknowledgement \
-                     released. Re-adding a dataset for this table will take a fresh initial \
-                     snapshot"
-                );
                 let (schema_name, table_name) = key.clone();
                 match slot::remove_table_from_publication(&params, &schema_name, &table_name).await
                 {
@@ -2119,7 +2126,46 @@ impl SharedSource {
                     // keep arriving with no member to route them to, and acking
                     // past them would be the very loss this hold exists to
                     // prevent.
-                    Ok(()) => source.ack.release(&key),
+                    Ok(slot::PublicationRemoval::Removed) => {
+                        tracing::error!(
+                            table = %format_member(&key),
+                            slot = %slot_name,
+                            publication = %publication,
+                            grace_secs,
+                            "no dataset subscribed to a published table on this shared slot \
+                             within the grace period; it was pinning WAL retention for every \
+                             dataset on the slot, so it is being dropped from the publication \
+                             and the slot's acknowledgement released. Re-adding a dataset for \
+                             this table will take a fresh initial snapshot"
+                        );
+                        source.ack.release(&key);
+                    }
+                    // The publication includes the table without naming it
+                    // (`FOR ALL TABLES`, `FOR TABLES IN SCHEMA`), so no drop can
+                    // ever succeed and holding on would pin WAL for the life of
+                    // the slot. Release it anyway: a dataset that joins this
+                    // table later finds the slot acknowledged past its recorded
+                    // position and is rebuilt from the source
+                    // (`RebuildCause::AcknowledgedPast`), and one with no record
+                    // is loaded from the source — neither resumes over the
+                    // changes acknowledged here.
+                    Ok(slot::PublicationRemoval::StillPublished) => {
+                        let table = format_member(&key);
+                        tracing::warn!(
+                            table = %table,
+                            slot = %slot_name,
+                            publication = %publication,
+                            grace_secs,
+                            "{}",
+                            implicitly_published_release_message(
+                                &table,
+                                &slot_name,
+                                &publication,
+                                grace_secs,
+                            )
+                        );
+                        source.ack.release(&key);
+                    }
                     Err(e) => {
                         // Keep the hold and re-arm the grace period so the next
                         // sweep tries again, rather than leaving a table pinning
@@ -2157,6 +2203,24 @@ impl SharedSource {
 
 fn format_member(key: &MemberKey) -> String {
     format!("{}.{}", key.0, key.1)
+}
+
+/// Logged when an unclaimed hold is released on a table its publication cannot
+/// drop (see [`SharedSource::release_unclaimed_reservations`]).
+fn implicitly_published_release_message(
+    table: &str,
+    slot: &str,
+    publication: &str,
+    grace_secs: u64,
+) -> String {
+    format!(
+        "No dataset subscribed to table '{table}' on shared replication slot '{slot}' within \
+         {grace_secs}s, and publication '{publication}' includes it through `FOR ALL TABLES` or \
+         `FOR TABLES IN SCHEMA`, so it cannot be dropped from the publication; the slot stops \
+         holding WAL for it so retention does not grow without bound. A dataset added for this \
+         table later is reloaded from the source if the changes since it last ran are no longer \
+         retained. See: https://spiceai.org/docs/components/data-connectors/postgres"
+    )
 }
 
 /// Entry point: subscribe one dataset to its shared replication source.
@@ -2351,9 +2415,24 @@ async fn attach_member(
     // `snapshot_on_resume` overrides all of that: a non-persistent
     // accelerator starts empty every boot, so WAL replay alone can never
     // reconstruct it — snapshot-then-replay is the only correct sequence.
-    let need_snapshot = params.snapshot_on_resume
-        || setup.table_added
-        || (!rejoining && source.slot_created_fresh.load(Ordering::Acquire));
+    //
+    // `super::creation_cause` holds that disjunction *and* the sentence that
+    // explains it, so the reason logged below cannot describe a different rule
+    // from the one that decided (the same reason `super::rebuild_cause` exists).
+    let creation_cause = super::creation_cause(super::CreationInputs {
+        source_read_policy: if params.snapshot_on_resume {
+            if params.ephemeral_accelerator {
+                super::SourceReadPolicy::EveryStartEphemeral
+            } else {
+                super::SourceReadPolicy::EveryStartConfigured
+            }
+        } else {
+            super::SourceReadPolicy::WhenHistoryIsMissing
+        },
+        table_added: setup.table_added,
+        slot_created_this_process: !rejoining && source.slot_created_fresh.load(Ordering::Acquire),
+    });
+    let need_snapshot = creation_cause.is_some();
 
     let snapshotting = need_snapshot && params.initial_snapshot;
 
@@ -2445,7 +2524,23 @@ async fn attach_member(
     // disabled outright — the rebuild is the only thing that would populate the
     // acceleration, and skipping it would resume from the slot's position and
     // leave every row that predates it missing for good.
-    let load_runs_without_rebuild = params.acceleration.is_provably_empty() && snapshotting;
+    let acceleration_is_empty = params.acceleration.is_provably_empty();
+    let load_runs_without_rebuild = acceleration_is_empty && snapshotting;
+    // The same observation against a watermark that is *present*, which says the
+    // opposite — see `super::rebuild_cause`, which owns the reasoning. The gate is
+    // the one above inverted for the same reason it is there: a snapshot going to
+    // populate the table leaves no gap, and nothing else loading it makes the
+    // rebuild the only thing that will.
+    //
+    // Passed as the observed state, not as `is_provably_empty()`, because
+    // inverting the question inverts which answer is the cautious one. Above, an
+    // unproven probe answering `false` keeps the rebuild; here `false` would
+    // *skip* one — so a probe that failed after the table was recreated would
+    // resume on the surviving watermark and leave every row below it missing,
+    // which is the hole this whole path exists to close. Only a positive
+    // `NonEmpty` licenses the resume, and `rebuild_cause` reports `Empty` and
+    // `Unknown` as the different events they are.
+    let contents_implying_gap = (!snapshotting).then_some(params.acceleration);
     // The floor passed here is the one the member was *actually* seated at above,
     // not the snapshot `setup` was built from — see the registration comment for
     // why the difference is a silent skip rather than a rounding error.
@@ -2455,14 +2550,14 @@ async fn attach_member(
         setup.slot_restart_lsn,
         setup.slot.consistent_lsn.max(seated_floor),
         !params.ephemeral_accelerator && tracks_positions && !load_runs_without_rebuild,
+        contents_implying_gap,
     );
     let rebuild_via_consumer = rebuild_cause.is_some();
-    // A rebuild is a full re-read nobody asked for, and which cause fired is what
-    // says whether to look at the source, the configuration, or the slot — so it
-    // is reported as a label rather than left to be recovered from log text. Set
-    // unconditionally (not only inside `if let Some`): the collector is reused
-    // across reattaches, so a clean resume must clear a cause an earlier attach
-    // left set, or the metric would keep exporting it as if this attach rebuilt.
+    // Recorded, not exported: the operator is told which cause fired by the
+    // warning below, and this is the same fact in the form an integration test
+    // can assert (see `ReplicationMetricsCollector::rebuild_cause`). Set
+    // unconditionally, so a clean resume clears a cause an earlier attach left
+    // behind on the reused collector.
     metrics.set_rebuild_cause(rebuild_cause.map(super::RebuildCause::label));
 
     // A member resuming on a position a previous process recorded already has a
@@ -2602,8 +2697,14 @@ async fn attach_member(
             },
             slot_acknowledged_position = %slot::format_lsn(setup.slot.consistent_lsn),
             rebuild_cause = rebuild_cause.map_or("", super::RebuildCause::label),
-            "this acceleration will be rebuilt from the source before changes are applied: {}",
-            rebuild_cause.map_or("", super::RebuildCause::reason)
+            "{}",
+            // `rebuild_via_consumer` is `rebuild_cause.is_some()`, so this arm
+            // always has a cause; the fallback is unreachable rather than a
+            // default worth reading.
+            rebuild_cause.map_or_else(String::new, |cause| super::rebuild_log_message(
+                &dataset_name,
+                cause
+            ))
         );
         // No snapshot runs on this path — the consumer's reload replaces it — so
         // the gauge's documented "finished, or skipped" state is reached here.
@@ -2611,6 +2712,24 @@ async fn attach_member(
         metrics.mark_bootstrap_complete();
         Box::pin(signal.chain(live_flip_hook(source, &member_key)))
     } else if snapshotting {
+        // Reading a whole table is the most expensive thing an acceleration does,
+        // and on this path the metrics say the least: the bootstrap counters
+        // report rows and completion but never a duration (only a rebuild runs
+        // through the timed refresh path), and none of them say why the read is
+        // happening. So this line is the operator's whole account of it, and it
+        // names the condition that fired rather than leaving them to infer it
+        // from the slot and publication state.
+        // `snapshotting` implies a cause, so the `if let` never falls through.
+        if let Some(cause) = creation_cause {
+            tracing::info!(
+                dataset = %dataset_name,
+                table = %format_member(&member_key),
+                slot = %source.key.slot_name,
+                creation_cause = cause.label(),
+                "{}",
+                super::creation_log_message(&dataset_name, cause)
+            );
+        }
         // Built before `dataset_name` is moved into the snapshot input below.
         let watermark_boundary = snapshot_watermark_envelope(
             &schema,
@@ -6382,6 +6501,31 @@ mod tests {
             source.slot_generation.load(Ordering::Acquire),
             refused_generation + 1,
             "one replacement happened, so the generation moved exactly once"
+        );
+    }
+
+    /// The only explanation an operator gets for a hold released on a table the
+    /// publication cannot drop, so it must name the table, slot and publication,
+    /// say why the drop was impossible and what a later dataset will do, and link
+    /// the docs.
+    #[test]
+    fn implicitly_published_release_message_names_the_resources_and_the_consequence() {
+        let message = implicitly_published_release_message("public.b", "spice_slot", "allpub", 300);
+        for needle in [
+            "table 'public.b'",
+            "slot 'spice_slot'",
+            "publication 'allpub'",
+            "within 300s",
+            "`FOR ALL TABLES`",
+            "`FOR TABLES IN SCHEMA`",
+            "reloaded from the source if the changes since it last ran are no longer retained",
+            "https://spiceai.org/docs/components/data-connectors/postgres",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+        assert!(
+            !message.contains('\n'),
+            "log messages stay on one line: {message}"
         );
     }
 

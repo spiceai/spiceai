@@ -6,7 +6,7 @@ name: postgres-cayenne[file]-cdc-tuned-memory-cold-sf1000
 # inherited verbatim (RAM mem-tier absorbs writes, flushes by size/age to the warm local-disk
 # Vortex tier); this variant adds the third, colder storage tier below the warm tier. The full
 # cascade is: RAM mem-tier -> warm local-disk Vortex -> COLD object store. A background promoter
-# graduates the warm tier to read-optimized, Z-order-clustered Vortex on the cold store once the
+# graduates the warm tier to read-optimized, Hilbert-clustered Vortex on the cold store once the
 # per-table warm-size trigger is crossed, and queries span all three tiers with per-tier
 # pushdown/pruning. See the datalake/cold knobs on &accel_high_volume below.
 #
@@ -112,16 +112,15 @@ datasets:
         # footers.
         cayenne_datalake_target_file_size_mb: '1024'
         # Promote a table's warm tier to cold once it exceeds 4 GiB. THE key tuning knob: promotion
-        # re-materializes the whole visible table (Z-order clustered), so this is sized so the big
+        # rewrites the warm delta and dirty datalake files (Hilbert clustered), so this is sized so the big
         # tables (order_line, stock, customer, oorder) graduate after the initial-snapshot
         # bootstrap while the small ones (district, new_order) stay warm — not so low that it
         # re-promotes per batch.
         cayenne_datalake_warm_max_bytes: '4294967296'
         # Background datalake tiering-check cadence — re-checks the warm-size trigger every 30s.
         cayenne_datalake_tiering_check_interval_ms: '30000'
-        # cayenne_datalake_clustering_columns omitted -> Z-order falls back to the primary key
-        # (sensible default for chbench point/range lookups); tune per-table if a scan dimension
-        # dominates.
+        # cayenne_cluster_by omitted -> the automatic layout policy applies; set it per table when
+        # particular scan dimensions should define both warm and datalake layout.
 
   - from: postgres:customer
     name: customer

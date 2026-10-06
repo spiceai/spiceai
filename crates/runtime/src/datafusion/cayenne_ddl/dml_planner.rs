@@ -83,7 +83,7 @@ pub fn extract_filters(plan: &LogicalPlan, table_name: &str) -> DFResult<Vec<Exp
 /// - `<expr> AS col` — SET assignment, included.
 pub fn extract_update_assignments(
     plan: &LogicalPlan,
-    table_name: &datafusion::sql::TableReference,
+    table_name: &datafusion::common::TableReference,
 ) -> DFResult<Vec<(String, Expr)>> {
     let LogicalPlan::Projection(proj) = plan else {
         return Ok(Vec::new());
