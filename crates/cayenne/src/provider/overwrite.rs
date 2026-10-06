@@ -76,6 +76,7 @@ use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::key_conflicts::Survivor;
 use super::mutation_writer::InlineBatchBuffer;
+use super::overwrite_postpass::CopyOrder;
 use super::table::{
     CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, OverwriteRouting,
     RangePartitioning, serialize_batches_to_ipc,
@@ -671,21 +672,36 @@ impl CayenneTableProvider {
         // its rows with its arrival sequence, and once the files are written a
         // query finds every copy other than the one the policy keeps — the last
         // under the upsert policies, the first under `drop`.
-        let mut postpass: Option<(Survivor, Vec<String>)> = None;
+        // A writer that supplies row versions (`upsert_by_time`) orders the copies
+        // by version instead of arrival.
+        let mut postpass: Option<(CopyOrder, Vec<String>)> = None;
         let mut dedup_share: Option<super::overwrite_postpass::DedupShare> = None;
         let data: SendableRecordBatchStream = match self.key_resolver()? {
             None => data,
             Some(resolver) => {
                 let indices = self.primary_key_indices()?.unwrap_or_default();
+                let order = match &self.row_versions {
+                    Some(_) => CopyOrder::Version,
+                    None => CopyOrder::Arrival(Survivor::for_policy(resolver.policy())),
+                };
                 dedup_share = Some(super::overwrite_postpass::DedupShare::claim());
                 postpass = Some((
-                    Survivor::for_policy(resolver.policy()),
+                    order,
                     super::overwrite_postpass::key_column_names(&self.table_schema(), &indices),
                 ));
-                let arrival = super::overwrite_postpass::arrival_column(&self.table_schema());
-                Box::pin(super::overwrite_postpass::ArrivalStream::new(
-                    data, resolver, &arrival,
-                ))
+                let table_schema = self.table_schema();
+                let arrival = super::overwrite_postpass::ArrivalStream::new(
+                    data,
+                    resolver,
+                    &super::overwrite_postpass::arrival_column(&table_schema),
+                );
+                match &self.row_versions {
+                    Some(versions) => Box::pin(arrival.with_versions(
+                        Arc::clone(versions),
+                        &super::overwrite_postpass::version_columns(&table_schema),
+                    )),
+                    None => Box::pin(arrival),
+                }
             }
         };
 
@@ -725,12 +741,21 @@ impl CayenneTableProvider {
         // single serial writer. Without split points the shards hash the key and
         // each still sorts its rows by it, so an equality on the key reads about
         // one zone of every file instead of all of them.
-        let write_schema = if postpass.is_some() {
-            let table_schema = self.table_schema();
-            let arrival = super::overwrite_postpass::arrival_column(&table_schema);
-            super::overwrite_postpass::with_arrival(&table_schema, &arrival)
-        } else {
-            self.table_schema()
+        let write_schema = match &postpass {
+            Some((order, _)) => {
+                let table_schema = self.table_schema();
+                let arrival = super::overwrite_postpass::arrival_column(&table_schema);
+                if matches!(order, CopyOrder::Version) {
+                    super::overwrite_postpass::with_versions(
+                        &table_schema,
+                        &arrival,
+                        &super::overwrite_postpass::version_columns(&table_schema),
+                    )
+                } else {
+                    super::overwrite_postpass::with_arrival(&table_schema, &arrival)
+                }
+            }
+            None => self.table_schema(),
         };
         let written: Result<_> = async {
             let written = self
@@ -763,12 +788,12 @@ impl CayenneTableProvider {
         // hold them without them and so publishes no deletes at all.
         let (position_deletions, write_stats_acc) = match postpass.take() {
             None => (HashMap::new(), write_stats_acc),
-            Some((survivor, key_columns)) => {
+            Some((order, key_columns)) => {
                 let resolved: Result<_> = async {
                     let superseded = self
                         .find_superseded_by_arrival(
                             &new_snapshot_id,
-                            survivor,
+                            order,
                             &key_columns,
                             row_count,
                         )

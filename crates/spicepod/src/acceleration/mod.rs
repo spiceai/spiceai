@@ -215,6 +215,10 @@ pub enum OnConflictBehavior {
     /// Replace the stored row. Of the versions of a key one write holds, the
     /// last to arrive is kept. Cayenne only.
     UpsertByArrival,
+    /// Keep, per primary key, the row with the greatest dataset `time_column`: the
+    /// newest version among the rows a refresh reads and, on append, the version
+    /// already stored. Cayenne only.
+    UpsertByTime,
 }
 
 impl OnConflictBehavior {
@@ -227,6 +231,7 @@ impl OnConflictBehavior {
             Self::UpsertDedup => "upsert_dedup",
             Self::UpsertDedupByRowId => "upsert_dedup_by_row_id",
             Self::UpsertByArrival => "upsert_by_arrival",
+            Self::UpsertByTime => "upsert_by_time",
         }
     }
 
@@ -236,14 +241,14 @@ impl OnConflictBehavior {
         match self {
             Self::UpsertDedup => Some(Self::Upsert),
             Self::UpsertDedupByRowId => Some(Self::UpsertByArrival),
-            Self::Drop | Self::Upsert | Self::UpsertByArrival => None,
+            Self::Drop | Self::Upsert | Self::UpsertByArrival | Self::UpsertByTime => None,
         }
     }
 
     /// Whether only the Cayenne accelerator supports this behavior.
     #[must_use]
     pub fn requires_cayenne(self) -> bool {
-        matches!(self, Self::UpsertByArrival)
+        matches!(self, Self::UpsertByArrival | Self::UpsertByTime)
     }
 }
 
@@ -951,6 +956,20 @@ mod tests {
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::UpsertDedup)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_upsert_by_time() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert_by_time
+            ";
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::UpsertByTime)
         );
     }
 

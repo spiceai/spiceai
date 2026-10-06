@@ -140,8 +140,21 @@ impl MultiSink {
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
-        superseded: Option<Arc<util::session_state::SupersededRows>>,
+        write: &super::RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
+        // Row versions let one accelerator resolve repeated keys as it writes, but every
+        // table here receives the rows and not every one reads them. The refresh resolves
+        // them before writing to a table with synchronized children, so one attached since
+        // then fails the write, and the next attempt resolves them first.
+        if write.row_versions.is_some() {
+            return Err(RetryError::transient(
+                crate::accelerated::Error::FailedToWriteData {
+                    source: DataFusionError::Execution(
+                        "a synchronized dataset attached during this refresh, so it was not applied; the next refresh writes the same rows to both".to_string(),
+                    ),
+                },
+            ));
+        }
         let schema = record_batch_stream.schema();
         let (tx, _) = broadcast::channel::<RecordBatch>(32);
         let mut join_set = JoinSet::new();
@@ -167,13 +180,9 @@ impl MultiSink {
 
         // Spawn primary task
         let primary_provider = Arc::clone(&self.original_table_provider);
-        let parent_state = match superseded {
-            Some(rows) => util::session_state::with_superseded_rows(&ctx.state(), rows),
-            None => ctx.state(),
-        };
         join_set.spawn(Self::spawn_parent_task(
             primary_provider,
-            parent_state,
+            write.state(&ctx.state()),
             tx.subscribe(),
             Arc::clone(&schema),
             parent_complete_tx,

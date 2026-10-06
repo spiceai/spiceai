@@ -62,6 +62,9 @@ fn kept<'a>(behavior: OnConflictBehavior, first: &'a str, last: &'a str) -> Opti
         OnConflictBehavior::Drop => Some(first),
         OnConflictBehavior::Upsert | OnConflictBehavior::UpsertDedup => None,
         OnConflictBehavior::UpsertByArrival | OnConflictBehavior::UpsertDedupByRowId => Some(last),
+        OnConflictBehavior::UpsertByTime => {
+            unreachable!("`upsert_by_time` orders versions by time; see `upsert_by_time.rs`")
+        }
     }
 }
 

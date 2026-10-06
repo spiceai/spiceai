@@ -196,6 +196,14 @@ pub static REFRESH_ROWS_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Rows a refresh received but the accelerated table did not keep, by `reason`:
+///
+/// - `unchanged`: an identical copy of a row the table kept;
+/// - `arrival`: a different version of the key, settled by the order versions arrived in;
+/// - `older`: under `on_conflict: upsert_by_time`, a version of the key with a greater
+///   `time_column` was kept;
+/// - `equal_time`: under `on_conflict: upsert_by_time`, a different row with the kept
+///   version's time, so `time_column` is not unique per key.
 pub static REFRESH_ROWS_SUPERSEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("dataset_acceleration_refresh_rows_superseded")

@@ -335,6 +335,15 @@ pub enum Error {
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display(
+        "Failed to register dataset '{dataset_name}' ({connector}): {reason} See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
+    ))]
+    UpsertByTimeUnsupported {
+        dataset_name: String,
+        connector: String,
+        reason: String,
+    },
+
+    #[snafu(display(
         "Failed to register dataset {dataset_name} (drasi): Drasi forwarding publishes the dataset's change stream, but this dataset has no change stream to publish — it is {reason}. Set 'acceleration.refresh_mode: changes' on a source that supports change data capture, or remove the 'drasi' block. See: https://spiceai.org/docs/reference/spicepod/datasets#drasi"
     ))]
     DrasiWithoutChangeStream {

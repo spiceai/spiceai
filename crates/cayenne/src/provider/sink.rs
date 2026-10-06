@@ -77,6 +77,15 @@ pub struct CayenneDataSink {
     context: Arc<CayenneContext>,
 }
 
+/// The error for an append that carries row versions but can't keep each key's greatest
+/// version: it is not a load into an empty table, so a stored copy of a key it writes
+/// would be superseded whatever its version.
+fn versioned_append_refused(table: &str) -> datafusion_common::DataFusionError {
+    datafusion_common::DataFusionError::Execution(format!(
+        "Cayenne table '{table}' holds rows, so this refresh's append cannot order a key's copies by version against them; the refresh was not applied and the next one resolves them before writing."
+    ))
+}
+
 impl CayenneDataSink {
     /// Creates a new `CayenneDataSink`.
     ///
@@ -178,6 +187,9 @@ impl DataSink for CayenneDataSink {
         // interleaves with a concurrent append.
         if self.table.is_memory_resident_mode() {
             let overwrite = self.overwrite == InsertOp::Overwrite;
+            if !overwrite && self.table.row_versions.is_some() {
+                return Err(versioned_append_refused(self.table.table_name()));
+            }
             let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
             let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
             // Acquire the write lock BEFORE draining so memory-mode writes are
@@ -298,6 +310,11 @@ impl DataSink for CayenneDataSink {
                 }
             });
             Ok(rows)
+        } else if self.table.row_versions.is_some() {
+            // Row versions order a key's copies only against the copies one write
+            // holds, which is every copy only in a load into an empty table; any
+            // other append would supersede a stored copy whatever its version.
+            Err(versioned_append_refused(self.table.table_name()))
         } else if let Some(interval) = self.context.stream_publish_interval()
             && self.table.key_resolver()?.is_none()
         {

@@ -238,7 +238,7 @@ impl TableSink {
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
-        superseded: Option<Arc<util::session_state::SupersededRows>>,
+        write: &super::RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
         let start = std::time::Instant::now();
         tracing::debug!(
@@ -247,10 +247,7 @@ impl TableSink {
         );
 
         let ctx = util::session_state::session_context();
-        let state = match superseded {
-            Some(rows) => util::session_state::with_superseded_rows(&ctx.state(), rows),
-            None => ctx.state(),
-        };
+        let state = write.state(&ctx.state());
         let target_schema = self.table_provider.schema();
         warn_on_narrowing_schema_cast(
             &self.dataset_name,

@@ -1903,6 +1903,11 @@ pub struct CayenneTableProvider {
     /// Counts the rows a write through this provider receives but does not keep;
     /// set on the clone a write runs on, from its session.
     superseded_rows: Option<Arc<util::session_state::SupersededRows>>,
+    /// How a write orders the copies of a key it repeats, when the writer
+    /// supplies row versions (`on_conflict: upsert_by_time`): the copy with the
+    /// greatest version survives instead of the last to arrive. Set on the clone
+    /// a write runs on, from its session.
+    pub(crate) row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -9417,6 +9422,7 @@ impl CayenneTableProvider {
             scan_view_reuse,
             upsert_policy,
             superseded_rows: None,
+            row_versions: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -11553,6 +11559,7 @@ impl CayenneTableProvider {
             scan_view_reuse: self.scan_view_reuse,
             upsert_policy: self.upsert_policy,
             superseded_rows: self.superseded_rows.clone(),
+            row_versions: self.row_versions.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
@@ -13494,10 +13501,44 @@ impl CayenneTableProvider {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>> {
-        match self.key_resolver()? {
-            Some(resolver) => resolver.collapse_write(batches),
-            None => Ok(batches),
+        match (self.key_resolver()?, &self.row_versions) {
+            (Some(resolver), Some(versions)) => {
+                self.collapse_buffered_write_by_version(&resolver, versions, batches)
+            }
+            (Some(resolver), None) => resolver.collapse_write(batches),
+            (None, _) => Ok(batches),
         }
+    }
+
+    /// [`Self::collapse_buffered_write`] for a writer that supplies row versions: each
+    /// key keeps its greatest version, and the copies not kept are counted.
+    fn collapse_buffered_write_by_version(
+        &self,
+        resolver: &super::key_conflicts::KeyResolver,
+        versions: &Arc<dyn util::session_state::RowVersions>,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>> {
+        let versioned = batches
+            .into_iter()
+            .map(|batch| {
+                // A NULL or unreadable time fails the write here, as on the streaming
+                // path. `DataFusion` errors convert back unchanged, so it keeps its type.
+                let (times, hashes) = versions
+                    .versions(&batch)
+                    .map_err(|source| Error::DataFusion { source })?;
+                Ok(super::key_conflicts::VersionedBatch {
+                    batch,
+                    times,
+                    hashes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let kept = resolver.resolve_by_version(versioned)?;
+        Ok(kept
+            .into_iter()
+            .map(|versioned| versioned.batch)
+            .filter(|batch| batch.num_rows() > 0)
+            .collect())
     }
 
     /// Resolve the keys a buffered change-stream write repeats: a later change of
@@ -38187,9 +38228,12 @@ impl TableProvider for CayenneTableProvider {
         // - Overwrite: new snapshot creation, catalog commit, state updates, cleanup
         // - Append: write lock, PK validation, on-conflict deletions, new snapshot
         //   when needed, retention filters, sort-and-rewrite, listing table refresh
+        let mut table = self
+            .clone_for_write()
+            .with_superseded_rows(util::session_state::superseded_rows(state.config()));
+        table.row_versions = util::session_state::row_versions(state.config());
         let sink = Arc::new(CayenneDataSink::new(
-            self.clone_for_write()
-                .with_superseded_rows(util::session_state::superseded_rows(state.config())),
+            table,
             overwrite,
             self.table_schema(),
             Arc::clone(&self.context),

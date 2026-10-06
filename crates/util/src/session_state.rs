@@ -53,10 +53,14 @@ pub enum SupersededReason {
     Unchanged,
     /// A different version of a key, settled by the order versions arrived in.
     Arrival,
+    /// A version of a key with an earlier time than the version kept.
+    Older,
+    /// A version of a key with the kept version's time but different content.
+    EqualTime,
 }
 
 impl SupersededReason {
-    pub const ALL: [Self; 2] = [Self::Unchanged, Self::Arrival];
+    pub const ALL: [Self; 4] = [Self::Unchanged, Self::Arrival, Self::Older, Self::EqualTime];
 
     /// The `reason` label a metric reports this under.
     #[must_use]
@@ -64,6 +68,21 @@ impl SupersededReason {
         match self {
             Self::Unchanged => "unchanged",
             Self::Arrival => "arrival",
+            Self::Older => "older",
+            Self::EqualTime => "equal_time",
+        }
+    }
+
+    /// Why a copy with version `loser` lost to `winner`, each a `(time, content
+    /// hash)` from [`RowVersions`].
+    #[must_use]
+    pub fn of_version(loser: (i64, u64), winner: (i64, u64)) -> Self {
+        if loser.0 < winner.0 {
+            Self::Older
+        } else if loser.1 == winner.1 {
+            Self::Unchanged
+        } else {
+            Self::EqualTime
         }
     }
 }
@@ -73,16 +92,12 @@ impl SupersededReason {
 /// ([`with_superseded_rows`]); the accelerator counts into it.
 #[derive(Debug, Default)]
 pub struct SupersededRows {
-    unchanged: std::sync::atomic::AtomicU64,
-    arrival: std::sync::atomic::AtomicU64,
+    counts: [std::sync::atomic::AtomicU64; SupersededReason::ALL.len()],
 }
 
 impl SupersededRows {
     fn counter(&self, reason: SupersededReason) -> &std::sync::atomic::AtomicU64 {
-        match reason {
-            SupersededReason::Unchanged => &self.unchanged,
-            SupersededReason::Arrival => &self.arrival,
-        }
+        &self.counts[reason as usize]
     }
 
     pub fn add(&self, reason: SupersededReason, rows: u64) {
@@ -112,6 +127,48 @@ pub fn with_superseded_rows(state: &SessionState, rows: Arc<SupersededRows>) -> 
 #[must_use]
 pub fn superseded_rows(config: &SessionConfig) -> Option<Arc<SupersededRows>> {
     config.get_extension::<SupersededRows>()
+}
+
+/// Orders the copies of a key a write repeats by the version each row carries,
+/// rather than by the order they arrive in: the row with the greatest
+/// `(time, content hash)` is kept. Implemented by the writer that knows how to read
+/// a row's version (for `on_conflict: upsert_by_time`, its `time_column`); read by
+/// an accelerator that resolves repeated keys after writing them.
+pub trait RowVersions: Send + Sync + std::fmt::Debug {
+    /// Each row of `batch`'s time, as UTC nanoseconds, and content hash. The hash
+    /// is 63 bits: its lowest bit is always clear. A row whose time cannot be read
+    /// fails the write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a time is NULL or cannot be read.
+    fn versions(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> datafusion::error::Result<(arrow::array::Int64Array, arrow::array::UInt64Array)>;
+}
+
+/// The [`RowVersions`] a write orders a key's copies by; see [`with_row_versions`].
+#[derive(Debug)]
+struct WriteRowVersions(Arc<dyn RowVersions>);
+
+/// `state` carrying `versions`, so the accelerator's write orders a key's copies
+/// by them.
+#[must_use]
+pub fn with_row_versions(state: &SessionState, versions: Arc<dyn RowVersions>) -> SessionState {
+    let mut state = state.clone();
+    state
+        .config_mut()
+        .set_extension(Arc::new(WriteRowVersions(versions)));
+    state
+}
+
+/// The [`RowVersions`] a write's `config` carries, if any.
+#[must_use]
+pub fn row_versions(config: &SessionConfig) -> Option<Arc<dyn RowVersions>> {
+    config
+        .get_extension::<WriteRowVersions>()
+        .map(|versions| Arc::clone(&versions.0))
 }
 
 /// A [`TaskContext`] carrying [`session_config`], for executing a plan outside

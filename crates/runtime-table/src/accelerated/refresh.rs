@@ -78,6 +78,14 @@ pub enum Error {
     },
 }
 
+/// How `on_conflict: upsert_by_time` resolves a refresh's versions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpsertByTime {
+    /// The accelerator resolves a full refresh's repeated keys after writing them, by
+    /// the row versions the refresh supplies (unpartitioned file-mode Cayenne).
+    pub versions_resolved_after_write: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Refresh {
     pub(crate) time_column: Option<String>,
@@ -93,6 +101,10 @@ pub struct Refresh {
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
     pub(crate) append_overlap: Option<Duration>,
+    /// `on_conflict: upsert_by_time`: keep only rows newer than the version
+    /// of their key already kept (see `refresh_task::latest_by_time`), resolved as the
+    /// accelerator needs.
+    pub(crate) upsert_by_time: Option<UpsertByTime>,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
     /// TTL for cache entries. Data older than this is considered stale.
@@ -210,6 +222,12 @@ impl Refresh {
     #[must_use]
     pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
+        self
+    }
+
+    #[must_use]
+    pub fn upsert_by_time(mut self, upsert_by_time: Option<UpsertByTime>) -> Self {
+        self.upsert_by_time = upsert_by_time;
         self
     }
 
@@ -514,6 +532,7 @@ impl Default for Refresh {
             mode: RefreshMode::Full,
             period: None,
             append_overlap: None,
+            upsert_by_time: None,
             retry_enabled: false,
             retry_max_attempts: None,
             caching_ttl: None,
@@ -566,6 +585,10 @@ pub struct Refresher {
     cdc_apply_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
     /// Shared with `DataConnector` and `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
@@ -633,6 +656,7 @@ impl Refresher {
             cdc_apply_runtime,
             io_runtime,
             resource_monitor: None,
+            query_runtime_env: None,
             accelerator_write_mutex,
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
@@ -762,6 +786,14 @@ impl Refresher {
         monitor: runtime_resources::ResourceMonitor,
     ) -> &mut Self {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    pub fn with_query_runtime_env(
+        &mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> &mut Self {
+        self.query_runtime_env = Some(runtime_env);
         self
     }
 
@@ -954,6 +986,11 @@ impl Refresher {
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresh_task_runner =
                 refresh_task_runner.with_resource_monitor(resource_monitor.clone());
+        }
+
+        if let Some(ref runtime_env) = self.query_runtime_env {
+            refresh_task_runner =
+                refresh_task_runner.with_query_runtime_env(Arc::clone(runtime_env));
         }
 
         refresh_task_runner =

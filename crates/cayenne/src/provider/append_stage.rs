@@ -30,7 +30,7 @@ use super::column_stats::ColumnStatsAccumulator;
 use super::key_conflicts::{KeyResolver, Survivor};
 use super::on_conflict::{OnConflictDeletions, PostValidationState};
 use super::overwrite::{FileStatsObserver, WriteShape};
-use super::overwrite_postpass::{self, ArrivalStream, DedupShare};
+use super::overwrite_postpass::{self, ArrivalStream, CopyOrder, DedupShare};
 use super::pk_index::PkDigestSet;
 use super::table::{CayenneTableProvider, record_cayenne_write_phase};
 
@@ -39,7 +39,7 @@ use super::table::{CayenneTableProvider, record_cayenne_write_phase};
 /// and is stamped with its arrival, and once the files are written, a query
 /// over them finds every copy the policy does not keep.
 pub(super) struct ResolveAfterWrite {
-    survivor: Survivor,
+    order: CopyOrder,
     key_columns: Vec<String>,
     write_schema: SchemaRef,
     stamped_batches: Arc<AtomicU64>,
@@ -60,14 +60,33 @@ impl ResolveAfterWrite {
         let survivor = Survivor::for_policy(resolver.policy());
         let share = DedupShare::claim();
         let arrival = ArrivalStream::new(data, resolver, &arrival_name);
+        let stamped_batches = arrival.stamped_batches();
+        // A writer that supplies row versions (`upsert_by_time`) orders a key's
+        // copies by version instead of arrival.
+        let (order, write_schema, data): (_, _, SendableRecordBatchStream) =
+            match &table.row_versions {
+                Some(versions) => {
+                    let version_names = overwrite_postpass::version_columns(&schema);
+                    (
+                        CopyOrder::Version,
+                        overwrite_postpass::with_versions(&schema, &arrival_name, &version_names),
+                        Box::pin(arrival.with_versions(Arc::clone(versions), &version_names)),
+                    )
+                }
+                None => (
+                    CopyOrder::Arrival(survivor),
+                    overwrite_postpass::with_arrival(&schema, &arrival_name),
+                    Box::pin(arrival),
+                ),
+            };
         let resolution = Self {
-            survivor,
+            order,
             key_columns: overwrite_postpass::key_column_names(&schema, &indices),
-            write_schema: overwrite_postpass::with_arrival(&schema, &arrival_name),
-            stamped_batches: arrival.stamped_batches(),
+            write_schema,
+            stamped_batches,
             _share: share,
         };
-        Ok((resolution, Box::pin(arrival)))
+        Ok((resolution, data))
     }
 
     /// The schema the stamped stream is written with.
@@ -89,7 +108,7 @@ impl ResolveAfterWrite {
             return Ok(HashMap::new());
         }
         table
-            .find_superseded_by_arrival(snapshot_id, self.survivor, &self.key_columns, rows)
+            .find_superseded_by_arrival(snapshot_id, self.order, &self.key_columns, rows)
             .await
     }
 }

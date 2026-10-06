@@ -105,6 +105,12 @@ pub enum Error {
     ))]
     FailedToRefreshDataset { source: DataFusionError },
 
+    /// A refresh the dataset's own configuration refused to apply. The message is the
+    /// complete cause, with its fix and docs link, so it is shown without the generic
+    /// data-connector advice `FailedToRefreshDataset` adds.
+    #[snafu(display("{message}"))]
+    RefreshNotApplied { message: String },
+
     #[snafu(display(
         "Failed to scan the dataset from the data connector: {}. Ensure the dataset configuration is valid, and try again.",
         format_datafusion_error(source)
@@ -452,6 +458,10 @@ pub struct Builder {
     caching_max_size_bytes: Option<u64>,
     caching_max_items: Option<u64>,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
@@ -511,6 +521,7 @@ impl Builder {
             caching_max_size_bytes: None,
             caching_max_items: None,
             resource_monitor: None,
+            query_runtime_env: None,
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
             is_s3_express_acceleration: false,
@@ -646,6 +657,16 @@ impl Builder {
         monitor: runtime_resources::ResourceMonitor,
     ) -> &mut Self {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    /// Bound what a refresh holds in memory by the runtime's query memory pool, and spill
+    /// to its disk manager.
+    pub fn with_query_runtime_env(
+        &mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> &mut Self {
+        self.query_runtime_env = Some(runtime_env);
         self
     }
 
@@ -1013,6 +1034,10 @@ impl Builder {
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
+        }
+
+        if let Some(ref runtime_env) = self.query_runtime_env {
+            refresher.with_query_runtime_env(Arc::clone(runtime_env));
         }
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);

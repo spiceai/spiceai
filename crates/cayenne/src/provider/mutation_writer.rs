@@ -1230,6 +1230,16 @@ impl<'a> AppendMutationWriter<'a> {
         resolver: super::key_conflicts::KeyResolver,
         write_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
+        // A writer's row versions order a key's copies only against the copies this
+        // write holds, which are all of them only in a load into an empty table.
+        if self.table.row_versions.is_some() && !self.into_empty_table {
+            return Err(super::Error::DataFusion {
+                source: datafusion_common::DataFusionError::Internal(format!(
+                    "an append carrying row versions reached a table '{}' that holds rows",
+                    self.table.table_name()
+                )),
+            });
+        }
         let write = super::overwrite::WriteShape {
             target_size_bytes: self.context.target_file_size_bytes(),
             target_partitions: self.task_context.session_config().target_partitions(),
