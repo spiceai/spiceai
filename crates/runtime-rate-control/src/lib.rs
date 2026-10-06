@@ -20,9 +20,10 @@ limitations under the License.
 //! * **In-memory** (default): a local `governor` rate limiter per quota, plus
 //!   an optional concurrency semaphore. No coordination across replicas.
 //! * **Cluster** (when `with_object_store_persistence_for_instance` is
-//!   configured): each named quota is enforced by a `LeasedBucket` which
-//!   negotiates a per-window slice of the cluster-wide budget through OCC
-//!   writes to the configured `object_store`. See [`leased`].
+//!   configured, which the runtime does when `runtime.state.location` is set):
+//!   each named quota is enforced by a `LeasedBucket` which negotiates a
+//!   per-window slice of the cluster-wide budget through OCC writes to the
+//!   configured `object_store`. See [`leased`].
 //!
 //! When cluster mode is enabled, the configured `requests_per_second_limit` /
 //! `requests_per_minute_limit` is interpreted as the **cluster-wide** limit,

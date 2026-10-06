@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! The new leased-bucket model treats `requests_per_second_limit` as a
 //! **cluster-wide** budget and shares it across replicas via per-window OCC
-//! writes to the configured state location. These tests run two replicas
+//! writes to `runtime.state.location`. These tests run two replicas
 //! against the same `file://` state location and assert that the combined
 //! throughput stays within the cluster budget.
 
@@ -31,7 +31,7 @@ use runtime::{
     Runtime,
     component::dataset::{Dataset, builder::DatasetBuilder},
 };
-use spicepod::component::runtime::{Runtime as SpicepodRuntime, SourceRateControl};
+use spicepod::component::runtime::{Runtime as SpicepodRuntime, RuntimeState, SourceRateControl};
 use url::Url;
 
 const APP_NAME: &str = "rate_control_cluster_lease";
@@ -40,9 +40,11 @@ const ORIGIN_URL: &str = "https://rate-control-cluster.example.com/data";
 fn app_with_file_rate_control(state_location: &str, refresh_interval: &str) -> App {
     AppBuilder::new(APP_NAME)
         .with_runtime(SpicepodRuntime {
-            source_rate_control: Some(SourceRateControl {
-                state_location: Some(state_location.to_string()),
+            state: Some(RuntimeState {
+                location: state_location.to_string(),
                 params: None,
+            }),
+            source_rate_control: Some(SourceRateControl {
                 refresh_interval: refresh_interval.to_string(),
                 github_concurrent_connections_limit: None,
             }),

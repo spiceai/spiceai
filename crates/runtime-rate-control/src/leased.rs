@@ -277,8 +277,7 @@ impl PersistedLimiter {
     fn retain_recent_windows(&mut self, now_window: u64) {
         self.windows.retain(|id, _| {
             id.parse::<u64>()
-                .ok()
-                .is_some_and(|id| id + STALE_WINDOW_RETENTION >= now_window)
+                .is_ok_and(|id| id + STALE_WINDOW_RETENTION >= now_window)
         });
     }
 

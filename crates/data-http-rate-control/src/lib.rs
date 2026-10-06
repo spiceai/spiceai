@@ -821,7 +821,7 @@ pub fn parameter_specs() -> [ParameterSpec; 9] {
         ParameterSpec::runtime("rate_control_acquire_timeout")
             .description("Maximum time a request waits to acquire HTTP rate-control capacity (a concurrency slot and the per-second/minute quota) before failing instead of waiting indefinitely. Accepts durations such as '30s' or '500ms'. Defaults to the connector's `client_timeout`. '0' disables the bound. Overrides runtime.params.http_rate_control_acquire_timeout when set."),
         ParameterSpec::runtime("rate_control_mode")
-            .description("How the configured HTTP rate limits apply. 'static' (default) applies them as they are. 'adaptive' lowers the effective request rate while the upstream origin fails or times out, then raises it again as the origin recovers, always within the configured static limits. With runtime.source_rate_control.state_location set, every instance derives the same coefficient from the shared state, so the cluster backs off together; it scales requests_per_second_limit and requests_per_minute_limit only, never the instance-local max_concurrent_requests. Overrides runtime.params.http_rate_control_mode when set."),
+            .description("How the configured HTTP rate limits apply. 'static' (default) applies them as they are. 'adaptive' lowers the effective request rate while the upstream origin fails or times out, then raises it again as the origin recovers, always within the configured static limits. With runtime.state.location set, every instance derives the same coefficient from the shared state, so the cluster backs off together; it scales requests_per_second_limit and requests_per_minute_limit only, never the instance-local max_concurrent_requests. Overrides runtime.params.http_rate_control_mode when set."),
         ParameterSpec::runtime("rate_control_failure_threshold")
             .description("The upstream error rate above which adaptive rate control begins throttling, as a percentage like '25%' or a fraction like '0.25'. Below this error rate the configured limits are used unchanged; above it, admission is scaled down in proportion to the success rate. Overrides runtime.params.http_rate_control_failure_threshold when set. Applies only when rate_control_mode is 'adaptive'. Defaults to 10%."),
         ParameterSpec::runtime("rate_control_window")
@@ -1516,7 +1516,7 @@ fn build_shared_rate_controller(
 /// Cluster rate control leases the per-second and per-minute request quotas
 /// through object storage. `max_concurrent_requests` is a local semaphore that
 /// is never leased, so an origin limited only by concurrency builds no leased
-/// bucket: `state_location` has no effect on it, and neither does adaptive mode,
+/// bucket: `runtime.state.location` has no effect on it, and neither does adaptive mode,
 /// which throttles by scaling the leased budget. Until now that was silent.
 ///
 /// Called from controller construction, so it is reported once per origin rather
@@ -1534,7 +1534,7 @@ fn warn_about_inert_cluster_settings(
     }
 
     tracing::warn!(
-        "Cluster rate control is set for origin '{origin}', but no request-rate limit is set. `state_location` applies to `requests_per_second_limit` and `requests_per_minute_limit` only. `max_concurrent_requests` stays local to each instance. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+        "Cluster rate control is set for origin '{origin}', but no request-rate limit is set. Cluster rate control at `runtime.state.location` applies to `requests_per_second_limit` and `requests_per_minute_limit` only. `max_concurrent_requests` stays local to each instance. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
     );
 }
 
