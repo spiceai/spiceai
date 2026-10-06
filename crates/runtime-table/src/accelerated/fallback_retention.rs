@@ -187,6 +187,11 @@ impl FallbackRetentionKeep {
     /// Returns an error if a time column cannot be converted or the combined
     /// predicate cannot be simplified against `schema`.
     pub fn keep_filters(&self, schema: &SchemaRef) -> Result<Vec<Expr>> {
+        self.keep_filters_at(schema, SystemTime::now())
+    }
+
+    /// [`Self::keep_filters`] with every time cutoff measured back from `now`.
+    fn keep_filters_at(&self, schema: &SchemaRef, now: SystemTime) -> Result<Vec<Expr>> {
         let mut delete_preds = Vec::with_capacity(self.filters.len());
         for filter in &self.filters {
             match filter {
@@ -202,6 +207,7 @@ impl FallbackRetentionKeep {
                 } => {
                     delete_preds.push(time_retention_delete_expr(
                         schema,
+                        now,
                         *period,
                         time_column,
                         *time_format,
@@ -236,6 +242,7 @@ impl FallbackRetentionKeep {
 
 fn time_retention_delete_expr(
     schema: &SchemaRef,
+    now: SystemTime,
     period: std::time::Duration,
     time_column: &str,
     time_format: Option<TimeFormat>,
@@ -259,7 +266,7 @@ fn time_retention_delete_expr(
     .ok_or_else(|| Error::UntranslatableTime {
         time_column: time_column.to_string(),
     })?;
-    let start = SystemTime::now() - period;
+    let start = now - period;
     let timestamp = refresh::get_timestamp(start);
     Ok(converter.convert(timestamp, Operator::Lt))
 }
@@ -613,9 +620,11 @@ mod tests {
         use datafusion::catalog::MemTable;
         use datafusion::prelude::SessionContext;
 
+        // One instant for the fixture timestamps and the cutoff, so the result
+        // does not depend on how long building the predicate takes.
+        let now = SystemTime::now();
         let now_ms = i64::try_from(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
+            now.duration_since(SystemTime::UNIX_EPOCH)
                 .expect("clock")
                 .as_millis(),
         )
@@ -649,7 +658,7 @@ mod tests {
                     None,
                 );
                 let keep_expr = keep
-                    .keep_filters(&schema)
+                    .keep_filters_at(&schema, now)
                     .expect("keep")
                     .into_iter()
                     .next()
