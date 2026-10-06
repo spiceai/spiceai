@@ -106,15 +106,21 @@ pub(crate) async fn run(args: &ColdStartArgs) -> anyhow::Result<()> {
     );
 
     let mut candidate = BinaryResult {
-        spiced_path: args.common.spiced_path_buf(),
+        spiced_path: executable_path(&args.common.spiced_path_buf())?,
         version: String::new(),
         runs: Vec::new(),
     };
-    let mut baseline = args.baseline_spiced_path.as_ref().map(|path| BinaryResult {
-        spiced_path: path.clone(),
-        version: String::new(),
-        runs: Vec::new(),
-    });
+    let mut baseline = args
+        .baseline_spiced_path
+        .as_deref()
+        .map(|path| {
+            Ok::<_, anyhow::Error>(BinaryResult {
+                spiced_path: executable_path(path)?,
+                version: String::new(),
+                runs: Vec::new(),
+            })
+        })
+        .transpose()?;
 
     // Interleave the two binaries and swap which goes first in every other pair,
     // so steady drift in the host's load during the job favours neither.
@@ -311,6 +317,16 @@ fn evaluate(
     failures
 }
 
+/// `spiced` is launched from a temporary directory, so a relative path to it is
+/// made absolute here; a bare name is left to the `PATH` lookup.
+fn executable_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.is_relative() && path.components().count() > 1 {
+        Ok(std::fs::canonicalize(path)?)
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
 /// Sum of every sample of `name` whose labels include all of `labels`.
 fn metric_sum(metrics: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
     let mut found = None;
@@ -473,6 +489,25 @@ cayenne_compaction_outcome_total{kind="subset_current",outcome="committed",table
         let mut args = ColdStartArgs::parse_from(["cold-start"]);
         args.max_full_compactions = max_full_compactions;
         args
+    }
+
+    #[test]
+    fn executable_path_resolves_only_relative_paths_with_a_directory() {
+        assert_eq!(
+            executable_path(Path::new("spiced")).expect("bare name"),
+            PathBuf::from("spiced")
+        );
+        assert_eq!(
+            executable_path(Path::new("/usr/local/bin/spiced")).expect("absolute path"),
+            PathBuf::from("/usr/local/bin/spiced")
+        );
+        let relative = Path::new("./Cargo.toml");
+        let resolved = executable_path(relative).expect("relative path");
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(relative).expect("canonicalize")
+        );
     }
 
     #[test]
