@@ -696,7 +696,7 @@ impl CayenneTableProvider {
                 match &self.row_versions {
                     Some(versions) => Box::pin(arrival.with_versions(
                         Arc::clone(versions),
-                        &super::overwrite_postpass::version_columns(&table_schema),
+                        &super::overwrite_postpass::version_column(&table_schema),
                     )),
                     None => Box::pin(arrival),
                 }
@@ -747,7 +747,7 @@ impl CayenneTableProvider {
                     super::overwrite_postpass::with_versions(
                         &table_schema,
                         &arrival,
-                        &super::overwrite_postpass::version_columns(&table_schema),
+                        &super::overwrite_postpass::version_column(&table_schema),
                     )
                 } else {
                     super::overwrite_postpass::with_arrival(&table_schema, &arrival)

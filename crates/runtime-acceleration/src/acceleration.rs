@@ -357,9 +357,6 @@ impl From<spicepod_acceleration::OnConflictBehavior> for OnConflictBehavior {
             spicepod_acceleration::OnConflictBehavior::UpsertDedup => {
                 OnConflictBehavior::Upsert(UpsertOptions::default().with_remove_duplicates(true))
             }
-            // `upsert_by_time` reaches the engine as `upsert_by_arrival`: the refresh
-            // passes a key's versions oldest first, and only those newer than the
-            // version already kept (see `Acceleration::upsert_by_time`).
             spicepod_acceleration::OnConflictBehavior::UpsertDedupByRowId
             | spicepod_acceleration::OnConflictBehavior::UpsertByArrival
             | spicepod_acceleration::OnConflictBehavior::UpsertByTime => {
@@ -558,12 +555,6 @@ pub struct Acceleration {
     pub primary_key: Option<ColumnReference>,
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
-
-    /// `on_conflict: upsert_by_time`, and the columns it is set on: the refresh keeps,
-    /// per primary key, only rows newer (by the dataset `time_column`) than the version
-    /// already kept, and the engine keeps the last of what remains. `on_conflict` itself
-    /// records `upsert_by_arrival`.
-    pub upsert_by_time: Option<ColumnReference>,
 
     pub maintained_aggregates: spicepod_acceleration::MaintainedAggregates,
 
@@ -939,6 +930,22 @@ impl Acceleration {
         }
     }
 
+    /// Whether a refresh keeps the newest version of each key by the dataset's
+    /// `time_column` rather than the last to arrive: a Cayenne acceleration with a
+    /// time column, refreshed `full` or `append` (#14576). A change stream applies
+    /// changes in order. The refresh still keeps the last arrival when its table has
+    /// no primary key, its key holds the time column, or the rows it reads lack it.
+    #[must_use]
+    pub fn orders_versions_by_time(
+        &self,
+        time_column: Option<&str>,
+        refresh_mode: RefreshMode,
+    ) -> bool {
+        self.engine == Engine::Cayenne
+            && time_column.is_some()
+            && matches!(refresh_mode, RefreshMode::Full | RefreshMode::Append)
+    }
+
     /// Returns the `UpsertOptions` if the `on_conflict` behavior is `Upsert`.
     /// Returns `UpsertOptions::default()` if no `on_conflict` is set.
     #[must_use]
@@ -999,13 +1006,11 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             .copied()
             .find(|behavior| behavior.requires_cayenne());
         let mut on_conflict = HashMap::new();
-        let mut upsert_by_time = None;
         for (k, v) in acceleration.on_conflict {
-            let columns = try_parse_column_reference(k.as_str())?;
-            if v == spicepod_acceleration::OnConflictBehavior::UpsertByTime {
-                upsert_by_time = Some(columns.clone());
-            }
-            on_conflict.insert(columns, OnConflictBehavior::from(v));
+            on_conflict.insert(
+                try_parse_column_reference(k.as_str())?,
+                OnConflictBehavior::from(v),
+            );
         }
 
         let mut params = acceleration.params.clone();
@@ -1125,7 +1130,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             indexes,
             primary_key,
             on_conflict,
-            upsert_by_time,
             maintained_aggregates: acceleration.maintained_aggregates,
             write_mode: acceleration.write_mode,
             storage_profile: StorageProfile::from(acceleration.storage_profile),
@@ -1173,7 +1177,6 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
-            upsert_by_time: None,
             maintained_aggregates: spicepod_acceleration::MaintainedAggregates::default(),
             write_mode: spicepod_acceleration::WriteMode::default(),
             storage_profile: StorageProfile::default(),
@@ -1452,11 +1455,6 @@ mod tests {
             assert_eq!(
                 parsed.upsert_options(),
                 UpsertOptions::default().with_last_write_wins(true)
-            );
-            assert_eq!(
-                parsed.upsert_by_time.is_some(),
-                behavior == B::UpsertByTime,
-                "{behavior:?}"
             );
             for engine in ["arrow", "duckdb", "sqlite"] {
                 let error = Acceleration::try_from(acceleration(engine))

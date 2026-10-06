@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `on_conflict: upsert_by_time` keeps, per primary key, the row with the
-//! greatest `time_column`, whatever order the source returns a key's versions in.
+//! A Cayenne acceleration with a primary key and a `time_column` keeps, per key,
+//! the row with the greatest `time_column`, whatever order the source returns a
+//! key's versions in, and the later arrival of rows with the same time (#14576).
 //!
 //! Cayenne is run in memory and file mode:
 //!
@@ -25,7 +26,7 @@ limitations under the License.
 //!   that the files span several record batches;
 //! - an append refresh, where a late row older than the stored version (inside
 //!   `refresh_append_overlap`) must not replace it, and a newer row must;
-//! - a NULL `time_column`, which fails the refresh rather than guessing;
+//! - a NULL `time_column`, which is older than any time;
 //! - a `localpod` child of a file-mode Cayenne parent, which must keep the same
 //!   versions as its parent.
 #![expect(clippy::expect_used)]
@@ -39,7 +40,7 @@ use std::time::Duration;
 use app::AppBuilder;
 use arrow::array::AsArray;
 use runtime::Runtime;
-use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 
@@ -105,12 +106,11 @@ async fn load(
         refresh_append_overlap: Some("7d".to_string()),
         params: (!params.is_empty()).then(|| Params::from_string_map(params)),
         primary_key: Some("id".to_string()),
-        on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::UpsertByTime)]),
         ..Acceleration::default()
     });
 
     configure_test_datafusion();
-    let app = AppBuilder::new(format!("upsert_by_time_{label}"))
+    let app = AppBuilder::new(format!("newest_by_time_{label}"))
         .with_dataset(dataset)
         .build();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -185,8 +185,8 @@ async fn full_refresh_keeps_the_newest_version_of_each_key() {
                 assert_eq!(values_of(&rt, 2).await, ["id2-newest"], "{label}: key 2");
                 assert_eq!(values_of(&rt, 3).await, ["id3-only"], "{label}: key 3");
                 assert_eq!(values_of(&rt, 4).await, ["id4-newest"], "{label}: key 4");
-                // Equal times keep exactly one of the tied rows; which one depends on
-                // the order the files are read in.
+                // Equal times keep the tied row that arrived last, which depends on
+                // the order the files are read in; either way, one row.
                 assert_eq!(values_of(&rt, 5).await.len(), 1, "{label}: key 5");
                 assert_eq!(rows(&rt).await, 5 + FILLER_KEYS, "{label}: one row per key");
             }
@@ -266,7 +266,7 @@ async fn append_refresh_keeps_a_stored_newer_version_and_takes_a_newer_one() {
 }
 
 #[tokio::test]
-async fn a_null_time_column_fails_the_refresh() {
+async fn a_null_time_column_is_the_oldest_version() {
     test_request_context()
         .scope(async {
             for mode in modes() {
@@ -276,10 +276,16 @@ async fn a_null_time_column_fails_the_refresh() {
                 write(
                     source.path(),
                     "a.csv",
-                    &csv(&[(1, "", "null-time"), (2, "2026-01-03T00:00:00", "has-time")]),
+                    &csv(&[
+                        (1, "", "only-null"),
+                        (2, "2026-01-03T00:00:00", "timed"),
+                        (2, "", "null"),
+                        (3, "", "null"),
+                        (3, "2026-01-01T00:00:00", "timed"),
+                    ]),
                 );
 
-                let (_rt, ready) = load(
+                let (rt, ready) = load(
                     source.path(),
                     accel.path(),
                     &mode,
@@ -287,10 +293,11 @@ async fn a_null_time_column_fails_the_refresh() {
                     &label,
                 )
                 .await;
-                assert!(
-                    !ready,
-                    "{label}: a refresh with a NULL time_column must fail, not load"
-                );
+                assert!(ready, "{label}: a NULL time_column loads");
+                assert_eq!(values_of(&rt, 1).await, ["only-null"], "{label}: key 1");
+                assert_eq!(values_of(&rt, 2).await, ["timed"], "{label}: key 2");
+                assert_eq!(values_of(&rt, 3).await, ["timed"], "{label}: key 3");
+                assert_eq!(rows(&rt).await, 3, "{label}: one row per key");
             }
         })
         .await;
@@ -328,7 +335,7 @@ async fn refresh_and_wait(rt: &Arc<Runtime>, table: &str) {
 /// A `localpod` child writes the rows its parent's refresh writes, so a parent that
 /// resolves versions as it writes them (unpartitioned file-mode Cayenne) must resolve
 /// them before the child sees them: the child keeps the newest version, and a NULL
-/// `time_column` applies to neither.
+/// `time_column` loses to a timed one in both.
 #[tokio::test]
 async fn a_synchronized_child_keeps_the_same_versions_as_its_parent() {
     test_request_context()
@@ -365,7 +372,6 @@ async fn a_synchronized_child_keeps_the_same_versions_as_its_parent() {
                     .into(),
                 )),
                 primary_key: Some("id".to_string()),
-                on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::UpsertByTime)]),
                 ..Acceleration::default()
             });
             let mut child = Dataset::new(format!("localpod:{TABLE}"), "events_child");
@@ -376,7 +382,7 @@ async fn a_synchronized_child_keeps_the_same_versions_as_its_parent() {
             });
 
             configure_test_datafusion();
-            let app = AppBuilder::new("upsert_by_time_synchronized_child")
+            let app = AppBuilder::new("newest_by_time_synchronized_child")
                 .with_dataset(parent)
                 .with_dataset(child)
                 .build();
@@ -409,31 +415,18 @@ async fn a_synchronized_child_keeps_the_same_versions_as_its_parent() {
                 assert_eq!(values_in(&rt, table, 2).await, ["two"], "{table}: key 2");
             }
 
-            write(source.path(), "a.csv", &csv(&[(1, "", "null-time")]));
-            std::fs::remove_file(source.path().join("b.csv")).expect("remove b.csv");
-            // A refresh that is not applied records no completion; its error status is
-            // the signal that it finished.
-            trigger_refresh(&rt, TABLE).await.expect("trigger refresh");
-            let table = datafusion::common::TableReference::bare(TABLE);
-            let failed = wait_until_true(Duration::from_mins(1), || {
-                let status = rt.status().get_dataset_status(&table);
-                async move {
-                    status
-                        .and_then(|status| status.error_message().map(ToString::to_string))
-                        .is_some_and(|message| message.contains("is NULL"))
-                }
-            })
-            .await;
-            assert!(
-                failed,
-                "the NULL time_column refresh should fail, but the status is {:?}",
-                rt.status().get_dataset_status(&table)
+            write(
+                source.path(),
+                "a.csv",
+                &csv(&[(1, "2026-01-01T00:00:00", "timed"), (1, "", "null-time")]),
             );
+            std::fs::remove_file(source.path().join("b.csv")).expect("remove b.csv");
+            refresh_and_wait(&rt, TABLE).await;
             for table in [TABLE, "events_child"] {
                 assert_eq!(
                     values_in(&rt, table, 1).await,
-                    ["newer"],
-                    "{table}: a refresh with a NULL time_column is not applied"
+                    ["timed"],
+                    "{table}: a NULL time_column loses to a timed one"
                 );
             }
         })

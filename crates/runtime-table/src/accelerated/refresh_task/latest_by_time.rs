@@ -14,19 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `on_conflict: upsert_by_time`: keep, per primary key, only rows newer than
-//! the version of that key already kept.
+//! Keep, per primary key, the newest version by the dataset's `time_column`
+//! (#14576): pass on only rows at least as new as the version of their key already
+//! kept.
 //!
 //! A refresh streams its rows through a [`LatestByTime`] selector that holds one entry per
 //! key — a 128-bit key identity, and the greatest `time_column` kept so far with a 64-bit
 //! hash of that row's contents — never the rest of the row. A row is passed to the write
-//! only if it beats that entry: a greater time, or an equal time and a greater content
-//! hash, so ties pick the same row whatever the read order. A row with the same time and
-//! content is a re-read and writes nothing. Every row not written is counted in
+//! if it beats that entry: a greater time, or an equal time and different contents, the
+//! later arrival winning the tie. A NULL time is older than any time. A row with the same
+//! time and contents is a re-read: it writes nothing, and is counted as superseded by
+//! arrival. Every row not written is counted in
 //! `dataset_acceleration_refresh_rows_superseded`. On append, the selector is first seeded
 //! with the rows the acceleration already stores from the append window start, so a late
 //! row never replaces a newer stored version. Within a refresh, the rows passed for a key
-//! arrive in increasing `(time, hash)` order, so the last one written for a key wins.
+//! arrive in non-decreasing time order, so the last one written for a key wins.
 
 use std::collections::VecDeque;
 
@@ -54,9 +56,8 @@ type Spill = Arc<dyn SpillFile>;
 
 /// The local path of `file`, which this mode reads back directly.
 fn spill_path(file: &Spill) -> Result<&std::path::Path, DataFusionError> {
-    file.path().ok_or_else(|| {
-        spill_failed(&"the configured spill storage has no local file to read back")
-    })
+    file.path()
+        .ok_or_else(|| spill_failed(&"the configured spill storage has no local file to read back"))
 }
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -68,7 +69,7 @@ use runtime_component::dataset::TimeFormat;
 use runtime_metrics::acceleration as metrics;
 use twox_hash::XxHash3_128;
 
-const DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time";
+const DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/constraints";
 
 /// A refresh this mode refused to apply, worded as the cause the refresh log line shows
 /// after `Failed to refresh dataset <name> (<connector>):`. It crosses the write as a
@@ -122,17 +123,17 @@ fn time_format_name(time_format: Option<TimeFormat>) -> &'static str {
 /// Rows superseded under each version reason.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Counts {
+    /// A version with a later time was kept.
     older: u64,
-    equal_time: u64,
-    unchanged: u64,
+    /// A version with the same time arrived later.
+    arrival: u64,
 }
 
 impl Counts {
     #[cfg(test)]
     fn add(&mut self, other: &Self) {
         self.older += other.older;
-        self.equal_time += other.equal_time;
-        self.unchanged += other.unchanged;
+        self.arrival += other.arrival;
     }
 }
 
@@ -149,10 +150,9 @@ impl Superseded {
     /// Count `version`, which lost to `winner`.
     fn count(&mut self, version: Kept, winner: Kept) {
         use util::session_state::SupersededReason;
-        match SupersededReason::of_version(version.order(), winner.order()) {
+        match SupersededReason::of_version(version.time, winner.time) {
             SupersededReason::Older => self.counts.older += 1,
-            SupersededReason::EqualTime => self.counts.equal_time += 1,
-            SupersededReason::Unchanged | SupersededReason::Arrival => self.counts.unchanged += 1,
+            SupersededReason::Arrival => self.counts.arrival += 1,
         }
     }
 }
@@ -160,28 +160,30 @@ impl Superseded {
 /// The version of a key kept so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Kept {
-    /// The greatest `time_column` kept, in UTC nanoseconds.
+    /// The greatest `time_column` kept, in UTC nanoseconds; a NULL time is
+    /// [`i64::MIN`].
     time: i64,
-    /// A hash of the kept row's contents: it settles equal times, and an equal hash means
-    /// the same row read again. Content hashes have their lowest bit clear; it is set
-    /// when this refresh received the row, rather than finding it stored.
+    /// A hash of the kept row's contents: an equal time and hash mean the same row
+    /// read again. Content hashes have their lowest bit clear; it is set when this
+    /// refresh received the row, rather than finding it stored.
     hash: u64,
 }
 
 impl Kept {
-    /// What versions are ordered by: the time, then the content hash.
-    fn order(self) -> (i64, u64) {
-        (self.time, self.hash & !1)
-    }
-
     /// Whether this refresh received the row (and so wrote it).
     fn received(self) -> bool {
         self.hash & 1 == 1
     }
 
-    /// Whether this version replaces `other`.
+    /// Whether this version and `other` are the same row: the same time and contents.
+    fn same_row(self, other: Self) -> bool {
+        self.time == other.time && self.hash & !1 == other.hash & !1
+    }
+
+    /// Whether this version, arriving after `other`, replaces it: a later time, or the
+    /// same time and different contents.
     fn beats(self, other: Self) -> bool {
-        self.order() > other.order()
+        self.time > other.time || (self.time == other.time && !self.same_row(other))
     }
 
     /// This version, marked as received by this refresh.
@@ -308,7 +310,7 @@ impl LatestByTime {
     #[must_use]
     pub(crate) fn with_runtime_env(mut self, runtime_env: Arc<RuntimeEnv>) -> Self {
         self.reservation = Some(
-            MemoryConsumer::new(format!("UpsertByTimeKeys[{}]", self.dataset))
+            MemoryConsumer::new(format!("NewestByTimeKeys[{}]", self.dataset))
                 .register(&runtime_env.memory_pool),
         );
         self.disk = Some(Arc::clone(&runtime_env.disk_manager));
@@ -346,10 +348,7 @@ impl LatestByTime {
         Ok(())
     }
 
-    async fn write_run(
-        &self,
-        entries: Vec<(u128, Kept)>,
-    ) -> Result<Spill, DataFusionError> {
+    async fn write_run(&self, entries: Vec<(u128, Kept)>) -> Result<Spill, DataFusionError> {
         let disk = self.spill_disk()?;
         tokio::task::spawn_blocking(move || write_run(&disk, entries))
             .await
@@ -364,8 +363,8 @@ impl LatestByTime {
             .ok_or_else(|| spill_failed(&"no spill directory is configured"))
     }
 
-    /// Record the keys and times already stored. Rows with a NULL stored time are
-    /// skipped: any incoming version replaces them.
+    /// Record the keys and times already stored. A NULL stored time is the oldest:
+    /// any incoming version replaces it.
     ///
     /// # Errors
     ///
@@ -398,11 +397,12 @@ impl LatestByTime {
         let times = time_nanos(&column, self.reader.time_format)?;
         let hashes = self.reader.content_hashes(stored)?;
         for (row, key) in keys.into_iter().enumerate() {
-            if times.is_null(row) {
-                continue;
-            }
             let version = Kept {
-                time: times.value(row),
+                time: if times.is_null(row) {
+                    i64::MIN
+                } else {
+                    times.value(row)
+                },
                 hash: hashes[row],
             };
             match latest.entry(key) {
@@ -419,14 +419,14 @@ impl LatestByTime {
         Ok(())
     }
 
-    /// Keep the rows of `batch` that are newer than the version of their key kept so far,
-    /// and record them as kept. Within the batch only the last kept row of each key is
+    /// Keep the rows of `batch` that beat the version of their key kept so far, and
+    /// record them as kept. Within the batch only the last kept row of each key is
     /// passed on, so a write never holds two versions of a key from one batch.
     ///
     /// # Errors
     ///
-    /// Returns a [`RefreshNotApplied`] error if a time is NULL or cannot be read: the
-    /// refresh then writes nothing, rather than choosing a version without one.
+    /// Returns a [`RefreshNotApplied`] error if a time cannot be read: the refresh then
+    /// writes nothing, rather than choosing a version without one.
     pub(crate) async fn select(
         &mut self,
         batch: &RecordBatch,
@@ -737,19 +737,12 @@ impl VersionReader {
             })
     }
 
-    /// The time column as UTC nanoseconds, interpreted per `time_format`. Values without
-    /// a zone are read as UTC; strings are parsed, so offsets compare by instant.
+    /// The time column as UTC nanoseconds, interpreted per `time_format`, a NULL time as
+    /// [`i64::MIN`], older than any time. Values without a zone are read as UTC; strings
+    /// are parsed, so offsets compare by instant.
     fn times(&self, batch: &RecordBatch) -> Result<Int64Array, DataFusionError> {
         let column = self.time_column_of(batch)?;
-        let nulls = column.null_count();
-        if nulls > 0 {
-            return Err(not_applied(&format!(
-                "'time_column' '{time_column}' is NULL in {nulls} {rows}, so this refresh was not applied and the previous data is still served. Fill '{time_column}' at the source, or exclude those rows with 'acceleration.refresh_sql'.",
-                time_column = self.time_column,
-                rows = plural(nulls, "row", "rows"),
-            )));
-        }
-        time_nanos(&column, self.time_format).map_err(|_| {
+        let times = time_nanos(&column, self.time_format).map_err(|_| {
             let unreadable = unreadable_times(&column, self.time_format);
             not_applied(&format!(
                 "'time_column' '{}' has {unreadable} {} that cannot be read as '{}', so this refresh was not applied and the previous data is still served. Correct the source values or set 'time_format' to match them.",
@@ -757,14 +750,21 @@ impl VersionReader {
                 plural(unreadable, "value", "values"),
                 time_format_name(self.time_format),
             ))
+        })?;
+        Ok(if times.null_count() == 0 {
+            times
+        } else {
+            times
+                .iter()
+                .map(|time| Some(time.unwrap_or(i64::MIN)))
+                .collect()
         })
     }
 }
 
 impl util::session_state::RowVersions for VersionReader {
-    fn versions(&self, batch: &RecordBatch) -> Result<(Int64Array, UInt64Array), DataFusionError> {
-        let times = self.times(batch)?;
-        Ok((times, UInt64Array::from(self.content_hashes(batch)?)))
+    fn versions(&self, batch: &RecordBatch) -> Result<Int64Array, DataFusionError> {
+        self.times(batch)
     }
 }
 
@@ -777,8 +777,7 @@ fn record_selection(
 ) {
     use util::session_state::SupersededReason;
     rows.add(SupersededReason::Older, superseded.counts.older);
-    rows.add(SupersededReason::EqualTime, superseded.counts.equal_time);
-    rows.add(SupersededReason::Unchanged, superseded.counts.unchanged);
+    rows.add(SupersededReason::Arrival, superseded.counts.arrival);
     // Rows passed on are counted as the write receives them; the rest only here.
     if superseded.not_written > 0 {
         metrics::REFRESH_ROWS_WRITTEN.add(superseded.not_written, labels.dataset());
@@ -794,7 +793,7 @@ fn map_bytes(entries: usize) -> usize {
 
 fn spill_failed(cause: &dyn fmt::Display) -> DataFusionError {
     not_applied(&format!(
-        "'acceleration.on_conflict: upsert_by_time' could not spill its key versions to 'runtime.query.temp_directory', so this refresh was not applied and the previous data is still served. Free space there, or raise 'runtime.query.memory_limit'. Cause: {cause}."
+        "keeping the newest version of each key by 'time_column' could not spill to 'runtime.query.temp_directory', so this refresh was not applied and the previous data is still served. Free space there, or raise 'runtime.query.memory_limit'. Cause: {cause}."
     ))
 }
 
@@ -814,7 +813,7 @@ fn write_run(
 ) -> Result<Spill, DataFusionError> {
     use std::io::Write as _;
     entries.sort_unstable_by_key(|(key, _)| *key);
-    let file = disk.create_tmp_file("upsert_by_time key spill")?;
+    let file = disk.create_tmp_file("newest-by-time key spill")?;
     {
         let mut out = std::io::BufWriter::new(file.open_writer()?);
         for (key, kept) in &entries {
@@ -870,10 +869,7 @@ impl RunReader {
 }
 
 /// Merge `runs` into one run holding each key's newest version, or `None` without runs.
-fn merge_runs(
-    disk: &Arc<DiskManager>,
-    runs: &[Spill],
-) -> Result<Option<Spill>, DataFusionError> {
+fn merge_runs(disk: &Arc<DiskManager>, runs: &[Spill]) -> Result<Option<Spill>, DataFusionError> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     use std::io::Write as _;
@@ -890,7 +886,7 @@ fn merge_runs(
             heap.push(Reverse((key, source, kept.time, kept.hash)));
         }
     }
-    let file = disk.create_tmp_file("upsert_by_time merged key spill")?;
+    let file = disk.create_tmp_file("newest-by-time merged key spill")?;
     {
         let mut out = std::io::BufWriter::new(file.open_writer()?);
         let mut current: Option<(u128, Kept)> = None;
@@ -901,9 +897,9 @@ fn merge_runs(
             let entry = Kept { time, hash };
             current = match current {
                 Some((current_key, kept)) if current_key == key => {
-                    // The later version; on an equal one, the copy this refresh received.
-                    let later =
-                        entry.beats(kept) || (entry.order() == kept.order() && entry.received());
+                    // The later run's version, unless it is the same row; then the copy
+                    // this refresh received.
+                    let later = entry.beats(kept) || (entry.same_row(kept) && entry.received());
                     Some((key, if later { entry } else { kept }))
                 }
                 Some((current_key, kept)) => {
@@ -992,11 +988,11 @@ fn key_half(key: u128) -> u64 {
     u64::try_from(key & u128::from(u64::MAX)).unwrap_or_default()
 }
 
-const KEY_HI: &str = "__spice_upsert_by_time_key_hi";
-const KEY_LO: &str = "__spice_upsert_by_time_key_lo";
-const TIME: &str = "__spice_upsert_by_time_time";
-const SEQ: &str = "__spice_upsert_by_time_seq";
-const HASH: &str = "__spice_upsert_by_time_hash";
+const KEY_HI: &str = "__spice_newest_by_time_key_hi";
+const KEY_LO: &str = "__spice_newest_by_time_key_lo";
+const TIME: &str = "__spice_newest_by_time_time";
+const SEQ: &str = "__spice_newest_by_time_seq";
+const HASH: &str = "__spice_newest_by_time_hash";
 /// The helper columns deferral appends after a row's own columns.
 const HELPERS: usize = 5;
 
@@ -1026,7 +1022,7 @@ impl DeferredRows {
         ]);
         let schema = Arc::new(Schema::new(fields));
         let file = disk
-            .create_tmp_file("upsert_by_time deferred rows")
+            .create_tmp_file("newest-by-time deferred rows")
             .map_err(|e| spill_failed(&e))?;
         let writer = arrow::ipc::writer::FileWriter::try_new(
             file.open_writer().map_err(|e| spill_failed(&e))?,
@@ -1064,11 +1060,10 @@ impl DeferredRows {
             Arc::new(UInt64Array::from(hashes)) as ArrayRef,
         ]);
         let tagged = RecordBatch::try_new(Arc::clone(&self.schema), columns)?;
-        let mut writer = self
-            .writer
-            .get_mut()
-            .take()
-            .ok_or_else(|| DataFusionError::Internal("deferred rows already finished".into()))?;
+        let mut writer =
+            self.writer.get_mut().take().ok_or_else(|| {
+                DataFusionError::Internal("deferred rows already finished".into())
+            })?;
         let writer = tokio::task::spawn_blocking(move || writer.write(&tagged).map(|()| writer))
             .await
             .map_err(|e| spill_failed(&e))?
@@ -1369,6 +1364,36 @@ pub(crate) fn select_latest(
     .superseded_counted_before_write(superseded)
 }
 
+/// [`select_latest`], seeding `selector` with the stored rows `stored` reads first.
+/// `stored` is read when the write first pulls a row, so it sees every write
+/// published before this one took the accelerator write lock.
+pub(crate) fn select_latest_after_seeding(
+    mut selector: LatestByTime,
+    stored: datafusion::dataframe::DataFrame,
+    update: StreamingDataUpdate,
+) -> StreamingDataUpdate {
+    let schema = update.data.schema();
+    let update_type = update.update_type;
+    let superseded = Arc::clone(&selector.superseded);
+    let input = update.data;
+    let input_type = update_type.clone();
+    let stream = futures::stream::once(async move {
+        let mut stored = stored.execute_stream().await?;
+        while let Some(batch) = stored.try_next().await? {
+            selector.seed(&batch).await?;
+        }
+        Ok::<_, DataFusionError>(
+            select_latest(selector, StreamingDataUpdate::new(input, input_type)).data,
+        )
+    })
+    .try_flatten();
+    StreamingDataUpdate::new(
+        Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
+        update_type,
+    )
+    .superseded_counted_before_write(superseded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1433,7 +1458,7 @@ mod tests {
             .await
             .expect("selects");
         assert_eq!(values(&first), ["a10", "b5"]);
-        // Older and equal versions are dropped; the newer one passes.
+        // An older version and an identical re-read are dropped; the newer one passes.
         let second = s
             .select(&batch(&[
                 (1, Some(8), "a8"),
@@ -1460,7 +1485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_seeded_stored_version_blocks_older_and_equal_rows() {
+    async fn a_seeded_stored_version_blocks_older_rows_and_re_reads() {
         let mut s = selector();
         s.seed(&batch(&[(1, Some(10), "stored")]))
             .await
@@ -1481,22 +1506,80 @@ mod tests {
         assert_eq!(values(&newer), ["newer"]);
     }
 
+    /// The stored versions are read when the write first pulls a row, which it does
+    /// holding the accelerator write lock, so a write published after the refresh
+    /// was planned but before it wrote is seen: its newer version is kept.
     #[tokio::test]
-    async fn a_null_time_fails_the_refresh_and_reports_a_count() {
-        let mut s = selector();
-        let err = s
-            .select(&batch(&[(1, None, "x"), (2, None, "y"), (3, Some(1), "z")]))
+    async fn the_stored_versions_are_read_when_the_write_pulls_rows() {
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let stored = Arc::new(
+            MemTable::try_new(schema(), vec![vec![batch(&[(1, Some(10), "stored")])]])
+                .expect("a table"),
+        );
+        ctx.register_table("stored", Arc::clone(&stored) as _)
+            .expect("registers");
+        let incoming: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema(),
+            futures::stream::iter([Ok(batch(&[(1, Some(15), "incoming")]))]),
+        ));
+        let selected = select_latest_after_seeding(
+            selector(),
+            ctx.table("stored").await.expect("a frame"),
+            StreamingDataUpdate::new(
+                incoming,
+                runtime_acceleration::dataupdate::UpdateType::Append,
+            ),
+        );
+        // A write lands between planning the refresh and its write.
+        ctx.read_batch(batch(&[(1, Some(20), "newer")]))
+            .expect("a frame")
+            .write_table(
+                "stored",
+                datafusion::dataframe::DataFrameWriteOptions::new(),
+            )
             .await
-            .expect_err("NULL time fails");
-        let message = not_applied_message(&err).expect("a refresh-not-applied error");
+            .expect("inserts");
+        let written: Vec<RecordBatch> = selected.data.try_collect().await.expect("selects");
         assert_eq!(
-            message,
-            "'time_column' 'occurred_at' is NULL in 2 rows, so this refresh was not applied and the previous data is still served. Fill 'occurred_at' at the source, or exclude those rows with 'acceleration.refresh_sql'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
+            written.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            0,
+            "the incoming version is older than the newer stored one"
         );
-        assert!(
-            !message.contains("id="),
-            "no key values in the message: {message}"
-        );
+    }
+
+    /// A row with the stored version's time but different contents is a correction:
+    /// it arrived later, so it replaces the stored row.
+    #[tokio::test]
+    async fn an_equal_time_different_row_replaces_the_stored_one() {
+        let mut s = selector();
+        s.seed(&batch(&[(1, Some(10), "stored")]))
+            .await
+            .expect("seeds");
+        let out = s
+            .select(&batch(&[(1, Some(10), "corrected")]))
+            .await
+            .expect("selects");
+        assert_eq!(values(&out), ["corrected"]);
+    }
+
+    /// A NULL time is older than any time: it loads when nothing else is kept, never
+    /// replaces a timed version, and is replaced by one.
+    #[tokio::test]
+    async fn a_null_time_is_older_than_any_time() {
+        let mut s = selector();
+        let first = s
+            .select(&batch(&[(1, None, "null"), (2, Some(1), "timed")]))
+            .await
+            .expect("selects");
+        assert_eq!(values(&first), ["null", "timed"]);
+        let second = s
+            .select(&batch(&[(1, Some(0), "earliest"), (2, None, "null")]))
+            .await
+            .expect("selects");
+        assert_eq!(values(&second), ["earliest"]);
     }
 
     #[test]
@@ -1530,16 +1613,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_single_null_time_is_one_row() {
-        let err = selector()
-            .select(&batch(&[(1, None, "x")]))
-            .await
-            .expect_err("NULL time fails");
-        let message = not_applied_message(&err).expect("a refresh-not-applied error");
-        assert!(message.contains("is NULL in 1 row,"), "{message}");
-    }
-
-    #[tokio::test]
     async fn unreadable_times_report_a_count_and_the_format_but_no_value() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -1569,7 +1642,7 @@ mod tests {
         let message = not_applied_message(&err).expect("a refresh-not-applied error");
         assert_eq!(
             message,
-            "'time_column' 'occurred_at' has 2 values that cannot be read as 'ISO8601', so this refresh was not applied and the previous data is still served. Correct the source values or set 'time_format' to match them. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
+            "'time_column' 'occurred_at' has 2 values that cannot be read as 'ISO8601', so this refresh was not applied and the previous data is still served. Correct the source values or set 'time_format' to match them. See: https://spiceai.org/docs/features/data-acceleration/constraints"
         );
         assert!(!message.contains("not-a-time"), "{message}");
     }
@@ -1588,7 +1661,7 @@ mod tests {
         assert_eq!(
             not_applied_message(&missing_time).as_deref(),
             Some(
-                "'time_column' 'updated_at' is not in the rows the refresh reads, so versions of a key cannot be ordered. Include it in 'acceleration.refresh_sql'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
+                "'time_column' 'updated_at' is not in the rows the refresh reads, so versions of a key cannot be ordered. Include it in 'acceleration.refresh_sql'. See: https://spiceai.org/docs/features/data-acceleration/constraints"
             )
         );
         let missing_key = LatestByTime::try_new(
@@ -1603,7 +1676,7 @@ mod tests {
         assert_eq!(
             not_applied_message(&missing_key).as_deref(),
             Some(
-                "primary key column 'tenant_id' is not in the rows the refresh reads, so versions of a key cannot be matched. Include it in 'acceleration.refresh_sql', or remove it from 'acceleration.primary_key'. See: https://spiceai.org/docs/features/data-acceleration/constraints#upsert_by_time"
+                "primary key column 'tenant_id' is not in the rows the refresh reads, so versions of a key cannot be matched. Include it in 'acceleration.refresh_sql', or remove it from 'acceleration.primary_key'. See: https://spiceai.org/docs/features/data-acceleration/constraints"
             )
         );
     }
@@ -1627,8 +1700,7 @@ mod tests {
             Superseded {
                 counts: Counts {
                     older: 1,
-                    unchanged: 1,
-                    ..Default::default()
+                    arrival: 1,
                 },
                 not_written: 2,
             }
@@ -1655,11 +1727,11 @@ mod tests {
         (last, total)
     }
 
-    /// Two different rows with one time: the same one wins whatever order they are read
-    /// in, within a batch, across batches, or against the stored copy, and the loser
-    /// counts as `equal_time`.
+    /// Two different rows with one time: the one that arrives later wins, within a
+    /// batch, across batches, or against the stored copy, and the other counts as
+    /// superseded by arrival.
     #[test]
-    fn a_tie_keeps_the_same_row_whatever_the_read_order() {
+    fn a_tie_keeps_the_later_arrival() {
         let a = || batch(&[(1, Some(10), "a")]);
         let b = || batch(&[(1, Some(10), "b")]);
         let (across_ab, sup_ab) = last_written(None, &[a(), b()]);
@@ -1670,16 +1742,15 @@ mod tests {
             last_written(None, &[batch(&[(1, Some(10), "b"), (1, Some(10), "a")])]);
         let (stored_a, _) = last_written(Some(&a()), &[b()]);
         let (stored_b, _) = last_written(Some(&b()), &[a()]);
-        let winner = across_ab;
-        assert!(winner == "a" || winner == "b");
-        for got in [&across_ba, &within_ab, &within_ba, &stored_a, &stored_b] {
-            assert_eq!(got, &winner);
-        }
-        // Either order supersedes the loser once: not passed on, or passed on and then
-        // replaced by the winner.
-        assert_eq!(sup_ab.counts.equal_time, 1);
-        assert_eq!(sup_ba.counts.equal_time, 1);
-        assert_eq!(sup_ab.counts.unchanged + sup_ba.counts.unchanged, 0);
+        assert_eq!(
+            [
+                across_ab, across_ba, within_ab, within_ba, stored_a, stored_b
+            ],
+            ["b", "a", "b", "a", "b", "a"].map(String::from)
+        );
+        assert_eq!(sup_ab.counts.arrival, 1);
+        assert_eq!(sup_ba.counts.arrival, 1);
+        assert_eq!(sup_ab.counts.older + sup_ba.counts.older, 0);
     }
 
     #[test]
@@ -1854,7 +1925,7 @@ mod tests {
             .expect_err("nothing fits");
         let message = not_applied_message(&err).expect("a refresh-not-applied error");
         assert!(
-            message.starts_with("'acceleration.on_conflict: upsert_by_time' could not spill its key versions to 'runtime.query.temp_directory', so this refresh was not applied and the previous data is still served. Free space there, or raise 'runtime.query.memory_limit'. Cause: "),
+            message.starts_with("keeping the newest version of each key by 'time_column' could not spill to 'runtime.query.temp_directory', so this refresh was not applied and the previous data is still served. Free space there, or raise 'runtime.query.memory_limit'. Cause: "),
             "{message}"
         );
     }

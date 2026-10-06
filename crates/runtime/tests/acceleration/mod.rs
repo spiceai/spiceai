@@ -61,6 +61,8 @@ mod localpod_sync;
 mod on_conflict;
 
 #[cfg(not(target_os = "windows"))]
+mod newest_by_time;
+#[cfg(not(target_os = "windows"))]
 mod on_conflict_cayenne;
 #[cfg(feature = "duckdb")]
 mod on_conflict_options;
@@ -83,8 +85,6 @@ mod single_instance_duckdb;
 mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
 mod snapshot_mutex;
-#[cfg(not(target_os = "windows"))]
-mod upsert_by_time;
 #[cfg(feature = "sqlite")]
 mod user_function_pushdown;
 

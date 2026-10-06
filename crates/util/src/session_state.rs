@@ -73,16 +73,14 @@ impl SupersededReason {
         }
     }
 
-    /// Why a copy with version `loser` lost to `winner`, each a `(time, content
-    /// hash)` from [`RowVersions`].
+    /// Why a copy with time `loser` lost to the copy with time `winner`, each from
+    /// [`RowVersions`]: an older time, or the same time and an earlier arrival.
     #[must_use]
-    pub fn of_version(loser: (i64, u64), winner: (i64, u64)) -> Self {
-        if loser.0 < winner.0 {
+    pub fn of_version(loser: i64, winner: i64) -> Self {
+        if loser < winner {
             Self::Older
-        } else if loser.1 == winner.1 {
-            Self::Unchanged
         } else {
-            Self::EqualTime
+            Self::Arrival
         }
     }
 }
@@ -129,23 +127,23 @@ pub fn superseded_rows(config: &SessionConfig) -> Option<Arc<SupersededRows>> {
     config.get_extension::<SupersededRows>()
 }
 
-/// Orders the copies of a key a write repeats by the version each row carries,
-/// rather than by the order they arrive in: the row with the greatest
-/// `(time, content hash)` is kept. Implemented by the writer that knows how to read
-/// a row's version (for `on_conflict: upsert_by_time`, its `time_column`); read by
-/// an accelerator that resolves repeated keys after writing them.
+/// Orders the copies of a key a write repeats by the time each row carries,
+/// rather than only by the order they arrive in: the row with the greatest time is
+/// kept, and of rows with the same time the last to arrive. Implemented by the
+/// writer that knows how to read a row's time (a refresh, from the dataset's
+/// `time_column`); read by an accelerator that resolves repeated keys after
+/// writing them.
 pub trait RowVersions: Send + Sync + std::fmt::Debug {
-    /// Each row of `batch`'s time, as UTC nanoseconds, and content hash. The hash
-    /// is 63 bits: its lowest bit is always clear. A row whose time cannot be read
-    /// fails the write.
+    /// Each row of `batch`'s time, as UTC nanoseconds. A NULL time is
+    /// [`i64::MIN`], older than any time.
     ///
     /// # Errors
     ///
-    /// Returns an error if a time is NULL or cannot be read.
+    /// Returns an error if a time cannot be read.
     fn versions(
         &self,
         batch: &arrow::array::RecordBatch,
-    ) -> datafusion::error::Result<(arrow::array::Int64Array, arrow::array::UInt64Array)>;
+    ) -> datafusion::error::Result<arrow::array::Int64Array>;
 }
 
 /// The [`RowVersions`] a write orders a key's copies by; see [`with_row_versions`].

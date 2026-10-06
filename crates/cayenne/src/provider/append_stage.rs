@@ -65,11 +65,11 @@ impl ResolveAfterWrite {
         let (order, write_schema, data): (_, _, SendableRecordBatchStream) =
             match &table.row_versions {
                 Some(versions) => {
-                    let version_names = overwrite_postpass::version_columns(&schema);
+                    let version_name = overwrite_postpass::version_column(&schema);
                     (
                         CopyOrder::Version,
-                        overwrite_postpass::with_versions(&schema, &arrival_name, &version_names),
-                        Box::pin(arrival.with_versions(Arc::clone(versions), &version_names)),
+                        overwrite_postpass::with_versions(&schema, &arrival_name, &version_name),
+                        Box::pin(arrival.with_versions(Arc::clone(versions), &version_name)),
                     )
                 }
                 None => (

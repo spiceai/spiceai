@@ -13509,8 +13509,9 @@ impl CayenneTableProvider {
         }
     }
 
-    /// [`Self::collapse_buffered_write`] for a writer that supplies row versions: each
-    /// key keeps its greatest version, and the copies not kept are counted.
+    /// [`Self::collapse_buffered_write`] for a writer that supplies row times: each
+    /// key keeps its greatest time (the later arrival on a tie), and the copies not
+    /// kept are counted.
     fn collapse_buffered_write_by_version(
         &self,
         resolver: &super::key_conflicts::KeyResolver,
@@ -13520,16 +13521,12 @@ impl CayenneTableProvider {
         let versioned = batches
             .into_iter()
             .map(|batch| {
-                // A NULL or unreadable time fails the write here, as on the streaming
-                // path. `DataFusion` errors convert back unchanged, so it keeps its type.
-                let (times, hashes) = versions
+                // An unreadable time fails the write here, as on the streaming path.
+                // `DataFusion` errors convert back unchanged, so it keeps its type.
+                let times = versions
                     .versions(&batch)
                     .map_err(|source| Error::DataFusion { source })?;
-                Ok(super::key_conflicts::VersionedBatch {
-                    batch,
-                    times,
-                    hashes,
-                })
+                Ok(super::key_conflicts::VersionedBatch { batch, times })
             })
             .collect::<Result<Vec<_>>>()?;
         let kept = resolver.resolve_by_version(versioned)?;

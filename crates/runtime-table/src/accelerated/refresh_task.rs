@@ -820,7 +820,7 @@ impl RefreshTask {
                     .get_full_or_incremental_append_update(refresh, None)
                     .await
                 {
-                    Ok(update) if refresh.upsert_by_time.is_some() => {
+                    Ok(update) if refresh.versions_by_time.is_some() => {
                         self.select_latest_by_time(refresh, update, None).await
                     }
                     other => other,
@@ -1111,7 +1111,7 @@ impl RefreshTask {
         let sink = &*sink_lock;
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
-        // Under `upsert_by_time` the refresh may have counted the rows it did not
+        // Ordering versions by time, the refresh may have counted the rows it did not
         // keep before the write; then the table counts none of its own.
         let (superseded, table_counts) = match counted_before_write {
             Some(rows) => (rows, false),
@@ -1288,9 +1288,9 @@ impl RefreshTask {
                     .get_full_or_incremental_append_update(refresh, timestamp)
                     .await
                 {
-                    // `upsert_by_time` replaces the exact-row dedupe: it is
+                    // Ordering versions by time replaces the exact-row dedupe: it is
                     // seeded with the stored keys and times from the same window start.
-                    Ok(data) if refresh.upsert_by_time.is_some() => {
+                    Ok(data) if refresh.versions_by_time.is_some() => {
                         self.select_latest_by_time(refresh, data, timestamp).await
                     }
                     // Reuse `timestamp`: the dedupe must compare against the same mark the
@@ -1314,8 +1314,9 @@ impl RefreshTask {
         }
     }
 
-    /// `on_conflict: upsert_by_time`: pass on only rows newer than the version
-    /// of their key already kept. When `window_start` is set (an append), the selector is
+    /// Keep the newest version of each key by `time_column`: pass on only rows newer
+    /// than the version of their key already kept. When `window_start` is set (an
+    /// append), the selector is
     /// first seeded with the keys and times the acceleration stores from that same window
     /// start the source fetch used: any stored row newer than an incoming row is at or after
     /// it, so nothing earlier needs reading.
@@ -1332,10 +1333,13 @@ impl RefreshTask {
                     .unwrap_or_else(|| error.to_string()),
             })
         };
-        let Some(time_column) = refresh.time_column.clone() else {
-            return Err(not_applied(&latest_by_time::not_applied(
-                "'acceleration.on_conflict: upsert_by_time' requires a 'time_column'. Set 'time_column' to the column that records when each row occurred.",
-            )));
+        // Without a time column to read, versions keep the order they arrive in.
+        let Some(time_column) = refresh
+            .time_column
+            .clone()
+            .filter(|column| update.data.schema().field_with_name(column).is_ok())
+        else {
+            return Ok(update);
         };
         let accelerator_schema = self.accelerator.schema();
         let key_columns = self
@@ -1347,14 +1351,14 @@ impl RefreshTask {
                     &accelerator_schema,
                 )
             });
-        if key_columns.is_empty() {
-            return Err(not_applied(&latest_by_time::not_applied(
-                "'acceleration.on_conflict: upsert_by_time' requires 'acceleration.primary_key'. Set it to the column(s) that identify a row.",
-            )));
+        // A table without a primary key keeps every row, and one whose key holds the
+        // time column gives every version a key of its own.
+        if key_columns.is_empty() || key_columns.contains(&time_column) {
+            return Ok(update);
         }
         // A synchronized child writes the same rows but cannot read their versions, so
         // a dataset with one resolves them here, before the rows reach either table.
-        let dedup = refresh.upsert_by_time.unwrap_or_default();
+        let dedup = refresh.versions_by_time.unwrap_or_default();
         // The accelerator orders a key's copies by version only against the copies one
         // write holds: a write that replaces the table, or an append it loads into an
         // empty table (which it confirms itself, refusing the append otherwise). An
@@ -1373,7 +1377,7 @@ impl RefreshTask {
             }
         {
             // The accelerator reads each row's version once as it writes it, fails
-            // the write on a NULL or unreadable time, and keeps each key's greatest
+            // the write on an unreadable time, and keeps each key's greatest
             // version, so the rows go to it untouched.
             let row_versions = latest_by_time::row_versions(
                 &dataset,
@@ -1409,7 +1413,8 @@ impl RefreshTask {
                 self.io_runtime.clone(),
             )
             .await;
-            // Every incoming column: a stored row's content hash settles ties with it.
+            // Every incoming column: a stored row's content hash tells a re-read of
+            // it from a correction with the same time.
             let incoming = update.data.schema();
             let columns: Vec<&str> = incoming
                 .fields()
@@ -1435,32 +1440,20 @@ impl RefreshTask {
             } else {
                 Some(value)
             };
-            let mut stored = accelerator_df(&Arc::clone(&self.accelerator), &ctx)
+            // Read when the write first pulls rows, which it does holding the
+            // accelerator write lock, so no write lands between the read and the
+            // write it decides.
+            let stored = accelerator_df(&Arc::clone(&self.accelerator), &ctx)
                 .and_then(|df| match start {
                     Some(start) => df.filter(filter_converter.convert_high_water_mark(start)),
                     None => Ok(df),
                 })
                 .and_then(|df| df.select_columns(&columns))
                 .map_err(find_datafusion_root)
-                .context(super::UnableToScanTableProviderSnafu)?
-                .execute_stream()
-                .await
-                .map_err(find_datafusion_root)
                 .context(super::UnableToScanTableProviderSnafu)?;
-            while let Some(batch) = stored.next().await {
-                let batch = batch
-                    .map_err(find_datafusion_root)
-                    .context(super::UnableToScanTableProviderSnafu)?;
-                selector.seed(&batch).await.map_err(|e| {
-                    if latest_by_time::not_applied_message(&e).is_some() {
-                        not_applied(&e)
-                    } else {
-                        RetryError::permanent(super::Error::UnableToScanTableProvider {
-                            source: find_datafusion_root(e),
-                        })
-                    }
-                })?;
-            }
+            return Ok(latest_by_time::select_latest_after_seeding(
+                selector, stored, update,
+            ));
         }
 
         Ok(latest_by_time::select_latest(selector, update))
@@ -3305,8 +3298,8 @@ fn dedup_predicates(
 }
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
-    // A refresh the dataset's configuration refused (e.g. a NULL `time_column` under
-    // `upsert_by_time`) carries its own complete cause.
+    // A refresh the dataset's configuration refused (e.g. a `time_column` value that
+    // cannot be read while ordering versions by time) carries its own complete cause.
     if let Some(message) = latest_by_time::not_applied_message(&error) {
         return RetryError::permanent(super::Error::RefreshNotApplied { message });
     }

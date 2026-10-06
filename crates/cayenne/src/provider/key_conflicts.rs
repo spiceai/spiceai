@@ -45,11 +45,10 @@ use util::session_state::{SupersededReason, SupersededRows};
 /// Seeds the hash [`KeyResolver::may_repeat_within`] checks a batch's keys by.
 const REPEAT_CHECK_SEED: u64 = 0x6361_7965_6e6e_6502;
 
-/// A batch with each row's version: its time (UTC nanoseconds) and content hash.
+/// A batch with each row's time (UTC nanoseconds).
 pub(crate) struct VersionedBatch {
     pub(crate) batch: RecordBatch,
     pub(crate) times: arrow::array::Int64Array,
-    pub(crate) hashes: arrow::array::UInt64Array,
 }
 
 impl VersionedBatch {
@@ -63,10 +62,6 @@ impl VersionedBatch {
             batch: filter_record_batch(&self.batch, keep)?,
             times: arrow::array::AsArray::as_primitive::<arrow::datatypes::Int64Type>(
                 filter(&self.times)?.as_ref(),
-            )
-            .clone(),
-            hashes: arrow::array::AsArray::as_primitive::<arrow::datatypes::UInt64Type>(
-                filter(&self.hashes)?.as_ref(),
             )
             .clone(),
         })
@@ -235,9 +230,9 @@ impl KeyResolver {
         Ok(self.keys.convert_columns(&columns)?)
     }
 
-    /// Resolve the keys `batches` repeat by row version rather than arrival: each key
-    /// keeps its copy with the greatest `(time, hash)` (each batch's own `times` and
-    /// `hashes`), the later copy on an equal one, and every other copy is counted.
+    /// Resolve the keys `batches` repeat by row time rather than arrival alone: each
+    /// key keeps its copy with the greatest time (each batch's own `times`), the later
+    /// copy on an equal one, and every other copy is counted.
     /// Every batch comes back, filtered to its kept rows in their order, with its
     /// versions filtered alike.
     ///
@@ -254,10 +249,7 @@ impl KeyResolver {
             digests.push(self.digests(&versioned.batch)?);
         }
         let rows: usize = digests.iter().map(Vec::len).sum();
-        let version = |(index, row): (usize, usize)| {
-            let versioned = &batches[index];
-            (versioned.times.value(row), versioned.hashes.value(row))
-        };
+        let version = |(index, row): (usize, usize)| batches[index].times.value(row);
         let mut kept: HashMap<u128, (usize, usize), PrehashedBuildHasher> =
             HashMap::with_capacity_and_hasher(rows, PrehashedBuildHasher);
         let mut counts = [0_u64; SupersededReason::ALL.len()];

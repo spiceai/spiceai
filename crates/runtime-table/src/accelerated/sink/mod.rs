@@ -35,7 +35,7 @@ pub struct RefreshWrite {
     /// Counts the rows the table receives but does not keep.
     pub superseded: Option<Arc<util::session_state::SupersededRows>>,
     /// Orders the copies of a key the write repeats by version, for
-    /// `on_conflict: upsert_by_time`.
+    /// a refresh that orders versions by `time_column`.
     pub row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
 }
 
