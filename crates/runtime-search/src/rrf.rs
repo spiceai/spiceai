@@ -1370,6 +1370,17 @@ impl TableProvider for ReciprocalRankFusion {
     ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         not_impl_err!("ReciprocalRankFusion does not support truncate")
     }
+
+    async fn merge_into(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _source: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        _merge_schema: datafusion::common::DFSchemaRef,
+        _on: datafusion::prelude::Expr,
+        _clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        not_impl_err!("ReciprocalRankFusion does not support merge_into")
+    }
 }
 
 #[cfg(test)]

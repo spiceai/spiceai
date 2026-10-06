@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use parking_lot::{Mutex, RwLock};
 use runtime_acceleration::Engine;
 use runtime_acceleration::snapshot::CurrentSnapshotError;

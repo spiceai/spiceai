@@ -47,11 +47,11 @@ mod update;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference;
 use datafusion::common::config::Dialect;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::sql::TableReference;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::CreateTableOptions;
 use datafusion::sql::sqlparser::ast::Expr as SQLExpr;
@@ -364,6 +364,11 @@ async fn plan_distributed_dml(
         WriteOp::Truncate => Err(DataFusionError::Internal(
             "TRUNCATE should not reach DML planner".to_string(),
         )),
+        // `WriteOp` is non-exhaustive (DataFusion 55 added MERGE INTO); a write the
+        // distributed Cayenne planner has no plan for is refused, not guessed at.
+        other => Err(DataFusionError::NotImplemented(format!(
+            "{other} is not supported on a distributed Cayenne table"
+        ))),
     }
 }
 

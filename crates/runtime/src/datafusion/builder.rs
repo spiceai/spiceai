@@ -417,6 +417,43 @@ pub struct DataFusionBuilder {
 pub use runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder;
 pub use runtime_datafusion::session_config::{DEFAULT_DATAFUSION_CONFIG, get_df_default_config};
 
+/// `datafusion-spark` scalar functions the session does not register at all,
+/// matched on the function's name or any of its aliases. `hypot`, `monthname`,
+/// `quote` and `weekday` collide with no built-in, but `datafusion-spark` added
+/// them with `DataFusion` 55 and no release has shipped them: a new SQL
+/// function is new surface, not a side effect of a dependency upgrade.
+/// Collisions with a function the session already holds are decided in
+/// [`SPARK_SCALAR_COLLISIONS`] instead.
+///
+/// `the_built_session_registers_exactly_the_shipped_spark_functions` pins what
+/// is registered, so a function a later `datafusion-spark` adds has to be
+/// decided on rather than arriving silently.
+const SPARK_SCALAR_NOT_SHIPPED: &[&str] = &["hypot", "monthname", "quote", "weekday"];
+
+/// Whether `udf`'s name or any alias is in [`SPARK_SCALAR_NOT_SHIPPED`].
+fn is_not_shipped(udf: &datafusion::logical_expr::ScalarUDF) -> bool {
+    std::iter::once(udf.name())
+        .chain(udf.aliases().iter().map(String::as_str))
+        .any(|name| SPARK_SCALAR_NOT_SHIPPED.contains(&name))
+}
+
+/// The `datafusion-spark` scalar functions the built session registers: every
+/// one but those [`SPARK_SCALAR_NOT_SHIPPED`] names and those a
+/// [`SPARK_SCALAR_COLLISIONS`] entry keeps out (`Keep::BuiltIn`). The NSQL
+/// context lists these as the Spark-compatible functions, so what it describes
+/// is what runs.
+pub(crate) fn registered_spark_scalar_functions()
+-> impl Iterator<Item = Arc<datafusion::logical_expr::ScalarUDF>> {
+    datafusion_spark::all_default_scalar_functions()
+        .into_iter()
+        .filter(|udf| {
+            !is_not_shipped(udf)
+                && !SPARK_SCALAR_COLLISIONS
+                    .iter()
+                    .any(|(name, _, keep)| *name == udf.name() && *keep == Keep::BuiltIn)
+        })
+}
+
 impl DataFusionBuilder {
     /// Creates a new `DataFusionBuilder` with the runtime defaults.
     ///
@@ -1160,7 +1197,11 @@ impl DataFusionBuilder {
         // says which side each keeps and why, and a collision it does not name
         // is refused right here, so a fork repin that adds one fails the build
         // instead of shadowing a built-in silently (spiceai/spiceai#14361).
+        // A function `SPARK_SCALAR_NOT_SHIPPED` names is not registered at all.
         for udf in datafusion_spark::all_default_scalar_functions() {
+            if is_not_shipped(&udf) {
+                continue;
+            }
             if let Some(taken) = kept_out(
                 "scalar",
                 state.scalar_functions(),
@@ -2164,8 +2205,9 @@ enum Keep {
 ///   federated rendering surfaces as a schema assertion, not a function error.
 ///   Spark's `ceil` alias `ceiling`, a name no built-in has, is lent to the
 ///   built-in (`SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN`).
-/// - `round`: Spark's returns the argument's type; the built-in returns
-///   `Float64` for an integer argument.
+/// - `round`: the built-in is the documented one. Since `DataFusion` 55
+///   (apache/datafusion#22697) it keeps an integer argument's type, as Spark's
+///   does, where it used to return `Float64`.
 /// - `concat` is **Spark's on purpose**: it answers NULL when any argument is
 ///   NULL where the built-in skips the argument. The `DuckDB` dialect renders
 ///   the call to match (`||`, `concat_to_string_concat`, #13849), so flipping
@@ -2197,13 +2239,22 @@ enum Keep {
 ///   both — so no overload is lost.
 /// - `trunc`: Spark's is date truncation and shadows the numeric
 ///   `trunc(<float>, <int>)` (#11415).
+/// - `pow` (also `power`), `atan2` and `concat_ws` arrived with
+///   `datafusion-spark` 55 and keep the built-in, which is what every release
+///   before 55 answered: Spark's `pow` returns `Float64` for a decimal base
+///   where the built-in keeps the decimal (and fails on zero to a negative
+///   power where Spark's answers infinity), Spark's `atan2` widens a `Float32`
+///   pair to `Float64`, and Spark's `concat_ws` flattens an array argument
+///   (`the_built_session_keeps_the_built_in_math_and_string_functions`).
 const SPARK_SCALAR_COLLISIONS: &[(&str, &[&str], Keep)] = &[
     ("abs", &["abs"], Keep::BuiltIn),
+    ("atan2", &["atan2"], Keep::BuiltIn),
     ("array_contains", &["array_contains"], Keep::BuiltIn),
     ("array_repeat", &["array_repeat"], Keep::BuiltIn),
     ("ascii", &["ascii"], Keep::BuiltIn),
     ("ceil", &["ceil"], Keep::BuiltIn),
     ("concat", &["concat"], Keep::Spark),
+    ("concat_ws", &["concat_ws"], Keep::BuiltIn),
     ("date_part", &["date_part", "datepart"], Keep::BuiltIn),
     ("date_trunc", &["date_trunc"], Keep::BuiltIn),
     ("factorial", &["factorial"], Keep::BuiltIn),
@@ -2213,6 +2264,7 @@ const SPARK_SCALAR_COLLISIONS: &[(&str, &[&str], Keep)] = &[
         &["length", "character_length", "char_length"],
         Keep::Spark,
     ),
+    ("pow", &["pow", "power"], Keep::BuiltIn),
     ("round", &["round"], Keep::BuiltIn),
     ("substring", &["substring", "substr"], Keep::BuiltIn),
     ("trunc", &["trunc"], Keep::BuiltIn),
@@ -2469,15 +2521,22 @@ mod tests {
         }
     }
 
-    /// `json_get(x, k)::string` federates, because `register_all` also installs
-    /// the rewrite that turns a cast of `json_get` into the typed accessor.
+    /// A cast of `json_get` federates where a typed accessor does, because
+    /// `register_all` also installs the rewrite that turns the cast into one.
     ///
     /// That is why the guidance can offer the cast form as an alternative to
-    /// editing every call: `CAST(… AS VARCHAR)` becomes `json_get_str`,
-    /// `AS BIGINT` becomes `json_get_int`, `AS DOUBLE` becomes `json_get_float`
-    /// — and those are the names the `BigQuery` deny-list carves out, so the
-    /// statement pushes down. A bare `json_get` stays a JSON union with no SQL
-    /// type to unparse into, and stays local.
+    /// editing every call: `AS BIGINT` becomes `json_get_int`, `AS DOUBLE`
+    /// becomes `json_get_float`, `AS BOOLEAN` becomes `json_get_bool` — and those
+    /// are the names the `BigQuery` deny-list carves out, so the statement pushes
+    /// down. A bare `json_get` stays a JSON union with no SQL type to unparse into,
+    /// and stays local.
+    ///
+    /// A cast to a string type is the exception. It becomes `json_as_text`, not
+    /// `json_get_str`, because a cast answers for every JSON node (`7` is `'7'`,
+    /// an object its JSON text), where `json_get_str` answers only for a JSON
+    /// string. `json_as_text` has no faithful `BigQuery` rendering (see
+    /// `json_extraction_keeps_the_semantics_the_pushdown_guidance_assumes`), so
+    /// that form stays local; `json_get_str` is what pushes a string read down.
     ///
     /// Losing the rewrite would not fail a query; it would quietly stop the cast
     /// form from federating, which is the whole point of recommending it.
@@ -2498,7 +2557,7 @@ mod tests {
             .expect("register the document table");
 
         for (cast_to, expected) in [
-            ("VARCHAR", "json_get_str"),
+            ("VARCHAR", "json_as_text"),
             ("BIGINT", "json_get_int"),
             ("DOUBLE", "json_get_float"),
             ("BOOLEAN", "json_get_bool"),
@@ -2515,8 +2574,7 @@ mod tests {
                 .to_string();
             assert!(
                 plan.contains(expected),
-                "a cast to {cast_to} has to become {expected}, which the BigQuery \
-                 deny-list carves out: {plan}"
+                "a cast to {cast_to} has to become {expected}: {plan}"
             );
         }
     }
@@ -2944,8 +3002,9 @@ mod tests {
                 .state()
                 .scalar_functions()
                 .contains_key("array_append"),
-            "only a colliding Spark function decided `Keep::BuiltIn` is kept out; the rest \
-             of the Spark functions must still register"
+            "only a colliding Spark function decided `Keep::BuiltIn`, or one \
+             `SPARK_SCALAR_NOT_SHIPPED` names, is kept out; the rest of the Spark \
+             functions must still register"
         );
     }
 
@@ -3101,6 +3160,251 @@ mod tests {
         );
     }
 
+    /// Every name the built session answers with a `datafusion-spark`
+    /// implementation, pinned.
+    ///
+    /// A `datafusion-spark` release adds functions, and some of them share a
+    /// name with a built-in: registered, each replaces the built-in's
+    /// semantics, and each new name is new SQL surface. Neither may arrive as
+    /// a side effect of a version bump, so the set the session resolves to
+    /// Spark's implementation is pinned here, aliases included. A name joining
+    /// it fails this test and has to be decided on: added to the registration
+    /// loop's skip, or listed here once it is meant to ship.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_registers_exactly_the_shipped_spark_functions() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+        let state = df.ctx.state();
+
+        let mut resolved_to_spark = std::collections::BTreeSet::new();
+        for udf in datafusion_spark::all_default_scalar_functions() {
+            for name in std::iter::once(udf.name()).chain(udf.aliases().iter().map(String::as_str))
+            {
+                if state
+                    .scalar_functions()
+                    .get(name)
+                    .is_some_and(|registered| **registered == *udf)
+                {
+                    resolved_to_spark.insert(format!("scalar {name}"));
+                }
+            }
+        }
+        for udaf in datafusion_spark::all_default_aggregate_functions() {
+            for name in
+                std::iter::once(udaf.name()).chain(udaf.aliases().iter().map(String::as_str))
+            {
+                if state
+                    .aggregate_functions()
+                    .get(name)
+                    .is_some_and(|registered| **registered == *udaf)
+                {
+                    resolved_to_spark.insert(format!("aggregate {name}"));
+                }
+            }
+        }
+        for udwf in datafusion_spark::all_default_window_functions() {
+            for name in
+                std::iter::once(udwf.name()).chain(udwf.aliases().iter().map(String::as_str))
+            {
+                if state
+                    .window_functions()
+                    .get(name)
+                    .is_some_and(|registered| **registered == *udwf)
+                {
+                    resolved_to_spark.insert(format!("window {name}"));
+                }
+            }
+        }
+
+        let shipped: std::collections::BTreeSet<String> = SHIPPED_SPARK_FUNCTIONS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let unexpected: Vec<_> = resolved_to_spark.difference(&shipped).collect();
+        let missing: Vec<_> = shipped.difference(&resolved_to_spark).collect();
+        assert!(
+            unexpected.is_empty() && missing.is_empty(),
+            "the Spark functions the session registers changed; newly registered: \
+             {unexpected:?}, no longer registered: {missing:?}"
+        );
+    }
+
+    /// The names `the_built_session_registers_exactly_the_shipped_spark_functions`
+    /// pins: what the session resolves to `datafusion-spark`, given the
+    /// decisions in `SPARK_SCALAR_COLLISIONS` and `SPARK_SCALAR_NOT_SHIPPED`.
+    const SHIPPED_SPARK_FUNCTIONS: &[&str] = &[
+        "aggregate collect_list",
+        "aggregate collect_set",
+        "aggregate try_sum",
+        "scalar add_months",
+        "scalar array",
+        "scalar base64",
+        "scalar bin",
+        "scalar bit_count",
+        "scalar bit_get",
+        "scalar bitmap_bit_position",
+        "scalar bitmap_bucket_number",
+        "scalar bitmap_count",
+        "scalar bitwise_not",
+        "scalar char",
+        "scalar char_length",
+        "scalar character_length",
+        "scalar concat",
+        "scalar crc32",
+        "scalar csc",
+        "scalar date_add",
+        "scalar date_diff",
+        "scalar date_sub",
+        "scalar dateadd",
+        "scalar datediff",
+        "scalar elt",
+        "scalar expm1",
+        "scalar format_string",
+        "scalar from_utc_timestamp",
+        "scalar getbit",
+        "scalar hex",
+        "scalar hour",
+        "scalar if",
+        "scalar ilike",
+        "scalar is_valid_utf8",
+        "scalar json_tuple",
+        "scalar last_day",
+        "scalar len",
+        "scalar length",
+        "scalar like",
+        "scalar luhn_check",
+        "scalar make_dt_interval",
+        "scalar make_interval",
+        "scalar make_valid_utf8",
+        "scalar map_from_arrays",
+        "scalar map_from_entries",
+        "scalar minute",
+        "scalar mod",
+        "scalar negative",
+        "scalar next_day",
+        "scalar parse_url",
+        "scalar pmod",
+        "scalar printf",
+        "scalar rint",
+        "scalar sec",
+        "scalar second",
+        "scalar sha",
+        "scalar sha1",
+        "scalar sha2",
+        "scalar shiftleft",
+        "scalar shiftright",
+        "scalar shiftrightunsigned",
+        "scalar shuffle",
+        "scalar size",
+        "scalar slice",
+        "scalar soundex",
+        "scalar space",
+        "scalar spark_cast",
+        "scalar str_to_map",
+        "scalar time_trunc",
+        "scalar to_utc_timestamp",
+        "scalar try_parse_url",
+        "scalar try_url_decode",
+        "scalar unbase64",
+        "scalar unhex",
+        "scalar unix_date",
+        "scalar unix_micros",
+        "scalar unix_millis",
+        "scalar unix_seconds",
+        "scalar url_decode",
+        "scalar url_encode",
+        "scalar width_bucket",
+        "scalar xxhash64",
+    ];
+
+    /// The built-ins a `datafusion-spark` function of the same name would
+    /// replace keep their own answers.
+    ///
+    /// Each statement here answered differently with Spark's implementation
+    /// registered over the built-in: `power` answered infinity for zero to a
+    /// negative power where the built-in reports the result undefined, `atan2`
+    /// widened `Float32` to `Float64`, and `concat_ws` flattened an array
+    /// argument instead of rendering it. Through `DataFusionBuilder::build`,
+    /// because what can regress is the registration loop's skip.
+    ///
+    /// The decimal rows pin the built-in's own answer, which `DataFusion` 55
+    /// changed: `power` now always returns `Float64`
+    /// (apache/datafusion#22482, #22651), because the decimal result it kept
+    /// the base's type for truncated silently — `2.5⁴` in `DECIMAL(2,1)`
+    /// answered `3.9`.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_math_and_string_functions() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        let answers = df
+            .ctx
+            .sql(
+                "SELECT \
+                 power(CAST(2.5 AS DECIMAL(2,1)), 4.0) AS power_decimal, \
+                 arrow_typeof(power(CAST(2.5 AS DECIMAL(2,1)), 4.0)) AS power_decimal_type, \
+                 arrow_typeof(pow(CAST(2.5 AS DECIMAL(2,1)), 4.0)) AS pow_decimal_type, \
+                 power(2, 3) AS power_integer, \
+                 arrow_typeof(atan2(CAST(1.0 AS FLOAT), CAST(3.0 AS FLOAT))) AS atan2_float_type, \
+                 atan2(1.0, 3.0) AS atan2_double, \
+                 concat_ws(',', make_array('a', 'b'), 'c') AS concat_ws_array, \
+                 concat_ws(',', 'a', NULL, 'b') AS concat_ws_null",
+            )
+            .await
+            .expect("plan the built-in calls")
+            .collect()
+            .await
+            .expect("run the built-in calls");
+        datafusion::assert_batches_eq!(
+            [
+                "+---------------+--------------------+------------------+---------------+------------------+--------------------+-----------------+----------------+",
+                "| power_decimal | power_decimal_type | pow_decimal_type | power_integer | atan2_float_type | atan2_double       | concat_ws_array | concat_ws_null |",
+                "+---------------+--------------------+------------------+---------------+------------------+--------------------+-----------------+----------------+",
+                "| 39.0625       | Float64            | Float64          | 8.0           | Float32          | 0.3217505543966422 | [a, b],c        | a,b            |",
+                "+---------------+--------------------+------------------+---------------+------------------+--------------------+-----------------+----------------+",
+            ],
+            &answers
+        );
+
+        // Zero to a negative power is undefined: the built-in says so, where
+        // Spark's answers infinity.
+        let undefined = match df.ctx.sql("SELECT power(0.0, -1.0) AS v").await {
+            Ok(frame) => frame.collect().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        let error = undefined.expect_err("zero to a negative power must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("zero raised to a negative power is undefined"),
+            "zero to a negative power must fail as undefined: {error}"
+        );
+
+        // A function no release has shipped stays unknown.
+        for unshipped in [
+            "SELECT hypot(3.0, 4.0)",
+            "SELECT monthname(DATE '2024-03-17')",
+            "SELECT quote('a')",
+            "SELECT weekday(DATE '2024-03-17')",
+        ] {
+            let planned = df.ctx.sql(unshipped).await;
+            assert!(
+                planned.is_err(),
+                "`{unshipped}` must stay an unknown function"
+            );
+        }
+    }
+
     /// The built session keeps **Spark's** `length`: it takes a binary
     /// argument and counts bytes, which the built-in `character_length` does
     /// not — it coerces the value to UTF-8 and counts characters, so the two
@@ -3238,13 +3542,13 @@ mod tests {
             "+-----------------+-------------+---------------+",
             "| contains_absent | floor_float | round_integer |",
             "+-----------------+-------------+---------------+",
-            "| false           | 1.0         | 5.0           |",
+            "| false           | 1.0         | 5             |",
             "+-----------------+-------------+---------------+",
         ];
         datafusion::assert_batches_eq!(&expected, &batches);
         let schema = batches.first().expect("one batch").schema();
         assert_eq!(schema.field(1).data_type(), &DataType::Float64);
-        assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(2).data_type(), &DataType::Int64);
 
         let ascii_of_a_number = df.ctx.sql("SELECT ascii(5) AS v").await;
         assert!(
@@ -3675,6 +3979,147 @@ mod tests {
                 .optimizer
                 .eager_aggregation_max_pushed_groups,
             1024
+        );
+    }
+
+    /// Whether `plan` has an `AggregateExec` anywhere below a `HashJoinExec`, which
+    /// is where eager aggregation puts the pre-aggregation it pushes.
+    #[cfg(not(windows))]
+    fn aggregates_below_a_join(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        below_a_join: bool,
+    ) -> bool {
+        use datafusion::physical_plan::aggregates::AggregateExec;
+        use datafusion::physical_plan::joins::HashJoinExec;
+
+        if below_a_join && plan.is::<AggregateExec>() {
+            return true;
+        }
+        let below_a_join = below_a_join || plan.is::<HashJoinExec>();
+        plan.children()
+            .into_iter()
+            .any(|child| aggregates_below_a_join(child, below_a_join))
+    }
+
+    /// Plans `SUM(amount) GROUP BY name` over `fact JOIN dim` in a session built
+    /// with `eager_aggregation`, and returns whether the plan pre-aggregates below the
+    /// join, the rendered plan, and the query's rows.
+    #[cfg(not(windows))]
+    async fn plan_an_aggregate_over_a_join(eager_aggregation: bool) -> (bool, String, String) {
+        use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .eager_aggregation(Some(eager_aggregation))
+        .build();
+
+        // 10,000 fact rows over 100 join keys, and one dimension row per key.
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("fk", DataType::Int32, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let fact = RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values((1..=10_000).map(|i| i % 100))),
+                Arc::new(Int64Array::from_iter_values(1..=10_000)),
+            ],
+        )
+        .expect("build the fact batch");
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("dk", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let dim = RecordBatch::try_new(
+            Arc::clone(&dim_schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|k| format!("n{k}")),
+                )),
+            ],
+        )
+        .expect("build the dimension batch");
+        for (name, schema, batch) in [("fact", fact_schema, fact), ("dim", dim_schema, dim)] {
+            let table = MemTable::try_new(schema, vec![vec![batch]]).expect("build the table");
+            df.ctx
+                .register_table(name, Arc::new(table) as Arc<dyn TableProvider>)
+                .expect("register the table");
+        }
+
+        let query = df
+            .ctx
+            .sql(
+                "SELECT d.name, SUM(f.amount) AS total FROM fact f JOIN dim d ON f.fk = d.dk \
+                 WHERE f.fk = 5 GROUP BY d.name",
+            )
+            .await
+            .expect("plan the query");
+        let plan = query
+            .clone()
+            .create_physical_plan()
+            .await
+            .expect("build the physical plan");
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let rows = arrow::util::pretty::pretty_format_batches(
+            &query.collect().await.expect("run the query"),
+        )
+        .expect("format the rows")
+        .to_string();
+        (aggregates_below_a_join(&plan, false), rendered, rows)
+    }
+
+    /// The eager-aggregation rule — a physical optimizer rule the
+    /// `spiceai/datafusion` fork carries and spiced enables by default — actually
+    /// rewrites a plan built by this session, rather than only being switched on in
+    /// its configuration.
+    ///
+    /// The push side reaches the join through a `FilterExec`, and that is what makes
+    /// this a guard for the rule's `StatisticsContext` migration as well as for the
+    /// rule: the rule's cost gate reads row and distinct counts, `DataFusion` 55
+    /// derives a `FilterExec`'s only through `StatisticsContext`, and a rule still
+    /// reading the deprecated `partition_statistics` sees none there, declines every
+    /// push, and returns the same rows more slowly. The rows are asserted too, and
+    /// the disabled session is the control that shows the plan check can tell the
+    /// two apart.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn eager_aggregation_pushes_an_aggregate_below_a_join() {
+        let expected_rows = [
+            "+------+--------+",
+            "| name | total  |",
+            "+------+--------+",
+            "| n5   | 495500 |",
+            "+------+--------+",
+        ]
+        .join("\n");
+
+        let (pushed, plan, rows) = plan_an_aggregate_over_a_join(true).await;
+        assert!(
+            pushed,
+            "with eager aggregation enabled the aggregate over the join has to be \
+             pre-aggregated below it; the rule declined the push, so it no longer fires: \
+             {plan}"
+        );
+        assert_eq!(
+            rows, expected_rows,
+            "the rewritten plan returned wrong rows"
+        );
+
+        let (pushed, plan, rows) = plan_an_aggregate_over_a_join(false).await;
+        assert!(
+            !pushed,
+            "with eager aggregation disabled nothing may be pre-aggregated below the join, \
+             or the check above cannot tell the rule firing from the plan's own shape: {plan}"
+        );
+        assert_eq!(
+            rows, expected_rows,
+            "the unrewritten plan returned wrong rows"
         );
     }
 
