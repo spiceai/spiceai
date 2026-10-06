@@ -2276,8 +2276,8 @@ async fn a_graceful_shutdown_records_the_acknowledged_position_so_a_restart_resu
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = pg_client(port).await?;
 
