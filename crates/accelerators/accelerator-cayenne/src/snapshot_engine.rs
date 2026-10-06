@@ -464,6 +464,7 @@ mod tests {
     use super::*;
     use cayenne::CayenneCatalog;
     use cayenne::metadata::CreateTableOptions;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     async fn fresh_catalog(dir: &std::path::Path) -> Arc<CayenneCatalog> {
@@ -1055,6 +1056,20 @@ mod tests {
     /// snapshots.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn snapshot_attempt_holds_cayenne_file_deletions() {
+        assert_snapshot_attempt_holds_file_deletions(&HashMap::new()).await;
+    }
+
+    /// The same through the upsert-dedup wrapper the engine adds for
+    /// `upsert_remove_duplicates`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_attempt_holds_file_deletions_through_upsert_dedup() {
+        let options = HashMap::from([("upsert_remove_duplicates".to_string(), "true".to_string())]);
+        assert_snapshot_attempt_holds_file_deletions(&options).await;
+    }
+
+    /// Runs the real snapshot attempt over the table wrapped as the engine wraps
+    /// it, with an orphaned-DV sweep started inside the attempt.
+    async fn assert_snapshot_attempt_holds_file_deletions(options: &HashMap<String, String>) {
         use async_trait::async_trait;
         use datafusion::common::TableReference;
         use datafusion::datasource::TableProvider;
@@ -1112,7 +1127,19 @@ mod tests {
             probe: std::sync::Mutex::new(None),
         });
         let checkpointer: Arc<dyn DatasetCheckpointer> = Arc::clone(&probe) as _;
-        let accelerator: Arc<dyn TableProvider> = table;
+        let write = data_accelerator_api::upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            table,
+            options,
+            datafusion::common::Constraints::default(),
+        );
+        let accelerator: Arc<dyn TableProvider> = Arc::new(
+            data_components::poly::PolyTableProvider::new_with_schema_metadata(
+                Arc::clone(&write),
+                write,
+                HashMap::new(),
+            ),
+        )
+        .into_table();
         runtime_table::accelerated::snapshots::create_checkpoint_and_snapshot(
             &checkpointer,
             None,

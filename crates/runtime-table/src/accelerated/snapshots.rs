@@ -14,8 +14,8 @@ use crate::accelerated::SnapshotCreateTrigger;
 use crate::accelerated::caching::is_reserved_caching_column;
 use crate::accelerated::refresh::Refresh;
 use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshCompletionOutcome};
+use crate::accelerated::write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target};
 use arrow_schema::{FieldRef, Schema, SchemaRef};
-use cayenne::CayenneTableProvider;
 use data_accelerator_api::DataAccelerator;
 use data_accelerator_api::ReloadProviderFactory;
 use data_accelerator_api::swappable::SwappableTableProvider;
@@ -32,7 +32,6 @@ use runtime_acceleration::snapshot::{
 use runtime_async::is_shutdown_cancellation;
 use runtime_status::{RuntimeStatus, WaitOutcome};
 use snafu::{ResultExt, Snafu};
-use spice_table::{LayerWalk, find_concrete};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -624,11 +623,9 @@ async fn create_checkpoint_and_snapshot_once(
 ) -> Result<(), SnapshotAttemptError> {
     // Keeps Cayenne maintenance from deleting files until the archive is written.
     // Taken before the write lock, so writers never wait on a sweep batch.
-    let file_deletion_hold = match accelerator
-        .and_then(|a| find_concrete::<CayenneTableProvider>(a.as_ref(), LayerWalk::Write))
-    {
-        Some(table) => Some(table.hold_file_deletions().await),
-        None => None,
+    let file_deletion_hold = match accelerator.and_then(extract_cayenne_write_target) {
+        Some(CayenneWriteTarget::Staged(table)) => Some(table.hold_file_deletions().await),
+        _ => None,
     };
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
