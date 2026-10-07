@@ -122,7 +122,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `8ee430737cb6999025d0b29672ec6cb92df19b6d` | `spiceai-1.4.4-patches-2` (spiceai/duckdb-rs#49 was squash-merged into `spiceai-1.4.4`, so this revision is the head of the protected `-patches-2` branch rather than a `spiceai-1.4.4` commit. datafusion-table-providers pins this exact revision, so the two move to `spiceai-1.4.4` together, which also brings spiceai/duckdb-rs#50 and #51) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
-| [iceberg-rust](#iceberg-rust) | `3e2a14e8182cb39d75b74b95d9c7b83244ecac55` | `spiceai-0.10.1-df-55` |
+| [iceberg-rust](#iceberg-rust) | `7735caa2d9a839ad81aa6a1316932c99ea3019c5` | `spiceai-0.11.0-df-55` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
@@ -441,15 +441,15 @@ else — every other row was re-confirmed present, unchanged, at the pinned revi
 ## iceberg-rust
 
 Upstream [apache/iceberg-rust](https://github.com/apache/iceberg-rust), branch
-`spiceai-0.10.1-df-55-patches`: the previous line plus two commits that move it to
-DataFusion 55.1 and arrow 59 and migrate to the DataFusion 55 APIs
-(`ExecutionPlan::apply_expressions`, `CreateExternalTable::locations`). Neither
-touches a row below; each was re-confirmed present at the pinned revision.
+`spiceai-0.11.0-df-55`: the 0.10.1 / DataFusion 55 line with upstream's `0.11.x`
+release branch (0.11.0 RC) merged in (spiceai/iceberg-rust#55). Each row below was
+re-confirmed present at the pinned revision; the SigV4 row was re-implemented on
+upstream's new REST auth API.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `RowDeltaAction` for row-level deletes via delete files (fork PR #28) | `DELETE` against an Iceberg table has no commit path | build | `crates/data_components/src/iceberg/delete.rs` calls `tx.row_delta()` |
-| SigV4 signing middleware for REST catalogs on AWS Glue (commits `c9f1c85`, `f67e44c`; no fork PR) | Glue-backed Iceberg catalogs fail to authenticate | build (module) + silent (signing) | `crates/runtime/src/catalogconnector/iceberg.rs` wires `rest.sigv4-enabled`; the signing itself is guarded by `crates/data_components/src/iceberg/catalog/rest/catalog.rs::a_sigv4_catalog_signs_every_request_it_sends`, with `…::a_catalog_without_sigv4_sends_no_signature` as its control |
+| SigV4 signing for REST catalogs on AWS Glue (commits `c9f1c85`, `f67e44c`; re-implemented as an `AuthManager` in `crates/catalog/rest/src/auth/sigv4.rs` by fork PR #55) | Glue-backed Iceberg catalogs fail to authenticate | build (module) + silent (signing) | `crates/runtime/src/catalogconnector/iceberg.rs` wires `rest.sigv4-enabled`; the signing itself is guarded by `crates/data_components/src/iceberg/catalog/rest/catalog.rs::a_sigv4_catalog_signs_every_request_it_sends`, with `…::a_catalog_without_sigv4_sends_no_signature` as its control |
 | Limit push-down for `IcebergTableProvider` (fork PR #19) | `SELECT … LIMIT n` scans the whole table | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_given_a_limit_reads_no_more_rows_than_it_asked_for` for the single-node scan, counted at the provider because a `GlobalLimitExec` above it returns the right rows either way; the distributed path is covered by `crates/runtime/src/cluster/datafusion/codec/spice_physical_codec.rs`, which refuses to serialise a scan whose limit it cannot carry |
 | Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | `crates/data_components/src/iceberg/provider.rs::a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one` |
 | Parallel file scanning with eager task bucketing (fork PR #43) | Iceberg scans lose file-level parallelism | silent (perf) | **GAP** |
