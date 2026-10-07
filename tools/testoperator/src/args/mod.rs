@@ -40,6 +40,9 @@ pub use text_to_sql::TextToSqlArgs;
 mod schema;
 pub use schema::SchemaTestArgs;
 
+mod cold_start;
+pub use cold_start::ColdStartArgs;
+
 mod htap;
 pub use htap::HtapArgs;
 
@@ -66,6 +69,8 @@ pub enum TestCommands {
     Load(LoadTestArgs),
     /// Run a single-run benchmark
     Bench(DatasetTestArgs),
+    /// Measure how long a fresh spiced takes to load its accelerations and report ready
+    ColdStart(ColdStartArgs),
     /// Run a data consistency test
     DataConsistency(DataConsistencyArgs),
     #[cfg(feature = "append")]
