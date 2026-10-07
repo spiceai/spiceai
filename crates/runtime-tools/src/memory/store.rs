@@ -132,13 +132,15 @@ impl SpiceModelTool for StoreMemoryTool {
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::store_memory", tool = self.name().to_string(), input = arg);
-        // Auth gate before table lookup so RO rejection does not depend on app
-        // wiring and is covered by unit tests without a live memory dataset.
-        if current_principal_requires_read_only().await {
-            return Err("Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth".into());
-        }
-        let table_name = memory_table_name(&self.app).await?;
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
+            // Auth gate before table lookup so RO rejection does not depend on app
+            // wiring and is covered by unit tests without a live memory dataset.
+            // Inside this future so `task_history` records a refusal as an error,
+            // like every other failure below.
+            if current_principal_requires_read_only().await {
+                return Err("Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth".into());
+            }
+            let table_name = memory_table_name(&self.app).await?;
             let params: StoreMemoryParams = serde_json::from_str(arg).boxed()?;
             validate_store_memory_params(&params)?;
 
@@ -406,6 +408,75 @@ mod tests {
             engine.write_calls(),
             1,
             "RW principal must invoke write_data once"
+        );
+    }
+
+    /// Records the span and message of every `task_history` ERROR event. The
+    /// `runtime.task_history` exporter takes a row's `error_message` from the
+    /// first ERROR event on its span, so a failure without one reads as success.
+    #[derive(Clone, Default)]
+    struct TaskHistoryErrors(Arc<Mutex<Vec<(Option<String>, String)>>>);
+
+    impl TaskHistoryErrors {
+        fn recorded(&self) -> Vec<(Option<String>, String)> {
+            self.0.lock().expect("task_history errors lock").clone()
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for TaskHistoryErrors
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "task_history"
+                || *event.metadata().level() != tracing::Level::ERROR
+            {
+                return;
+            }
+            let mut message = String::new();
+            event.record(&mut MessageVisitor(&mut message));
+            let span = ctx.event_span(event).map(|span| span.name().to_string());
+            self.0
+                .lock()
+                .expect("task_history errors lock")
+                .push((span, message));
+        }
+    }
+
+    struct MessageVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn store_memory_read_only_refusal_is_recorded_in_task_history() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let errors = TaskHistoryErrors::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(errors.clone()));
+        let engine = Arc::new(RecordingQueryEngine::new());
+        let tool = store_memory_tool(Arc::clone(&engine));
+        let err = spice_ctx_with_api_key("topsecret123")
+            .scope(async {
+                tool.call(r#"{"thoughts":["remember this"]}"#)
+                    .await
+                    .expect_err("RO principal must reject store_memory")
+            })
+            .await;
+        assert_eq!(
+            errors.recorded(),
+            vec![(Some("tool_use::store_memory".to_string()), err.to_string())],
+            "a refused write must be recorded as an error on its task_history span"
         );
     }
 }
