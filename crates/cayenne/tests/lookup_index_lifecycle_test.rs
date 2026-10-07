@@ -31,12 +31,14 @@ use common::lookup_index::{
 };
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
@@ -1714,21 +1716,47 @@ async fn a_key_spelled_in_another_case_is_used_by_lookups() {
 }
 
 #[derive(Debug)]
-struct PausedIndexPutStore {
+struct FaultInjectingIndexStore {
     inner: Arc<dyn ObjectStore>,
     armed: Arc<AtomicBool>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
+    fail_delete: Arc<AtomicBool>,
+    failed_delete: Arc<std::sync::Mutex<Option<Path>>>,
+    delete_attempts: Arc<std::sync::Mutex<HashMap<Path, usize>>>,
 }
 
-impl fmt::Display for PausedIndexPutStore {
+impl FaultInjectingIndexStore {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(object_store::local::LocalFileSystem::new()),
+            armed: Arc::new(AtomicBool::new(false)),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            fail_delete: Arc::new(AtomicBool::new(false)),
+            failed_delete: Arc::new(std::sync::Mutex::new(None)),
+            delete_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn attempts_for(&self, path: &Path) -> usize {
+        self.delete_attempts
+            .lock()
+            .expect("delete attempts lock")
+            .get(path)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+impl fmt::Display for FaultInjectingIndexStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("PausedIndexPutStore")
+        f.write_str("FaultInjectingIndexStore")
     }
 }
 
 #[async_trait]
-impl ObjectStore for PausedIndexPutStore {
+impl ObjectStore for FaultInjectingIndexStore {
     async fn put_opts(
         &self,
         location: &Path,
@@ -1766,7 +1794,44 @@ impl ObjectStore for PausedIndexPutStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(locations)
+        let inner = Arc::clone(&self.inner);
+        let fail_delete = Arc::clone(&self.fail_delete);
+        let failed_delete = Arc::clone(&self.failed_delete);
+        let delete_attempts = Arc::clone(&self.delete_attempts);
+        locations
+            .then(move |location| {
+                let inner = Arc::clone(&inner);
+                let fail_delete = Arc::clone(&fail_delete);
+                let failed_delete = Arc::clone(&failed_delete);
+                let delete_attempts = Arc::clone(&delete_attempts);
+                async move {
+                    let location = location?;
+                    if std::path::Path::new(location.as_ref())
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("run"))
+                    {
+                        *delete_attempts
+                            .lock()
+                            .expect("delete attempts lock")
+                            .entry(location.clone())
+                            .or_default() += 1;
+                        if fail_delete.swap(false, Ordering::AcqRel) {
+                            *failed_delete.lock().expect("failed delete lock") =
+                                Some(location.clone());
+                            return Err(object_store::Error::Generic {
+                                store: "fault injection",
+                                source: std::io::Error::other(
+                                    "injected index run deletion failure",
+                                )
+                                .into(),
+                            });
+                        }
+                    }
+                    inner.delete(&location).await?;
+                    Ok(location)
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -1797,12 +1862,7 @@ async fn reopening_without_indexes_fences_an_old_pending_sync() {
             .expect("fixture"),
     );
     let env = Arc::new(RuntimeEnv::default());
-    let store = Arc::new(PausedIndexPutStore {
-        inner: Arc::new(object_store::local::LocalFileSystem::new()),
-        armed: Arc::new(AtomicBool::new(false)),
-        entered: Arc::new(Notify::new()),
-        release: Arc::new(Notify::new()),
-    });
+    let store = Arc::new(FaultInjectingIndexStore::new());
     env.register_object_store(
         &url::Url::parse("file:///").expect("file URL"),
         Arc::clone(&store) as Arc<dyn ObjectStore>,
@@ -1942,4 +2002,54 @@ async fn stale_syncs_do_not_modify_replacement_runs() {
         }
         lookup(&replacement, name, 7).await;
     }
+}
+
+/// A failed deletion after unregistration remains eligible for the open's sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_run_file_deletion_does_not_prevent_orphan_cleanup() {
+    const NAME: &str = "failed_orphan_delete";
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let store = Arc::new(FaultInjectingIndexStore::new());
+    env.register_object_store(
+        &url::Url::parse("file:///").expect("file URL"),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+    );
+    let table = open_table(
+        &fixture,
+        Arc::clone(&env),
+        TableSpec::new(NAME, schema(), &[&KEY]).persistence(IndexPersistence::Enabled),
+    )
+    .await;
+    overwrite(&table, vec![rows(0, 20_000)]).await;
+    wait_for_persisted_runs(&fixture, NAME, 1).await;
+    drop(table);
+    store.fail_delete.store(true, Ordering::Release);
+    let reopened = open_table(
+        &fixture,
+        env,
+        TableSpec::new(NAME, schema(), &[]).persistence(IndexPersistence::Enabled),
+    )
+    .await;
+    let registered = registered_runs(&fixture, NAME).await.len();
+    let files = run_file_count(&fixture.data_path);
+    let orphan = store
+        .failed_delete
+        .lock()
+        .expect("failed delete lock")
+        .clone()
+        .expect("failed path");
+    let attempts = store.attempts_for(&orphan);
+    println!(
+        "after index removal and sweep: registered={registered} run_files={files} orphan_attempts={attempts}"
+    );
+    lookup(&reopened, NAME, 7).await;
+    assert_eq!(registered, 0);
+    assert_eq!(
+        files, 0,
+        "the unregistered file remains eligible for the sweep"
+    );
+    assert_eq!(attempts, 2, "the same open retries the orphan deletion");
 }

@@ -2792,7 +2792,8 @@ impl PersistedRuns {
         Ok(())
     }
 
-    /// Unregisters a run, then deletes its file.
+    /// Unregisters a run, then attempts to delete its file. An orphan left by
+    /// a failed deletion is eligible for cleanup during a successful open.
     async fn remove(&self, key: &str, name: &str) -> Result<(), String> {
         let path = self.path(key, name);
         self.catalog
@@ -2801,7 +2802,10 @@ impl PersistedRuns {
             .map_err(|e| format!("unregister {path}: {e}"))?;
         match self.store.delete(&path).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(format!("delete {path}: {e}")),
+            Err(error) => {
+                tracing::debug!(table = %self.table_name, run_file = %path, %error, "An unregistered persisted secondary index run was not deleted; a successful open can retry cleanup");
+                Ok(())
+            }
         }
     }
 
