@@ -450,6 +450,21 @@ impl TableProvider for LocationPruningListingTable {
         filters: &[datafusion_expr::Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        // The planner hands a pushed-down conjunction it has proven unsatisfiable to
+        // `scan` as a `false` (or NULL) literal: `_location = 'a' AND _location = 'b'`
+        // arrives as `[false]`. No row passes it, so answer with an empty scan instead
+        // of listing the whole prefix only to prune every file.
+        if filters.iter().any(|filter| {
+            matches!(
+                filter,
+                datafusion_expr::Expr::Literal(ScalarValue::Boolean(None | Some(false)), _)
+            )
+        }) {
+            return self
+                .scan_partitioned_files(state, Vec::new(), projection, limit)
+                .await;
+        }
+
         let Some(locations) = extract_location_predicates(filters) else {
             if self.uses_format_selected_listing() {
                 return self
@@ -5997,8 +6012,8 @@ mod tests {
 
         const NEW_LOC: &str = "s3://bucket/prefix/new.csv";
 
-        // Conjoined `_location` equalities select the union of both objects as candidates,
-        // but the SQL matches neither, so both must be pruned.
+        // Conjoined `_location` equalities naming different objects match nothing. The
+        // planner folds them to `false` before `scan`, which answers without listing.
         #[tokio::test]
         async fn case2b_conflicting_location_equalities_match_nothing() {
             let store = MatrixStore::new(vec![old_meta(), new_meta()], true);
@@ -6010,6 +6025,11 @@ mod tests {
             )
             .await;
             assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert_eq!(
+                store.heads(),
+                0,
+                "an unsatisfiable predicate opens no object"
+            );
             assert!(
                 plan.contains("EmptyExec"),
                 "no object satisfies both equalities: {plan}"
@@ -6036,7 +6056,8 @@ mod tests {
             assert!(!plan.contains("FilterExec"), "{plan}");
         }
 
-        // Overlapping `IN` lists keep only the shared object.
+        // Overlapping `IN` lists keep only the shared object. The planner intersects the
+        // lists before `scan`, so only that object is head()ed.
         #[tokio::test]
         async fn case2d_overlapping_location_in_lists_keep_the_intersection() {
             let store = MatrixStore::new(vec![old_meta(), new_meta()], true);
@@ -6051,8 +6072,7 @@ mod tests {
             assert!(!plan.contains("EmptyExec"), "new.csv matches: {plan}");
             assert!(plan.contains("new.csv"), "{plan}");
             assert!(!plan.contains("old.csv"), "old.csv is pruned: {plan}");
-            // old.csv and new.csv are each head()ed once; a repeated candidate would add a third.
-            assert_eq!(store.heads(), 2, "each candidate is head()ed once");
+            assert_eq!(store.heads(), 1, "only the shared candidate is head()ed");
         }
 
         // Repeated literals must not scan the same object twice.
