@@ -80,6 +80,9 @@ limitations under the License.
 //! * A selection of N row positions is not a promise of N decoded rows. Vortex
 //!   reads whole encoded segments and dictionaries that cover those positions.
 
+use tracing::Instrument;
+use tracing::instrument::WithSubscriber;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1552,9 +1555,14 @@ impl LookupIndexState {
         store: Arc<dyn ObjectStore>,
         catalog: Arc<dyn MetadataCatalog>,
         table_id: String,
-        root: &object_store::path::Path,
+        location: &datafusion::datasource::listing::ListingTableUrl,
         live: Vec<String>,
     ) {
+        let coordinator = PersistenceCoordinator::for_location(location.to_string());
+        let mut generation = Arc::clone(&coordinator.owner).lock_owned().await;
+        let owner = Arc::new(());
+        *generation = Arc::downgrade(&owner);
+        let root = location.prefix().clone();
         let keys: Vec<String> = self
             .shapes
             .load()
@@ -1570,9 +1578,32 @@ impl LookupIndexState {
             store,
             catalog,
             table_id,
-            root.clone(),
+            root,
             keys,
+            (coordinator, owner),
         ));
+        let state = Arc::clone(self);
+        // Cancellation while waiting does no work; after acquisition the worker
+        // retains the operation lock until every mutation has completed.
+        let result = tokio::spawn(
+            async move {
+                let _generation = generation;
+                state.open_persisted_runs_owned(persisted_runs, live).await;
+            }
+            .instrument(tracing::Span::current())
+            .with_current_subscriber(),
+        )
+        .await;
+        if let Err(error) = result {
+            tracing::debug!(table = %self.table_name, %error, "Persisted secondary index initialization did not complete");
+        }
+    }
+
+    async fn open_persisted_runs_owned(
+        self: &Arc<Self>,
+        persisted_runs: Arc<PersistedRuns>,
+        live: Vec<String>,
+    ) {
         if self
             .persisted_runs
             .set(Arc::clone(&persisted_runs))
@@ -2523,6 +2554,29 @@ const DEFER_FINISH_ROWS: usize = 1 << 20;
 /// for testing: `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled`.
 pub(crate) const PERSISTENCE_ENV: &str = "SPICE_CAYENNE_INDEX_PERSISTENCE";
 
+/// Serializes persistence for one durable table location across provider opens.
+/// The weak owner fences work queued by providers that have been replaced.
+struct PersistenceCoordinator {
+    owner: Arc<tokio::sync::Mutex<std::sync::Weak<()>>>,
+}
+
+impl PersistenceCoordinator {
+    fn for_location(location: String) -> Arc<Self> {
+        type Registry = HashMap<String, std::sync::Weak<PersistenceCoordinator>>;
+        static REGISTRY: std::sync::OnceLock<Mutex<Registry>> = std::sync::OnceLock::new();
+        let mut registry = REGISTRY.get_or_init(Mutex::default).lock();
+        registry.retain(|_, coordinator| coordinator.strong_count() > 0);
+        if let Some(coordinator) = registry.get(&location).and_then(std::sync::Weak::upgrade) {
+            return coordinator;
+        }
+        let coordinator = Arc::new(Self {
+            owner: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
+        });
+        registry.insert(location, Arc::downgrade(&coordinator));
+        coordinator
+    }
+}
+
 /// Every key's runs, persisted one file per run under the table's
 /// `_lookup_index` directory, which snapshot cleanup never sweeps.
 ///
@@ -2550,6 +2604,8 @@ pub(crate) struct PersistedRuns {
     pending: Mutex<Option<Vec<(String, IndexView)>>>,
     /// Whether a sync is running.
     syncing: AtomicBool,
+    coordinator: Arc<PersistenceCoordinator>,
+    owner: Arc<()>,
 }
 
 /// Field order keeps decoded runs charged until their allocations are freed.
@@ -2585,8 +2641,11 @@ impl PersistedRuns {
         table_id: String,
         root: object_store::path::Path,
         keys: Vec<String>,
+        ownership: (Arc<PersistenceCoordinator>, Arc<()>),
     ) -> Self {
         Self {
+            coordinator: ownership.0,
+            owner: ownership.1,
             table_name,
             store,
             catalog,
@@ -2608,11 +2667,36 @@ impl PersistedRuns {
         catalog: Arc<dyn MetadataCatalog>,
         table_id: String,
         root: object_store::path::Path,
+        location: String,
     ) {
-        let runs = Self::new(table_name, store, catalog, table_id, root, Vec::new());
-        if let Err(error) = runs.load(None).await {
-            tracing::debug!(table = %runs.table_name, %error, "Persisted secondary index runs of removed indexes were not deleted; the next open retries");
+        let coordinator = PersistenceCoordinator::for_location(location);
+        let mut generation = Arc::clone(&coordinator.owner).lock_owned().await;
+        let owner = Arc::new(());
+        *generation = Arc::downgrade(&owner);
+        let runs = Self::new(
+            table_name.clone(),
+            store,
+            catalog,
+            table_id,
+            root,
+            Vec::new(),
+            (coordinator, owner),
+        );
+        let result = tokio::spawn(async move {
+            let _generation = generation;
+            if let Err(error) = runs.load(None).await {
+                tracing::debug!(table = %runs.table_name, %error, "Persisted secondary index runs of removed indexes were not deleted; the next open retries");
+            }
+        }.instrument(tracing::Span::current()).with_current_subscriber()).await;
+        if let Err(error) = result {
+            tracing::debug!(table = %table_name, %error, "Persisted secondary index removal did not complete");
         }
+    }
+
+    /// Stops replaced providers from persisting when persistence is disabled.
+    pub(crate) async fn fence(location: String) {
+        let coordinator = PersistenceCoordinator::for_location(location);
+        *coordinator.owner.lock().await = std::sync::Weak::new();
     }
 
     /// Persists `views`' runs in the background, coalescing with any sync
@@ -2646,6 +2730,12 @@ impl PersistedRuns {
                 }
                 return;
             };
+            let generation = self.coordinator.owner.lock().await;
+            if !std::sync::Weak::ptr_eq(&generation, &Arc::downgrade(&self.owner)) {
+                self.pending.lock().take();
+                self.syncing.store(false, Ordering::Release);
+                return;
+            }
             if let Err(error) = self.sync_views(&views).await {
                 tracing::debug!(table = %self.table_name, %error, "Persisted secondary index runs were not synced; the next change retries");
             }

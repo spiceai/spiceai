@@ -9607,6 +9607,12 @@ impl CayenneTableProvider {
 
         if index_persistence == IndexPersistence::Enabled {
             provider.open_persisted_lookup_index().await;
+        } else if let Ok(url) = ListingTableUrl::parse(Self::snapshot_dir_url(
+            &provider.table_metadata.path,
+            &provider.table_metadata.table_id,
+            LOOKUP_INDEX_DIR_NAME,
+        )) {
+            super::lookup_index::PersistedRuns::fence(url.to_string()).await;
         }
 
         Ok(provider)
@@ -9624,6 +9630,7 @@ impl CayenneTableProvider {
             return;
         };
         let Ok(store) = self.context.runtime_env().object_store(&url) else {
+            super::lookup_index::PersistedRuns::fence(url.to_string()).await;
             return;
         };
         let Some(state) = &self.lookup_index else {
@@ -9633,6 +9640,7 @@ impl CayenneTableProvider {
                 Arc::clone(&self.catalog),
                 self.table_metadata.table_id.clone(),
                 url.prefix().clone(),
+                url.to_string(),
             )
             .await;
             return;
@@ -9659,6 +9667,7 @@ impl CayenneTableProvider {
                     .collect(),
                 Err(error) => {
                     tracing::debug!(table = %self.table_metadata.table_name, %error, "Persisted secondary index runs were not loaded: the table's files could not be listed");
+                    super::lookup_index::PersistedRuns::fence(url.to_string()).await;
                     return;
                 }
             }
@@ -9668,7 +9677,7 @@ impl CayenneTableProvider {
                 store,
                 Arc::clone(&self.catalog),
                 self.table_metadata.table_id.clone(),
-                url.prefix(),
+                &url,
                 live,
             )
             .await;

@@ -30,6 +30,17 @@ use common::lookup_index::{
     runtime_with_pool, until_covered,
 };
 
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
+
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -1700,4 +1711,235 @@ async fn a_key_spelled_in_another_case_is_used_by_lookups() {
         1,
         "the lookup did not use the index: {before:?} -> {after:?}"
     );
+}
+
+#[derive(Debug)]
+struct PausedIndexPutStore {
+    inner: Arc<dyn ObjectStore>,
+    armed: Arc<AtomicBool>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl fmt::Display for PausedIndexPutStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PausedIndexPutStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PausedIndexPutStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        if std::path::Path::new(location.as_ref())
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("run"))
+            && self.armed.swap(false, Ordering::AcqRel)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// An old provider's sync must finish before a replacement removes its indexes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reopening_without_indexes_fences_an_old_pending_sync() {
+    const NAME: &str = "pending_removed_index";
+    let fixture = Arc::new(
+        common::TestFixture::new(common::BackendType::Sqlite)
+            .await
+            .expect("fixture"),
+    );
+    let env = Arc::new(RuntimeEnv::default());
+    let store = Arc::new(PausedIndexPutStore {
+        inner: Arc::new(object_store::local::LocalFileSystem::new()),
+        armed: Arc::new(AtomicBool::new(false)),
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    });
+    env.register_object_store(
+        &url::Url::parse("file:///").expect("file URL"),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+    );
+    let table = open_table(
+        &fixture,
+        Arc::clone(&env),
+        TableSpec::new(NAME, schema(), &[&KEY]).persistence(IndexPersistence::Enabled),
+    )
+    .await;
+    store.armed.store(true, Ordering::Release);
+    overwrite(&table, vec![rows(0, 20_000)]).await;
+    tokio::time::timeout(Duration::from_secs(10), store.entered.notified())
+        .await
+        .expect("old sync reached run put");
+    drop(table);
+    let reopening_fixture = Arc::clone(&fixture);
+    let mut reopening = tokio::spawn(async move {
+        open_table(
+            &reopening_fixture,
+            env,
+            TableSpec::new(NAME, schema(), &[]).persistence(IndexPersistence::Enabled),
+        )
+        .await
+    });
+    let early = tokio::time::timeout(Duration::from_secs(1), &mut reopening).await;
+    println!(
+        "replacement completed while old sync paused: {}",
+        early.is_ok()
+    );
+    store.release.notify_one();
+    let reopened = match early {
+        Ok(result) => result.expect("reopen task"),
+        Err(_) => reopening.await.expect("reopen after old sync"),
+    };
+    // The resumed local put and catalog registration must have time to finish.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let registered = registered_runs(&fixture, NAME).await;
+    let files = run_file_count(&fixture.data_path);
+    println!(
+        "after old sync and index removal: registrations={} run_files={files}",
+        registered.len()
+    );
+    assert!(
+        registered.is_empty(),
+        "an old sync resurrected a removed index registration"
+    );
+    assert_eq!(files, 0, "an old sync resurrected a removed index file");
+    lookup(&reopened, NAME, 7).await;
+}
+
+/// Late publications from an old provider cannot change a replacement's runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_syncs_do_not_modify_replacement_runs() {
+    for (name, indexes, persistence) in [
+        ("stale_removed", &[][..], IndexPersistence::Enabled),
+        (
+            "stale_replaced",
+            &[&["AutoId"][..]][..],
+            IndexPersistence::Enabled,
+        ),
+        (
+            "stale_disabled",
+            &[&KEY[..]][..],
+            IndexPersistence::Disabled,
+        ),
+    ] {
+        let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+            .await
+            .expect("fixture");
+        let env = Arc::new(RuntimeEnv::default());
+        let old = open_table(
+            &fixture,
+            Arc::clone(&env),
+            TableSpec::new(name, schema(), &[&KEY]).persistence(IndexPersistence::Enabled),
+        )
+        .await;
+        overwrite(&old, vec![rows(0, 20_000)]).await;
+        wait_for_persisted_runs(&fixture, name, 1).await;
+        let replacement = open_table(
+            &fixture,
+            env,
+            TableSpec::new(name, schema(), indexes).persistence(persistence),
+        )
+        .await;
+        if name == "stale_replaced" {
+            until_covered(&replacement, async || {
+                let sql = format!("SELECT \"AutoId\" FROM {name} WHERE \"AutoId\" = 7");
+                let found = int64_column(&query(&replacement, name, &sql).await);
+                assert_eq!(found, vec![7]);
+            })
+            .await;
+            wait_for_persisted_runs(&fixture, name, 1).await;
+        }
+        let mut before = registered_runs(&fixture, name).await;
+        before.sort_by(|left, right| left.run_name.cmp(&right.run_name));
+        let mut paths = Vec::new();
+        run_files(&fixture.data_path, &mut paths);
+        paths.sort();
+        let before_files: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    std::fs::read(path).expect("read existing run"),
+                )
+            })
+            .collect();
+        let publications_before = counters(&old).builds_published;
+        insert(&old, name, rows(20_000, 20_000)).await;
+        assert!(
+            counters(&old).builds_published > publications_before,
+            "the old provider must publish a run to exercise stale scheduling"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut after = registered_runs(&fixture, name).await;
+        after.sort_by(|left, right| left.run_name.cmp(&right.run_name));
+        println!(
+            "late old publication ({name}): registered_before={} registered_after={} run_files={}",
+            before.len(),
+            after.len(),
+            run_file_count(&fixture.data_path)
+        );
+        assert_eq!(
+            after, before,
+            "stale persistence changed the replacement registrations"
+        );
+        let mut remaining = Vec::new();
+        run_files(&fixture.data_path, &mut remaining);
+        remaining.sort();
+        assert_eq!(
+            remaining, paths,
+            "stale persistence changed the replacement files"
+        );
+        for (path, bytes) in before_files {
+            assert_eq!(std::fs::read(path).expect("retained run"), bytes);
+        }
+        lookup(&replacement, name, 7).await;
+    }
 }
