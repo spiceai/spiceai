@@ -149,8 +149,8 @@ pub use scan::CayenneAccelerationExec;
 pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
 pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
 pub use table::{
-    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, IndexPersistence,
-    LastSmallFileCompactPath, PreparedAppendSnapshotPublish, ScanViewReuse,
+    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, FileDeletionHold,
+    IndexPersistence, LastSmallFileCompactPath, PreparedAppendSnapshotPublish, ScanViewReuse,
 };
 pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
 pub use tuning::{
