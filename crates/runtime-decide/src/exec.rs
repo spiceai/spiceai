@@ -195,6 +195,7 @@ impl Decider {
                         model: model_name.clone(),
                         state,
                         questions: questions.clone(),
+                        safety_identifier: None,
                     };
                     Arc::clone(&context).scope(async move {
                         let result = ask(model.as_ref(), request).await;

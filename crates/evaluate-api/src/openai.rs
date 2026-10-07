@@ -383,6 +383,7 @@ impl DecisionRequest {
                 model: self.model.clone(),
                 state,
                 questions,
+                safety_identifier: self.safety_identifier.clone(),
             },
             asked,
         })
@@ -682,7 +683,8 @@ fn score_legend(criteria: &[NonNullEntry]) -> BTreeMap<String, EntryType> {
 }
 
 /// Builds the `OpenAI` decision request that asks `request`'s questions of `model`,
-/// naming each question by its System One id so its answer can be matched back.
+/// naming each question by its System One id so its answer can be matched back, and
+/// forwarding the request's `safety_identifier`.
 ///
 /// # Errors
 ///
@@ -691,7 +693,6 @@ fn score_legend(criteria: &[NonNullEntry]) -> BTreeMap<String, EntryType> {
 pub fn system_one_to_decision_request(
     request: &EvaluateRequest,
     model: &str,
-    safety_identifier: Option<String>,
 ) -> Result<DecisionRequest, InvalidDecisionRequest> {
     if request.questions.len() > MAX_QUESTIONS {
         return Err(InvalidDecisionRequest::new(
@@ -786,7 +787,7 @@ pub fn system_one_to_decision_request(
         model: model.to_string(),
         input,
         questions,
-        safety_identifier,
+        safety_identifier: request.safety_identifier.clone(),
     })
 }
 
@@ -890,6 +891,28 @@ mod tests {
 
     fn request(value: serde_json::Value) -> DecisionRequest {
         serde_json::from_value(value).expect("valid decision request")
+    }
+
+    #[test]
+    fn the_safety_identifier_travels_with_the_request() {
+        let req = request(json!({
+            "model": "gpt-6-luna", "input": "x", "safety_identifier": "user-1",
+            "questions": [{"type": "predicate", "instructions": "?"}]
+        }));
+        let translated = req.to_system_one().expect("translates");
+        assert_eq!(
+            translated.request.safety_identifier.as_deref(),
+            Some("user-1")
+        );
+        let upstream =
+            system_one_to_decision_request(&translated.request, "gpt-6-luna").expect("builds");
+        assert_eq!(upstream.safety_identifier.as_deref(), Some("user-1"));
+        assert!(
+            !serde_json::to_string(&translated.request)
+                .expect("serializes")
+                .contains("user-1"),
+            "the identifier must not reach providers that serialize the System One request"
+        );
     }
 
     /// The reference request from `OpenAI`'s API docs parses and translates to a noul.
@@ -1088,7 +1111,7 @@ mod tests {
         }))
         .expect("system one request");
 
-        let decision = system_one_to_decision_request(&asked, "gpt-6-luna", None).expect("builds");
+        let decision = system_one_to_decision_request(&asked, "gpt-6-luna").expect("builds");
         assert_eq!(
             serde_json::to_value(&decision).expect("serializes"),
             json!({

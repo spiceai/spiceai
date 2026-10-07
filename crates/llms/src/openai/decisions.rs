@@ -162,7 +162,7 @@ impl OpenAiDecisions {
 #[async_trait]
 impl Evaluate for OpenAiDecisions {
     async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse> {
-        let body = system_one_to_decision_request(&request, &self.model_id, None).map_err(|e| {
+        let body = system_one_to_decision_request(&request, &self.model_id).map_err(|e| {
             evaluate_api::Error::InvalidRequest {
                 model: self.name.clone(),
                 message: e.message,
@@ -253,7 +253,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn request() -> EvaluateRequest {
-        serde_json::from_value(json!({
+        let mut request: EvaluateRequest = serde_json::from_value(json!({
             "model": "luna",
             "state": "The package arrived with a broken screen.",
             "questions": {
@@ -261,7 +261,9 @@ mod tests {
                 "team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "Payments", "support": null}}
             }
         }))
-        .expect("request")
+        .expect("request");
+        request.safety_identifier = Some("user-1".to_string());
+        request
     }
 
     fn client(server: &MockServer) -> OpenAiDecisions {
@@ -288,7 +290,8 @@ mod tests {
                 "questions": [
                     {"type": "predicate", "name": "damaged", "instructions": "Does the customer report a damaged item?"},
                     {"type": "choice", "name": "team", "instructions": "Which team?", "choices": [{"value": "billing", "description": "Payments"}, {"value": "support"}]}
-                ]
+                ],
+                "safety_identifier": "user-1"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "model": "gpt-6-luna",

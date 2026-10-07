@@ -410,6 +410,10 @@ pub struct EvaluateRequest {
     #[schemars(extend("minProperties" = 1))]
     #[cfg_attr(feature = "openapi", schema(schema_with = nonempty_question_map))]
     pub questions: BTreeMap<String, Question>,
+    /// Opaque end-user identifier from an `OpenAI`-shaped request, forwarded only to
+    /// `OpenAI` decision models. It is never serialized, so other providers never see it.
+    #[serde(skip)]
+    pub safety_identifier: Option<String>,
 }
 
 /// Token usage reported by the provider.
