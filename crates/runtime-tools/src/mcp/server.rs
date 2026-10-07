@@ -819,9 +819,8 @@ impl ServerHandler for RuntimeServer {
         Box::pin(async move {
             let run = self.call_tool_with_auth(request, tool_name.clone(), arguments);
             let spice_ctx = spice_request_context_from_mcp(&context);
-            match spice_ctx.filter(|ctx| {
-                AuthRequestContext::auth_principal(ctx.as_ref()).is_some()
-            }) {
+            match spice_ctx.filter(|ctx| AuthRequestContext::auth_principal(ctx.as_ref()).is_some())
+            {
                 Some(ctx) => ctx.scope(run).await,
                 None => {
                     // `/v1/mcp` requires `runtime.auth`. Missing principal means
@@ -4586,7 +4585,9 @@ mod tests {
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", "2025-11-25")
-            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
             .expect("valid initialize request");
         let response = service.handle(request).await;
         let status = response.status();
@@ -4652,7 +4653,9 @@ mod tests {
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", "2025-11-25")
             .header("mcp-session-id", session_id)
-            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
             .expect("valid legacy tools/call request");
         if let Some(ctx) = spice_ctx {
             if let Some(principal) = AuthRequestContext::auth_principal(ctx.as_ref()) {

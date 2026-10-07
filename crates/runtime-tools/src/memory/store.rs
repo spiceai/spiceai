@@ -353,9 +353,11 @@ mod tests {
     }
 
     fn store_memory_tool(engine: Arc<RecordingQueryEngine>) -> StoreMemoryTool {
-        let app = Arc::new(AppBuilder::new("store_memory_auth_test")
-            .with_dataset(Dataset::new("memory:memories", "memories"))
-            .build());
+        let app = Arc::new(
+            AppBuilder::new("store_memory_auth_test")
+                .with_dataset(Dataset::new("memory:memories", "memories"))
+                .build(),
+        );
         StoreMemoryTool::new(
             engine as Arc<dyn QueryEngine>,
             Arc::new(RwLock::new(Some(app))),
